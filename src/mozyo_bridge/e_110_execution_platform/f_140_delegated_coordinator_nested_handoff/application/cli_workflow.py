@@ -508,6 +508,39 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_workflow_dispatch_fence(args: argparse.Namespace) -> int:
+    """Operator surface for the increment-2 dispatch idempotency fence (Redmine #13489 F1).
+
+    Distinguishes an initial ``--bootstrap`` (safe first init) from a deliberate ``--recover``
+    (loss recovery: mints a fresh store under a new nonce — invoke ONLY after reconciling the
+    lost action in Redmine + issuing a new ``action_id``). With no flag, reports status. The
+    reserve path never auto-creates the store, so this is the sanctioned way to (re)initialize it.
+    """
+    from mozyo_bridge.core.state.dispatch_outbox_fence import (
+        DispatchOutboxFence,
+        DispatchOutboxFenceError,
+    )
+
+    fence = DispatchOutboxFence()
+    try:
+        if getattr(args, "fence_recover", False):
+            fence.recover()
+            print(f"dispatch fence recovered (fresh store) at {fence.path}")
+            print("reconcile the lost action + issue a NEW action_id upstream before re-dispatch")
+            return 0
+        if getattr(args, "fence_bootstrap", False):
+            fence.bootstrap()
+            print(f"dispatch fence bootstrapped at {fence.path}")
+            return 0
+    except DispatchOutboxFenceError as exc:
+        print(f"dispatch fence error: {exc}")
+        print("a store loss/replacement needs `workflow dispatch-fence --recover`")
+        return 1
+    state = "bootstrapped" if fence.is_bootstrapped() else "absent / not bootstrapped"
+    print(f"dispatch fence: {state} at {fence.path}")
+    return 0
+
+
 def register(sub) -> None:
     """Register ``workflow`` (``step`` / ``fill-decision`` / ``admission`` / ...).
 
@@ -559,6 +592,26 @@ def register(sub) -> None:
     register_resume(workflow_sub)
     register_watch(workflow_sub)
     register_glance(workflow_sub)
+
+    fence_p = workflow_sub.add_parser(
+        "dispatch-fence",
+        description=(
+            "Operator surface for the increment-2 worker-dispatch idempotency fence "
+            "(Redmine #13489). `--bootstrap` initializes it; `--recover` mints a fresh store "
+            "after a loss (only after reconciling the lost action + issuing a new action_id "
+            "upstream); no flag reports status. The reserve path never auto-creates the store."
+        ),
+        help="Bootstrap / recover / status the worker-dispatch idempotency fence.",
+    )
+    fence_p.add_argument(
+        "--bootstrap", dest="fence_bootstrap", action="store_true",
+        help="Initialize the fence store (safe first init; refuses on a detected loss).",
+    )
+    fence_p.add_argument(
+        "--recover", dest="fence_recover", action="store_true",
+        help="Deliberate loss recovery: mint a fresh store under a new nonce.",
+    )
+    fence_p.set_defaults(func=cmd_workflow_dispatch_fence)
 
     step = workflow_sub.add_parser(
         "step",

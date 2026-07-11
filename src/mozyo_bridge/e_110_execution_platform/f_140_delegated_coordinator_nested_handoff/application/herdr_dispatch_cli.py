@@ -23,15 +23,28 @@ import os
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
+from mozyo_bridge.core.state.dispatch_outbox_fence import (
+    DispatchOutboxFence,
+    DispatchOutboxFenceError,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (
+    DISPATCH_FENCE_UNAVAILABLE,
     DISPATCH_SKIPPED,
-    TURN_START_ACK_ONLY,
     TURN_START_NOT_STARTED,
+    TURN_START_STARTED,
+    TURN_START_UNKNOWN,
     DispatchExecutionResult,
     SendOutcome,
     execute_dispatch,
 )
+
+# The herdr ops turn-start token -> the fence's SendOutcome turn-start token (mid-review F2).
+_OPS_TURN_START_TO_SEND = {
+    "started": TURN_START_STARTED,
+    "delivered_not_started": TURN_START_NOT_STARTED,
+    "not_started": TURN_START_NOT_STARTED,
+    "unknown": TURN_START_UNKNOWN,
+}
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authority import (
     AUTHORIZE,
     DispatchDecision,
@@ -109,24 +122,22 @@ def _default_send_factory(
             issue=authorization.issue,
             env=dict(env),
         )
-        rc = ops.dispatch_to_worker(
+        # Surface the structured herdr turn-start FROM the dispatch ops (mid-review j#75047 F2):
+        # the delivery ACK alone (submit-completion) is not a turn-start, so `delivered` is
+        # confirmed only when the ops observes the exact worker's turn actually started
+        # (`started`); ACK-without-turn / unobservable -> uncertain. No raw wait loop.
+        rc, ops_turn_start = ops.dispatch_to_worker_turn_start(
             issue=authorization.issue,
             journal=journal,
             worker_pane=worker_pane,
             lane_label=authorization.lane_id,
             gateway_callback_target=None,
             target_repo="auto",
+            worker_assigned_name=authorization.target_assigned_name,
             allow_direct_worker=True,
         )
-        # `dispatch_to_worker`'s exit code is a delivery-**ACK** measurement (submit-completion),
-        # which is NOT a turn-start confirmation (mid-review j#75047 F2). So even rc==0 is only
-        # ACK-only -> uncertain; a non-zero rc is not_started. A positive turn-start would require
-        # threading the structured delivery outcome's turn-start observation through this seam —
-        # that live positive-delivered wiring lands with the coordinator's separate live-enable
-        # dispatch action_id (product auto-dispatch is disabled until then, j#75006).
-        if int(rc or 0) == 0:
-            return SendOutcome(turn_start=TURN_START_ACK_ONLY, detail=f"worker dispatch ACK rc={rc}")
-        return SendOutcome(turn_start=TURN_START_NOT_STARTED, detail=f"worker dispatch rc={rc}")
+        turn_start = _OPS_TURN_START_TO_SEND.get(ops_turn_start, TURN_START_UNKNOWN)
+        return SendOutcome(turn_start=turn_start, detail=f"worker dispatch rc={rc} turn_start={ops_turn_start}")
 
     return _send
 
@@ -192,13 +203,22 @@ def execute_herdr_dispatch(
         )
 
     authorization = decision.authorization
+    outbox = fence if fence is not None else DispatchOutboxFence()
+    # Auto-bootstrap the identity: this is deletion-safe (mid-review j#75047 F1). A genuine first
+    # bootstrap creates the DB + sidecar; a store loss (sidecar remains, DB gone) makes bootstrap
+    # refuse -> fail closed here (zero send). It never silently re-creates a fresh empty store.
+    try:
+        outbox.bootstrap()
+    except DispatchOutboxFenceError as exc:
+        return DispatchExecutionResult(
+            result=DISPATCH_FENCE_UNAVAILABLE,
+            fence_state="absent",
+            detail=f"dispatch fence unavailable ({exc}); no send — operator recover() required",
+            sent=False,
+        )
     factory = send_factory if send_factory is not None else _default_send_factory
     send = factory(args, authorization, journal, str(repo_root), environ)
-    return execute_dispatch(
-        authorization=authorization,
-        fence=fence if fence is not None else DispatchOutboxFence(),
-        send=send,
-    )
+    return execute_dispatch(authorization=authorization, fence=outbox, send=send)
 
 
 __all__ = ("execute_herdr_dispatch",)

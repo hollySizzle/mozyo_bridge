@@ -16,7 +16,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
+from mozyo_bridge.core.state.dispatch_outbox_fence import (
+    DispatchOutboxFence,
+    dispatch_outbox_fence_path,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     herdr_dispatch_authority,
     herdr_dispatch_cli,
@@ -25,9 +28,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_cli import (
     execute_herdr_dispatch,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    herdr_dispatch_cli as _cli,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    sublane_worker_dispatch_herdr_ops as _herdr_ops,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (
     DISPATCH_DELIVERED,
+    DISPATCH_FENCE_UNAVAILABLE,
     DISPATCH_SKIPPED,
+    DISPATCH_UNCERTAIN,
     TURN_START_STARTED,
     SendOutcome,
 )
@@ -148,6 +159,90 @@ class DispatchLegTest(unittest.TestCase):
         )
         self.assertEqual(r.result, DISPATCH_SKIPPED)
         self.assertEqual(counter.calls, 0)
+
+    def test_store_loss_is_fence_unavailable_zero_send(self):
+        # Product path (F1): a delivered action, then the fence DB is lost -> a repeat with the
+        # SAME still-authorized action must be fence-unavailable (zero send), never a re-send.
+        self._set_decision(
+            decide_dispatch_authority(
+                authorization=_auth(), superseded=False, target_runtime=TARGET_AWAITING_INPUT
+            )
+        )
+        counter = _Counter()
+        execute_herdr_dispatch(
+            self._args(),
+            ANCHOR,
+            env={"x": "y"},
+            send_factory=counter.factory,
+            fence=DispatchOutboxFence(home=self.home),
+        )
+        dispatch_outbox_fence_path(self.home).unlink()  # the fence DB is lost (sidecar remains)
+        counter2 = _Counter()
+        r = execute_herdr_dispatch(
+            self._args(),
+            ANCHOR,
+            env={"x": "y"},
+            send_factory=counter2.factory,
+            fence=DispatchOutboxFence(home=self.home),
+        )
+        self.assertEqual(r.result, DISPATCH_FENCE_UNAVAILABLE)
+        self.assertEqual(counter2.calls, 0)
+
+    def _run_default_leg_with_ops_turn_start(self, ops_turn_start):
+        """Drive the DEFAULT product send factory with a faked ops turn-start (F2)."""
+        self._set_decision(
+            decide_dispatch_authority(
+                authorization=_auth(), superseded=False, target_runtime=TARGET_AWAITING_INPUT
+            )
+        )
+        orig_locator = _cli._resolve_target_locator
+        orig_ts = _herdr_ops.HerdrWorkerDispatchOps.dispatch_to_worker_turn_start
+        _cli._resolve_target_locator = lambda name, env: "pane1"
+        _herdr_ops.HerdrWorkerDispatchOps.dispatch_to_worker_turn_start = (
+            lambda self, **kw: (0, ops_turn_start)
+        )
+        try:
+            return execute_herdr_dispatch(
+                self._args(),
+                ANCHOR,
+                env={"x": "y"},
+                fence=DispatchOutboxFence(home=self.home),
+            )  # send_factory=None -> the real default product leg
+        finally:
+            _cli._resolve_target_locator = orig_locator
+            _herdr_ops.HerdrWorkerDispatchOps.dispatch_to_worker_turn_start = orig_ts
+
+    def test_default_leg_started_is_delivered(self):
+        # F2: the DEFAULT product leg reaches `delivered` on a real positive turn-start.
+        r = self._run_default_leg_with_ops_turn_start("started")
+        self.assertEqual(r.result, DISPATCH_DELIVERED)
+
+    def test_default_leg_ack_without_turn_start_is_uncertain(self):
+        # F2: an ACK landing without the receiver's turn starting -> uncertain, not delivered.
+        r = self._run_default_leg_with_ops_turn_start("delivered_not_started")
+        self.assertEqual(r.result, DISPATCH_UNCERTAIN)
+
+    def test_recover_and_new_action_sends_once(self):
+        # After a loss + operator recover(), a reconciled NEW action_id sends exactly once.
+        dispatch_outbox_fence_path(self.home).unlink()
+        DispatchOutboxFence(home=self.home).recover()
+        self._set_decision(
+            decide_dispatch_authority(
+                authorization=_auth(action_id="act-2"),
+                superseded=False,
+                target_runtime=TARGET_AWAITING_INPUT,
+            )
+        )
+        counter = _Counter()
+        r = execute_herdr_dispatch(
+            self._args(),
+            ANCHOR,
+            env={"x": "y"},
+            send_factory=counter.factory,
+            fence=DispatchOutboxFence(home=self.home),
+        )
+        self.assertEqual(r.result, DISPATCH_DELIVERED)
+        self.assertEqual(counter.calls, 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

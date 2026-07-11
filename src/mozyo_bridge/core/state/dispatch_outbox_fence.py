@@ -19,15 +19,21 @@ home-scoped SQLite store with a UNIQUE key over
   surfaced for operator reconcile — it is **not** auto-retried.
 - concurrency: ``BEGIN IMMEDIATE`` serializes two callers of the same key; the loser sees the
   winner's row and never sends. The UNIQUE constraint is the backstop.
-- a *missing* file is the legitimate empty fence (first dispatch) and is created fresh; a
-  *corrupt* / *unrecognized-version* file fails closed (:class:`DispatchOutboxFenceError`) —
-  the caller must not send. The reserve / send-outcome recovery is operator-gated: a superseded
-  or lost action is reconciled and re-attempted only under a **new** ``action_id`` (a new key),
-  never by this store re-sending.
+- **store identity (mid-review j#75047 F1).** A reserve never auto-creates or silently accepts
+  a fresh store: the mechanism would then let a **deleted / replaced** DB re-send an already
+  delivered action. The store carries a random ``store_nonce`` pinned in a **DB-external
+  sidecar** file. :meth:`bootstrap` is *initial only* — it creates the DB + sidecar together,
+  and **refuses** (fail closed) when a sidecar already exists but the DB is missing / at the
+  wrong nonce (a loss / replacement), directing the operator to the deliberate
+  :meth:`recover`. Every reserve / update requires the DB and sidecar to co-exist at the same
+  nonce; a missing / empty-swap / foreign / nonce-mismatched store fails closed. Recovery is
+  operator-gated: :meth:`recover` mints a new nonce + a fresh DB, and a re-attempt of a lost
+  action is only authorized upstream by a reconcile + a **new** ``action_id``.
 """
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,6 +43,7 @@ from typing import Optional
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 DISPATCH_OUTBOX_FENCE_FILENAME = "dispatch-outbox-fence.sqlite"
+DISPATCH_OUTBOX_FENCE_SIDECAR_SUFFIX = ".anchor"
 DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION = 1
 
 # The closed fence-state vocabulary (design requirement 3).
@@ -63,6 +70,15 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
     UNIQUE(workspace_id, lane_id, issue, journal, action_id, target_assigned_name)
 )
 """
+
+_META_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS store_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
+_STORE_NONCE_KEY = "store_nonce"
 
 
 class DispatchOutboxFenceError(RuntimeError):
@@ -140,49 +156,94 @@ class DispatchOutboxFence:
 
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else dispatch_outbox_fence_path(home)
+        self.sidecar_path = self.path.with_name(
+            self.path.name + DISPATCH_OUTBOX_FENCE_SIDECAR_SUFFIX
+        )
 
-    # -- bootstrap ---------------------------------------------------------
+    # -- store identity (DB-external sidecar) ------------------------------
 
-    def bootstrap(self) -> None:
-        """Create + stamp the fence store (the explicit, deliberate initialization).
+    def _read_sidecar_nonce(self) -> Optional[str]:
+        """The nonce pinned in the DB-external sidecar, or ``None`` when absent / unreadable."""
+        try:
+            value = self.sidecar_path.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return None
+        return value or None
 
-        This is the **only** path that creates the store. A dispatch reserve never
-        auto-creates a missing store (mid-review j#75047 F1): auto-creation on a missing file
-        would silently resurrect a **deleted / replaced** store and let an already-``delivered``
-        action re-send. Bootstrapping stamps ``PRAGMA user_version`` — the durable marker that a
-        later :meth:`reserve` uses to tell an intentionally-initialized store apart from a lost
-        (missing / empty-replacement / foreign) one. Idempotent: an already-bootstrapped store at
-        the expected version is a no-op; a corrupt / unrecognized-version file fails closed.
-        """
+    @staticmethod
+    def _db_nonce(conn: sqlite3.Connection) -> Optional[str]:
+        """The ``store_nonce`` stamped inside the DB, or ``None`` (fail-soft)."""
+        try:
+            row = conn.execute(
+                "SELECT value FROM store_meta WHERE key = ?", (_STORE_NONCE_KEY,)
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        return str(row[0]) if row is not None else None
+
+    def _create_fresh(self, nonce: str) -> None:
+        """(Re)create the DB fresh, stamp the schema version + the store nonce, write sidecar."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            self.path.unlink()
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 2000")
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version == 0:
-                conn.execute(_TABLE_SQL)
-                conn.execute(f"PRAGMA user_version = {DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION}")
-            elif version != DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION:
-                raise DispatchOutboxFenceError(
-                    f"dispatch outbox fence {self.path} has unsupported schema version "
-                    f"{version}; this build understands "
-                    f"{DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION}. The DB is left untouched."
-                )
-        except sqlite3.DatabaseError as exc:
+            conn.execute(_TABLE_SQL)
+            conn.execute(_META_TABLE_SQL)
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
+                (_STORE_NONCE_KEY, nonce),
+            )
+            conn.execute(f"PRAGMA user_version = {DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION}")
+        finally:
             conn.close()
-            raise DispatchOutboxFenceError(
-                f"dispatch outbox fence {self.path} is unreadable ({type(exc).__name__}); "
-                f"cannot bootstrap"
-            ) from exc
-        except DispatchOutboxFenceError:
-            conn.close()
-            raise
-        else:
-            conn.close()
+        self.sidecar_path.write_text(nonce, encoding="utf-8")
+
+    # -- bootstrap / recover -----------------------------------------------
+
+    def bootstrap(self) -> None:
+        """Initial-only creation of the fence store + its DB-external identity (mid-review F1).
+
+        The **only** initial-creation path. A reserve never auto-creates a missing store —
+        auto-creation would resurrect a **deleted / replaced** store and let an already
+        ``delivered`` action re-send. Behavior:
+
+        - no sidecar (a genuine first bootstrap) -> mint a random ``store_nonce``, create the
+          DB + sidecar together at that nonce.
+        - sidecar present AND the DB co-exists at the same nonce -> idempotent no-op.
+        - sidecar present but the DB is **missing / empty / at a different nonce** (a loss or
+          replacement) -> **fail closed** (:class:`DispatchOutboxFenceError`): this is not a
+          first bootstrap, so it must go through the deliberate :meth:`recover`, not silently
+          get a fresh empty store that would re-enable old actions.
+        """
+        sidecar_nonce = self._read_sidecar_nonce()
+        if sidecar_nonce is None:
+            self._create_fresh(secrets.token_hex(16))
+            return
+        if self.is_bootstrapped():
+            return  # DB co-exists at the sidecar nonce: already bootstrapped.
+        raise DispatchOutboxFenceError(
+            f"dispatch outbox fence {self.path} sidecar exists but the DB is missing / at a "
+            f"different nonce (store loss or replacement); refusing to silently re-create. Use "
+            f"recover() for a deliberate, operator-gated loss recovery."
+        )
+
+    def recover(self) -> None:
+        """Deliberate operator loss-recovery: mint a NEW nonce and a fresh DB (mid-review F1).
+
+        The explicit surface an operator invokes AFTER reconciling the lost action in Redmine
+        (superseding it + issuing a new ``action_id``). It replaces the (lost / corrupt) store
+        with a fresh DB under a brand-new nonce, so any lingering old DB is invalidated. Distinct
+        from :meth:`bootstrap` (initial only): this is intentional, and the upstream reconcile —
+        not this store — is what stops the old action from re-sending.
+        """
+        self._create_fresh(secrets.token_hex(16))
 
     def is_bootstrapped(self) -> bool:
-        """True when the store exists and carries the expected schema version (fail-soft)."""
-        if not self.path.exists():
+        """True when the DB and sidecar co-exist at the same nonce and schema version (fail-soft)."""
+        sidecar_nonce = self._read_sidecar_nonce()
+        if sidecar_nonce is None or not self.path.exists():
             return False
         try:
             conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
@@ -190,29 +251,38 @@ class DispatchOutboxFence:
             return False
         try:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version != DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION:
+                return False
+            return self._db_nonce(conn) == sidecar_nonce
         except (sqlite3.DatabaseError, TypeError, ValueError):
             return False
         finally:
             conn.close()
-        return version == DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION
 
     # -- connection --------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        """Open an **existing, bootstrapped** manual-transaction connection, or fail closed.
+        """Open an **existing, identity-matched** manual-transaction connection, or fail closed.
 
-        Unlike the sibling stores, a reserve never creates the container (mid-review j#75047
-        F1). A **missing** file (never bootstrapped / deleted / lost), an **empty** file (a
-        ``user_version=0`` swap-in), a **foreign** / unrecognized-version file, and a **corrupt**
-        file all fail closed via :class:`DispatchOutboxFenceError` — the caller must not send,
-        because the idempotency authority is not the one this run bootstrapped, so a send could
-        duplicate an already-delivered action. Recovery is operator-gated: re-:meth:`bootstrap`
-        + a **new** ``action_id``.
+        A reserve never creates the container (mid-review j#75047 F1). The DB and its
+        DB-external sidecar must co-exist at the **same** ``store_nonce``: a **missing** file
+        (never bootstrapped / deleted), an **empty** ``user_version=0`` swap-in, a **foreign** /
+        unrecognized-version file, and a **nonce-mismatched replacement** all fail closed via
+        :class:`DispatchOutboxFenceError` — the caller must not send, because the idempotency
+        authority is not the one this store was bootstrapped as, so a send could duplicate an
+        already-delivered action. Recovery is operator-gated (:meth:`recover` + a new
+        ``action_id`` from an upstream reconcile).
         """
+        sidecar_nonce = self._read_sidecar_nonce()
+        if sidecar_nonce is None:
+            raise DispatchOutboxFenceError(
+                f"dispatch outbox fence {self.path} has no identity sidecar (never bootstrapped "
+                f"/ lost); fail closed rather than risk a duplicate send"
+            )
         if not self.path.exists():
             raise DispatchOutboxFenceError(
-                f"dispatch outbox fence {self.path} does not exist (never bootstrapped / lost); "
-                f"fail closed rather than auto-create and risk a duplicate send"
+                f"dispatch outbox fence {self.path} DB is missing while its sidecar remains "
+                f"(store loss); fail closed rather than auto-create and risk a duplicate send"
             )
         # ``isolation_level=None`` -> autocommit; we drive BEGIN IMMEDIATE / COMMIT ourselves.
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -224,6 +294,11 @@ class DispatchOutboxFence:
                     f"dispatch outbox fence {self.path} is not a bootstrapped fence at version "
                     f"{DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION} (found {version}: empty / replaced / "
                     f"foreign store); fail closed rather than risk a duplicate send"
+                )
+            if self._db_nonce(conn) != sidecar_nonce:
+                raise DispatchOutboxFenceError(
+                    f"dispatch outbox fence {self.path} nonce does not match its sidecar "
+                    f"(replaced / foreign store); fail closed rather than risk a duplicate send"
                 )
         except sqlite3.DatabaseError as exc:
             conn.close()
@@ -389,6 +464,7 @@ class DispatchOutboxFence:
 
 __all__ = (
     "DISPATCH_OUTBOX_FENCE_FILENAME",
+    "DISPATCH_OUTBOX_FENCE_SIDECAR_SUFFIX",
     "DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION",
     "FENCE_RESERVED",
     "FENCE_DELIVERED",

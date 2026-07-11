@@ -116,6 +116,39 @@ class ReserveTest(unittest.TestCase):
         with self.assertRaises(DispatchOutboxFenceError):
             DispatchOutboxFence(home=self.home).reserve(_key())
 
+    def test_rebootstrap_after_loss_refuses(self):
+        # The reviewer's j#75052 F1 reproduction: reserve -> delivered -> delete DB ->
+        # bootstrap() must REFUSE (sidecar remains) rather than silently make a fresh empty store.
+        self.fence.reserve(_key())
+        self.fence.mark_delivered(_key())
+        dispatch_outbox_fence_path(self.home).unlink()
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).bootstrap()
+
+    def test_recover_mints_fresh_store_for_new_action(self):
+        # After a loss, the deliberate recover() surface makes a fresh store; a NEW action_id
+        # (from an upstream reconcile) then reserves once. The old key was superseded upstream.
+        self.fence.reserve(_key())
+        self.fence.mark_delivered(_key())
+        dispatch_outbox_fence_path(self.home).unlink()
+        recovered = DispatchOutboxFence(home=self.home)
+        recovered.recover()
+        self.assertTrue(recovered.reserve(_key(action_id="act-2")).won)
+
+    def test_foreign_nonce_replacement_fails_closed(self):
+        # A valid-schema DB swapped in with a DIFFERENT nonce than the sidecar -> fail closed.
+        self.fence.reserve(_key())
+        # Replace the DB with another bootstrapped store (different nonce), keep the old sidecar.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as other:
+            foreign = DispatchOutboxFence(home=Path(other))
+            foreign.bootstrap()
+            data = dispatch_outbox_fence_path(Path(other)).read_bytes()
+        dispatch_outbox_fence_path(self.home).write_bytes(data)
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).reserve(_key())
+
     def test_empty_replacement_fails_closed(self):
         # A 0-byte / empty (user_version=0) swap-in is not a bootstrapped fence -> fail closed.
         self.fence.reserve(_key())

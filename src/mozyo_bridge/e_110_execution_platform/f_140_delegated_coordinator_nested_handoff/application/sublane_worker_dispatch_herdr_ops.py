@@ -187,5 +187,82 @@ class HerdrWorkerDispatchOps:
         )
         return _worker_dispatcher._drive_worker_send_argv(argv)
 
+    def dispatch_to_worker_turn_start(
+        self,
+        *,
+        issue: str,
+        journal: str,
+        worker_pane: str,
+        lane_label: str,
+        gateway_callback_target: Optional[str],
+        target_repo: str,
+        worker_assigned_name: str,
+        allow_direct_worker: bool = False,
+    ) -> tuple[int, str]:
+        """Drive the worker forward AND surface the herdr turn-start signal (Redmine #13489 F2).
+
+        Returns ``(delivery_ack_rc, turn_start_token)``. The ACK rc is
+        :meth:`dispatch_to_worker`'s submit-completion measurement — which is **not** a
+        turn-start confirmation (mid-review j#75047 F2). The turn-start token is the
+        dispatch-ops-surfaced herdr runtime signal that the receiver's turn actually started:
+        after a positive ACK, the exact worker is re-resolved in the live inventory and its
+        runtime receiver-state is read — ``busy`` / ``working`` (the turn started) ->
+        ``started``; a still-``awaiting_input`` worker (ACK landed but no turn) ->
+        ``delivered_not_started``; any other / unobservable state -> ``unknown``. A non-zero ACK
+        -> ``not_started``. Conservative: only a definitive ``started`` promotes to
+        ``delivered`` upstream; everything else is uncertain. No raw wait loop is introduced —
+        a single structured observation.
+        """
+        rc = self.dispatch_to_worker(
+            issue=issue,
+            journal=journal,
+            worker_pane=worker_pane,
+            lane_label=lane_label,
+            gateway_callback_target=gateway_callback_target,
+            target_repo=target_repo,
+            allow_direct_worker=allow_direct_worker,
+        )
+        if int(rc or 0) != 0:
+            return rc, "not_started"
+        return rc, self._observe_worker_turn_start(worker_assigned_name)
+
+    def _observe_worker_turn_start(self, worker_assigned_name: str) -> str:
+        """The exact worker's post-ACK herdr runtime turn-start signal (fail-soft)."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+            list_herdr_agent_rows,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+            HerdrSessionStartError,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            AGENT_KEY_NAME,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
+            agent_row_runtime_state,
+        )
+
+        want = (worker_assigned_name or "").strip()
+        if not want:
+            return "unknown"
+        try:
+            rows = list_herdr_agent_rows(self.env)
+        except HerdrSessionStartError:
+            return "unknown"
+        except Exception:  # noqa: BLE001 - an unobservable runtime is conservatively unknown
+            return "unknown"
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping) and str(row.get(AGENT_KEY_NAME, "")).strip() == want
+        ]
+        if len(matches) != 1:
+            return "unknown"
+        runtime = agent_row_runtime_state(matches[0])
+        if runtime in ("busy", "working"):
+            return "started"
+        if runtime == "awaiting_input":
+            return "delivered_not_started"
+        return "unknown"
+
 
 __all__ = ("HerdrWorkerDispatchOps",)
