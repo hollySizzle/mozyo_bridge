@@ -7,21 +7,25 @@ tmux primitive (US #13518 acceptance: the tool surface is limited to mozyo seman
 operations). The correctness lives in the store / domain / orchestrator; this is the thin
 argparse edge that wires them to the live Redmine journal source and the home-scoped outbox.
 
-Three mutually-exclusive actions:
+Actions (mutually exclusive):
 
-- ``--sweep`` — the **fresh-turn sweep** (read-only actuation-wise): reconcile crashed
+- ``--sweep`` — the **fresh-turn sweep** (read-only actuation-wise): reconcile crashed / stale
   ``inflight`` rows (pre-send -> pending, post-send -> uncertain) and surface the pending +
   dead-letter backlog once, so a single fresh LLM turn reads the source journal. Sends nothing.
 - ``--ingest`` — classify each ``--candidate ISSUE:JOURNAL:ROUTE[:KIND]`` against its **exact
   source journal** (from ``--redmine-json`` snapshot or ``--poll --source-issue`` live) and
   idempotently enqueue it (classified -> pending; unclassified -> dead_letter). Sends nothing.
-- ``--deliver`` — recover crashed rows, claim pending rows (single winner), and fire **one**
-  send per row through a configured sender. The bare CLI has **no** default sender and
-  fail-closes: live callback actuation runs through the controlled #13521 harness (QA-only
-  anchors), never a bare-CLI invocation that could re-send a completed request.
+- ``--deliver`` — recover stale rows, claim pending rows (single winner), and fire **one**
+  send per row through the real sender (the handoff send port). Delivery safety is the outbox
+  UNIQUE fence + one-send-per-claim (a delivered callback is never re-sent), not a refusal to
+  send. Actuates.
+- ``--run-once`` — one **production pass**: discover fresh handoff-worthy gate candidates from
+  ``--source-issue`` (structured markers), ingest/classify, deliver once, sweep. Actuates.
+- ``--watch`` — the bounded background-watcher loop: run a production pass per Herdr-event wake
+  (``--max-passes`` / ``--wake-interval``), re-reading Redmine every wake outcome. Actuates.
 
-Always exits 0 for a successful read/record; a fail-closed actuation refusal or a source /
-store error is a ``SystemExit`` with a redacted message (never a credential / URL / pane id).
+Always exits 0 for a successful read / record / pass; a source / store error is a
+``SystemExit`` with a redacted message (never a credential / URL / pane id).
 """
 
 from __future__ import annotations
@@ -114,14 +118,33 @@ def _callback_sender(args: argparse.Namespace) -> Callable[[CallbackOutboxRow], 
     return HandoffCallbackSender(HandoffCallbackSendPort())
 
 
-def _wake_wait_fn(args: argparse.Namespace) -> Callable[[], object]:
-    """Build the Herdr-event wake primitive for ``--watch`` (patchable seam).
+def _herdr_wake_wait(interval_seconds: float) -> object:
+    """One bounded background-watcher wake: block for the cadence, then a timeout hint.
 
-    Production binds this to the stable Herdr CLI wait; the bare / env-less default is a
-    no-op that reports a bounded timeout (still triggers a Redmine re-read — the Herdr event
-    is only a hint). The #13490 live harness injects the real cockpit-bound wait.
+    This is the background watcher's blocking wait — the wait/polling doctrine homes the 45–55s
+    cadence here (NOT in an LLM turn). It blocks ``interval_seconds`` (a real bounded wait, not a
+    busy spin) and returns falsy (a timeout hint); the runtime re-reads Redmine every pass
+    regardless (the Herdr event is only a hint). The optional stable Herdr-event wait (wake early
+    on an agent status change) is an injectable optimization the #13490 live harness supplies;
+    fail-safe by construction (it only sleeps).
     """
-    return lambda: False  # timeout hint; the runtime re-reads Redmine regardless (fail-safe)
+    if interval_seconds > 0:
+        import time
+
+        time.sleep(interval_seconds)
+    return False
+
+
+def _wake_wait_fn(args: argparse.Namespace) -> Callable[[], object]:
+    """Build the ``--watch`` wake primitive (a real bounded background-watcher wait; seam).
+
+    Bound to a bounded interval wait (``--wake-interval``, default 0 for a one-shot / test pass;
+    an operator sets the 45–55s watcher cadence). The stable Herdr CLI-event wait is an
+    injectable optimization (patched by the #13490 live harness) — the loop re-reads Redmine on
+    every wake outcome regardless, so a plain bounded wait is correct and fail-safe.
+    """
+    interval = float(getattr(args, "wake_interval", 0) or 0)
+    return lambda: _herdr_wake_wait(interval)
 
 
 def _parse_candidate(spec: str) -> CallbackCandidate:
@@ -201,7 +224,7 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         return _emit(payload, as_json=as_json, text_lines=lines)
 
     if getattr(args, "deliver", False):
-        sender = _callback_sender(args)  # fail-closed by default (raises SystemExit)
+        sender = _callback_sender(args)  # the real handoff send port (actuates one send per row)
         processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE)
         report = processor.deliver(sender, limit=int(getattr(args, "limit", 32) or 32))
         payload = {"action": "deliver", **report.as_payload()}
@@ -218,19 +241,27 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
 
     if getattr(args, "run_once", False) or getattr(args, "watch", False):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
+            discover_candidates,
             run_once,
             watch,
         )
 
-        candidates = list(getattr(args, "candidate", None) or [])
-        # A pass that ingests fresh candidates needs the exact source journal; a drain-only
-        # pass (no candidates) delivers + sweeps the existing outbox and needs no source.
-        source = _journal_source(args) if candidates else _NULL_SOURCE
+        explicit = list(getattr(args, "candidate", None) or [])
+        source_issue = (getattr(args, "source_issue", None) or "").strip()
         sender = _callback_sender(args)
         cursor = (getattr(args, "cursor", None) or "").strip() or None
+        # Production discovery (F1-R1): with --source-issue + a journal source, each pass
+        # RE-READS Redmine and discovers fresh handoff-worthy gate candidates from the issue's
+        # structured markers (deduped by the outbox fence). Explicit --candidate specs are also
+        # honored. A pass with neither discovers nothing and only drains the existing outbox.
+        needs_source = bool(explicit) or bool(source_issue)
+        source = _journal_source(args) if needs_source else _NULL_SOURCE
 
         def _pass() -> dict:
             processor = CallbackOutboxProcessor(outbox, source)
+            candidates = list(explicit)
+            if source_issue:
+                candidates.extend(discover_candidates(source, source_issue))
             return run_once(processor, sender, candidates=candidates, cursor=cursor)
 
         if getattr(args, "watch", False):
@@ -275,29 +306,34 @@ def register_callbacks(sub) -> None:
     p = sub.add_parser(
         "callbacks",
         description=(
-            "Zero-wait callback outbox facade (Redmine #13520 / US #13518). `--sweep` runs the "
-            "fresh-turn sweep (reconcile crashed rows + surface the pending/dead-letter backlog "
-            "once; sends nothing). `--ingest` classifies each --candidate against its exact "
-            "source journal (--redmine-json snapshot or --poll live) and idempotently enqueues "
-            "it. `--deliver` fires one send per claimed pending row through a configured sender "
-            "(fail-closed on the bare CLI; live actuation runs through the #13521 harness). The "
+            "Zero-wait callback outbox facade (Redmine #13520 / US #13518). `--sweep` reconciles "
+            "stale rows + surfaces the pending/dead-letter backlog once (sends nothing). "
+            "`--ingest` classifies each --candidate against its exact source journal and enqueues "
+            "it (sends nothing). `--deliver` fires one send per claimed pending row through the "
+            "real handoff send port (safety = the outbox UNIQUE fence + one-send-per-claim). "
+            "`--run-once` is one production pass (discover gate candidates from --source-issue, "
+            "ingest, deliver, sweep); `--watch` is the bounded background-watcher loop. The "
             "journal marker is the gate authority; a notification is only a pointer."
         ),
-        help="Zero-wait callback outbox: sweep / ingest / deliver.",
+        help="Zero-wait callback outbox: sweep / ingest / deliver / run-once / watch.",
     )
     action = p.add_mutually_exclusive_group(required=True)
     action.add_argument("--sweep", action="store_true", help="Fresh-turn sweep (read-only).")
     action.add_argument("--ingest", action="store_true", help="Classify + enqueue --candidate specs.")
-    action.add_argument("--deliver", action="store_true", help="Fire one send per pending row.")
+    action.add_argument("--deliver", action="store_true", help="Fire one real send per pending row (actuates).")
     action.add_argument(
         "--run-once", dest="run_once", action="store_true",
-        help="One production pass: ingest --candidate specs (if any), deliver, sweep.",
+        help="One production pass: discover (--source-issue) + ingest, deliver, sweep (actuates).",
     )
     action.add_argument(
         "--watch", action="store_true",
-        help="Bounded Herdr-event wake loop; run one pass per wake (--max-passes).",
+        help="Bounded background-watcher loop; one production pass per wake (--max-passes).",
     )
     p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")
+    p.add_argument(
+        "--wake-interval", dest="wake_interval", type=float, default=0.0,
+        help="Background-watcher wake cadence seconds for --watch (0 = one-shot; operator sets 45-55).",
+    )
     p.add_argument(
         "--candidate", action="append", type=_parse_candidate, metavar="ISSUE:JOURNAL:ROUTE[:KIND]",
         help="A callback candidate (repeatable). Required for --ingest.",

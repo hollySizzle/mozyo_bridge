@@ -198,6 +198,38 @@ class RunOnceCliTest(_CliTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
 
+    def test_run_once_discovers_candidates_from_source_issue(self):
+        # F1-R1: --run-once with --source-issue discovers gate candidates from the issue's
+        # structured markers (no explicit --candidate needed).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+            render_workflow_event_marker,
+        )
+
+        snapshot = Path(self._tmp.name) / "gate.json"
+        snapshot.write_text(
+            _json.dumps(
+                {"issue": {"id": "13543", "journals": [
+                    {"id": "75212", "notes": f"review {render_workflow_event_marker('review_request')}"}]}}
+            ),
+            encoding="utf-8",
+        )
+        orig = cli._callback_sender
+        cli._callback_sender = lambda args: (lambda row: SEND_DELIVERED)
+        try:
+            rc = cli.cmd_workflow_callbacks(
+                _args(
+                    run_once=True, store_path=str(self.store_path),
+                    redmine_json=str(snapshot), source_issue="13543",
+                )
+            )
+        finally:
+            cli._callback_sender = orig
+        self.assertEqual(rc, 0)
+        row = self.outbox.read()[0]
+        self.assertEqual(
+            (row.journal, row.normalized_gate, row.state), ("75212", "review_request", CALLBACK_DELIVERED)
+        )
+
     def test_watch_runs_bounded_passes(self):
         orig = cli._callback_sender
         cli._callback_sender = lambda args: (lambda row: SEND_DELIVERED)

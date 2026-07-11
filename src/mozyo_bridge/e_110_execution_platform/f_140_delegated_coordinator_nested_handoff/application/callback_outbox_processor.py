@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.callback_outbox import (
     CallbackOutboxRow,
 )
 from mozyo_bridge.core.state.workflow_runtime_store import (
+    CALLBACK_ABSENT,
     CALLBACK_DEAD_LETTER,
     CALLBACK_PENDING,
 )
@@ -134,11 +135,19 @@ class IngestReport:
 
 @dataclass(frozen=True)
 class DeliveryOutcome:
-    """One claimed callback's delivery result: the send outcome + the resulting store state."""
+    """One claimed callback's delivery result: the send outcome + the resulting store state.
+
+    ``resulting_state`` is the **actual persisted** callback-outbox state after the terminal
+    mark (not the intended one). ``ownership_lost`` is True when the terminal mark no-op'd
+    because the claim's lease expired mid-send and another processor reconciled the row — a
+    duplicate delivery was still prevented, but this delivery's evidence is the reconciled state
+    (#13520 review F2-R1).
+    """
 
     key: CallbackOutboxKey
     send_outcome: str
     resulting_state: str
+    ownership_lost: bool = False
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -148,6 +157,7 @@ class DeliveryOutcome:
             "callback_route": self.key.callback_route,
             "send_outcome": self.send_outcome,
             "resulting_state": self.resulting_state,
+            "ownership_lost": self.ownership_lost,
         }
 
 
@@ -334,17 +344,27 @@ class CallbackOutboxProcessor:
             outcome = sender(row)
             if outcome not in SEND_OUTCOMES:
                 outcome = SEND_UNCERTAIN
+            # The terminal mark is token-conditional. If it no-ops (rowcount 0 / ABSENT), the
+            # lease expired mid-send and another processor reconciled the row — the report must
+            # reflect the ACTUAL persisted state, not the intended one (#13520 review F2-R1), so
+            # CLI / QA evidence never claims delivered while the durable state says uncertain.
             if outcome == SEND_DELIVERED:
-                self._outbox.mark_delivered(row.key, claim_token=token, now=now)
-                resulting = "delivered"
+                applied = self._outbox.mark_delivered(row.key, claim_token=token, now=now)
             elif outcome == SEND_NOT_SENT:
-                resulting = self._outbox.mark_retry_or_dead(row.key, claim_token=token, now=now)
+                applied = self._outbox.mark_retry_or_dead(
+                    row.key, claim_token=token, now=now
+                ) != CALLBACK_ABSENT
             else:
-                self._outbox.mark_uncertain(row.key, claim_token=token, now=now)
-                resulting = "uncertain"
+                applied = self._outbox.mark_uncertain(row.key, claim_token=token, now=now)
+            # When the terminal mark applied, the persisted state is exactly what this delivery
+            # intended; when it did not, read the state the reconciling processor actually left.
+            resulting = self._outbox.state_of(row.key)
             report.delivered.append(
                 DeliveryOutcome(
-                    key=row.key, send_outcome=outcome, resulting_state=resulting
+                    key=row.key,
+                    send_outcome=outcome,
+                    resulting_state=resulting,
+                    ownership_lost=not applied,
                 )
             )
         return report

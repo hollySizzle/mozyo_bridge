@@ -632,6 +632,28 @@ class CallbackOutbox:
             conn.close()
         return tuple(_row(r) for r in rows)
 
+    def state_of(self, key: CallbackOutboxKey) -> str:
+        """Return the current persisted state for the key, or :data:`CALLBACK_ABSENT`.
+
+        A read-only diagnostic used by the processor to report the **actual** durable state when
+        a terminal mark no-ops (the owner lost the lease and another processor reconciled the
+        row): the report must match the persisted state, not the intended one (#13520 review F2-R1).
+        """
+        conn = self._connect_ro()
+        if conn is None:
+            return CALLBACK_ABSENT
+        try:
+            if not self._table_present(conn):
+                return CALLBACK_ABSENT
+            row = conn.execute(
+                "SELECT state FROM callback_outbox WHERE source=? AND issue=? AND journal=? "
+                "AND normalized_gate=? AND callback_route=?",
+                key.as_row(),
+            ).fetchone()
+            return str(row[0]) if row is not None else CALLBACK_ABSENT
+        finally:
+            conn.close()
+
     def read_cursor(self, source: str) -> Optional[str]:
         """Return the persisted cursor token for ``source``, or ``None`` if unset."""
         conn = self._connect_ro()

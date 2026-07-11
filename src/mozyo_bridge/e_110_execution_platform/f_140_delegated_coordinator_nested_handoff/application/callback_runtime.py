@@ -30,6 +30,44 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_wake import (
     resolve_wake,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    RedmineJournalSource,
+    markers_from_source,
+)
+
+#: The default callback route for a handoff-worthy gate: the coordinator (a sublane callback
+#: goes to the coordinator lane, per the workflow doctrine).
+DEFAULT_CALLBACK_ROUTE = "coordinator"
+
+
+def discover_candidates(
+    source: RedmineJournalSource,
+    issue: str,
+    *,
+    route: str = DEFAULT_CALLBACK_ROUTE,
+) -> list[CallbackCandidate]:
+    """Discover callback candidates from a source issue's structured gate markers (#13520 F1-R1).
+
+    Reads the issue's journals from ``source`` and extracts every handoff-worthy structured gate
+    marker (:func:`...redmine_journal_source.markers_from_source` — the machine ``[mozyo:...]``
+    token, never prose), turning each into a :class:`CallbackCandidate` targeting ``route`` (the
+    coordinator by default). This is the production discovery the review required: a real
+    handoff-worthy durable gate update on the issue becomes a callback candidate, deduped
+    downstream by the outbox UNIQUE fence (re-discovering the same gate enqueues no new row). A
+    read failure propagates to the caller (the processor's ingest handles it fail-closed per
+    candidate); an issue with no gate marker yields ``[]`` (nothing to deliver — never a guess).
+    """
+    candidates: list[CallbackCandidate] = []
+    for marker in markers_from_source(source, issue):
+        candidates.append(
+            CallbackCandidate(
+                issue=str(marker.issue).strip(),
+                journal=str(marker.journal).strip(),
+                callback_route=route,
+                notification_kind=marker.gate,
+            )
+        )
+    return candidates
 
 
 def run_once(
@@ -83,4 +121,4 @@ def watch(
     return results
 
 
-__all__ = ("run_once", "watch")
+__all__ = ("DEFAULT_CALLBACK_ROUTE", "discover_candidates", "run_once", "watch")

@@ -12,9 +12,10 @@ This adapter is the thin, contract-bearing seam: it wraps an injected ``wait_fn`
 Herdr wait primitive) and normalizes its result to a :class:`WakeSignal` whose
 :attr:`should_reread` is **always True**. That invariant is the whole point — a caller can
 never be tempted to trust the Herdr signal as authority or to skip the Redmine re-read on a
-timeout. The actual daemon loop (``while running: resolve_wake(...); processor.ingest(from live
-Redmine); processor.deliver(...); processor.sweep()``) is operator background runtime, not an
-LLM turn; this module gives it a fail-safe wake primitive.
+timeout. The bounded daemon loop that drives this — one production pass (discover -> ingest ->
+deliver-once -> sweep) per wake — is implemented in
+:func:`...application.callback_runtime.watch` (and reachable via ``workflow callbacks --watch``);
+this module gives that loop its fail-safe wake primitive.
 """
 
 from __future__ import annotations

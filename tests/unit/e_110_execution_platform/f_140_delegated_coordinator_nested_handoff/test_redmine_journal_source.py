@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     extract_markers,
     extract_markers_from_note,
     markers_from_source,
+    render_workflow_event_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     GATE_REVIEW,
@@ -198,6 +199,31 @@ class NestedRestShapeTest(unittest.TestCase):
         payload = {"issue": {"id": "12672"}}
         source = MappingRedmineJournalSource(payload=payload)
         self.assertEqual(source.read_entries(), [])
+
+
+class RenderWorkflowEventMarkerTest(unittest.TestCase):
+    """The gate-journal marker PRODUCER (#13520 review F1-R1): render round-trips to a marker."""
+
+    def test_bare_marker_round_trips_through_the_classifier(self):
+        token = render_workflow_event_marker("review_request")
+        self.assertEqual(token, "[mozyo:workflow-event:gate=review_request]")
+        markers = extract_markers_from_note("13543", "75212", f"review posted {token}")
+        self.assertEqual([(m.issue, m.journal, m.gate) for m in markers], [("13543", "75212", "review_request")])
+
+    def test_review_result_alias_round_trips_to_review(self):
+        token = render_workflow_event_marker("review_result")
+        markers = extract_markers_from_note("13543", "75212", token)
+        self.assertEqual(markers[0].gate, "review")  # review_result -> review runtime gate
+
+    def test_optional_fields_are_emitted_and_read_back(self):
+        token = render_workflow_event_marker("implementation_done", commit_bearing=True, issue_open=False)
+        markers = extract_markers_from_note("13543", "75094", token)
+        self.assertTrue(markers[0].commit_bearing)
+        self.assertFalse(markers[0].issue_open)
+
+    def test_non_gate_kind_is_rejected(self):
+        with self.assertRaises(ValueError):
+            render_workflow_event_marker("reply")
 
 
 if __name__ == "__main__":

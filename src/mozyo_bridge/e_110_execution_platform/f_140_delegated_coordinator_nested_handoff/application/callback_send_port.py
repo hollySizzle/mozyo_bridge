@@ -92,6 +92,11 @@ class HandoffCallbackSendPort:
             "--mode", "standard",
             "--target-repo", "auto",
             "--record-format", "json",
+            # Persist the callback delivery outcome durably through the sanctioned handoff
+            # delivery-record path (#13520 review F1-R1 / j#75108). The write transport is
+            # credential-gated (a local receipt otherwise) — the same gated path all handoff
+            # deliveries use — so the outcome is recorded durably where the environment allows.
+            "--persist-delivery",
         ]
         try:
             rc, stdout = self.runner(argv)

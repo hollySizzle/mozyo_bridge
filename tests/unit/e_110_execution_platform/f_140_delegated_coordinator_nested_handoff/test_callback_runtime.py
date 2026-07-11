@@ -20,8 +20,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CallbackOutboxProcessor,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
+    discover_candidates,
     run_once,
     watch,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    render_workflow_event_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
     SEND_DELIVERED,
@@ -70,6 +74,67 @@ class RunOnceTest(unittest.TestCase):
         report = run_once(self.proc, lambda row: SEND_DELIVERED, stale_seconds=0)
         self.assertNotIn("ingest", report)
         self.assertEqual(len(report["deliver"]["delivered"]), 1)
+
+
+class DiscoverCandidatesTest(unittest.TestCase):
+    """F1-R1 production discovery: real gate-marker journals become callback candidates."""
+
+    def test_gate_markers_become_coordinator_candidates(self):
+        # Real gate journals whose notes carry the producer's marker (render_workflow_event_marker).
+        source = _FakeSource(
+            {
+                "13543": [
+                    RedmineJournalEntry("13543", "75212", f"review {render_workflow_event_marker('review_request')}"),
+                    RedmineJournalEntry("13543", "75094", f"done {render_workflow_event_marker('implementation_done')}"),
+                    RedmineJournalEntry("13543", "75300", "just prose, no marker"),
+                ]
+            }
+        )
+        cands = discover_candidates(source, "13543")
+        self.assertEqual(
+            [(c.journal, c.callback_route, c.notification_kind) for c in cands],
+            [("75212", "coordinator", "review_request"), ("75094", "coordinator", "implementation_done")],
+        )
+
+    def test_no_gate_marker_discovers_nothing(self):
+        source = _FakeSource({"13543": [RedmineJournalEntry("13543", "75300", "prose only")]})
+        self.assertEqual(discover_candidates(source, "13543"), [])
+
+
+class ProductionPipelineTest(unittest.TestCase):
+    """F1-R1 end-to-end: a real gate journal -> discover -> classify -> deliver once."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.outbox = CallbackOutbox(path=Path(self._tmp.name) / "wf.sqlite")
+
+    def test_gate_journal_with_marker_delivers_a_coordinator_callback(self):
+        source = _FakeSource(
+            {"13543": [RedmineJournalEntry("13543", "75212", f"review {render_workflow_event_marker('review_request')}")]}
+        )
+        proc = CallbackOutboxProcessor(self.outbox, source)
+        cands = discover_candidates(source, "13543")
+        report = run_once(proc, lambda row: SEND_DELIVERED, candidates=cands, stale_seconds=0)
+        self.assertEqual([d["journal"] for d in report["deliver"]["delivered"]], ["75212"])
+        row = self.outbox.read()[0]
+        self.assertEqual(
+            (row.normalized_gate, row.callback_route, row.state),
+            ("review_request", "coordinator", CALLBACK_DELIVERED),
+        )
+
+    def test_rediscovery_is_idempotent(self):
+        source = _FakeSource(
+            {"13543": [RedmineJournalEntry("13543", "75212", f"review {render_workflow_event_marker('review_request')}")]}
+        )
+        proc = CallbackOutboxProcessor(self.outbox, source)
+        cands = discover_candidates(source, "13543")
+        run_once(proc, lambda row: SEND_DELIVERED, candidates=cands, stale_seconds=0)
+        # Re-discovering the same gate on a later pass enqueues no new row and re-sends nothing.
+        report2 = run_once(proc, lambda row: SEND_DELIVERED, candidates=discover_candidates(source, "13543"), stale_seconds=0)
+        self.assertEqual(report2["ingest"]["enqueued"], 0)
+        self.assertEqual(report2["deliver"]["delivered"], [])
+        self.assertEqual(len(self.outbox.read()), 1)
 
 
 class WatchTest(unittest.TestCase):

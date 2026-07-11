@@ -189,6 +189,37 @@ class DeliverTest(_ProcessorTestCase):
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
 
 
+class OwnershipLostReportTest(_ProcessorTestCase):
+    """F2-R1 (#13520 j#75167): the report reflects the ACTUAL persisted state after lease loss."""
+
+    def test_lease_loss_mid_send_reports_reconciled_state_not_delivered(self):
+        source = _FakeSource({"13518": [_entry("13518", "75094", "implementation_done")]})
+        proc = self._processor(source)
+        proc.ingest([CallbackCandidate("13518", "75094", "coordinator", "implementation_done")])
+        # A second processor over the same store; the sender simulates the lease expiring
+        # mid-send so the second processor reconciles the row to uncertain (token cleared).
+        other = CallbackOutbox(path=self.path)
+
+        def racing_sender(row):
+            other.recover_inflight(stale_seconds=0)
+            return SEND_DELIVERED
+
+        report = proc.deliver(racing_sender)
+        outcome = report.delivered[0]
+        # Double-send prevention holds, but the report must NOT claim delivered.
+        self.assertEqual(outcome.resulting_state, CALLBACK_UNCERTAIN)
+        self.assertTrue(outcome.ownership_lost)
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_UNCERTAIN)
+
+    def test_normal_delivery_reports_delivered_without_ownership_loss(self):
+        source = _FakeSource({"13518": [_entry("13518", "75094", "implementation_done")]})
+        proc = self._processor(source)
+        proc.ingest([CallbackCandidate("13518", "75094", "coordinator", "implementation_done")])
+        outcome = proc.deliver(lambda row: SEND_DELIVERED).delivered[0]
+        self.assertEqual(outcome.resulting_state, CALLBACK_DELIVERED)
+        self.assertFalse(outcome.ownership_lost)
+
+
 class SweepTest(_ProcessorTestCase):
     def test_sweep_surfaces_pending_and_dead_letter_and_recovers_inflight(self):
         source = _FakeSource(

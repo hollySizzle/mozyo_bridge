@@ -45,6 +45,8 @@ class HandoffCallbackSendPortTest(unittest.TestCase):
         self.assertIn("send", argv)
         self.assertIn("coordinator", argv)
         self.assertIn("75094", argv)
+        # F1-R1: the callback outcome is persisted durably through the sanctioned path.
+        self.assertIn("--persist-delivery", argv)
 
     def test_parses_blocked_outcome(self):
         port = HandoffCallbackSendPort(

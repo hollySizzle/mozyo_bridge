@@ -293,6 +293,49 @@ def markers_from_source(
     return extract_markers(source.read_entries(issue_id))
 
 
+def render_workflow_event_marker(
+    gate: str,
+    *,
+    conclusion: str | None = None,
+    callback: str | None = None,
+    commit_bearing: bool | None = None,
+    integration_recorded: bool | None = None,
+    issue_open: bool | None = None,
+    blocker_recorded: bool | None = None,
+) -> str:
+    """Render the structured ``[mozyo:workflow-event:...]`` gate marker for a gate journal (pure).
+
+    This is the **producer** inverse of :func:`extract_markers_from_note` (#13520 review F1-R1):
+    an agent recording a handoff-worthy gate journal (implementation_done / review_request /
+    review_result) embeds the returned token in the journal notes so the callback watcher can
+    **discover** the gate structurally later — the watcher reads the machine token, never the
+    surrounding prose. Only the fields that are set are emitted (a bare marker carries just the
+    gate). ``gate`` must be a gate-bearing kind (:data:`GATE_BEARING_KINDS`); anything else is a
+    programming error and raises. The output round-trips through
+    :func:`extract_markers_from_note` back to the same :class:`JournalMarker`.
+    """
+    gate_s = str(gate).strip()
+    if gate_s not in GATE_BEARING_KINDS:
+        raise ValueError(
+            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, "
+            f"got {gate!r}"
+        )
+    fields = [f"gate={gate_s}"]
+    if conclusion is not None:
+        fields.append(f"conclusion={str(conclusion).strip()}")
+    if callback is not None:
+        fields.append(f"callback={str(callback).strip()}")
+    for key, value in (
+        ("commit", commit_bearing),
+        ("integrated", integration_recorded),
+        ("open", issue_open),
+        ("blocker", blocker_recorded),
+    ):
+        if value is not None:
+            fields.append(f"{key}={'1' if value else '0'}")
+    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
+
+
 __all__ = (
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
@@ -304,4 +347,5 @@ __all__ = (
     "RedmineJournalSource",
     "MappingRedmineJournalSource",
     "markers_from_source",
+    "render_workflow_event_marker",
 )
