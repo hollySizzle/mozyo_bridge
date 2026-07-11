@@ -44,6 +44,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application i
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_runtime import (  # noqa: E402
     TimingTestResult,
+    _repo_root_importable,
     cmd_tests_profile,
 )
 
@@ -431,6 +432,50 @@ class CmdTestsProfileTest(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["test_count"], 1)
         self.assertEqual(len(payload["violations"]), 1)
+
+
+class RepoRootImportableTest(unittest.TestCase):
+    """The repo-root bootstrap that gives installed console-script parity.
+
+    Redmine #13555: ``python -m unittest discover -s tests`` runs with the repo
+    root (cwd) on ``sys.path``; an installed console-script does not, so repo-root
+    ``tests.*`` package imports fail at collection. ``_repo_root_importable``
+    inserts the repo root only when absent and restores ``sys.path`` afterwards.
+    """
+
+    def test_inserts_when_absent_and_restores(self) -> None:
+        root = "/nonexistent/mozyo-#13555-probe-root"
+        self.assertNotIn(root, sys.path)
+        before = list(sys.path)
+        with _repo_root_importable(Path(root)):
+            # Available (and at the front, matching `python -m` cwd semantics)
+            # while discovery runs.
+            self.assertEqual(sys.path[0], root)
+        # Fully restored once discovery is done: in-process callers stay isolated.
+        self.assertEqual(sys.path, before)
+        self.assertNotIn(root, sys.path)
+
+    def test_noop_when_already_present_does_not_remove(self) -> None:
+        # Local `python -m` / editable lane: the root is already on the path and
+        # must not be stripped out by the context manager's cleanup.
+        root = "/nonexistent/mozyo-#13555-preexisting-root"
+        sys.path.insert(0, root)
+        self.addCleanup(lambda: sys.path.remove(root) if root in sys.path else None)
+        before = list(sys.path)
+        with _repo_root_importable(Path(root)):
+            self.assertIn(root, sys.path)
+        # Still present exactly once — we didn't add it, so we don't remove it.
+        self.assertEqual(sys.path, before)
+        self.assertEqual(sys.path.count(root), 1)
+
+    def test_restores_on_exception(self) -> None:
+        root = "/nonexistent/mozyo-#13555-raising-root"
+        before = list(sys.path)
+        with self.assertRaises(RuntimeError):
+            with _repo_root_importable(Path(root)):
+                raise RuntimeError("boom during discovery")
+        self.assertEqual(sys.path, before)
+        self.assertNotIn(root, sys.path)
 
 
 if __name__ == "__main__":  # pragma: no cover

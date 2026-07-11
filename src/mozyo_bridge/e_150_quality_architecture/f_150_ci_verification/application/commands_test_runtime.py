@@ -19,14 +19,27 @@ Verbose output is a per-lane knob (acceptance #3): the default lane runs at
 unittest verbosity 1 (quiet dots) and relies on the runtime summary for the
 slow-test signal; ``-v`` is opt-in for a failure-investigation lane. See
 ``vibes/docs/logics/test-runtime-profiling-policy.md``.
+
+Repo-root import parity (Redmine #13555): ``python -m unittest discover -s tests``
+puts the invocation cwd (the repo root) on ``sys.path[0]``, so repo-root test
+packages resolve their ``from tests.support ...`` / ``from tests.unit ...``
+imports at collection time. An installed console-script entry point does *not*
+put the invocation cwd on ``sys.path``, so the same discovery raised
+``ModuleNotFoundError: No module named 'tests'`` for those cross-package imports
+across the whole Python matrix. ``_run_suite`` therefore bootstraps the repo root
+onto ``sys.path`` for the duration of discovery, matching the ``python -m`` cwd
+semantics without changing ``top_level_dir`` (so discovered module names / test
+IDs are unchanged — see ``tests-placement-discovery-policy.md``).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json as _json
 import sys
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from time import perf_counter
 
@@ -152,6 +165,35 @@ def _verbosity(args: argparse.Namespace) -> int:
     return 1 if value is None else int(value)
 
 
+@contextlib.contextmanager
+def _repo_root_importable(repo_root: Path) -> Iterator[None]:
+    """Make the repo root importable for the duration of discovery.
+
+    ``python -m unittest discover -s tests`` runs with the invocation cwd (the
+    repo root) on ``sys.path[0]``, which is what lets repo-root test packages
+    resolve their ``from tests.support ...`` / ``from tests.unit ...`` imports.
+    An installed console-script entry point does not put the cwd on ``sys.path``,
+    so the same discovery fails to import those cross-package helpers (Redmine
+    #13555). Insert the repo root at the front — matching the ``python -m`` cwd
+    semantics — only when it is absent, and restore ``sys.path`` afterwards so
+    in-process callers (tests, embedded runs) stay isolated. ``top_level_dir`` is
+    deliberately left untouched, so this only *enables* the imports; it never
+    changes which modules are discovered or their dotted names / test IDs.
+    """
+    root = str(repo_root)
+    if root in sys.path:
+        # Local ``python -m`` / editable-install lane already has the repo root
+        # (cwd) on the path; nothing to add and nothing to clean up.
+        yield
+        return
+    sys.path.insert(0, root)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(root)
+
+
 def _run_suite(
     repo_root: Path, args: argparse.Namespace
 ) -> tuple[TimingTestResult, list[TestTiming]]:
@@ -162,18 +204,19 @@ def _run_suite(
     top_level_dir = str(Path(top_level)) if top_level else None
 
     loader = unittest.TestLoader()
-    suite = loader.discover(
-        start_dir=str(start_dir),
-        pattern=getattr(args, "pattern", "test*.py"),
-        top_level_dir=top_level_dir,
-    )
-    runner = unittest.TextTestRunner(
-        stream=sys.stderr,
-        verbosity=_verbosity(args),
-        failfast=bool(getattr(args, "failfast", False)),
-        resultclass=TimingTestResult,
-    )
-    result = runner.run(suite)
+    with _repo_root_importable(repo_root):
+        suite = loader.discover(
+            start_dir=str(start_dir),
+            pattern=getattr(args, "pattern", "test*.py"),
+            top_level_dir=top_level_dir,
+        )
+        runner = unittest.TextTestRunner(
+            stream=sys.stderr,
+            verbosity=_verbosity(args),
+            failfast=bool(getattr(args, "failfast", False)),
+            resultclass=TimingTestResult,
+        )
+        result = runner.run(suite)
     return result, list(result.timings)
 
 
@@ -241,4 +284,4 @@ def _render_text(summary: RuntimeSummary) -> None:
             print(f"  - {test_id}")
 
 
-__all__ = ("TimingTestResult", "cmd_tests_profile")
+__all__ = ("TimingTestResult", "cmd_tests_profile", "_repo_root_importable")
