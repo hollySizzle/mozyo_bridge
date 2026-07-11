@@ -228,6 +228,21 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-conversational-onboarding-tool-contract
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/conversational-onboarding-tool-contract.md
+    purpose: bare mozyo 一語から非エンジニア向け会話 onboarding を開始し、LLMをclosed intent変換へ限定したまま、preflight・scaffold・typed config・workspace登録・herdr起動を決定論toolで実行するcontract。home/sync/Git/binaryのmodel起動前gate、plan drift、idempotent resume、verification責務を定義する。
+    audit_role: conversational_onboarding_tool_contract_spec
+    related_document_refs:
+      - task-external-project-herdr-adoption
+      - logic-bootstrap
+      - logic-turnkey-e2e-acceptance
+      - spec-herdr-native-identity
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - spec-project-map
+
   - id: spec-delegated-route-live-executor
     type: spec
     status: active

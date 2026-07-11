@@ -281,6 +281,47 @@ task-level design mid-review が必須 (Start Gate j#74685)。増分は次で切
   record 上で既に成立する場合のみ実行、それ以外は resolution-only)。domain/design 判断・issue
   起票・Review Gate・owner approval・release・credential は自動承認しない (`## 禁止される自動実行`)。
 
+### Increment 2 dispatch 再有効化 contract (j#74922 / j#74996)
+
+Increment 2 の worker dispatch は、worker liveness と verified anchor だけでは再有効化しない。
+次の三条件を **action-time に同時に**満たした一つの dispatch attempt だけを許可する。
+
+1. **Redmine `implementation_request` authorization。** coordinator role が durable Redmine
+   journal に `action_id`、`source_gate`、`issue`、`workspace_id`、`lane_id`、
+   `target_role=implementation_worker`、`target_assigned_name`、`action=dispatch_worker`、
+   `conclusion=authorized`、`authorized_by_role=coordinator` を structured field として記録する。
+   prose、pane notification、delivery ACK は authorization ではない。credential-gated live
+   Redmine source で exact journal を再読し、field 欠落、identity drift、または後続の
+   implementation_done / review / close / blocked gate による supersede を検出した場合は
+   monitor / no-op とする。
+2. **credential-trusted runtime observation。** herdr control socket から action-time に exact
+   assigned name を再解決し、candidate が一つで runtime state が `awaiting_input` の場合だけ
+   runtime 必要条件を満たす。caller-supplied inventory、lane metadata、pane text、曖昧な
+   `idle` 表示は authority ではない。busy / working / blocked / turn_ended / unknown / missing /
+   ambiguous は monitor または fail-closed とする。runtime readiness 単独で dispatch を許可しない。
+3. **atomic idempotency / outbox fence。** home-scoped SQLite authority store に
+   `(workspace_id, lane_id, issue, journal, action_id, target_assigned_name)` の UNIQUE key を置き、
+   `BEGIN IMMEDIATE` transaction で send 前に reserve する。state は `reserved` / `delivered` /
+   `uncertain` / `cancelled` の closed vocabulary とする。同じ key の再実行は never-send。
+   `reserved` / `uncertain` は自動 retry せず operator reconcile、`delivered` は monitor、
+   supersede を send 前に確認できた場合だけ `cancelled` とする。append-only herdr delivery
+   ledger、lane metadata、workflow runtime store は recovery evidence であり、UNIQUE fence の
+   authority へ昇格しない。
+
+一回の `workflow step` が行える mutation は、reserve、一回だけの exact-target send attempt、
+outcome write までである。reserve 前 crash は再実行可能。reserve 後 send 前 crash、および send 後
+outcome write 前 crash は duplicate の可能性があるため `reserved` / `uncertain` のまま自動 retry
+しない。SQLite store の missing / corrupt / identity mismatch も fail-closed とし、Redmine
+authorization と live target だけから再送を復元しない。operator が Redmine delivery outcome と
+照合して旧 action を reconcile し、coordinator が **new journal + new `action_id`** を発行した場合だけ
+新しい attempt を許可する。
+
+再有効化前の必須回帰は、authorized + awaiting_input + empty fence の一回送信、同一 action repeat、
+busy / unknown / ambiguous / target drift / gate supersede、reserve 後 crash、send 後 crash、DB
+missing / corrupt / replacement、明示 reconcile 後の new action、二つの concurrent caller の
+UNIQUE winner、Redmine unavailable / credential failure を含む。negative case はすべて zero-send を
+assert する。destructive drain / retire はこの contract の対象外で、引き続き resolution-only とする。
+
 実 module / reason token / next_action 文言は実装 (`domain/workflow_step_herdr.py` +
 `application/herdr_workflow_step.py` + tests) を正本にする。tmux path は byte 不変
 (`_herdr_step_preflight` は backend=tmux で `None` を返し、tmux rail に一切触れない)。

@@ -16,6 +16,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -24,19 +25,26 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
+    BINARY_SOURCE_ENV,
+    BINARY_SOURCE_PATH,
+    REASON_BINARY_AMBIGUOUS,
     REASON_BINARY_NOT_FOUND,
     REASON_BINARY_UNCONFIGURED,
+    REASON_BINARY_UNSAFE_PATH,
     REASON_INVALID_SOURCE,
     REASON_INVALID_TARGET,
     REASON_TRANSPORT_ERROR,
     SOURCE_VISIBLE,
+    HerdrBinaryResolution,
     TerminalTransportConfig,
     TerminalTransportError,
     TerminalTransportPort,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     HERDR_BINARY_ENV,
+    HERDR_PATH_NAME,
     HerdrCliTransport,
+    resolve_herdr_binary,
     resolve_terminal_transport,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
@@ -335,6 +343,291 @@ class ResolverTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.reason, REASON_BINARY_NOT_FOUND)
             finally:
                 os.environ["PATH"] = prev_path
+
+
+def _make_executable(path: Path) -> None:
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class TrustedBinaryResolutionTest(unittest.TestCase):
+    """The #13496 trusted-env resolution order: explicit env -> trusted PATH herdr.
+
+    Pins the shared :func:`resolve_herdr_binary` — resolution order, structured
+    provenance, realpath / executable verification, absolute injection, and the
+    fail-closed cases (missing / non-executable / repo-local cwd rejection). No
+    subprocess spawns; every binary is a temp file.
+    """
+
+    def test_env_unset_falls_back_to_trusted_path_herdr(self) -> None:
+        # Redmine #13500 baseline bug: env WITHOUT MOZYO_HERDR_BINARY but with an
+        # executable `herdr` on the trusted PATH now resolves (was binary_unconfigured).
+        with tempfile.TemporaryDirectory() as tmp:
+            binpath = Path(tmp) / HERDR_PATH_NAME
+            _make_executable(binpath)
+            resolution = resolve_herdr_binary({"PATH": tmp})
+            self.assertIsInstance(resolution, HerdrBinaryResolution)
+            self.assertEqual(resolution.source, BINARY_SOURCE_PATH)
+            self.assertEqual(resolution.path, str(binpath))
+            self.assertTrue(os.path.isabs(resolution.path))
+            # And the transport resolver rides the same order end to end.
+            transport = resolve_terminal_transport(
+                TerminalTransportConfig(backend=BACKEND_HERDR), env={"PATH": tmp}
+            )
+            self.assertIsInstance(transport, HerdrCliTransport)
+            self.assertEqual(transport.binary, str(binpath))
+
+    def test_env_unset_and_no_path_key_is_unconfigured(self) -> None:
+        # No explicit value and no PATH key at all -> nothing to resolve from either
+        # trusted source. env={} must stay binary_unconfigured (all six sites rely
+        # on this so `env={}` never silently resolves an ambient/cwd herdr).
+        with self.assertRaises(TerminalTransportError) as ctx:
+            resolve_herdr_binary({})
+        self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+
+    def test_env_unset_trusted_path_without_herdr_is_unconfigured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary({"PATH": tmp})
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+
+    def test_explicit_env_takes_precedence_over_trusted_path(self) -> None:
+        # Both an explicit MOZYO_HERDR_BINARY and a trusted-PATH herdr are present
+        # and DIFFERENT; resolution order is env-first (source=env).
+        with tempfile.TemporaryDirectory() as env_dir, tempfile.TemporaryDirectory() as path_dir:
+            explicit = Path(env_dir) / "explicit-herdr"
+            _make_executable(explicit)
+            path_herdr = Path(path_dir) / HERDR_PATH_NAME
+            _make_executable(path_herdr)
+            resolution = resolve_herdr_binary(
+                {HERDR_BINARY_ENV: str(explicit), "PATH": path_dir}
+            )
+            self.assertEqual(resolution.source, BINARY_SOURCE_ENV)
+            self.assertEqual(resolution.path, str(explicit))
+
+    def test_explicit_env_source_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binpath = Path(tmp) / "fake-herdr"
+            _make_executable(binpath)
+            resolution = resolve_herdr_binary({HERDR_BINARY_ENV: str(binpath)})
+            self.assertEqual(resolution.source, BINARY_SOURCE_ENV)
+            self.assertEqual(resolution.path, str(binpath))
+
+    def test_non_executable_trusted_path_file_fails_closed(self) -> None:
+        # A `herdr` on the trusted PATH that is NOT executable is not resolved
+        # (shutil.which requires X_OK) -> unconfigured, never a silent success.
+        with tempfile.TemporaryDirectory() as tmp:
+            not_exec = Path(tmp) / HERDR_PATH_NAME
+            not_exec.write_text("#!/bin/sh\n", encoding="utf-8")  # no chmod +x
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary({"PATH": tmp})
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+
+    def test_non_executable_env_binary_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            not_exec = Path(tmp) / "fake-herdr"
+            not_exec.write_text("#!/bin/sh\n", encoding="utf-8")  # no chmod +x
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary({HERDR_BINARY_ENV: str(not_exec)})
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_NOT_FOUND)
+
+    def test_symlink_env_binary_records_realpath(self) -> None:
+        # realpath verification (#13496): an env value that is a symlink to a real
+        # executable resolves; `path` is the symlink's absolute path (injected),
+        # `realpath` is the symlink-resolved real executable that was verified.
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real-herdr"
+            _make_executable(real)
+            link = Path(tmp) / "link-herdr"
+            os.symlink(real, link)
+            resolution = resolve_herdr_binary({HERDR_BINARY_ENV: str(link)})
+            # `path` is the symlink's own absolute path (what gets injected);
+            # `realpath` is the symlink-resolved real executable that was verified.
+            self.assertEqual(resolution.path, str(link))
+            self.assertEqual(resolution.realpath, os.path.realpath(str(link)))
+            self.assertEqual(resolution.realpath, os.path.realpath(str(real)))
+            self.assertNotEqual(resolution.path, resolution.realpath)
+
+    def test_dangling_symlink_env_binary_fails_closed(self) -> None:
+        # A symlink whose target does not exist has no executable real file — the
+        # realpath verify fails closed rather than trusting the dangling link.
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "link-herdr"
+            os.symlink(Path(tmp) / "does-not-exist", link)
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary({HERDR_BINARY_ENV: str(link)})
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_NOT_FOUND)
+
+    def test_repo_local_cwd_herdr_is_never_a_source(self) -> None:
+        # Security boundary (#13502): with no explicit env value and no trusted PATH
+        # key, an executable `herdr` sitting in the CURRENT WORKING DIRECTORY must
+        # NOT be picked up — a hostile checkout cannot point the runtime at its own
+        # binary. Fails closed as binary_unconfigured.
+        with tempfile.TemporaryDirectory() as tmp:
+            hostile = Path(tmp) / HERDR_PATH_NAME
+            _make_executable(hostile)
+            prev_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    resolve_herdr_binary({})
+                self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+                # Even a bare-name explicit env value only resolves on the trusted
+                # PATH, never the cwd, so a cwd herdr stays unreachable.
+                with self.assertRaises(TerminalTransportError) as ctx2:
+                    resolve_herdr_binary({HERDR_BINARY_ENV: HERDR_PATH_NAME})
+                self.assertEqual(ctx2.exception.reason, REASON_BINARY_NOT_FOUND)
+            finally:
+                os.chdir(prev_cwd)
+
+    def test_ambient_path_is_not_a_source(self) -> None:
+        # An executable `herdr` on the AMBIENT process PATH but absent from the
+        # supplied trusted env is not resolved (the trusted env is the authority).
+        with tempfile.TemporaryDirectory() as ambient:
+            ambient_bin = Path(ambient) / HERDR_PATH_NAME
+            _make_executable(ambient_bin)
+            prev_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = ambient + os.pathsep + prev_path
+            try:
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    # trusted env carries no PATH key at all
+                    resolve_herdr_binary({})
+                self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+            finally:
+                os.environ["PATH"] = prev_path
+
+
+class TrustedPathSafetyTest(unittest.TestCase):
+    """Review j#74773: an unsafe (empty/relative) PATH component fails closed as a
+    WHOLE — never silently skipped so a later absolute candidate resolves."""
+
+    def test_relative_path_component_dot_fails_closed(self) -> None:
+        # A trusted PATH of `.` is cwd-dependent -> structured failure, not a search.
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_executable(Path(tmp) / HERDR_PATH_NAME)
+            prev_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    resolve_herdr_binary({"PATH": "."})
+                self.assertEqual(ctx.exception.reason, REASON_BINARY_UNSAFE_PATH)
+            finally:
+                os.chdir(prev_cwd)
+
+    def test_empty_path_components_fail_closed(self) -> None:
+        # Leading / middle / trailing empty components (`:`) each mean "cwd" to a
+        # POSIX shell; ANY of them rejects the whole trusted PATH.
+        with tempfile.TemporaryDirectory() as safe:
+            for path_val in (f":{safe}", f"{safe}:", f"{safe}::{safe}"):
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    resolve_herdr_binary({"PATH": path_val})
+                self.assertEqual(
+                    ctx.exception.reason, REASON_BINARY_UNSAFE_PATH, path_val
+                )
+
+    def test_unsafe_component_beside_safe_candidate_still_fails_closed(self) -> None:
+        # The core of j#74773: even when a SAFE absolute component holds a real
+        # herdr, an unsafe sibling component fails the whole resolution closed —
+        # the resolver never silently drops the unsafe one and uses the safe one.
+        with tempfile.TemporaryDirectory() as safe:
+            _make_executable(Path(safe) / HERDR_PATH_NAME)
+            for path_val in (f".:{safe}", f"{safe}:", f"{safe}::{safe}", f".{os.pathsep}{safe}"):
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    resolve_herdr_binary({"PATH": path_val})
+                self.assertEqual(
+                    ctx.exception.reason, REASON_BINARY_UNSAFE_PATH, path_val
+                )
+
+    def test_relative_pathshaped_explicit_env_fails_closed(self) -> None:
+        # A path-shaped but RELATIVE explicit MOZYO_HERDR_BINARY (e.g. `./herdr`) is
+        # cwd-dependent, so it fails closed as unsafe rather than resolving.
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_executable(Path(tmp) / HERDR_PATH_NAME)
+            prev_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                for rel in (f".{os.sep}{HERDR_PATH_NAME}", f"sub{os.sep}herdr"):
+                    with self.assertRaises(TerminalTransportError) as ctx:
+                        resolve_herdr_binary({HERDR_BINARY_ENV: rel})
+                    self.assertEqual(
+                        ctx.exception.reason, REASON_BINARY_UNSAFE_PATH, rel
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+    def test_empty_path_string_is_unconfigured_not_unsafe(self) -> None:
+        # A present-but-empty PATH string (and a missing PATH key) is "no search
+        # dir", NOT an unsafe component -> unconfigured, so env={} is unchanged.
+        for env in ({"PATH": ""}, {}):
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary(env)
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+
+
+class TrustedPathAmbiguityTest(unittest.TestCase):
+    """Review F2 (#13502 j#74764): >1 distinct trusted-PATH herdr fails closed."""
+
+    def test_two_distinct_herdr_on_trusted_path_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            _make_executable(Path(a) / HERDR_PATH_NAME)
+            _make_executable(Path(b) / HERDR_PATH_NAME)
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary({"PATH": a + os.pathsep + b})
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_AMBIGUOUS)
+
+    def test_ambiguity_also_detected_for_bare_name_env(self) -> None:
+        # A bare-name explicit MOZYO_HERDR_BINARY resolved on a PATH with two
+        # distinct herdr is equally ambiguous (same enumeration path).
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            _make_executable(Path(a) / HERDR_PATH_NAME)
+            _make_executable(Path(b) / HERDR_PATH_NAME)
+            with self.assertRaises(TerminalTransportError) as ctx:
+                resolve_herdr_binary(
+                    {HERDR_BINARY_ENV: HERDR_PATH_NAME, "PATH": a + os.pathsep + b}
+                )
+            self.assertEqual(ctx.exception.reason, REASON_BINARY_AMBIGUOUS)
+
+    def test_same_realpath_via_symlink_is_not_ambiguous(self) -> None:
+        # Two PATH entries whose `herdr` resolve to the SAME realpath (a symlink to
+        # the real file) are one binary, not an ambiguity — it resolves.
+        with tempfile.TemporaryDirectory() as real_dir, tempfile.TemporaryDirectory() as link_dir:
+            real = Path(real_dir) / HERDR_PATH_NAME
+            _make_executable(real)
+            os.symlink(real, Path(link_dir) / HERDR_PATH_NAME)
+            resolution = resolve_herdr_binary(
+                {"PATH": real_dir + os.pathsep + link_dir}
+            )
+            self.assertEqual(resolution.source, BINARY_SOURCE_PATH)
+            self.assertEqual(resolution.realpath, os.path.realpath(str(real)))
+
+    def test_duplicate_path_entry_is_not_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_executable(Path(tmp) / HERDR_PATH_NAME)
+            resolution = resolve_herdr_binary({"PATH": tmp + os.pathsep + tmp})
+            self.assertEqual(resolution.source, BINARY_SOURCE_PATH)
+
+
+class HerdrBinaryResolutionRecordTest(unittest.TestCase):
+    """The structured resolution record fails closed on a malformed construction."""
+
+    def test_rejects_unknown_source(self) -> None:
+        with self.assertRaises(TerminalTransportError):
+            HerdrBinaryResolution(path="/x/herdr", realpath="/x/herdr", source="cwd")
+
+    def test_rejects_none_source(self) -> None:
+        # `none` is the fail-closed provenance; a *resolved* record may never carry it.
+        with self.assertRaises(TerminalTransportError):
+            HerdrBinaryResolution(path="/x/herdr", realpath="/x/herdr", source="none")
+
+    def test_rejects_empty_path(self) -> None:
+        with self.assertRaises(TerminalTransportError):
+            HerdrBinaryResolution(path="", realpath="/x/herdr", source=BINARY_SOURCE_ENV)
+
+    def test_accepts_valid_record(self) -> None:
+        rec = HerdrBinaryResolution(
+            path="/x/herdr", realpath="/real/herdr", source=BINARY_SOURCE_PATH
+        )
+        self.assertEqual(rec.source, BINARY_SOURCE_PATH)
 
 
 if __name__ == "__main__":
