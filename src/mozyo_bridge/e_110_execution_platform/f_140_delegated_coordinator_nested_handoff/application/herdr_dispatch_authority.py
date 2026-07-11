@@ -40,7 +40,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (
     DispatchAuthorization,
-    SUPERSEDING_GATES,
     parse_dispatch_authorizations,
 )
 
@@ -94,37 +93,48 @@ def _select_authorization(
     return selected
 
 
-def _is_superseded(entries, *, issue: str, authorization_journal: str) -> bool:
-    """True when a later durable gate on the issue supersedes the authorization (pure over reads).
+def _is_superseded(
+    entries, *, workspace_id: str, lane_id: str, issue: str, authorization_journal: str
+) -> bool:
+    """True when the authorization is not the latest durable intent for this lane (fail-safe).
 
-    Reads the same live entries' structured gate markers (never prose) and treats the
-    authorization as superseded when a journal *after* it carries a superseding gate
-    (:data:`SUPERSEDING_GATES`), a close (``issue_open`` false), or a recorded blocker.
+    The design requires monitor when the latest durable state has advanced to
+    implementation_done / review / close / blocked. Redmine gate journals are Markdown prose
+    that carry **no** machine marker (mid-review j#75047 F3), so scanning only for structured
+    gate markers would let a real Implementation Done / Review Request silently fail to
+    supersede a standing authorization.
+
+    So the rule is fail-safe over the *latest durable state*: any journal recorded **after** the
+    selected authorization supersedes it — UNLESS that later journal is itself a valid
+    dispatch-authorization for this same lane + issue (a re-authorization, which
+    :func:`_select_authorization` already picks as the newest). An unclassifiable prose gate
+    journal (Implementation Done, Review Request, close, blocked, or any later note) therefore
+    drives monitor rather than being safely ignored. Pure over the read entries.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-        extract_markers,
-    )
-
     try:
         auth_j = int((authorization_journal or "").strip())
     except (TypeError, ValueError):
         return False
-    for marker in extract_markers(entries):
-        if str(getattr(marker, "issue", "")).strip() != (issue or "").strip():
+    issue = (issue or "").strip()
+    for entry in entries:
+        if str(getattr(entry, "issue_id", "")).strip() != issue:
             continue
         try:
-            marker_j = int(str(getattr(marker, "journal", "")).strip())
+            entry_j = int(str(getattr(entry, "journal_id", "")).strip())
         except (TypeError, ValueError):
             continue
-        if marker_j <= auth_j:
+        if entry_j <= auth_j:
             continue
-        gate = str(getattr(marker, "gate", "")).strip()
-        if (
-            gate in SUPERSEDING_GATES
-            or not bool(getattr(marker, "issue_open", True))
-            or bool(getattr(marker, "blocker_recorded", False))
-        ):
-            return True
+        # A later journal exists. It only fails to supersede when it is itself a valid
+        # re-authorization for this exact lane + issue (a fresh authority, not a state advance).
+        reauths = [
+            a
+            for a in parse_dispatch_authorizations([entry])
+            if a.valid and a.matches_lane(workspace_id=workspace_id, lane_id=lane_id, issue=issue)
+        ]
+        if reauths:
+            continue
+        return True
     return False
 
 
@@ -219,7 +229,13 @@ def resolve_dispatch_decision(
             authorization=authorization, superseded=False, target_runtime=TARGET_ABSENT
         )
 
-    superseded = _is_superseded(entries, issue=issue, authorization_journal=authorization.journal)
+    superseded = _is_superseded(
+        entries,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        issue=issue,
+        authorization_journal=authorization.journal,
+    )
     if superseded:
         return decide_dispatch_authority(
             authorization=authorization, superseded=True, target_runtime=TARGET_ABSENT

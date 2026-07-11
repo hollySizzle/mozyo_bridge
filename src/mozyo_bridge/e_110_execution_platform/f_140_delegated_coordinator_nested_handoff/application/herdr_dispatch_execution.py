@@ -35,23 +35,40 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 # Execution result tokens (machine-readable; literal regardless of UI language).
-DISPATCH_DELIVERED = "dispatch_delivered"  # reserved + sent + positive ACK
+DISPATCH_DELIVERED = "dispatch_delivered"  # reserved + sent + positive turn-start
 DISPATCH_UNCERTAIN = "dispatch_uncertain"  # reserved + sent, but the outcome is unknown
 DISPATCH_SKIPPED = "dispatch_skipped"  # never-send: the key was already fenced
 DISPATCH_FENCE_UNAVAILABLE = "dispatch_fence_unavailable"  # corrupt/unreadable fence -> no send
 
+# Structured turn-start observation tokens (mid-review j#75047 F2): ``delivered`` is confirmed
+# ONLY by a positive turn-start ``started``, never by a bare delivery ACK. The ACK/delivery/
+# completion layers are distinct (``ack-completion-receiver-state.md``): a submit-completion ACK
+# proves the message landed in the composer, not that the receiver's turn actually started.
+TURN_START_STARTED = "started"  # the receiver's turn positively started -> delivered
+TURN_START_ACK_ONLY = "ack_only"  # a delivery ACK only, no turn-start confirmation -> uncertain
+TURN_START_NOT_STARTED = "not_started"  # observed, but the turn did not start -> uncertain
+TURN_START_TIMEOUT = "timeout"  # the turn-start observation timed out -> uncertain
+TURN_START_UNKNOWN = "unknown"  # the turn-start could not be observed -> uncertain
+
 
 @dataclass(frozen=True)
 class SendOutcome:
-    """The result of the single send attempt: ``ack_ok`` is a positive turn-start delivery.
+    """The result of the single send attempt: a **structured turn-start** observation.
 
-    ``ack_ok`` True is the **only** thing that confirms :data:`FENCE_DELIVERED` — anything else
-    (a non-zero ACK, a timeout the seam reports as ``ack_ok=False``, or a raised exception the
-    orchestrator catches) leaves the fence :data:`FENCE_UNCERTAIN`.
+    ``turn_start`` is one of the :data:`TURN_START_*` tokens. Only :data:`TURN_START_STARTED`
+    confirms :data:`FENCE_DELIVERED` (mid-review j#75047 F2); every other token — an ACK-only
+    submit-completion, a not-started / timeout / unknown observation, or a raised exception the
+    orchestrator catches — leaves the fence :data:`FENCE_UNCERTAIN` for operator reconcile. No
+    raw LLM wait is introduced; the seam returns whatever structured turn-start the transport
+    surfaced.
     """
 
-    ack_ok: bool
+    turn_start: str
     detail: str = ""
+
+    @property
+    def started(self) -> bool:
+        return self.turn_start == TURN_START_STARTED
 
 
 @dataclass(frozen=True)
@@ -133,21 +150,28 @@ def execute_dispatch(
             sent=True,
         )
 
-    if outcome.ack_ok:
-        fence.mark_delivered(key, detail=outcome.detail or "delivered", now=now)
+    if outcome.started:
+        fence.mark_delivered(key, detail=outcome.detail or "turn-start confirmed", now=now)
         return DispatchExecutionResult(
             result=DISPATCH_DELIVERED,
             fence_state="delivered",
-            detail=outcome.detail or "reserved, sent, delivery confirmed",
+            detail=outcome.detail or "reserved, sent, turn-start confirmed",
             sent=True,
         )
+    # Any non-``started`` turn-start (ack-only / not-started / timeout / unknown) -> uncertain:
+    # the send may have landed but the receiver's turn is not confirmed to have started.
     fence.mark_uncertain(
-        key, detail=outcome.detail or "send returned no positive ACK", now=now
+        key,
+        detail=outcome.detail or f"turn-start {outcome.turn_start}; not confirmed started",
+        now=now,
     )
     return DispatchExecutionResult(
         result=DISPATCH_UNCERTAIN,
         fence_state="uncertain",
-        detail=outcome.detail or "send returned no positive ACK; outcome uncertain -> reconcile",
+        detail=(
+            outcome.detail
+            or f"turn-start {outcome.turn_start} (not started); outcome uncertain -> reconcile"
+        ),
         sent=True,
     )
 
@@ -157,6 +181,11 @@ __all__ = (
     "DISPATCH_UNCERTAIN",
     "DISPATCH_SKIPPED",
     "DISPATCH_FENCE_UNAVAILABLE",
+    "TURN_START_STARTED",
+    "TURN_START_ACK_ONLY",
+    "TURN_START_NOT_STARTED",
+    "TURN_START_TIMEOUT",
+    "TURN_START_UNKNOWN",
     "SendOutcome",
     "DispatchExecutionResult",
     "fence_key_for",

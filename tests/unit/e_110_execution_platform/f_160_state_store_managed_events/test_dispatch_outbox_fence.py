@@ -49,6 +49,7 @@ class ReserveTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self.fence = DispatchOutboxFence(home=self.home)
+        self.fence.bootstrap()  # explicit init; reserve never auto-creates (F1)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -99,13 +100,39 @@ class ReserveTest(unittest.TestCase):
         self.fence.mark_delivered(_key())
         self.assertEqual(self.fence.state_of(_key()), FENCE_DELIVERED)
 
+    def test_reserve_on_unbootstrapped_store_fails_closed(self):
+        # A store that was never bootstrapped must not be auto-created by reserve (F1).
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(DispatchOutboxFenceError):
+                DispatchOutboxFence(home=Path(d)).reserve(_key())
+
+    def test_store_loss_after_delivered_fails_closed(self):
+        # reserve -> delivered -> DELETE the DB -> a same-key reserve must NOT win (no re-send).
+        self.fence.reserve(_key())
+        self.fence.mark_delivered(_key())
+        dispatch_outbox_fence_path(self.home).unlink()
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).reserve(_key())
+
+    def test_empty_replacement_fails_closed(self):
+        # A 0-byte / empty (user_version=0) swap-in is not a bootstrapped fence -> fail closed.
+        self.fence.reserve(_key())
+        self.fence.mark_delivered(_key())
+        path = dispatch_outbox_fence_path(self.home)
+        path.unlink()
+        path.write_bytes(b"")  # empty replacement
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).reserve(_key())
+
     def test_concurrent_reserves_single_winner(self):
         results = []
         barrier = threading.Barrier(8)
 
         def worker():
             barrier.wait()
-            # Each thread its own store handle over the same DB path.
+            # Each thread its own store handle over the same (bootstrapped) DB path.
             fence = DispatchOutboxFence(home=self.home)
             results.append(fence.reserve(_key()).won)
 
@@ -144,12 +171,12 @@ class CorruptStoreTest(unittest.TestCase):
         with self.assertRaises(DispatchOutboxFenceError):
             DispatchOutboxFence(home=self.home).reserve(_key())
 
-    def test_replacement_with_delivered_key_never_sends(self):
-        # A store "replaced" with one that already has the key delivered -> never-send.
+    def test_same_db_with_delivered_key_never_sends(self):
+        # A fresh caller against the SAME bootstrapped DB that already delivered -> never-send.
         fence = DispatchOutboxFence(home=self.home)
+        fence.bootstrap()
         fence.reserve(_key())
         fence.mark_delivered(_key())
-        # Simulate a fresh caller against the same (replaced) DB.
         r = DispatchOutboxFence(home=self.home).reserve(_key())
         self.assertFalse(r.won)
         self.assertEqual(r.prior_state, FENCE_DELIVERED)

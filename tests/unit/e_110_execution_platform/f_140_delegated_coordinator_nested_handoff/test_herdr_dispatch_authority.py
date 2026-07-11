@@ -120,6 +120,27 @@ class ResolveTest(unittest.TestCase):
         d = _decide(entries, _rows((TARGET, "idle")))
         self.assertEqual(d.decision, AUTHORIZE)
 
+    def test_prose_gate_journal_supersedes(self):
+        # A REAL Redmine gate journal is Markdown prose with NO machine marker (j#75047 F3).
+        # It must still supersede a standing authorization -> monitor, not authorize.
+        prose = _Entry(ISSUE, "75023", "## Gate: implementation_done\n\n- commit: cded370\nprose")
+        d = _decide([_auth_note("75010"), prose], _rows((TARGET, "idle")))
+        self.assertEqual(d.decision, MONITOR)
+        self.assertEqual(d.reason, REASON_AUTHORIZATION_SUPERSEDED)
+
+    def test_any_later_unclassifiable_journal_supersedes(self):
+        # Any later note that is not a same-lane re-authorization drives monitor (fail-safe).
+        later = _Entry(ISSUE, "75030", "just a follow-up comment, no marker")
+        d = _decide([_auth_note("75010"), later], _rows((TARGET, "idle")))
+        self.assertEqual(d.decision, MONITOR)
+
+    def test_later_reauthorization_does_not_supersede(self):
+        # A later re-authorization for the SAME lane is the fresh authority, not a supersede.
+        entries = [_auth_note("75010", action_id="a1"), _auth_note("75020", action_id="a2")]
+        d = _decide(entries, _rows((TARGET, "idle")))
+        self.assertEqual(d.decision, AUTHORIZE)
+        self.assertEqual(d.authorization.action_id, "a2")
+
     def test_target_drift_is_blocked_absent(self):
         # The live worker renamed / different -> the exact target is absent.
         d = _decide([_auth_note("75010")], _rows(("mzb1_ws1_claude_other", "idle")))

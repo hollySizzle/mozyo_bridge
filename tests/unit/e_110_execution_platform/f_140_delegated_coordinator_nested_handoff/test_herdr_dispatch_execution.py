@@ -25,6 +25,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_FENCE_UNAVAILABLE,
     DISPATCH_SKIPPED,
     DISPATCH_UNCERTAIN,
+    TURN_START_ACK_ONLY,
+    TURN_START_STARTED,
     SendOutcome,
     execute_dispatch,
     fence_key_for,
@@ -53,16 +55,16 @@ def _auth(**over) -> DispatchAuthorization:
 
 
 class _Counter:
-    def __init__(self, ack_ok=True, raises=None):
+    def __init__(self, turn_start=TURN_START_STARTED, raises=None):
         self.calls = 0
-        self.ack_ok = ack_ok
+        self.turn_start = turn_start
         self.raises = raises
 
     def __call__(self):
         self.calls += 1
         if self.raises is not None:
             raise self.raises
-        return SendOutcome(ack_ok=self.ack_ok, detail="fake send")
+        return SendOutcome(turn_start=self.turn_start, detail="fake send")
 
 
 class ExecuteDispatchTest(unittest.TestCase):
@@ -70,6 +72,7 @@ class ExecuteDispatchTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self.fence = DispatchOutboxFence(home=self.home)
+        self.fence.bootstrap()  # explicit init; reserve never auto-creates (F1)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -109,11 +112,25 @@ class ExecuteDispatchTest(unittest.TestCase):
         self.assertEqual(r.result, DISPATCH_SKIPPED)
         self.assertEqual(send.calls, 0)  # never-send on a reserved crash-window key
 
-    def test_non_positive_ack_is_uncertain(self):
-        send = _Counter(ack_ok=False)
+    def test_ack_only_without_turn_start_is_uncertain(self):
+        # A delivery ACK that is NOT a turn-start confirmation must be uncertain, not delivered.
+        send = _Counter(turn_start=TURN_START_ACK_ONLY)
         r = execute_dispatch(authorization=_auth(), fence=self.fence, send=send)
         self.assertEqual(r.result, DISPATCH_UNCERTAIN)
         self.assertEqual(send.calls, 1)
+        self.assertEqual(self.fence.state_of(fence_key_for(_auth())), FENCE_UNCERTAIN)
+
+    def test_store_loss_after_delivered_no_resend(self):
+        # reserve+deliver, then the fence DB is lost -> a repeat is fence-unavailable, zero send.
+        send = _Counter()
+        execute_dispatch(authorization=_auth(), fence=self.fence, send=send)
+        dispatch_outbox_fence_path(self.home).unlink()
+        send2 = _Counter()
+        r = execute_dispatch(
+            authorization=_auth(), fence=DispatchOutboxFence(home=self.home), send=send2
+        )
+        self.assertEqual(r.result, DISPATCH_FENCE_UNAVAILABLE)
+        self.assertEqual(send2.calls, 0)
 
     def test_new_action_id_after_reconcile_sends_once(self):
         send = _Counter()

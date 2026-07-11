@@ -28,6 +28,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (
     DISPATCH_DELIVERED,
     DISPATCH_SKIPPED,
+    TURN_START_STARTED,
     SendOutcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authority import (
@@ -85,7 +86,7 @@ class _Counter:
     def factory(self, args, authorization, journal, repo_root, env):
         def _send():
             self.calls += 1
-            return SendOutcome(ack_ok=True, detail="fake send")
+            return SendOutcome(turn_start=TURN_START_STARTED, detail="fake send")
 
         return _send
 
@@ -95,6 +96,7 @@ class DispatchLegTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self.fence = DispatchOutboxFence(home=self.home)
+        self.fence.bootstrap()  # explicit init; reserve never auto-creates (F1)
         self._orig = {
             "sender": herdr_target_resolution.resolve_sender_identity,
             "anchor_ws": herdr_workflow_step._anchor_workspace_id,

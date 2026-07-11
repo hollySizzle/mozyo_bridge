@@ -26,6 +26,8 @@ from typing import Callable, Mapping, Optional
 from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (
     DISPATCH_SKIPPED,
+    TURN_START_ACK_ONLY,
+    TURN_START_NOT_STARTED,
     DispatchExecutionResult,
     SendOutcome,
     execute_dispatch,
@@ -98,7 +100,7 @@ def _default_send_factory(
         worker_pane = _resolve_target_locator(authorization.target_assigned_name, env)
         if not worker_pane:
             return SendOutcome(
-                ack_ok=False,
+                turn_start=TURN_START_NOT_STARTED,
                 detail="the authorized target locator vanished between decision and send",
             )
         ops = HerdrWorkerDispatchOps(
@@ -116,7 +118,15 @@ def _default_send_factory(
             target_repo="auto",
             allow_direct_worker=True,
         )
-        return SendOutcome(ack_ok=(int(rc or 0) == 0), detail=f"worker dispatch rc={rc}")
+        # `dispatch_to_worker`'s exit code is a delivery-**ACK** measurement (submit-completion),
+        # which is NOT a turn-start confirmation (mid-review j#75047 F2). So even rc==0 is only
+        # ACK-only -> uncertain; a non-zero rc is not_started. A positive turn-start would require
+        # threading the structured delivery outcome's turn-start observation through this seam —
+        # that live positive-delivered wiring lands with the coordinator's separate live-enable
+        # dispatch action_id (product auto-dispatch is disabled until then, j#75006).
+        if int(rc or 0) == 0:
+            return SendOutcome(turn_start=TURN_START_ACK_ONLY, detail=f"worker dispatch ACK rc={rc}")
+        return SendOutcome(turn_start=TURN_START_NOT_STARTED, detail=f"worker dispatch rc={rc}")
 
     return _send
 

@@ -141,18 +141,20 @@ class DispatchOutboxFence:
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else dispatch_outbox_fence_path(home)
 
-    # -- connection --------------------------------------------------------
+    # -- bootstrap ---------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a manual-transaction connection, creating / validating the container.
+    def bootstrap(self) -> None:
+        """Create + stamp the fence store (the explicit, deliberate initialization).
 
-        ``PRAGMA user_version`` is the migration guard (mirrors the sibling stores). Version
-        ``0`` is a fresh file — create the table and stamp the version. An existing file with an
-        unrecognized version, or a corrupt file, fails closed via
-        :class:`DispatchOutboxFenceError` rather than being rewritten.
+        This is the **only** path that creates the store. A dispatch reserve never
+        auto-creates a missing store (mid-review j#75047 F1): auto-creation on a missing file
+        would silently resurrect a **deleted / replaced** store and let an already-``delivered``
+        action re-send. Bootstrapping stamps ``PRAGMA user_version`` — the durable marker that a
+        later :meth:`reserve` uses to tell an intentionally-initialized store apart from a lost
+        (missing / empty-replacement / foreign) one. Idempotent: an already-bootstrapped store at
+        the expected version is a no-op; a corrupt / unrecognized-version file fails closed.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # ``isolation_level=None`` -> autocommit; we drive BEGIN IMMEDIATE / COMMIT ourselves.
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 2000")
@@ -164,8 +166,64 @@ class DispatchOutboxFence:
                 raise DispatchOutboxFenceError(
                     f"dispatch outbox fence {self.path} has unsupported schema version "
                     f"{version}; this build understands "
-                    f"{DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION}. The DB is left untouched "
-                    f"(downgrade-safe)."
+                    f"{DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION}. The DB is left untouched."
+                )
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            raise DispatchOutboxFenceError(
+                f"dispatch outbox fence {self.path} is unreadable ({type(exc).__name__}); "
+                f"cannot bootstrap"
+            ) from exc
+        except DispatchOutboxFenceError:
+            conn.close()
+            raise
+        else:
+            conn.close()
+
+    def is_bootstrapped(self) -> bool:
+        """True when the store exists and carries the expected schema version (fail-soft)."""
+        if not self.path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        except sqlite3.DatabaseError:
+            return False
+        try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        except (sqlite3.DatabaseError, TypeError, ValueError):
+            return False
+        finally:
+            conn.close()
+        return version == DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION
+
+    # -- connection --------------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open an **existing, bootstrapped** manual-transaction connection, or fail closed.
+
+        Unlike the sibling stores, a reserve never creates the container (mid-review j#75047
+        F1). A **missing** file (never bootstrapped / deleted / lost), an **empty** file (a
+        ``user_version=0`` swap-in), a **foreign** / unrecognized-version file, and a **corrupt**
+        file all fail closed via :class:`DispatchOutboxFenceError` — the caller must not send,
+        because the idempotency authority is not the one this run bootstrapped, so a send could
+        duplicate an already-delivered action. Recovery is operator-gated: re-:meth:`bootstrap`
+        + a **new** ``action_id``.
+        """
+        if not self.path.exists():
+            raise DispatchOutboxFenceError(
+                f"dispatch outbox fence {self.path} does not exist (never bootstrapped / lost); "
+                f"fail closed rather than auto-create and risk a duplicate send"
+            )
+        # ``isolation_level=None`` -> autocommit; we drive BEGIN IMMEDIATE / COMMIT ourselves.
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 2000")
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version != DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION:
+                raise DispatchOutboxFenceError(
+                    f"dispatch outbox fence {self.path} is not a bootstrapped fence at version "
+                    f"{DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION} (found {version}: empty / replaced / "
+                    f"foreign store); fail closed rather than risk a duplicate send"
                 )
         except sqlite3.DatabaseError as exc:
             conn.close()
@@ -310,7 +368,13 @@ class DispatchOutboxFence:
     # -- reads -------------------------------------------------------------
 
     def state_of(self, key: FenceKey) -> str:
-        """The current fence state for the key, or :data:`FENCE_ABSENT` (fail-closed on corrupt)."""
+        """The current fence state for the key, or :data:`FENCE_ABSENT` (fail-soft diagnostic).
+
+        A read-only diagnostic (not a send gate): an un-bootstrapped / missing store simply has
+        no state for the key (:data:`FENCE_ABSENT`) rather than raising.
+        """
+        if not self.is_bootstrapped():
+            return FENCE_ABSENT
         conn = self._connect()
         try:
             row = conn.execute(
