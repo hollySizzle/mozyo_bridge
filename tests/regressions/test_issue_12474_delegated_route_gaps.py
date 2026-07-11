@@ -37,7 +37,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_SEND_TO_GRANDCHILD_GATEWAY,
     plan_delegated_coordinator_route,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import GATE_BLOCKED, GATE_REALIZED  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (  # noqa: E402
+    GATE_BLOCKED,
+    GATE_REALIZED,
+    GrandchildTargetIdentity,
+)
 
 from support.delegation_route_fakes import (  # noqa: E402
     DELEGATED_COORDINATOR_UNIT,
@@ -105,6 +109,84 @@ class StaleSiblingBindingRegressionTest(unittest.TestCase):
         )
         self.assertEqual(PLAN_PROCEED, plan.verdict)
         self.assertEqual(GRANDCHILD_UNIT, plan.realization_gate.realized_grandchild_unit)
+
+
+class DispatchSelectedAuthorityRegressionTest(unittest.TestCase):
+    """#13571 j#75462 F1: an explicit target cannot override the adopt selection.
+
+    For an adopt dispatch the selected candidate is authoritative; an explicit
+    ``grandchild_target`` that names a DIFFERENT lane must fail closed rather than
+    open the gate on an unrelated sibling's display evidence.
+    """
+
+    def test_explicit_target_disagreeing_with_selection_blocks(self) -> None:
+        # Dispatch selects the real grandchild (lane-grandchild); an explicit
+        # target names a different lane (lane-other) present in the inventory.
+        other = GrandchildTargetIdentity(
+            unit_id="ws-child-project/lane-other",
+            delegation_parent=DELEGATED_COORDINATOR_UNIT,
+            repo_identity=CHILD_REPO_IDENTITY,
+        )
+        plan = plan_delegated_coordinator_route(
+            base_request(
+                grandchild_target=other,
+                realized_units=[
+                    (
+                        "ws-child-project/lane-other",
+                        "implementation",
+                        2,
+                        DELEGATED_COORDINATOR_UNIT,
+                        "derived",
+                        CHILD_REPO_IDENTITY,
+                    )
+                ],
+            )
+        )
+        self.assertEqual(PLAN_BLOCKED, plan.verdict)
+        self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict)
+
+    def test_explicit_target_agreeing_with_selection_proceeds(self) -> None:
+        # An explicit target that names the SAME lane the dispatch selected is
+        # fine (it is the dispatch-selected identity).
+        same = GrandchildTargetIdentity(
+            unit_id=GRANDCHILD_UNIT,
+            delegation_parent=DELEGATED_COORDINATOR_UNIT,
+            repo_identity=CHILD_REPO_IDENTITY,
+        )
+        plan = plan_delegated_coordinator_route(
+            base_request(grandchild_target=same, realized_units=realized_grandchild_rows())
+        )
+        self.assertEqual(PLAN_PROCEED, plan.verdict)
+        self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
+
+    def test_launch_without_target_is_unbound_blocked(self) -> None:
+        # A launch dispatch (no selectable candidate) with no explicit target
+        # cannot bind an exact grandchild -> blocked, never same-lane acceptance.
+        plan = plan_delegated_coordinator_route(
+            base_request(candidates=[], realized_units=realized_grandchild_rows())
+        )
+        self.assertTrue(plan.dispatch_decision.is_launch)
+        self.assertEqual(PLAN_BLOCKED, plan.verdict)
+        self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict)
+
+    def test_launch_with_authoritative_target_proceeds(self) -> None:
+        # A launch dispatch WITH the runtime-supplied post-launch identity binds
+        # to that exact lane and proceeds.
+        created = GrandchildTargetIdentity(
+            unit_id=GRANDCHILD_UNIT,
+            delegation_parent=DELEGATED_COORDINATOR_UNIT,
+            repo_identity=CHILD_REPO_IDENTITY,
+        )
+        plan = plan_delegated_coordinator_route(
+            base_request(
+                candidates=[],
+                grandchild_target=created,
+                realized_units=realized_grandchild_rows(),
+            )
+        )
+        self.assertTrue(plan.dispatch_decision.is_launch)
+        self.assertEqual(PLAN_PROCEED, plan.verdict)
+        self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
 
 
 class SameLaneFallbackRegressionTest(unittest.TestCase):

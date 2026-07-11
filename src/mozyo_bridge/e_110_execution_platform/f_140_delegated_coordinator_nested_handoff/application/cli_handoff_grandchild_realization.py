@@ -235,8 +235,10 @@ def _register_grandchild_gate(handoff_sub) -> None:
         metavar="repo_identity",
         help=(
             "Canonical child repo identity (the `--target-repo` gate value) of the "
-            "dispatch-selected grandchild. When set, the matched inventory row's "
-            "repo must equal it, else the binding fails closed (repo mismatch)."
+            "dispatch-selected grandchild. REQUIRED together with "
+            "`--grandchild-unit`: repo is part of the exact identity, so the "
+            "matched inventory row's repo must equal it. Omitting it leaves the "
+            "target unbound and the gate fails closed (Redmine #13571)."
         ),
     )
     parser.add_argument(

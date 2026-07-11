@@ -254,47 +254,96 @@ def cmd_handoff_grandchild_stamp(args: argparse.Namespace) -> int:
 
 
 def _discover_delegation_units(args: argparse.Namespace):
-    """Discover live lanes and derive their delegation breadcrumb per unit.
+    """Discover live lanes and re-resolve each delegation-tree unit's identity.
 
-    Returns a list of ``(unit_id, lane_kind, delegation_depth,
-    delegation_parent, status, repo_identity)`` rows folded per
-    ``<workspace_id>/<lane_id>`` unit, ready for
-    :func:`resolve_realized_grandchild_binding`. The trailing ``repo_identity`` is
-    the canonical repo the lane resolved (from the discovery candidate), so the
-    binding can re-verify the dispatch-selected target's ``--target-repo``
-    identity (Redmine #13571 / #12454 j#75444 F1). Reads ``agents targets``
-    discovery; the delegation derivation is the same read-only #12466 projection
-    ``agents targets`` itself uses.
+    Returns a list of
+    :class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp.InventoryUnit`,
+    one per ``<workspace_id>/<lane_id>`` unit, ready for
+    :func:`resolve_realized_grandchild_binding`. Beyond the display breadcrumb and
+    the per-lane canonical repo, each unit carries the two live-resolution facts
+    the display columns cannot express (Redmine #13571 / #12454 j#75444 F2):
+
+    - ``has_codex_gateway``: a live ``codex`` gateway pane exists for the unit, so
+      the lane is route-bound (a Claude-only remnant is not).
+    - ``ambiguous``: the folded unit carried conflicting candidate panes
+      (disagreeing repo / KIND / depth / parent) or a weakly-identified candidate,
+      so the raw ambiguity is preserved instead of being silently collapsed by the
+      per-unit fold.
+
+    Reads ``agents targets`` discovery; the delegation derivation is the same
+    read-only #12466 projection ``agents targets`` itself uses.
     """
     from mozyo_bridge.application.commands import _agents_target_candidates
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import AGENT_KIND_CODEX
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import InventoryUnit
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import require_tmux
+
+    def _norm_repo(path):
+        if not path:
+            return None
+        norm = str(path).strip().rstrip("/")
+        return norm or None
 
     require_tmux()
     candidates = _agents_target_candidates(args)
     displays = derive_targets_delegation(candidates)
-    units: dict[str, tuple[str, object, str, str, Optional[str]]] = {}
+
+    # Group candidate panes by their folded unit id, keeping every pane's facts so
+    # conflicting panes surface as ambiguity rather than a silent first-writer win.
+    grouped: dict[str, list] = {}
     for cand in candidates:
-        unit_id = f"{getattr(cand, 'workspace_id', '') or ''}/{getattr(cand, 'lane_id', '') or ''}"
         display = displays.get(cand.pane_id)
         if display is None:
             continue
-        repo_identity = getattr(cand, "repo_root", None)
-        # Prefer a derived row over a none/diagnostic one when a unit's panes
-        # disagree, so a realized grandchild is not masked by a blank sibling pane.
-        existing = units.get(unit_id)
-        if existing is None or (existing[3] != "derived" and display.status == "derived"):
-            units[unit_id] = (
-                display.lane_kind,
-                display.delegation_depth,
-                display.delegation_parent,
-                display.status,
-                repo_identity,
+        unit_id = f"{getattr(cand, 'workspace_id', '') or ''}/{getattr(cand, 'lane_id', '') or ''}"
+        grouped.setdefault(unit_id, []).append((cand, display))
+
+    result: list[InventoryUnit] = []
+    for unit_id, members in grouped.items():
+        has_codex = any(
+            getattr(cand, "agent_kind", None) == AGENT_KIND_CODEX for cand, _ in members
+        )
+        weak_candidate = any(getattr(cand, "ambiguous", False) for cand, _ in members)
+        repos = {
+            _norm_repo(getattr(cand, "repo_root", None))
+            for cand, _ in members
+            if _norm_repo(getattr(cand, "repo_root", None)) is not None
+        }
+        derived = [d for _, d in members if d.status == "derived"]
+        # Authoritative facts come from the derived breadcrumb(s); if the derived
+        # panes disagree on KIND/depth/parent, the unit is ambiguous.
+        derived_facts = {
+            (d.lane_kind, d.delegation_depth, d.delegation_parent) for d in derived
+        }
+        if derived:
+            lane_kind, depth, parent = next(
+                (d.lane_kind, d.delegation_depth, d.delegation_parent) for d in derived
             )
-    return [
-        (unit_id, kind, depth, parent, status, repo)
-        for unit_id, (kind, depth, parent, status, repo) in units.items()
-    ]
+            status = "derived"
+        else:
+            first = members[0][1]
+            lane_kind, depth, parent, status = (
+                first.lane_kind,
+                first.delegation_depth,
+                first.delegation_parent,
+                first.status,
+            )
+        ambiguous = weak_candidate or len(repos) > 1 or len(derived_facts) > 1
+        repo_identity = next(iter(repos)) if len(repos) == 1 else None
+        result.append(
+            InventoryUnit(
+                unit_id=unit_id,
+                lane_kind=lane_kind,
+                delegation_depth=depth,
+                delegation_parent=parent,
+                status=status,
+                repo_identity=repo_identity,
+                has_codex_gateway=has_codex,
+                ambiguous=ambiguous,
+            )
+        )
+    return result
 
 
 def _render_gate_record(

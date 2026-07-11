@@ -61,7 +61,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     evaluate_grandchild_realization_gate,
     resolve_realized_grandchild_binding,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import DelegationCandidate
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
+    DelegationCandidate,
+    repo_identity_matches,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_read_boundary import ReadBoundaryVerdict
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     ROLE_DELEGATED_COORDINATOR,
@@ -273,31 +276,57 @@ def _resolve_role_profile_chain(request: RoutePlanRequest) -> tuple[RoleProfileR
     return tuple(resolutions)
 
 
+def _identities_agree(
+    a: GrandchildTargetIdentity, b: GrandchildTargetIdentity
+) -> bool:
+    """Whether two grandchild identities name the same exact lane (F1).
+
+    Compares the routing-authoritative facts: unit id, declared parent, and
+    canonical repo (normalized). A display-only difference never matters because
+    those facts are not compared; a difference in unit / parent / repo means the
+    two identities are NOT the same lane.
+    """
+    return (
+        a.unit_id == b.unit_id
+        and a.delegation_parent == b.delegation_parent
+        and repo_identity_matches(a.repo_identity, b.repo_identity)
+    )
+
+
 def _effective_grandchild_target(
     request: RoutePlanRequest, dispatch: GrandchildDispatchDecision
 ) -> Optional[GrandchildTargetIdentity]:
     """Resolve the exact grandchild identity the realization gate must bind to.
 
-    Precedence (Redmine #13571 / #12454 j#75444 F1): an explicit
-    ``request.grandchild_target`` (the runtime's authoritative created/adopted
-    lane identity) always wins. Otherwise, an **adopt** dispatch's selected Codex
-    gateway candidate supplies the identity — the dispatch literally selected
-    that lane, so its ``<workspace_id>/<lane_id>`` unit and the canonical
-    ``--target-repo`` identity are the exact target. A launch dispatch with no
-    explicit target yields ``None`` (the gate then fails closed as ``unbound``
-    rather than adopting the first depth-2 sibling).
+    Authority order (Redmine #13571 / #12454 j#75444 F1): for an **adopt**
+    dispatch the selected Codex gateway candidate is authoritative — the dispatch
+    literally selected that lane, so its ``<workspace_id>/<lane_id>`` unit and the
+    canonical ``--target-repo`` identity are the exact target. An explicit
+    ``request.grandchild_target`` may accompany it but must NAME THE SAME LANE;
+    an explicit target that disagrees with the dispatch selection is a conflict
+    and yields ``None`` (the gate then fails closed rather than letting an
+    unrelated sibling's display evidence open the gate). An explicit target is
+    authoritative only for a **launch** dispatch (no selected candidate — the
+    runtime supplies the created lane's post-launch identity). A launch with no
+    explicit target yields ``None`` -> ``unbound`` -> blocked.
     """
-    if request.grandchild_target is not None:
-        return request.grandchild_target
     selected = dispatch.selected
     if selected is not None:
-        unit_id = f"{selected.workspace_id or ''}/{selected.lane_id or ''}"
-        return GrandchildTargetIdentity(
-            unit_id=unit_id,
+        derived = GrandchildTargetIdentity(
+            unit_id=f"{selected.workspace_id or ''}/{selected.lane_id or ''}",
             delegation_parent=request.delegated_coordinator_unit,
             repo_identity=request.target_repo_identity or selected.repo_root,
         )
-    return None
+        if request.grandchild_target is not None and not _identities_agree(
+            request.grandchild_target, derived
+        ):
+            # Explicit target disagrees with the dispatch-selected lane: fail
+            # closed instead of overriding the dispatch selection (F1).
+            return None
+        return derived
+    # Launch: no selected candidate; the explicit post-launch identity (if any)
+    # is authoritative. None -> unbound -> blocked.
+    return request.grandchild_target
 
 
 def plan_delegated_coordinator_route(
