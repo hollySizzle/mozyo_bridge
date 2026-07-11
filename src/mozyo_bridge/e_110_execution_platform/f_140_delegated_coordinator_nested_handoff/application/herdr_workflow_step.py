@@ -408,6 +408,39 @@ def _same_lane_worker_liveness(
     return WORKER_LIVE if with_locator == 1 else WORKER_LOCATOR_MISSING
 
 
+def _anchor_issue(anchor_pointer: str) -> str:
+    """The issue id embedded in a verified ``redmine:issue=<id>:journal=<id>`` anchor, else ""."""
+    s = (anchor_pointer or "").strip()
+    if not s or s == "none" or not s.startswith("redmine:"):
+        return ""
+    for field in s.split(":"):
+        field = field.strip()
+        if field.startswith("issue="):
+            return field[len("issue="):].strip()
+    return ""
+
+
+def _resolve_lane_dispatch_decision(
+    args: argparse.Namespace, workspace_id: str, lane_id: str, issue: str
+):
+    """The bounded dispatch decision for a gateway lane (increment 2), or ``None`` (Redmine #13489).
+
+    Resolves the source-of-truth Redmine dispatch authorization + the exact target's action-time
+    runtime (:func:`...herdr_dispatch_authority.resolve_dispatch_decision`). Returns ``None`` when
+    the anchor carried no issue id (the pure resolver then keeps the resolution-only monitor
+    no-op). A read failure inside the resolver fails closed to a BLOCKED decision (never a send).
+    """
+    if not issue:
+        return None
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_authority import (
+        resolve_dispatch_decision,
+    )
+
+    return resolve_dispatch_decision(
+        args, workspace_id=workspace_id, lane_id=lane_id, issue=issue, env=os.environ
+    )
+
+
 def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
     """Resolve the herdr-native ``workflow step`` outcome for the current lane (Redmine #13489).
 
@@ -463,17 +496,28 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
         anchor_status, anchor_pointer = _resolve_lane_anchor(
             args, sender.workspace_id, repo_root, sender.lane_id
         )
+    dispatch_decision = None
     if lane.caller_role == ROLE_DELEGATED_COORDINATOR and anchor_status == ANCHOR_VERIFIED:
         # Only read the live inventory when the gateway lane actually reaches the worker gate.
         worker_liveness = _same_lane_worker_liveness(
             sender.workspace_id, sender.lane_id, env=os.environ
         )
+        # Increment 2 (Redmine #13489): with a single live same-lane worker, resolve the bounded
+        # dispatch authority from source-of-truth Redmine (a valid, non-superseded coordinator
+        # dispatch authorization) + the exact target's action-time runtime state. Absent an
+        # authorization this decides MONITOR, so the resolution-only monitor no-op is preserved
+        # and product auto-dispatch stays disabled until a coordinator records one (j#75006).
+        if worker_liveness == WORKER_LIVE:
+            dispatch_decision = _resolve_lane_dispatch_decision(
+                args, sender.workspace_id, sender.lane_id, _anchor_issue(anchor_pointer)
+            )
 
     return resolve_herdr_workflow_step(
         lane,
         worker_liveness=worker_liveness,
         anchor_status=anchor_status,
         anchor_pointer=anchor_pointer,
+        dispatch_decision=dispatch_decision,
     )
 
 
