@@ -199,6 +199,8 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
     attempts            INTEGER NOT NULL DEFAULT 0,
     max_attempts        INTEGER NOT NULL DEFAULT 3,
     send_attempted      INTEGER NOT NULL DEFAULT 0,
+    claim_token         TEXT NOT NULL DEFAULT '',
+    claimed_at          TEXT NOT NULL DEFAULT '',
     notification_kind   TEXT NOT NULL DEFAULT '',
     notification_summary TEXT NOT NULL DEFAULT '',
     gate_mismatch       INTEGER NOT NULL DEFAULT 0,
@@ -210,6 +212,27 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
     UNIQUE(source, issue, journal, normalized_gate, callback_route)
 )
 """
+
+#: The callback-outbox ownership columns (Redmine #13520 review F2). A ``claim_token`` +
+#: ``claimed_at`` lease fences a claim so a concurrent processor cannot reclaim an actively
+#: worked row and double-send. Added defensively to a callback table that predates them.
+_CALLBACK_OWNERSHIP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("claim_token", "TEXT NOT NULL DEFAULT ''"),
+    ("claimed_at", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _ensure_callback_ownership_columns(conn: sqlite3.Connection) -> None:
+    """Add the F2 ownership columns to a callback table that lacks them (idempotent).
+
+    A callback outbox created before the #13520 review-F2 fix has no ``claim_token`` /
+    ``claimed_at``. ``ALTER TABLE ADD COLUMN`` is additive and preserves rows; it is a no-op
+    once present. Guarded by ``PRAGMA table_info`` so it never errors on an already-migrated DB.
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+    for name, decl in _CALLBACK_OWNERSHIP_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
 
 _CALLBACK_CURSOR_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS callback_cursor (
@@ -368,15 +391,18 @@ class WorkflowRuntimeStore:
             # for any table already present.
             conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
             conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
+            _ensure_callback_ownership_columns(conn)
             conn.execute(
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
             )
             conn.commit()
         elif version == WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
             # Already current; the tables exist. A defensive IF-NOT-EXISTS keeps a DB that
-            # somehow lost a table self-healing without touching data.
+            # somehow lost a table self-healing without touching data, and the F2 ownership
+            # columns are ALTER-added if this DB predates them.
             conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
             conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
+            _ensure_callback_ownership_columns(conn)
             conn.commit()
         else:
             conn.close()

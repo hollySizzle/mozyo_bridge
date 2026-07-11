@@ -53,6 +53,9 @@ def _args(**over) -> argparse.Namespace:
         sweep=False,
         ingest=False,
         deliver=False,
+        run_once=False,
+        watch=False,
+        max_passes=1,
         candidate=None,
         redmine_json=None,
         poll=False,
@@ -168,12 +171,43 @@ class DeliverCliTest(_CliTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
 
-    def test_bare_deliver_fail_closes(self):
-        self._ingest_pending()
-        with self.assertRaises(SystemExit):
-            cli.cmd_workflow_callbacks(_args(deliver=True, store_path=str(self.store_path)))
-        # Nothing was delivered — the row stays pending (no unsafe bare-CLI actuation).
-        self.assertEqual(self.outbox.read()[0].state, CALLBACK_PENDING)
+    def test_callback_sender_builds_a_real_sender(self):
+        # F1 (j#75147): _callback_sender no longer unconditionally fail-closes; it builds a real
+        # HandoffCallbackSender over the handoff send port (safety = outbox fence + QA anchors).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
+            HandoffCallbackSender,
+        )
+
+        sender = cli._callback_sender(_args())
+        self.assertIsInstance(sender, HandoffCallbackSender)
+
+
+class RunOnceCliTest(_CliTestCase):
+    def test_run_once_ingests_delivers_and_sweeps(self):
+        orig = cli._callback_sender
+        cli._callback_sender = lambda args: (lambda row: SEND_DELIVERED)
+        try:
+            rc = cli.cmd_workflow_callbacks(
+                _args(
+                    run_once=True, store_path=str(self.store_path), redmine_json=str(self.snapshot),
+                    candidate=[self._candidate("13518:75094:coordinator:implementation_done")],
+                )
+            )
+        finally:
+            cli._callback_sender = orig
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
+
+    def test_watch_runs_bounded_passes(self):
+        orig = cli._callback_sender
+        cli._callback_sender = lambda args: (lambda row: SEND_DELIVERED)
+        try:
+            rc = cli.cmd_workflow_callbacks(
+                _args(watch=True, store_path=str(self.store_path), max_passes=2)
+            )
+        finally:
+            cli._callback_sender = orig
+        self.assertEqual(rc, 0)
 
 
 class ParseCandidateTest(unittest.TestCase):

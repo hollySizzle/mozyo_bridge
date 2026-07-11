@@ -139,10 +139,12 @@ class DeliveryTransitionsTest(_OutboxTestCase):
 
 class InflightRecoveryTest(_OutboxTestCase):
     def test_pre_send_crash_recovers_to_pending(self):
+        # stale_seconds=0 forces recovery of the just-claimed row (a real crash would be older);
+        # the default lease deliberately leaves a fresh claim alone (see the F2 race test).
         k = _key("75094")
         self.outbox.enqueue(k)
         self.outbox.claim_pending()  # inflight, send_attempted=0
-        recovered = self.outbox.recover_inflight()
+        recovered = self.outbox.recover_inflight(stale_seconds=0)
         self.assertEqual([r.state for r in recovered], [CALLBACK_PENDING])
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_PENDING)
 
@@ -151,13 +153,72 @@ class InflightRecoveryTest(_OutboxTestCase):
         self.outbox.enqueue(k)
         self.outbox.claim_pending()
         self.outbox.mark_sending(k)  # crossed the send edge
-        recovered = self.outbox.recover_inflight()
+        recovered = self.outbox.recover_inflight(stale_seconds=0)
         self.assertEqual([r.state for r in recovered], [CALLBACK_UNCERTAIN])
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_UNCERTAIN)
 
+    def test_fresh_claim_is_not_recovered_under_the_lease(self):
+        # F2: a concurrent processor's default-lease recovery must NOT reclaim a fresh active
+        # claim (that is what enabled the double-send).
+        k = _key("75094")
+        self.outbox.enqueue(k)
+        self.outbox.claim_pending()
+        self.assertEqual(self.outbox.recover_inflight(), ())  # default lease -> skipped
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_INFLIGHT)
+
     def test_recover_is_noop_without_inflight(self):
         self.outbox.enqueue(_key("75094"))
-        self.assertEqual(self.outbox.recover_inflight(), ())
+        self.assertEqual(self.outbox.recover_inflight(stale_seconds=0), ())
+
+
+class ConcurrentClaimFencingTest(unittest.TestCase):
+    """F2 regression (#13520 j#75147): two processors never double-send the same callback."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "workflow-runtime.sqlite"
+        self.A = CallbackOutbox(path=self.path)
+        self.B = CallbackOutbox(path=self.path)
+
+    def test_concurrent_claim_recover_send_is_single_winner(self):
+        k = _key("75094")
+        self.A.enqueue(k)
+        # Processor A claims the row (fresh, holds a claim token).
+        claimed_a = self.A.claim_pending()
+        token_a = claimed_a[0].claim_token
+        self.assertTrue(token_a)
+        # Processor B runs a deliver()-style pass: default-lease recovery does NOT reclaim A's
+        # fresh active claim, and the row is inflight (not pending), so B claims nothing.
+        recovered_b = self.B.recover_inflight()
+        self.assertEqual(recovered_b, ())
+        claimed_b = self.B.claim_pending()
+        self.assertEqual(claimed_b, ())
+        # A proceeds through the send gate exactly once.
+        sends = []
+        for row in claimed_b:  # empty
+            if self.B.mark_sending(row.key, claim_token=row.claim_token):
+                sends.append("B")
+        if self.A.mark_sending(k, claim_token=token_a):
+            sends.append("A")
+            self.A.mark_delivered(k, claim_token=token_a)
+        self.assertEqual(sends, ["A"])  # single send
+        self.assertEqual(self.A.read()[0].state, CALLBACK_DELIVERED)
+
+    def test_stale_reclaim_old_owner_cannot_send(self):
+        # If a lease expires and another processor reclaims + re-claims, the ORIGINAL owner's
+        # token-conditional mark_sending is a no-op, so it never sends after losing ownership.
+        k = _key("75094")
+        self.A.enqueue(k)
+        claimed_a = self.A.claim_pending()
+        token_a = claimed_a[0].claim_token
+        self.B.recover_inflight(stale_seconds=0)  # force the lease to be expired
+        claimed_b = self.B.claim_pending()
+        token_b = claimed_b[0].claim_token
+        self.assertNotEqual(token_a, token_b)
+        # New owner B sends; old owner A cannot (its token no longer matches).
+        self.assertTrue(self.B.mark_sending(k, claim_token=token_b))
+        self.assertFalse(self.A.mark_sending(k, claim_token=token_a))
 
 
 class CursorTest(_OutboxTestCase):

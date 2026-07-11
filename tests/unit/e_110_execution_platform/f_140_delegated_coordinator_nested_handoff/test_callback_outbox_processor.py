@@ -182,7 +182,8 @@ class DeliverTest(_ProcessorTestCase):
         # Simulate a crash mid-claim: claim leaves the row inflight, no outcome recorded.
         self.outbox.claim_pending()
         # A fresh deliver pass recovers it (pre-send -> pending) and then delivers it.
-        report = proc.deliver(lambda row: SEND_DELIVERED)
+        # stale_seconds=0 treats the just-claimed row as abandoned (a real crash would be older).
+        report = proc.deliver(lambda row: SEND_DELIVERED, stale_seconds=0)
         self.assertEqual(len(report.recovered), 1)
         self.assertEqual(report.recovered[0].state, CALLBACK_PENDING)
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
@@ -212,7 +213,7 @@ class SweepTest(_ProcessorTestCase):
         self.outbox.mark_sending(
             CallbackOutboxKey("redmine", "13518", "75096", "review_request", "coordinator")
         )
-        report = proc.sweep()
+        report = proc.sweep(stale_seconds=0)
         recovered_states = {r.journal: r.state for r in report.recovered}
         self.assertEqual(recovered_states["75094"], CALLBACK_PENDING)  # pre-send -> retry
         self.assertEqual(recovered_states["75096"], CALLBACK_UNCERTAIN)  # post-send -> uncertain

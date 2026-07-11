@@ -29,11 +29,18 @@ State machine (closed vocabulary):
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+
+#: Default lease (seconds) after which a still-``inflight`` row is treated as abandoned and
+#: eligible for recovery (#13520 review F2). A live processor claims and sends in well under a
+#: second, so a concurrent processor never reclaims a fresh active claim; only a genuinely
+#: crashed / hung claim older than the lease is recovered.
+CALLBACK_CLAIM_LEASE_SECONDS = 300
 
 from mozyo_bridge.core.state.workflow_runtime_store import (
     CALLBACK_ABSENT,
@@ -53,6 +60,17 @@ from mozyo_bridge.core.state.workflow_runtime_store import (
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _utc_cutoff(stale_seconds: int) -> str:
+    """ISO-second UTC timestamp ``stale_seconds`` in the past (the recovery lease cutoff).
+
+    Compared lexicographically against ``claimed_at`` (both ISO-8601 UTC-second, which sorts
+    chronologically): a row whose ``claimed_at`` is < this cutoff has an expired lease.
+    """
+    return (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)).isoformat(
+        timespec="seconds"
+    )
 
 
 @dataclass(frozen=True)
@@ -100,6 +118,7 @@ class CallbackOutboxRow:
     gate_mismatch: bool
     detail: str
     payload: str
+    claim_token: str = ""
 
     @property
     def key(self) -> CallbackOutboxKey:
@@ -127,6 +146,7 @@ class CallbackOutboxRow:
             "gate_mismatch": self.gate_mismatch,
             "detail": self.detail,
             "payload": self.payload,
+            "claim_token": self.claim_token,
         }
 
 
@@ -146,7 +166,7 @@ class CallbackEnqueueResult:
 _SELECT = (
     "SELECT source, issue, journal, normalized_gate, callback_route, state, "
     "attempts, max_attempts, send_attempted, notification_kind, "
-    "notification_summary, gate_mismatch, detail, payload FROM callback_outbox"
+    "notification_summary, gate_mismatch, detail, payload, claim_token FROM callback_outbox"
 )
 
 
@@ -166,6 +186,7 @@ def _row(r: tuple) -> CallbackOutboxRow:
         gate_mismatch=bool(r[11]),
         detail=r[12],
         payload=r[13],
+        claim_token=r[14] if len(r) > 14 else "",
     )
 
 
@@ -330,6 +351,9 @@ class CallbackOutbox:
         ``BEGIN IMMEDIATE`` serializes concurrent processors: the first claimer flips the
         pending rows to :data:`CALLBACK_INFLIGHT` (``send_attempted=0``) and returns them; a
         second concurrent claimer sees no pending rows and returns empty — a single winner.
+        Each claimed row is stamped with a fresh **claim token** + a ``claimed_at`` lease so a
+        concurrent processor's :meth:`recover_inflight` cannot reclaim this active claim, and
+        the owner's subsequent marks are token-conditional (#13520 review F2).
         """
         stamp = now or _utc_now()
         conn = self._connect_immediate()
@@ -339,19 +363,23 @@ class CallbackOutbox:
                 _SELECT + " WHERE state=? ORDER BY seq LIMIT ?",
                 (CALLBACK_PENDING, int(limit)),
             ).fetchall()
-            claimed = tuple(_row(r) for r in rows)
-            for row in claimed:
+            claimed = []
+            for r in rows:
+                row = _row(r)
+                token = secrets.token_hex(16)
                 conn.execute(
-                    "UPDATE callback_outbox SET state=?, send_attempted=0, updated_at=? "
-                    "WHERE source=? AND issue=? AND journal=? AND normalized_gate=? "
-                    "AND callback_route=?",
-                    (CALLBACK_INFLIGHT, stamp, *row.key.as_row()),
+                    "UPDATE callback_outbox SET state=?, send_attempted=0, claim_token=?, "
+                    "claimed_at=?, updated_at=? WHERE source=? AND issue=? AND journal=? "
+                    "AND normalized_gate=? AND callback_route=?",
+                    (CALLBACK_INFLIGHT, token, stamp, stamp, *row.key.as_row()),
+                )
+                claimed.append(
+                    CallbackOutboxRow(
+                        **{**row.as_payload(), "state": CALLBACK_INFLIGHT, "claim_token": token}  # type: ignore[arg-type]
+                    )
                 )
             conn.execute("COMMIT")
-            return tuple(
-                CallbackOutboxRow(**{**r.as_payload(), "state": CALLBACK_INFLIGHT})  # type: ignore[arg-type]
-                for r in claimed
-            )
+            return tuple(claimed)
         except sqlite3.DatabaseError as exc:
             self._rollback(conn)
             raise WorkflowRuntimeStoreError(
@@ -360,37 +388,49 @@ class CallbackOutbox:
         finally:
             conn.close()
 
-    def recover_inflight(self, *, now: Optional[str] = None) -> tuple[CallbackOutboxRow, ...]:
-        """Reconcile ``inflight`` rows left by a crash (watcher restart recovery).
+    def recover_inflight(
+        self, *, stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS, now: Optional[str] = None
+    ) -> tuple[CallbackOutboxRow, ...]:
+        """Reconcile ``inflight`` rows whose claim **lease has expired** (crash recovery).
 
-        ``send_attempted`` disambiguates: ``0`` (pre-injection crash) -> reset to
-        :data:`CALLBACK_PENDING` (a later claim retries; nothing was sent); ``1`` (crash after
-        the send edge) -> :data:`CALLBACK_UNCERTAIN`, never auto-retried.
+        Only a row whose ``claimed_at`` is older than ``stale_seconds`` is reclaimed — an
+        actively-worked fresh claim (a concurrent processor between claim and its terminal
+        mark) is left untouched, so a concurrent :meth:`recover_inflight` can never steal it and
+        cause a double send (#13520 review F2). For a stale row, ``send_attempted`` disambiguates:
+        ``0`` (pre-injection crash) -> reset to :data:`CALLBACK_PENDING` (a later claim retries;
+        nothing was sent); ``1`` (crash after the send edge) -> :data:`CALLBACK_UNCERTAIN`, never
+        auto-retried. The claim token is cleared on reclaim (a new owner will re-claim). A row
+        with an empty ``claimed_at`` (a legacy pre-F2 row) is treated as stale.
         """
         stamp = now or _utc_now()
+        cutoff = _utc_cutoff(stale_seconds)
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                _SELECT + " WHERE state=? ORDER BY seq", (CALLBACK_INFLIGHT,)
+                _SELECT + " WHERE state=? AND (claimed_at='' OR claimed_at <= ?) ORDER BY seq",
+                (CALLBACK_INFLIGHT, cutoff),
             ).fetchall()
             recovered: list[CallbackOutboxRow] = []
             for r in rows:
                 row = _row(r)
                 new_state = CALLBACK_UNCERTAIN if row.send_attempted else CALLBACK_PENDING
                 conn.execute(
-                    "UPDATE callback_outbox SET state=?, detail=?, updated_at=? WHERE source=? "
-                    "AND issue=? AND journal=? AND normalized_gate=? AND callback_route=?",
+                    "UPDATE callback_outbox SET state=?, claim_token='', detail=?, updated_at=? "
+                    "WHERE source=? AND issue=? AND journal=? AND normalized_gate=? "
+                    "AND callback_route=?",
                     (
                         new_state,
-                        "recovered inflight: "
+                        "recovered stale inflight: "
                         + ("post-send uncertain" if row.send_attempted else "pre-send retry"),
                         stamp,
                         *row.key.as_row(),
                     ),
                 )
                 recovered.append(
-                    CallbackOutboxRow(**{**row.as_payload(), "state": new_state})  # type: ignore[arg-type]
+                    CallbackOutboxRow(
+                        **{**row.as_payload(), "state": new_state, "claim_token": ""}  # type: ignore[arg-type]
+                    )
                 )
             conn.execute("COMMIT")
             return tuple(recovered)
@@ -404,30 +444,50 @@ class CallbackOutbox:
 
     # -- outcome marks -----------------------------------------------------
 
-    def mark_sending(self, key: CallbackOutboxKey, *, now: Optional[str] = None) -> bool:
+    def mark_sending(
+        self,
+        key: CallbackOutboxKey,
+        *,
+        claim_token: Optional[str] = None,
+        now: Optional[str] = None,
+    ) -> bool:
         """Checkpoint the send edge (``send_attempted=1``) right before injection.
 
-        Lets crash recovery tell a pre-send crash (safe to retry) from a post-send crash
-        (uncertain).
+        Token-conditional: returns ``False`` when the caller no longer owns the row (its claim
+        was recovered + re-claimed elsewhere). The processor uses this as the **send gate** — it
+        only injects when ``mark_sending`` matched, so a de-owned processor never sends. Also
+        lets crash recovery tell a pre-send crash (retry) from a post-send crash (uncertain).
         """
-        return self._update(key, "send_attempted=1", (), now=now or _utc_now())
+        return self._update(
+            key, "send_attempted=1", (), now=now or _utc_now(), claim_token=claim_token
+        )
 
     def mark_delivered(
-        self, key: CallbackOutboxKey, *, detail: str = "", now: Optional[str] = None
+        self,
+        key: CallbackOutboxKey,
+        *,
+        claim_token: Optional[str] = None,
+        detail: str = "",
+        now: Optional[str] = None,
     ) -> bool:
-        """Record the claimed callback's one send as positively delivered."""
+        """Record the claimed callback's one send as positively delivered (token-conditional)."""
         return self._update(
             key, "state=?, detail=?", (CALLBACK_DELIVERED, detail or "callback delivered"),
-            now=now or _utc_now(),
+            now=now or _utc_now(), claim_token=claim_token,
         )
 
     def mark_uncertain(
-        self, key: CallbackOutboxKey, *, detail: str = "", now: Optional[str] = None
+        self,
+        key: CallbackOutboxKey,
+        *,
+        claim_token: Optional[str] = None,
+        detail: str = "",
+        now: Optional[str] = None,
     ) -> bool:
         """Record the send outcome as unknown (ACK-only / crash-after-send); no auto-retry."""
         return self._update(
             key, "state=?, detail=?", (CALLBACK_UNCERTAIN, detail or "callback outcome uncertain"),
-            now=now or _utc_now(),
+            now=now or _utc_now(), claim_token=claim_token,
         )
 
     def mark_dead_letter(
@@ -440,7 +500,12 @@ class CallbackOutbox:
         )
 
     def mark_retry_or_dead(
-        self, key: CallbackOutboxKey, *, detail: str = "", now: Optional[str] = None
+        self,
+        key: CallbackOutboxKey,
+        *,
+        claim_token: Optional[str] = None,
+        detail: str = "",
+        now: Optional[str] = None,
     ) -> str:
         """Record a **deterministic not-sent** failure: bump attempts, retry or dead-letter.
 
@@ -449,23 +514,27 @@ class CallbackOutbox:
         resulting state (or :data:`CALLBACK_ABSENT` if the key had no row).
         """
         stamp = now or _utc_now()
+        token_clause = " AND claim_token=?" if claim_token is not None else ""
+        token_params = (claim_token,) if claim_token is not None else ()
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT attempts, max_attempts FROM callback_outbox WHERE source=? AND "
-                "issue=? AND journal=? AND normalized_gate=? AND callback_route=?",
-                key.as_row(),
+                "issue=? AND journal=? AND normalized_gate=? AND callback_route=?" + token_clause,
+                (*key.as_row(), *token_params),
             ).fetchone()
             if row is None:
+                # No row for the key, or the caller lost ownership (token mismatch) — no-op.
                 conn.execute("ROLLBACK")
                 return CALLBACK_ABSENT
             attempts = int(row[0]) + 1
             resulting = CALLBACK_PENDING if attempts < int(row[1]) else CALLBACK_DEAD_LETTER
+            # A retry clears the claim token so a later claim re-owns it; a dead-letter clears it too.
             conn.execute(
                 "UPDATE callback_outbox SET state=?, attempts=?, send_attempted=0, "
-                "detail=?, updated_at=? WHERE source=? AND issue=? AND journal=? AND "
-                "normalized_gate=? AND callback_route=?",
+                "claim_token='', detail=?, updated_at=? WHERE source=? AND issue=? AND journal=? AND "
+                "normalized_gate=? AND callback_route=?" + token_clause,
                 (
                     resulting,
                     attempts,
@@ -477,6 +546,7 @@ class CallbackOutbox:
                     ),
                     stamp,
                     *key.as_row(),
+                    *token_params,
                 ),
             )
             conn.execute("COMMIT")
@@ -490,15 +560,32 @@ class CallbackOutbox:
             conn.close()
 
     def _update(
-        self, key: CallbackOutboxKey, assignments: str, params: tuple, *, now: str
+        self,
+        key: CallbackOutboxKey,
+        assignments: str,
+        params: tuple,
+        *,
+        now: str,
+        claim_token: Optional[str] = None,
     ) -> bool:
+        """Token-conditional row update; returns whether a row matched.
+
+        When ``claim_token`` is given, the update only applies to the row still owned by that
+        token (``AND claim_token=?``) — a processor that lost ownership (its claim was recovered
+        + re-claimed by another) gets ``rowcount == 0`` and does not transition the row, so a
+        stale owner never corrupts the state or double-sends. ``None`` means unconditional
+        (direct store use / single-processor tests).
+        """
+        token_clause = " AND claim_token=?" if claim_token is not None else ""
+        token_params = (claim_token,) if claim_token is not None else ()
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 f"UPDATE callback_outbox SET {assignments}, updated_at=? WHERE source=? "
-                "AND issue=? AND journal=? AND normalized_gate=? AND callback_route=?",
-                (*params, now, *key.as_row()),
+                "AND issue=? AND journal=? AND normalized_gate=? AND callback_route=?"
+                + token_clause,
+                (*params, now, *key.as_row(), *token_params),
             )
             conn.execute("COMMIT")
             return cur.rowcount > 0

@@ -94,19 +94,34 @@ def _journal_source(args: argparse.Namespace) -> RedmineJournalSource:
 
 
 def _callback_sender(args: argparse.Namespace) -> Callable[[CallbackOutboxRow], str]:
-    """Resolve the one-send callback sender for ``--deliver`` (fail-closed by default).
+    """Build the real one-send callback sender (#13520 review F1 — the runnable path).
 
-    The bare CLI ships **no** default sender: live callback actuation must go through the
-    controlled #13521 scenario / live harness, which injects a sender bound to QA-only durable
-    anchors / targets so it never re-sends a completed implementation request (j#75108 live
-    safety). A bare ``--deliver`` therefore fail-closes rather than actuate a real handoff. The
-    harness / a test patches this seam to supply the real (or a fake) sender.
+    Wires :class:`...handoff_callback_sender.HandoffCallbackSender` over the real
+    :class:`...callback_send_port.HandoffCallbackSendPort` (which fires ``mozyo-bridge handoff
+    send`` once and maps the structured outcome). Delivery safety does **not** come from
+    refusing to send — it comes from the outbox UNIQUE fence + one-send-per-claim (a delivered
+    callback is never re-sent) and from ingesting only the intended (QA-only, in a controlled
+    run) candidates. A test / the #13490 live harness patches this seam to inject a fake / a
+    cockpit-bound real sender.
     """
-    raise SystemExit(
-        "workflow callbacks --deliver has no default live sender: callback actuation runs "
-        "through the #13521 controlled harness (QA-only anchors), not the bare CLI. Refusing "
-        "to actuate a real handoff that could re-send a completed request."
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
+        HandoffCallbackSendPort,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
+        HandoffCallbackSender,
+    )
+
+    return HandoffCallbackSender(HandoffCallbackSendPort())
+
+
+def _wake_wait_fn(args: argparse.Namespace) -> Callable[[], object]:
+    """Build the Herdr-event wake primitive for ``--watch`` (patchable seam).
+
+    Production binds this to the stable Herdr CLI wait; the bare / env-less default is a
+    no-op that reports a bounded timeout (still triggers a Redmine re-read — the Herdr event
+    is only a hint). The #13490 live harness injects the real cockpit-bound wait.
+    """
+    return lambda: False  # timeout hint; the runtime re-reads Redmine regardless (fail-safe)
 
 
 def _parse_candidate(spec: str) -> CallbackCandidate:
@@ -201,7 +216,48 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         ]
         return _emit(payload, as_json=as_json, text_lines=lines)
 
-    raise SystemExit("workflow callbacks requires an action: --sweep | --ingest | --deliver")
+    if getattr(args, "run_once", False) or getattr(args, "watch", False):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
+            run_once,
+            watch,
+        )
+
+        candidates = list(getattr(args, "candidate", None) or [])
+        # A pass that ingests fresh candidates needs the exact source journal; a drain-only
+        # pass (no candidates) delivers + sweeps the existing outbox and needs no source.
+        source = _journal_source(args) if candidates else _NULL_SOURCE
+        sender = _callback_sender(args)
+        cursor = (getattr(args, "cursor", None) or "").strip() or None
+
+        def _pass() -> dict:
+            processor = CallbackOutboxProcessor(outbox, source)
+            return run_once(processor, sender, candidates=candidates, cursor=cursor)
+
+        if getattr(args, "watch", False):
+            max_passes = int(getattr(args, "max_passes", 1) or 1)
+            passes = watch(_wake_wait_fn(args), _pass, max_passes=max_passes)
+            payload = {"action": "watch", "passes": passes}
+            lines = [f"action: watch", f"passes: {len(passes)}"] + [
+                f"  wake={p['wake']} delivered={len(p['pass']['deliver']['delivered'])}"
+                for p in passes
+            ]
+            return _emit(payload, as_json=as_json, text_lines=lines)
+
+        report = _pass()
+        payload = {"action": "run-once", **report}
+        lines = [
+            "action: run-once",
+            f"delivered: {len(report['deliver']['delivered'])}",
+            f"recovered: {len(report['deliver']['recovered'])}",
+            f"pending: {len(report['sweep']['pending'])}",
+            f"dead_letter: {len(report['sweep']['dead_letter'])}",
+        ]
+        return _emit(payload, as_json=as_json, text_lines=lines)
+
+    raise SystemExit(
+        "workflow callbacks requires an action: --sweep | --ingest | --deliver | "
+        "--run-once | --watch"
+    )
 
 
 class _NullSource:
@@ -233,6 +289,15 @@ def register_callbacks(sub) -> None:
     action.add_argument("--sweep", action="store_true", help="Fresh-turn sweep (read-only).")
     action.add_argument("--ingest", action="store_true", help="Classify + enqueue --candidate specs.")
     action.add_argument("--deliver", action="store_true", help="Fire one send per pending row.")
+    action.add_argument(
+        "--run-once", dest="run_once", action="store_true",
+        help="One production pass: ingest --candidate specs (if any), deliver, sweep.",
+    )
+    action.add_argument(
+        "--watch", action="store_true",
+        help="Bounded Herdr-event wake loop; run one pass per wake (--max-passes).",
+    )
+    p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")
     p.add_argument(
         "--candidate", action="append", type=_parse_candidate, metavar="ISSUE:JOURNAL:ROUTE[:KIND]",
         help="A callback candidate (repeatable). Required for --ingest.",

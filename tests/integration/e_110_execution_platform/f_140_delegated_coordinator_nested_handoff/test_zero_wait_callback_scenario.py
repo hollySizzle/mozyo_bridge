@@ -132,8 +132,11 @@ class ZeroWaitCallbackScenarioTest(unittest.TestCase):
         # Simulate a crash right after claim (pre-send): row stuck inflight, no outcome.
         self.outbox.claim_pending()
         # A fresh deliver pass recovers it (pre-send -> pending) and delivers exactly once.
+        # stale_seconds=0 treats the just-claimed row as abandoned (a real crash would be older).
         calls = []
-        report = self.processor.deliver(lambda row: calls.append(row.journal) or SEND_DELIVERED)
+        report = self.processor.deliver(
+            lambda row: calls.append(row.journal) or SEND_DELIVERED, stale_seconds=0
+        )
         self.assertEqual(report.recovered[0].state, CALLBACK_PENDING)
         self.assertEqual(calls, ["75094"])  # exactly one send
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
@@ -160,9 +163,19 @@ class ZeroWaitCallbackScenarioTest(unittest.TestCase):
         # A sweep surfaces the backlog and sends nothing.
         self.assertEqual(cli.cmd_workflow_callbacks(_cli_args(sweep=True, store_path=str(self.store_path))), 0)
         self.assertEqual(len(self.outbox.read(states=[CALLBACK_PENDING])), 1)
-        # The bare deliver fail-closes (live actuation only via the QA harness).
-        with self.assertRaises(SystemExit):
-            cli.cmd_workflow_callbacks(_cli_args(deliver=True, store_path=str(self.store_path)))
+        # Deliver flows through the facade's real sender (the send port shells out to the
+        # sanctioned `mozyo-bridge handoff send`, not a raw herdr/tmux primitive). Patched here
+        # to keep the test hermetic; the live send is verified under #13490 with QA-only anchors.
+        from mozyo_bridge.core.state.callback_outbox import CALLBACK_DELIVERED
+
+        orig = cli._callback_sender
+        cli._callback_sender = lambda args: (lambda row: SEND_DELIVERED)
+        try:
+            rc = cli.cmd_workflow_callbacks(_cli_args(deliver=True, store_path=str(self.store_path)))
+        finally:
+            cli._callback_sender = orig
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
 
 
 if __name__ == "__main__":

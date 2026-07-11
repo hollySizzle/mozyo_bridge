@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.core.state.callback_outbox import (
+    CALLBACK_CLAIM_LEASE_SECONDS,
     CallbackEnqueueResult,
     CallbackOutbox,
     CallbackOutboxKey,
@@ -303,6 +304,7 @@ class CallbackOutboxProcessor:
         sender: Callable[[CallbackOutboxRow], str],
         *,
         limit: int = 32,
+        stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
         now: Optional[str] = None,
     ) -> DeliveryReport:
         """Recover crashed inflight rows, then fire **one** send per claimed pending row.
@@ -319,19 +321,26 @@ class CallbackOutboxProcessor:
         - :data:`SEND_UNCERTAIN` (or an unknown token, fail-safe) -> ``uncertain`` (no auto-retry).
         """
         report = DeliveryReport()
-        report.recovered.extend(self._outbox.recover_inflight(now=now))
+        # Recover only lease-expired (stale) inflight rows — never a concurrent processor's
+        # fresh active claim (#13520 review F2). A default lease is used unless overridden.
+        report.recovered.extend(self._outbox.recover_inflight(stale_seconds=stale_seconds, now=now))
         for row in self._outbox.claim_pending(limit=limit, now=now):
-            self._outbox.mark_sending(row.key, now=now)
+            token = row.claim_token
+            # The send gate: mark_sending is token-conditional. If we no longer own the row
+            # (its claim was recovered + re-claimed elsewhere) it returns False and we DO NOT
+            # send — a de-owned processor never fires a duplicate callback.
+            if not self._outbox.mark_sending(row.key, claim_token=token, now=now):
+                continue
             outcome = sender(row)
             if outcome not in SEND_OUTCOMES:
                 outcome = SEND_UNCERTAIN
             if outcome == SEND_DELIVERED:
-                self._outbox.mark_delivered(row.key, now=now)
+                self._outbox.mark_delivered(row.key, claim_token=token, now=now)
                 resulting = "delivered"
             elif outcome == SEND_NOT_SENT:
-                resulting = self._outbox.mark_retry_or_dead(row.key, now=now)
+                resulting = self._outbox.mark_retry_or_dead(row.key, claim_token=token, now=now)
             else:
-                self._outbox.mark_uncertain(row.key, now=now)
+                self._outbox.mark_uncertain(row.key, claim_token=token, now=now)
                 resulting = "uncertain"
             report.delivered.append(
                 DeliveryOutcome(
@@ -342,7 +351,9 @@ class CallbackOutboxProcessor:
 
     # -- sweep -------------------------------------------------------------
 
-    def sweep(self, *, now: Optional[str] = None) -> SweepReport:
+    def sweep(
+        self, *, stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS, now: Optional[str] = None
+    ) -> SweepReport:
         """Fresh-turn recovery: reconcile crashed rows, then surface the backlog once.
 
         Reconciles inflight rows (crash recovery), then reads the pending + dead-letter rows so
@@ -351,7 +362,7 @@ class CallbackOutboxProcessor:
         doctrine relies on instead of an LLM-turn poll.
         """
         report = SweepReport()
-        report.recovered.extend(self._outbox.recover_inflight(now=now))
+        report.recovered.extend(self._outbox.recover_inflight(stale_seconds=stale_seconds, now=now))
         report.pending.extend(self._outbox.read(states=[CALLBACK_PENDING]))
         report.dead_letter.extend(self._outbox.read(states=[CALLBACK_DEAD_LETTER]))
         return report
