@@ -65,6 +65,18 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 - relaunch した worker は「⏵⏵ auto mode on」footer を確認 (permission parity #13360)。旧 pane は先に `herdr pane close`。
 - relaunch 後、gateway に worker route の再駆動を指示 (worker の pane id は変わるが解決は assigned name 経由で自動追従)。
 
+## Host reboot recovery (#13518)
+
+host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit するが、`herdr agent list` の durable assigned-name row は残る (foreground は `-zsh` のみ、detected agent 無し)。**複数正本を照合する fail-closed recovery reconciler** を使い、DB 単独を authority にしない (設計正本: #13520 j#75276)。
+
+- **state を混同しない (authority matrix, #13520 j#75276)**: Redmine issue/journal = workflow gate と durable anchor / Git worktree・ref・diff = code と dirty state / `registry.sqlite` + repo-local anchor = workspace identity / `state.sqlite` = lane metadata・callback outbox の復元材料 (workflow truth ではない) / herdr assigned-name + live inventory = runtime liveness / launch-time sender env = 再 attest する process-local input (永続 authority にしない)。
+- **composite liveness で false-positive adopt を防ぐ (#13518 j#75329)**: `herdr session-start` の adopt 判定は assigned `name` 一致だけでは不十分。`agent list` row を `classify_named_slot` (`domain/herdr_slot_liveness.py`) で複合判定し、detected agent 不在 + `agent_status=unknown` の **shell residue** は `stale_named_slot` として outcome `stale` で surface する (blind adopt しない / 名前が残っているため launch も上書きしない)。detected agent が名指しされた live slot は従来どおり adopt、liveness signal を一切持たない minimal row も従来どおり adopt (self-heal 不変)。
+- **dirty worktree を never-clobber**: recovery 中に lane worktree を reset / stash / delete / recreate しない。未 commit 成果は保全して同一 durable anchor から resume する (12-file dirty diff を SHA-256 で preflight/post-check して不変を確認した実例: #13518 j#75331/j#75334)。
+- **stale pane の close + same-slot relaunch は destructive** ゆえ **owner-approved recovery gate** を要求する (replayable に journal 記録: #13518 j#75331)。承認後は old pane を `herdr pane close` → 同一 lane/worktree へ `herdr session-start` で relaunch (adopt でなく launched になる)。
+- **projection cache を authority にしない**: `sublane status` の `panes=[]` は stale projection でありうる。live assigned-name inventory と矛盾する場合は同じ reconciler で fail-closed に扱い、runtime 不在と即断しない。
+- **env 欠落に注意**: reboot 後に adopt された既存 process は launch-time `MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID` を欠くことがある (session-start adopt は retroactive 注入しない)。正規 dispatch が `missing_sender_env` で fail-closed した場合、registry/anchor/live assigned-name から検証した値を **その 1 回の** high-level dispatch child process にだけ再注入する (env spoof / 別 role 偽装はしない)。Herdr backend では tmux 専用の `mozyo-bridge init` hint は無効 (`TMUX_PANE is not set`)。
+- **fail-closed 条件**: workspace mismatch / missing・unreadable journal / ambiguous live slot / DB と Redmine・Git の矛盾は停止。implementation/close/integration/publish を自動承認しない。
+
 ## lane retire (guarded close)
 
 1. lane worktree の dirty を確認・復元: `git -C <worktree> checkout -- .claude/settings.local.json` (agent harness が触る唯一の常連 dirt)。**dirty のままだと retire は `dirty_worktree` で fail-closed する** (正常動作、#13331 j#73339 guard)。

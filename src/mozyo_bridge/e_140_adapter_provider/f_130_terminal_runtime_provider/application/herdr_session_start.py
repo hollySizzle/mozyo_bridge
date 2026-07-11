@@ -15,9 +15,11 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
 2. ensure the workspace is registered (``register_workspace`` / anchor reuse) and take
    its ``workspace_id`` — the workspace_registry schema is unchanged (#11425);
 3. mint the durable name ``encode_assigned_name(workspace_id, provider, lane)`` (#13247);
-4. **idempotency:** if a live agent already carries that exact assigned name, *adopt*
-   it (no launch). A duplicated assigned name (more than one live agent) fails closed
-   rather than corrupting identity;
+4. **idempotency + composite liveness:** if a *live* agent already carries that exact
+   assigned name, *adopt* it (no launch). Liveness is a composite judgment, not a bare name
+   match (Redmine #13518 j#75329): a host-restart shell residue (name survives, no detected
+   agent) is classified :data:`SLOT_STALE` and surfaced read-only, never blind-adopted. A
+   duplicated assigned name (more than one live agent) fails closed rather than corrupting;
 5. otherwise launch the agent as a herdr-managed pane with the durable name applied
    **at start** and the self-identity vars injected via ``--env``.
 
@@ -123,6 +125,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_lane_workspace_token,
     encode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
+    SLOT_STALE as LIVENESS_STALE,
+    classify_named_slot,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
     MOZYO_AGENT_ROLE_ENV,
@@ -165,6 +171,8 @@ from mozyo_bridge.shared.errors import die
 SLOT_ADOPTED = "adopted"
 SLOT_LAUNCHED = "launched"
 SLOT_PLANNED = "planned"
+# A host-restart shell / name residue: surfaced read-only (#13518 j#75329; see herdr_slot_liveness).
+SLOT_STALE = LIVENESS_STALE
 
 
 @dataclass(frozen=True)
@@ -446,8 +454,8 @@ class _SlotPlan:
 
     provider: str
     assigned_name: str
-    kind: str  # "adopt" | "launch" | "planned"
-    locator: str = ""  # adopted live locator (kind == "adopt"); else ""
+    kind: str  # "adopt" | "launch" | "planned" | "stale"
+    locator: str = ""  # adopted live locator (kind == "adopt") / stale residue pane (kind == "stale"); else ""
 
 
 def prepare_session(
@@ -586,8 +594,11 @@ def prepare_session(
                 "names must be unique — refuse to launch / rename over a duplicate"
             )
         if len(existing) == 1:
+            # Composite liveness (Redmine #13518 j#75329): a host-restart shell residue (name
+            # matches, no detected agent) is classified stale and surfaced, never blind-adopted.
+            kind = "stale" if classify_named_slot(existing[0]) == LIVENESS_STALE else "adopt"
             plans.append(
-                _SlotPlan(provider, assigned_name, "adopt", _agent_locator(existing[0]))
+                _SlotPlan(provider, assigned_name, kind, _agent_locator(existing[0]))
             )
         elif dry_run:
             plans.append(_SlotPlan(provider, assigned_name, "planned"))
@@ -761,6 +772,20 @@ def _execute_slot(
             assigned_name=plan.assigned_name,
             outcome=SLOT_PLANNED,
             detail="would launch (dry-run)",
+        )
+    if plan.kind == "stale":
+        # A host-restart shell-residue slot (Redmine #13518 j#75329): surfaced read-only with
+        # its residue locator so an owner-approved recovery (j#75331) can close that exact pane
+        # and relaunch the same slot — this run performs no destructive side effect.
+        return SlotResult(
+            provider=plan.provider,
+            assigned_name=plan.assigned_name,
+            outcome=SLOT_STALE,
+            locator=plan.locator,
+            detail=(
+                "durable name held by a shell-residue pane with no live agent; requires an "
+                "owner-approved close + same-slot relaunch (dirty worktree preserved)"
+            ),
         )
     # Launch the agent with the durable name applied at start (herdr 0.7.1 real
     # syntax: `agent start <NAME> [--cwd] [--workspace ID] [--env K=V]... [--no-focus]
@@ -965,6 +990,7 @@ __all__ = (
     "SLOT_ADOPTED",
     "SLOT_LAUNCHED",
     "SLOT_PLANNED",
+    "SLOT_STALE",
     "HerdrSessionStartError",
     "SessionStartResult",
     "SlotResult",

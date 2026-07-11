@@ -34,6 +34,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SLOT_ADOPTED,
     SLOT_LAUNCHED,
     SLOT_PLANNED,
+    SLOT_STALE,
     HerdrSessionStartError,
     herdr_workspace_segment,
     prepare_session,
@@ -531,6 +532,93 @@ class SessionStartTest(unittest.TestCase):
         # No launch / rename occurred.
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
+
+    def _prepare_with_rows(self, tmp, *, existing, providers, lane):
+        """Register a temp workspace and run prepare_session against ``existing`` rows.
+
+        ``existing`` is built from the resolved ``workspace_id`` (a callable ``ws -> rows``) so
+        the seeded durable names match what the run mints.
+        """
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            herdr = _Herdr(existing_rows=existing(ws))
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env={HERDR_ENV: str(binpath)},
+                runner=herdr.run,
+            )
+        return result, herdr
+
+    def test_reboot_shell_residue_is_stale_not_adopted(self) -> None:
+        # Host-restart residue (Redmine #13518 j#75329): the durable name survives on a bare
+        # `-zsh` pane with no detected agent. The reconciler must NOT blind-adopt it (that would
+        # route a handoff into a shell) and must NOT launch over the still-taken name.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w19:p3",
+                        "agent_status": "unknown",
+                    }
+                ],
+                providers=["codex"],
+                lane="lane-1",
+            )
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_STALE)
+        self.assertEqual(slot.locator, "w19:p3")  # the residue pane, for owner-gated recovery
+        # Never adopted, never launched over, never a destructive close in this read-only pass.
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["pane", "close"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["workspace", "create"]])
+
+    def test_null_detected_agent_row_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=lambda ws: [
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w19:p3", "agent": None}
+                ],
+                providers=["codex"],
+                lane="lane-1",
+            )
+        self.assertEqual(result.slots[0].outcome, SLOT_STALE)
+
+    def test_live_detected_agent_still_adopts(self) -> None:
+        # A row with a positively detected provider agent is a live agent and still adopts —
+        # the composite check only refuses shell residue, never a genuinely live slot.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w19:pC",
+                        "agent": "codex",
+                        "agent_status": "idle",
+                    }
+                ],
+                providers=["codex"],
+                lane="lane-1",
+            )
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_ADOPTED)
+        self.assertEqual(slot.locator, "w19:pC")
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
 
     def test_duplicate_name_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
