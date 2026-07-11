@@ -81,9 +81,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
+    EXECUTION_READY,
     PRIMITIVE_CHILD_INTAKE,
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
+    PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_TICKETLESS_CALLBACK,
     PendingCallback,
     WorkflowAnchor,
@@ -320,6 +322,43 @@ def _execute_primitive(
     return int(rc or 0), buf.getvalue()
 
 
+def _is_herdr_dispatch_leg(outcome: WorkflowStepOutcome) -> bool:
+    """True when the outcome is the executable increment-2 herdr worker-dispatch leg.
+
+    This leg is deliberately NOT part of the generic ``WorkflowStepOutcome.executable`` set —
+    it carries its own reserve+send+outcome idempotency fence and is driven by a dedicated CLI
+    executor, never the generic ``_primitive_argv`` rail (Redmine #13489 increment 2).
+    """
+    return (
+        outcome.primitive == PRIMITIVE_HERDR_DISPATCH_WORKER
+        and outcome.execution == EXECUTION_READY
+    )
+
+
+def _execute_herdr_dispatch_leg(
+    outcome: WorkflowStepOutcome, args: argparse.Namespace
+) -> tuple[int, str]:
+    """Run the fenced one-step herdr worker dispatch; return (rc, summary text).
+
+    Delegates to :func:`...herdr_dispatch_cli.execute_herdr_dispatch`, which re-resolves the
+    dispatch decision at action time and drives the idempotency fence around one send. ``rc`` is
+    ``0`` for a delivered / never-send (skipped) outcome and ``1`` for a fence-unavailable /
+    uncertain outcome the operator must reconcile.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_cli import (
+        execute_herdr_dispatch,
+    )
+
+    result = execute_herdr_dispatch(args, outcome.durable_anchor)
+    text = (
+        f"dispatch_result: {result.result}\n"
+        f"fence_state: {result.fence_state}\n"
+        f"sent: {result.sent}\n"
+        f"detail: {result.detail}"
+    )
+    return (0 if result.ok else 1), text
+
+
 def _herdr_step_preflight(args: argparse.Namespace) -> WorkflowStepOutcome | None:
     """Herdr-native ``workflow step`` resolution for the current lane, or ``None`` under tmux.
 
@@ -422,11 +461,15 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     )
     outcome = reconciled.outcome
 
+    # The increment-2 herdr worker-dispatch leg is executable but rides its own fence, not the
+    # generic `executable` set (Redmine #13489). Treat it as an executable leg here.
+    is_herdr_dispatch = _is_herdr_dispatch_leg(outcome)
+
     # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work
     # no-op): report the resolved outcome, mutate nothing.
-    if dry_run or not outcome.executable:
+    if dry_run or (not outcome.executable and not is_herdr_dispatch):
         reported = outcome
-        if dry_run and outcome.executable:
+        if dry_run and (outcome.executable or is_herdr_dispatch):
             # Reflect that the executable leg was not actually run.
             reported = dataclasses.replace(outcome, execution=EXECUTION_DRY_RUN)
         if as_json:
@@ -439,8 +482,11 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
                 print(line)
         return 0 if reported.ok else 1
 
-    # Executable leg: dispatch the internal primitive.
-    rc, primitive_out = _execute_primitive(outcome, args, session=session)
+    # Executable leg: dispatch the internal primitive, or the fenced herdr worker dispatch.
+    if is_herdr_dispatch:
+        rc, primitive_out = _execute_herdr_dispatch_leg(outcome, args)
+    else:
+        rc, primitive_out = _execute_primitive(outcome, args, session=session)
     executed = dataclasses.replace(outcome, execution=EXECUTION_EXECUTED)
     if as_json:
         payload = executed.as_payload()
@@ -460,6 +506,39 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     # delivery's success/fail-closed result is the primitive's (e.g. a gateway that
     # vanished between resolution and delivery), so the caller sees the real outcome.
     return rc
+
+
+def cmd_workflow_dispatch_fence(args: argparse.Namespace) -> int:
+    """Operator surface for the increment-2 dispatch idempotency fence (Redmine #13489 F1).
+
+    Distinguishes an initial ``--bootstrap`` (safe first init) from a deliberate ``--recover``
+    (loss recovery: mints a fresh store under a new nonce — invoke ONLY after reconciling the
+    lost action in Redmine + issuing a new ``action_id``). With no flag, reports status. The
+    reserve path never auto-creates the store, so this is the sanctioned way to (re)initialize it.
+    """
+    from mozyo_bridge.core.state.dispatch_outbox_fence import (
+        DispatchOutboxFence,
+        DispatchOutboxFenceError,
+    )
+
+    fence = DispatchOutboxFence()
+    try:
+        if getattr(args, "fence_recover", False):
+            fence.recover()
+            print(f"dispatch fence recovered (fresh store) at {fence.path}")
+            print("reconcile the lost action + issue a NEW action_id upstream before re-dispatch")
+            return 0
+        if getattr(args, "fence_bootstrap", False):
+            fence.bootstrap()
+            print(f"dispatch fence bootstrapped at {fence.path}")
+            return 0
+    except DispatchOutboxFenceError as exc:
+        print(f"dispatch fence error: {exc}")
+        print("a store loss/replacement needs `workflow dispatch-fence --recover`")
+        return 1
+    state = "bootstrapped" if fence.is_bootstrapped() else "absent / not bootstrapped"
+    print(f"dispatch fence: {state} at {fence.path}")
+    return 0
 
 
 def register(sub) -> None:
@@ -513,6 +592,26 @@ def register(sub) -> None:
     register_resume(workflow_sub)
     register_watch(workflow_sub)
     register_glance(workflow_sub)
+
+    fence_p = workflow_sub.add_parser(
+        "dispatch-fence",
+        description=(
+            "Operator surface for the increment-2 worker-dispatch idempotency fence "
+            "(Redmine #13489). `--bootstrap` initializes it; `--recover` mints a fresh store "
+            "after a loss (only after reconciling the lost action + issuing a new action_id "
+            "upstream); no flag reports status. The reserve path never auto-creates the store."
+        ),
+        help="Bootstrap / recover / status the worker-dispatch idempotency fence.",
+    )
+    fence_p.add_argument(
+        "--bootstrap", dest="fence_bootstrap", action="store_true",
+        help="Initialize the fence store (safe first init; refuses on a detected loss).",
+    )
+    fence_p.add_argument(
+        "--recover", dest="fence_recover", action="store_true",
+        help="Deliberate loss recovery: mint a fresh store under a new nonce.",
+    )
+    fence_p.set_defaults(func=cmd_workflow_dispatch_fence)
 
     step = workflow_sub.add_parser(
         "step",

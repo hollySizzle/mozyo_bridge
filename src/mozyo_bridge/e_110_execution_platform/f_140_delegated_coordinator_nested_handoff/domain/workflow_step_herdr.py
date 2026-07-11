@@ -51,12 +51,19 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_WORKER,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authority import (
+    AUTHORIZE,
+    BLOCKED as DISPATCH_BLOCKED,
+    DispatchDecision,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
     EXECUTION_NO_OP,
+    EXECUTION_READY,
     OWNER_CHILD,
     OWNER_GRANDCHILD,
     OWNER_OPERATOR,
+    PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_NONE,
     STATE_CHILD_WORKER_DISPATCH,
     STATE_GRANDCHILD_REDMINE_WORK,
@@ -109,6 +116,12 @@ ANCHOR_STORE_MISMATCH = "store_mismatch"
 REASON_HERDR_WORKER_STEP_READY = "herdr_worker_step_ready"
 #: The gateway lane's step: verified anchor + a single live same-lane worker -> dispatch / monitor.
 REASON_HERDR_WORKER_DISPATCH_READY = "herdr_worker_dispatch_ready"
+#: The gateway lane's step is an executable one-step dispatch (increment 2): verified anchor,
+#: single live worker, AND a valid non-superseded coordinator authorization + awaiting_input target.
+REASON_HERDR_DISPATCH_AUTHORIZED = "herdr_dispatch_authorized"
+#: The gateway lane's dispatch is fail-closed (increment 2): a present-but-invalid authorization,
+#: a drifted / duplicate / unobservable target — the pure decider's ``BLOCKED``.
+REASON_HERDR_DISPATCH_BLOCKED = "herdr_dispatch_blocked"
 #: The gateway lane's step is blocked: no live same-lane worker slot to dispatch to.
 REASON_HERDR_WORKER_SLOT_MISSING = "herdr_worker_slot_missing"
 #: The gateway lane's step is blocked: 2+ same-lane worker slots (ambiguous identity, j#74749 F2).
@@ -134,6 +147,8 @@ HERDR_STEP_REASONS = frozenset(
     {
         REASON_HERDR_WORKER_STEP_READY,
         REASON_HERDR_WORKER_DISPATCH_READY,
+        REASON_HERDR_DISPATCH_AUTHORIZED,
+        REASON_HERDR_DISPATCH_BLOCKED,
         REASON_HERDR_WORKER_SLOT_MISSING,
         REASON_HERDR_WORKER_AMBIGUOUS,
         REASON_HERDR_WORKER_LOCATOR_MISSING,
@@ -306,6 +321,7 @@ def resolve_herdr_workflow_step(
     worker_liveness: Optional[str] = None,
     anchor_status: Optional[str] = None,
     anchor_pointer: str = "",
+    dispatch_decision: Optional[DispatchDecision] = None,
 ) -> WorkflowStepOutcome:
     """Map a classified herdr lane onto a resolution-only :class:`WorkflowStepOutcome` (pure).
 
@@ -362,6 +378,49 @@ def resolve_herdr_workflow_step(
         return _anchor_blocked(lane, STATE_CHILD_WORKER_DISPATCH, anchor_status, OWNER_CHILD)
 
     if worker_liveness == WORKER_LIVE:
+        # Increment 2: a verified anchor + a single live worker is *identity / readiness* — it
+        # never authorizes a send by itself. The bounded auto-dispatch fires only when a valid,
+        # non-superseded coordinator authorization + an awaiting_input target decide AUTHORIZE
+        # (design ``### Increment 2 dispatch 再有効化 contract``). Absent a decision (increment-1
+        # callers / no authorization on the issue) this stays the resolution-only monitor no-op.
+        if dispatch_decision is not None and dispatch_decision.decision == AUTHORIZE:
+            return WorkflowStepOutcome(
+                state=STATE_CHILD_WORKER_DISPATCH,
+                next_action=(
+                    "this sublane gateway has a verified Redmine anchor "
+                    f"({anchor_pointer}), a single live awaiting_input worker, and a valid "
+                    "non-superseded coordinator dispatch authorization: perform the bounded "
+                    "one-step dispatch (reserve + exactly one exact-target send + outcome "
+                    "write). The idempotency fence guarantees at-most-once delivery."
+                ),
+                execution=EXECUTION_READY,
+                reason=REASON_HERDR_DISPATCH_AUTHORIZED,
+                next_owner=OWNER_CHILD,
+                primitive=PRIMITIVE_HERDR_DISPATCH_WORKER,
+                durable_anchor=anchor_pointer or "none",
+                detail=lane.detail + "; " + dispatch_decision.detail,
+                **base,
+            )
+        if dispatch_decision is not None and dispatch_decision.decision == DISPATCH_BLOCKED:
+            return WorkflowStepOutcome(
+                state=STATE_CHILD_WORKER_DISPATCH,
+                next_action=(
+                    "this sublane gateway holds a dispatch authorization but it cannot be "
+                    "safely acted on: " + dispatch_decision.detail + ". Fail closed rather than "
+                    "dispatch to an untrusted / unobservable target."
+                ),
+                execution=EXECUTION_BLOCKED,
+                reason=REASON_HERDR_DISPATCH_BLOCKED,
+                next_owner=OWNER_CHILD,
+                primitive=PRIMITIVE_NONE,
+                durable_anchor=anchor_pointer or "none",
+                detail=lane.detail + "; " + dispatch_decision.detail,
+                **base,
+            )
+        # No authorization / superseded / worker mid-turn: the resolution-only monitor no-op.
+        monitor_detail = (
+            "; " + dispatch_decision.detail if dispatch_decision is not None else ""
+        )
         return WorkflowStepOutcome(
             state=STATE_CHILD_WORKER_DISPATCH,
             next_action=(
@@ -369,14 +428,14 @@ def resolve_herdr_workflow_step(
                 f"({anchor_pointer}) and a single live same-lane worker: dispatch or monitor "
                 "it with `sublane dispatch-worker --execute`. Whether to dispatch (worker idle) "
                 "or monitor (implementation in flight) is settled by the lane's Redmine gate — "
-                "herdr-native gate resolution + one-step auto-dispatch is increment 2."
+                "one-step auto-dispatch fires only under a coordinator dispatch authorization."
             ),
             execution=EXECUTION_NO_OP,
             reason=REASON_HERDR_WORKER_DISPATCH_READY,
             next_owner=OWNER_CHILD,
             primitive=PRIMITIVE_NONE,
             durable_anchor=anchor_pointer or "none",
-            detail=lane.detail,
+            detail=lane.detail + monitor_detail,
             **base,
         )
 
@@ -428,6 +487,8 @@ __all__ = (
     "ANCHOR_STORE_MISMATCH",
     "REASON_HERDR_WORKER_STEP_READY",
     "REASON_HERDR_WORKER_DISPATCH_READY",
+    "REASON_HERDR_DISPATCH_AUTHORIZED",
+    "REASON_HERDR_DISPATCH_BLOCKED",
     "REASON_HERDR_WORKER_SLOT_MISSING",
     "REASON_HERDR_WORKER_AMBIGUOUS",
     "REASON_HERDR_WORKER_LOCATOR_MISSING",
