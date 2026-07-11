@@ -402,7 +402,10 @@ def _render_gate_record(
     binding: Optional[GrandchildBinding] = None,
 ) -> str:
     """Pasteable ``## Grandchild realization gate`` record (Redmine #12474 / j#64151)."""
-    delegated = getattr(args, "delegated_coordinator_unit", None) or "<delegated_coordinator_unit>"
+    # Redact a malformed (e.g. path-like) coordinator context so no private path
+    # reaches the pasteable record (Redmine #13571 R7-F2).
+    delegated_raw = getattr(args, "delegated_coordinator_unit", None)
+    delegated = redact_unit_token(delegated_raw) if delegated_raw else "<delegated_coordinator_unit>"
     parent_issue = getattr(args, "parent_issue", None) or "<parent_issue>"
     child_issue = getattr(args, "child_issue", None) or "<child_issue>"
     # Redact a malformed (e.g. absolute-path typo) unit so a private host path
@@ -483,7 +486,7 @@ def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
         payload = {
             "verdict": result.verdict,
             "grandchild_required": result.grandchild_required,
-            "delegated_coordinator_unit": args.delegated_coordinator_unit,
+            "delegated_coordinator_unit": redact_unit_token(args.delegated_coordinator_unit),
             "dispatch_selected_grandchild_unit": (
                 redact_unit_token(gc_unit) if gc_unit else None
             ),

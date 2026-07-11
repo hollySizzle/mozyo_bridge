@@ -398,17 +398,26 @@ def _is_stable_unit(unit_id: Optional[object]) -> bool:
     """Whether ``unit_id`` is a portable stable ``<workspace_id>/<lane_id>`` pointer.
 
     A stable unit has exactly one ``/`` with both components non-empty and is not
-    path-like (no leading ``/`` / ``~`` / ``.``, no backslash). An operator typo
-    such as an absolute ``/Users/...`` / ``/home/...`` path, a ``~`` home
-    reference, or a Windows path is NOT a stable identity (Redmine #13571 R6-F1).
+    path-like. Rejected as path-like: a leading ``/`` / ``~`` / ``.``, any
+    backslash (a Windows path), a drive-letter prefix such as ``C:`` / ``C:/``
+    (a forward-slash Windows drive-root/relative path — platform independent), and
+    any ``.`` / ``..`` component. So an operator typo such as an absolute
+    ``/Users/...`` / ``/home/...`` path, a ``~`` home reference, ``C:/private``,
+    or ``ws/..`` is NOT a stable identity (Redmine #13571 R6-F1 / R7-F1).
     """
     if unit_id is None:
         return False
     s = str(unit_id).strip()
     if not s or s.startswith(("/", "~", ".")) or "\\" in s:
         return False
+    # Windows drive-root / drive-relative (``C:`` / ``C:/x`` / ``C:x``), independent
+    # of the running platform's separator.
+    if len(s) >= 2 and s[0].isalpha() and s[1] == ":":
+        return False
     parts = s.split("/")
-    return len(parts) == 2 and all(parts)
+    if len(parts) != 2 or not all(parts):
+        return False
+    return not any(part in (".", "..") for part in parts)
 
 
 def redact_unit_token(unit_id: Optional[object]) -> str:
@@ -482,6 +491,13 @@ class GrandchildTargetIdentity:
             )
         if not (self.delegation_parent or "").strip():
             problems.append("delegation_parent (the delegated coordinator unit) is required")
+        elif not _is_stable_unit(self.delegation_parent):
+            # The parent is also a stable-unit pointer, never a path — a path-like
+            # parent must not bind (routing safety) nor leak (Redmine #13571 R7-F2).
+            problems.append(
+                f"delegation_parent {redact_unit_token(self.delegation_parent)} must "
+                "be a stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
         if not (self.repo_identity or "").strip():
             problems.append("a canonical repo identity (the --target-repo gate) is required")
         if self.lane_kind != LANE_KIND_IMPLEMENTATION:
@@ -621,6 +637,21 @@ def resolve_realized_grandchild_binding(
     the shared canonical :func:`repo_identity_matches` helper, and any repo named
     in a reason is redacted to its basename (F3).
     """
+    # The gate's own delegated-coordinator context must be a stable-unit pointer,
+    # never a path — a malformed context fails closed and is redacted, so a
+    # path-like coordinator can neither open the gate nor leak (Redmine #13571
+    # R7-F2).
+    if not _is_stable_unit(delegated_coordinator_unit):
+        return GrandchildBinding(
+            outcome=BINDING_UNBOUND,
+            matched_unit=None,
+            reason=(
+                "delegated coordinator context "
+                f"{redact_unit_token(delegated_coordinator_unit)} is not a stable "
+                "<workspace_id>/<lane_id> unit; the gate cannot bind a grandchild "
+                "under a malformed coordinator context."
+            ),
+        )
     if target is None or not target.is_bindable:
         detail = (
             "no target supplied"
@@ -644,9 +675,9 @@ def resolve_realized_grandchild_binding(
             outcome=BINDING_MISMATCH,
             matched_unit=None,
             reason=(
-                f"target grandchild {target.unit_id!r} declares parent "
-                f"{target.delegation_parent!r}, but the gate binds under delegated "
-                f"coordinator {delegated_coordinator_unit!r}."
+                f"target grandchild {redact_unit_token(target.unit_id)} declares parent "
+                f"{redact_unit_token(target.delegation_parent)}, but the gate binds "
+                f"under delegated coordinator {redact_unit_token(delegated_coordinator_unit)}."
             ),
         )
 
@@ -707,7 +738,8 @@ def resolve_realized_grandchild_binding(
         )
     if unit.delegation_parent != delegated_coordinator_unit:
         problems.append(
-            f"parent={unit.delegation_parent!r} (expected {delegated_coordinator_unit!r})"
+            f"parent={redact_unit_token(unit.delegation_parent)} "
+            f"(expected {redact_unit_token(delegated_coordinator_unit)})"
         )
     if not repo_identity_matches(unit.repo_identity, target.repo_identity):
         problems.append(

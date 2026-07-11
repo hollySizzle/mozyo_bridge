@@ -475,12 +475,18 @@ class UnitIdentityPrivacyTest(unittest.TestCase):
 
     # Built from parts at runtime so the tracked source never contains a literal
     # `/Users/<name>` / `C:\\Users\\<name>` home-path shape (the tracked-file
-    # secret-literal rule), while still exercising those shapes at runtime.
+    # secret-literal rule), while still exercising those shapes at runtime. Also
+    # covers forward-slash Windows drive paths and dot components (R7-F1).
     _SYNTHETIC = (
         "/" + "Users" + "/synthetic/private/repo",
         "/" + "home" + "/synthetic/private/repo",
         "~/synthetic-private",
         "C:" + chr(92) + "Users" + chr(92) + "synthetic",
+        "C:/synthetic-private",
+        "D:/x",
+        "C:relative",
+        "ws/.",
+        "ws/..",
     )
 
     def test_redact_unit_token_redacts_pathlike_keeps_stable(self) -> None:
@@ -538,6 +544,109 @@ class UnitIdentityPrivacyTest(unittest.TestCase):
     def test_valid_stable_unit_still_displayed_in_gate_record(self) -> None:
         rc, out = self._gate_output("ws-gc/lane-gc", as_json=True)
         self.assertIn("ws-gc/lane-gc", out)
+
+
+class ParentIdentityStableUnitTest(unittest.TestCase):
+    """#13571 j#75508 R7-F2: the delegation parent is a stable unit, never a path.
+
+    A path-like parent / coordinator context must neither open the realization
+    gate (routing safety) nor leak a raw private path into any durable surface,
+    in both directions (malformed target/gate context, and malformed live parent).
+    """
+
+    _PATH_PARENT = "/" + "Users" + "/synthetic/private/delegated"
+
+    def _unit(self, parent, *, kind="implementation", depth=2):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            InventoryUnit,
+        )
+
+        return InventoryUnit(
+            unit_id=_GC_UNIT,
+            lane_kind=kind,
+            delegation_depth=depth,
+            delegation_parent=parent,
+            status="derived",
+            repo_identity="/ws/child",
+            has_codex_gateway=True,
+            ambiguous=False,
+        )
+
+    def _target(self, parent):
+        return GrandchildTargetIdentity(
+            unit_id=_GC_UNIT, delegation_parent=parent, repo_identity="/ws/child"
+        )
+
+    def test_pathlike_parent_and_context_is_unbound_no_leak(self) -> None:
+        # All three parent strings equal the same path (the R7-F2 realize repro):
+        # must fail closed and never leak.
+        binding = resolve_realized_grandchild_binding(
+            [self._unit(self._PATH_PARENT)],
+            target=self._target(self._PATH_PARENT),
+            delegated_coordinator_unit=self._PATH_PARENT,
+        )
+        self.assertEqual(BINDING_UNBOUND, binding.outcome)
+        self.assertNotIn(self._PATH_PARENT, binding.reason)
+        self.assertIn(REDACTED_UNIT_TOKEN, binding.reason)
+
+    def test_pathlike_gate_context_with_valid_target_is_unbound_no_leak(self) -> None:
+        # A malformed gate coordinator context fails closed even with a valid
+        # target parent (the gate context is validated first).
+        binding = resolve_realized_grandchild_binding(
+            [self._unit("mz/lane-deleg")],
+            target=self._target("mz/lane-deleg"),
+            delegated_coordinator_unit=self._PATH_PARENT,
+        )
+        self.assertEqual(BINDING_UNBOUND, binding.outcome)
+        self.assertNotIn(self._PATH_PARENT, binding.reason)
+        self.assertIn(REDACTED_UNIT_TOKEN, binding.reason)
+
+    def test_valid_target_parent_malformed_live_parent_is_mismatch_no_leak(self) -> None:
+        # The other direction: a valid target/gate parent but a malformed live
+        # observed parent -> mismatch, and the raw live value is redacted.
+        binding = resolve_realized_grandchild_binding(
+            [self._unit(self._PATH_PARENT)],
+            target=self._target("mz/lane-deleg"),
+            delegated_coordinator_unit="mz/lane-deleg",
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+        self.assertNotIn(self._PATH_PARENT, binding.reason)
+
+    def test_valid_parent_realizes(self) -> None:
+        binding = resolve_realized_grandchild_binding(
+            [self._unit("mz/lane-deleg")],
+            target=self._target("mz/lane-deleg"),
+            delegated_coordinator_unit="mz/lane-deleg",
+        )
+        self.assertEqual(BINDING_REALIZED, binding.outcome)
+
+    def test_cli_pathlike_context_blocks_and_does_not_leak(self) -> None:
+        import argparse
+        import contextlib
+        import io
+
+        for as_json in (True, False):
+            args = argparse.Namespace(
+                delegated_coordinator_unit=self._PATH_PARENT,
+                grandchild_unit=_GC_UNIT,
+                grandchild_repo="/ws/child",
+                require_grandchild=True,
+                parent_issue="1",
+                child_issue="2",
+                session=None,
+                as_json=as_json,
+            )
+            buf = io.StringIO()
+            patch = (
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+                "application.grandchild_stamp._discover_delegation_units"
+            )
+            with mock.patch(patch, return_value=[self._unit(self._PATH_PARENT)]), contextlib.redirect_stdout(buf):
+                rc = cmd_handoff_grandchild_gate(args)
+            out = buf.getvalue()
+            self.assertEqual(3, rc, msg=f"as_json={as_json}")
+            self.assertNotIn(self._PATH_PARENT, out, msg=f"as_json={as_json}")
+            self.assertIn(REDACTED_UNIT_TOKEN, out, msg=f"as_json={as_json}")
 
 
 class PublicCatalogResolverContractTest(unittest.TestCase):
