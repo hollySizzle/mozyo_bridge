@@ -422,6 +422,39 @@ class GrandchildTargetIdentity:
     delegation_depth: int = GRANDCHILD_DEPTH
     repo_identity: Optional[str] = None
 
+    def bindability_problems(self) -> list[str]:
+        """The specific conditions this identity fails for binding, in order.
+
+        Empty when :attr:`is_bindable`. Each entry names one unmet requirement so
+        the durable :data:`BINDING_UNBOUND` reason explains *why* a target could
+        not bind — including the canonical grandchild-shape conditions, so a
+        non-grandchild target (a coordinator, a delegated coordinator, or a
+        depth-1 lane) that otherwise carries a unit / parent / repo is not
+        misdiagnosed as merely "missing a field" (Redmine #13571 j#75494 R5-F2).
+        """
+        problems: list[str] = []
+        workspace, lane = _split_workspace_lane(self.unit_id)
+        if not (workspace and lane):
+            problems.append(
+                f"unit_id {self.unit_id!r} must be <workspace_id>/<lane_id> with "
+                "both components non-empty"
+            )
+        if not (self.delegation_parent or "").strip():
+            problems.append("delegation_parent (the delegated coordinator unit) is required")
+        if not (self.repo_identity or "").strip():
+            problems.append("a canonical repo identity (the --target-repo gate) is required")
+        if self.lane_kind != LANE_KIND_IMPLEMENTATION:
+            problems.append(
+                f"KIND={self.lane_kind!r} is not the fixed grandchild acceptance "
+                f"shape (must be {LANE_KIND_IMPLEMENTATION!r})"
+            )
+        if not (type(self.delegation_depth) is int and self.delegation_depth == GRANDCHILD_DEPTH):
+            problems.append(
+                f"DEPTH={self.delegation_depth!r} is not the fixed grandchild depth "
+                f"(must be the plain int {GRANDCHILD_DEPTH})"
+            )
+        return problems
+
     @property
     def is_bindable(self) -> bool:
         """True only for a fully-specified, exactly-bindable grandchild identity.
@@ -434,21 +467,10 @@ class GrandchildTargetIdentity:
         A caller cannot relax the KIND / depth to bind a non-grandchild lane (a
         coordinator, a delegated coordinator, or a depth-1 same-lane worker); such
         a target fails closed to :data:`BINDING_UNBOUND`
-        (Redmine #13571 F2 (b)/(d), j#75487 R4-F1).
+        (Redmine #13571 F2 (b)/(d), j#75487 R4-F1). See
+        :meth:`bindability_problems` for the per-condition breakdown.
         """
-        workspace, lane = _split_workspace_lane(self.unit_id)
-        depth_ok = (
-            type(self.delegation_depth) is int
-            and self.delegation_depth == GRANDCHILD_DEPTH
-        )
-        return bool(
-            workspace
-            and lane
-            and (self.delegation_parent or "").strip()
-            and (self.repo_identity or "").strip()
-            and self.lane_kind == LANE_KIND_IMPLEMENTATION
-            and depth_ok
-        )
+        return not self.bindability_problems()
 
 
 @dataclass(frozen=True)
@@ -559,14 +581,19 @@ def resolve_realized_grandchild_binding(
     in a reason is redacted to its basename (F3).
     """
     if target is None or not target.is_bindable:
+        detail = (
+            "no target supplied"
+            if target is None
+            else "; ".join(target.bindability_problems())
+        )
         return GrandchildBinding(
             outcome=BINDING_UNBOUND,
             matched_unit=None,
             reason=(
                 "no bindable dispatch-selected grandchild target identity "
-                "(needs non-empty workspace/lane, parent, and a canonical repo); "
-                "the gate cannot bind to an exact grandchild lane (a same-lane "
-                "worker handoff is never acceptance without a bound target)."
+                f"({detail}); the gate cannot bind to an exact grandchild lane "
+                "(a same-lane worker handoff is never acceptance without a bound "
+                "target)."
             ),
         )
     # The target's declared parent must be the coordinator this gate runs under;

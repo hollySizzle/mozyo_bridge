@@ -45,7 +45,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _discover_delegation_units,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (  # noqa: E402
+    BINDING_MISMATCH,
     BINDING_REALIZED,
+    BINDING_UNBOUND,
     GrandchildTargetIdentity,
     resolve_realized_grandchild_binding,
 )
@@ -392,41 +394,66 @@ class CanonicalGrandchildShapeTest(unittest.TestCase):
             repo_identity="/ws/child",
         )
 
-    def test_non_grandchild_target_shape_is_unbound(self) -> None:
+    def test_non_grandchild_target_shape_is_exactly_unbound(self) -> None:
         # A caller aligning BOTH target and live unit to a non-grandchild shape
-        # must not realize (the prior fail-open). Each is unbound (not bindable).
+        # must be EXACTLY unbound (not misclassified as missing/ambiguous), the
+        # prior fail-open (Redmine #13571 j#75494 R5-F2).
         for kind, depth in (
             ("coordinator", 2),
             ("delegated_coordinator", 2),
             ("implementation", 1),
             ("implementation", 3),
+            ("implementation", True),
         ):
             binding = resolve_realized_grandchild_binding(
                 [self._unit(kind, depth)],
                 target=self._target(kind, depth),
                 delegated_coordinator_unit=_DELEG_UNIT,
             )
-            self.assertNotEqual(
-                BINDING_REALIZED, binding.outcome, msg=f"{kind}/{depth}"
-            )
+            self.assertEqual(BINDING_UNBOUND, binding.outcome, msg=f"{kind}/{depth}")
             self.assertFalse(self._target(kind, depth).is_bindable, msg=f"{kind}/{depth}")
 
-    def test_bool_depth_is_not_a_valid_grandchild_depth(self) -> None:
-        # `True` is an int subclass equal to 1; it must not pass as depth 2 nor
-        # sneak through as a truthy depth.
-        self.assertFalse(self._target("implementation", True).is_bindable)
+    def test_unbound_reason_names_the_canonical_kind_depth_condition(self) -> None:
+        # The durable unbound reason must explain WHY a shape-wrong target failed
+        # (not the generic missing-field text), and must not leak a host path.
+        kind_binding = resolve_realized_grandchild_binding(
+            [self._unit("coordinator", 2)],
+            target=self._target("coordinator", 2),
+            delegated_coordinator_unit=_DELEG_UNIT,
+        )
+        self.assertIn("KIND", kind_binding.reason)
+        self.assertIn("implementation", kind_binding.reason)
+        depth_binding = resolve_realized_grandchild_binding(
+            [self._unit("implementation", 1)],
+            target=self._target("implementation", 1),
+            delegated_coordinator_unit=_DELEG_UNIT,
+        )
+        self.assertIn("DEPTH", depth_binding.reason)
+        self.assertIn("plain int 2", depth_binding.reason)
+        for reason in (kind_binding.reason, depth_binding.reason):
+            self.assertNotIn("/Users", reason)
+            self.assertNotIn("/home", reason)
 
-    def test_canonical_target_but_wrong_live_kind_is_mismatch(self) -> None:
+    def test_canonical_target_but_wrong_live_kind_is_exactly_mismatch(self) -> None:
         # A canonical (bindable) target whose live unit is a coordinator lane must
-        # mismatch — the live row is checked against the canonical constant.
+        # be EXACTLY identity_mismatch — the live row is checked against the
+        # canonical constant.
         binding = resolve_realized_grandchild_binding(
             [self._unit("coordinator", 2)],
             target=self._target("implementation", 2),
             delegated_coordinator_unit=_DELEG_UNIT,
         )
-        self.assertNotEqual(BINDING_REALIZED, binding.outcome)
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
 
-    def test_canonical_shape_realizes(self) -> None:
+    def test_canonical_target_but_wrong_live_depth_is_exactly_mismatch(self) -> None:
+        binding = resolve_realized_grandchild_binding(
+            [self._unit("implementation", 1)],
+            target=self._target("implementation", 2),
+            delegated_coordinator_unit=_DELEG_UNIT,
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+
+    def test_canonical_shape_is_exactly_realized(self) -> None:
         binding = resolve_realized_grandchild_binding(
             [self._unit("implementation", 2)],
             target=self._target("implementation", 2),

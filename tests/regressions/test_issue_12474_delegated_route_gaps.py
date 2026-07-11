@@ -194,10 +194,11 @@ class DispatchSelectedAuthorityRegressionTest(unittest.TestCase):
         self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
 
     def test_launch_target_with_non_grandchild_shape_blocks(self) -> None:
-        # #13571 j#75487 R4-F1: a launch's explicit target that carries a
-        # non-grandchild KIND / depth cannot open the gate (the acceptance shape
-        # is the fixed implementation/depth-2 invariant, not caller-tunable).
-        for kind, depth in (("coordinator", 2), ("implementation", 1)):
+        # #13571 j#75487 R4-F1 / j#75494 R5-F1: reproduce the OLD fail-open shape
+        # at the route-plan seam — the launch's explicit target AND the live unit
+        # are BOTH aligned to the same non-grandchild KIND / depth. On the old
+        # code this realized; now the fixed grandchild-shape invariant blocks it.
+        for kind, depth in (("coordinator", 2), ("implementation", 1), ("implementation", True)):
             created = GrandchildTargetIdentity(
                 unit_id=GRANDCHILD_UNIT,
                 delegation_parent=DELEGATED_COORDINATOR_UNIT,
@@ -209,12 +210,33 @@ class DispatchSelectedAuthorityRegressionTest(unittest.TestCase):
                 base_request(
                     candidates=[],
                     grandchild_target=created,
-                    realized_units=realized_grandchild_rows(),
+                    realized_units=realized_grandchild_rows(
+                        lane_kind=kind, delegation_depth=depth
+                    ),
                 )
             )
-            self.assertTrue(plan.dispatch_decision.is_launch)
+            self.assertTrue(plan.dispatch_decision.is_launch, msg=f"{kind}/{depth}")
             self.assertEqual(PLAN_BLOCKED, plan.verdict, msg=f"{kind}/{depth}")
-            self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict)
+            self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict, msg=f"{kind}/{depth}")
+
+    def test_launch_canonical_shape_proceeds(self) -> None:
+        # The positive control: a canonical launch target + canonical live unit
+        # still proceeds (the invariant blocks only non-grandchild shapes).
+        created = GrandchildTargetIdentity(
+            unit_id=GRANDCHILD_UNIT,
+            delegation_parent=DELEGATED_COORDINATOR_UNIT,
+            repo_identity=CHILD_REPO_IDENTITY,
+        )
+        plan = plan_delegated_coordinator_route(
+            base_request(
+                candidates=[],
+                grandchild_target=created,
+                realized_units=realized_grandchild_rows(),
+            )
+        )
+        self.assertTrue(plan.dispatch_decision.is_launch)
+        self.assertEqual(PLAN_PROCEED, plan.verdict)
+        self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
 
     def test_launch_target_colliding_with_prelaunch_candidate_blocks(self) -> None:
         # #13571 j#75473 F5: a launch dispatch whose explicit target names an

@@ -138,19 +138,23 @@ def realized_grandchild_rows(
     repo_identity: Optional[str] = CHILD_REPO_IDENTITY,
     has_codex_gateway: bool = True,
     ambiguous: bool = False,
+    lane_kind: str = LANE_KIND_IMPLEMENTATION,
+    delegation_depth: object = 2,
 ) -> list[InventoryUnit]:
     """A live-inventory unit set in which a depth-2 implementation grandchild is realized.
 
     Typed :class:`InventoryUnit` (not a bare tuple): a positive realization
     requires a re-resolved codex gateway (``has_codex_gateway``) and a canonical
     ``repo_identity`` so the dispatch-selected target re-verifies end to end
-    (Redmine #13571 j#75473 F2). A bare tuple can never realize.
+    (Redmine #13571 j#75473 F2). A bare tuple can never realize. ``lane_kind`` /
+    ``delegation_depth`` override the live shape so a test can align the live unit
+    to a non-grandchild shape (Redmine #13571 j#75494 R5-F1).
     """
     return [
         InventoryUnit(
             unit_id=unit_id,
-            lane_kind=LANE_KIND_IMPLEMENTATION,
-            delegation_depth=2,
+            lane_kind=lane_kind,
+            delegation_depth=delegation_depth,  # type: ignore[arg-type]
             delegation_parent=parent,
             status="derived",
             repo_identity=repo_identity,
