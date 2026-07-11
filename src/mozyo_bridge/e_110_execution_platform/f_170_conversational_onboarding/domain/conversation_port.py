@@ -50,12 +50,46 @@ __all__ = (
     "build_turn_json_schema",
     "build_tool_schema",
     "sanitize_facts",
+    "sanitize_display_text",
 )
 
 #: Fail-closed code a binding raises when the provider cannot be operated safely
 #: (missing binary, timeout, non-zero exit, malformed output). The bare-entry
 #: driver renders it and mutates nothing (Redmine #13497 j#74915).
 PROVIDER_UNAVAILABLE = "conversation_provider_unavailable"
+
+# Model-authored display text is untrusted terminal output: newline / tab are
+# kept, but every other C0 control, DEL, the C1 range, and the Unicode bidi /
+# direction overrides are rendered as a visible escape so a provider can never
+# emit raw escape sequences that drive the terminal (title / clipboard / cursor)
+# or spoof the human-confirmation UI with reordered text (Redmine #13497 j#74970 F2).
+_DISPLAY_ALLOWED_CONTROLS: frozenset[str] = frozenset({"\n", "\t"})
+_DISPLAY_BIDI_CONTROLS: frozenset[int] = frozenset(
+    {0x200E, 0x200F, 0x061C, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+     0x2066, 0x2067, 0x2068, 0x2069}
+)
+
+
+def sanitize_display_text(text: str) -> str:
+    """Escape control / direction characters in untrusted model display text.
+
+    Keeps ``\\n`` / ``\\t``; replaces every other C0 control, ``DEL``, the C1
+    range, and the bidi / direction overrides with a visible ``\\xNN`` / ``\\uNNNN``
+    escape (never silently dropped). Printable text is returned unchanged.
+    """
+    out: list[str] = []
+    for ch in text:
+        if ch in _DISPLAY_ALLOWED_CONTROLS:
+            out.append(ch)
+            continue
+        cp = ord(ch)
+        if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+            out.append(f"\\x{cp:02x}")
+        elif cp in _DISPLAY_BIDI_CONTROLS:
+            out.append(f"\\u{cp:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 @dataclass(frozen=True)

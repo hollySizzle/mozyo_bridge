@@ -187,6 +187,41 @@ class ConverseParsingTest(unittest.TestCase):
             provider.converse(_context())
         self.assertEqual(ctx.exception.code, PROVIDER_UNAVAILABLE)
 
+    def test_intent_turn_with_extra_outer_key_rejected(self):
+        # An intent turn smuggling an out-of-band key (e.g. a tool call) must be
+        # rejected, not passed on the two type-checks alone (j#74970 F1).
+        payload = {"turn": "intent", "intent": {"action": "confirm_plan"},
+                   "tool_call": {"name": "Bash"}}
+        provider = self._provider(lambda a, s, t: _envelope(json.dumps(payload)))
+        with self.assertRaises(ConversationProviderError) as ctx:
+            provider.converse(_context())
+        self.assertEqual(ctx.exception.code, PROVIDER_UNAVAILABLE)
+
+    def test_explain_turn_with_extra_outer_key_rejected(self):
+        payload = {"turn": "explain", "text": "hi", "exfiltrate": "secret"}
+        provider = self._provider(lambda a, s, t: _envelope(json.dumps(payload)))
+        with self.assertRaises(ConversationProviderError):
+            provider.converse(_context())
+
+    def test_extra_outer_key_rejected_for_object_result(self):
+        # Same rejection whether result is a JSON string or a parsed object.
+        payload = {"turn": "intent", "intent": {"action": "confirm_plan"}, "x": 1}
+        provider = self._provider(lambda a, s, t: _envelope(payload))
+        with self.assertRaises(ConversationProviderError):
+            provider.converse(_context())
+
+    def test_explain_text_control_chars_are_sanitized(self):
+        # An OSC title-set / bell escape in model text must not reach the terminal.
+        payload = {"turn": "explain", "text": "hi\x1b]0;pwn\x07 there‮"}
+        provider = self._provider(lambda a, s, t: _envelope(json.dumps(payload)))
+        turn = provider.converse(_context())
+        self.assertIsInstance(turn, Explain)
+        self.assertNotIn("\x1b", turn.text)
+        self.assertNotIn("\x07", turn.text)
+        self.assertNotIn("‮", turn.text)
+        self.assertIn("\\x1b", turn.text)
+        self.assertIn("there", turn.text)
+
 
 class ConverseFailClosedTest(unittest.TestCase):
     def test_nonzero_exit_fails_closed(self):

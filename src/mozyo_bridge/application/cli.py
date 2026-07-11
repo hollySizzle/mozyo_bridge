@@ -417,6 +417,7 @@ def _bare_mozyo_entry(args: argparse.Namespace, argv: Optional[list[str]]) -> in
         launch_adopted=lambda: _backend_aware_launch(args, target_root),
         provider=SafeClaudeCliProvider(),
         gate_secret=os.environ.get(GATE_SECRET_ENV),
+        json_output=bool(getattr(args, "json_output", False)),
     )
 
 

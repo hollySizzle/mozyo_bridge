@@ -59,6 +59,7 @@ from ...domain.conversation_port import (
     Explain,
     IntentCandidate,
     build_turn_json_schema,
+    sanitize_display_text,
 )
 from .provider_binary import resolve_claude_binary
 
@@ -298,14 +299,26 @@ def _extract_result(stdout: str) -> object:
     return envelope["result"]
 
 
+# The closed outer key sets a turn envelope may carry — an extra / missing key is
+# a malformed turn (Redmine #13497 j#74970 F1). The generation-time --json-schema
+# is defense-in-depth; this post-hoc validator is the fail-closed authority so an
+# ``explain``/``intent`` turn smuggling an extra out-of-band key (e.g. a tool call)
+# is rejected rather than silently passed on the two type-checks alone.
+_EXPLAIN_KEYS: frozenset[str] = frozenset({"turn", "text"})
+_INTENT_KEYS: frozenset[str] = frozenset({"turn", "intent"})
+
+
 def _parse_turn(result: object) -> ConversationTurn:
     """Coerce the envelope ``result`` into exactly one closed :class:`ConversationTurn`.
 
     ``result`` is either a JSON string or an already-parsed object (both shapes
-    the CLI may emit under ``--json-schema``). The turn's ``turn`` must be
-    ``explain`` or ``intent``; anything else fails closed. The raw ``intent``
-    mapping is passed through untouched so the loop's ``validate_onboarding_intent``
-    remains the single fail-closed authority over the intent contents.
+    the CLI may emit under ``--json-schema``). The envelope must be **exactly** an
+    ``explain`` turn (``{turn, text}``) or an ``intent`` turn (``{turn, intent}``)
+    — an unknown ``turn``, an unexpected extra key, or a missing key fails closed.
+    Display ``text`` is sanitized (untrusted terminal output, j#74970 F2); the raw
+    ``intent`` mapping is passed through untouched so the loop's
+    ``validate_onboarding_intent`` stays the single fail-closed authority over the
+    intent contents.
     """
     if isinstance(result, str):
         try:
@@ -320,15 +333,26 @@ def _parse_turn(result: object) -> ConversationTurn:
         raise ConversationProviderError(
             PROVIDER_UNAVAILABLE, "conversation turn is not a JSON object"
         )
+    keys = set(obj)
     kind = obj.get("turn")
     if kind == "explain":
+        if keys != _EXPLAIN_KEYS:
+            raise ConversationProviderError(
+                PROVIDER_UNAVAILABLE,
+                "explain turn must have exactly the keys {turn, text}",
+            )
         explain_text = obj.get("text")
         if not isinstance(explain_text, str):
             raise ConversationProviderError(
-                PROVIDER_UNAVAILABLE, "explain turn has no text"
+                PROVIDER_UNAVAILABLE, "explain turn text must be a string"
             )
-        return Explain(text=explain_text)
+        return Explain(text=sanitize_display_text(explain_text))
     if kind == "intent":
+        if keys != _INTENT_KEYS:
+            raise ConversationProviderError(
+                PROVIDER_UNAVAILABLE,
+                "intent turn must have exactly the keys {turn, intent}",
+            )
         intent = obj.get("intent")
         if not isinstance(intent, Mapping):
             raise ConversationProviderError(

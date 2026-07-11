@@ -97,6 +97,18 @@ class LoopHappyPathTest(unittest.TestCase):
         # The human reply was threaded into the second context.
         self.assertEqual(provider.seen[1].messages[-1]["text"], "a fresh folder")
 
+    def test_explain_text_is_sanitized_before_render(self):
+        # Even a provider that returns raw control chars is escaped at the loop's
+        # render boundary — no raw ESC reaches the IO (j#74970 F2).
+        provider = ScriptedProvider(
+            [Explain("danger\x1b[2Jclear"), IntentCandidate(_READY_INTENT)]
+        )
+        io = ScriptedIO(["ok"])
+        run_onboarding_conversation(provider, _context(), io)
+        shown = "".join(io.shown)
+        self.assertNotIn("\x1b", shown)
+        self.assertIn("\\x1b", shown)
+
 
 class LoopRejectionTest(unittest.TestCase):
     def test_invalid_candidate_loops_back_as_structured_error(self):

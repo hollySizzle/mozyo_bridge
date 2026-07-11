@@ -404,6 +404,39 @@ class BareMozyoBackendRoutingTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         return called["tmux"], called["herdr"]
 
+    def test_fresh_json_emits_single_json_no_launch(self) -> None:
+        # #13497 j#74970 F3: bare `mozyo --json` on an unadopted root must emit a
+        # single machine-readable JSON object and never launch or read stdin.
+        import contextlib
+        import json as _json
+
+        from mozyo_bridge.application import cli
+        from mozyo_bridge.application import herdr_launch_command
+
+        called = {"tmux": False, "herdr": False}
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orig_tmux = cli.cmd_mozyo
+            orig_herdr = herdr_launch_command.cmd_mozyo_herdr
+            cli.cmd_mozyo = lambda args: called.__setitem__("tmux", True) or 0
+            herdr_launch_command.cmd_mozyo_herdr = (
+                lambda args: called.__setitem__("herdr", True) or 0
+            )
+            try:
+                with mock.patch("sys.stdin", io.StringIO("")), \
+                     contextlib.redirect_stdout(buf):
+                    rc = cli.main(["--repo", str(repo), "--json"])
+            finally:
+                cli.cmd_mozyo = orig_tmux
+                herdr_launch_command.cmd_mozyo_herdr = orig_herdr
+
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(called["tmux"])
+        self.assertFalse(called["herdr"])
+        obj = _json.loads(buf.getvalue())  # exactly one JSON object
+        self.assertIn("error", obj)
+
     def test_config_absent_enters_onboarding_not_tmux(self) -> None:
         # #13497: an unadopted directory no longer auto-launches tmux; bare
         # `mozyo` enters onboarding. With no human on stdin it cancels/blocks

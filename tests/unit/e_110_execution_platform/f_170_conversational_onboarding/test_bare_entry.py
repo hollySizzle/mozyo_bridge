@@ -9,8 +9,11 @@ routing + launch wiring is isolated.
 
 from __future__ import annotations
 
+import json
 import types
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -267,6 +270,105 @@ class FreshOnboardingTest(unittest.TestCase):
             )
         self.assertEqual(rc, 1)
         self.assertEqual(launch.calls, 0)
+
+
+class StrictNoIO:
+    """An IO that fails the test if any interactive method is touched."""
+
+    def show(self, text):
+        raise AssertionError("show() must not be called under --json")
+
+    def prompt(self):
+        raise AssertionError("stdin must not be read under --json")
+
+    def confirm(self, text):
+        raise AssertionError("confirm() must not be called under --json")
+
+
+class JsonModeTest(unittest.TestCase):
+    """--json machine-readable contract: no prose/prompt mixing (j#74970 F3)."""
+
+    def _run_json(self, **patches):
+        launch = Launch()
+        apply_mock = mock.Mock()
+        resume_mock = mock.Mock()
+        buf = StringIO()
+        ctxs = [
+            mock.patch.object(be, "apply_plan", apply_mock),
+            mock.patch.object(be, "resume_onboarding", resume_mock),
+        ]
+        for name, val in patches.items():
+            ctxs.append(mock.patch.object(be, name, val))
+        with redirect_stdout(buf):
+            for c in ctxs:
+                c.__enter__()
+            try:
+                rc = be.run_bare_entry(
+                    target_root=_ROOT, launch_adopted=launch,
+                    provider=FakeProvider([]), gate_secret="s",
+                    io=StrictNoIO(), json_output=True,
+                )
+            finally:
+                for c in reversed(ctxs):
+                    c.__exit__(None, None, None)
+        return rc, buf.getvalue(), launch, apply_mock, resume_mock
+
+    def test_adopted_complete_launches_under_json(self):
+        launch = Launch()
+        with mock.patch.object(
+            be, "classify_adoption",
+            return_value=AdoptionStatus(ADOPTION_COMPLETE, _ROOT),
+        ):
+            rc = be.run_bare_entry(
+                target_root=_ROOT, launch_adopted=launch, provider=FakeProvider([]),
+                gate_secret="s", io=StrictNoIO(), json_output=True,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(launch.calls, 1)
+
+    def test_fresh_unadopted_emits_single_json_no_launch_no_mutation(self):
+        rc, out, launch, apply_mock, resume_mock = self._run_json(
+            classify_adoption=mock.Mock(return_value=AdoptionStatus("absent", _ROOT)),
+            inspect_onboarding=mock.Mock(return_value=_inspection("unadopted")),
+        )
+        self.assertEqual(rc, 1)
+        obj = json.loads(out)  # exactly one JSON object, parseable
+        self.assertEqual(obj["error"], "interactive_onboarding_required")
+        self.assertEqual(launch.calls, 0)
+        apply_mock.assert_not_called()
+
+    def test_in_progress_emits_json_no_resume(self):
+        rc, out, launch, apply_mock, resume_mock = self._run_json(
+            classify_adoption=mock.Mock(
+                return_value=AdoptionStatus(ADOPTION_IN_PROGRESS, _ROOT)),
+        )
+        self.assertEqual(rc, 1)
+        obj = json.loads(out)
+        self.assertEqual(obj["error"], "interactive_onboarding_required")
+        self.assertEqual(obj["state"], "adoption_in_progress")
+        resume_mock.assert_not_called()
+        self.assertEqual(launch.calls, 0)
+
+    def test_broken_emits_json(self):
+        rc, out, launch, apply_mock, resume_mock = self._run_json(
+            classify_adoption=mock.Mock(
+                return_value=AdoptionStatus(ADOPTION_BROKEN, _ROOT, reason="bad")),
+        )
+        self.assertEqual(rc, 1)
+        obj = json.loads(out)
+        self.assertEqual(obj["error"], "onboarding_blocked")
+        self.assertEqual(launch.calls, 0)
+
+    def test_blocked_emits_json(self):
+        rc, out, launch, apply_mock, resume_mock = self._run_json(
+            classify_adoption=mock.Mock(return_value=AdoptionStatus("absent", _ROOT)),
+            inspect_onboarding=mock.Mock(
+                return_value=_inspection("blocked", reasons=("home root",))),
+        )
+        self.assertEqual(rc, 1)
+        obj = json.loads(out)
+        self.assertEqual(obj["state"], "blocked")
+        self.assertEqual(obj["error"], "onboarding_blocked")
 
 
 if __name__ == "__main__":

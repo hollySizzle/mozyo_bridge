@@ -30,6 +30,7 @@ from ..domain.conversation_port import (
     ConversationProviderError,
     Explain,
     IntentCandidate,
+    sanitize_display_text,
 )
 from ..domain.intent import IntentError, OnboardingIntent, validate_onboarding_intent
 
@@ -98,11 +99,15 @@ def run_onboarding_conversation(
             return Aborted(exc.code, exc.message)
 
         if isinstance(turn, Explain):
-            io.show(turn.text)
+            # Sanitize at the universal render boundary too, so any provider's
+            # untrusted display text is escaped before it reaches the terminal
+            # (Redmine #13497 j#74970 F2), not only the CLI binding's.
+            safe_text = sanitize_display_text(turn.text)
+            io.show(safe_text)
             reply = io.prompt()
             if reply is None:
                 return Cancelled()
-            context = context.with_assistant(turn.text).with_human(reply)
+            context = context.with_assistant(safe_text).with_human(reply)
             continue
 
         if isinstance(turn, IntentCandidate):

@@ -35,7 +35,7 @@ model. Nothing here persists a transcript, prompt, response, or credential.
 
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -114,6 +114,7 @@ def run_bare_entry(
     provider: ConversationProvider,
     gate_secret: str | None,
     io: HumanIO | None = None,
+    json_output: bool = False,
 ) -> int:
     """Route bare ``mozyo`` and drive onboarding. Returns a process exit code.
 
@@ -122,12 +123,21 @@ def run_bare_entry(
     j#74936); every probe, plan, apply, and the launch operate on this same root.
     ``launch_adopted`` runs the existing backend-aware launch (passed in so this
     module never imports the CLI). ``provider`` is the conversation binding.
+
+    ``json_output`` reflects the root ``--json`` machine-readable contract: an
+    adopted-complete root still takes the existing (byte-compatible) JSON launch,
+    but every route that would otherwise run *interactive* onboarding (prose +
+    ``input()`` prompts) instead emits a single JSON status object and fails
+    closed — never mixing prompts / prose into the JSON stream, reading stdin, or
+    mutating (Redmine #13497 j#74970 F3).
     """
     io = io or CliHumanIO()
 
     status = classify_adoption(target_root, gate_secret=gate_secret)
     if status.is_complete:
         return launch_adopted()
+    if json_output:
+        return _bare_entry_json(status, target_root, gate_secret=gate_secret)
     if status.is_broken:
         io.show(f"mozyo: refusing to launch or onboard — {status.reason}.")
         io.show("Resolve the existing .mozyo-bridge state and retry.")
@@ -160,6 +170,53 @@ def run_bare_entry(
     return _drive_fresh_onboarding(
         inspection, launch_adopted=launch_adopted,
         provider=provider, gate_secret=gate_secret, io=io,
+    )
+
+
+def _emit_json(record: dict, *, code: int) -> int:
+    print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    return code
+
+
+def _bare_entry_json(status, target_root: Path, *, gate_secret) -> int:
+    """Emit a single JSON status object for a non-adopted root under ``--json``.
+
+    Interactive onboarding (a conversation and its ``input()`` confirmations)
+    cannot run against a machine-readable, stdin-capturing ``--json`` invocation,
+    so every non-adopted route fails closed with one JSON object and no prompt,
+    stdin read, or mutation. ``inspect_onboarding`` is mutation-free, so probing
+    a fresh root for its precise state is safe here.
+    """
+    if status.is_broken:
+        return _emit_json(
+            {"state": "blocked", "error": "onboarding_blocked",
+             "reason": status.reason,
+             "next_action": "resolve the existing .mozyo-bridge state"},
+            code=1,
+        )
+    if status.is_in_progress:
+        return _emit_json(
+            {"state": STATE_ADOPTION_IN_PROGRESS,
+             "error": "interactive_onboarding_required",
+             "next_action": "run `mozyo` without --json to resume onboarding"},
+            code=1,
+        )
+
+    inspection = inspect_onboarding(target_root, gate_secret=gate_secret)
+    state = inspection.preflight.state
+    if state == STATE_BLOCKED:
+        return _emit_json(
+            {"state": "blocked", "error": "onboarding_blocked",
+             "reasons": list(inspection.preflight.hard_block_reasons)},
+            code=1,
+        )
+    # unadopted / caution_requires_ack (and any defensive residue): a fresh
+    # adoption needs the interactive conversation + human confirmations.
+    return _emit_json(
+        {"state": state, "error": "interactive_onboarding_required",
+         "next_action":
+             "run `mozyo` without --json to complete onboarding interactively"},
+        code=1,
     )
 
 

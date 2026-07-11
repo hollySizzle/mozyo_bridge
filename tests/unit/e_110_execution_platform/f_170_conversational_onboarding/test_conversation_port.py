@@ -15,6 +15,7 @@ from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.domai
     build_intent_schema,
     build_tool_schema,
     build_turn_json_schema,
+    sanitize_display_text,
     sanitize_facts,
 )
 from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.domain.intent import (
@@ -93,6 +94,29 @@ class SchemaProjectionTest(unittest.TestCase):
     def test_tool_schema_is_names_and_mutation_only(self):
         for tool in build_tool_schema():
             self.assertEqual(set(tool), {"name", "mutation", "actor"})
+
+
+class SanitizeDisplayTextTest(unittest.TestCase):
+    def test_keeps_newline_and_tab(self):
+        self.assertEqual(sanitize_display_text("a\nb\tc"), "a\nb\tc")
+
+    def test_escapes_c0_and_del_and_c1(self):
+        self.assertEqual(sanitize_display_text("\x1b"), "\\x1b")  # ESC
+        self.assertEqual(sanitize_display_text("\x07"), "\\x07")  # BEL
+        self.assertEqual(sanitize_display_text("\x7f"), "\\x7f")  # DEL
+        self.assertEqual(sanitize_display_text("\x9b"), "\\x9b")  # C1 CSI
+
+    def test_escapes_bidi_direction_controls(self):
+        for cp in (0x202E, 0x2066, 0x200F):
+            got = sanitize_display_text(chr(cp))
+            self.assertEqual(got, f"\\u{cp:04x}")
+
+    def test_printable_unchanged(self):
+        self.assertEqual(sanitize_display_text("Hello 日本語 42!"), "Hello 日本語 42!")
+
+    def test_idempotent_on_escaped_output(self):
+        once = sanitize_display_text("x\x1by")
+        self.assertEqual(sanitize_display_text(once), once)
 
 
 class ContextAccumulationTest(unittest.TestCase):
