@@ -403,13 +403,17 @@ class GrandchildTargetIdentity:
 
     ``unit_id`` is the stable ``<workspace_id>/<lane_id>`` pointer — both
     components must be non-empty to bind. ``delegation_parent`` is the delegated
-    coordinator unit the grandchild must descend from. ``lane_kind`` is the
-    display KIND acceptance shape (``implementation``); the route-bound agent
-    gateway ROLE (:data:`GRANDCHILD_GATEWAY_ROLE`) is verified separately against
-    the live inventory. ``delegation_depth`` defaults to the grandchild depth.
-    ``repo_identity`` is the canonical child repo identity from the mandatory
-    ``--target-repo`` gate and is **required** to bind — the matched inventory
-    row's repo must equal it (fail closed on a repo mismatch).
+    coordinator unit the grandchild must descend from. ``lane_kind`` /
+    ``delegation_depth`` carry the **fixed** grandchild acceptance shape
+    (:data:`LANE_KIND_IMPLEMENTATION` at :data:`GRANDCHILD_DEPTH`); they are NOT a
+    caller-tunable expectation — a target that does not carry the canonical shape
+    is not bindable, and the live re-verification compares against the canonical
+    constants, never against caller values (Redmine #13571 j#75487 R4-F1). The
+    route-bound agent gateway ROLE (:data:`GRANDCHILD_GATEWAY_ROLE`) is verified
+    separately against the live inventory. ``repo_identity`` is the canonical
+    child repo identity from the mandatory ``--target-repo`` gate and is
+    **required** to bind — the matched inventory row's repo must equal it (fail
+    closed on a repo mismatch).
     """
 
     unit_id: str
@@ -420,20 +424,30 @@ class GrandchildTargetIdentity:
 
     @property
     def is_bindable(self) -> bool:
-        """True only for a fully-specified, exactly-bindable identity.
+        """True only for a fully-specified, exactly-bindable grandchild identity.
 
         Requires a non-empty parent, a canonical repo identity (the mandatory
-        ``--target-repo`` gate value), and a ``unit_id`` whose workspace **and**
-        lane components are both non-empty. A half-identity (missing component /
-        parent / repo) is not bindable and fails closed to
-        :data:`BINDING_UNBOUND` (Redmine #13571 F2 (b)/(d)).
+        ``--target-repo`` gate value), a ``unit_id`` whose workspace **and** lane
+        components are both non-empty, AND the fixed grandchild acceptance shape:
+        ``lane_kind == LANE_KIND_IMPLEMENTATION`` and a plain-int
+        ``delegation_depth == GRANDCHILD_DEPTH`` (a ``bool`` is not a valid depth).
+        A caller cannot relax the KIND / depth to bind a non-grandchild lane (a
+        coordinator, a delegated coordinator, or a depth-1 same-lane worker); such
+        a target fails closed to :data:`BINDING_UNBOUND`
+        (Redmine #13571 F2 (b)/(d), j#75487 R4-F1).
         """
         workspace, lane = _split_workspace_lane(self.unit_id)
+        depth_ok = (
+            type(self.delegation_depth) is int
+            and self.delegation_depth == GRANDCHILD_DEPTH
+        )
         return bool(
             workspace
             and lane
             and (self.delegation_parent or "").strip()
             and (self.repo_identity or "").strip()
+            and self.lane_kind == LANE_KIND_IMPLEMENTATION
+            and depth_ok
         )
 
 
@@ -602,19 +616,26 @@ def resolve_realized_grandchild_binding(
                 "candidate panes; the realized identity is ambiguous."
             ),
         )
+    # The grandchild acceptance shape is re-verified against the CANONICAL
+    # constants (implementation lane at depth 2), never against caller-supplied
+    # target values — a target cannot relax the KIND / depth to open the gate on a
+    # non-grandchild lane (Redmine #13571 j#75487 R4-F1). ``is_bindable`` already
+    # rejects a non-canonical target, so this is defense in depth on the live row.
     problems: list[str] = []
     if unit.status != "derived":
         problems.append(f"status={unit.status!r} (not a trusted derived breadcrumb)")
-    if unit.lane_kind != target.lane_kind:
-        problems.append(f"kind={unit.lane_kind!r} (expected {target.lane_kind!r})")
+    if unit.lane_kind != LANE_KIND_IMPLEMENTATION:
+        problems.append(
+            f"kind={unit.lane_kind!r} (expected {LANE_KIND_IMPLEMENTATION!r})"
+        )
     if not unit.has_codex_gateway:
         problems.append(
             f"gateway_role missing (expected a live {GRANDCHILD_GATEWAY_ROLE!r} "
             "gateway pane; the route lands at the grandchild gateway, not Claude)"
         )
-    if unit.delegation_depth != target.delegation_depth:
+    if not (type(unit.delegation_depth) is int and unit.delegation_depth == GRANDCHILD_DEPTH):
         problems.append(
-            f"depth={unit.delegation_depth!r} (expected {target.delegation_depth})"
+            f"depth={unit.delegation_depth!r} (expected {GRANDCHILD_DEPTH})"
         )
     if unit.delegation_parent != delegated_coordinator_unit:
         problems.append(
@@ -639,7 +660,7 @@ def resolve_realized_grandchild_binding(
         matched_unit=unit.unit_id,
         reason=(
             f"grandchild {unit.unit_id!r} re-verifies as a route-bound depth-"
-            f"{target.delegation_depth} {target.lane_kind} lane (live "
+            f"{GRANDCHILD_DEPTH} {LANE_KIND_IMPLEMENTATION} lane (live "
             f"{GRANDCHILD_GATEWAY_ROLE} gateway present) under "
             f"{delegated_coordinator_unit!r}."
         ),

@@ -359,6 +359,82 @@ def _discover_units_dotspelled():
         return _discover_delegation_units(argparse.Namespace(agent=None, session=None))
 
 
+class CanonicalGrandchildShapeTest(unittest.TestCase):
+    """#13571 j#75487 R4-F1: KIND/depth is the fixed grandchild invariant.
+
+    A caller cannot relax the acceptance shape (implementation lane at depth 2)
+    to bind a non-grandchild lane; the live re-verification compares against the
+    canonical constants, not caller-supplied target values.
+    """
+
+    def _unit(self, kind, depth):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            InventoryUnit,
+        )
+
+        return InventoryUnit(
+            unit_id=_GC_UNIT,
+            lane_kind=kind,
+            delegation_depth=depth,
+            delegation_parent=_DELEG_UNIT,
+            status="derived",
+            repo_identity="/ws/child",
+            has_codex_gateway=True,
+            ambiguous=False,
+        )
+
+    def _target(self, kind, depth):
+        return GrandchildTargetIdentity(
+            unit_id=_GC_UNIT,
+            delegation_parent=_DELEG_UNIT,
+            lane_kind=kind,
+            delegation_depth=depth,
+            repo_identity="/ws/child",
+        )
+
+    def test_non_grandchild_target_shape_is_unbound(self) -> None:
+        # A caller aligning BOTH target and live unit to a non-grandchild shape
+        # must not realize (the prior fail-open). Each is unbound (not bindable).
+        for kind, depth in (
+            ("coordinator", 2),
+            ("delegated_coordinator", 2),
+            ("implementation", 1),
+            ("implementation", 3),
+        ):
+            binding = resolve_realized_grandchild_binding(
+                [self._unit(kind, depth)],
+                target=self._target(kind, depth),
+                delegated_coordinator_unit=_DELEG_UNIT,
+            )
+            self.assertNotEqual(
+                BINDING_REALIZED, binding.outcome, msg=f"{kind}/{depth}"
+            )
+            self.assertFalse(self._target(kind, depth).is_bindable, msg=f"{kind}/{depth}")
+
+    def test_bool_depth_is_not_a_valid_grandchild_depth(self) -> None:
+        # `True` is an int subclass equal to 1; it must not pass as depth 2 nor
+        # sneak through as a truthy depth.
+        self.assertFalse(self._target("implementation", True).is_bindable)
+
+    def test_canonical_target_but_wrong_live_kind_is_mismatch(self) -> None:
+        # A canonical (bindable) target whose live unit is a coordinator lane must
+        # mismatch — the live row is checked against the canonical constant.
+        binding = resolve_realized_grandchild_binding(
+            [self._unit("coordinator", 2)],
+            target=self._target("implementation", 2),
+            delegated_coordinator_unit=_DELEG_UNIT,
+        )
+        self.assertNotEqual(BINDING_REALIZED, binding.outcome)
+
+    def test_canonical_shape_realizes(self) -> None:
+        binding = resolve_realized_grandchild_binding(
+            [self._unit("implementation", 2)],
+            target=self._target("implementation", 2),
+            delegated_coordinator_unit=_DELEG_UNIT,
+        )
+        self.assertEqual(BINDING_REALIZED, binding.outcome)
+
+
 class PublicCatalogResolverContractTest(unittest.TestCase):
     """#13571 j#75473 F4: pin the PUBLIC-only resolver view for the parser path.
 

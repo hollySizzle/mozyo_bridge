@@ -193,6 +193,29 @@ class DispatchSelectedAuthorityRegressionTest(unittest.TestCase):
         self.assertEqual(PLAN_PROCEED, plan.verdict)
         self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
 
+    def test_launch_target_with_non_grandchild_shape_blocks(self) -> None:
+        # #13571 j#75487 R4-F1: a launch's explicit target that carries a
+        # non-grandchild KIND / depth cannot open the gate (the acceptance shape
+        # is the fixed implementation/depth-2 invariant, not caller-tunable).
+        for kind, depth in (("coordinator", 2), ("implementation", 1)):
+            created = GrandchildTargetIdentity(
+                unit_id=GRANDCHILD_UNIT,
+                delegation_parent=DELEGATED_COORDINATOR_UNIT,
+                lane_kind=kind,
+                delegation_depth=depth,
+                repo_identity=CHILD_REPO_IDENTITY,
+            )
+            plan = plan_delegated_coordinator_route(
+                base_request(
+                    candidates=[],
+                    grandchild_target=created,
+                    realized_units=realized_grandchild_rows(),
+                )
+            )
+            self.assertTrue(plan.dispatch_decision.is_launch)
+            self.assertEqual(PLAN_BLOCKED, plan.verdict, msg=f"{kind}/{depth}")
+            self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict)
+
     def test_launch_target_colliding_with_prelaunch_candidate_blocks(self) -> None:
         # #13571 j#75473 F5: a launch dispatch whose explicit target names an
         # EXISTING pre-launch discovery candidate is an adopt smuggled in under a
