@@ -195,6 +195,95 @@ class LiveProducerGatewayResolutionTest(unittest.TestCase):
         self.assertTrue(gc.has_codex_gateway)
         self.assertIsNone(gc.repo_identity)
 
+    def test_strong_plus_weak_codex_is_ambiguous_not_unique(self) -> None:
+        # j#75480 F1: a strong codex + a weak (non-ambiguous) codex are TWO codex
+        # candidates -> not a single trusted gateway. Fail closed, not realized.
+        gc = self._grandchild(
+            _chain(
+                _gc_pane("%3", "codex"),
+                _gc_pane("%4", "codex", confidence=CONFIDENCE_NONE),
+            )
+        )
+        self.assertFalse(gc.has_codex_gateway)
+        self.assertTrue(gc.ambiguous)
+        target = GrandchildTargetIdentity(
+            unit_id=_GC_UNIT,
+            delegation_parent=_DELEG_UNIT,
+            repo_identity=_canonical_repo_identity(_CHILD_REPO),
+        )
+        binding = resolve_realized_grandchild_binding(
+            [gc], target=target, delegated_coordinator_unit=_DELEG_UNIT
+        )
+        self.assertNotEqual(BINDING_REALIZED, binding.outcome)
+
+    def test_member_repo_conflict_is_ambiguous_both_orders(self) -> None:
+        # j#75480 F2: the codex gateway and a sibling Claude pane on DIFFERENT
+        # checkouts is a conflicted identity -> ambiguous regardless of pane order.
+        for panes in (
+            (_gc_pane("%3", "codex", repo_root="/ws/repo-a"),
+             _gc_pane("%4", "claude", repo_root="/ws/repo-b")),
+            (_gc_pane("%3", "claude", repo_root="/ws/repo-b"),
+             _gc_pane("%4", "codex", repo_root="/ws/repo-a")),
+        ):
+            gc = self._grandchild(_chain(*panes))
+            self.assertTrue(gc.ambiguous)
+            target = GrandchildTargetIdentity(
+                unit_id=_GC_UNIT,
+                delegation_parent=_DELEG_UNIT,
+                repo_identity=_canonical_repo_identity("/ws/repo-a"),
+            )
+            binding = resolve_realized_grandchild_binding(
+                [gc], target=target, delegated_coordinator_unit=_DELEG_UNIT
+            )
+            self.assertNotEqual(BINDING_REALIZED, binding.outcome)
+
+
+class TypedInventoryUnitEvidenceTest(unittest.TestCase):
+    """#13571 j#75480 F3: typed identity must carry explicit gateway evidence.
+
+    ``has_codex_gateway`` / ``ambiguous`` are required constructor fields, so a
+    caller cannot build a positive-looking unit by omitting the evidence (the
+    fail-open that a tuple->dataclass swap would otherwise re-introduce).
+    """
+
+    def test_inventory_unit_requires_gateway_and_ambiguity_fields(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            InventoryUnit,
+        )
+
+        with self.assertRaises(TypeError):
+            InventoryUnit(  # type: ignore[call-arg]
+                unit_id="ws/gc",
+                lane_kind="implementation",
+                delegation_depth=2,
+                delegation_parent="ws/d",
+                status="derived",
+                repo_identity="/ws/child",
+            )
+
+    def test_explicit_no_gateway_fails_closed(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            InventoryUnit,
+        )
+
+        unit = InventoryUnit(
+            unit_id="ws/gc",
+            lane_kind="implementation",
+            delegation_depth=2,
+            delegation_parent="ws/d",
+            status="derived",
+            repo_identity="/ws/child",
+            has_codex_gateway=False,
+            ambiguous=False,
+        )
+        target = GrandchildTargetIdentity(
+            unit_id="ws/gc", delegation_parent="ws/d", repo_identity="/ws/child"
+        )
+        binding = resolve_realized_grandchild_binding(
+            [unit], target=target, delegated_coordinator_unit="ws/d"
+        )
+        self.assertNotEqual(BINDING_REALIZED, binding.outcome)
+
 
 class RepoIdentityCanonicalParityTest(unittest.TestCase):
     """#13571 j#75473 F3: repo identity uses one canonical form.
@@ -219,6 +308,18 @@ class RepoIdentityCanonicalParityTest(unittest.TestCase):
             _canonical_repo_identity("/workspace/child-project"),
             _canonical_repo_identity("/workspace/child-project/"),
         )
+
+    def test_home_tilde_is_expanded(self) -> None:
+        # `~` must expand to the resolved home so a `~`-spelled repo compares equal
+        # to its absolute form (nonblocking note in #13571 j#75480).
+        import os
+
+        home = os.path.expanduser("~")
+        self.assertEqual(
+            _canonical_repo_identity("~/child-project"),
+            _canonical_repo_identity(f"{home}/child-project"),
+        )
+        self.assertNotIn("~", _canonical_repo_identity("~/child-project") or "")
 
     def test_nfc_and_nfd_spellings_canonicalize_equal(self) -> None:
         import unicodedata

@@ -321,27 +321,40 @@ def _discover_delegation_units(args: argparse.Namespace):
 
     result: list[InventoryUnit] = []
     for unit_id, members in grouped.items():
-        # Resolve the route-bound Codex gateway as EXACTLY ONE strong,
-        # non-ambiguous `role==codex` candidate (the discovery projection uses
-        # `role`, not `agent_kind`). 0 / 2+ / weak / ambiguous all mean the unit
-        # is not a single trusted route-bound gateway (Redmine #13571 j#75473 F1).
-        strong_codex = [
-            cand
-            for cand, _ in members
-            if getattr(cand, "role", None) == GRANDCHILD_GATEWAY_ROLE
-            and getattr(cand, "confidence", None) == CONFIDENCE_STRONG
-            and not getattr(cand, "ambiguous", False)
+        # Resolve the route-bound Codex gateway (the discovery projection uses
+        # `role`, not `agent_kind`). It is route-bound only when the unit has
+        # EXACTLY ONE `role==codex` candidate AND that sole candidate is strong /
+        # non-ambiguous. Two codex candidates (even strong+weak), zero, a weak or
+        # ambiguous sole candidate all fail the "single trusted gateway" rule
+        # (Redmine #13571 j#75473 F1 / j#75480 F1).
+        codex_members = [
+            cand for cand, _ in members if getattr(cand, "role", None) == GRANDCHILD_GATEWAY_ROLE
         ]
-        weak_candidate = any(getattr(cand, "ambiguous", False) for cand, _ in members)
-        has_codex_gateway = len(strong_codex) == 1
+        strong_sole_codex = (
+            codex_members[0]
+            if len(codex_members) == 1
+            and getattr(codex_members[0], "confidence", None) == CONFIDENCE_STRONG
+            and not getattr(codex_members[0], "ambiguous", False)
+            else None
+        )
+        has_codex_gateway = strong_sole_codex is not None
         # The gateway's OWN repo is authoritative — never synthesized from a
-        # sibling Claude pane's repo (F1). Missing gateway repo -> None -> the
+        # sibling Claude pane's repo. Missing gateway repo -> None -> the
         # binding's mandatory repo re-match fails closed.
         gateway_repo = (
-            _canonical_repo_identity(getattr(strong_codex[0], "repo_root", None))
+            _canonical_repo_identity(getattr(strong_sole_codex, "repo_root", None))
             if has_codex_gateway
             else None
         )
+        # Canonical non-empty repos across ALL panes of the unit: a checkout
+        # disagreement (codex on repo-A, Claude on repo-B) is a conflicted
+        # identity, not a trusted single realization (j#75480 F2).
+        member_repos = {
+            _canonical_repo_identity(getattr(cand, "repo_root", None))
+            for cand, _ in members
+            if _canonical_repo_identity(getattr(cand, "repo_root", None)) is not None
+        }
+        weak_candidate = any(getattr(cand, "ambiguous", False) for cand, _ in members)
         derived = [d for _, d in members if d.status == "derived"]
         # Authoritative KIND/depth/parent come from the derived breadcrumb(s); if
         # the derived panes disagree, the unit is ambiguous.
@@ -361,7 +374,12 @@ def _discover_delegation_units(args: argparse.Namespace):
                 first.delegation_parent,
                 first.status,
             )
-        ambiguous = weak_candidate or len(strong_codex) > 1 or len(derived_facts) > 1
+        ambiguous = (
+            weak_candidate
+            or len(codex_members) > 1
+            or len(member_repos) > 1
+            or len(derived_facts) > 1
+        )
         result.append(
             InventoryUnit(
                 unit_id=unit_id,

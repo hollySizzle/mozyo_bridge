@@ -454,6 +454,11 @@ class InventoryUnit:
       candidate panes (different repo/parent/kind, or a weak candidate), so the
       raw candidate ambiguity is preserved instead of being silently collapsed by
       the per-unit fold (F2 (c)).
+
+    ``has_codex_gateway`` and ``ambiguous`` are **required** (no default): a
+    positive realization must carry explicit live gateway / ambiguity evidence, so
+    switching a caller's container from a bare tuple to this dataclass can never
+    silently re-introduce a fail-open (Redmine #13571 j#75480 F3).
     """
 
     unit_id: str
@@ -461,9 +466,9 @@ class InventoryUnit:
     delegation_depth: Optional[int]
     delegation_parent: str
     status: str
+    has_codex_gateway: bool
+    ambiguous: bool
     repo_identity: Optional[str] = None
-    has_codex_gateway: bool = True
-    ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -503,6 +508,7 @@ def _coerce_unit(row: object) -> InventoryUnit:
         status=str(seq[4]),
         repo_identity=repo,
         has_codex_gateway=False,
+        ambiguous=False,
     )
 
 
