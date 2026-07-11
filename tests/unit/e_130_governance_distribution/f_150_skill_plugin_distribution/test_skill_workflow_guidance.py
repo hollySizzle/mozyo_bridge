@@ -152,6 +152,11 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "### bounded wait は user commentary SLA 内に収める",
         "### timeout / state 不変時に pane history を掘らない",
         "### 通常 finding は gate journal にまとめ、即時 interrupt は Critical に限定する",
+        # Redmine #13518 (owner intent j#75078): dispatch 後は LLM turn を
+        # zero-wait で終了し、通常運用は mozyo facade only、raw Herdr/tmux は
+        # operator debug に限る。45–55 秒 cadence は LLM turn ではなく
+        # background watcher / operator debug へ再帰属した。
+        "### dispatch / handoff 後は LLM turn を zero-wait で終了する",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
@@ -369,6 +374,20 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "gate journal の時点でまとめて durable record に載せる",
         "即時 interrupt は、**安全・authority・不可逆リスクに関わる Critical**",
         "user commentary SLA 内の 45–55 秒基本 cadence に収める",
+        # Redmine #13518 (owner intent j#75078): the load-bearing semantics of
+        # the zero-wait / mozyo-only doctrine. Pin them verbatim so a byte-parity
+        # pass alone cannot let them be deleted or weakened: the LLM turn ends
+        # without blocking wait / poll after a dispatch, raw herdr wait/read/list
+        # + pane/tmux ops are operator-debug primitives (not agent tools), the
+        # 45–55s cadence is re-homed to the background watcher / operator layer,
+        # and the four role profiles carry the mozyo-facade-only + zero-wait/yield
+        # discipline.
+        "blocking wait も poll も実行せず、turn を終了 (yield) する",
+        "`herdr agent wait` / `herdr agent read` / `herdr agent list` / raw pane・tmux 操作は adapter test と operator debug のための primitive",
+        "watcher / operator 側の観測周期である",
+        "通常運用は mozyo semantic facade (`workflow step` / `handoff` 等) のみを使う。raw Herdr / tmux command は adapter test / operator debug に限り、通常 turn では使わない",
+        "dispatch / handoff / callback を送信したら blocking wait / poll をせず turn を終了 (zero-wait / yield) し、進捗再開は durable callback による新 turn に委ねる",
+        "handoff / callback を送信したら blocking wait / poll をせず turn を終了 (zero-wait / yield) し、進捗再開は durable callback による新 turn に委ねる",
     )
 
     SKILL_PATH = (
