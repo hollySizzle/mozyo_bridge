@@ -24,11 +24,15 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
     CLASSIFY_CLASSIFIED,
     CLASSIFY_UNCLASSIFIED,
+    SEND_DELIVERED,
+    SEND_NOT_SENT,
+    SEND_UNCERTAIN,
     UNCLASSIFIED_GATE_MARKER_AMBIGUOUS,
     UNCLASSIFIED_GATE_MARKER_MISSING,
     UNCLASSIFIED_ISSUE_JOURNAL_MISMATCH,
     classify_callback_gate,
     normalize_gate_name,
+    send_outcome_for_delivery,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     build_marker,
@@ -99,6 +103,43 @@ class ClassifyCallbackGateTest(unittest.TestCase):
     def test_empty_markers_is_unclassified_missing(self):
         c = classify_callback_gate([], "13518", "75094")
         self.assertEqual(c.reason, UNCLASSIFIED_GATE_MARKER_MISSING)
+
+
+class SendOutcomeForDeliveryTest(unittest.TestCase):
+    """The conservative DeliveryOutcome -> send-outcome mapping (only positive turn-start -> delivered)."""
+
+    def test_sent_ok_is_delivered(self):
+        self.assertEqual(send_outcome_for_delivery("sent", "ok"), SEND_DELIVERED)
+
+    def test_sent_queue_enter_is_delivered(self):
+        self.assertEqual(send_outcome_for_delivery("sent", "queue_enter"), SEND_DELIVERED)
+
+    def test_deterministic_pre_injection_blocks_are_not_sent(self):
+        for reason in (
+            "target_unavailable",
+            "target_not_agent",
+            "invalid_anchor",
+            "invalid_args",
+            "receiver_blocked",
+            "turn_start_absent",
+            "precondition_not_idle",
+            "cross_session_claude",
+            "target_repo_mismatch",
+            "gateway_route_blocked",
+            "main_lane_implementation_blocked",
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_NOT_SENT)
+
+    def test_ambiguous_blocks_are_uncertain(self):
+        for reason in ("marker_timeout", "turn_start_unconfirmed", "inject_failed"):
+            with self.subTest(reason=reason):
+                self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_UNCERTAIN)
+
+    def test_unknown_status_or_reason_defaults_to_uncertain(self):
+        self.assertEqual(send_outcome_for_delivery("pending_input", "ok"), SEND_UNCERTAIN)
+        self.assertEqual(send_outcome_for_delivery("sent", "surprise"), SEND_UNCERTAIN)
+        self.assertEqual(send_outcome_for_delivery("weird", "weird"), SEND_UNCERTAIN)
 
 
 if __name__ == "__main__":

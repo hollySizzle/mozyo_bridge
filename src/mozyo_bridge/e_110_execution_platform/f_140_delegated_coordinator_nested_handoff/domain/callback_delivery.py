@@ -88,6 +88,59 @@ SEND_UNCERTAIN = "uncertain"
 SEND_OUTCOMES = frozenset({SEND_DELIVERED, SEND_NOT_SENT, SEND_UNCERTAIN})
 
 
+# ---------------------------------------------------------------------------
+# Delivery-outcome -> send-outcome mapping. The one callback send goes through the existing
+# handoff primitive, which reports a ``DeliveryOutcome`` (status + reason). This maps that onto
+# the closed :data:`SEND_OUTCOMES` vocabulary, conservatively (a duplicate delivery is the
+# failure to avoid, #13520 j#75098 / j#75108): ONLY a positively-confirmed turn-start is
+# ``delivered``; a deterministic pre-injection block (nothing was typed) is ``not_sent`` (safe
+# bounded retry); everything ambiguous (marker not observed, turn-start unconfirmed, inject
+# failure, unknown) is ``uncertain`` and never auto-retried.
+# ---------------------------------------------------------------------------
+
+#: Handoff ``status=="sent"`` reasons that mean the send positively landed / started.
+_DELIVERED_SENT_REASONS = frozenset({"ok", "queue_enter"})
+
+#: Handoff ``status=="blocked"`` reasons that are **deterministic pre-injection** — the send
+#: was refused before anything was typed, so a retry cannot duplicate. Anything NOT in this set
+#: (marker_timeout / turn_start_unconfirmed / inject_failed / unknown) is treated as uncertain.
+_NOT_SENT_BLOCKED_REASONS = frozenset(
+    {
+        "target_unavailable",
+        "target_not_agent",
+        "invalid_anchor",
+        "invalid_args",
+        "receiver_blocked",
+        "turn_start_absent",
+        "precondition_not_idle",
+        "cross_session_claude",
+        "target_repo_mismatch",
+        "gateway_route_blocked",
+        "main_lane_implementation_blocked",
+    }
+)
+
+
+def send_outcome_for_delivery(status: str, reason: str) -> str:
+    """Map a handoff ``DeliveryOutcome`` (status, reason) onto a closed send outcome (pure).
+
+    - ``sent`` + a positive reason (``ok`` / ``queue_enter``) -> :data:`SEND_DELIVERED`;
+    - ``blocked`` + a deterministic pre-injection reason -> :data:`SEND_NOT_SENT`
+      (nothing typed, so a bounded retry is safe);
+    - **everything else** — ``blocked`` with an ambiguous reason (``marker_timeout`` /
+      ``turn_start_unconfirmed`` / ``inject_failed`` / anything unrecognized), or an unexpected
+      status (``pending_input``) — -> :data:`SEND_UNCERTAIN` (no auto-retry; a duplicate send is
+      the failure to avoid). The default is deliberately the safe one.
+    """
+    status_s = str(status or "").strip()
+    reason_s = str(reason or "").strip()
+    if status_s == "sent" and reason_s in _DELIVERED_SENT_REASONS:
+        return SEND_DELIVERED
+    if status_s == "blocked" and reason_s in _NOT_SENT_BLOCKED_REASONS:
+        return SEND_NOT_SENT
+    return SEND_UNCERTAIN
+
+
 def normalize_gate_name(name: str) -> str:
     """Map a marker-facing gate name onto the runtime gate (``review_result`` -> ``review``).
 
@@ -207,6 +260,7 @@ __all__ = (
     "SEND_NOT_SENT",
     "SEND_UNCERTAIN",
     "SEND_OUTCOMES",
+    "send_outcome_for_delivery",
     "normalize_gate_name",
     "CallbackClassification",
     "classify_callback_gate",
