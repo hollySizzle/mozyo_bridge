@@ -56,9 +56,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_no_dispatch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+    GrandchildTargetIdentity,
     RealizationGateResult,
     evaluate_grandchild_realization_gate,
-    find_realized_grandchild_unit,
+    resolve_realized_grandchild_binding,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import DelegationCandidate
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_read_boundary import ReadBoundaryVerdict
@@ -134,12 +135,15 @@ class RoutePlanRequest:
     discovery ``candidates`` for the grandchild Codex gateway, the canonical
     ``target_repo_identity`` gate, the ``delegated_coordinator_unit`` the
     grandchild must descend from, and the ``realized_units`` rows
-    (``(unit_id, lane_kind, delegation_depth, delegation_parent, status)``) the
-    realization gate reads. ``no_dispatch_reason``, when set, plans an explicit
-    keep-in-lane (no-dispatch) route instead of a grandchild dispatch.
-    ``role_profile_fields`` supplies per-role ``<placeholder>`` values for the
-    chain; ``role_profile_chain`` may be overridden but must remain the complete
-    canonical chain.
+    (``(unit_id, lane_kind, delegation_depth, delegation_parent, status[,
+    repo_identity])``) the realization gate reads. ``grandchild_target``, when
+    set, is the exact dispatch-selected/created/adopted grandchild identity the
+    realization gate binds to; when unset, an adopt dispatch's selected candidate
+    supplies it (Redmine #13571 / #12454 j#75444 F1). ``no_dispatch_reason``,
+    when set, plans an explicit keep-in-lane (no-dispatch) route instead of a
+    grandchild dispatch. ``role_profile_fields`` supplies per-role
+    ``<placeholder>`` values for the chain; ``role_profile_chain`` may be
+    overridden but must remain the complete canonical chain.
     """
 
     durable_anchor: str
@@ -149,7 +153,8 @@ class RoutePlanRequest:
     candidates: Sequence[DelegationCandidate]
     target_repo_identity: Optional[str]
     delegated_coordinator_unit: str
-    realized_units: Sequence[tuple[str, str, Optional[int], str, str]] = ()
+    realized_units: Sequence[Sequence[object]] = ()
+    grandchild_target: Optional[GrandchildTargetIdentity] = None
     current_depth: int = DEFAULT_DELEGATED_COORDINATOR_DEPTH
     active_grandchild_lanes: int = 0
     excluded_lane_ids: tuple[str, ...] = ()
@@ -268,6 +273,33 @@ def _resolve_role_profile_chain(request: RoutePlanRequest) -> tuple[RoleProfileR
     return tuple(resolutions)
 
 
+def _effective_grandchild_target(
+    request: RoutePlanRequest, dispatch: GrandchildDispatchDecision
+) -> Optional[GrandchildTargetIdentity]:
+    """Resolve the exact grandchild identity the realization gate must bind to.
+
+    Precedence (Redmine #13571 / #12454 j#75444 F1): an explicit
+    ``request.grandchild_target`` (the runtime's authoritative created/adopted
+    lane identity) always wins. Otherwise, an **adopt** dispatch's selected Codex
+    gateway candidate supplies the identity — the dispatch literally selected
+    that lane, so its ``<workspace_id>/<lane_id>`` unit and the canonical
+    ``--target-repo`` identity are the exact target. A launch dispatch with no
+    explicit target yields ``None`` (the gate then fails closed as ``unbound``
+    rather than adopting the first depth-2 sibling).
+    """
+    if request.grandchild_target is not None:
+        return request.grandchild_target
+    selected = dispatch.selected
+    if selected is not None:
+        unit_id = f"{selected.workspace_id or ''}/{selected.lane_id or ''}"
+        return GrandchildTargetIdentity(
+            unit_id=unit_id,
+            delegation_parent=request.delegated_coordinator_unit,
+            repo_identity=request.target_repo_identity or selected.repo_root,
+        )
+    return None
+
+
 def plan_delegated_coordinator_route(
     request: RoutePlanRequest,
 ) -> DelegatedCoordinatorRoutePlan:
@@ -373,12 +405,19 @@ def plan_delegated_coordinator_route(
     #     handoff, and the realize-or-blocked gate decides proceed vs blocked.
     steps.append(STEP_LAUNCH_OR_ADOPT)
     steps.append(STEP_STAMP)
-    realized_unit = find_realized_grandchild_unit(
+    # Bind the realization gate to the EXACT dispatch-selected grandchild identity
+    # (never the first depth-2 sibling): a stale/unrelated sibling must not be
+    # treated as realized (Redmine #13571 / #12454 j#75444 F1). The binding
+    # re-verifies role/depth/parent/repo against the live inventory and fails
+    # closed (missing/mismatch/ambiguous/unbound) to a blocked gate.
+    target = _effective_grandchild_target(request, dispatch)
+    binding = resolve_realized_grandchild_binding(
         request.realized_units,
+        target=target,
         delegated_coordinator_unit=request.delegated_coordinator_unit,
     )
     gate = evaluate_grandchild_realization_gate(
-        grandchild_required=True, realized_grandchild_unit=realized_unit
+        grandchild_required=True, realized_grandchild_unit=binding.matched_unit
     )
     steps.append(STEP_REALIZATION_GATE)
 

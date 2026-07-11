@@ -317,30 +317,244 @@ class RealizationGateResult:
         return self.verdict == GATE_REALIZED
 
 
-def find_realized_grandchild_unit(
-    units: Sequence[tuple[str, str, Optional[int], str, str]],
+# --- dispatch-selected grandchild identity binding (Redmine #13571 / #12454) --
+# US #12454 review j#75444 finding 1: the realization gate must bind to the
+# EXACT grandchild unit the dispatch selected / created / adopted, not to "the
+# first depth-2 implementation lane under the delegated coordinator". A stale or
+# unrelated sibling that happens to share the coordinator parent, depth, and
+# kind could otherwise be treated as ``realized`` — a false PASS whose outcome
+# depended on the inventory scan order. The binding re-verifies the exact target
+# identity (workspace/lane, role, repo, parent, depth) against the live
+# inventory and fails closed on a missing / mismatched / ambiguous identity.
+
+#: The exact target unit is present in the inventory and every identity fact
+#: (role / depth / parent / repo / derived status) re-verifies: the grandchild is
+#: realized and route-bound.
+BINDING_REALIZED = "realized"
+#: The exact target unit is not present in the inventory at all (the dispatched
+#: grandchild lane is not visible / not stamped yet). Fail closed.
+BINDING_MISSING = "missing"
+#: The exact target unit is present but one or more identity facts disagree with
+#: the dispatch-selected identity (wrong role / depth / parent / repo, or an
+#: untrusted status). Fail closed rather than trust a half-formed lane.
+BINDING_MISMATCH = "identity_mismatch"
+#: More than one inventory row carries the exact target unit id, so which one is
+#: the realized grandchild cannot be trusted. Fail closed.
+BINDING_AMBIGUOUS = "ambiguous_identity"
+#: No dispatch-selected target identity was supplied, so the gate cannot bind to
+#: an exact grandchild. A same-lane worker handoff must never be treated as
+#: acceptance without a bound target. Fail closed.
+BINDING_UNBOUND = "unbound"
+
+
+@dataclass(frozen=True)
+class GrandchildTargetIdentity:
+    """The exact grandchild lane identity the dispatch selected/created/adopted.
+
+    Read from the durable dispatch record (the #12458 dispatch decision's
+    selected Codex-gateway candidate for an adopt, or the created/adopted lane's
+    stable identity for a launch) — never "whatever depth-2 sibling appears
+    first". The realization gate binds to *this* identity and re-verifies it
+    against the live inventory, so an unrelated / stale sibling can never be
+    treated as the realized grandchild (Redmine #13571 / #12454 j#75444 F1).
+
+    ``unit_id`` is the stable ``<workspace_id>/<lane_id>`` pointer (workspace +
+    lane). ``delegation_parent`` is the delegated coordinator unit the grandchild
+    must descend from. ``lane_kind`` (role) and ``delegation_depth`` default to
+    the grandchild acceptance shape. ``repo_identity``, when set, is the canonical
+    child repo identity from the mandatory ``--target-repo`` gate; the matched
+    inventory row's repo must equal it (fail closed on a repo mismatch).
+    """
+
+    unit_id: str
+    delegation_parent: str
+    lane_kind: str = LANE_KIND_IMPLEMENTATION
+    delegation_depth: int = GRANDCHILD_DEPTH
+    repo_identity: Optional[str] = None
+
+    @property
+    def is_bindable(self) -> bool:
+        """True only when the identity carries a unit id and a parent to bind on."""
+        return bool((self.unit_id or "").strip()) and bool(
+            (self.delegation_parent or "").strip()
+        )
+
+
+@dataclass(frozen=True)
+class GrandchildBinding:
+    """The verdict of binding the realization gate to the exact target identity."""
+
+    outcome: str
+    matched_unit: Optional[str]
+    reason: str
+
+    @property
+    def is_realized(self) -> bool:
+        return self.outcome == BINDING_REALIZED
+
+
+def _normalize_repo_identity(path: Optional[str]) -> Optional[str]:
+    """Normalize a repo identity for comparison (strip, drop a trailing slash)."""
+    if path is None:
+        return None
+    norm = path.strip().rstrip("/")
+    return norm or None
+
+
+def _split_unit_row(
+    row: Sequence[object],
+) -> tuple[str, str, Optional[int], str, str, Optional[str]]:
+    """Unpack a discovery row, tolerating the 5-tuple and repo-carrying 6-tuple.
+
+    Rows are ``(unit_id, lane_kind, delegation_depth, delegation_parent,
+    status)`` with an optional trailing ``repo_identity`` (the canonical child
+    repo the live inventory resolved for the lane). A row without the repo
+    element yields ``None`` for it, so repo re-match is enforced only when both
+    the target and the row supply a repo.
+    """
+    unit_id = str(row[0])
+    lane_kind = str(row[1])
+    depth = row[2]  # type: ignore[assignment]
+    parent = str(row[3])
+    status = str(row[4])
+    repo = str(row[5]) if len(row) >= 6 and row[5] is not None else None
+    return unit_id, lane_kind, depth, parent, status, repo  # type: ignore[return-value]
+
+
+def resolve_realized_grandchild_binding(
+    units: Sequence[Sequence[object]],
     *,
+    target: Optional[GrandchildTargetIdentity],
     delegated_coordinator_unit: str,
-) -> Optional[str]:
-    """Return the unit_id of a route-bound, realized grandchild lane, or ``None``.
+) -> GrandchildBinding:
+    """Bind the realization gate to the exact dispatch-selected grandchild.
 
     ``units`` is a sequence of ``(unit_id, lane_kind, delegation_depth,
-    delegation_parent, status)`` rows — one per discovered lane unit, derived by
-    the caller from ``delegation_display.derive_targets_delegation``. A *realized*
-    grandchild is a ``derived`` (not diagnostic / none) depth-:data:`GRANDCHILD_DEPTH`
-    :data:`LANE_KIND_IMPLEMENTATION` lane whose ``delegation_parent`` is
-    ``delegated_coordinator_unit``. Pure; the first match wins (the route is
-    one-grandchild-per-delegated-coordinator under the shallow-delegation model).
+    delegation_parent, status[, repo_identity])`` rows — one per discovered lane
+    unit, derived by the caller from
+    ``delegation_display.derive_targets_delegation`` (plus the per-lane repo the
+    inventory resolved). Instead of returning the first depth-2 implementation
+    lane under the coordinator, this looks up **exactly** ``target.unit_id`` and
+    re-verifies every identity fact against the live inventory:
+
+    - **missing** (:data:`BINDING_MISSING`): no row carries ``target.unit_id``.
+    - **ambiguous** (:data:`BINDING_AMBIGUOUS`): more than one row carries it, so
+      the realized grandchild cannot be trusted.
+    - **identity_mismatch** (:data:`BINDING_MISMATCH`): the row is present but its
+      role (``lane_kind``) / depth / parent / repo disagrees with the
+      dispatch-selected identity, or its status is not ``derived`` (a
+      diagnostic / none row is never a trusted realization).
+    - **unbound** (:data:`BINDING_UNBOUND`): no bindable target was supplied.
+
+    Only :data:`BINDING_REALIZED` yields a ``matched_unit``. Pure and
+    order-independent: unrelated / stale siblings before or after the target in
+    ``units`` never change the verdict, because the match is keyed on the exact
+    ``unit_id`` (Redmine #13571 / #12454 j#75444 finding 1).
     """
-    for unit_id, lane_kind, depth, parent, status in units:
-        if (
-            status == "derived"
-            and lane_kind == LANE_KIND_IMPLEMENTATION
-            and depth == GRANDCHILD_DEPTH
-            and parent == delegated_coordinator_unit
-        ):
-            return unit_id
-    return None
+    if target is None or not target.is_bindable:
+        return GrandchildBinding(
+            outcome=BINDING_UNBOUND,
+            matched_unit=None,
+            reason=(
+                "no dispatch-selected grandchild target identity supplied; the gate "
+                "cannot bind to an exact grandchild lane (a same-lane worker handoff "
+                "is never acceptance without a bound target)."
+            ),
+        )
+    # The target's declared parent must be the coordinator this gate runs under;
+    # a target whose parent is a different coordinator is a caller inconsistency.
+    if target.delegation_parent != delegated_coordinator_unit:
+        return GrandchildBinding(
+            outcome=BINDING_MISMATCH,
+            matched_unit=None,
+            reason=(
+                f"target grandchild {target.unit_id!r} declares parent "
+                f"{target.delegation_parent!r}, but the gate binds under delegated "
+                f"coordinator {delegated_coordinator_unit!r}."
+            ),
+        )
+
+    matches = [
+        _split_unit_row(row)
+        for row in units
+        if str(row[0]) == target.unit_id
+    ]
+    if not matches:
+        return GrandchildBinding(
+            outcome=BINDING_MISSING,
+            matched_unit=None,
+            reason=(
+                f"dispatch-selected grandchild {target.unit_id!r} is not visible in "
+                "the live inventory (not created/adopted/stamped yet)."
+            ),
+        )
+    if len(matches) > 1:
+        return GrandchildBinding(
+            outcome=BINDING_AMBIGUOUS,
+            matched_unit=None,
+            reason=(
+                f"{len(matches)} inventory rows carry the target unit "
+                f"{target.unit_id!r}; the realized grandchild identity is ambiguous."
+            ),
+        )
+
+    unit_id, lane_kind, depth, parent, status, repo = matches[0]
+    problems: list[str] = []
+    if status != "derived":
+        problems.append(f"status={status!r} (not a trusted derived breadcrumb)")
+    if lane_kind != target.lane_kind:
+        problems.append(f"role={lane_kind!r} (expected {target.lane_kind!r})")
+    if depth != target.delegation_depth:
+        problems.append(f"depth={depth!r} (expected {target.delegation_depth})")
+    if parent != delegated_coordinator_unit:
+        problems.append(
+            f"parent={parent!r} (expected {delegated_coordinator_unit!r})"
+        )
+    target_repo = _normalize_repo_identity(target.repo_identity)
+    if target_repo is not None:
+        row_repo = _normalize_repo_identity(repo)
+        if row_repo != target_repo:
+            problems.append(f"repo={repo!r} (expected {target.repo_identity!r})")
+    if problems:
+        return GrandchildBinding(
+            outcome=BINDING_MISMATCH,
+            matched_unit=None,
+            reason=(
+                f"grandchild {unit_id!r} live identity does not re-verify: "
+                + "; ".join(problems)
+            ),
+        )
+    return GrandchildBinding(
+        outcome=BINDING_REALIZED,
+        matched_unit=unit_id,
+        reason=(
+            f"grandchild {unit_id!r} re-verifies as a route-bound depth-"
+            f"{target.delegation_depth} {target.lane_kind} lane under "
+            f"{delegated_coordinator_unit!r}."
+        ),
+    )
+
+
+def find_realized_grandchild_unit(
+    units: Sequence[Sequence[object]],
+    *,
+    target: Optional[GrandchildTargetIdentity],
+    delegated_coordinator_unit: str,
+) -> Optional[str]:
+    """Return the exact dispatch-selected realized grandchild unit, or ``None``.
+
+    Thin convenience wrapper over :func:`resolve_realized_grandchild_binding`:
+    returns the matched unit id only when the binding re-verifies as
+    :data:`BINDING_REALIZED`, else ``None`` (missing / mismatch / ambiguous /
+    unbound all fail closed to ``None``). Binds to ``target.unit_id`` exactly, so
+    a stale / unrelated sibling never wins on scan order (Redmine #13571).
+    """
+    binding = resolve_realized_grandchild_binding(
+        units,
+        target=target,
+        delegated_coordinator_unit=delegated_coordinator_unit,
+    )
+    return binding.matched_unit
 
 
 def evaluate_grandchild_realization_gate(
@@ -410,6 +624,14 @@ __all__ = (
     "GATE_BLOCKED",
     "GATE_SAME_LANE_OK",
     "RealizationGateResult",
+    "BINDING_REALIZED",
+    "BINDING_MISSING",
+    "BINDING_MISMATCH",
+    "BINDING_AMBIGUOUS",
+    "BINDING_UNBOUND",
+    "GrandchildTargetIdentity",
+    "GrandchildBinding",
+    "resolve_realized_grandchild_binding",
     "find_realized_grandchild_unit",
     "evaluate_grandchild_realization_gate",
 )

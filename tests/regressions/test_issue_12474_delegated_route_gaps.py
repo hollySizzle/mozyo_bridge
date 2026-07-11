@@ -31,19 +31,80 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan import (  # noqa: E402
     PLAN_BLOCKED,
+    PLAN_PROCEED,
     STEP_DISPATCH_DECISION,
     STEP_SEND_SAME_LANE_WORKER,
     STEP_SEND_TO_GRANDCHILD_GATEWAY,
     plan_delegated_coordinator_route,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import GATE_BLOCKED  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import GATE_BLOCKED, GATE_REALIZED  # noqa: E402
 
 from support.delegation_route_fakes import (  # noqa: E402
+    DELEGATED_COORDINATOR_UNIT,
+    GRANDCHILD_UNIT,
+    CHILD_REPO_IDENTITY,
     FakeDelegationExecutor,
     base_request,
     contaminated_read,
     insufficient_read,
+    realized_grandchild_rows,
 )
+
+
+def _stale_sibling_row():
+    """A depth-2 implementation sibling under the SAME coordinator, different lane.
+
+    Same coordinator parent / role / depth as the real grandchild, so the old
+    "first depth-2 implementation lane" match could bind to it — a stale/unrelated
+    false PASS. The exact-identity binding must ignore it (Redmine #13571).
+    """
+    return (
+        "ws-child-project/lane-stale",
+        "implementation",
+        2,
+        DELEGATED_COORDINATOR_UNIT,
+        "derived",
+        CHILD_REPO_IDENTITY,
+    )
+
+
+class StaleSiblingBindingRegressionTest(unittest.TestCase):
+    """#13571 / #12454 j#75444 F1: bind the exact dispatch-selected grandchild.
+
+    A stale/unrelated sibling under the same coordinator must never be treated as
+    the realized grandchild, and the verdict must not depend on inventory order.
+    """
+
+    def test_only_stale_sibling_present_blocks(self) -> None:
+        # ONLY a stale sibling is visible; the exact dispatch-selected grandchild
+        # is not. The old first-match returned the sibling -> false realized. Now
+        # the route blocks.
+        plan = plan_delegated_coordinator_route(
+            base_request(realized_units=[_stale_sibling_row()])
+        )
+        self.assertEqual(PLAN_BLOCKED, plan.verdict)
+        self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict)
+
+    def test_stale_sibling_before_target_is_order_independent(self) -> None:
+        # The exact target IS present, with a stale sibling ordered before it. The
+        # gate binds to the exact target regardless of scan order.
+        plan = plan_delegated_coordinator_route(
+            base_request(
+                realized_units=[_stale_sibling_row(), *realized_grandchild_rows()]
+            )
+        )
+        self.assertEqual(PLAN_PROCEED, plan.verdict)
+        self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
+        self.assertEqual(GRANDCHILD_UNIT, plan.realization_gate.realized_grandchild_unit)
+
+    def test_stale_sibling_after_target_is_order_independent(self) -> None:
+        plan = plan_delegated_coordinator_route(
+            base_request(
+                realized_units=[*realized_grandchild_rows(), _stale_sibling_row()]
+            )
+        )
+        self.assertEqual(PLAN_PROCEED, plan.verdict)
+        self.assertEqual(GRANDCHILD_UNIT, plan.realization_gate.realized_grandchild_unit)
 
 
 class SameLaneFallbackRegressionTest(unittest.TestCase):

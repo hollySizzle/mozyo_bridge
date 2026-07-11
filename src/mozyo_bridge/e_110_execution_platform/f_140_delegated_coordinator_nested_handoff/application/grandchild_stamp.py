@@ -44,13 +44,15 @@ from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
     DeclaredLane,
+    GrandchildBinding,
     GrandchildStampError,
     GrandchildStampPlan,
+    GrandchildTargetIdentity,
     REALIZATION_ADOPT,
     REALIZATIONS,
     RealizationGateResult,
     evaluate_grandchild_realization_gate,
-    find_realized_grandchild_unit,
+    resolve_realized_grandchild_binding,
     resolve_grandchild_stamp_plan,
 )
 
@@ -255,10 +257,14 @@ def _discover_delegation_units(args: argparse.Namespace):
     """Discover live lanes and derive their delegation breadcrumb per unit.
 
     Returns a list of ``(unit_id, lane_kind, delegation_depth,
-    delegation_parent, status)`` rows folded per ``<workspace_id>/<lane_id>``
-    unit, ready for :func:`find_realized_grandchild_unit`. Reads ``agents
-    targets`` discovery; the delegation derivation is the same read-only #12466
-    projection ``agents targets`` itself uses.
+    delegation_parent, status, repo_identity)`` rows folded per
+    ``<workspace_id>/<lane_id>`` unit, ready for
+    :func:`resolve_realized_grandchild_binding`. The trailing ``repo_identity`` is
+    the canonical repo the lane resolved (from the discovery candidate), so the
+    binding can re-verify the dispatch-selected target's ``--target-repo``
+    identity (Redmine #13571 / #12454 j#75444 F1). Reads ``agents targets``
+    discovery; the delegation derivation is the same read-only #12466 projection
+    ``agents targets`` itself uses.
     """
     from mozyo_bridge.application.commands import _agents_target_candidates
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
@@ -267,12 +273,13 @@ def _discover_delegation_units(args: argparse.Namespace):
     require_tmux()
     candidates = _agents_target_candidates(args)
     displays = derive_targets_delegation(candidates)
-    units: dict[str, tuple[str, object, str, str]] = {}
+    units: dict[str, tuple[str, object, str, str, Optional[str]]] = {}
     for cand in candidates:
         unit_id = f"{getattr(cand, 'workspace_id', '') or ''}/{getattr(cand, 'lane_id', '') or ''}"
         display = displays.get(cand.pane_id)
         if display is None:
             continue
+        repo_identity = getattr(cand, "repo_root", None)
         # Prefer a derived row over a none/diagnostic one when a unit's panes
         # disagree, so a realized grandchild is not masked by a blank sibling pane.
         existing = units.get(unit_id)
@@ -282,20 +289,24 @@ def _discover_delegation_units(args: argparse.Namespace):
                 display.delegation_depth,
                 display.delegation_parent,
                 display.status,
+                repo_identity,
             )
     return [
-        (unit_id, kind, depth, parent, status)
-        for unit_id, (kind, depth, parent, status) in units.items()
+        (unit_id, kind, depth, parent, status, repo)
+        for unit_id, (kind, depth, parent, status, repo) in units.items()
     ]
 
 
 def _render_gate_record(
-    result: RealizationGateResult, args: argparse.Namespace
+    result: RealizationGateResult,
+    args: argparse.Namespace,
+    binding: Optional[GrandchildBinding] = None,
 ) -> str:
     """Pasteable ``## Grandchild realization gate`` record (Redmine #12474 / j#64151)."""
     delegated = getattr(args, "delegated_coordinator_unit", None) or "<delegated_coordinator_unit>"
     parent_issue = getattr(args, "parent_issue", None) or "<parent_issue>"
     child_issue = getattr(args, "child_issue", None) or "<child_issue>"
+    target_unit = (getattr(args, "grandchild_unit", None) or "").strip() or "none"
     lines = [
         "## Grandchild realization gate",
         "",
@@ -305,11 +316,18 @@ def _render_gate_record(
         f"- parent_issue: {parent_issue}",
         f"- child_issue: {child_issue}",
         f"- delegated_coordinator_unit: {delegated}",
+        f"- dispatch_selected_grandchild_unit: {target_unit}",
         f"- realized_grandchild_unit: {result.realized_grandchild_unit or 'none'}",
         f"- reason: {result.reason}",
-        "- enforcement: a same-lane worker handoff alone does not satisfy display "
-        "acceptance when grandchild realization is required (#12460 / #12474 j#64151).",
     ]
+    if binding is not None:
+        lines.append(f"- identity_binding: {binding.outcome} ({binding.reason})")
+    lines.append(
+        "- enforcement: the gate binds to the EXACT dispatch-selected grandchild "
+        "identity (workspace/lane/role/repo/parent/depth) and fails closed on a "
+        "missing/mismatched/ambiguous identity; a same-lane worker handoff alone "
+        "does not satisfy display acceptance (#13571 / #12460 / #12474 j#64151)."
+    )
     if result.is_blocked:
         lines.append(
             "- remediation: create/adopt a route-bound grandchild lane/window, run "
@@ -337,12 +355,25 @@ def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
     ``0`` for a ``realized`` or ``same_lane_ok`` verdict.
     """
     units = _discover_delegation_units(args)
-    realized = find_realized_grandchild_unit(
-        units, delegated_coordinator_unit=args.delegated_coordinator_unit
+    # Bind to the EXACT dispatch-selected/created/adopted grandchild identity
+    # (never the first depth-2 sibling), then re-verify it against the live
+    # inventory (Redmine #13571 / #12454 j#75444 F1).
+    gc_unit = (getattr(args, "grandchild_unit", None) or "").strip()
+    target = (
+        GrandchildTargetIdentity(
+            unit_id=gc_unit,
+            delegation_parent=args.delegated_coordinator_unit,
+            repo_identity=(getattr(args, "grandchild_repo", None) or None),
+        )
+        if gc_unit
+        else None
+    )
+    binding = resolve_realized_grandchild_binding(
+        units, target=target, delegated_coordinator_unit=args.delegated_coordinator_unit
     )
     result = evaluate_grandchild_realization_gate(
         grandchild_required=bool(getattr(args, "require_grandchild", True)),
-        realized_grandchild_unit=realized,
+        realized_grandchild_unit=binding.matched_unit,
     )
 
     if getattr(args, "as_json", False):
@@ -350,17 +381,23 @@ def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
             "verdict": result.verdict,
             "grandchild_required": result.grandchild_required,
             "delegated_coordinator_unit": args.delegated_coordinator_unit,
+            "dispatch_selected_grandchild_unit": gc_unit or None,
             "realized_grandchild_unit": result.realized_grandchild_unit,
+            "identity_binding": {
+                "outcome": binding.outcome,
+                "matched_unit": binding.matched_unit,
+                "reason": binding.reason,
+            },
             "reason": result.reason,
             "blocked": result.is_blocked,
-            "gate_record": _render_gate_record(result, args),
+            "gate_record": _render_gate_record(result, args, binding),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"verdict: {result.verdict}")
         print(f"reason: {result.reason}")
         print("")
-        print(_render_gate_record(result, args))
+        print(_render_gate_record(result, args, binding))
 
     return _EXIT_GATE_BLOCKED if result.is_blocked else 0
 

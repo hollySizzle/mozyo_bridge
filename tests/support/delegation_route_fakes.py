@@ -132,9 +132,15 @@ def realized_grandchild_rows(
     *,
     unit_id: str = GRANDCHILD_UNIT,
     parent: str = DELEGATED_COORDINATOR_UNIT,
-) -> list[tuple[str, str, Optional[int], str, str]]:
-    """A discovery row set in which a depth-2 implementation grandchild is realized."""
-    return [(unit_id, LANE_KIND_IMPLEMENTATION, 2, parent, "derived")]
+    repo_identity: Optional[str] = CHILD_REPO_IDENTITY,
+) -> list[tuple[str, str, Optional[int], str, str, Optional[str]]]:
+    """A discovery row set in which a depth-2 implementation grandchild is realized.
+
+    The trailing ``repo_identity`` carries the canonical child repo the lane
+    resolved so the realization gate can re-verify the dispatch-selected target's
+    ``--target-repo`` identity (Redmine #13571 / #12454 j#75444 F1).
+    """
+    return [(unit_id, LANE_KIND_IMPLEMENTATION, 2, parent, "derived", repo_identity)]
 
 
 def base_request(**overrides: object) -> RoutePlanRequest:
