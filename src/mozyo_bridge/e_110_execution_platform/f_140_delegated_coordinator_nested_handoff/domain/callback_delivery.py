@@ -102,16 +102,25 @@ SEND_OUTCOMES = frozenset({SEND_DELIVERED, SEND_NOT_SENT, SEND_UNCERTAIN})
 _DELIVERED_SENT_REASONS = frozenset({"ok", "queue_enter"})
 
 #: Handoff ``status=="blocked"`` reasons that are **deterministic pre-injection** — the send
-#: was refused before anything was typed, so a retry cannot duplicate. Anything NOT in this set
-#: (marker_timeout / turn_start_unconfirmed / inject_failed / unknown) is treated as uncertain.
+#: was refused *before anything was typed*, so a retry cannot duplicate. Anything NOT in this set
+#: (marker_timeout / turn_start_unconfirmed / inject_failed / receiver_blocked / turn_start_absent
+#: / unknown) is treated as uncertain.
+#:
+#: ``receiver_blocked`` and ``turn_start_absent`` are DELIBERATELY excluded (#13520 review F2,
+#: j#75381): they are the herdr turn-start rail's **post-injection** outcomes — ``OUTCOME_BLOCKED``
+#: ("injected, timed out, re-snapshot found a runtime block") and ``OUTCOME_ABSENT``, both of which
+#: report ``TurnStartResult.delivered == True`` (``turn_start_rail.py``; ``handoff.py`` documents
+#: receiver_blocked as "the injection was delivered but the rail re-snapshotted a runtime block").
+#: The body may already be on the receiver, so a bounded retry would DUPLICATE the callback. They
+#: therefore fall through to ``uncertain`` (no auto-retry). Every reason below is a genuine
+#: pre-injection refusal (``delivered == False`` / route-resolution / precondition failure): the
+#: send edge was never crossed, so a bounded retry is safe.
 _NOT_SENT_BLOCKED_REASONS = frozenset(
     {
         "target_unavailable",
         "target_not_agent",
         "invalid_anchor",
         "invalid_args",
-        "receiver_blocked",
-        "turn_start_absent",
         "precondition_not_idle",
         "cross_session_claude",
         "target_repo_mismatch",
@@ -127,10 +136,13 @@ def send_outcome_for_delivery(status: str, reason: str) -> str:
     - ``sent`` + a positive reason (``ok`` / ``queue_enter``) -> :data:`SEND_DELIVERED`;
     - ``blocked`` + a deterministic pre-injection reason -> :data:`SEND_NOT_SENT`
       (nothing typed, so a bounded retry is safe);
-    - **everything else** — ``blocked`` with an ambiguous reason (``marker_timeout`` /
-      ``turn_start_unconfirmed`` / ``inject_failed`` / anything unrecognized), or an unexpected
-      status (``pending_input``) — -> :data:`SEND_UNCERTAIN` (no auto-retry; a duplicate send is
-      the failure to avoid). The default is deliberately the safe one.
+    - **everything else** — ``blocked`` with an ambiguous or post-injection reason
+      (``marker_timeout`` / ``turn_start_unconfirmed`` / ``inject_failed`` / ``receiver_blocked``
+      / ``turn_start_absent`` / anything unrecognized), or an unexpected status
+      (``pending_input``) — -> :data:`SEND_UNCERTAIN` (no auto-retry; a duplicate send is the
+      failure to avoid). ``receiver_blocked`` / ``turn_start_absent`` are post-injection rail
+      outcomes (``delivered == True``), so they must NOT be retried (#13520 review F2). The
+      default is deliberately the safe one.
     """
     status_s = str(status or "").strip()
     reason_s = str(reason or "").strip()

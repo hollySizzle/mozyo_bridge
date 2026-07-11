@@ -59,6 +59,15 @@ class HandoffCallbackSenderTest(unittest.TestCase):
         )
         self.assertEqual(sender(_row()), SEND_UNCERTAIN)
 
+    def test_post_injection_block_is_uncertain_not_retryable(self):
+        # #13520 review F2: a post-injection rail outcome must not become a retryable not_sent.
+        for reason in ("receiver_blocked", "turn_start_absent"):
+            with self.subTest(reason=reason):
+                sender = HandoffCallbackSender(
+                    lambda row, r=reason: HandoffDeliveryResult("blocked", r)
+                )
+                self.assertEqual(sender(_row()), SEND_UNCERTAIN)
+
     def test_send_fn_exception_is_fail_safe_uncertain(self):
         def boom(row):
             raise RuntimeError("mid-send explosion")

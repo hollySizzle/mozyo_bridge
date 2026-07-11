@@ -115,13 +115,15 @@ class SendOutcomeForDeliveryTest(unittest.TestCase):
         self.assertEqual(send_outcome_for_delivery("sent", "queue_enter"), SEND_DELIVERED)
 
     def test_deterministic_pre_injection_blocks_are_not_sent(self):
+        # Every reason here is a genuine pre-injection refusal (delivered == False / route
+        # resolution / precondition) — the send edge was never crossed, so a retry cannot
+        # duplicate. receiver_blocked / turn_start_absent are DELIBERATELY absent (see
+        # test_post_injection_blocks_are_uncertain).
         for reason in (
             "target_unavailable",
             "target_not_agent",
             "invalid_anchor",
             "invalid_args",
-            "receiver_blocked",
-            "turn_start_absent",
             "precondition_not_idle",
             "cross_session_claude",
             "target_repo_mismatch",
@@ -130,6 +132,15 @@ class SendOutcomeForDeliveryTest(unittest.TestCase):
         ):
             with self.subTest(reason=reason):
                 self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_NOT_SENT)
+
+    def test_post_injection_blocks_are_uncertain_not_retried(self):
+        # #13520 review F2 (j#75381): receiver_blocked (OUTCOME_BLOCKED "injected, then blocked")
+        # and turn_start_absent (OUTCOME_ABSENT) are the herdr turn-start rail's post-injection
+        # outcomes — TurnStartResult.delivered == True. Classifying them not_sent (retryable)
+        # would re-send an already-delivered callback. They must be uncertain (no auto-retry).
+        for reason in ("receiver_blocked", "turn_start_absent"):
+            with self.subTest(reason=reason):
+                self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_UNCERTAIN)
 
     def test_ambiguous_blocks_are_uncertain(self):
         for reason in ("marker_timeout", "turn_start_unconfirmed", "inject_failed"):
