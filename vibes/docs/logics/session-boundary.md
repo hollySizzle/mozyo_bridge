@@ -116,6 +116,8 @@ pane_lifecycle:
 単一 issue の boundary prompt だけでは、active US とその後続 release / E2E、owner の限定承認を一度に表せない場合がある。このときは [[spec-session-continuity-user-harness]] に従い、`vibes/docs/temps/session-handoff-<issue>.md` を **一時的な pointer bundle** として作る。
 
 - bundle は active / queued issue を `#<id> <短い概要>`、issue role、latest known journal、dependency 順で列挙する。
+- lane を記す場合は Git branch/worktree・registered lane metadata・live routable runtime を別 state として区別し、routable でない lane は欠落 layer を名指し (branch-only / lane-unregistered / runtime-unavailable) で fail-closed にする。`target lane` label を live routable lane と同一視しない (正本 [[spec-session-continuity-user-harness]] `### Routable lane state の区別`)。lane state は `sublane list --lane <label> --json` (registered lane metadata) と live slot 実測で判定し、backend=herdr の `agents targets` empty candidate を「routable lane 不在」の根拠にしない。
+- backend=herdr では lane discovery / dispatch / handoff 可否の next-action を確定する前に runtime fingerprint を照合する: standard surface (`sublane ...`) と primitive/debug 面 (`agents targets` 等) を区別し、`mozyo-bridge doctor runtime` で installed/source skew を read-only 検出して mismatch を fail-closed 記録する (正本 [[spec-session-continuity-user-harness]] `### Runtime fingerprint gate (backend=herdr)` / [[task-herdr-lane-operations]])。
 - release chain では active review finding / commitのorigin到達性、main・integration・issue branch head、latest main CI、version / build / artifact / TestPyPI install / installed CLI E2Eのgate状態を列挙する。local test greenだけをrelease-ready verdictにしない。
 - owner approval は対象と除外を同時に記す。release approval を production publish まで拡張解釈しない。
 - preservation signal、dirty / running lane、未完 review を記し、reset / kill / retire / integration の誤実行を防ぐ。

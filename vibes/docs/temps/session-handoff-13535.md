@@ -1,6 +1,8 @@
 # Session handoff bundle — Redmine #13535
 
 > 一時 pointer bundle。Redmine issue / journal と cataloged docs が正本であり、本書は新しい authority ではない。次 session の受領 journal 後に削除する。
+>
+> Correction (#13543 / #13535 j#75183): 旧版は `Target lane` を live routable herdr lane と同一視していた。実際は branch-only / lane-unregistered。lane state は下記 Boundary で 3 state に区別する。
 
 ## Boundary
 
@@ -10,7 +12,10 @@
 - Version: #301「ワークフロー単一ステップ実行入口整備枠」
 - Repo: `mozyo-giken-3800-mozyo-bridge`
 - Workspace identity: `e1487dcb1f2d4412b28e825fdeccf9e8`
-- Target lane: `issue_13535_session_transition`（baseは`origin/int_13472_session_continuity`）
+- Lane state (`spec-session-continuity-user-harness` `### Routable lane state の区別`、#13543):
+  - `issue_13535_session_transition` は **branch-only / lane-unregistered**。Git branch/worktree と commit `49a770f...` は存在するが、source runtime の `sublane list --lane issue_13535_session_transition --json` は `sublanes: []` で registered lane metadata / live routable herdr slot を持たない。
+  - routable な herdr lane として dispatch / handoff の対象にしない。branch base は `origin/int_13472_session_continuity`。
+  - runtime fingerprint 注意: installed `mozyo-bridge 0.10.0` は source の #13446 herdr preflight を欠く。next-action 前に `mozyo-bridge doctor runtime` で installed/source skew を確認し、mismatch なら repo-local source CLI を使う (`### Runtime fingerprint gate (backend=herdr)`)。
 - Execution root: `.`
 - Base integration head: `0b051eb162b11a055beda53b85438904e531b42a`
 - Bundle commit: #13535 latest journalのexact hashを正本として読む。
@@ -58,6 +63,7 @@
 2. #13518 j#75147 / j#75150 / j#75152とcommit `e776d5f`を独立再reviewする。
 3. #13524、#13490のlatest journalを読み、dependencyと承認境界を再確認する。
 4. main / integration / issue branch head、latest main CI、package versionをread-onlyで再取得する。
-5. #13537 QA Verificationと#13535 US-level reviewを記録する。integration / close / publishは別gateまで行わない。
+5. lane に next-action を取る前に routable lane state (Git branch/worktree・registered lane metadata・live routable runtime) と runtime fingerprint を確認する。`sublane list --lane <label> --json` と `mozyo-bridge doctor runtime` を read-only 実行し、`agents targets` の tmux 候補空振りを lane 不在の根拠にしない (#13543)。
+6. #13537 QA Verificationと#13535 US-level reviewを記録する。integration / close / publishは別gateまで行わない。
 
 Boundary signals: `context_pressure`, `gate_transition`, `active_issue_change`。

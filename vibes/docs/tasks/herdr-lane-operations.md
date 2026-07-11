@@ -15,6 +15,17 @@ backend=herdr の workspace では、旧 tmux-era の semantic selection / pane 
   - `agents targets`: backend=herdr で tmux-era primitive/debug 面である旨を stderr note で明示 (listing 自体は read-only で維持)。
 - tmux backend の workspace では上記 guard は一切発火せず、出力は byte-invariant。
 
+## routable lane state の確認と runtime fingerprint (次 action 前, #13543)
+
+session 移行 bundle や journal の `target lane` label を、live で routable な herdr lane と同一視しない。lane に dispatch / handoff / retire の next-action を取る前に、次を **別 state** として確認する (契約正本: `spec-session-continuity-user-harness` `### Routable lane state の区別` / `### Runtime fingerprint gate (backend=herdr)`)。
+
+1. **Git branch/worktree**: `git branch --list issue_<id>_<slug>` / worktree の存在。branch/worktree が在っても routable lane を意味しない。
+2. **registered lane metadata**: `sublane list --lane <label> --json` の `sublanes`。非空なら registered、`sublanes: []` なら **lane-unregistered** (branch が在れば branch-only)。この空振りを「dispatch 送達失敗」と誤帰着しない。
+3. **live routable runtime**: gateway/worker の live slot 実測 (`herdr agent read <pane>` / lane metadata の pane id)。metadata registered でも live slot が無ければ **runtime-unavailable**。
+4. **runtime fingerprint**: `mozyo-bridge doctor runtime` を read-only 実行。installed CLI が source checkout の herdr preflight 等を欠く (`status: drifted` / probe mismatch) なら、skew を durable record に fail-closed 記録し、installed CLI surface の出力を next-action の根拠にしない。以降の lane discovery / dispatch は repo-local source CLI (`PYTHONPATH=src python3 -m mozyo_bridge <args>`) で行う (installed CLI upgrade は owner-gated)。
+
+再発事例 (#13543 / #13535 j#75183): installed `mozyo-bridge 0.10.0` が #13446 herdr preflight を欠き、backend=herdr でも `agents targets` を通常面のように tmux 候補列挙した。coordinator が runtime fingerprint を照合せず、その空振りを handoff blocker 理由にした。正しくは `sublane list --lane issue_13535_session_transition --json` = `sublanes: []` (lane-unregistered / branch-only) であり、tmux candidate 空振りではない。
+
 ## 前提
 
 - 実行 CLI: **installed CLI (pipx の `mozyo-bridge` / `mozyo`) が標準** (#13167 で herdr lane 世代へ追いつき済み、#13379 で installed CLI のみでの lane 運用完結を確認)。installed CLI が最新 origin/main と版ズレしている間に限り、fallback として **repo-local CLI** を使う。fallback の標準形は package 直の module 実行 (`src/mozyo_bridge/__main__.py` 経由):
