@@ -52,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REALIZATIONS,
     RealizationGateResult,
     evaluate_grandchild_realization_gate,
+    redact_unit_token,
     resolve_realized_grandchild_binding,
     resolve_grandchild_stamp_plan,
 )
@@ -404,7 +405,9 @@ def _render_gate_record(
     delegated = getattr(args, "delegated_coordinator_unit", None) or "<delegated_coordinator_unit>"
     parent_issue = getattr(args, "parent_issue", None) or "<parent_issue>"
     child_issue = getattr(args, "child_issue", None) or "<child_issue>"
-    target_unit = (getattr(args, "grandchild_unit", None) or "").strip() or "none"
+    # Redact a malformed (e.g. absolute-path typo) unit so a private host path
+    # never reaches the pasteable gate record (Redmine #13571 R6-F1).
+    target_unit = redact_unit_token(getattr(args, "grandchild_unit", None))
     lines = [
         "## Grandchild realization gate",
         "",
@@ -481,7 +484,9 @@ def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
             "verdict": result.verdict,
             "grandchild_required": result.grandchild_required,
             "delegated_coordinator_unit": args.delegated_coordinator_unit,
-            "dispatch_selected_grandchild_unit": gc_unit or None,
+            "dispatch_selected_grandchild_unit": (
+                redact_unit_token(gc_unit) if gc_unit else None
+            ),
             "realized_grandchild_unit": result.realized_grandchild_unit,
             "identity_binding": {
                 "outcome": binding.outcome,

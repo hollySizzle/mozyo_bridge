@@ -390,6 +390,45 @@ def _repo_token(path: Optional[str]) -> str:
     return norm.rsplit("/", 1)[-1] or norm
 
 
+#: The placeholder a malformed (non-stable) unit id is redacted to.
+REDACTED_UNIT_TOKEN = "<redacted-unit>"
+
+
+def _is_stable_unit(unit_id: Optional[object]) -> bool:
+    """Whether ``unit_id`` is a portable stable ``<workspace_id>/<lane_id>`` pointer.
+
+    A stable unit has exactly one ``/`` with both components non-empty and is not
+    path-like (no leading ``/`` / ``~`` / ``.``, no backslash). An operator typo
+    such as an absolute ``/Users/...`` / ``/home/...`` path, a ``~`` home
+    reference, or a Windows path is NOT a stable identity (Redmine #13571 R6-F1).
+    """
+    if unit_id is None:
+        return False
+    s = str(unit_id).strip()
+    if not s or s.startswith(("/", "~", ".")) or "\\" in s:
+        return False
+    parts = s.split("/")
+    return len(parts) == 2 and all(parts)
+
+
+def redact_unit_token(unit_id: Optional[object]) -> str:
+    """Durable-safe projection of a unit id for reasons / records (Redmine #13571 R6-F1).
+
+    A valid stable ``<workspace_id>/<lane_id>`` unit (:func:`_is_stable_unit`) is
+    safe to show. Any other value — an absolute ``/Users/...`` / ``/home/...``
+    path, a ``~`` home reference, a Windows path, or a multi-segment path — is
+    redacted to :data:`REDACTED_UNIT_TOKEN` so a private host path can never reach
+    the durable JSON / pasteable gate record even on a fail-closed verdict
+    (public/private durable-record boundary). ``none`` for an empty value.
+    """
+    if unit_id is None:
+        return "none"
+    s = str(unit_id).strip()
+    if not s:
+        return "none"
+    return s if _is_stable_unit(s) else REDACTED_UNIT_TOKEN
+
+
 @dataclass(frozen=True)
 class GrandchildTargetIdentity:
     """The exact grandchild lane identity the dispatch selected/created/adopted.
@@ -433,11 +472,13 @@ class GrandchildTargetIdentity:
         misdiagnosed as merely "missing a field" (Redmine #13571 j#75494 R5-F2).
         """
         problems: list[str] = []
-        workspace, lane = _split_workspace_lane(self.unit_id)
-        if not (workspace and lane):
+        if not _is_stable_unit(self.unit_id):
+            # Redact the offending value: a non-stable unit is often an absolute
+            # host path / home reference typo, which must not reach the durable
+            # reason (Redmine #13571 R6-F1).
             problems.append(
-                f"unit_id {self.unit_id!r} must be <workspace_id>/<lane_id> with "
-                "both components non-empty"
+                f"unit_id {redact_unit_token(self.unit_id)} must be a stable "
+                "<workspace_id>/<lane_id> pointer (not a path)"
             )
         if not (self.delegation_parent or "").strip():
             problems.append("delegation_parent (the delegated coordinator unit) is required")
@@ -789,6 +830,8 @@ __all__ = (
     "BINDING_AMBIGUOUS",
     "BINDING_UNBOUND",
     "GRANDCHILD_GATEWAY_ROLE",
+    "REDACTED_UNIT_TOKEN",
+    "redact_unit_token",
     "GrandchildTargetIdentity",
     "InventoryUnit",
     "GrandchildBinding",

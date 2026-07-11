@@ -43,12 +43,15 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.grandchild_stamp import (  # noqa: E402
     _canonical_repo_identity,
     _discover_delegation_units,
+    cmd_handoff_grandchild_gate,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (  # noqa: E402
     BINDING_MISMATCH,
     BINDING_REALIZED,
     BINDING_UNBOUND,
+    REDACTED_UNIT_TOKEN,
     GrandchildTargetIdentity,
+    redact_unit_token,
     resolve_realized_grandchild_binding,
 )
 
@@ -460,6 +463,81 @@ class CanonicalGrandchildShapeTest(unittest.TestCase):
             delegated_coordinator_unit=_DELEG_UNIT,
         )
         self.assertEqual(BINDING_REALIZED, binding.outcome)
+
+
+class UnitIdentityPrivacyTest(unittest.TestCase):
+    """#13571 j#75501 R6-F1: a malformed unit id must not leak a private path.
+
+    An operator typo such as an absolute ``/Users/...`` / ``/home/...`` path
+    passed as ``--grandchild-unit`` fails closed (unbound), and the raw value must
+    not reach the binding reason, the CLI JSON, or the pasteable gate record.
+    """
+
+    # Built from parts at runtime so the tracked source never contains a literal
+    # `/Users/<name>` / `C:\\Users\\<name>` home-path shape (the tracked-file
+    # secret-literal rule), while still exercising those shapes at runtime.
+    _SYNTHETIC = (
+        "/" + "Users" + "/synthetic/private/repo",
+        "/" + "home" + "/synthetic/private/repo",
+        "~/synthetic-private",
+        "C:" + chr(92) + "Users" + chr(92) + "synthetic",
+    )
+
+    def test_redact_unit_token_redacts_pathlike_keeps_stable(self) -> None:
+        for value in self._SYNTHETIC:
+            self.assertEqual(REDACTED_UNIT_TOKEN, redact_unit_token(value), msg=value)
+        for stable in ("ws/gc", "mozyo/lane-1", "ws-child-project/lane-grandchild"):
+            self.assertEqual(stable, redact_unit_token(stable), msg=stable)
+        self.assertEqual("none", redact_unit_token(""))
+        self.assertEqual("none", redact_unit_token(None))
+
+    def test_binding_reason_does_not_leak_pathlike_unit(self) -> None:
+        for value in self._SYNTHETIC:
+            target = GrandchildTargetIdentity(
+                unit_id=value, delegation_parent=_DELEG_UNIT, repo_identity="/ws/child"
+            )
+            binding = resolve_realized_grandchild_binding(
+                [], target=target, delegated_coordinator_unit=_DELEG_UNIT
+            )
+            self.assertEqual(BINDING_UNBOUND, binding.outcome, msg=value)
+            self.assertNotIn(value.strip(), binding.reason, msg=value)
+            self.assertIn(REDACTED_UNIT_TOKEN, binding.reason, msg=value)
+
+    def _gate_output(self, unit, *, as_json):
+        import argparse
+        import contextlib
+        import io
+
+        args = argparse.Namespace(
+            delegated_coordinator_unit="mz/lane-deleg",
+            grandchild_unit=unit,
+            grandchild_repo="/ws/child",
+            require_grandchild=True,
+            parent_issue="1",
+            child_issue="2",
+            session=None,
+            as_json=as_json,
+        )
+        buf = io.StringIO()
+        patch = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.grandchild_stamp._discover_delegation_units"
+        )
+        with mock.patch(patch, return_value=[]), contextlib.redirect_stdout(buf):
+            rc = cmd_handoff_grandchild_gate(args)
+        return rc, buf.getvalue()
+
+    def test_cli_json_and_gate_record_do_not_leak_pathlike_unit(self) -> None:
+        for value in self._SYNTHETIC:
+            for as_json in (True, False):
+                rc, out = self._gate_output(value, as_json=as_json)
+                self.assertEqual(3, rc, msg=f"{value}/{as_json}")  # unbound -> blocked
+                self.assertNotIn(value.strip(), out, msg=f"{value}/{as_json}")
+                self.assertIn(REDACTED_UNIT_TOKEN, out, msg=f"{value}/{as_json}")
+
+    def test_valid_stable_unit_still_displayed_in_gate_record(self) -> None:
+        rc, out = self._gate_output("ws-gc/lane-gc", as_json=True)
+        self.assertIn("ws-gc/lane-gc", out)
 
 
 class PublicCatalogResolverContractTest(unittest.TestCase):

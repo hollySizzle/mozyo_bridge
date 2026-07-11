@@ -745,17 +745,19 @@ class FindRealizedGrandchildTest(unittest.TestCase):
 
     def test_repo_mismatch_reason_redacts_absolute_path(self) -> None:
         # F3 (b): the mismatch reason must not leak a raw absolute host path; only
-        # the portable basename is emitted.
-        rows = [_gc_unit(repo_identity="/home/secret/dev/repo-b")]
+        # the portable basename is emitted. The private prefix is built at runtime
+        # so the tracked source carries no home-path-shaped literal.
+        private = "/" + "home" + "/synthetic/dev"
+        rows = [_gc_unit(repo_identity=f"{private}/repo-b")]
         binding = resolve_realized_grandchild_binding(
             rows,
-            target=_gc_target(repo_identity="/home/secret/dev/repo-a"),
+            target=_gc_target(repo_identity=f"{private}/repo-a"),
             delegated_coordinator_unit="mozyo/d",
         )
         self.assertEqual(BINDING_MISMATCH, binding.outcome)
         self.assertIn("repo-a", binding.reason)
         self.assertIn("repo-b", binding.reason)
-        self.assertNotIn("/home/secret", binding.reason)
+        self.assertNotIn(private, binding.reason)
 
     def test_repo_match_realizes(self) -> None:
         rows = [_gc_unit(repo_identity="/ws/repo-a/")]
