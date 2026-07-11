@@ -156,8 +156,15 @@ def _render_realization_record(
     """
     parent_issue = getattr(args, "parent_issue", None) or "<parent_issue>"
     child_issue = getattr(args, "child_issue", None) or "<child_issue>"
+    # The record-only `--delegated-coordinator` is operator-supplied and is not
+    # validated by the plan; project it through the shared unit redactor so a
+    # path-like override cannot leak into the pasteable record (Redmine #13571
+    # R8-F1). `plan.grandchild_parent` is already validated stable by the plan.
+    delegated_raw = getattr(args, "delegated_coordinator", None)
     delegated_coordinator = (
-        getattr(args, "delegated_coordinator", None) or plan.grandchild_parent or "-"
+        redact_unit_token(delegated_raw)
+        if delegated_raw
+        else (plan.grandchild_parent or "-")
     )
     dispatch_anchor = getattr(args, "dispatch_anchor", None) or "pending"
     if applied is None:

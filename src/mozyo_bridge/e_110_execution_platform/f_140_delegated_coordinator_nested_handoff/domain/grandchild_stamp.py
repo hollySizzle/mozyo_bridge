@@ -196,6 +196,30 @@ def resolve_grandchild_stamp_plan(
     if not declared_lanes:
         raise GrandchildStampError("no declared lanes; cannot stamp a delegation tree")
 
+    # Every declared unit id, every non-root parent pointer, and the grandchild
+    # unit must be a stable ``<workspace_id>/<lane_id>`` pointer BEFORE any plan /
+    # side effect — the stamp producer must not turn a path-like (e.g. absolute
+    # host path) breadcrumb into a success record or a live ``@mozyo_delegation_parent``
+    # tmux write, and the error must not leak the raw value. This is the same
+    # stable-unit contract the realization gate consumer enforces, so producer and
+    # consumer agree (Redmine #13571 j#75515 R8-F1).
+    for lane in declared_lanes:
+        if not _is_stable_unit(lane.unit_id):
+            raise GrandchildStampError(
+                f"declared lane unit {redact_unit_token(lane.unit_id)} must be a "
+                "stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
+        if lane.delegation_parent is not None and not _is_stable_unit(lane.delegation_parent):
+            raise GrandchildStampError(
+                f"declared lane parent {redact_unit_token(lane.delegation_parent)} must "
+                "be a stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
+    if not _is_stable_unit(grandchild_unit):
+        raise GrandchildStampError(
+            f"grandchild_unit {redact_unit_token(grandchild_unit)} must be a stable "
+            "<workspace_id>/<lane_id> pointer (not a path)"
+        )
+
     sources = [
         DelegationSource(
             unit_id=lane.unit_id,

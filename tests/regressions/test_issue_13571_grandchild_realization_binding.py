@@ -44,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _canonical_repo_identity,
     _discover_delegation_units,
     cmd_handoff_grandchild_gate,
+    cmd_handoff_grandchild_stamp,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (  # noqa: E402
     BINDING_MISMATCH,
@@ -647,6 +648,105 @@ class ParentIdentityStableUnitTest(unittest.TestCase):
             self.assertEqual(3, rc, msg=f"as_json={as_json}")
             self.assertNotIn(self._PATH_PARENT, out, msg=f"as_json={as_json}")
             self.assertIn(REDACTED_UNIT_TOKEN, out, msg=f"as_json={as_json}")
+
+
+class StampProducerStableUnitTest(unittest.TestCase):
+    """#13571 j#75515 R8-F1: the stamp producer enforces the stable-unit contract.
+
+    `delegate-grandchild-stamp` (the producer of the live KIND/DEPTH/PARENT
+    breadcrumb the gate reads) must fail closed on a path-like declared unit /
+    parent / grandchild BEFORE any plan or tmux write, must not leak the raw
+    value, and must perform zero tmux writes on invalid input.
+    """
+
+    _PATH_GC = "/" + "Users" + "/synthetic/private/gc"
+    _PATH_PARENT = "/" + "Users" + "/synthetic/private/deleg"
+
+    def _run(self, lanes, gc_unit, realization, *, adopt_reason=None,
+             as_json=True, apply=False, delegated_coordinator=None):
+        import argparse
+        import contextlib
+        import io
+
+        args = argparse.Namespace(
+            lane=lanes,
+            grandchild_unit=gc_unit,
+            realization=realization,
+            adopt_reason=adopt_reason,
+            parent_issue="1",
+            child_issue="2",
+            delegated_coordinator=delegated_coordinator,
+            dispatch_anchor=None,
+            apply=apply,
+            dry_run=False,
+            as_json=as_json,
+        )
+        buf = io.StringIO()
+        rc = None
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                rc = cmd_handoff_grandchild_stamp(args)
+            except SystemExit as exc:  # die() on fail-closed
+                rc = f"die:{exc.code}"
+        return rc, buf.getvalue()
+
+    def _chain(self, *, gc_unit, parent="mz/d"):
+        return [
+            "kind=coordinator,unit=gk/p,parent=-",
+            f"kind=delegated_coordinator,unit={parent},parent=gk/p",
+            f"kind=implementation,unit={gc_unit},parent={parent},pane=%3",
+        ]
+
+    def test_pathlike_grandchild_fails_closed_no_leak(self) -> None:
+        for realization, ar in (("launch", None), ("adopt", "because")):
+            rc, out = self._run(
+                self._chain(gc_unit=self._PATH_GC), self._PATH_GC, realization,
+                adopt_reason=ar,
+            )
+            self.assertTrue(str(rc).startswith("die:"), msg=f"{realization}: {rc}")
+            self.assertNotIn(self._PATH_GC, out, msg=realization)
+            self.assertIn(REDACTED_UNIT_TOKEN, out, msg=realization)
+
+    def test_pathlike_parent_fails_closed_no_leak(self) -> None:
+        for realization, ar in (("launch", None), ("adopt", "because")):
+            rc, out = self._run(
+                self._chain(gc_unit="mz/gc", parent=self._PATH_PARENT), "mz/gc",
+                realization, adopt_reason=ar,
+            )
+            self.assertTrue(str(rc).startswith("die:"), msg=f"{realization}: {rc}")
+            self.assertNotIn(self._PATH_PARENT, out, msg=realization)
+
+    def test_drive_dot_multisegment_unit_fails_closed(self) -> None:
+        for bad in ("C:/x", "ws/.", "ws/..", "ws/a/b"):
+            rc, out = self._run(self._chain(gc_unit=bad), bad, "launch")
+            self.assertTrue(str(rc).startswith("die:"), msg=f"{bad}: {rc}")
+            self.assertNotIn(bad, out, msg=bad)
+
+    def test_record_only_delegated_coordinator_path_is_redacted(self) -> None:
+        # A valid chain with a path-like record-only --delegated-coordinator:
+        # the plan succeeds but the override is redacted (never leaked).
+        rc, out = self._run(
+            self._chain(gc_unit="mz/gc"), "mz/gc", "launch",
+            delegated_coordinator=self._PATH_PARENT,
+        )
+        self.assertEqual(0, rc)
+        self.assertNotIn(self._PATH_PARENT, out)
+        self.assertIn(REDACTED_UNIT_TOKEN, out)
+
+    def test_all_valid_chain_still_succeeds(self) -> None:
+        rc, out = self._run(self._chain(gc_unit="mz/gc"), "mz/gc", "launch")
+        self.assertEqual(0, rc)
+        self.assertIn("mz/gc", out)
+
+    def test_apply_invalid_input_performs_zero_tmux_writes(self) -> None:
+        tmux = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client"
+        with mock.patch(f"{tmux}.run_tmux") as run_tmux, mock.patch(f"{tmux}.require_tmux"):
+            rc, out = self._run(
+                self._chain(gc_unit=self._PATH_GC), self._PATH_GC, "launch", apply=True
+            )
+            self.assertTrue(str(rc).startswith("die:"))
+            self.assertEqual(0, run_tmux.call_count)
+            self.assertNotIn(self._PATH_GC, out)
 
 
 class PublicCatalogResolverContractTest(unittest.TestCase):
