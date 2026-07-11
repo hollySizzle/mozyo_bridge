@@ -111,6 +111,18 @@ pane_lifecycle:
 - **#12098 execution-root propagation を維持する**。next-session prompt の execution root は portable pointer で表現し、絶対 path は構造化出力にのみ残す。
 - **owner approval なしの pane kill / discard / destructive cleanup を自動化しない**。`guarded_kill` は owner 承認 + clean pane の二条件を満たすときだけ許す。
 
+## 4. 複数 issue をまたぐ session transition package
+
+単一 issue の boundary prompt だけでは、active US とその後続 release / E2E、owner の限定承認を一度に表せない場合がある。このときは [[spec-session-continuity-user-harness]] に従い、`vibes/docs/temps/session-handoff-<issue>.md` を **一時的な pointer bundle** として作る。
+
+- bundle は active / queued issue を `#<id> <短い概要>`、issue role、latest known journal、dependency 順で列挙する。
+- owner approval は対象と除外を同時に記す。release approval を production publish まで拡張解釈しない。
+- preservation signal、dirty / running lane、未完 review を記し、reset / kill / retire / integration の誤実行を防ぐ。
+- bundle 自体は authority ではない。fresh session は最初に boundary issue の journal、次に各 issue の latest journal を source-of-truth system から読む。
+- bundle は次 session の受領 journal 後に stale とみなし、恒久 doc から参照しない。
+
+transition package 作成のために worker callback を poll しない。境界時点で source journal を一度解決し、既知 state を記録して turn を終了する。新しい callback は fresh session の latest-journal read で回収する。
+
 ## 入口の薄さ
 
 判定ルール・prompt 仕様・lifecycle 条件の本文はこの doc に固定する。AGENTS.md / CLAUDE.md / skill 入口には「session boundary は [[logic-coordinator-sublane-development-flow]] と本 doc を読む」という pointer のみ置き、同じ判断材料を複製しない ([[rule-llm-rule-authoring]])。helper 出力 (`session boundary-prompt` / `session pane-decision`) は本 doc の判定を実行可能にしたものであり、doc と実装が drift したら同一 task で両方を直す。

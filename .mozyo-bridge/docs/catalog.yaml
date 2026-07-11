@@ -138,6 +138,7 @@ documents:
       - rule-project-agent-workflow
       - rule-workflow-docs-boundary
       - logic-session-boundary
+      - spec-session-continuity-user-harness
       - task-herdr-lane-operations
       - task-external-project-herdr-adoption
 
@@ -150,6 +151,19 @@ documents:
     related_document_refs:
       - skill-project-map-reference
       - spec-bounded-context-map
+
+  - id: spec-session-continuity-user-harness
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/session-continuity-user-harness.md
+    purpose: 新規sessionがchat memoryやpane scrollbackに依存せず、router / central preset / cataloged docs / Redmine durable state / temporary transition bundle / boundary promptからactive workflowと承認境界を復元するuser harness仕様。恒久contractと`vibes/docs/temps/`の時点snapshotを分離し、受領後cleanupまで定義する (Redmine #13529)。
+    audit_role: session_continuity_user_harness_spec
+    related_document_refs:
+      - task-new-session-onboarding
+      - logic-session-boundary
+      - rule-workflow-docs-boundary
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
 
   - id: spec-bounded-context-map
     type: spec
@@ -677,6 +691,7 @@ documents:
       - rule-llm-rule-authoring
       - skill-workflow-reference
       - spec-project-map
+      - spec-session-continuity-user-harness
 
   - id: logic-cockpit-attention-state
     type: logic

@@ -42,13 +42,25 @@ handoff notification marker (`kind` / `receiver` / role profile pointer 等) は
 
 boundary-prompt から現在地を再構成する順序は §「読む順序」に従う: prompt の anchor → 該当 Redmine journal → parent US / active issue → 質問ドメインの cataloged docs。prompt に固定された state はどれも durable record で照合する。
 
+## Session transition package の受領
+
+prompt が `vibes/docs/temps/session-handoff-<issue>.md` を指す場合、その file は複数 issue の current chain を束ねた一時 pointer であり、authority ではない。[[spec-session-continuity-user-harness]] と [[logic-session-boundary]] に従い、次の順で受領する。
+
+1. prompt の boundary issue / journal を Redmine から読む。
+2. temporary bundle に列挙された active / queued issue の latest journal を読む。bundle と相違すれば Redmine を採用する。
+3. approval の対象と除外、preservation signal、pending action / next actor を復元する。
+4. fresh-session QA の結果を boundary Test / parent US に記録する。
+5. 受領記録後、bundle は stale cleanup 対象とする。恒久 doc から参照しない。
+
+LLM turn 内で worker completion を待つための poll は行わない。callback が未着なら current durable state を記録して turn を終了し、次の callback / fresh turn で再開する。
+
 ## 主要 doc の在り処 (vibes/docs レイアウト)
 
 | dir | 用途 | 主な doc |
 | --- | --- | --- |
 | `logics/` | 業務ロジック | `coordinator-sublane-development-flow.md` / `delegated-coordinator-cockpit-display.md` / `sublane-lifecycle-map.md` / `herdr-scenario-test-foundation.md` |
 | `rules/` | プロジェクト規約 | `agent-workflow.md` / `workflow-docs-boundary.md` / `public-private-boundary.md` / `codex-autonomous-guardrail-lane.md` |
-| `specs/` | 仕様 | `herdr-native-identity.md` / `route-identity-ledger.md` / `delegation-policy-project-config.md` |
+| `specs/` | 仕様 | `session-continuity-user-harness.md` / `herdr-native-identity.md` / `route-identity-ledger.md` / `delegation-policy-project-config.md` |
 | `tasks/` | 手順書 | `herdr-lane-operations.md` (lane 運用) / `external-project-herdr-adoption.md` (他 project 導入) / 本書 |
 | `temps/` | 一時ドキュメント | 恒久参照にしない。stale は掃除対象。 |
 
