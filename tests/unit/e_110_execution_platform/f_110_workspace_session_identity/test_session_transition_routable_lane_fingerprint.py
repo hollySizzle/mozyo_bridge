@@ -122,26 +122,25 @@ class RoutableLaneStateContractDocsTest(unittest.TestCase):
                 ),
             )
 
-    def test_stale_bundle_correction_when_present(self) -> None:
-        # The transition bundle is an ephemeral temps file (stale-cleanup target),
-        # so only assert on it while it exists; do not fail once it is deleted.
+    def test_received_stale_bundle_is_deleted(self) -> None:
+        # The #13535 transition bundle was received (#13537 j#75168) and its
+        # stale cleanup deferred to the next reviewable transition commit. Per
+        # spec-session-continuity-user-harness stale-bundle lifecycle, that
+        # commit must DELETE the received bundle, not keep a corrected live
+        # pointer — the durable routable-lane correction already lives in the
+        # permanent spec / herdr-ops runbook and #13535 j#75183. Deletion is the
+        # expected end state; a re-appearing #13535 bundle is a lifecycle
+        # regression (Redmine #13543 review j#75201 F1).
         path = ROOT / "vibes" / "docs" / "temps" / "session-handoff-13535.md"
-        if not path.is_file():
-            self.skipTest("transition bundle already cleaned up (expected)")
-        body = path.read_text(encoding="utf-8")
-        for marker in (
-            "branch-only / lane-unregistered",
-            "sublanes: []",
-            "Routable lane state",
-        ):
-            self.assertIn(
-                marker,
-                body,
-                msg=(
-                    f"session-handoff-13535 bundle is missing correction marker "
-                    f"{marker!r}; see Redmine #13543 / #13535 j#75183."
-                ),
-            )
+        self.assertFalse(
+            path.is_file(),
+            msg=(
+                "received #13535 transition bundle must be deleted in its next "
+                "reviewable transition commit, not retained as a live pointer; "
+                "the durable correction lives in the permanent spec / runbook and "
+                "#13535 j#75183 (see Redmine #13543 j#75201 F1)."
+            ),
+        )
 
 
 class ExistingDiagnosticUsageTest(unittest.TestCase):
