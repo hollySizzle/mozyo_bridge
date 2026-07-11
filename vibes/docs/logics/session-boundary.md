@@ -62,7 +62,7 @@ boundary_prompt_fields:
     - issue_role      # この issue が何をするものか: smoke本番 / pre-smoke再検証 / metadata cleanup / operator decision 等
     - journal (latest anchor journal id)
   portable_pointer:
-    - repo            # portable identifier (canonical session name / workspace id)。絶対 path にしない
+    - repo            # portable identifier (canonical session name + workspace id when available)。絶対 path にしない
     - execution_root  # #12098。portable repo-relative pointer。絶対 path は構造化出力にのみ残す
   推奨:
     - parent_issue    # 親 US (child Task の場合)
@@ -78,7 +78,7 @@ boundary_prompt_fields:
 - prompt 先頭は handoff notification と同じ **durable-anchor 契約**で始める: 「anchor journal を source-of-truth system から読んでから着手せよ。以下は pointer であって新しい authority ではない」。
 - issue id だけを提示しない。少なくとも `issue id + short subject + issue_role + parent_issue` を同じ行または隣接行に置き、特に smoke / release / cleanup / readiness のように誤実行が高コストな issue では `not_this_issue` / `non_goals` を明示する。例: `#12650 Post-layout #12546 pre-smoke readiness を再検証する` は #12546 smoke 本番ではなく、#12499 配下の Test であり、#12546 を実行しない。
 - auto-generated subject が長すぎる、description の先頭を丸ごと使っている、または issue id だけでは役割が判別できない場合は、次 session prompt を出す前に subject を短く正規化し、clarification journal を残す。読み手が Redmine を開く前に「どの issue が本番実行で、どの issue が前提確認か」を取り違えないことを prompt の品質条件にする。
-- **repo は portable identifier (canonical session name) で参照**し、checkout は workspace registry から解決する。pane location からは解決しない。絶対 repo root と execution-root workdir は構造化出力 (`--json`) にのみ載せ、pasteable text には載せない ([[rule-public-private-boundary]])。
+- **repo は portable identifier (canonical session name + 利用可能なら workspace id) で参照**し、checkout は workspace registry から解決する。pane location からは解決しない。canonical session 名に複数 record が一致する場合は workspace id、checkout の存在、Redmine project、Git originで一意性を検証し、決まらなければ fail-closed にする。絶対 repo root と execution-root workdir は構造化出力 (`--json`) にのみ載せ、pasteable text には載せない ([[rule-public-private-boundary]])。
 - 実装: `mozyo-bridge session boundary-prompt --issue <id> --journal <id> --issue-subject <s> --issue-role <r> [--parent ...] [--commit ...] [--target-lane ...] [--execution-root <abs>] [--gate ...] [--verification ...] [--residual ... (repeatable)] [--pending-action ...] [--next-actor owner|claude|codex] [--signal <name> (repeatable)] [--json]`。`--issue-subject` / `--issue-role` は required で non-empty (空/空白は fail-closed; Redmine #13479)。markdown は Ticket 行を `#<id> <subject>` で描き Role 行を隣接させ、`--json` は両 field を構造化出力に載せる。default は pasteable markdown、`--json` は prompt field + `prompt_markdown` + 絶対 `repo_root`。formatter 正本は `session_boundary.build_boundary_prompt`。
 
 ## 3. Claude pane lifecycle
@@ -116,10 +116,11 @@ pane_lifecycle:
 単一 issue の boundary prompt だけでは、active US とその後続 release / E2E、owner の限定承認を一度に表せない場合がある。このときは [[spec-session-continuity-user-harness]] に従い、`vibes/docs/temps/session-handoff-<issue>.md` を **一時的な pointer bundle** として作る。
 
 - bundle は active / queued issue を `#<id> <短い概要>`、issue role、latest known journal、dependency 順で列挙する。
+- release chain では active review finding / commitのorigin到達性、main・integration・issue branch head、latest main CI、version / build / artifact / TestPyPI install / installed CLI E2Eのgate状態を列挙する。local test greenだけをrelease-ready verdictにしない。
 - owner approval は対象と除外を同時に記す。release approval を production publish まで拡張解釈しない。
 - preservation signal、dirty / running lane、未完 review を記し、reset / kill / retire / integration の誤実行を防ぐ。
 - bundle 自体は authority ではない。fresh session は最初に boundary issue の journal、次に各 issue の latest journal を source-of-truth system から読む。
-- bundle は次 session の受領 journal 後に stale とみなし、恒久 doc から参照しない。
+- bundle は次 session の受領 journal 後に stale とみなし、恒久 doc から参照しない。削除は次のreviewable transition commitへ含めるか、受領journalに延期理由を記録し、黙ってlive pointer風に残さない。
 
 transition package 作成のために worker callback を poll しない。境界時点で source journal を一度解決し、既知 state を記録して turn を終了する。新しい callback は fresh session の latest-journal read で回収する。
 
