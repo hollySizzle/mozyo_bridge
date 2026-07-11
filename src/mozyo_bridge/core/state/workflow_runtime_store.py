@@ -66,7 +66,21 @@ WORKFLOW_RUNTIME_STORE_FILENAME = "workflow-runtime.sqlite"
 
 #: Schema version stamped into ``PRAGMA user_version``. Bump only with a migration; an
 #: unrecognized version fails closed rather than dropping the runtime state.
-WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION = 1
+#:
+#: - v1 (#12671): ``workflow_events`` / ``workflow_route_identities`` /
+#:   ``workflow_runtime_meta``.
+#: - v2 (#13520): adds the **callback outbox** (``callback_outbox`` + ``callback_cursor``)
+#:   for the zero-wait callback delivery bounded context. The v1->v2 migration is additive
+#:   and explicit (:meth:`WorkflowRuntimeStore._connect_rw`): it creates the new tables and
+#:   preserves every existing event / route / meta row. A downgraded build that only knows
+#:   an older version fails closed rather than dropping the newer state.
+WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION = 2
+
+#: The recognized schema versions this build can read. A write always migrates up to the
+#: current version; a read tolerates any recognized version (a v1 DB is still readable for
+#: its legacy tables, and its callback reads simply return empty until the first callback
+#: write migrates it). Anything else (a newer / foreign version) fails closed.
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
 
 #: The recognized advisory meta keys (the scalar inputs to the admission decision).
 META_READY_INDEPENDENT = "ready_independent_work"
@@ -137,6 +151,91 @@ CREATE TABLE IF NOT EXISTS workflow_runtime_meta (
     updated_at TEXT NOT NULL
 )
 """
+
+# ---------------------------------------------------------------------------
+# Callback outbox (schema v2, Redmine #13520). The zero-wait callback delivery
+# bounded context: a handoff-worthy durable gate transition becomes a callback to
+# fire exactly once (a coordinator new-turn trigger), idempotency-fenced so a
+# watcher restart / duplicate herdr-or-Redmine event / concurrent claimer can never
+# produce a duplicate delivery. Deliberately a **separate bounded context** from the
+# dispatch outbox fence (:mod:`...dispatch_outbox_fence`): different DB / table / key,
+# because worker send authority and callback delivery are distinct concerns
+# (#13520 design answer j#75098 Q3). What is reused is the *pattern* — ``BEGIN
+# IMMEDIATE`` reserve, a UNIQUE idempotency key, a closed state vocabulary, and a
+# fail-closed migration — not the fence's store.
+# ---------------------------------------------------------------------------
+
+#: The closed callback-outbox state vocabulary (#13520 design answer j#75098 Q3).
+CALLBACK_PENDING = "pending"  # classified + enqueued; awaiting a delivery claim
+CALLBACK_INFLIGHT = "inflight"  # claimed by a processor; ``send_attempted`` tracks the send edge
+CALLBACK_DELIVERED = "delivered"  # the one send was positively delivered
+CALLBACK_UNCERTAIN = "uncertain"  # send outcome unknown (ACK-only / crash-after-send) -> no auto-retry
+CALLBACK_DEAD_LETTER = "dead_letter"  # unclassified, or retries exhausted -> fresh-turn sweep + diagnostic
+CALLBACK_ABSENT = "absent"  # sentinel: no row for the key (never persisted)
+
+CALLBACK_STATES = frozenset(
+    {
+        CALLBACK_PENDING,
+        CALLBACK_INFLIGHT,
+        CALLBACK_DELIVERED,
+        CALLBACK_UNCERTAIN,
+        CALLBACK_DEAD_LETTER,
+    }
+)
+
+#: The default bounded retry budget for a *deterministic not-sent* delivery failure. Only a
+#: pre-injection / known-not-sent failure consumes an attempt; an ACK-only / uncertain
+#: outcome never auto-retries (it goes straight to :data:`CALLBACK_UNCERTAIN`).
+CALLBACK_DEFAULT_MAX_ATTEMPTS = 3
+
+_CALLBACK_OUTBOX_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS callback_outbox (
+    source              TEXT NOT NULL,
+    issue               TEXT NOT NULL,
+    journal             TEXT NOT NULL,
+    normalized_gate     TEXT NOT NULL,
+    callback_route      TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    max_attempts        INTEGER NOT NULL DEFAULT 3,
+    send_attempted      INTEGER NOT NULL DEFAULT 0,
+    notification_kind   TEXT NOT NULL DEFAULT '',
+    notification_summary TEXT NOT NULL DEFAULT '',
+    gate_mismatch       INTEGER NOT NULL DEFAULT 0,
+    detail              TEXT NOT NULL DEFAULT '',
+    payload             TEXT NOT NULL DEFAULT '',
+    seq                 INTEGER NOT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    UNIQUE(source, issue, journal, normalized_gate, callback_route)
+)
+"""
+
+_CALLBACK_CURSOR_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS callback_cursor (
+    source     TEXT PRIMARY KEY,
+    cursor     TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+#: The columns a persisted callback outbox row carries.
+CALLBACK_COLUMNS: tuple[str, ...] = (
+    "source",
+    "issue",
+    "journal",
+    "normalized_gate",
+    "callback_route",
+    "state",
+    "attempts",
+    "max_attempts",
+    "send_attempted",
+    "notification_kind",
+    "notification_summary",
+    "gate_mismatch",
+    "detail",
+    "payload",
+)
 
 
 class WorkflowRuntimeStoreError(RuntimeError):
@@ -250,21 +349,41 @@ class WorkflowRuntimeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
         conn.execute("PRAGMA busy_timeout = 2000")
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         if version == 0:
+            # Fresh file: create the full v2 schema (all tables) and stamp the version.
             conn.execute(_EVENTS_TABLE_SQL)
             conn.execute(_ROUTE_TABLE_SQL)
             conn.execute(_META_TABLE_SQL)
+            conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
+            conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
             conn.execute(
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
             )
             conn.commit()
-        elif version != WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
+        elif version == 1:
+            # v1 -> v2 explicit migration (#13520): additive only. Create the callback
+            # outbox tables and re-stamp the version. Existing event / route / meta rows are
+            # left untouched (data preservation); a `CREATE TABLE IF NOT EXISTS` is a no-op
+            # for any table already present.
+            conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
+            conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
+            conn.execute(
+                f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
+            )
+            conn.commit()
+        elif version == WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
+            # Already current; the tables exist. A defensive IF-NOT-EXISTS keeps a DB that
+            # somehow lost a table self-healing without touching data.
+            conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
+            conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
+            conn.commit()
+        else:
             conn.close()
             raise WorkflowRuntimeStoreError(
                 f"workflow runtime store {self.path} has unsupported schema version "
                 f"{version}; this build understands "
-                f"{WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}. The DB is left untouched "
+                f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The DB is left untouched "
                 f"(downgrade-safe); migrate with a newer build or move it aside."
             )
         return conn
@@ -285,12 +404,12 @@ class WorkflowRuntimeStore:
             raise WorkflowRuntimeStoreError(
                 f"workflow runtime store {self.path} is unreadable: {exc}"
             ) from exc
-        if version != WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
+        if version not in _RECOGNIZED_SCHEMA_VERSIONS:
             conn.close()
             raise WorkflowRuntimeStoreError(
                 f"workflow runtime store {self.path} has unsupported schema version "
                 f"{version}; this build understands "
-                f"{WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}."
+                f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}."
             )
         return conn
 
@@ -534,6 +653,16 @@ class WorkflowRuntimeStore:
             conn.close()
         return {r[0]: r[1] for r in rows}
 
+    def ensure_schema(self) -> None:
+        """Create / migrate the container to the current schema version (idempotent).
+
+        Public so the sibling callback-outbox bounded context
+        (:mod:`mozyo_bridge.core.state.callback_outbox`), which shares this same
+        ``workflow-runtime.sqlite`` file, can drive the v1->v2 migration through the one
+        schema authority before opening its own manual-transaction connection.
+        """
+        self._connect_rw().close()
+
 
 __all__ = (
     "WORKFLOW_RUNTIME_STORE_FILENAME",
@@ -544,6 +673,15 @@ __all__ = (
     "META_OWNER_OR_RELEASE_GATE",
     "EVENT_COLUMNS",
     "ROUTE_COLUMNS",
+    "CALLBACK_COLUMNS",
+    "CALLBACK_PENDING",
+    "CALLBACK_INFLIGHT",
+    "CALLBACK_DELIVERED",
+    "CALLBACK_UNCERTAIN",
+    "CALLBACK_DEAD_LETTER",
+    "CALLBACK_ABSENT",
+    "CALLBACK_STATES",
+    "CALLBACK_DEFAULT_MAX_ATTEMPTS",
     "WorkflowRuntimeStoreError",
     "workflow_runtime_store_path",
     "WorkflowEventRow",
