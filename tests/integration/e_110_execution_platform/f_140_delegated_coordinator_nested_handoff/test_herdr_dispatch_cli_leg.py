@@ -188,6 +188,34 @@ class DispatchLegTest(unittest.TestCase):
         self.assertEqual(r.result, DISPATCH_FENCE_UNAVAILABLE)
         self.assertEqual(counter2.calls, 0)
 
+    def test_sidecar_only_loss_is_fence_unavailable_zero_send(self):
+        # Product path (j#75065 F1): only the sidecar is lost (delivered DB remains). The leg's
+        # auto-bootstrap must refuse (not destroy the DB) -> fence-unavailable, zero send.
+        self._set_decision(
+            decide_dispatch_authority(
+                authorization=_auth(), superseded=False, target_runtime=TARGET_AWAITING_INPUT
+            )
+        )
+        counter = _Counter()
+        execute_herdr_dispatch(
+            self._args(),
+            ANCHOR,
+            env={"x": "y"},
+            send_factory=counter.factory,
+            fence=DispatchOutboxFence(home=self.home),
+        )
+        DispatchOutboxFence(home=self.home).sidecar_path.unlink()  # sidecar-only loss
+        counter2 = _Counter()
+        r = execute_herdr_dispatch(
+            self._args(),
+            ANCHOR,
+            env={"x": "y"},
+            send_factory=counter2.factory,
+            fence=DispatchOutboxFence(home=self.home),
+        )
+        self.assertEqual(r.result, DISPATCH_FENCE_UNAVAILABLE)
+        self.assertEqual(counter2.calls, 0)
+
     def _run_default_leg_with_ops_turn_start(self, ops_turn_start):
         """Drive the DEFAULT product send factory with a faked ops turn-start (F2)."""
         self._set_decision(

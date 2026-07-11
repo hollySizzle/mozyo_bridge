@@ -125,6 +125,25 @@ class ReserveTest(unittest.TestCase):
         with self.assertRaises(DispatchOutboxFenceError):
             DispatchOutboxFence(home=self.home).bootstrap()
 
+    def test_sidecar_only_loss_bootstrap_refuses_and_preserves_db(self):
+        # j#75065 F1: only the sidecar is lost (the delivered DB remains). bootstrap() must NOT
+        # unlink the durable DB and re-enable the old action -> fail closed.
+        self.fence.reserve(_key())
+        self.fence.mark_delivered(_key())
+        self.fence.sidecar_path.unlink()  # sidecar-only loss; DB (with delivered row) remains
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).bootstrap()
+        # The durable DB was not destroyed; a reserve still fails closed (sidecar gone), never wins.
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).reserve(_key())
+
+    def test_db_only_no_sidecar_bootstrap_refuses(self):
+        # A DB present with no sidecar at all (never a genuine first bootstrap) -> fail closed.
+        self.fence.reserve(_key())
+        self.fence.sidecar_path.unlink()
+        with self.assertRaises(DispatchOutboxFenceError):
+            DispatchOutboxFence(home=self.home).bootstrap()
+
     def test_recover_mints_fresh_store_for_new_action(self):
         # After a loss, the deliberate recover() surface makes a fresh store; a NEW action_id
         # (from an upstream reconcile) then reserves once. The old key was superseded upstream.

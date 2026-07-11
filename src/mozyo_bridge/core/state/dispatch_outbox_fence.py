@@ -209,23 +209,27 @@ class DispatchOutboxFence:
         auto-creation would resurrect a **deleted / replaced** store and let an already
         ``delivered`` action re-send. Behavior:
 
-        - no sidecar (a genuine first bootstrap) -> mint a random ``store_nonce``, create the
-          DB + sidecar together at that nonce.
-        - sidecar present AND the DB co-exists at the same nonce -> idempotent no-op.
-        - sidecar present but the DB is **missing / empty / at a different nonce** (a loss or
-          replacement) -> **fail closed** (:class:`DispatchOutboxFenceError`): this is not a
-          first bootstrap, so it must go through the deliberate :meth:`recover`, not silently
-          get a fresh empty store that would re-enable old actions.
+        - **both** the DB and the sidecar absent (a genuine first bootstrap) -> mint a random
+          ``store_nonce``, create the DB + sidecar together at that nonce.
+        - DB and sidecar co-exist at the same nonce -> idempotent no-op.
+        - **any** other state — sidecar present but DB missing / mismatched, OR the DB present
+          but the sidecar missing (a *sidecar-only* loss that would otherwise let a fresh
+          bootstrap unlink a durable DB, mid-review j#75065 F1), OR a nonce mismatch -> **fail
+          closed** (:class:`DispatchOutboxFenceError`): an inconsistent single-sided store is a
+          loss / replacement and must go through the deliberate :meth:`recover`, never a silent
+          re-create that would destroy or re-enable an already-delivered action.
         """
         sidecar_nonce = self._read_sidecar_nonce()
-        if sidecar_nonce is None:
-            self._create_fresh(secrets.token_hex(16))
+        db_exists = self.path.exists()
+        if sidecar_nonce is None and not db_exists:
+            self._create_fresh(secrets.token_hex(16))  # both absent: the only genuine first init.
             return
         if self.is_bootstrapped():
-            return  # DB co-exists at the sidecar nonce: already bootstrapped.
+            return  # DB + sidecar co-exist at the same nonce: already bootstrapped.
         raise DispatchOutboxFenceError(
-            f"dispatch outbox fence {self.path} sidecar exists but the DB is missing / at a "
-            f"different nonce (store loss or replacement); refusing to silently re-create. Use "
+            f"dispatch outbox fence {self.path} is in an inconsistent state (only one of the DB "
+            f"/ sidecar exists, or their nonces differ): a store loss or replacement. Refusing "
+            f"to silently re-create (which could destroy or re-enable a delivered action). Use "
             f"recover() for a deliberate, operator-gated loss recovery."
         )
 
