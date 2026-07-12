@@ -765,6 +765,19 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-herdr-live-relayout-runbook
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-live-relayout-runbook.md
+    purpose: "live な herdr pane pair の位置交換 (swap) と split 方向変換 (左右 ⇔ 上下) を実機検証済み recipe として固定する operator runbook (Redmine #13648 / #13664)。2 段 bounce (`pane move --new-tab` 退避 → 元 tab へ `--split down|right --target-pane` で戻す) 手順、same-tab re-split が `same_tab` no-op / `pane swap` は位置交換のみ / TUI に orientation 変換 action 不在という herdr 0.7.1 gap、assigned-name authority 不変・agent process 無傷・一時 tab 自動消滅・target identity 確認・失敗時 fail-closed の安全境界、upstream 要望未提出 (外部投稿しない)、設定駆動配置 (#13646 / #13647) との境界を記録する。live pair の即時再配置の唯一の経路。"
+    audit_role: herdr_live_relayout_runbook_logic
+    related_document_refs:
+      - task-herdr-lane-operations
+      - spec-herdr-native-identity
+      - logic-pane-centric-cockpit-semantics
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-project-scoped-workspace-identity
     type: logic
     status: active
