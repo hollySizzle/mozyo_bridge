@@ -654,13 +654,11 @@ def register_lifecycle(sub) -> None:
         "--issue-closed",
         dest="issue_closed",
         action="store_true",
-        help="The lane's Redmine issue is durably closed.",
-    )
-    sublane_retire.add_argument(
-        "--owner-approved",
-        dest="owner_approved",
-        action="store_true",
-        help="The owner close-approval journal exists.",
+        help=(
+            "The lane's Redmine issue is durably closed. Redmine #13602 (Option A): this "
+            "IS the owner-close decision — routine green-preflight retirement is coordinator "
+            "authority and takes no separate --owner-approved flag."
+        ),
     )
     sublane_retire.add_argument(
         "--callbacks-drained",
