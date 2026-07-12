@@ -209,6 +209,60 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("env_anchor_workspace_mismatch", detail)
 
+    def test_sender_preflight_rejects_default_bound_claude_sender(self) -> None:
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                registered = register_workspace(ops.repo_root, home=home)
+            ops.env = {
+                **ops.env,
+                "MOZYO_WORKSPACE_ID": registered.record.workspace_id,
+                "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "default",
+            }
+            ok, detail = ops.preflight_dispatch_sender()
+        self.assertFalse(ok)
+        self.assertIn("configured coordinator provider 'codex'", detail)
+
+    def test_sender_preflight_rejects_nondefault_lane(self) -> None:
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                registered = register_workspace(ops.repo_root, home=home)
+            ops.env = {
+                **ops.env,
+                "MOZYO_WORKSPACE_ID": registered.record.workspace_id,
+                "MOZYO_AGENT_ROLE": "codex",
+                "MOZYO_LANE_ID": "issue_13613_nested",
+            }
+            ok, detail = ops.preflight_dispatch_sender()
+        self.assertFalse(ok)
+        self.assertIn("is not the coordinator default lane", detail)
+
+    def test_sender_preflight_follows_coordinator_provider_binding(self) -> None:
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                registered = register_workspace(ops.repo_root, home=home)
+            ops.env = {
+                **ops.env,
+                "MOZYO_WORKSPACE_ID": registered.record.workspace_id,
+                "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "default",
+            }
+            target = (
+                "mozyo_bridge.e_110_execution_platform."
+                "f_140_delegated_coordinator_nested_handoff.application."
+                "main_lane_guard_gate.resolve_coordinator_provider"
+            )
+            with patch(target, return_value="claude"):
+                ok, detail = ops.preflight_dispatch_sender()
+        self.assertTrue(ok)
+        self.assertIn("coordinator binding", detail)
+
     def test_append_then_read_lane_round_trips(self) -> None:
         herdr = _StatefulHerdr()
         with tempfile.TemporaryDirectory() as tmp:

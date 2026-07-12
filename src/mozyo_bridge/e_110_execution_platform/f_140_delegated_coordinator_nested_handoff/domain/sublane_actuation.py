@@ -270,7 +270,7 @@ class SublaneActuationOutcome:
         return self.dispatch_result == DISPATCH_WORKER_DISPATCHED
 
     def as_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "status": self.status,
             "execute": self.execute,
             "reason": self.reason,
@@ -292,6 +292,19 @@ class SublaneActuationOutcome:
             "fill_override_reason": self.fill_override_reason,
             "gateway_ready": self.gateway_ready,
         }
+        if self.is_blocked and "sender_attestation" in self.blocked_reasons:
+            payload["next_action"] = {
+                "action": "restore_attested_coordinator_shell",
+                "allowed_methods": [
+                    "relaunch_from_fixed_session_start",
+                    "verified_high_level_coordinator_proxy",
+                ],
+                "forbidden_methods": [
+                    "manual_mozyo_env_injection",
+                    "raw_herdr_send",
+                ],
+            }
+        return payload
 
 
 def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
@@ -349,9 +362,16 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         lines.append(f"- gateway_ready: {str(outcome.gateway_ready).lower()}")
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
-        lines.append(
-            "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
-        )
+        if "sender_attestation" in outcome.blocked_reasons:
+            lines.append(
+                "- next_action: restore an attested coordinator shell by relaunching "
+                "from fixed session-start, or use a verified high-level coordinator "
+                "proxy; do not inject MOZYO env manually or use raw herdr send"
+            )
+        else:
+            lines.append(
+                "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
+            )
     else:
         lines.append("- next_action: " + _next_action(outcome))
     return "\n".join(lines)

@@ -163,7 +163,25 @@ class HerdrSublaneActuatorOps:
         )
         if not result.ok or result.identity is None:
             return False, f"{result.reason}: {result.detail}"
-        return True, "sender identity matches the workspace anchor"
+        try:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
+                resolve_coordinator_provider,
+            )
+
+            coordinator_provider = resolve_coordinator_provider(str(self.repo_root))
+        except Exception as exc:  # config/binding IO is fail-closed here
+            return False, f"coordinator provider binding is unreadable ({exc})"
+        if result.identity.role != coordinator_provider:
+            return False, (
+                f"sender provider {result.identity.role!r} is not the configured "
+                f"coordinator provider {coordinator_provider!r}"
+            )
+        if result.identity.lane_id != DEFAULT_LANE:
+            return False, (
+                f"sender lane {result.identity.lane_id!r} is not the coordinator "
+                f"default lane {DEFAULT_LANE!r}"
+            )
+        return True, "sender identity matches the coordinator binding and default lane"
 
     def create_worktree(
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
