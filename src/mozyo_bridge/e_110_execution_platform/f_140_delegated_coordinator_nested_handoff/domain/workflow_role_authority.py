@@ -58,6 +58,11 @@ SCHEMA_NAME = "mozyo.workflow-role-bindings"
 #: The schema version. Bumped when the on-disk shape changes incompatibly.
 SCHEMA_VERSION = 1
 
+#: Closed top-level / per-entry key sets (Redmine #13583 R2): a present-but-malformed declaration
+#: with an unknown key fails closed rather than being silently accepted with the key ignored.
+_ALLOWED_TOP_KEYS = frozenset({"schema", "version", "bindings"})
+_ALLOWED_ENTRY_KEYS = frozenset({"role", "project_scope", "source_pointer"})
+
 # ---------------------------------------------------------------------------
 # Role vocabulary. The canonical durable workflow roles a binding may declare; the
 # provider space (claude / codex / …) is deliberately NOT part of this vocabulary — a
@@ -88,6 +93,12 @@ DEFAULT_LANE = "default"
 # ---------------------------------------------------------------------------
 LANE_SCHEME = "pgwv1"
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+#: Readable-slug budget for the derived lane id (Redmine #13583 R3). Bounded so the lane id,
+#: once encoded into an mzb1 assigned name (``mzb1_<ws>_<role>_<lane>`` — each non-``[A-Za-z0-9]``
+#: byte escapes to 3 chars) with a 32-hex workspace id + a provider token, stays within the herdr
+#: ``NAME_MAX_LENGTH`` (128) so the project-gateway lane can actually be launched / adopted. The
+#: full digest below carries injectivity, so truncating the readable slug never risks a collision.
+_SLUG_BUDGET = 16
 
 
 def _norm(value: object) -> str:
@@ -119,11 +130,12 @@ class WorkflowRoleAuthorityError(ValueError):
 def project_gateway_lane_id(project_scope: object) -> str:
     """Derive the deterministic, versioned project-gateway lane id for ``project_scope`` (pure).
 
-    The lane id is ``<scheme>_<slug>-<digest>`` — a readable slug of the scope plus a short
-    stable digest of the *exact* raw scope so two distinct scopes never collide onto one lane
-    (and a slug that reduces to empty still derives a stable id from the digest alone). The
-    result can never equal :data:`DEFAULT_LANE`, so a project gateway lane can never collide
-    with the grandparent's default lane. Fails closed
+    The lane id is ``<scheme>_<slug>-<digest>`` — a readable slug of the scope (bounded to
+    :data:`_SLUG_BUDGET` chars so the lane fits the mzb1 assigned-name length limit, Redmine
+    #13583 R3) plus a short stable digest of the *exact* raw scope so two distinct scopes never
+    collide onto one lane (and a slug that reduces to empty still derives a stable id from the
+    digest alone). The result can never equal :data:`DEFAULT_LANE`, so a project gateway lane can
+    never collide with the grandparent's default lane. Fails closed
     (:class:`WorkflowRoleAuthorityError`) on an empty scope — a grandparent has no project scope
     and is not derived here; a project gateway must name one.
     """
@@ -133,7 +145,7 @@ def project_gateway_lane_id(project_scope: object) -> str:
             "a project gateway lane requires a non-empty project scope; the grandparent "
             "coordinator (no scope) sits in the default lane and is not derived here"
         )
-    slug = _SLUG_RE.sub("-", scope.lower()).strip("-")
+    slug = _SLUG_RE.sub("-", scope.lower()).strip("-")[:_SLUG_BUDGET].strip("-")
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
     core = f"{slug}-{digest}" if slug else digest
     return f"{LANE_SCHEME}_{core}"
@@ -239,17 +251,38 @@ class WorkflowRoleResolution:
 # ---------------------------------------------------------------------------
 
 
+def _entry_type_error(index: int, entry: Mapping) -> str:
+    """Return a fixed error message if an entry's fields are the wrong type, else ``""`` (R2).
+
+    ``role`` must be a non-empty string; ``project_scope`` / ``source_pointer``, when present, must
+    be strings. A non-string value is rejected rather than silently ``str()``-coerced (a
+    ``project_scope: 123`` must not become the scope ``"123"``).
+    """
+    role = entry.get("role")
+    if not isinstance(role, str) or not role.strip():
+        return f"binding #{index} role must be a non-empty string; got {role!r}"
+    for field in ("project_scope", "source_pointer"):
+        value = entry.get(field)
+        if value is not None and not isinstance(value, str):
+            return f"binding #{index} {field} must be a string when present; got {value!r}"
+    return ""
+
+
 def parse_role_bindings(record: object) -> ParsedRoleBindings:
     """Parse + fail-closed validate a static binding declaration into :class:`ParsedRoleBindings`.
 
     ``record`` is the decoded JSON object (or ``None`` for an absent file -> :meth:`empty`). The
-    declaration must carry ``schema`` == :data:`SCHEMA_NAME` and ``version`` == :data:`SCHEMA_VERSION`
-    and a ``bindings`` list. Each entry is ``{role, project_scope?, source_pointer?}``; the
-    ``lane_id`` is derived, never read from the file. Fails closed (an ``invalid`` result with a
-    fixed reason) on:
+    schema is **closed** (Redmine #13583 R2): the declaration must carry exactly ``schema`` ==
+    :data:`SCHEMA_NAME`, ``version`` == :data:`SCHEMA_VERSION`, and a ``bindings`` **list**
+    (present and a list — a missing / null ``bindings`` is *not* an empty authority; only an
+    explicit ``[]`` is). Each entry has only ``{role, project_scope?, source_pointer?}`` with
+    string values; the ``lane_id`` is derived, never read from the file. A **present-but-malformed
+    declaration never falls through like an absent file** — it fails closed (an ``invalid`` result
+    with a fixed reason) on:
 
-    - a wrong / missing schema or version, or a non-list ``bindings``;
-    - an entry that is not a mapping, or an unknown / out-of-vocabulary role;
+    - a wrong schema / version, an unknown top-level key, or a missing / non-list ``bindings``;
+    - an entry that is not an object, an unknown entry key, a non-string / unknown / out-of-vocabulary
+      role, or a non-string project scope / source pointer;
     - a grandparent with a non-empty project scope, or a project gateway with an empty scope;
     - two grandparent entries, or two entries that derive the same lane id (slot collision).
     """
@@ -258,6 +291,11 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
     if not isinstance(record, Mapping):
         return ParsedRoleBindings.invalid(
             f"binding declaration must be a JSON object, got {type(record).__name__}"
+        )
+    unknown_top = set(record.keys()) - _ALLOWED_TOP_KEYS
+    if unknown_top:
+        return ParsedRoleBindings.invalid(
+            f"unknown top-level key(s) {sorted(unknown_top)}; allowed: {sorted(_ALLOWED_TOP_KEYS)}"
         )
     if _norm(record.get("schema")) != SCHEMA_NAME:
         return ParsedRoleBindings.invalid(
@@ -268,10 +306,11 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
             f"unexpected schema version {record.get('version')!r}; expected {SCHEMA_VERSION}"
         )
     raw_bindings = record.get("bindings")
-    if raw_bindings is None:
-        raw_bindings = []
-    if not isinstance(raw_bindings, (list, tuple)):
-        return ParsedRoleBindings.invalid("`bindings` must be a list")
+    if not isinstance(raw_bindings, list):
+        return ParsedRoleBindings.invalid(
+            "`bindings` must be present and a list (an empty topology is an explicit `[]`, "
+            f"never a missing / null key); got {type(raw_bindings).__name__}"
+        )
 
     bindings: list = []
     lane_ids: dict = {}
@@ -281,6 +320,15 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
             return ParsedRoleBindings.invalid(
                 f"binding #{index} must be an object, got {type(entry).__name__}"
             )
+        unknown_entry = set(entry.keys()) - _ALLOWED_ENTRY_KEYS
+        if unknown_entry:
+            return ParsedRoleBindings.invalid(
+                f"binding #{index} has unknown key(s) {sorted(unknown_entry)}; "
+                f"allowed: {sorted(_ALLOWED_ENTRY_KEYS)}"
+            )
+        type_error = _entry_type_error(index, entry)
+        if type_error:
+            return ParsedRoleBindings.invalid(type_error)
         role = normalize_role(entry.get("role"))
         if not role:
             return ParsedRoleBindings.invalid(

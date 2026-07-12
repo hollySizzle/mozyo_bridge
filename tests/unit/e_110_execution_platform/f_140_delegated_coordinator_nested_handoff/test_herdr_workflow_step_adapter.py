@@ -667,6 +667,41 @@ class RoleAuthorityAdapterTest(unittest.TestCase):
             out = self._run()
         self.assertEqual(out.reason, REASON_HERDR_WORKER_STEP_READY)
 
+    def test_broken_provider_config_fails_closed_not_resolved(self):
+        # R1: a broken provider config must NOT degrade to the compat default and resolve the
+        # role on an unverified surface; the bound lane fails closed (provider mismatch).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            workflow_binding_source,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            REASON_ROLE_PROVIDER_MISMATCH,
+        )
+
+        self._write_bindings({"role": "grandparent_coordinator"})
+        with patch.object(
+            htr, "resolve_sender_identity", return_value=_sender_ok("codex", "default")
+        ), patch.object(
+            workflow_binding_source, "load_workflow_binding", side_effect=RuntimeError("malformed config")
+        ):
+            out = self._run()
+        self.assertEqual(out.reason, REASON_ROLE_PROVIDER_MISMATCH)
+        self.assertEqual(out.execution, "blocked")
+
+    def test_broken_config_still_missing_when_lane_unbound(self):
+        # A broken config must not block a lane that has no binding at all -> still fall-through.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            workflow_binding_source,
+        )
+
+        self._write_bindings({"role": "grandparent_coordinator"})
+        with patch.object(
+            htr, "resolve_sender_identity", return_value=_sender_ok("claude", "issue_1")
+        ), patch.object(
+            workflow_binding_source, "load_workflow_binding", side_effect=RuntimeError("malformed config")
+        ), patch.object(adapter, "_resolve_lane_anchor", return_value=(ANCHOR_VERIFIED, PTR)):
+            out = self._run()
+        self.assertEqual(out.reason, REASON_HERDR_WORKER_STEP_READY)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

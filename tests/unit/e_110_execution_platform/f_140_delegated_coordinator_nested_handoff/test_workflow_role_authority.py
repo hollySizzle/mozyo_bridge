@@ -75,9 +75,15 @@ class ProjectGatewayLaneIdTest(unittest.TestCase):
         )
 
     def test_versioned_prefix_and_readable_slug(self):
-        lane = project_gateway_lane_id("Cloud Drive Management")
+        # Short scope: the readable slug is preserved in full (within the budget).
+        lane = project_gateway_lane_id("cloud-drive")
         self.assertTrue(lane.startswith(f"{LANE_SCHEME}_"))
-        self.assertIn("cloud-drive-management", lane)
+        self.assertIn("cloud-drive", lane)
+
+    def test_long_slug_is_truncated_but_readable_prefix_kept(self):
+        # Long scope: the slug is capped (R3) but the readable prefix survives for humans.
+        lane = project_gateway_lane_id("Cloud Drive Management")
+        self.assertTrue(lane.startswith(f"{LANE_SCHEME}_cloud-drive-mana"))
 
     def test_never_equals_default_lane(self):
         self.assertNotEqual(project_gateway_lane_id("default"), DEFAULT_LANE)
@@ -91,6 +97,28 @@ class ProjectGatewayLaneIdTest(unittest.TestCase):
             project_gateway_lane_id("")
         with self.assertRaises(WorkflowRoleAuthorityError):
             project_gateway_lane_id("   ")
+
+    def test_slug_is_bounded(self):
+        # R3: a very long scope's readable slug is capped; the digest still keeps it unique.
+        long_scope = "cloud-drive-management-department-operations-external"
+        lane = project_gateway_lane_id(long_scope)
+        # scheme(5) + "_" + slug(<=16) + "-" + digest(12) -> comfortably short.
+        self.assertLessEqual(len(lane), len(f"{LANE_SCHEME}_") + 16 + 1 + 12)
+        self.assertNotEqual(project_gateway_lane_id(long_scope + "-x"), lane)
+
+    def test_long_scope_fits_mzb1_assigned_name(self):
+        # R3: the derived lane must compose into an mzb1 assigned name within NAME_MAX_LENGTH so
+        # the project gateway lane can actually be launched / adopted (herdr identity contract).
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            NAME_MAX_LENGTH,
+            encode_assigned_name,
+        )
+
+        ws = "e1487dcb1f2d4412b28e825fdeccf9e8"  # a real 32-hex workspace id
+        long_scope = "x" + "-cloud-drive-management" * 3 + "-abcdefghij"  # ~80 chars
+        lane = project_gateway_lane_id(long_scope)
+        name = encode_assigned_name(ws, "codex", lane)
+        self.assertLessEqual(len(name), NAME_MAX_LENGTH)
 
 
 class ParseRoleBindingsTest(unittest.TestCase):
@@ -176,6 +204,46 @@ class ParseRoleBindingsTest(unittest.TestCase):
 
     def test_entry_not_a_mapping_fails_closed(self):
         self.assertFalse(parse_role_bindings(_record("grandparent_coordinator")).ok)
+
+    def test_missing_bindings_key_fails_closed(self):
+        # R2: a present-but-malformed declaration must not fall through like an absent file.
+        self.assertFalse(parse_role_bindings({"schema": SCHEMA_NAME, "version": SCHEMA_VERSION}).ok)
+
+    def test_null_bindings_fails_closed(self):
+        self.assertFalse(
+            parse_role_bindings({"schema": SCHEMA_NAME, "version": SCHEMA_VERSION, "bindings": None}).ok
+        )
+
+    def test_explicit_empty_list_is_valid_empty(self):
+        parsed = parse_role_bindings({"schema": SCHEMA_NAME, "version": SCHEMA_VERSION, "bindings": []})
+        self.assertTrue(parsed.ok)
+        self.assertEqual(parsed.bindings, ())
+
+    def test_unknown_top_level_key_fails_closed(self):
+        self.assertFalse(
+            parse_role_bindings(
+                {"schema": SCHEMA_NAME, "version": SCHEMA_VERSION, "bindings": [], "junk": 1}
+            ).ok
+        )
+
+    def test_unknown_entry_key_fails_closed(self):
+        self.assertFalse(
+            parse_role_bindings(_record({"role": "grandparent_coordinator", "bogus": "x"})).ok
+        )
+
+    def test_non_string_scope_fails_closed(self):
+        # R2: `project_scope: 123` must NOT be silently str()-coerced to "123".
+        self.assertFalse(
+            parse_role_bindings(_record({"role": "project_gateway", "project_scope": 123})).ok
+        )
+
+    def test_non_string_role_fails_closed(self):
+        self.assertFalse(parse_role_bindings(_record({"role": 123})).ok)
+
+    def test_non_string_source_pointer_fails_closed(self):
+        self.assertFalse(
+            parse_role_bindings(_record({"role": "grandparent_coordinator", "source_pointer": 5})).ok
+        )
 
 
 class ResolveRoleForLaneTest(unittest.TestCase):
