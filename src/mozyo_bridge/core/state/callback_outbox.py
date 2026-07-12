@@ -89,14 +89,19 @@ class CallbackOutboxKey:
     journal: str
     normalized_gate: str
     callback_route: str
+    #: The workspace this callback belongs to (#13520 review R2-F5). Part of the UNIQUE key so a
+    #: shared home DB partitions rows by workspace — one workspace's watcher never claims / collides
+    #: with another's. Default ``""`` is the un-partitioned (legacy / single-workspace) bucket.
+    workspace_id: str = ""
 
-    def as_row(self) -> tuple[str, str, str, str, str]:
+    def as_row(self) -> tuple[str, str, str, str, str, str]:
         return (
             self.source,
             self.issue,
             self.journal,
             self.normalized_gate,
             self.callback_route,
+            self.workspace_id,
         )
 
 
@@ -119,6 +124,7 @@ class CallbackOutboxRow:
     detail: str
     payload: str
     claim_token: str = ""
+    workspace_id: str = ""
 
     @property
     def key(self) -> CallbackOutboxKey:
@@ -128,6 +134,7 @@ class CallbackOutboxRow:
             journal=self.journal,
             normalized_gate=self.normalized_gate,
             callback_route=self.callback_route,
+            workspace_id=self.workspace_id,
         )
 
     def as_payload(self) -> dict[str, object]:
@@ -147,6 +154,7 @@ class CallbackOutboxRow:
             "detail": self.detail,
             "payload": self.payload,
             "claim_token": self.claim_token,
+            "workspace_id": self.workspace_id,
         }
 
 
@@ -166,7 +174,8 @@ class CallbackEnqueueResult:
 _SELECT = (
     "SELECT source, issue, journal, normalized_gate, callback_route, state, "
     "attempts, max_attempts, send_attempted, notification_kind, "
-    "notification_summary, gate_mismatch, detail, payload, claim_token FROM callback_outbox"
+    "notification_summary, gate_mismatch, detail, payload, claim_token, workspace_id "
+    "FROM callback_outbox"
 )
 
 
@@ -187,6 +196,7 @@ def _row(r: tuple) -> CallbackOutboxRow:
         detail=r[12],
         payload=r[13],
         claim_token=r[14] if len(r) > 14 else "",
+        workspace_id=r[15] if len(r) > 15 else "",
     )
 
 
@@ -212,6 +222,17 @@ class CallbackOutbox:
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.execute("PRAGMA busy_timeout = 2000")
         return conn
+
+    def _ensure_migrated_if_exists(self) -> None:
+        """Migrate an EXISTING store up to the current schema before a read (never creates one).
+
+        A read path selects the current column set (including ``workspace_id``, #13520 review R2-F5),
+        so an older but recognized DB (e.g. a v2 callback table without ``workspace_id``) must be
+        migrated first or the read would fail on the missing column. Guarded on ``exists()`` so a
+        pure read never creates the store (a missing DB still reads as empty).
+        """
+        if self.path.exists():
+            self._schema.ensure_schema()
 
     def _connect_ro(self) -> Optional[sqlite3.Connection]:
         """Read-only connection if the DB exists; ``None`` when absent. Unknown version fails."""
@@ -288,7 +309,7 @@ class CallbackOutbox:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT state FROM callback_outbox WHERE source=? AND issue=? AND journal=? "
-                "AND normalized_gate=? AND callback_route=?",
+                "AND normalized_gate=? AND callback_route=? AND workspace_id=?",
                 key.as_row(),
             ).fetchone()
             if existing is None:
@@ -299,11 +320,11 @@ class CallbackOutbox:
                 )
                 conn.execute(
                     "INSERT INTO callback_outbox (source, issue, journal, normalized_gate, "
-                    "callback_route, state, attempts, max_attempts, send_attempted, "
+                    "callback_route, workspace_id, state, attempts, max_attempts, send_attempted, "
                     "notification_kind, notification_summary, gate_mismatch, detail, payload, "
                     "seq, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(source, issue, journal, normalized_gate, callback_route) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(workspace_id, source, issue, journal, normalized_gate, callback_route) "
                     "DO NOTHING",
                     (
                         *key.as_row(),
@@ -344,7 +365,7 @@ class CallbackOutbox:
     # -- claim / recover ---------------------------------------------------
 
     def claim_pending(
-        self, *, limit: int = 32, now: Optional[str] = None
+        self, *, limit: int = 32, now: Optional[str] = None, workspace_id: Optional[str] = None
     ) -> tuple[CallbackOutboxRow, ...]:
         """Atomically claim up to ``limit`` pending rows, moving them to ``inflight``.
 
@@ -354,15 +375,26 @@ class CallbackOutbox:
         Each claimed row is stamped with a fresh **claim token** + a ``claimed_at`` lease so a
         concurrent processor's :meth:`recover_inflight` cannot reclaim this active claim, and
         the owner's subsequent marks are token-conditional (#13520 review F2).
+
+        ``workspace_id`` (#13520 review R2-F5) **partitions the claim**: when supplied, only rows in
+        that workspace are claimed, so a watcher owning workspace A can never claim workspace B's
+        rows on a shared home DB. ``None`` (the default) is the un-partitioned legacy behavior
+        (single-workspace / test); the production watcher always pins its attested workspace.
         """
         stamp = now or _utc_now()
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                _SELECT + " WHERE state=? ORDER BY seq LIMIT ?",
-                (CALLBACK_PENDING, int(limit)),
-            ).fetchall()
+            if workspace_id is None:
+                rows = conn.execute(
+                    _SELECT + " WHERE state=? ORDER BY seq LIMIT ?",
+                    (CALLBACK_PENDING, int(limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    _SELECT + " WHERE state=? AND workspace_id=? ORDER BY seq LIMIT ?",
+                    (CALLBACK_PENDING, str(workspace_id), int(limit)),
+                ).fetchall()
             claimed = []
             for r in rows:
                 row = _row(r)
@@ -370,7 +402,7 @@ class CallbackOutbox:
                 conn.execute(
                     "UPDATE callback_outbox SET state=?, send_attempted=0, claim_token=?, "
                     "claimed_at=?, updated_at=? WHERE source=? AND issue=? AND journal=? "
-                    "AND normalized_gate=? AND callback_route=?",
+                    "AND normalized_gate=? AND callback_route=? AND workspace_id=?",
                     (CALLBACK_INFLIGHT, token, stamp, stamp, *row.key.as_row()),
                 )
                 claimed.append(
@@ -418,7 +450,7 @@ class CallbackOutbox:
                 conn.execute(
                     "UPDATE callback_outbox SET state=?, claim_token='', detail=?, updated_at=? "
                     "WHERE source=? AND issue=? AND journal=? AND normalized_gate=? "
-                    "AND callback_route=?",
+                    "AND callback_route=? AND workspace_id=?",
                     (
                         new_state,
                         "recovered stale inflight: "
@@ -521,7 +553,8 @@ class CallbackOutbox:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT attempts, max_attempts FROM callback_outbox WHERE source=? AND "
-                "issue=? AND journal=? AND normalized_gate=? AND callback_route=?" + token_clause,
+                "issue=? AND journal=? AND normalized_gate=? AND callback_route=? AND "
+                "workspace_id=?" + token_clause,
                 (*key.as_row(), *token_params),
             ).fetchone()
             if row is None:
@@ -534,7 +567,7 @@ class CallbackOutbox:
             conn.execute(
                 "UPDATE callback_outbox SET state=?, attempts=?, send_attempted=0, "
                 "claim_token='', detail=?, updated_at=? WHERE source=? AND issue=? AND journal=? AND "
-                "normalized_gate=? AND callback_route=?" + token_clause,
+                "normalized_gate=? AND callback_route=? AND workspace_id=?" + token_clause,
                 (
                     resulting,
                     attempts,
@@ -583,8 +616,8 @@ class CallbackOutbox:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 f"UPDATE callback_outbox SET {assignments}, updated_at=? WHERE source=? "
-                "AND issue=? AND journal=? AND normalized_gate=? AND callback_route=?"
-                + token_clause,
+                "AND issue=? AND journal=? AND normalized_gate=? AND callback_route=? "
+                "AND workspace_id=?" + token_clause,
                 (*params, now, *key.as_row(), *token_params),
             )
             conn.execute("COMMIT")
@@ -611,6 +644,7 @@ class CallbackOutbox:
 
         A v1 DB with no callback table yet (never migrated) reads as empty rather than raising.
         """
+        self._ensure_migrated_if_exists()
         conn = self._connect_ro()
         if conn is None:
             return ()
@@ -639,6 +673,7 @@ class CallbackOutbox:
         a terminal mark no-ops (the owner lost the lease and another processor reconciled the
         row): the report must match the persisted state, not the intended one (#13520 review F2-R1).
         """
+        self._ensure_migrated_if_exists()
         conn = self._connect_ro()
         if conn is None:
             return CALLBACK_ABSENT
@@ -647,7 +682,7 @@ class CallbackOutbox:
                 return CALLBACK_ABSENT
             row = conn.execute(
                 "SELECT state FROM callback_outbox WHERE source=? AND issue=? AND journal=? "
-                "AND normalized_gate=? AND callback_route=?",
+                "AND normalized_gate=? AND callback_route=? AND workspace_id=?",
                 key.as_row(),
             ).fetchone()
             return str(row[0]) if row is not None else CALLBACK_ABSENT

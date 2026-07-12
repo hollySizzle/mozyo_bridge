@@ -72,6 +72,27 @@ def _outbox_from_args(args: argparse.Namespace) -> CallbackOutbox:
     return CallbackOutbox(path=_outbox_store_path(args))
 
 
+def _resolve_workspace_id(args: argparse.Namespace) -> str:
+    """Resolve the attested workspace this callback surface owns (#13520 review R2-F5).
+
+    The workspace registry anchor is authoritative (the current repo's workspace identity); the
+    ``MOZYO_WORKSPACE_ID`` env is a fallback. ``""`` (no anchor / not resolvable) is the legacy
+    un-partitioned bucket, so a bare invocation stays back-compatible. This scopes every processor's
+    claim and the sender's route to one workspace, so a shared home DB never lets this surface claim
+    or send another workspace's callback rows.
+    """
+    ws = ""
+    try:
+        from mozyo_bridge.core.state.workspace_registry import read_anchor
+        from mozyo_bridge.application.commands_common import repo_root_from_args
+
+        anchor = read_anchor(repo_root_from_args(args))
+        ws = (anchor.get("workspace_id") if isinstance(anchor, dict) else "") or ""
+    except Exception:  # noqa: BLE001 - anchor unresolvable -> fall back to env, then "" (back-compat)
+        ws = ""
+    return str(ws or os.environ.get("MOZYO_WORKSPACE_ID") or "").strip()
+
+
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
     """Build the live poll source from daemon-trusted credentials (patchable test seam)."""
     since = (getattr(args, "since", None) or "").strip() or None
@@ -128,7 +149,9 @@ def _callback_sender(args: argparse.Namespace) -> Callable[[CallbackOutboxRow], 
         HandoffCallbackSender,
     )
 
-    return HandoffCallbackSender(HandoffCallbackSendPort())
+    return HandoffCallbackSender(
+        HandoffCallbackSendPort(attested_workspace_id=_resolve_workspace_id(args))
+    )
 
 
 def _herdr_wake_wait(interval_seconds: float) -> object:
@@ -235,7 +258,7 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
     outbox = _outbox_from_args(args)
 
     if getattr(args, "sweep", False):
-        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE)
+        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=_resolve_workspace_id(args))
         report = processor.sweep()
         payload = {"action": "sweep", **report.as_payload()}
         lines = [
@@ -255,7 +278,7 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         if not candidates:
             raise SystemExit("--ingest requires at least one --candidate ISSUE:JOURNAL:ROUTE[:KIND]")
         source = _journal_source(args)
-        processor = CallbackOutboxProcessor(outbox, source)
+        processor = CallbackOutboxProcessor(outbox, source, workspace_id=_resolve_workspace_id(args))
         cursor = (getattr(args, "cursor", None) or "").strip() or None
         report = processor.ingest(candidates, cursor=cursor)
         payload = {"action": "ingest", **report.as_payload()}
@@ -277,7 +300,7 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
 
     if getattr(args, "deliver", False):
         sender = _callback_sender(args)  # the real handoff send port (actuates one send per row)
-        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE)
+        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=_resolve_workspace_id(args))
         report = processor.deliver(sender, limit=int(getattr(args, "limit", 32) or 32))
         payload = {"action": "deliver", **report.as_payload()}
         lines = [
@@ -393,10 +416,12 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         source = _journal_source(args) if needs_source else _NULL_SOURCE
 
         def _pass() -> dict:
-            processor = CallbackOutboxProcessor(outbox, source)
+            processor = CallbackOutboxProcessor(outbox, source, workspace_id=_resolve_workspace_id(args))
             candidates = list(explicit)
             if source_issue:
-                candidates.extend(discover_candidates(source, source_issue))
+                candidates.extend(
+                    discover_candidates(source, source_issue, workspace_id=_resolve_workspace_id(args))
+                )
             return run_once(processor, sender, candidates=candidates, cursor=cursor)
 
         if getattr(args, "watch", False):

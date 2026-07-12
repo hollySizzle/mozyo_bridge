@@ -74,13 +74,17 @@ WORKFLOW_RUNTIME_STORE_FILENAME = "workflow-runtime.sqlite"
 #:   and explicit (:meth:`WorkflowRuntimeStore._connect_rw`): it creates the new tables and
 #:   preserves every existing event / route / meta row. A downgraded build that only knows
 #:   an older version fails closed rather than dropping the newer state.
-WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION = 2
+#: - v3 (#13520 review R2-F5): adds ``workspace_id`` to the callback outbox and widens the UNIQUE
+#:   key to include it, so a shared home DB partitions callback rows / claims by workspace (a
+#:   watcher never claims another workspace's rows). The v2->v3 migration recreates the callback
+#:   table preserving existing rows (``workspace_id=''``).
+WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION = 3
 
 #: The recognized schema versions this build can read. A write always migrates up to the
 #: current version; a read tolerates any recognized version (a v1 DB is still readable for
 #: its legacy tables, and its callback reads simply return empty until the first callback
 #: write migrates it). Anything else (a newer / foreign version) fails closed.
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 #: The recognized advisory meta keys (the scalar inputs to the admission decision).
 META_READY_INDEPENDENT = "ready_independent_work"
@@ -206,12 +210,36 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
     gate_mismatch       INTEGER NOT NULL DEFAULT 0,
     detail              TEXT NOT NULL DEFAULT '',
     payload             TEXT NOT NULL DEFAULT '',
+    workspace_id        TEXT NOT NULL DEFAULT '',
     seq                 INTEGER NOT NULL,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
-    UNIQUE(source, issue, journal, normalized_gate, callback_route)
+    UNIQUE(workspace_id, source, issue, journal, normalized_gate, callback_route)
 )
 """
+
+
+def _migrate_callback_outbox_workspace(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: add ``workspace_id`` to the callback outbox + widen the UNIQUE key (#13520 R2-F5).
+
+    A callback outbox created before the review-R2-F5 fix keys rows on
+    ``(source, issue, journal, normalized_gate, callback_route)`` with NO workspace authority, so a
+    shared home DB lets one workspace's watcher claim / collide with another's rows. Widening the
+    UNIQUE key to include ``workspace_id`` requires recreating the table (SQLite cannot alter a
+    table-level UNIQUE). Data-preserving: existing rows copy across with ``workspace_id=''`` (they
+    were unique on the old sub-key, so they stay unique under the widened key). Idempotent — a no-op
+    once ``workspace_id`` is present.
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()]
+    if not cols or "workspace_id" in cols:
+        return  # table absent (created fresh by the caller) or already migrated
+    conn.execute("ALTER TABLE callback_outbox RENAME TO _callback_outbox_pre_v3")
+    conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)  # new table: workspace_id + widened UNIQUE
+    shared = ", ".join(cols)  # every old column exists in the new table (a superset)
+    conn.execute(
+        f"INSERT INTO callback_outbox ({shared}) SELECT {shared} FROM _callback_outbox_pre_v3"
+    )
+    conn.execute("DROP TABLE _callback_outbox_pre_v3")
 
 #: The callback-outbox ownership columns (Redmine #13520 review F2). A ``claim_token`` +
 #: ``claimed_at`` lease fences a claim so a concurrent processor cannot reclaim an actively
@@ -384,25 +412,29 @@ class WorkflowRuntimeStore:
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
             )
             conn.commit()
-        elif version == 1:
-            # v1 -> v2 explicit migration (#13520): additive only. Create the callback
-            # outbox tables and re-stamp the version. Existing event / route / meta rows are
-            # left untouched (data preservation); a `CREATE TABLE IF NOT EXISTS` is a no-op
-            # for any table already present.
+        elif version in (1, 2):
+            # v1 -> v3 (#13520): a v1 DB has no callback tables — create them fresh (the current
+            # SQL already carries workspace_id + the widened UNIQUE). A v2 DB has the callback
+            # table without workspace_id — recreate it preserving rows (workspace migration). Both
+            # leave event / route / meta rows untouched (data preservation) and re-stamp the
+            # version. `CREATE TABLE IF NOT EXISTS` is a no-op for a table already present.
             conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
             conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
             _ensure_callback_ownership_columns(conn)
+            _migrate_callback_outbox_workspace(conn)
             conn.execute(
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
             )
             conn.commit()
         elif version == WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
             # Already current; the tables exist. A defensive IF-NOT-EXISTS keeps a DB that
-            # somehow lost a table self-healing without touching data, and the F2 ownership
-            # columns are ALTER-added if this DB predates them.
+            # somehow lost a table self-healing without touching data; the F2 ownership columns
+            # and the R2-F5 workspace_id migration are idempotently applied if this DB predates
+            # them (the version guard alone cannot distinguish a partially-migrated file).
             conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
             conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
             _ensure_callback_ownership_columns(conn)
+            _migrate_callback_outbox_workspace(conn)
             conn.commit()
         else:
             conn.close()

@@ -20,12 +20,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-def _row(route="coordinator"):
+def _row(route="coordinator", workspace_id=""):
     return CallbackOutboxRow(
         source="redmine", issue="13518", journal="75094",
         normalized_gate="implementation_done", callback_route=route, state="inflight",
         attempts=0, max_attempts=3, send_attempted=True, notification_kind="implementation_done",
-        notification_summary="", gate_mismatch=False, detail="", payload="",
+        notification_summary="", gate_mismatch=False, detail="", payload="", workspace_id=workspace_id,
     )
 
 
@@ -99,6 +99,28 @@ class HandoffCallbackSendPortTest(unittest.TestCase):
         )(_row())
         self.assertIsNone(result.persist_ok)
         self.assertEqual(result.persist_reason, "")
+
+    def test_foreign_workspace_row_is_refused_before_send(self):
+        # #13520 review R2-F5: a sender attested for workspace A never routes workspace B's row.
+        calls = []
+        port = HandoffCallbackSendPort(
+            runner=lambda argv: calls.append(argv) or (0, '{"status": "sent", "reason": "ok"}'),
+            attested_workspace_id="A",
+        )
+        result = port(_row(workspace_id="B"))
+        self.assertEqual((result.status, result.reason), ("blocked", "workspace_mismatch"))
+        self.assertEqual(calls, [])  # no handoff was fired for the foreign workspace's row
+
+    def test_matching_workspace_row_sends(self):
+        port = HandoffCallbackSendPort(
+            runner=lambda argv: (0, '{"status": "sent", "reason": "ok"}'), attested_workspace_id="A",
+        )
+        self.assertEqual(port(_row(workspace_id="A")).status, "sent")
+
+    def test_unpinned_sender_is_backcompat(self):
+        # attested_workspace_id="" (default) skips the pin — single-workspace / legacy behavior.
+        port = HandoffCallbackSendPort(runner=lambda argv: (0, '{"status": "sent", "reason": "ok"}'))
+        self.assertEqual(port(_row(workspace_id="B")).status, "sent")
 
 
 if __name__ == "__main__":

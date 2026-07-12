@@ -82,6 +82,10 @@ class CallbackCandidate:
     callback_route: str
     notification_kind: str = ""
     payload: str = ""
+    #: The workspace this callback belongs to (#13520 review R2-F5), threaded into the outbox key
+    #: so a shared home DB partitions rows / claims by workspace. Default ``""`` is the legacy /
+    #: single-workspace bucket; the production watcher supplies its attested workspace id.
+    workspace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -206,10 +210,15 @@ class CallbackOutboxProcessor:
         source: RedmineJournalSource,
         *,
         source_name: str = SOURCE_REDMINE,
+        workspace_id: str = "",
     ) -> None:
         self._outbox = outbox
         self._source = source
         self._source_name = source_name
+        # The workspace this processor owns (#13520 review R2-F5): every row it enqueues is keyed
+        # to it, and deliver() claims ONLY this workspace's rows — a processor never claims another
+        # workspace's rows on a shared home DB. "" is the legacy / single-workspace bucket.
+        self._workspace_id = str(workspace_id or "")
 
     # -- ingest ------------------------------------------------------------
 
@@ -263,6 +272,7 @@ class CallbackOutboxProcessor:
                     journal=candidate.journal,
                     normalized_gate=classification.normalized_gate,
                     callback_route=candidate.callback_route,
+                    workspace_id=candidate.workspace_id or self._workspace_id,
                 )
                 result = self._outbox.enqueue(
                     key,
@@ -292,6 +302,7 @@ class CallbackOutboxProcessor:
                     journal=candidate.journal,
                     normalized_gate=UNCLASSIFIED_GATE,
                     callback_route=candidate.callback_route,
+                    workspace_id=candidate.workspace_id or self._workspace_id,
                 )
                 result = self._outbox.enqueue(
                     key,
@@ -340,7 +351,9 @@ class CallbackOutboxProcessor:
         # Recover only lease-expired (stale) inflight rows — never a concurrent processor's
         # fresh active claim (#13520 review F2). A default lease is used unless overridden.
         report.recovered.extend(self._outbox.recover_inflight(stale_seconds=stale_seconds, now=now))
-        for row in self._outbox.claim_pending(limit=limit, now=now):
+        for row in self._outbox.claim_pending(
+            limit=limit, now=now, workspace_id=self._workspace_id or None
+        ):
             token = row.claim_token
             # The send gate: mark_sending is token-conditional. If we no longer own the row
             # (its claim was recovered + re-claimed elsewhere) it returns False and we DO NOT

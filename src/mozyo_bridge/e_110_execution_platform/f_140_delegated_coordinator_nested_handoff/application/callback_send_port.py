@@ -116,8 +116,21 @@ class HandoffCallbackSendPort:
 
     runner: CallbackSendRunner = _default_runner
     mozyo_bridge_bin: str = "mozyo-bridge"
+    #: The workspace this sender is attested for (#13520 review R2-F5). When both this and the
+    #: row carry a workspace id and they DIFFER, the send is refused (fail-closed) rather than
+    #: routing another workspace's callback via the ambient cwd/env — a sender pins to the row's
+    #: stored/attested workspace, it never delivers a foreign workspace's row. "" (either side)
+    #: skips the check (legacy / single-workspace, back-compat).
+    attested_workspace_id: str = ""
 
     def __call__(self, row: CallbackOutboxRow) -> HandoffDeliveryResult:
+        row_ws = str(getattr(row, "workspace_id", "") or "").strip()
+        attested = str(self.attested_workspace_id or "").strip()
+        if row_ws and attested and row_ws != attested:
+            # Fail-closed workspace pin: refuse to route a foreign workspace's callback. Not a
+            # deterministic pre-injection refusal that dead-letters — return uncertain so the row
+            # stays for the correct-workspace watcher (never delivered here, never mis-sent).
+            return HandoffDeliveryResult("blocked", "workspace_mismatch")
         argv = [
             self.mozyo_bridge_bin, "handoff", "send",
             "--to", "codex",
