@@ -1258,7 +1258,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1065
+    lines: 1075
     reason: >-
       Herdr session-start composition root (classification / placement / reclaim).
       It sat at 1072 after Bug #13595 (dry-run purity). Bug #13637 (adopted-agent
@@ -1267,10 +1267,12 @@ allowlist:
       absent/stale/missing/conflict) and its store import, but ALSO carried out the
       previously-scheduled reduction: the launch-argv assembly (provider command,
       the #13637 self-attestation wrapper, and the #13411 tab flags) was extracted
-      to the cohesive sibling `herdr_launch_argv.build_agent_start_argv`, netting a
-      reduction to 1065. Remaining surface is integrated / correctness-required
-      behaviour; a further reduction could extract the empty-base-pane / tab reclaim
-      helpers if this grows again.
+      to the cohesive sibling `herdr_launch_argv.build_agent_start_argv` — netting a
+      drop to 1065. The #13637 review (j#76492 Finding 1) then required threading the
+      resolved store home to the wrapper (`--env MOZYO_BRIDGE_HOME`) and pinning the
+      adopt reader to it, +10 correctness-required lines to 1075 — still a net +3 over
+      the pre-#13637 1072 despite adding the whole self-attestation feature. A further
+      reduction could extract the empty-base-pane / tab reclaim helpers if this grows.
     owner_issue: "#13637"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

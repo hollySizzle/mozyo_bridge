@@ -44,31 +44,47 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
 
 
+def _is_absolute_executable(candidate: str) -> bool:
+    """True iff ``candidate`` is an absolute path to an existing executable file.
+
+    The same posture the herdr-binary resolver uses (``herdr_transport
+    ._verify_executable``): absolute, a regular file after ``realpath`` (symlink
+    resolved), and ``os.X_OK``. A non-absolute / missing / directory / non-executable
+    value is rejected so a launcher can never be a repo-local or unrunnable path.
+    """
+    if not candidate or not os.path.isabs(candidate):
+        return False
+    real = os.path.realpath(candidate)
+    return os.path.isfile(real) and os.access(real, os.X_OK)
+
+
 def resolve_attest_launcher(env: Mapping[str, str]) -> str:
     """The absolute mozyo-bridge launcher to wrap the provider through, or ``""``.
 
     The #13637 managed launch execs the provider THROUGH ``mozyo-bridge herdr
     agent-attest`` so the agent self-attests its injected identity env before
     ``exec``ing the provider. This resolves that launcher from the trusted
-    environment — an explicit absolute :data:`MOZYO_BRIDGE_LAUNCHER_ENV`, else an
-    absolute ``mozyo-bridge`` on the passed env's PATH — mirroring the herdr-binary
-    trusted-resolution posture (never a repo-local / relative path, and never
+    environment — an explicit :data:`MOZYO_BRIDGE_LAUNCHER_ENV`, else ``mozyo-bridge``
+    on the passed env's PATH — and BOTH branches require an absolute path to an
+    existing executable (never a repo-local / relative path, and never
     ``shutil.which``'s ambient ``os.environ`` fallback, so resolution is hermetic).
-    Returns ``""`` when nothing absolute resolves, which disables the wrapper: the
-    launch falls back to the byte-invariant direct provider command rather than risk
-    a dead pane, and the missing self-attestation record makes the adopt / doctor
+    An override that does not resolve to a runnable executable (e.g. a config typo)
+    is rejected exactly like an unresolvable PATH (Redmine #13637 review j#76492
+    Finding 2): returning ``""`` disables the wrapper so the launch falls back to the
+    byte-invariant direct provider command rather than start an unrunnable wrapper
+    (a dead pane), and the missing self-attestation record makes the adopt / doctor
     read side fail closed (the safe degradation, Design Answer j#76462).
     """
     override = _norm(env.get(MOZYO_BRIDGE_LAUNCHER_ENV))
     if override:
-        return override if os.path.isabs(override) else ""
+        return override if _is_absolute_executable(override) else ""
     import shutil
 
     path = _norm(env.get("PATH"))
     if not path:
         return ""
     found = shutil.which("mozyo-bridge", path=path)
-    return found if found and os.path.isabs(found) else ""
+    return found if found and _is_absolute_executable(found) else ""
 
 
 def _provider_command(
@@ -115,6 +131,7 @@ def build_agent_start_argv(
     split_tab: bool,
     binary: str,
     attest_launcher: str,
+    store_home: str,
     claude_permission_mode: Optional[str],
     launch_argv_extra: Sequence[str],
 ) -> list[str]:
@@ -133,6 +150,15 @@ def build_agent_start_argv(
     When it does not resolve the run command is the bare provider (byte-invariant
     pre-#13637 launch) — a launch is never risked on a dead pane; the absent record
     then makes the adopt / doctor read side fail closed.
+
+    ``store_home`` is the launcher's resolved mozyo-bridge home; it rides on
+    ``--env MOZYO_BRIDGE_HOME=<home>`` (review j#76492 Finding 1). The wrapper writes
+    the self-attestation to whatever home IT resolves, and a herdr-spawned process
+    does NOT inherit the launching client's ``MOZYO_BRIDGE_HOME`` — so without this
+    the wrapper would write to a different store than the launcher / adopt / doctor
+    read, and a fresh launch's record would read as permanently ``absent``. Injecting
+    the launcher's home pins writer and reader to one store. It is always injected
+    (harmless when it equals the wrapper's default home).
 
     Lane=tab placement (Redmine #13411): a non-default lane's ``--tab`` (and
     ``--split right`` for the second slot) is inserted right after ``--workspace``;
@@ -164,14 +190,7 @@ def build_agent_start_argv(
         ]
     else:
         run_cmd = provider_cmd
-    launch_argv = [
-        "agent",
-        "start",
-        assigned_name,
-        "--cwd",
-        str(repo_root),
-        "--workspace",
-        target_workspace,
+    env_flags = [
         "--env",
         f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
         "--env",
@@ -180,6 +199,23 @@ def build_agent_start_argv(
         f"{MOZYO_LANE_ID_ENV}={lane}",
         "--env",
         f"{HERDR_BINARY_ENV}={binary}",
+    ]
+    # MOZYO_BRIDGE_HOME rides along ONLY when wrapping (review j#76492 Finding 1): the
+    # wrapper writes its self-attestation to the home it resolves, so it must resolve
+    # the launcher's home — but a herdr-spawned process does not inherit the client's
+    # MOZYO_BRIDGE_HOME. The unwrapped fallback writes no record, so it stays
+    # byte-for-byte the pre-#13637 env set (no extra --env).
+    if attest_launcher:
+        env_flags += ["--env", f"MOZYO_BRIDGE_HOME={store_home}"]
+    launch_argv = [
+        "agent",
+        "start",
+        assigned_name,
+        "--cwd",
+        str(repo_root),
+        "--workspace",
+        target_workspace,
+        *env_flags,
         "--no-focus",
         "--",
         *run_cmd,

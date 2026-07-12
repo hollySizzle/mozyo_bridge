@@ -48,6 +48,16 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
 
+def _env_flags(start_argv):
+    """The `--env KEY=VALUE` pairs of a launched `agent start` argv, as a dict."""
+    flags = {}
+    for i, tok in enumerate(start_argv):
+        if tok == "--env" and i + 1 < len(start_argv) and "=" in start_argv[i + 1]:
+            key, value = start_argv[i + 1].split("=", 1)
+            flags[key] = value
+    return flags
+
+
 def _present_attestation_reader(ws, role, lane, locator):
     """A reader that returns a generation-matched ``present`` record for this slot.
 
@@ -309,13 +319,83 @@ class SessionStartTest(unittest.TestCase):
 
     def test_launch_is_byte_invariant_when_launcher_unresolvable(self) -> None:
         # No resolvable mozyo-bridge on the launch env PATH -> no wrapper, byte-invariant
-        # pre-#13637 launch (`-- <provider>`), the safe fallback.
+        # pre-#13637 launch (`-- <provider>`), the safe fallback. No MOZYO_BRIDGE_HOME
+        # is injected in the unwrapped case (review j#76492 Finding 1).
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
         start = herdr.start_argvs[0]
         self.assertNotIn("agent-attest", start)
+        self.assertNotIn("MOZYO_BRIDGE_HOME", "".join(start))
         self.assertEqual(start[-2:], ["--", "claude"])
+
+    def test_wrapped_launch_injects_store_home_matching_reader(self) -> None:
+        # Finding 1 (review j#76492): the wrapped launch injects
+        # `--env MOZYO_BRIDGE_HOME=<launcher home>` so the herdr-spawned wrapper (which
+        # does NOT inherit the client's home) writes to the SAME store the adopt reader
+        # uses. `_prepare` patches os.environ MOZYO_BRIDGE_HOME to `<tmp>/home`, so the
+        # injected value is that home resolved (the same `mozyo_bridge_home()` the reader
+        # resolves inside the run).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            self._prepare(tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env)
+            injected = _env_flags(herdr.start_argvs[0])
+            expected_home = str((Path(tmp) / "home").resolve())
+            self.assertEqual(injected.get("MOZYO_BRIDGE_HOME"), expected_home)
+
+    def test_wrapper_record_in_resolved_home_is_adopted_without_injected_reader(self) -> None:
+        # Finding 1 end-to-end: with NO injected reader, the adopt gate reads the store
+        # at the resolved home (mozyo_bridge_home) — the same home the launcher injects
+        # onto the wrapper — so a wrapper-written present record is adopted.
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                name = encode_assigned_name(ws, "codex", "lane-1")
+                # The wrapper wrote its present record into the RESOLVED home, locator w9:pX.
+                HerdrIdentityAttestationStore(home=home).upsert(
+                    IdentityAttestationRecord(
+                        assigned_name=name,
+                        workspace_id=ws,
+                        role="codex",
+                        lane_id="lane-1",
+                        locator="w9:pX",
+                        verdict=VERDICT_PRESENT,
+                    )
+                )
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": name,
+                            "pane_id": "w9:pX",
+                            "agent": "codex",
+                            "agent_status": "idle",
+                        }
+                    ]
+                )
+                binpath = Path(tmp) / "fake-herdr"
+                binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )  # NO attestation_reader -> default reader resolves the same home
+        self.assertEqual(result.slots[0].outcome, SLOT_ADOPTED)
 
     def test_launch_mints_names_at_start_no_rename(self) -> None:
         herdr = _Herdr()
@@ -2322,6 +2402,88 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         ]
         with self.assertRaises(HerdrSessionStartError):
             _tab_target_for_lane(split, ws, "w8", "lane-a")
+
+
+class ResolveAttestLauncherTest(unittest.TestCase):
+    """The #13637 self-check launcher resolver (review j#76492 Finding 2): BOTH the
+    explicit override and the PATH branch require an absolute path to an existing
+    executable; anything else falls back to `""` (disables the wrapper, no dead pane)."""
+
+    def _exe(self, tmp, name="mozyo-bridge"):
+        p = Path(tmp) / name
+        p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return p
+
+    def test_valid_absolute_executable_override_resolves(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            self.assertEqual(
+                resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": str(exe)}), str(exe)
+            )
+
+    def test_nonexistent_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        # A config typo (absolute but missing) must NOT be launched (dead-pane risk).
+        self.assertEqual(
+            resolve_attest_launcher(
+                {"MOZYO_BRIDGE_LAUNCHER": "/definitely/missing/mozyo-bridge"}
+            ),
+            "",
+        )
+
+    def test_directory_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": tmp}), ""
+            )
+
+    def test_non_executable_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "mozyo-bridge"
+            plain.write_text("not executable", encoding="utf-8")
+            plain.chmod(0o644)
+            self.assertEqual(
+                resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": str(plain)}), ""
+            )
+
+    def test_relative_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        self.assertEqual(
+            resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": "mozyo-bridge"}), ""
+        )
+
+    def test_path_resolution_requires_executable(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            self.assertEqual(
+                resolve_attest_launcher({"PATH": tmp}), str(exe)
+            )
+            # A PATH with no mozyo-bridge resolves to "".
+            with tempfile.TemporaryDirectory() as empty:
+                self.assertEqual(resolve_attest_launcher({"PATH": empty}), "")
 
 
 if __name__ == "__main__":  # pragma: no cover
