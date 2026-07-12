@@ -97,11 +97,13 @@ class TestPyPIExactShaWorkflowTest(unittest.TestCase):
             for step in steps
             if isinstance(step, dict) and "name" in step and "Verify" in step["name"]
         }
-        # The five approved fail-closed gates (j#75969 / j#75978).
+        # The approved fail-closed gates (j#75969 / j#75978) plus the F1
+        # trusted-Test-definition-equality gate (j#76006).
         required_markers = (
             "exact source SHA",
             "source_ref resolves",
             "version mirror == expected_version",
+            "Test workflow matches trusted main",
             "successful Test CI",
             "unused on TestPyPI",
         )
@@ -116,6 +118,27 @@ class TestPyPIExactShaWorkflowTest(unittest.TestCase):
                 str(step.get("if", "")),
                 msg=f"gate {name!r} must be guarded by github.event_name == workflow_dispatch",
             )
+
+    def test_f1_gate_compares_candidate_test_yml_to_trusted_main(self) -> None:
+        # F1 (j#76006): the gate must prove the candidate Test workflow matches
+        # trusted main, not merely that a Test run exists at the SHA.
+        self.assertIn("git fetch --no-tags origin main", self.text)
+        self.assertIn("FETCH_HEAD:.github/workflows/test.yml", self.text)
+        self.assertIn("HEAD:.github/workflows/test.yml", self.text)
+
+    def test_f2_gate_requires_exact_one_ref_not_first_line(self) -> None:
+        # F2 (j#76006): the weak first-line acceptance (`awk 'NR==1 {print $1}'`)
+        # must be gone as executable code; require metachar rejection + an
+        # exact-one count. (The explanatory comment may still name the old form.)
+        self.assertNotIn("NR==1 {print $1}", self.text)
+        self.assertIn("no globs/refspec metacharacters", self.text)
+        self.assertIn("require exactly one", self.text)
+
+    def test_f3_gate_requires_releases_schema_before_unused(self) -> None:
+        # F3 (j#76006): a payload without a `releases` object must fail closed,
+        # not fall through to "unused".
+        self.assertIn('isinstance(data.get("releases"), dict)', self.text)
+        self.assertIn("cannot prove version unused", self.text)
 
     def test_run_name_carries_nonce_and_concurrency_serializes_by_version(self) -> None:
         self.assertIn("dispatch_nonce", str(self.doc.get("run-name", "")))
