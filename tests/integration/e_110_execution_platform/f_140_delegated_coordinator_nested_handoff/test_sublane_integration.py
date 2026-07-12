@@ -32,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     BLOCKED_DIRTY_WORKTREE,
+    INTEGRATION_STALE_REVIEW_GENERATION,
     BLOCKED_MERGE_CONFLICT,
     INTEGRATION_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
@@ -150,6 +151,31 @@ class RetireUseCaseTest(unittest.TestCase):
         self.assertEqual(decision.state, RETIRE_OK)
         self.assertTrue(decision.merge_performed)
         self.assertTrue(ops.merge_called)
+
+    def test_stale_review_generation_blocks_integration_before_merge(self) -> None:
+        # #13518 review R2-F7: an inadmissible latest review generation (a stale approval / an
+        # unresolved blocking finding) fences integration BEFORE any git probe or merge.
+        ops = FakeGitOperations(git=True)
+        use_case = SublaneIntegrationUseCase(
+            operations=ops, policy=SublaneIntegrationPolicy.default()
+        )
+        invariants = RetireInvariants(
+            target_identity_known=True, verification_passed=True, issue_closed=True,
+            owner_approval_present=True, callbacks_drained=True, durable_record_recorded=True,
+            latest_generation_admissible=False,
+        )
+        decision = use_case.evaluate_retire(invariants=invariants)
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
+        self.assertFalse(ops.merge_called)  # no merge on a stale generation
+
+    def test_admissible_generation_default_is_backcompat(self) -> None:
+        # The fence defaults admissible=True, so an unchanged caller retires exactly as before.
+        ops = FakeGitOperations(git=True)
+        use_case = SublaneIntegrationUseCase(
+            operations=ops, policy=SublaneIntegrationPolicy.default()
+        )
+        self.assertEqual(use_case.evaluate_retire(invariants=_ok_invariants()).state, RETIRE_OK)
 
     def test_dirty_worktree_blocks_before_merge(self) -> None:
         ops = FakeGitOperations(git=True, dirty=True)

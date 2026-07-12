@@ -270,6 +270,13 @@ class RetirePreflight:
     durable_record_recorded: bool = True
 
 
+#: The retire/integration was refused because the latest review generation is not admissible —
+#: a stale approval for an older generation, or an unresolved blocking finding in the latest
+#: generation (#13518 review R2-F7). Integration requires the latest generation to be approved and
+#: clean, never merely "an approval exists somewhere".
+INTEGRATION_STALE_REVIEW_GENERATION = "stale_review_generation"
+
+
 @dataclass(frozen=True)
 class RetireDecision:
     """The result of :func:`decide_retire_integration`.
@@ -428,6 +435,7 @@ __all__ = (
     "LAUNCH_ACTIONS",
     "RETIRE_OK",
     "INTEGRATION_BLOCKED",
+    "INTEGRATION_STALE_REVIEW_GENERATION",
     "RETIRE_STATES",
     "BLOCKED_PREFLIGHT_FAILURE",
     "BLOCKED_DIRTY_WORKTREE",

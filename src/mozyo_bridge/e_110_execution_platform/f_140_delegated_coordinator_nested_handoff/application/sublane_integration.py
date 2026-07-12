@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
+    INTEGRATION_BLOCKED,
+    INTEGRATION_STALE_REVIEW_GENERATION,
     LAUNCH_CREATE_WORKTREE,
     LaunchPreflight,
     RetireDecision,
@@ -120,6 +122,12 @@ class RetireInvariants:
     owner_approval_present: bool = False
     callbacks_drained: bool = False
     durable_record_recorded: bool = False
+    #: The latest review generation is admissible for integration (#13518 review R2-F7): the latest
+    #: generation is approved with NO unresolved blocking finding
+    #: (:func:`...domain.review_generation.evaluate_integration_admissible`). Defaults ``True`` so a
+    #: caller that does not supply it is byte-for-byte back-compatible; the coordinator sets it
+    #: ``False`` to fence a stale approval / an unresolved blocking finding out of integration.
+    latest_generation_admissible: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +183,17 @@ class SublaneIntegrationUseCase:
         retirement *before* any merge runs. A merge conflict then re-decides to
         ``integration_blocked``.
         """
+        # R2-F7 integration latest-generation fence: refuse BEFORE any git probe / merge when the
+        # latest review generation is inadmissible (a stale approval / an unresolved blocking finding
+        # in the latest generation). This is the "latest generation is clean", not "an approval
+        # exists somewhere", requirement — a last-write-wins stale approval never integrates.
+        if not invariants.latest_generation_admissible:
+            return RetireDecision(
+                state=INTEGRATION_BLOCKED,
+                blocked_reasons=(INTEGRATION_STALE_REVIEW_GENERATION,),
+                primary_reason=INTEGRATION_STALE_REVIEW_GENERATION,
+            )
+
         is_git = self.operations.is_git_workspace()
         target = self.policy.integration_branch
         worktree_dirty = self.operations.worktree_dirty() if is_git else False
