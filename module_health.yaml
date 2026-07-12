@@ -1257,6 +1257,23 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
+  - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
+    lines: 1013
+    reason: >-
+      Herdr session-start composition root. It was de-listed at ~970 lines after
+      the #13411 topology extraction (see the note below) and sat at exactly 1000
+      on the #13518 pre-restack head (review j#76004). Integrating the reviewed
+      upstream Bugs #13613 (fail-before-mutation sender-attestation preflight) and
+      #13614 (launch-time Codex tool-shell identity) into the #13518 branch added
+      the `CodexShellIdentity` import + its `-c` override append in the codex
+      launch path (+13 lines -> 1013). This is integrated upstream behaviour, not
+      new #13518 surface, so it is allowlisted rather than trimmed; a split
+      follow-up (extract the launch-argv assembly to a cohesive sibling) is the
+      scheduled reduction.
+    owner_issue: "#13518"
+    resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
+
 # herdr_session_start.py was allowlisted at 1027 lines (owner_issue #13425, split
 # deferred pending #13392). Redmine #13411 (lane=tab subdivision) resolved the
 # deferral: the pure placement/topology decisions + payload parsers were extracted
@@ -1265,4 +1282,5 @@ allowlist:
 # (~446 lines: placement decisions + payload parsers + the workspace-segment
 # resolver), dropping herdr_session_start to ~970 lines — back under the 1000
 # threshold even after the j#74433 / j#74434 review-fix guards. The allowlist entry
-# is removed (not silently raised); the sibling is well under threshold and needs none.
+# was removed then; it is re-added above after the #13613/#13614 integration
+# (#13518 restack) pushed the file to 1013.
