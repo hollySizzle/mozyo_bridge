@@ -24,7 +24,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
@@ -172,6 +172,42 @@ class HerdrSublaneOpsTest(unittest.TestCase):
             runner=herdr.run,
         )
         return ops, home
+
+    def test_sender_preflight_fails_closed_before_anchor_or_env_attestation(self) -> None:
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            ok, detail = ops.preflight_dispatch_sender()
+            self.assertFalse(ok)
+            self.assertIn("missing_sender_env", detail)
+
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                registered = register_workspace(ops.repo_root, home=home)
+            ops.env = {
+                **ops.env,
+                "MOZYO_WORKSPACE_ID": registered.record.workspace_id,
+                "MOZYO_AGENT_ROLE": "codex",
+                "MOZYO_LANE_ID": "default",
+            }
+            ok, detail = ops.preflight_dispatch_sender()
+        self.assertTrue(ok)
+        self.assertIn("matches", detail)
+
+    def test_sender_preflight_rejects_wrong_nonempty_workspace(self) -> None:
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(ops.repo_root, home=home)
+            ops.env = {
+                **ops.env,
+                "MOZYO_WORKSPACE_ID": "wrong-but-nonempty",
+                "MOZYO_AGENT_ROLE": "codex",
+                "MOZYO_LANE_ID": "default",
+            }
+            ok, detail = ops.preflight_dispatch_sender()
+        self.assertFalse(ok)
+        self.assertIn("env_anchor_workspace_mismatch", detail)
 
     def test_append_then_read_lane_round_trips(self) -> None:
         herdr = _StatefulHerdr()
