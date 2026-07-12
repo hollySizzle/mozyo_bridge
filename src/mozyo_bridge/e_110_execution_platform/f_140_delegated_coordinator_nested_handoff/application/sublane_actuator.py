@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -289,6 +290,14 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         gateway_ready_probes=ready_probes,
         gateway_ready_interval_seconds=interval,
     )
+    # Action-time sender-attestation preflight (#13518 j#75671 / review R2-F3): a live dispatch
+    # resolves a coordinator sender identity from the environment; measure it NOW so the actuator
+    # can fail closed BEFORE creating a lane / worktree if it is unattested (a partial launch would
+    # force raw-input recovery). Both self-identity vars must be present to be attested.
+    sender_attested = bool(
+        (os.environ.get("MOZYO_WORKSPACE_ID") or "").strip()
+        and (os.environ.get("MOZYO_AGENT_ROLE") or "").strip()
+    )
     outcome = use_case.run(
         request,
         execute=execute and not dry_run,
@@ -296,6 +305,7 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         target_repo=getattr(args, "target_repo", None) or "auto",
         fill_inputs=fill_inputs,
         override_fill_stop=override_fill_stop,
+        sender_attested=sender_attested,
     )
     if json_mode:
         print(

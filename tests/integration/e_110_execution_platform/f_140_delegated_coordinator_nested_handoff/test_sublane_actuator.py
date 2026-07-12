@@ -32,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
+    REASON_SENDER_UNATTESTED,
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
     REASON_MISSING_IDENTITY,
@@ -302,6 +303,38 @@ class MissingIdentityTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+
+
+class SenderAttestationPreflightTests(unittest.TestCase):
+    """#13518 j#75671 / review R2-F3: no partial launch on an unattested coordinator sender."""
+
+    def test_unattested_sender_blocks_before_actuation(self):
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, sender_attested=False)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_SENDER_UNATTESTED, outcome.blocked_reasons)
+        # Fail-closed BEFORE any worktree side effect (a partial launch is exactly what j#75671
+        # forbids): create_worktree was never called.
+        self.assertFalse([c for c in ops.calls if isinstance(c, tuple) and c[0] == "create_worktree"])
+
+    def test_none_sender_attested_is_backcompat_no_op(self):
+        # An un-measured attestation (None) does not arm the gate — existing callers are unchanged.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, sender_attested=None)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_attested_sender_proceeds(self):
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, sender_attested=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_no_dispatch_is_not_gated_by_sender(self):
+        # --no-dispatch creates/adopts but dispatches no worker, so the sender gate does not arm.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(journal=None), execute=True, dispatch=False, sender_attested=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
 
 class WorkUnitGateTests(unittest.TestCase):

@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_FILL_STOP,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
+    REASON_SENDER_UNATTESTED,
     REASON_STAMP_FAILED,
     REASON_WORK_UNIT_BLOCKED,
     REASON_WORKTREE_CREATE_FAILED,
@@ -158,6 +159,7 @@ class SublaneActuateUseCase:
         target_repo: str = "auto",
         fill_inputs: Optional[FillDecisionInputs] = None,
         override_fill_stop: Optional[str] = None,
+        sender_attested: Optional[bool] = None,
     ) -> SublaneActuationOutcome:
         # 1. Fail closed on missing identity (#13432: a non-git workspace relaxes
         # --branch/--worktree and defaults the omitted worktree to the workspace root).
@@ -194,6 +196,21 @@ class SublaneActuateUseCase:
                 reason="a live dispatch requires a durable-anchor journal id "
                 "(--journal); refusing to dispatch a worker without an anchor",
                 reasons=(REASON_ANCHOR_REQUIRED,),
+                dispatch=dispatch,
+            )
+
+        # 3c. Action-time sender-attestation preflight (#13518 j#75671 / review R2-F3): creating a
+        # lane / worktree and only THEN failing the governed dispatch on an unattested sender is a
+        # partial launch that forces raw-input recovery — fail closed BEFORE any side effect. Armed
+        # only when the caller supplies a measured `sender_attested` (`None` = no-op, back-compat).
+        if execute and dispatch and sender_attested is False:
+            return self._blocked(
+                request,
+                launch_action=None,
+                reason="the coordinator sender identity is not attested; refusing to create a "
+                "lane / worktree before a verified sender. Re-attest the sender "
+                "(MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE), then re-run — the request replays.",
+                reasons=(REASON_SENDER_UNATTESTED,),
                 dispatch=dispatch,
             )
 

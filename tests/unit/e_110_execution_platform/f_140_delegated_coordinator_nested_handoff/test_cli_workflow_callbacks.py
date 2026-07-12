@@ -131,6 +131,61 @@ class WakeWaitFnTest(unittest.TestCase):
         self.assertFalse(wait())  # fail-safe fallback: bounded sleep hint, never a crash
 
 
+class RecoveryPlanMeasurementTest(unittest.TestCase):
+    """#13520 review R2-F3: --recovery-plan MEASURES authorities; never hard-codes unknown->safe."""
+
+    def _run_capture_obs(self, tmp, **over):
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            callback_recovery_command as cmd,
+        )
+
+        captured = {}
+        _orig = cmd.recovery_plan_from_observation
+
+        def _capture(obs):
+            captured["obs"] = obs
+            return _orig(obs)
+
+        ns = argparse.Namespace(
+            recovery_plan=True, json=True, store_path=str(tmp / "wf.sqlite"),
+            workspace_id=None, anchor_readable=False, repo=None,
+            sweep=False, ingest=False, deliver=False, run_once=False, watch=False, emit_gate=False,
+        )
+        ns.__dict__.update(over)
+        with patch(
+            "mozyo_bridge.core.state.workspace_registry.read_anchor",
+            lambda repo_root: {"workspace_id": "wsX"},
+        ), patch.object(cmd, "recovery_plan_from_observation", _capture), patch(
+            "mozyo_bridge.application.commands_common.repo_root_from_args",
+            lambda args: Path(tmp),
+        ):
+            cli.cmd_workflow_callbacks(ns)
+        return captured["obs"]
+
+    def test_anchor_readable_not_hardcoded_true_when_flag_unset(self):
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._run_capture_obs(Path(t), anchor_readable=False)
+        self.assertFalse(obs.redmine_anchor_readable)  # unverified -> fail-closed, NOT True
+
+    def test_anchor_readable_asserted_by_flag(self):
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._run_capture_obs(Path(t), anchor_readable=True)
+        self.assertTrue(obs.redmine_anchor_readable)
+
+    def test_outbox_present_measured_from_store_absence(self):
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._run_capture_obs(Path(t))  # store file does not exist
+        self.assertFalse(obs.outbox_present)  # measured, not hard-coded True
+
+    def test_expected_workspace_not_self_matched_to_registry(self):
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._run_capture_obs(Path(t), workspace_id=None)
+        # --workspace-id unset -> expected is blank (unverified), NEVER silently == registry.
+        self.assertEqual(obs.workspace_id_expected, "")
+        self.assertEqual(obs.workspace_id_registry, "wsX")
+
+
 class WatchPassSummaryTest(unittest.TestCase):
     """#13520 review R2-F2: the CLI renders an error pass without KeyError and surfaces it."""
 

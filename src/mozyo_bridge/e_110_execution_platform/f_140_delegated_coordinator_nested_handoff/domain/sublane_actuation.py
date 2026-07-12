@@ -110,6 +110,12 @@ REASON_HANDOFF_FAILED = "handoff_failed"
 #: The #13002 work-unit granularity gate refused: an ``epic`` / ``feature`` unit was
 #: requested without an explicit owner / operator decision anchor (durable journal id).
 REASON_WORK_UNIT_BLOCKED = "work_unit_blocked"
+#: The action-time sender-attestation preflight refused a live dispatch (#13518 j#75671 / review
+#: R2-F3): the coordinator sender identity was not attested, so actuating would create a lane /
+#: worktree and THEN fail the governed dispatch on an unattested sender (a partial launch that
+#: forces raw-input recovery). Fail closed BEFORE any worktree / launch side effect, with a
+#: replayable resume plan (re-attest the sender, then re-run create).
+REASON_SENDER_UNATTESTED = "sender_unattested"
 #: The #13290 dispatch admission gate refused: the caller-supplied fill decision
 #: resolved to a concrete stop and no explicit override was supplied. Defined in
 #: :mod:`...domain.sublane_dispatch_admission`; re-exported here so the actuator's
@@ -127,6 +133,7 @@ BLOCKED_REASONS = frozenset(
         REASON_LANE_MISMATCH,
         REASON_HANDOFF_FAILED,
         REASON_WORK_UNIT_BLOCKED,
+        REASON_SENDER_UNATTESTED,
         REASON_FILL_STOP,
     }
 )
@@ -402,6 +409,7 @@ __all__ = (
     "ACTUATE_READY",
     "ACTUATE_BLOCKED",
     "ACTUATE_STATES",
+    "REASON_SENDER_UNATTESTED",
     "REASON_MISSING_IDENTITY",
     "REASON_LAUNCH_BLOCKED",
     "REASON_ANCHOR_REQUIRED",

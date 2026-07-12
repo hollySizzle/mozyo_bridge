@@ -61,11 +61,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
+def _outbox_store_path(args: argparse.Namespace) -> Path:
+    """Resolve the callback outbox store path (``--store-path`` or the home default)."""
+    raw = (getattr(args, "store_path", None) or "").strip()
+    return Path(raw) if raw else workflow_runtime_store_path()
+
+
 def _outbox_from_args(args: argparse.Namespace) -> CallbackOutbox:
     """Build the callback outbox over ``--store-path`` (test/debug) or the home default."""
-    raw = (getattr(args, "store_path", None) or "").strip()
-    path = Path(raw) if raw else workflow_runtime_store_path()
-    return CallbackOutbox(path=path)
+    return CallbackOutbox(path=_outbox_store_path(args))
 
 
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
@@ -340,17 +344,26 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         repo_root = repo_root_from_args(args)
         anchor = read_anchor(repo_root)
         registry_ws = (anchor.get("workspace_id") if isinstance(anchor, dict) else "") or ""
-        # The expected workspace comes from the durable anchor (--workspace-id); default to the
-        # registry value when unset (then the mismatch check is trivially satisfied).
-        expected_ws = (getattr(args, "workspace_id", None) or registry_ws).strip()
+        # #13520 review R2-F3: MEASURE authorities at action-time; never replace an unknown with a
+        # safe default. The expected workspace comes from the durable anchor (--workspace-id) — when
+        # unset it is UNVERIFIED (left blank so the reconciler fail-closes on the mismatch, never a
+        # silent self-match to the registry). Redmine anchor readability is likewise unverified
+        # unless the operator asserts they read the exact gate journal (--anchor-readable), so it
+        # defaults to fail-closed rather than a hard-coded True. Outbox presence is measured from
+        # the store; the live Herdr slot inventory is the #13490 live surface (best-effort empty).
+        expected_ws = (getattr(args, "workspace_id", None) or "").strip()
+        anchor_readable = bool(getattr(args, "anchor_readable", False))
+        store_p = _outbox_store_path(args)
+        outbox_present = store_p.exists()
         obs = build_observation(
             workspace_id_expected=expected_ws,
             workspace_id_registry=registry_ws,
-            redmine_anchor_readable=True,  # a full poll is heavy; the operator flags an unreadable anchor
+            redmine_anchor_readable=anchor_readable,
             repo_root=str(repo_root),
-            outbox_present=True,
-            outbox_pending=len(outbox.read(states=[CALLBACK_PENDING])),
-            outbox_uncertain=len(outbox.read(states=[CALLBACK_UNCERTAIN])),
+            outbox_present=outbox_present,
+            outbox_pending=len(outbox.read(states=[CALLBACK_PENDING])) if outbox_present else 0,
+            outbox_uncertain=len(outbox.read(states=[CALLBACK_UNCERTAIN])) if outbox_present else 0,
+            outbox_workspace_id=registry_ws if outbox_present else "",
             env=os.environ,
         )
         plan = recovery_plan_from_observation(obs)
@@ -460,10 +473,16 @@ def register_callbacks(sub) -> None:
     action.add_argument(
         "--recovery-plan", dest="recovery_plan", action="store_true",
         help="Emit the READ-ONLY host-restart recovery plan (reconciles Redmine/Git/registry/"
-             "state-DB/runtime authorities; fail-closed + never-clobber; --workspace-id sets the "
-             "expected anchor workspace).",
+             "state-DB/runtime authorities; fail-closed + never-clobber). Measures at action-time: "
+             "unverified authorities fail-closed, never assumed safe. --workspace-id (expected "
+             "anchor workspace) and --anchor-readable (you verified the exact gate journal reads) "
+             "assert what you measured; unset = unverified = fail-closed.",
     )
-    p.add_argument("--workspace-id", dest="workspace_id", help="Expected anchor workspace id for --recovery-plan.")
+    p.add_argument("--workspace-id", dest="workspace_id", help="Expected anchor workspace id for --recovery-plan (unset = unverified).")
+    p.add_argument(
+        "--anchor-readable", dest="anchor_readable", action="store_true",
+        help="Assert the exact Redmine gate journal was verified readable (--recovery-plan; unset = unverified = fail-closed).",
+    )
     p.add_argument("--issue", help="Issue id for --emit-gate.")
     p.add_argument("--gate", help="Callback-required gate kind for --emit-gate (implementation_done | review_request | review_result | owner_close_approval_waiting | blocked).")
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
