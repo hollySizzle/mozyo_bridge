@@ -242,6 +242,22 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-herdr-default-lane-workflow-role-authority
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
+    purpose: "純 herdr default-lane pair が grandparent_coordinator と project_gateway を step 時点で区別する durable workflow-role authority を持たず workflow step が ambiguous_default_coordinator_role で fail-closed する問題 (Redmine #13583 / #13581 j#75707) を解く contract。provider / pane / default placement を role authority へ昇格せず、repo-local static artifact `.mozyo-bridge/workflow-role-bindings.json` (workspace_id / liveness / delivery / approval を保存しない topology 宣言) の schema/version/closed role/source_pointer、versioned な project_scope->lane_id 導出、provider_binding からの expected provider 照合、missing/ambiguous/invalid/provider_mismatch の fail-closed resolution matrix、resolution-only の Increment 1 と Herdr-native 一段 forward SEND の Increment 3 境界を定義する。role token 正本は transition_role。"
+    audit_role: herdr_default_lane_workflow_role_authority_spec
+    related_document_refs:
+      - spec-herdr-native-identity
+      - logic-workflow-step-command-design
+      - logic-ticketless-project-gateway-runtime-ux
+      - logic-managed-state-model
+      - logic-workspace-registry
+      - logic-project-scoped-workspace-identity
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: spec-conversational-onboarding-tool-contract
     type: spec
     status: active
@@ -1464,6 +1480,28 @@ file_conventions:
       - logic-managed-state-model
       - logic-unit-target-model
       - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-herdr-workflow-role-authority
+    name: herdr default-lane durable workflow-role authority source
+    patterns:
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
+      - .mozyo-bridge/workflow-role-bindings.json
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
+    severity: block
+    document_refs:
+      - spec-herdr-default-lane-workflow-role-authority
+      - logic-workflow-step-command-design
+      - logic-ticketless-project-gateway-runtime-ux
+      - spec-herdr-native-identity
+      - logic-managed-state-model
       - rule-project-agent-workflow
       - skill-workflow-reference
 

@@ -441,6 +441,61 @@ def _resolve_lane_dispatch_decision(
     )
 
 
+def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
+    """The durable workflow-role resolution for the current lane (Redmine #13583).
+
+    Reads the repo-local static binding declaration
+    (``.mozyo-bridge/workflow-role-bindings.json``) and cross-checks the current lane's provider
+    against the provider ``provider_binding`` expects for the bound role, then delegates to the
+    pure :func:`resolve_role_for_lane`. The current workspace is already attested upstream (the
+    sender-identity gate fails closed on an unattested identity), so the file — which stores no
+    ``workspace_id`` literal — is trusted as this attested workspace's topology.
+
+    Returns a :class:`WorkflowRoleResolution`: ``resolved`` (grandparent / project gateway),
+    ``blocked`` (malformed / ambiguous / provider mismatch — fail closed), or ``missing`` (no
+    binding for this lane -> the caller keeps the existing herdr classification). The
+    ``provider_binding`` load degrades to the compatibility default on a broken config rather
+    than crashing the step (a broken config is surfaced by the workflow-runtime surfaces).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+        load_workflow_binding,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_role_authority_source import (
+        load_parsed_role_bindings,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+        ROLE_PROJECT_GATEWAY as BINDING_PROJECT_GATEWAY,
+        ROLE_ROOT_COORDINATOR as BINDING_ROOT_COORDINATOR,
+        RoleProviderBinding,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+        resolve_role_for_lane,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        ROLE_GRANDPARENT_COORDINATOR,
+    )
+
+    parsed = load_parsed_role_bindings(repo_root)
+    try:
+        binding, _warnings = load_workflow_binding(repo_root)
+    except Exception:  # noqa: BLE001 - a broken config degrades to the compat default here
+        binding = RoleProviderBinding.default()
+
+    def _expected(role: str):
+        # The authority's canonical grandparent_coordinator maps to provider_binding's compat
+        # ``root_coordinator`` role for the expected-provider lookup (both default to codex).
+        key = (
+            BINDING_ROOT_COORDINATOR
+            if role == ROLE_GRANDPARENT_COORDINATOR
+            else BINDING_PROJECT_GATEWAY
+        )
+        return binding.provider_for(key)
+
+    return resolve_role_for_lane(
+        parsed, lane_id=sender.lane_id, provider=sender.role, expected_provider=_expected
+    )
+
+
 def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
     """Resolve the herdr-native ``workflow step`` outcome for the current lane (Redmine #13489).
 
@@ -449,6 +504,11 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
     anchor (worker / gateway), and — for a sublane gateway lane — reads the live inventory for
     its same-lane worker cardinality, then delegates to the pure resolver. Never mutates a lane
     or delivers anything (increment 1 is resolution-only).
+
+    A durable workflow-role authority (Redmine #13583) is resolved first: a **resolved** default
+    lane (grandparent / project gateway) or a **blocked** authority short-circuits here without
+    any anchor / inventory read (a coordinator lane is not the worker/gateway anchor gate); a
+    **missing** binding falls through to the existing worker / gateway flow unchanged.
     """
     from mozyo_bridge.application.commands_common import repo_root_from_args
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
@@ -487,6 +547,14 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
         repo_root=str(repo_root),
     )
 
+    # Durable workflow-role authority (Redmine #13583) takes precedence over the
+    # provider/placement classification, which cannot tell a grandparent from a project gateway.
+    # A resolved / blocked authority resolves or fails closed here with NO anchor / inventory
+    # read; a missing binding threads through and falls back to the existing classification.
+    role_authority = _resolve_role_authority(args, repo_root, sender)
+    if role_authority is not None and (role_authority.resolved or role_authority.blocked):
+        return resolve_herdr_workflow_step(lane, role_authority=role_authority)
+
     # A worker / gateway lane is anchor-gated (j#74748 F3); default-lane / unknown provider
     # fails closed in the pure resolver without any store / inventory read.
     anchor_status: Optional[str] = None
@@ -514,6 +582,7 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
 
     return resolve_herdr_workflow_step(
         lane,
+        role_authority=role_authority,
         worker_liveness=worker_liveness,
         anchor_status=anchor_status,
         anchor_pointer=anchor_pointer,

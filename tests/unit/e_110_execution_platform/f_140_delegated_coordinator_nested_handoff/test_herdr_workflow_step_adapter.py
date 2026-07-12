@@ -11,7 +11,9 @@ cardinality (F2/D), and no longer consults registry project_name (F1).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -575,6 +577,95 @@ class StoreLaneAnchorTest(unittest.TestCase):
             )
         )
         self.assertEqual(anchor, ("13489", "200", "review"))
+
+
+class RoleAuthorityAdapterTest(unittest.TestCase):
+    """End-to-end: a repo-local binding file resolves the default lane's role (Redmine #13583)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        from mozyo_bridge.application import commands_common
+
+        patches = [
+            patch.object(commands_common, "repo_root_from_args", return_value=self.repo),
+            patch.object(adapter, "_anchor_workspace_id", return_value=WS),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _write_bindings(self, *bindings):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            SCHEMA_NAME,
+            SCHEMA_VERSION,
+        )
+
+        path = self.repo / ".mozyo-bridge" / "workflow-role-bindings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"schema": SCHEMA_NAME, "version": SCHEMA_VERSION, "bindings": list(bindings)}),
+            encoding="utf-8",
+        )
+
+    def _run(self):
+        return adapter.resolve_herdr_step_outcome(argparse.Namespace(repo=None))
+
+    def test_default_lane_with_grandparent_binding_resolves_without_anchor_read(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+            ROLE_GRANDPARENT_COORDINATOR,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
+            REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
+        )
+
+        self._write_bindings({"role": "grandparent_coordinator", "source_pointer": "redmine:#13583"})
+        with patch.object(
+            htr, "resolve_sender_identity", return_value=_sender_ok("codex", "default")
+        ), patch.object(
+            adapter, "_resolve_lane_anchor", side_effect=AssertionError("anchor read for grandparent")
+        ), patch.object(
+            adapter, "_same_lane_worker_liveness", side_effect=AssertionError("inventory read")
+        ):
+            out = self._run()
+        self.assertEqual(out.reason, REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING)
+        self.assertEqual(out.caller_role, ROLE_GRANDPARENT_COORDINATOR)
+        self.assertEqual(out.primitive, "none")
+
+    def test_default_lane_provider_mismatch_fails_closed(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            REASON_ROLE_PROVIDER_MISMATCH,
+        )
+
+        # The default lane is bound to the grandparent (expected provider codex) but the sender
+        # runs claude -> provider mismatch, fail closed rather than resolve on the wrong surface.
+        self._write_bindings({"role": "grandparent_coordinator"})
+        with patch.object(
+            htr, "resolve_sender_identity", return_value=_sender_ok("claude", "default")
+        ):
+            out = self._run()
+        self.assertEqual(out.reason, REASON_ROLE_PROVIDER_MISMATCH)
+        self.assertEqual(out.execution, "blocked")
+
+    def test_no_bindings_file_keeps_default_lane_ambiguous(self):
+        # Byte-invariant: with no declaration the default lane still fails closed as before.
+        with patch.object(
+            htr, "resolve_sender_identity", return_value=_sender_ok("codex", "default")
+        ), patch.object(
+            adapter, "_resolve_lane_anchor", side_effect=AssertionError("anchor read")
+        ):
+            out = self._run()
+        self.assertEqual(out.reason, REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED)
+
+    def test_worker_lane_not_in_bindings_falls_through_to_anchor_flow(self):
+        # A binding file present, but a normal worker lane not named in it keeps its anchor flow.
+        self._write_bindings({"role": "grandparent_coordinator"})
+        with patch.object(
+            htr, "resolve_sender_identity", return_value=_sender_ok("claude", "issue_1")
+        ), patch.object(adapter, "_resolve_lane_anchor", return_value=(ANCHOR_VERIFIED, PTR)):
+            out = self._run()
+        self.assertEqual(out.reason, REASON_HERDR_WORKER_STEP_READY)
 
 
 if __name__ == "__main__":  # pragma: no cover

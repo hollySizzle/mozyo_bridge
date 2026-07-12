@@ -56,10 +56,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED as DISPATCH_BLOCKED,
     DispatchDecision,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    ROLE_GRANDPARENT_COORDINATOR,
+    ROLE_PROJECT_GATEWAY,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+    REASON_ROLE_BINDING_AMBIGUOUS,
+    REASON_ROLE_BINDING_INVALID,
+    REASON_ROLE_PROVIDER_MISMATCH,
+    WorkflowRoleResolution,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
     EXECUTION_NO_OP,
     EXECUTION_READY,
+    OWNER_CALLER,
     OWNER_CHILD,
     OWNER_GRANDCHILD,
     OWNER_OPERATOR,
@@ -67,7 +78,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PRIMITIVE_NONE,
     STATE_CHILD_WORKER_DISPATCH,
     STATE_GRANDCHILD_REDMINE_WORK,
+    STATE_GRANDPARENT_CONSULTATION,
     STATE_LANE_UNRESOLVED,
+    STATE_PARENT_WORK_INTAKE,
     WorkflowLane,
     WorkflowStepOutcome,
 )
@@ -138,6 +151,10 @@ REASON_HERDR_ANCHOR_UNVERIFIED = "herdr_anchor_unverified"
 REASON_HERDR_ANCHOR_STORE_MISMATCH = "herdr_anchor_store_mismatch"
 #: A default-lane Codex/Claude pair carries no step-time durable role authority (j#74748 F1).
 REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED = "ambiguous_default_coordinator_role"
+#: A durable workflow-role binding (Redmine #13583) resolves this lane to a grandparent /
+#: project gateway, but the herdr-native forward consult / child-intake wiring is a later
+#: increment: the role is resolved (no fail-closed ambiguity), no send is performed here.
+REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING = "herdr_role_resolved_forward_pending"
 #: The current herdr lane's provider is not a known runtime provider (claude / codex).
 REASON_HERDR_LANE_ROLE_UNRESOLVED = "herdr_lane_role_unresolved"
 #: The herdr-native sender identity itself could not be resolved (adapter maps to this).
@@ -157,8 +174,13 @@ HERDR_STEP_REASONS = frozenset(
         REASON_HERDR_ANCHOR_UNVERIFIED,
         REASON_HERDR_ANCHOR_STORE_MISMATCH,
         REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED,
+        REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
         REASON_HERDR_LANE_ROLE_UNRESOLVED,
         REASON_HERDR_SENDER_IDENTITY_UNRESOLVED,
+        # Durable workflow-role authority fail-closed reasons (Redmine #13583).
+        REASON_ROLE_BINDING_INVALID,
+        REASON_ROLE_BINDING_AMBIGUOUS,
+        REASON_ROLE_PROVIDER_MISMATCH,
     }
 )
 
@@ -315,9 +337,96 @@ def _anchor_blocked(
     )
 
 
+def _role_authority_resolved_outcome(
+    lane: WorkflowLane, resolution: WorkflowRoleResolution
+) -> WorkflowStepOutcome:
+    """Resolution-only outcome for a lane the durable role authority resolved (Redmine #13583).
+
+    The default-lane pair no longer fails closed ``ambiguous_default_coordinator_role`` when a
+    durable workflow-role binding resolves it: the role is named (``grandparent_coordinator`` /
+    ``project_gateway``) and the caller is pointed at its one-step-down action. Increment 1 is
+    resolution-only — the herdr-native forward consult / child-intake **send** is a later
+    increment (Design Answer j#75782), so ``primitive=none`` and no delivery is performed here.
+    """
+    if resolution.role == ROLE_GRANDPARENT_COORDINATOR:
+        state = STATE_GRANDPARENT_CONSULTATION
+        next_action = (
+            "durable workflow-role authority resolves this default lane to the department-root "
+            "grandparent_coordinator. Its one-step-down action is a ticketless consultation to "
+            "the project gateway; the herdr-native forward wiring lands in a later increment "
+            "(Redmine #13583). Drive the consult from the durable Redmine record + `workflow "
+            "admission` meanwhile. workflow step performs no send here."
+        )
+    else:  # ROLE_PROJECT_GATEWAY
+        state = STATE_PARENT_WORK_INTAKE
+        next_action = (
+            "durable workflow-role authority resolves this lane to the project_gateway "
+            f"(project_scope={resolution.project_scope!r}). Its one-step-down action is a "
+            "ticketless work-intake to the delegated_coordinator child; the herdr-native forward "
+            "wiring lands in a later increment (Redmine #13583). Drive the intake from the "
+            "durable Redmine record meanwhile. workflow step performs no send here."
+        )
+    return WorkflowStepOutcome(
+        state=state,
+        next_action=next_action,
+        execution=EXECUTION_NO_OP,
+        reason=REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
+        next_owner=OWNER_CALLER,
+        primitive=PRIMITIVE_NONE,
+        caller_role=resolution.role,
+        self_pane=lane.self_pane,
+        repo_root=lane.repo_root,
+        project_scope=resolution.project_scope,
+        durable_anchor="none",
+        detail=resolution.detail,
+    )
+
+
+def _role_authority_blocked_outcome(
+    lane: WorkflowLane, resolution: WorkflowRoleResolution
+) -> WorkflowStepOutcome:
+    """Fail-closed outcome when a present durable role authority cannot be applied (Redmine #13583).
+
+    A malformed declaration, an ambiguous match, or a provider that disagrees with
+    ``provider_binding`` each blocks with the authority's fixed reason rather than routing on an
+    untrusted role. The operator fixes ``.mozyo-bridge/workflow-role-bindings.json`` (or the lane
+    launch provider) and steps again.
+    """
+    next_action = {
+        REASON_ROLE_BINDING_INVALID: (
+            "the durable workflow-role binding declaration is malformed; fix "
+            "`.mozyo-bridge/workflow-role-bindings.json` (schema / version / role / scope / "
+            "slot) before stepping. workflow step will not route on an untrusted authority"
+        ),
+        REASON_ROLE_BINDING_AMBIGUOUS: (
+            "more than one workflow-role binding matches this lane; disambiguate the "
+            "declaration before stepping — workflow step will not guess the role"
+        ),
+        REASON_ROLE_PROVIDER_MISMATCH: (
+            "this lane's runtime provider does not match the provider_binding expected for its "
+            "bound workflow role; fix the launch provider or the binding before stepping"
+        ),
+    }.get(resolution.reason, "the durable workflow-role authority could not be applied to this lane")
+    return WorkflowStepOutcome(
+        state=STATE_LANE_UNRESOLVED,
+        next_action=next_action + " (" + resolution.detail + ")",
+        execution=EXECUTION_BLOCKED,
+        reason=resolution.reason,
+        next_owner=OWNER_OPERATOR,
+        primitive=PRIMITIVE_NONE,
+        caller_role=resolution.role or (lane.caller_role or ""),
+        self_pane=lane.self_pane,
+        repo_root=lane.repo_root,
+        project_scope=resolution.project_scope,
+        durable_anchor="none",
+        detail=resolution.detail,
+    )
+
+
 def resolve_herdr_workflow_step(
     lane: WorkflowLane,
     *,
+    role_authority: Optional[WorkflowRoleResolution] = None,
     worker_liveness: Optional[str] = None,
     anchor_status: Optional[str] = None,
     anchor_pointer: str = "",
@@ -328,6 +437,15 @@ def resolve_herdr_workflow_step(
     Increment 1 (Redmine #13489 j#74685 design_boundary): resolution-only — it names the
     role-appropriate next action / owner / herdr surface and performs no sublane mutation and
     no delivery (``primitive=none`` throughout).
+
+    A ``role_authority`` (Redmine #13583) is the durable workflow-role binding resolution the
+    application layer resolved out of band. When present it takes precedence over the
+    provider/placement classification (which cannot tell a grandparent from a project gateway):
+    a **resolved** authority names the grandparent / project-gateway role (:func:`_role_authority_resolved_outcome`);
+    a **blocked** authority (malformed / ambiguous / provider mismatch) fails closed with its
+    fixed reason (:func:`_role_authority_blocked_outcome`); a **missing** authority (no binding
+    for this lane, or ``None``) falls through to the existing classification so a normal
+    non-default issue lane and an unbound default lane are byte-invariant.
 
     - unclassifiable lane (default-lane pair / unknown provider) -> ``blocked``
       (:data:`REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED` / :data:`REASON_HERDR_LANE_ROLE_UNRESOLVED`).
@@ -341,6 +459,13 @@ def resolve_herdr_workflow_step(
       ``herdr_worker_slot_missing``, :data:`WORKER_AMBIGUOUS` -> ``herdr_worker_ambiguous``,
       :data:`WORKER_LOCATOR_MISSING` -> ``herdr_worker_locator_missing``).
     """
+    if role_authority is not None:
+        if role_authority.blocked:
+            return _role_authority_blocked_outcome(lane, role_authority)
+        if role_authority.resolved:
+            return _role_authority_resolved_outcome(lane, role_authority)
+        # A missing binding for this lane falls through to the existing classification.
+
     if lane.caller_role is None or not lane.provider_safe:
         return _blocked_lane_outcome(lane)
 
@@ -497,6 +622,7 @@ __all__ = (
     "REASON_HERDR_ANCHOR_UNVERIFIED",
     "REASON_HERDR_ANCHOR_STORE_MISMATCH",
     "REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED",
+    "REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING",
     "REASON_HERDR_LANE_ROLE_UNRESOLVED",
     "REASON_HERDR_SENDER_IDENTITY_UNRESOLVED",
     "HERDR_STEP_REASONS",
