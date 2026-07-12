@@ -1,23 +1,29 @@
 """Regression: compute_testpypi_dev_version --write must not leave a partial
-mirror on a write-time I/O failure (Redmine #13586, finding R5).
+mirror on a write-time I/O failure (Redmine #13586, findings R5 and R6).
 
 The two mirror files (pyproject.toml + src/mozyo_bridge/__init__.py) are
-rewritten to the same dev version. Before the fix, the writes were applied
-sequentially with no rollback: if the SECOND file could not be written (e.g.
-read-only or full disk), the FIRST file was already rewritten and left the
-checkout half-updated, contradicting the Start-Gate postcondition "a failure
-never leaves the mirror set partially updated" (j#75722).
+rewritten to the same dev version. Two failure modes are pinned:
 
-This pins the rollback behaviour by making the second mirror file read-only and
-asserting the command returns non-zero AND both files are byte-unchanged.
+- R5: the SECOND file cannot be written at all (open fails, e.g. read-only), so
+  the FIRST must be rolled back. Reproduced by making the file read-only.
+- R6: the SECOND file's write fails AFTER truncating / partially writing it
+  (e.g. a full disk), so the current file itself — not just files written
+  before it — must be rolled back. Reproduced by patching write_text to write
+  partial bytes and then raise.
+
+Both assert the command returns non-zero AND both files are byte-identical to
+their pre-write contents, honouring the Start-Gate postcondition "a failure
+never leaves the mirror set partially updated" (j#75722).
 """
 
 import importlib.util
 import os
+import pathlib
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = ROOT / "scripts" / "compute_testpypi_dev_version.py"
@@ -86,6 +92,44 @@ class ComputePartialWriteRegressionTest(unittest.TestCase):
                 "pyproject.toml was left rewritten after a mid-write failure",
             )
             self.assertEqual(before_mod, module.read_text(encoding="utf-8"))
+
+    def test_second_mirror_partial_write_then_raise_rolls_back(self) -> None:
+        # R6: the write of the second mirror file truncates / partially writes
+        # it and THEN raises (e.g. a full disk). The current file — not just the
+        # files written before it — must be restored. This case is not covered
+        # by the read-only reproduction, where the write fails at open before
+        # any truncation.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pyproject = _build_repo(root)
+            module = root / "src" / "mozyo_bridge" / "__init__.py"
+            before_py = pyproject.read_bytes()
+            before_mod = module.read_bytes()
+
+            real_write_text = pathlib.Path.write_text
+
+            def flaky_write_text(self, data, *args, **kwargs):  # noqa: ANN001
+                if self.name == "__init__.py":
+                    # Truncate + partially write, then fail — the classic
+                    # full-disk shape that leaves the file corrupted on disk.
+                    self.write_bytes(b'__version__ = "0.10')
+                    raise OSError("simulated disk full")
+                return real_write_text(self, data, *args, **kwargs)
+
+            with mock.patch.object(pathlib.Path, "write_text", flaky_write_text):
+                rc = mod.main(
+                    ["--pyproject", str(pyproject), "--dev-number", "777", "--write"]
+                )
+
+            self.assertEqual(1, rc)
+            # Both files must be byte-identical to their originals: the current
+            # (partially-written) file was rolled back, not left truncated.
+            self.assertEqual(
+                before_mod,
+                module.read_bytes(),
+                "__init__.py was left partially written after a mid-write failure",
+            )
+            self.assertEqual(before_py, pyproject.read_bytes())
 
 
 if __name__ == "__main__":

@@ -175,25 +175,45 @@ def main(argv: list[str]) -> int:
                 rewrites.append(
                     (path, text, version_mirror.replace_version(text, handler, new_version))
                 )
-            # Write phase with rollback: a write-time I/O failure on a later
-            # mirror file (e.g. a read-only or full disk) must not leave the
-            # set half-rewritten. Restore every already-written file to its
-            # original bytes before propagating the error, so the postcondition
-            # "a failure never leaves the mirror set partially updated" holds
-            # for I/O failures too, not just validation failures.
-            written: list[tuple[Path, str]] = []  # (path, original_text)
+            # Write phase with rollback: a write-time I/O failure on a mirror
+            # file (e.g. a read-only file, or a full disk that truncates then
+            # fails mid-write) must not leave the set half-rewritten. Each
+            # target is registered BEFORE its write, so the file that raised —
+            # which may already have been truncated / partially written — is
+            # itself a rollback candidate, not just the files written before
+            # it. This holds the postcondition "a failure never leaves the
+            # mirror set partially updated" for I/O failures too, not just
+            # validation failures.
+            attempted: list[tuple[Path, bytes]] = []  # (path, original_bytes)
             try:
                 for path, original_text, new_text in rewrites:
+                    attempted.append((path, original_text.encode("utf-8")))
                     path.write_text(new_text, encoding="utf-8")
-                    written.append((path, original_text))
             except OSError:
-                for done_path, original_text in reversed(written):
+                rollback_failures: list[tuple[Path, OSError]] = []
+                for done_path, original_bytes in reversed(attempted):
                     try:
-                        done_path.write_text(original_text, encoding="utf-8")
+                        # Skip files still byte-identical to their original
+                        # (e.g. a write that failed at open, before truncation),
+                        # so an un-writable but untouched file is not reported as
+                        # a spurious rollback failure.
+                        if done_path.read_bytes() == original_bytes:
+                            continue
                     except OSError:
-                        # Best-effort rollback; the original error is the one
-                        # that matters and is re-raised below.
-                        pass
+                        pass  # cannot read; fall through and attempt to restore
+                    try:
+                        done_path.write_bytes(original_bytes)
+                    except OSError as rollback_exc:
+                        rollback_failures.append((done_path, rollback_exc))
+                # Never treat a failed rollback as a silent success: surface it
+                # so a genuinely partial mirror is visible, not masked by the
+                # non-zero exit alone.
+                for failed_path, rollback_exc in rollback_failures:
+                    print(
+                        f"error: failed to roll back {failed_path} to its "
+                        f"pre-write version after a write error: {rollback_exc}",
+                        file=sys.stderr,
+                    )
                 raise
     except (DevVersionError, version_mirror.MirrorError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
