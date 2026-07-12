@@ -135,6 +135,64 @@ def _watch_sender_attested(args: argparse.Namespace) -> bool:
     return bool(_resolve_workspace_id(args)) and bool((os.environ.get("MOZYO_AGENT_ROLE") or "").strip())
 
 
+def _review_approval_refusal(args: argparse.Namespace, issue: str, gate: str):
+    """Return a fail-closed refusal reason for a review_result APPROVAL write, or ``None`` to allow.
+
+    #13518 review R3-F2: when the coordinator supplies a durable review observation
+    (``--review-generation-json``) and a ``--consumer-id`` for a ``review_result`` gate, the
+    approval write is fenced through :func:`...review_admission.admit_review_approval` — a durable
+    single-consumer generation lease + the pre-approval reread fence. A refusal (a duplicate
+    consumer, or a stale approval predating a newer unresolved blocking finding) returns its reason
+    so the caller fails closed (nothing written). When no observation is supplied, or the gate is not
+    a review_result, the write is unfenced here (``None``) — back-compat for non-approval gates.
+    """
+    if gate != "review_result":
+        return None
+    path = (getattr(args, "review_generation_json", None) or "").strip()
+    consumer = (getattr(args, "consumer_id", None) or "").strip()
+    if not path or not consumer:
+        return None
+    try:
+        import json
+
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.review_admission import (  # noqa: E501
+            GenerationLeaseStore,
+            admit_review_approval,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (  # noqa: E501
+            ReviewDecision,
+            ReviewGeneration,
+        )
+
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        gen = ReviewGeneration(
+            issue=str(raw.get("issue", issue)),
+            review_request_journal=str(raw.get("review_request_journal", "")),
+            target_head=str(raw.get("target_head", "")),
+        )
+        decisions = [
+            ReviewDecision(
+                generation=gen,
+                kind=str(d.get("kind", "")),
+                seq=int(d.get("seq", 0)),
+                blocking=bool(d.get("blocking", False)),
+                disposition=str(d.get("disposition", "unresolved")),
+                journal_id=str(d.get("journal_id", "")),
+            )
+            for d in (raw.get("decisions") or [])
+        ]
+        source_request_seq = int(raw.get("source_request_seq", 0))
+        lease = GenerationLeaseStore(store=WorkflowRuntimeStore(path=_outbox_store_path(args)))
+        result = admit_review_approval(
+            lease=lease, generation=gen, consumer_id=consumer,
+            source_request_seq=source_request_seq, decisions=decisions,
+        )
+        return None if result.admissible else result.reason
+    except Exception:  # noqa: BLE001 - an unreadable / malformed durable observation fails closed
+        return "review_generation_observation_unreadable"
+
+
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
     """Build the live poll source from daemon-trusted credentials (patchable test seam)."""
     since = (getattr(args, "since", None) or "").strip() or None
@@ -375,6 +433,20 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         gate = (getattr(args, "gate", None) or "").strip()
         if not issue or not gate:
             raise SystemExit("--emit-gate requires --issue and --gate")
+        # #13518 review R3-F2: a review_result APPROVAL write is fenced BEFORE it is recorded when a
+        # durable review observation (--review-generation-json) + a --consumer-id are supplied. The
+        # durable single-consumer generation lease + the pre-approval reread fence refuse a duplicate
+        # consumer or a stale approval (a snapshot predating a newer unresolved blocking finding —
+        # the #13586 case). Refusal fails closed: nothing is written, exit non-zero.
+        refusal = _review_approval_refusal(args, issue, gate)
+        if refusal is not None:
+            payload = {"action": "emit-gate", "issue": issue, "gate": gate,
+                       "recorded": False, "reason": refusal}
+            _emit(payload, as_json=as_json, text_lines=[
+                "action: emit-gate", f"issue: #{issue}", f"gate: {gate}",
+                "recorded: False", f"reason: {refusal}",
+            ])
+            return 1
         # Credential-gated, opt-in production writer (MOZYO_REDMINE_DELIVERY_WRITE). None ->
         # write_optin_unset (nothing written, fail-closed — never a silent success).
         transport = redmine_delivery_transport_from_env()
@@ -600,6 +672,17 @@ def register_callbacks(sub) -> None:
     )
     p.add_argument("--issue", help="Issue id for --emit-gate.")
     p.add_argument("--gate", help="Callback-required gate kind for --emit-gate (implementation_done | review_request | review_result | owner_close_approval_waiting | blocked).")
+    p.add_argument(
+        "--review-generation-json", dest="review_generation_json",
+        help="#13518 R3-F2: durable review observation {issue, review_request_journal, target_head, "
+             "source_request_seq, decisions:[...]} used to FENCE a --emit-gate --gate review_result "
+             "approval (durable generation lease + pre-approval reread fence; refusal fails closed).",
+    )
+    p.add_argument(
+        "--consumer-id", dest="consumer_id",
+        help="#13518 R3-F2: the approving consumer id for the review_result generation lease "
+             "(a duplicate consumer of the same generation is refused).",
+    )
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
     p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")
     p.add_argument(

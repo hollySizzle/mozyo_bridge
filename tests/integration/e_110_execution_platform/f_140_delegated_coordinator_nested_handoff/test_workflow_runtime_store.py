@@ -132,5 +132,34 @@ class AbsentAndVersionTest(_StoreTestCase):
             self.store.append_events([{"event_id": "e2", "issue": "12671", "gate": "start"}])
 
 
+class GenerationLeaseTest(_StoreTestCase):
+    """#13518 review R3-F2: durable single-consumer review-generation lease (CAS)."""
+
+    def test_acquire_is_cas_single_consumer(self):
+        key = "13586:75719:deadbeef"
+        self.assertTrue(self.store.acquire_generation_lease(key, "A"))
+        self.assertTrue(self.store.acquire_generation_lease(key, "A"))  # idempotent for same holder
+        self.assertFalse(self.store.acquire_generation_lease(key, "B"))  # different holder refused
+        self.assertEqual(self.store.generation_lease_holder(key), "A")
+
+    def test_blank_holder_never_acquires(self):
+        self.assertFalse(self.store.acquire_generation_lease("k", ""))
+        self.assertIsNone(self.store.generation_lease_holder("k"))
+
+    def test_lease_is_durable_across_instances(self):
+        key = "13586:75719:deadbeef"
+        self.assertTrue(self.store.acquire_generation_lease(key, "A"))
+        reopened = WorkflowRuntimeStore(path=self.path)
+        self.assertEqual(reopened.generation_lease_holder(key), "A")
+        self.assertFalse(reopened.acquire_generation_lease(key, "B"))
+
+    def test_lease_rows_excluded_from_advisory_meta(self):
+        self.store.acquire_generation_lease("13586:75719:deadbeef", "A")
+        self.store.set_meta({"ready_independent": "true"})
+        meta = self.store.read_meta()
+        self.assertIn("ready_independent", meta)
+        self.assertFalse(any(k.startswith("genlease:") for k in meta))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

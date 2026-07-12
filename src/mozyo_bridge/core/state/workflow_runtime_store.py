@@ -698,8 +698,66 @@ class WorkflowRuntimeStore:
         finally:
             conn.close()
 
+    #: Reserved ``workflow_runtime_meta`` key prefix for durable review-generation leases (#13518
+    #: review R3-F2). Kept out of the advisory meta vocabulary so the review-generation lease and
+    #: the runtime scalars never collide.
+    _GENERATION_LEASE_PREFIX = "genlease:"
+
+    def acquire_generation_lease(self, key: str, holder: str, *, now: Optional[str] = None) -> bool:
+        """Atomically CAS-acquire a durable single-consumer review-generation lease (#13518 R3-F2).
+
+        ``BEGIN IMMEDIATE`` serializes concurrent acquirers over the shared
+        ``workflow-runtime.sqlite``: the lease under ``key`` is granted iff it is unheld OR already
+        held by the same ``holder`` (idempotent re-acquire); a DIFFERENT holder is refused. This is
+        the durable review-decision-commit fence — at most one consumer ever commits a given review
+        generation's approval — complementing the callback-transport outbox fence. Returns True iff
+        this ``holder`` now holds the lease.
+        """
+        h = str(holder or "").strip()
+        if not h:
+            return False
+        self.ensure_schema()
+        stamp = now or _utc_now()
+        row_key = f"{self._GENERATION_LEASE_PREFIX}{key}"
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 2000")
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "SELECT value FROM workflow_runtime_meta WHERE key=?", (row_key,)
+            ).fetchone()
+            if cur is None:
+                conn.execute(
+                    "INSERT INTO workflow_runtime_meta (key, value, updated_at) VALUES (?, ?, ?)",
+                    (row_key, h, stamp),
+                )
+                conn.execute("COMMIT")
+                return True
+            conn.execute("ROLLBACK")
+            return str(cur[0]) == h
+        finally:
+            conn.close()
+
+    def generation_lease_holder(self, key: str) -> Optional[str]:
+        """Return the current durable review-generation lease holder for ``key`` (or ``None``)."""
+        row_key = f"{self._GENERATION_LEASE_PREFIX}{key}"
+        conn = self._connect_ro()
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT value FROM workflow_runtime_meta WHERE key=?", (row_key,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return str(row[0]) if row is not None else None
+
     def read_meta(self) -> dict[str, str]:
-        """Return the persisted advisory meta as ``{key: value}``; empty if absent."""
+        """Return the persisted advisory meta as ``{key: value}``; empty if absent.
+
+        The reserved review-generation lease rows (``genlease:`` prefix, #13518 R3-F2) are excluded
+        so they never leak into the advisory runtime meta vocabulary.
+        """
         conn = self._connect_ro()
         if conn is None:
             return {}
@@ -709,7 +767,9 @@ class WorkflowRuntimeStore:
             ).fetchall()
         finally:
             conn.close()
-        return {r[0]: r[1] for r in rows}
+        return {
+            r[0]: r[1] for r in rows if not str(r[0]).startswith(self._GENERATION_LEASE_PREFIX)
+        }
 
     def ensure_schema(self) -> None:
         """Create / migrate the container to the current schema version (idempotent).

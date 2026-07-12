@@ -34,6 +34,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
     SEND_DELIVERED,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.review_admission import (  # noqa: E501
+    REASON_LEASE_HELD_BY_OTHER as REASON_LEASE_HELD_BY_OTHER_REASON,
+)
 
 _SNAPSHOT = {
     "issue": {
@@ -556,6 +559,73 @@ class PartitionRequirementTest(_CliTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sends, [])  # the foreign row is not claimed by ws_mine
         self.assertEqual([r.workspace_id for r in self.outbox.read(states=[CALLBACK_PENDING])], ["ws_foreign"])
+
+
+class EmitGateReviewApprovalFenceTest(_CliTestCase):
+    """#13518 review R3-F2: --emit-gate --gate review_result APPROVAL is fenced through the durable
+    generation lease + pre-approval reread fence BEFORE it is written; a refusal fails closed."""
+
+    def _obs(self, decisions, source_request_seq=10, **top):
+        base = {
+            "issue": "13586", "review_request_journal": "75719", "target_head": "deadbeef",
+            "source_request_seq": source_request_seq, "decisions": decisions,
+        }
+        base.update(top)
+        p = Path(self._tmp.name) / "reviewgen.json"
+        p.write_text(_json.dumps(base), encoding="utf-8")
+        return str(p)
+
+    def _emit_args(self, **over):
+        base = dict(
+            emit_gate=True, json=True, issue="13586", gate="review_result", body="",
+            store_path=str(self.store_path),
+            review_generation_json=None, consumer_id=None,
+        )
+        base.update(over)
+        return _args(**base)
+
+    def _run_json(self, ns):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_workflow_callbacks(ns)
+        return rc, _json.loads(buf.getvalue())
+
+    def test_stale_approval_predating_newer_blocking_finding_is_refused(self):
+        obs = self._obs([
+            {"kind": "approval", "seq": 11},
+            {"kind": "finding", "seq": 12, "blocking": True, "disposition": "unresolved"},
+        ], source_request_seq=10)
+        rc, out = self._run_json(self._emit_args(review_generation_json=obs, consumer_id="reviewer-B"))
+        self.assertEqual(rc, 1)  # fail-closed, nothing written
+        self.assertFalse(out["recorded"])
+        self.assertEqual(out["reason"], "newer_unresolved_blocking_finding")
+
+    def test_duplicate_consumer_is_refused(self):
+        obs = self._obs([{"kind": "approval", "seq": 11}], source_request_seq=10)
+        # First consumer takes the durable lease (clean generation -> would be admissible; the write
+        # itself needs the opt-in transport, absent here, but the fence has already granted).
+        first = self._run_json(self._emit_args(review_generation_json=obs, consumer_id="reviewer-A"))
+        self.assertNotEqual(first[1].get("reason"), REASON_LEASE_HELD_BY_OTHER_REASON)
+        # A DIFFERENT consumer on the same generation is refused by the durable lease.
+        rc, out = self._run_json(self._emit_args(review_generation_json=obs, consumer_id="reviewer-B"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["reason"], REASON_LEASE_HELD_BY_OTHER_REASON)
+
+    def test_unfenced_when_no_observation_supplied(self):
+        # Back-compat: without a review observation the emit-gate path is not fenced here (the write
+        # still fails closed on the opt-in transport being unset, but not on the generation fence).
+        rc, out = self._run_json(self._emit_args())
+        self.assertNotIn(out.get("reason"), (REASON_LEASE_HELD_BY_OTHER_REASON,
+                                             "newer_unresolved_blocking_finding"))
+
+    def test_non_review_result_gate_is_not_fenced(self):
+        obs = self._obs([{"kind": "approval", "seq": 11}])
+        rc, out = self._run_json(self._emit_args(gate="implementation_done",
+                                                 review_generation_json=obs, consumer_id="X"))
+        self.assertNotEqual(out.get("reason"), REASON_LEASE_HELD_BY_OTHER_REASON)
 
 
 class ParseCandidateTest(unittest.TestCase):
