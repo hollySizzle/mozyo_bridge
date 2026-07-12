@@ -75,11 +75,16 @@ scope / source_pointer は key present なら string（explicit `null` は空 sc
   設計上同一 lane）、scheme tag（`pgwv1`）+ **budget 内に bound した** readable slug + canonicalized
   scope の短い digest で構成する。保証は (a) 決定論的、(b) machine 間で安定、(c) project-scope lane
   uniqueness は **48-bit collision-resistant digest** が担い、相異 scope の衝突は天文学的に稀だが
-  provably impossible ではない。実衝突は同一宣言内であれば parse 時 slot-collision で fail-closed
-  される（misroute ではなく rare availability risk）。slug は digest と独立なので切詰めは衝突挙動を
-  変えない、(d) `pgwv1_` prefix により `default` へ decay しない（構造保証）、(e) mzb1 assigned-name
-  （`NAME_MAX_LENGTH=128`、非 `[A-Za-z0-9]` は 3 char escape）へ実 ws + provider と合成しても収まる。
-  empty scope は fail-closed。provable injectivity を要求する場合は別 Design Consultation とする。
+  provably impossible ではない。**同一 declaration 内**に衝突する 2 binding が居る場合は parse 時
+  slot-collision で fail-closed される（availability failure であり misroute ではない）。ただし
+  `resolve_role_for_lane` は current declaration の derived `lane_id` 一致のみで照合するため、
+  **cross-revision alias**（revision A が scope X で lane を mint → 物理 lane 存続 → revision B が別
+  scope Y かつ digest 衝突で同一 lane id を宣言）は parse collision が発火せず、既存 lane が Y として
+  解釈され得る。これは 48-bit residual risk として残り、本 contract は **never-misroute を保証しない**。
+  slug は digest と独立なので切詰めは衝突挙動を変えない、(d) `pgwv1_` prefix により `default` へ decay
+  しない（構造保証）、(e) mzb1 assigned-name（`NAME_MAX_LENGTH=128`、非 `[A-Za-z0-9]` は 3 char escape）
+  へ実 ws + provider と合成しても収まる。empty scope は fail-closed。provable never-misroute / injectivity
+  （full-scope identity / migration fence）を要求する場合は別 Design Consultation とする。
 - project_gateway と root grandparent は同一 slot を奪い合わない: grandparent は default、gateway は
   derived lane。同一 lane_id を導く 2 binding は slot collision として fail-closed。
 
