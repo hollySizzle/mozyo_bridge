@@ -70,9 +70,11 @@ _EXIT_GATE_BLOCKED = 3
 _ROOT_PARENT_TOKENS = frozenset({"", "-", "none", "root"})
 
 #: The canonical tmux pane id shape a ``--lane`` ``pane=`` value must match
-#: (``%<digits>``, e.g. ``%3``). The plan feeds the value straight to
-#: ``set-option -p -t <pane>`` (Redmine #13571 j#75577 R10-F2).
-_PANE_ID_RE = re.compile(r"%\d+")
+#: (``%<ascii-digits>``, e.g. ``%3``). ``[0-9]`` (never ``\d``, which also matches
+#: Unicode decimal digits) so a look-alike pane like ``%１２３`` cannot become a
+#: tmux target. The plan feeds the value straight to ``set-option -p -t <pane>``
+#: (Redmine #13571 j#75577 R10-F2 / j#75589 R11-F2).
+_PANE_ID_RE = re.compile(r"%[0-9]+")
 
 
 def _canonical_repo_identity(path: Optional[str]) -> Optional[str]:
@@ -120,7 +122,11 @@ def _parse_lane_spec(raw: str) -> DeclaredLane:
     parent: Optional[str] = None
     panes: list[str] = []
     for token in raw.split(","):
-        token = token.strip()
+        # Only ASCII spaces are treated as readable DSL delimiter padding; tab /
+        # newline / Unicode whitespace / control are NOT stripped, so they reach
+        # the identity validator and fail closed instead of being silently
+        # normalized away (Redmine #13571 j#75589 R11-F1/R11-F2).
+        token = token.strip(" ")
         if not token:
             continue
         if "=" not in token:
@@ -129,7 +135,7 @@ def _parse_lane_spec(raw: str) -> DeclaredLane:
                 "kind=/unit=/parent=/pane= pairs)"
             )
         key, value = token.split("=", 1)
-        key, value = key.strip(), value.strip()
+        key, value = key.strip(" "), value.strip(" ")
         if key == "kind":
             kind = value
         elif key == "unit":
@@ -492,7 +498,10 @@ def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
     # Bind to the EXACT dispatch-selected/created/adopted grandchild identity
     # (never the first depth-2 sibling), then re-verify it against the live
     # inventory (Redmine #13571 / #12454 j#75444 F1).
-    gc_unit = (getattr(args, "grandchild_unit", None) or "").strip()
+    # Strip only ASCII-space padding, never control / newline / Unicode
+    # whitespace, so a padded `--grandchild-unit` reaches the stable validator and
+    # fails closed rather than being silently normalized (Redmine #13571 R11-F1).
+    gc_unit = (getattr(args, "grandchild_unit", None) or "").strip(" ")
     target = (
         GrandchildTargetIdentity(
             unit_id=gc_unit,

@@ -563,6 +563,67 @@ class ControlCharAndWindowsRepoRedactionTest(unittest.TestCase):
             self.assertNotIn("X", binding.reason)
             self.assertIn(REDACTED_UNIT_TOKEN, binding.reason)
 
+    def test_binding_rejects_leading_trailing_padded_unit(self) -> None:
+        # R11-F1 consumer: a padded target unit / parent (which a strip-before-
+        # validate accepted) is not stable -> unbound, redacted, no leak.
+        for bad in ("ws/gc\n", " ws/gc", "ws/gc\t", "\xa0ws/gc"):
+            target = GrandchildTargetIdentity(
+                unit_id=bad, delegation_parent=_DELEG_UNIT, repo_identity="/ws/child"
+            )
+            binding = resolve_realized_grandchild_binding(
+                [], target=target, delegated_coordinator_unit=_DELEG_UNIT
+            )
+            self.assertEqual(BINDING_UNBOUND, binding.outcome, msg=repr(bad))
+            self.assertNotIn(bad, binding.reason)
+            self.assertIn(REDACTED_UNIT_TOKEN, binding.reason)
+        # padded parent
+        target = GrandchildTargetIdentity(
+            unit_id=_GC_UNIT, delegation_parent="mz/d\n", repo_identity="/ws/child"
+        )
+        binding = resolve_realized_grandchild_binding(
+            [], target=target, delegated_coordinator_unit="mz/d\n"
+        )
+        self.assertEqual(BINDING_UNBOUND, binding.outcome)
+        self.assertNotIn("mz/d\n", binding.reason)
+
+    def test_repo_token_control_basename_redacted(self) -> None:
+        # R11-F3: a basename carrying control / newline falls to a fixed redacted
+        # token, both when it is the last segment and after separator basenaming.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            REDACTED_REPO_TOKEN,
+            _repo_token,
+        )
+
+        for bad in ("/a/b/repo\nMARK", "/a/b/repo\tMARK", "/a/b/repo\x00MARK",
+                    "C:" + chr(92) + "proj\nMARK"):
+            token = _repo_token(bad)
+            self.assertEqual(REDACTED_REPO_TOKEN, token, msg=repr(bad))
+            self.assertNotIn("MARK", token)
+        # normal basename diagnostic usefulness preserved.
+        self.assertEqual("proj", _repo_token("/a/b/proj"))
+
+    def test_binding_reason_redacts_control_repo_both_directions(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            InventoryUnit,
+        )
+
+        marker = "MARK"
+        ctrl_repo = "/ws/repo-b\n" + marker
+        # live control repo, target clean -> mismatch, no marker leak.
+        unit = InventoryUnit(
+            unit_id=_GC_UNIT, lane_kind="implementation", delegation_depth=2,
+            delegation_parent=_DELEG_UNIT, status="derived", repo_identity=ctrl_repo,
+            has_codex_gateway=True, ambiguous=False,
+        )
+        target = GrandchildTargetIdentity(
+            unit_id=_GC_UNIT, delegation_parent=_DELEG_UNIT, repo_identity="/ws/repo-a"
+        )
+        binding = resolve_realized_grandchild_binding(
+            [unit], target=target, delegated_coordinator_unit=_DELEG_UNIT
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+        self.assertNotIn(marker, binding.reason)
+
     def test_repo_token_basenames_windows_and_unc(self) -> None:
         # R10-F3: `_repo_token` handles POSIX / Windows / UNC separators.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
@@ -864,13 +925,70 @@ class StampProducerStableUnitTest(unittest.TestCase):
             self.assertNotIn(path, out)
 
     def test_canonical_pane_still_succeeds(self) -> None:
+        for pane in ("%42", "%0", "%123"):
+            lanes = [
+                "kind=coordinator,unit=gk/p,parent=-",
+                "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+                f"kind=implementation,unit=mz/gc,parent=mz/d,pane={pane}",
+            ]
+            rc, out = self._run(lanes, "mz/gc", "launch")
+            self.assertEqual(0, rc, msg=pane)
+
+    def test_leading_trailing_control_unit_fails_closed(self) -> None:
+        # #13571 j#75589 R11-F1: a unit / parent / grandchild padded with leading
+        # or trailing control / whitespace (which a prior strip-before-validate
+        # accepted) must fail closed for both launch and adopt, with no leak.
+        marker = "PAD"
+        padded = ("ws/gc\n", " ws/gc", "ws/gc\t", "ws/gc ", "\xa0ws/gc")
+        for bad in padded:
+            for realization, ar in (("launch", None), ("adopt", "because")):
+                rc, out = self._run(self._chain(gc_unit=bad), bad, realization, adopt_reason=ar)
+                self.assertTrue(str(rc).startswith("die:"), msg=f"{bad!r}/{realization}")
+                self.assertNotIn(bad, out, msg=f"{bad!r}/{realization}")
+        # padded parent, all-valid otherwise
+        rc, out = self._run(
+            self._chain(gc_unit="mz/gc", parent="mz/d\n"), "mz/gc", "launch"
+        )
+        self.assertTrue(str(rc).startswith("die:"))
+        self.assertNotIn(marker, out)
+
+    def test_unicode_digit_pane_fails_closed_no_leak(self) -> None:
+        # #13571 j#75589 R11-F2: `\d` look-alike Unicode digits must not become a
+        # tmux target.
+        for pane in ("%１２", "%١٢", "%\U0001d7d9"):
+            lanes = [
+                "kind=coordinator,unit=gk/p,parent=-",
+                "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+                f"kind=implementation,unit=mz/gc,parent=mz/d,pane={pane}",
+            ]
+            for realization, ar in (("launch", None), ("adopt", "because")):
+                for as_json in (True, False):
+                    rc, out = self._run(lanes, "mz/gc", realization, adopt_reason=ar, as_json=as_json)
+                    self.assertTrue(str(rc).startswith("die:"), msg=f"{pane!r}/{realization}")
+                    self.assertNotIn(pane[1:], out, msg=f"{pane!r}/{realization}")
+
+    def test_control_padded_pane_fails_closed(self) -> None:
+        for pane in ("%1\n", "\t%1", "%1 x"):
+            lanes = [
+                "kind=coordinator,unit=gk/p,parent=-",
+                "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+                f"kind=implementation,unit=mz/gc,parent=mz/d,pane={pane}",
+            ]
+            rc, out = self._run(lanes, "mz/gc", "launch")
+            self.assertTrue(str(rc).startswith("die:"), msg=repr(pane))
+
+    def test_unicode_pane_apply_performs_zero_tmux(self) -> None:
+        tmux = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client"
         lanes = [
             "kind=coordinator,unit=gk/p,parent=-",
             "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
-            "kind=implementation,unit=mz/gc,parent=mz/d,pane=%42",
+            "kind=implementation,unit=mz/gc,parent=mz/d,pane=%１２",
         ]
-        rc, out = self._run(lanes, "mz/gc", "launch")
-        self.assertEqual(0, rc)
+        with mock.patch(f"{tmux}.run_tmux") as run_tmux, mock.patch(f"{tmux}.require_tmux") as require_tmux:
+            rc, out = self._run(lanes, "mz/gc", "launch", apply=True)
+            self.assertTrue(str(rc).startswith("die:"))
+            self.assertEqual(0, run_tmux.call_count)
+            self.assertEqual(0, require_tmux.call_count)
 
     def test_path_like_kind_fails_closed_generic_no_raw(self) -> None:
         # #13571 j#75577 R10-F4: an invalid/path-like kind must fail closed with a

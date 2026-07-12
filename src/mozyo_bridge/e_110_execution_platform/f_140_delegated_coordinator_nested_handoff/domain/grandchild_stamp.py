@@ -408,6 +408,10 @@ def _split_workspace_lane(unit_id: str) -> tuple[str, str]:
     return workspace.strip(), lane.strip()
 
 
+#: The placeholder a non-single-line-printable repo basename is redacted to.
+REDACTED_REPO_TOKEN = "<redacted-repo>"
+
+
 def _repo_token(path: Optional[str]) -> str:
     """Portable, redacted repo token for durable/pasteable records (F3 (b)).
 
@@ -425,7 +429,16 @@ def _repo_token(path: Optional[str]) -> str:
         return "none"
     # Split on both separators; the last non-empty segment is the basename.
     segments = [seg for seg in re.split(r"[/\\]", norm) if seg]
-    return segments[-1] if segments else "none"
+    if not segments:
+        return "none"
+    token = segments[-1]
+    # The basename must itself be a single-line printable portable token; a
+    # basename carrying a newline / tab / control / non-printable char would still
+    # leak into (and split) the durable diagnostic, so it falls to a fixed
+    # redacted token (Redmine #13571 j#75589 R11-F3).
+    if not token.isprintable():
+        return REDACTED_REPO_TOKEN
+    return token
 
 
 #: The placeholder a malformed (non-stable) unit id is redacted to.
@@ -445,15 +458,19 @@ def _is_stable_unit(unit_id: Optional[object]) -> bool:
     """
     if unit_id is None:
         return False
-    s = str(unit_id).strip()
+    # Validate the RAW value — never canonicalize / strip first. A validator that
+    # stripped would accept a leading/trailing newline / tab / Unicode-whitespace
+    # padded value as stable, while the raw padded value is what downstream plans /
+    # records / breadcrumbs actually use (Redmine #13571 j#75589 R11-F1). The
+    # ``isspace`` scan below rejects leading, trailing, AND embedded whitespace.
+    s = str(unit_id)
     if not s or s.startswith(("/", "~", ".")) or "\\" in s:
         return False
     # No whitespace / control / non-printable character anywhere: a stable unit is
     # a single-line, printable identity, so a newline / tab / control char cannot
     # inject into a durable record field boundary or a live breadcrumb (Redmine
-    # #13571 j#75577 R10-F1). ``isspace`` catches internal whitespace that
-    # ``strip`` (leading/trailing only) leaves; ``isprintable`` is False for any
-    # control / non-printable char (and for a space, which ``isspace`` also rejects).
+    # #13571 j#75577 R10-F1). ``isprintable`` is False for any control /
+    # non-printable char (space is printable, so ``isspace`` rejects it too).
     if not s.isprintable() or any(ch.isspace() for ch in s):
         return False
     # Windows drive-root / drive-relative (``C:`` / ``C:/x`` / ``C:x``), independent
@@ -478,9 +495,11 @@ def redact_unit_token(unit_id: Optional[object]) -> str:
     """
     if unit_id is None:
         return "none"
-    s = str(unit_id).strip()
-    if not s:
+    s = str(unit_id)
+    if not s.strip():
         return "none"
+    # Validate the RAW value (not a stripped copy): a padded value is not stable,
+    # so it redacts rather than surfacing its raw form (Redmine #13571 R11-F1).
     return s if _is_stable_unit(s) else REDACTED_UNIT_TOKEN
 
 
