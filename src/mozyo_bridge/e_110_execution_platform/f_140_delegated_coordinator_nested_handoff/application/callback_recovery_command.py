@@ -56,6 +56,7 @@ def build_observation(
     outbox_pending: int,
     outbox_uncertain: int,
     outbox_workspace_id: str = "",
+    outbox_workspace_ids: Optional[Sequence[str]] = None,
     env: Optional[Mapping[str, str]] = None,
     slot_probe: Optional[SlotProbe] = None,
     git_runner: Optional[Callable[[list], "tuple[int, str]"]] = None,
@@ -76,6 +77,7 @@ def build_observation(
         outbox_pending=int(outbox_pending),
         outbox_uncertain=int(outbox_uncertain),
         outbox_workspace_id=outbox_workspace_id,
+        outbox_workspace_ids=tuple(outbox_workspace_ids or ()),
         runtime_slots=slots,
         sender_env_present=sender_env_present,
     )

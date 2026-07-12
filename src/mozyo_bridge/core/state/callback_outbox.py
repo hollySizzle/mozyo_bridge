@@ -684,6 +684,18 @@ class CallbackOutbox:
             conn.close()
         return tuple(_row(r) for r in rows)
 
+    def workspace_ids(self) -> tuple[str, ...]:
+        """Return the DISTINCT workspace ids actually present across all outbox rows (sorted).
+
+        #13518 review R3-F4b: the recovery reconciler must derive the outbox's workspace ownership
+        from the REAL rows, never from a substituted registry id. A foreign single workspace, a
+        mixed set, or a legacy blank id is reported here as-is so the reconciler can fail closed on
+        a DB that does not belong to the expected workspace (defeating the "reported as
+        registry-owned by construction" bypass). Blank ("") is included as a distinct element so the
+        reconciler can see unknown-ownership rows. An empty / never-migrated DB returns ``()``.
+        """
+        return tuple(sorted({str(getattr(r, "workspace_id", "") or "") for r in self.read()}))
+
     def state_of(self, key: CallbackOutboxKey) -> str:
         """Return the current persisted state for the key, or :data:`CALLBACK_ABSENT`.
 

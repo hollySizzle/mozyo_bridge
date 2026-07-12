@@ -90,7 +90,12 @@ class AuthorityObservation:
     outbox_present: bool
     outbox_pending: int
     outbox_uncertain: int
-    outbox_workspace_id: str = ""  # the workspace the outbox rows belong to ("" = not checked)
+    outbox_workspace_id: str = ""  # legacy single-field ("" = not checked); prefer the set below
+    #: The DISTINCT workspace ids ACTUALLY present across the outbox rows (#13518 review R3-F4b).
+    #: Derived from real rows (never a substituted registry id), so a foreign / mixed / unknown-
+    #: ownership DB fails closed instead of being reported as registry-owned by construction. ``()``
+    #: = not supplied (fall back to the legacy single field).
+    outbox_workspace_ids: Sequence[str] = ()
     runtime_slots: Sequence[RuntimeSlot] = ()
     sender_env_present: bool = True  # MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE present in this process
 
@@ -153,13 +158,30 @@ def build_recovery_plan(obs: AuthorityObservation) -> RecoveryPlan:
         blockers.append(BLOCK_WORKTREE_ABSENT)
     if any(int(s.count) > 1 for s in obs.runtime_slots):
         blockers.append(BLOCK_AMBIGUOUS_LIVE_SLOT)
-    if (
+    # DB workspace ownership (#13518 review R3-F4b): prefer the DISTINCT set derived from the ACTUAL
+    # outbox rows over the legacy single field. A foreign single workspace, a mixed set, rows tagged
+    # with a workspace we cannot match against an expected anchor, or rows of unknown (blank)
+    # ownership under a known expected workspace are ALL fail-closed contradictions — the restore-
+    # material DB is never silently adopted as registry-owned by construction. The DB is not the
+    # workflow authority, so any ownership it cannot positively prove is a stop, never a guess.
+    if obs.outbox_present and obs.outbox_workspace_ids:
+        expected = _norm(obs.workspace_id_expected)
+        row_ws = [_norm(w) for w in obs.outbox_workspace_ids]
+        distinct = sorted({w for w in row_ws if w})
+        blank_present = any(w == "" for w in row_ws)
+        if (
+            len(distinct) > 1  # mixed workspaces in one DB
+            or (len(distinct) == 1 and expected and distinct[0] != expected)  # foreign single
+            or (distinct and not expected)  # rows tagged, but no expected anchor to match against
+            or (not distinct and blank_present and expected)  # rows exist, ownership unknown
+        ):
+            blockers.append(BLOCK_DB_CONTRADICTION)
+    elif (
         obs.outbox_present
         and _norm(obs.outbox_workspace_id)
         and _norm(obs.outbox_workspace_id) != _norm(obs.workspace_id_expected)
     ):
-        # The restore-material DB references a different workspace than the durable anchor:
-        # the DB is NOT the workflow authority, so a mismatch is a stop, never a silent adopt.
+        # Legacy single-field path (a caller that supplies one outbox_workspace_id, not the set).
         blockers.append(BLOCK_DB_CONTRADICTION)
 
     if blockers:

@@ -192,6 +192,50 @@ class RecoveryPlanMeasurementTest(unittest.TestCase):
         self.assertEqual(obs.workspace_id_expected, "")
         self.assertEqual(obs.workspace_id_registry, "wsX")
 
+    def _seed_store(self, tmp: Path, *workspaces: str) -> None:
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
+
+        outbox = CallbackOutbox(path=tmp / "wf.sqlite")
+        for i, ws in enumerate(workspaces):
+            outbox.enqueue(
+                CallbackOutboxKey(
+                    source="redmine", issue="13518", journal=f"7500{i}",
+                    normalized_gate="implementation_done", callback_route="coordinator",
+                    workspace_id=ws,
+                ),
+                notification_kind="implementation_done",
+            )
+
+    def test_foreign_outbox_derives_real_ownership_and_contradicts(self):
+        # #13518 review R3-F4b: the observation carries the ACTUAL row workspace ids (not the
+        # substituted registry id), so a foreign DB fail-closes on BLOCK_DB_CONTRADICTION.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_reconciler import (
+            BLOCK_DB_CONTRADICTION,
+            RECOVERY_FAIL_CLOSED,
+            build_recovery_plan,
+        )
+
+        with tempfile.TemporaryDirectory() as t:
+            self._seed_store(Path(t), "ws_foreign")
+            obs = self._run_capture_obs(Path(t), workspace_id="ws_mine")
+        self.assertEqual(tuple(obs.outbox_workspace_ids), ("ws_foreign",))
+        plan = build_recovery_plan(obs)
+        self.assertIn(BLOCK_DB_CONTRADICTION, plan.blockers)
+        self.assertEqual(plan.status, RECOVERY_FAIL_CLOSED)
+
+    def test_mixed_outbox_contradicts(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_reconciler import (
+            BLOCK_DB_CONTRADICTION,
+            build_recovery_plan,
+        )
+
+        with tempfile.TemporaryDirectory() as t:
+            self._seed_store(Path(t), "ws_a", "ws_b")
+            obs = self._run_capture_obs(Path(t), workspace_id="ws_a")
+        self.assertEqual(tuple(obs.outbox_workspace_ids), ("ws_a", "ws_b"))
+        plan = build_recovery_plan(obs)
+        self.assertIn(BLOCK_DB_CONTRADICTION, plan.blockers)
+
 
 class WatchPassSummaryTest(unittest.TestCase):
     """#13520 review R2-F2: the CLI renders an error pass without KeyError and surfaces it."""

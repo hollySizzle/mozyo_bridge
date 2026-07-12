@@ -418,7 +418,11 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
             outbox_present=outbox_present,
             outbox_pending=len(outbox.read(states=[CALLBACK_PENDING])) if outbox_present else 0,
             outbox_uncertain=len(outbox.read(states=[CALLBACK_UNCERTAIN])) if outbox_present else 0,
-            outbox_workspace_id=registry_ws if outbox_present else "",
+            # #13518 review R3-F4b: derive the outbox ownership from the ACTUAL row workspace ids,
+            # never substitute the registry id. A foreign / mixed / unknown-ownership DB is then
+            # observed truthfully and fail-closes (BLOCK_DB_CONTRADICTION) instead of being reported
+            # as registry-owned by construction.
+            outbox_workspace_ids=outbox.workspace_ids() if outbox_present else (),
             env=os.environ,
         )
         plan = recovery_plan_from_observation(obs)

@@ -101,6 +101,31 @@ class FailClosedTest(unittest.TestCase):
         self.assertIn(BLOCK_DB_CONTRADICTION, plan.blockers)
         self.assertEqual(plan.status, RECOVERY_FAIL_CLOSED)
 
+    def test_db_ownership_set_foreign_single_fails_closed(self):
+        # #13518 review R3-F4b: ownership derived from the ACTUAL rows — a single foreign workspace
+        # is a contradiction (the pre-fix bug reported it as registry-owned by construction).
+        plan = build_recovery_plan(_healthy(outbox_workspace_id="", outbox_workspace_ids=("other_ws",)))
+        self.assertIn(BLOCK_DB_CONTRADICTION, plan.blockers)
+        self.assertEqual(plan.status, RECOVERY_FAIL_CLOSED)
+
+    def test_db_ownership_set_mixed_fails_closed(self):
+        # A DB carrying MORE THAN ONE workspace's rows can never be positively adopted -> stop.
+        plan = build_recovery_plan(_healthy(outbox_workspace_id="", outbox_workspace_ids=(WS, "other_ws")))
+        self.assertIn(BLOCK_DB_CONTRADICTION, plan.blockers)
+        self.assertEqual(plan.status, RECOVERY_FAIL_CLOSED)
+
+    def test_db_ownership_set_unknown_blank_rows_fails_closed(self):
+        # Rows exist but carry NO workspace id while a specific workspace is expected: ownership is
+        # unknown, so the DB is not adopted (never guess it belongs to the expected workspace).
+        plan = build_recovery_plan(_healthy(outbox_workspace_id="", outbox_workspace_ids=("",)))
+        self.assertIn(BLOCK_DB_CONTRADICTION, plan.blockers)
+        self.assertEqual(plan.status, RECOVERY_FAIL_CLOSED)
+
+    def test_db_ownership_set_all_expected_is_not_a_contradiction(self):
+        # Rows all in the expected workspace: this specific gate does not fire (a healthy DB).
+        plan = build_recovery_plan(_healthy(outbox_workspace_id="", outbox_workspace_ids=(WS,)))
+        self.assertNotIn(BLOCK_DB_CONTRADICTION, plan.blockers)
+
     def test_dirty_worktree_is_never_clobbered_even_when_fail_closed(self):
         plan = build_recovery_plan(_healthy(workspace_id_registry="x", git_dirty=True))
         self.assertEqual(plan.status, RECOVERY_FAIL_CLOSED)
