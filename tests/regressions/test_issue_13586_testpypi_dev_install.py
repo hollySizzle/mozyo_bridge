@@ -20,7 +20,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# This file lives at tests/regressions/, so the repo root is two levels up.
+ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = ROOT / "scripts" / "install_testpypi_dev.sh"
 
 # Fake pipx: the runbook only shells out to `pipx install ... "$spec"`; a
