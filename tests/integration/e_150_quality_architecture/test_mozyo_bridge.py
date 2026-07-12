@@ -263,6 +263,25 @@ class PathResolutionTest(unittest.TestCase):
 
             self.assertEqual(git_root.resolve(), find_repo_root(nested))
 
+    def test_find_repo_root_git_root_overrides_deeper_pyproject(self) -> None:
+        # Git-root-first (Redmine #13641) intentionally reaches beyond scaffold
+        # markers: an outer Git root overrides a DEEPER non-git repo marker too —
+        # here a nested `pyproject.toml` — the deliberate reversal of the
+        # pre-#13641 marker-only walk, which returned the nearest marker and never
+        # let a shallower Git root override a deeper pyproject root. This locks
+        # that the shared-resolver change is not scaffold-specific.
+        with tempfile.TemporaryDirectory() as tmp:
+            git_root = Path(tmp) / "monorepo"
+            proj = git_root / "projects" / "svc"
+            nested = proj / "src"
+            nested.mkdir(parents=True)
+            (git_root / ".git").mkdir()  # outer Git worktree root
+            (proj / "pyproject.toml").write_text("", encoding="utf-8")  # deeper marker
+
+            resolved = find_repo_root(nested)
+            self.assertEqual(git_root.resolve(), resolved)
+            self.assertNotEqual(proj.resolve(), resolved)
+
     def test_git_root_config_shadows_nested_scaffold_backend_from_subtree(
         self,
     ) -> None:

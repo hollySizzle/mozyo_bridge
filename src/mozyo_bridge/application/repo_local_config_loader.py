@@ -78,7 +78,8 @@ def repo_local_config_path(
 ) -> Path:
     """Resolve the absolute path of ``.mozyo-bridge/config.yaml`` for a repo.
 
-    ``repo_root`` (or ``MOZYO_REPO`` / a marker walk from ``start``) is resolved
+    ``repo_root`` (or ``MOZYO_REPO`` / a Git-root-first resolve from ``start``,
+    Redmine #13641) is resolved
     through :func:`mozyo_bridge.shared.paths.resolve_repo_root`, the single repo-
     root contract the rest of the codebase uses, so the config file is always
     looked up at the same root the workspace identity resolves to. This does no
