@@ -424,18 +424,22 @@ def _repo_token(path: Optional[str]) -> str:
     """
     if not path:
         return "none"
-    norm = str(path).strip().rstrip("/\\")
+    # Trim ONLY trailing separators (never whitespace / control): a ``.strip()``
+    # here would drop a trailing control char before the printable check, so a
+    # ``repo\n`` basename would surface as a clean ``repo`` token instead of the
+    # fixed redaction (Redmine #13571 j#75596 R12-F2).
+    norm = str(path).rstrip("/\\")
     if not norm:
         return "none"
-    # Split on both separators; the last non-empty segment is the basename.
+    # Split on both separators; the last non-empty segment is the RAW basename.
     segments = [seg for seg in re.split(r"[/\\]", norm) if seg]
     if not segments:
         return "none"
     token = segments[-1]
-    # The basename must itself be a single-line printable portable token; a
+    # The RAW basename must itself be a single-line printable portable token; a
     # basename carrying a newline / tab / control / non-printable char would still
     # leak into (and split) the durable diagnostic, so it falls to a fixed
-    # redacted token (Redmine #13571 j#75589 R11-F3).
+    # redacted token (Redmine #13571 j#75589 R11-F3 / j#75596 R12-F2).
     if not token.isprintable():
         return REDACTED_REPO_TOKEN
     return token

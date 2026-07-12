@@ -52,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BINDING_UNBOUND,
     REDACTED_UNIT_TOKEN,
     GrandchildTargetIdentity,
+    InventoryUnit,
     redact_unit_token,
     resolve_realized_grandchild_binding,
 )
@@ -587,20 +588,33 @@ class ControlCharAndWindowsRepoRedactionTest(unittest.TestCase):
         self.assertNotIn("mz/d\n", binding.reason)
 
     def test_repo_token_control_basename_redacted(self) -> None:
-        # R11-F3: a basename carrying control / newline falls to a fixed redacted
-        # token, both when it is the last segment and after separator basenaming.
+        # R11-F3 / R12-F2: a basename carrying control / newline / trailing control
+        # falls to a fixed redacted token — the raw basename is judged, never
+        # pre-stripped — across POSIX / drive / UNC / mixed separator shapes.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
             REDACTED_REPO_TOKEN,
             _repo_token,
         )
 
-        for bad in ("/a/b/repo\nMARK", "/a/b/repo\tMARK", "/a/b/repo\x00MARK",
-                    "C:" + chr(92) + "proj\nMARK"):
+        bs = chr(92)
+        embedded = ("/a/b/repo\nMARK", "/a/b/repo\tMARK", "/a/b/repo\x00MARK",
+                    "C:" + bs + "proj\nMARK")
+        # Trailing control (R12-F2): control at the very end must still redact.
+        trailing = tuple(
+            base + ctrl
+            for base in ("/a/b/repo", "C:" + bs + "x" + bs + "repo",
+                         bs + bs + "srv" + bs + "share" + bs + "repo",
+                         "C:/x" + bs + "repo")
+            for ctrl in ("\n", "\r", "\t", "\x0b", "\x0c", chr(0x2028), chr(0x2029), "\xa0")
+        )
+        for bad in embedded + trailing:
             token = _repo_token(bad)
             self.assertEqual(REDACTED_REPO_TOKEN, token, msg=repr(bad))
             self.assertNotIn("MARK", token)
-        # normal basename diagnostic usefulness preserved.
+        # normal basename + separator-trailing diagnostic usefulness preserved.
         self.assertEqual("proj", _repo_token("/a/b/proj"))
+        self.assertEqual("proj", _repo_token("/a/b/proj/"))
+        self.assertEqual("proj", _repo_token("C:" + bs + "x" + bs + "proj" + bs))
 
     def test_binding_reason_redacts_control_repo_both_directions(self) -> None:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
@@ -1052,6 +1066,87 @@ class StampProducerStableUnitTest(unittest.TestCase):
             self.assertTrue(str(rc).startswith("die:"))
             self.assertEqual(0, run_tmux.call_count)
             self.assertNotIn(self._PATH_GC, out)
+
+
+class RepoIdentityRawSafeCanonicalizationTest(unittest.TestCase):
+    """#13571 j#75596 R12-F1: the repo canonicalizer is raw-safe (no pre-strip).
+
+    A control-bearing repo identity must NOT be `.strip()`ed onto a clean path and
+    accepted as an exact re-match; it fails closed (``None``). A normal ASCII space
+    within a path is legitimate.
+    """
+
+    _CTRL = ("\n", "\r", "\t", "\x0b", "\x0c", chr(0x2028), chr(0x2029), "\xa0")
+
+    def test_control_repo_identity_is_none_clean_is_not(self) -> None:
+        for ctrl in self._CTRL:
+            self.assertIsNone(_canonical_repo_identity("/a/repo" + ctrl), msg=repr(ctrl))
+            self.assertIsNone(_canonical_repo_identity(ctrl + "/a/repo"), msg=repr(ctrl))
+        self.assertIsNotNone(_canonical_repo_identity("/a/repo"))
+        # A normal ASCII space inside a path is a legitimate identity.
+        self.assertIsNotNone(_canonical_repo_identity("/a/My Repo"))
+
+    def _gate(self, *, gc_repo, live_repo, as_json):
+        import argparse
+        import contextlib
+        import io
+
+        args = argparse.Namespace(
+            delegated_coordinator_unit="mz/lane-deleg",
+            grandchild_unit=_GC_UNIT,
+            grandchild_repo=gc_repo,
+            require_grandchild=True,
+            parent_issue="1",
+            child_issue="2",
+            session=None,
+            as_json=as_json,
+        )
+        unit = InventoryUnit(
+            unit_id=_GC_UNIT, lane_kind="implementation", delegation_depth=2,
+            delegation_parent="mz/lane-deleg", status="derived",
+            repo_identity=live_repo, has_codex_gateway=True, ambiguous=False,
+        )
+        buf = io.StringIO()
+        patch = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.grandchild_stamp._discover_delegation_units"
+        )
+        with mock.patch(patch, return_value=[unit]), contextlib.redirect_stdout(buf):
+            rc = cmd_handoff_grandchild_gate(args)
+        return rc, buf.getvalue()
+
+    def test_padded_target_repo_blocks_against_clean_live(self) -> None:
+        clean = _canonical_repo_identity("/ws/child")
+        for ctrl in self._CTRL:
+            for as_json in (True, False):
+                rc, out = self._gate(gc_repo="/ws/child" + ctrl, live_repo=clean, as_json=as_json)
+                self.assertEqual(3, rc, msg=f"{ctrl!r}/{as_json}")  # unbound -> blocked
+        # positive control: clean target + clean live realizes.
+        rc, out = self._gate(gc_repo="/ws/child", live_repo=clean, as_json=True)
+        self.assertEqual(0, rc)
+
+    def test_live_padded_repo_canonicalizes_to_none(self) -> None:
+        # The live producer runs candidate repos through the same canonicalizer,
+        # so a control-bearing live repo becomes None (repo re-match fails closed).
+        def units(cands):
+            with mock.patch(_CANDS_PATCH, return_value=cands), mock.patch(_TMUX_PATCH):
+                import argparse
+
+                return {
+                    u.unit_id: u
+                    for u in _discover_delegation_units(argparse.Namespace(agent=None, session=None))
+                }
+
+        gc = units(_chain(_gc_pane("%3", "codex", repo_root="/ws/child\n")))[_GC_UNIT]
+        self.assertIsNone(gc.repo_identity)
+        target = GrandchildTargetIdentity(
+            unit_id=_GC_UNIT, delegation_parent=_DELEG_UNIT,
+            repo_identity=_canonical_repo_identity("/ws/child"),
+        )
+        binding = resolve_realized_grandchild_binding(
+            [gc], target=target, delegated_coordinator_unit=_DELEG_UNIT
+        )
+        self.assertNotEqual(BINDING_REALIZED, binding.outcome)
 
 
 class PublicCatalogResolverContractTest(unittest.TestCase):

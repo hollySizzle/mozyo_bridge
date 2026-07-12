@@ -90,12 +90,24 @@ def _canonical_repo_identity(path: Optional[str]) -> Optional[str]:
     ``None`` for an empty path (the binding then fails closed on the mandatory
     repo re-match). Best-effort: an unresolvable path falls back to its
     Unicode-normalized raw form rather than raising.
+
+    The RAW value is validated for control / line-separator / non-printable
+    safety BEFORE any resolve — a repo identity is never ``.strip()``ed into a
+    different path, so a control-bearing target / live repo fails closed (returns
+    ``None``) instead of being normalized onto a clean path and accepted as an
+    exact re-match (Redmine #13571 j#75596 R12-F1). A normal ASCII space is a
+    legitimate path character (so this is NOT the identity-unit grammar), but any
+    control / line-separator / non-printable character makes the identity invalid.
     """
     from mozyo_bridge.shared.paths import normalize_path_unicode, resolve_repo_root
 
-    if not path or not str(path).strip():
+    if path is None or not str(path).strip():
         return None
-    raw = str(path).strip()
+    raw = str(path)
+    # ``isprintable`` is True for a space (a legitimate path char) but False for
+    # any control / line-separator / non-printable char — do NOT strip first.
+    if not raw.isprintable():
+        return None
     try:
         resolved = str(resolve_repo_root(raw))
     except (OSError, RuntimeError, ValueError):
