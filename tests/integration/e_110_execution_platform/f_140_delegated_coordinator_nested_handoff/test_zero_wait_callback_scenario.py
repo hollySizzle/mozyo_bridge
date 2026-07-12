@@ -83,6 +83,14 @@ class ZeroWaitCallbackScenarioTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.store_path = Path(self._tmp.name) / "wf.sqlite"
         self.outbox = CallbackOutbox(path=self.store_path)
+        # #13518 R4-F1: pin a VERIFIED test workspace so the CLI mutating actions (--sweep /
+        # --deliver, R3-F3) run partitioned + hermetic in a CLEAN CI environment — independent of
+        # any ambient MOZYO_WORKSPACE_ID / workspace anchor the developer shell happens to carry.
+        # Production stays fail-closed (this weakens nothing); only the test supplies its own
+        # attested identity, exactly as a real anchored workspace would.
+        self._orig_resolve_ws = cli._resolve_workspace_id
+        cli._resolve_workspace_id = lambda args: "ws_zero_wait_scenario"
+        self.addCleanup(setattr, cli, "_resolve_workspace_id", self._orig_resolve_ws)
         # A source-of-truth Redmine issue with a real implementation_done gate on j#75094,
         # and a note on j#75200 that carries NO structured gate marker (prose only).
         self.source = _FakeSource(
