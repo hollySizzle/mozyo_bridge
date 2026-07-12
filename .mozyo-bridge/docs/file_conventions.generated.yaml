@@ -119,6 +119,25 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: herdr default-lane durable workflow-role authority source
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
+  - .mozyo-bridge/workflow-role-bindings.json
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md と @vibes/docs/logics/workflow-step-command-design.md
+    と @vibes/docs/logics/ticketless-project-gateway-runtime-ux.md と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: package CLI and command entrypoints
   patterns:
   - src/mozyo_bridge/__main__.py

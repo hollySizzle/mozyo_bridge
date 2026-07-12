@@ -214,5 +214,95 @@ class ResolutionOnlyInvariantTest(unittest.TestCase):
             self.assertFalse(out.executable)
 
 
+class RoleAuthorityWiringTest(unittest.TestCase):
+    """The durable workflow-role authority overrides the provider/placement classification (#13583)."""
+
+    def _default_lane(self):
+        return classify_herdr_workflow_lane(provider="codex", lane_id="default", repo_root="/w")
+
+    def _resolution(self, **kw):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            STATUS_RESOLVED,
+            WorkflowRoleResolution,
+        )
+
+        base = dict(status=STATUS_RESOLVED, role="", project_scope="", lane_id="default", detail="d")
+        base.update(kw)
+        return WorkflowRoleResolution(**base)
+
+    def test_resolved_grandparent_no_longer_blocks(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+            ROLE_GRANDPARENT_COORDINATOR,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+            STATE_GRANDPARENT_CONSULTATION,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
+            REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
+        )
+
+        res = self._resolution(role=ROLE_GRANDPARENT_COORDINATOR)
+        out = resolve_herdr_workflow_step(self._default_lane(), role_authority=res)
+        self.assertEqual(out.state, STATE_GRANDPARENT_CONSULTATION)
+        self.assertEqual(out.execution, EXECUTION_NO_OP)
+        self.assertEqual(out.reason, REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING)
+        self.assertEqual(out.caller_role, ROLE_GRANDPARENT_COORDINATOR)
+        self.assertEqual(out.primitive, PRIMITIVE_NONE)
+        self.assertFalse(out.executable)
+        self.assertTrue(out.ok)  # resolved -> no longer a fail-closed block
+
+    def test_resolved_project_gateway_carries_scope(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+            ROLE_PROJECT_GATEWAY,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+            STATE_PARENT_WORK_INTAKE,
+        )
+
+        res = self._resolution(role=ROLE_PROJECT_GATEWAY, project_scope="cloud-drive", lane_id="pgwv1_x")
+        out = resolve_herdr_workflow_step(self._default_lane(), role_authority=res)
+        self.assertEqual(out.state, STATE_PARENT_WORK_INTAKE)
+        self.assertEqual(out.caller_role, ROLE_PROJECT_GATEWAY)
+        self.assertEqual(out.project_scope, "cloud-drive")
+
+    def test_blocked_authority_fails_closed_with_fixed_reason(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            REASON_ROLE_PROVIDER_MISMATCH,
+            STATUS_PROVIDER_MISMATCH,
+            WorkflowRoleResolution,
+        )
+
+        res = WorkflowRoleResolution(status=STATUS_PROVIDER_MISMATCH, role="", detail="mismatch")
+        out = resolve_herdr_workflow_step(self._default_lane(), role_authority=res)
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_ROLE_PROVIDER_MISMATCH)
+        self.assertEqual(out.next_owner, OWNER_OPERATOR)
+
+    def test_missing_authority_falls_through_to_existing_default_block(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            STATUS_MISSING,
+            WorkflowRoleResolution,
+        )
+
+        res = WorkflowRoleResolution(status=STATUS_MISSING, lane_id="default")
+        out = resolve_herdr_workflow_step(self._default_lane(), role_authority=res)
+        # Byte-invariant: a lane with no binding keeps the existing fail-closed behavior.
+        self.assertEqual(out.reason, REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED)
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+
+    def test_missing_authority_leaves_worker_lane_unchanged(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            STATUS_MISSING,
+            WorkflowRoleResolution,
+        )
+
+        lane = classify_herdr_workflow_lane(provider="claude", lane_id="issue_1", repo_root="/w")
+        res = WorkflowRoleResolution(status=STATUS_MISSING, lane_id="issue_1")
+        out = resolve_herdr_workflow_step(
+            lane, role_authority=res, anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR
+        )
+        self.assertEqual(out.reason, REASON_HERDR_WORKER_STEP_READY)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
