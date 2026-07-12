@@ -53,6 +53,29 @@ role             = codex / claude
 `repo_root` remains the authority for Git operations. `project_scope` tells the
 agent, cockpit, and handoff surfaces which business project the unit represents.
 
+## Shared Root Resolver Is Git-Root-First
+
+The `Workspace = Git repository / registry identity` invariant is not only a
+cockpit concern; it is a property of the shared identity resolver every
+entrypoint bottoms out at. When a Git worktree root is reachable above the cwd,
+that Git root is the workspace root — even when a monorepo project subdirectory
+carries its own `.mozyo-bridge/scaffold.json`. A nested workspace marker must not
+shadow the Git root's `.mozyo-bridge/config.yaml`; otherwise bare `mozyo` reads
+the (usually absent) subtree config and silently falls to the default tmux
+backend instead of the Git root's declared `terminal_transport.backend` (Redmine
+#13641).
+
+Concretely, the shared `find_repo_root` resolver (and therefore `resolve_repo_root`
+and the repo-local config load) prefer `infer_git_worktree_root`; the
+marker walk is the fallback ONLY when no Git root is reachable — a genuinely
+non-git scaffolded workspace (#11301), a registry-anchored non-git workspace
+(#11429), or a config-only adopted root (#13379) still resolve to their marker
+root. This mirrors the cockpit resolver `resolve_workspace_root`, so both paths
+now enforce the same invariant. Resolving to a Git root is an *identity*
+decision, not an *adoption* decision: `workspace_adoption_marker` still gates
+whether the resolved root launches a real agent, so an unadopted Git root does
+not start one (#13379). Explicit `--repo` / `MOZYO_REPO` overrides are unchanged.
+
 ## Discovery Philosophy
 
 The preferred model is self-describing project directories plus a generated
