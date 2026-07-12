@@ -107,24 +107,50 @@ provider binding / live inventory / project metadata は独立照合であり cu
 | declaration が malformed（schema/version/role/scope/slot）| invalid | `herdr_role_binding_invalid` |
 | provider 不一致 / expected 解決不能 | provider_mismatch | `herdr_role_provider_mismatch` |
 
-resolved 時、herdr `workflow step` は tmux / raw Herdr / raw pane へ fallback せず、role を名指す。
-blocked（invalid / ambiguous / provider_mismatch）は fixed reason + `next_owner=operator`。
+resolved 時、herdr `workflow step` は tmux / raw Herdr / raw pane へ fallback せず、role を名指し、
+その role の一段 forward を実行する（§6 Increment 3）。blocked（invalid / ambiguous /
+provider_mismatch）は fixed reason + `next_owner=operator`。
 
 ## 6. Increment 境界
 
-- **Increment 1**（本 spec の実装）: schema / core-owned loader / pure role+lane resolver /
-  docs / catalog / tests。**resolution-only**（`primitive=none`、send / lifecycle mutation なし）。
-  resolved な grandparent / project_gateway は `herdr_role_resolved_forward_pending`（`no_op`）で
-  role を名指し、一段委譲の forward transport は行わない。
-- **Increment 3**（後続・mid-review 承認後）: grandparent→project_gateway consult /
-  project_gateway→delegated_coordinator child-intake の Herdr-native 一段 forward SEND wiring。
-  既存 tmux-era project-gateway primitive への個別 fallback は追加しない。
+- **Increment 1**（済）: schema / core-owned loader / pure role+lane resolver / docs / catalog /
+  tests。**resolution-only**（send / lifecycle mutation なし）。
+
+- **Increment 3**（済・Design Answer j#76417 Opt A / 7-point safety contract）: grandparent→
+  project_gateway consultation / project_gateway→delegated_coordinator child-intake の Herdr-native
+  一段 forward SEND wiring。resolved な coordinator role は `no_op` でなく **executable leg**
+  （`execution=ready` + **direction 別 primitive/reason**: `herdr_forward_consultation` /
+  `herdr_forward_child_intake`）を名指す。
+  - **pure route matrix**（`domain/workflow_forward_route.py`）: resolved role → forward plan
+    （direction / target role / select mode / ticketless kind）+ pure send/zero-send decision
+    （`ok` target + `open` fence のみ send）。
+  - **target 解決**（`application/herdr_forward_send.py`）: grandparent は herdr inventory の
+    **唯一 live な bound project_gateway lane**（0/2+/locator-missing は zero-send）; project_gateway
+    は **same-lane self-fence** 付き child delegated_coordinator（self/missing/ambiguous は zero-send）。
+    provider/pane/placement を role authority へ昇格しない（binding が authority、provider は slot 特定）。
+  - **dedicated duplicate fence**（`core/state/forward_outbox_fence.py`）: forward 自身の anchor-free
+    identity を UNIQUE key に持ち、anchored worker `DispatchAuthorization`/Redmine journal へ偽装しない。
+    reserved/delivered/uncertain は duplicate zero-send、unknown は uncertain（blind retry なし）。
+  - **payload 再利用**: message は既存 ticketless `TicketlessConsultation` / `TicketlessWorkIntake`
+    + callback（`ticketless_callback` / `q_enter_consultation_callback`）契約を再利用。domain/design
+    answer と Redmine anchor 作成は自動化しない。
+  - **cli leg**（`cli_workflow.py`）: `--dry-run` は route/result のみ（fence/send write ゼロ = purity）。
+    executable は非 dry-run で dedicated forward leg を一回だけ発火。tmux path / binding 無し lane は
+    byte-invariant。既存 tmux-era project-gateway primitive への個別 fallback は追加しない。
 
 ## 7. 実装 surface
 
-- pure domain: `...f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py`。
+- pure domain（authority）: `...f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py`。
 - loader: `...f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py`。
 - herdr step 結線: `...domain/workflow_step_herdr.py`（`resolve_herdr_workflow_step` の
-  `role_authority` 分岐）+ `...application/herdr_workflow_step.py`（`_resolve_role_authority`）。
+  `role_authority` 分岐 / `_role_authority_resolved_outcome` の forward-ready 化）+
+  `...application/herdr_workflow_step.py`（`_resolve_role_authority` / `execute_herdr_forward_leg`）。
+- Increment 3 pure route matrix: `...domain/workflow_forward_route.py`。
+- Increment 3 forward send adapter: `...application/herdr_forward_send.py`
+  （target 解決 + `execute_herdr_forward` + `OrchestrateHandoffForwardSendPort`）。
+- Increment 3 dedicated fence: `...core/state/forward_outbox_fence.py`。
+- cli leg: `...application/cli_workflow.py`（`_is_herdr_forward_leg` / `_execute_herdr_forward_leg`）。
 - role token 正本: `...f_130_handoff_routing/domain/transition_role.py`
-  （`grandparent_coordinator` / `project_gateway`）。
+  （`grandparent_coordinator` / `project_gateway`）。ticketless payload 正本:
+  `...f_130_handoff_routing/domain/ticketless_consultation.py` / `ticketless_work_intake.py` /
+  `ticketless_callback.py`。

@@ -66,6 +66,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_ROLE_PROVIDER_MISMATCH,
     WorkflowRoleResolution,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+    PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
+    PRIMITIVE_HERDR_FORWARD_CONSULT,
+    REASON_HERDR_FORWARD_CHILD_INTAKE_READY,
+    REASON_HERDR_FORWARD_CONSULT_READY,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
     EXECUTION_NO_OP,
@@ -74,6 +80,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OWNER_CHILD,
     OWNER_GRANDCHILD,
     OWNER_OPERATOR,
+    OWNER_PARENT,
     PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_NONE,
     STATE_CHILD_WORKER_DISPATCH,
@@ -181,6 +188,9 @@ HERDR_STEP_REASONS = frozenset(
         REASON_ROLE_BINDING_INVALID,
         REASON_ROLE_BINDING_AMBIGUOUS,
         REASON_ROLE_PROVIDER_MISMATCH,
+        # Increment 3 one-step forward-ready reasons (Redmine #13583).
+        REASON_HERDR_FORWARD_CONSULT_READY,
+        REASON_HERDR_FORWARD_CHILD_INTAKE_READY,
     }
 )
 
@@ -340,39 +350,49 @@ def _anchor_blocked(
 def _role_authority_resolved_outcome(
     lane: WorkflowLane, resolution: WorkflowRoleResolution
 ) -> WorkflowStepOutcome:
-    """Resolution-only outcome for a lane the durable role authority resolved (Redmine #13583).
+    """Executable one-step forward outcome for a resolved coordinator lane (Redmine #13583 Inc 3).
 
     The default-lane pair no longer fails closed ``ambiguous_default_coordinator_role`` when a
     durable workflow-role binding resolves it: the role is named (``grandparent_coordinator`` /
-    ``project_gateway``) and the caller is pointed at its one-step-down action. Increment 1 is
-    resolution-only — the herdr-native forward consult / child-intake **send** is a later
-    increment (Design Answer j#75782), so ``primitive=none`` and no delivery is performed here.
+    ``project_gateway``) and — Increment 3 (Design Answer j#76417, Opt A) — the resolved role's
+    **one-step-down forward** is now an executable leg (``execution=ready``) with a
+    **direction-specific** primitive + reason (safety-contract point 1). The pure resolver only
+    *names* the forward; the herdr-native target resolution + fenced single send happen in the
+    application forward leg (:mod:`...application.herdr_forward_send`), which the cli fires only when
+    NOT ``--dry-run`` — so a dry-run reports the route/result and mutates nothing (point 6). The
+    forward primitive rides its own dedicated duplicate fence, never the generic ``executable`` set.
     """
     if resolution.role == ROLE_GRANDPARENT_COORDINATOR:
         state = STATE_GRANDPARENT_CONSULTATION
+        primitive = PRIMITIVE_HERDR_FORWARD_CONSULT
+        reason = REASON_HERDR_FORWARD_CONSULT_READY
+        next_owner = OWNER_PARENT
         next_action = (
             "durable workflow-role authority resolves this default lane to the department-root "
-            "grandparent_coordinator. Its one-step-down action is a ticketless consultation to "
-            "the project gateway; the herdr-native forward wiring lands in a later increment "
-            "(Redmine #13583). Drive the consult from the durable Redmine record + `workflow "
-            "admission` meanwhile. workflow step performs no send here."
+            "grandparent_coordinator. workflow step forwards a single ticketless consultation to "
+            "the single live project gateway in the herdr inventory (fail closed on zero / "
+            "duplicate / drift); the gateway returns its result via the ticketless callback "
+            "primitive. No Redmine anchor is minted here."
         )
     else:  # ROLE_PROJECT_GATEWAY
         state = STATE_PARENT_WORK_INTAKE
+        primitive = PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE
+        reason = REASON_HERDR_FORWARD_CHILD_INTAKE_READY
+        next_owner = OWNER_CHILD
         next_action = (
             "durable workflow-role authority resolves this lane to the project_gateway "
-            f"(project_scope={resolution.project_scope!r}). Its one-step-down action is a "
-            "ticketless work-intake to the delegated_coordinator child; the herdr-native forward "
-            "wiring lands in a later increment (Redmine #13583). Drive the intake from the "
-            "durable Redmine record meanwhile. workflow step performs no send here."
+            f"(project_scope={resolution.project_scope!r}). workflow step forwards a single "
+            "ticketless work-intake to the same-lane-self-fenced child delegated_coordinator (fail "
+            "closed on same-lane / missing / duplicate). It answers no project-domain question and "
+            "mints no anchor; the child owns the Redmine anchor decision."
         )
     return WorkflowStepOutcome(
         state=state,
         next_action=next_action,
-        execution=EXECUTION_NO_OP,
-        reason=REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
-        next_owner=OWNER_CALLER,
-        primitive=PRIMITIVE_NONE,
+        execution=EXECUTION_READY,
+        reason=reason,
+        next_owner=next_owner,
+        primitive=primitive,
         caller_role=resolution.role,
         self_pane=lane.self_pane,
         repo_root=lane.repo_root,

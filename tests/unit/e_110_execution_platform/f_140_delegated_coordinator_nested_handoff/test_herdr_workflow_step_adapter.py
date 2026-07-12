@@ -613,11 +613,15 @@ class RoleAuthorityAdapterTest(unittest.TestCase):
         return adapter.resolve_herdr_step_outcome(argparse.Namespace(repo=None))
 
     def test_default_lane_with_grandparent_binding_resolves_without_anchor_read(self):
+        # Increment 3 (Redmine #13583): a resolved grandparent default lane short-circuits to the
+        # executable consultation forward outcome WITHOUT reading the worker/gateway anchor or the
+        # inventory (that resolution stays coordinator-only); the send itself is the cli leg.
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
             ROLE_GRANDPARENT_COORDINATOR,
         )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
-            REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+            PRIMITIVE_HERDR_FORWARD_CONSULT,
+            REASON_HERDR_FORWARD_CONSULT_READY,
         )
 
         self._write_bindings({"role": "grandparent_coordinator", "source_pointer": "redmine:#13583"})
@@ -629,9 +633,10 @@ class RoleAuthorityAdapterTest(unittest.TestCase):
             adapter, "_same_lane_worker_liveness", side_effect=AssertionError("inventory read")
         ):
             out = self._run()
-        self.assertEqual(out.reason, REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING)
+        self.assertEqual(out.reason, REASON_HERDR_FORWARD_CONSULT_READY)
         self.assertEqual(out.caller_role, ROLE_GRANDPARENT_COORDINATOR)
-        self.assertEqual(out.primitive, "none")
+        self.assertEqual(out.primitive, PRIMITIVE_HERDR_FORWARD_CONSULT)
+        self.assertEqual(out.execution, "ready")
 
     def test_default_lane_provider_mismatch_fails_closed(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (

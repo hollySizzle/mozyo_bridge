@@ -596,4 +596,115 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
     )
 
 
-__all__ = ("resolve_herdr_step_outcome",)
+def execute_herdr_forward_leg(args: argparse.Namespace, outcome):
+    """Perform the fenced one-step herdr coordinator forward at action time (Redmine #13583 Inc 3).
+
+    The executable counterpart of :func:`resolve_herdr_step_outcome`'s resolution-only forward
+    outcome (``execution=ready`` + a herdr forward primitive). It **re-resolves** the sender
+    identity + durable role authority from the live launch env + binding declaration at action time
+    (safety-contract point 2 — never trusts the resolution-time outcome), resolves the single live
+    target from the herdr inventory, and drives the dedicated
+    :class:`~mozyo_bridge.core.state.forward_outbox_fence.ForwardOutboxFence` around one ticketless
+    send via :func:`execute_herdr_forward`. A default-lane role that no longer resolves (a binding /
+    provider change between resolution and action) fails closed to a zero-send.
+
+    Returns a :class:`...herdr_forward_send.ForwardExecutionResult`.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+        resolve_sender_identity,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        _agent_locator,
+        decode_assigned_name,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_role_authority_source import (
+        load_parsed_role_bindings,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_forward_send import (
+        ForwardExecutionResult,
+        ForwardSendOutcome,
+        OrchestrateHandoffForwardSendPort,
+        SEND_FAILED,
+        execute_herdr_forward,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+        ZERO_SEND,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        ROLE_PROJECT_GATEWAY,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
+        HERDR_PROVIDER_CODEX,
+    )
+    from mozyo_bridge.core.state.forward_outbox_fence import (
+        ForwardOutboxFence,
+        ForwardOutboxFenceError,
+    )
+
+    def _blocked(reason: str, detail: str) -> "ForwardExecutionResult":
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status="", fence_state="", reason=reason,
+            detail=detail,
+        )
+
+    repo_root = repo_root_from_args(args)
+    anchor_ws = _anchor_workspace_id(repo_root)
+    sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+    if not sender_res.ok or sender_res.identity is None:
+        return _blocked(
+            "herdr_forward_sender_unresolved",
+            f"sender identity unresolved at action time ({sender_res.reason})",
+        )
+    sender = sender_res.identity
+
+    # Action-time re-validation (point 2): the durable role authority must STILL resolve this lane
+    # to a coordinator role; a binding / provider change since resolution fails closed to no send.
+    role_authority = _resolve_role_authority(args, repo_root, sender)
+    if role_authority is None or not role_authority.resolved:
+        return _blocked(
+            "herdr_forward_role_unresolved",
+            "the durable workflow-role authority no longer resolves this lane to a coordinator role",
+        )
+
+    parsed = load_parsed_role_bindings(repo_root)
+    gateway_lane_ids = frozenset(
+        b.lane_id for b in parsed.bindings if b.role == ROLE_PROJECT_GATEWAY
+    )
+    try:
+        rows = _same_lane_agent_rows(env=os.environ)
+    except Exception:  # noqa: BLE001 - an unreadable inventory yields no target -> fail closed
+        rows = []
+
+    fence = ForwardOutboxFence()
+    try:
+        if not fence.is_bootstrapped():
+            fence.bootstrap()
+    except ForwardOutboxFenceError as exc:
+        return _blocked("herdr_forward_fence_unavailable", f"fence bootstrap failed: {exc}")
+
+    return execute_herdr_forward(
+        role_authority,
+        args=args,
+        workspace_id=sender.workspace_id,
+        sender_lane_id=sender.lane_id,
+        target_provider=HERDR_PROVIDER_CODEX,
+        gateway_lane_ids=gateway_lane_ids,
+        rows=rows,
+        decode=decode_assigned_name,
+        locator_of=_agent_locator,
+        fence=fence,
+        send_port=OrchestrateHandoffForwardSendPort(repo_root=str(repo_root)),
+    )
+
+
+def _same_lane_agent_rows(*, env):
+    """The live herdr ``agent list`` rows (fail-closed helper, mirrors the dispatch inventory read)."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+        list_herdr_agent_rows,
+    )
+
+    return list_herdr_agent_rows(env)
+
+
+__all__ = ("resolve_herdr_step_outcome", "execute_herdr_forward_leg")
