@@ -159,6 +159,11 @@ class CreateGateTests(unittest.TestCase):
         self.assertIn("sender_attestation", outcome.blocked_reasons)
         self.assertIn("missing_sender_env", outcome.reason)
         self.assertEqual(ops.calls, [])
+        next_action = outcome.as_payload()["next_action"]
+        self.assertEqual(next_action["action"], "restore_attested_coordinator_shell")
+        self.assertIn(
+            "manual_mozyo_env_injection", next_action["forbidden_methods"]
+        )
 
     def test_sender_attestation_is_not_required_for_create_only(self):
         class MissingSenderOps(FakeActuatorOps):
