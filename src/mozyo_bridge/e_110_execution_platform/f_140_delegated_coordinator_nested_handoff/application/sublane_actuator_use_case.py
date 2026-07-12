@@ -225,6 +225,23 @@ class SublaneActuateUseCase:
             fill_decision_token = admission.fill_decision
             fill_override_reason = admission.override_reason
 
+            # #13613: optional herdr sender attestation must fail before mutation;
+            # absence preserves tmux and existing test-port compatibility.
+            sender_preflight = getattr(self.ops, "preflight_dispatch_sender", None)
+            if callable(sender_preflight):
+                sender_ok, sender_detail = sender_preflight()
+                if not sender_ok:
+                    return self._blocked(
+                        request,
+                        launch_action=None,
+                        reason="dispatch sender attestation failed before actuation; "
+                        f"{sender_detail}",
+                        reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
+                        dispatch=dispatch,
+                        fill_decision=fill_decision_token,
+                        fill_override_reason=fill_override_reason,
+                    )
+
         # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
         # identity field present (step 1 passed) the pure decision does not currently
         # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
