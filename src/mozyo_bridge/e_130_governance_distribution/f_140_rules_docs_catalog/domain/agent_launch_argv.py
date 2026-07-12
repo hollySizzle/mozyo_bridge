@@ -72,6 +72,11 @@ def _validate_launch_argv_token(token: object, *, source: str) -> None:
         )
     if token == "":
         raise AgentLaunchArgvError(f"{source} launch argv token must not be empty")
+    if token == "--":
+        raise AgentLaunchArgvError(
+            f"{source} launch argv token '--' is not allowed: managed launch options "
+            "must remain in the provider option region"
+        )
     for ch in token:
         if ord(ch) < 0x20 or ord(ch) == 0x7F:
             raise AgentLaunchArgvError(

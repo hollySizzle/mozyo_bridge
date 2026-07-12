@@ -833,6 +833,7 @@ class LaunchArgvConfigTest(unittest.TestCase):
     def test_bad_tokens_fail_closed(self) -> None:
         bad_argvs = (
             [""],  # empty token
+            ["--"],  # option terminator can hide later mozyo-managed flags
             ["a\nb"],  # newline
             ["a\tb"],  # tab / control char
             [5],  # non-string

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import tomllib
 import unittest
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.codex_shell_identity import (
@@ -19,7 +19,9 @@ class CodexShellIdentityTest(unittest.TestCase):
         rendered = dict(item.split("=", 1) for item in argv[1::2])
         self.assertEqual(
             {
-                key.removeprefix("shell_environment_policy.set."): json.loads(value)
+                key.removeprefix("shell_environment_policy.set."): tomllib.loads(
+                    "value=" + value
+                )["value"]
                 for key, value in rendered.items()
             },
             {
@@ -29,6 +31,17 @@ class CodexShellIdentityTest(unittest.TestCase):
             },
         )
         self.assertFalse(any("inherit" in item for item in argv))
+
+    def test_toml_round_trip_covers_unicode_and_control_escapes(self) -> None:
+        for lane in ('ascii"quoted', "line\nfeed", "日本語", "lane-😀"):
+            with self.subTest(lane=lane):
+                value = CodexShellIdentity("workspace", lane).launch_argv()[-1]
+                rendered = value.split("=", 1)[1]
+                self.assertEqual(tomllib.loads("value=" + rendered)["value"], lane)
+
+    def test_lone_surrogate_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-scalar surrogate"):
+            CodexShellIdentity("workspace", "lane-\ud800").launch_argv()
 
 
 if __name__ == "__main__":

@@ -27,6 +27,17 @@ class CodexShellIdentity:
     workspace_id: str
     lane_id: str
 
+    @staticmethod
+    def _toml_string(value: str) -> str:
+        """Render ``value`` as a TOML basic string accepted by Codex ``-c``."""
+
+        # JSON and TOML share the escapes used here, but JSON's default ASCII
+        # rendering represents non-BMP characters as UTF-16 surrogate pairs.
+        # Surrogates are not TOML Unicode scalar values, so retain real Unicode.
+        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            raise ValueError("Codex shell identity contains a non-scalar surrogate")
+        return json.dumps(value, ensure_ascii=False)
+
     def launch_argv(self) -> tuple[str, ...]:
         values = (
             (MOZYO_WORKSPACE_ID_ENV, self.workspace_id),
@@ -35,13 +46,11 @@ class CodexShellIdentity:
         )
         argv: list[str] = []
         for key, value in values:
-            # JSON strings are valid TOML basic strings and safely preserve any
-            # lane label accepted by the upstream identity resolver.
             argv.extend(
                 (
                     "-c",
                     f"shell_environment_policy.set.{key}="
-                    f"{json.dumps(value, ensure_ascii=True)}",
+                    f"{self._toml_string(value)}",
                 )
             )
         return tuple(argv)
