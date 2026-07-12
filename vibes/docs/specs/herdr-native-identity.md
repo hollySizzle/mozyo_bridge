@@ -93,6 +93,26 @@ resolver はこれを fail-closed に読む。
   は標準sendをfail-closedにし、手動env注入でattestationを捏造しない。これはenv-less operator shellを
   authority化しない既存境界の明確化であり、route authorityを増やさない。
 
+- **startup self-attestation は launch-time の自己観測であり cryptographic attestation ではない
+  (Redmine #13637, Design Answer j#76462)。** herdr は `agent get/list/pane/read/target` しか露出せず、
+  **launched process の environment を read-only で返す surface を持たない**。稼働中 process の environ は
+  外部プロセスから変更不可 (POSIX) なので、env-less な live agent を launcher / doctor が **in-place で
+  read も repair もできない** (修復は relaunch のみ)。したがって triplet が実際に spawn 先へ届いたかを
+  観測できるのは **agent 自身の process だけ**である。managed launch は provider を
+  `mozyo-bridge herdr agent-attest` で wrap し、agent boot 時に自 `os.environ` を launcher が期待する
+  identity と照合して `present | missing | conflict` を判定し、**live locator に generation-bind した
+  durable record** (home-scoped `herdr-identity-attestation.sqlite`、runtime observation projection、
+  env 値・secret は保存しない) を書いてから provider を `exec` する。この record は
+  (a) adopt が live name-match を採用してよいかの gate (§5) と、(b) doctor が env-less/mismatch managed
+  slot を non-green にする join、の入力になる。record は「今 env を live read した」ことを主張せず、
+  boot 時 self-attestation の有無・世代一致・verdict のみを表す。**§2 冒頭の #13614 command-shell
+  attestation を置換しない**: startup record は TUI process env の boot 時観測であり、tool-exec
+  subprocess への伝播を証明しないため、send 直前の `resolve_sender_identity(os.environ, ...)` は hard
+  gate のまま残る (env-less shell は依然 `missing_sender_env` で fail-closed)。record 不在/世代不一致
+  (stale)/`missing`/`conflict` の adopt は fail-closed し、**owner 承認の close + same-slot relaunch** を
+  next action として返す (自動 destructive repair を行わない)。真の暗号学的 attestation
+  (nonce / challenge-response) の導入は別 US 判断であり本節の範囲外。
+
 ## 3. Target-resolution semantics
 
 > **Redmine #13305 で route authority を収束 (design record #13305 j#73008)。** 本節の
@@ -248,8 +268,19 @@ flow:
 4. 要求 agent (`claude` / `codex`) を herdr 管理 agent として **durable 名を start 時に付与**して
    launch する (下記 launch contract)。self-identity (`MOZYO_WORKSPACE_ID` /
    `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`, §2) は `--env KEY=VALUE` で spawn 先へ渡す。
+   **startup self-attestation wrap (Redmine #13637)**: provider は直接ではなく
+   `mozyo-bridge herdr agent-attest --assigned-name <NAME> --workspace-id <WS> --role <PROVIDER>
+   --lane <LANE> -- <provider argv...>` を通して起動する。この wrapper は agent 自身の process として
+   走り、自 env を期待 identity と照合して §2 の startup self-attestation record を書いてから provider を
+   `exec` する (self-check before exec)。mozyo-bridge launcher が trusted env (絶対 PATH / 明示
+   override) で解決できない場合は wrap せず直接 provider を起動する byte-invariant fallback を採り
+   (dead pane を作らない)、record 不在は adopt / doctor 側で fail-closed に縮退する。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。
-   slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
+   ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
+   `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /
+   pre-feature slot) / stale (locator 世代不一致) / `missing` / `conflict` は blind-adopt せず read-only
+   の **`unattested`** として exact reason + owner 承認 close+relaunch next action で surface する
+   (自動 close/relaunch はしない)。slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
 6. slot-uniqueness (要求側、#13261 j#72532): 要求された `(provider, lane)` slot が重複する場合は
    **いかなる side effect (binary 解決 / registration / inventory snapshot / launch) より前に**
    fail-closed で拒否する (silent 正規化しない)。同一 slot を二重に prepare すると同じ mzb1 名を二度
