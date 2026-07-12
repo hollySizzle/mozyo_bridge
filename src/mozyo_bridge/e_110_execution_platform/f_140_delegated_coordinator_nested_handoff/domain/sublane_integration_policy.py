@@ -93,11 +93,13 @@ RETIRE_STATES = frozenset({RETIRE_OK, INTEGRATION_BLOCKED})
 #
 # Redmine #13602 (Design Consultation j#76403, Option A): routine green-preflight
 # retirement is coordinator authority — there is NO universal owner-approval retire gate.
-# The owner's close approval lives upstream in ``issue_closed`` (a durably closed issue is
-# already the owner's close decision); the retire *actuation* does not re-require a separate
-# owner approval, so ``owner_approval_missing`` no longer exists as a blocked reason. The
-# exceptional owner/design escalations (force / dirty discard / unpushed / foreign / release
-# / credential / destructive project state) keep their own gates and refusals.
+# The issue's close contract is enforced upstream at close time and abstracted by
+# ``issue_closed`` (a child Task/Test/Bug via ``task_close`` with no owner_close_approval; a
+# US / standalone issue via an owner_close_approval-backed close — central preset
+# ``US-Level Audit Model``); the retire *actuation* only reads the closed fact and does not
+# re-require a separate owner approval, so ``owner_approval_missing`` no longer exists as a
+# blocked reason. The exceptional owner/design escalations (force / dirty discard / unpushed
+# / foreign / release / credential / destructive project state) keep their own gates and refusals.
 BLOCKED_PREFLIGHT_FAILURE = "preflight_failure"
 BLOCKED_DIRTY_WORKTREE = "dirty_worktree"
 BLOCKED_VERIFICATION_FAILURE = "verification_failure"
@@ -262,10 +264,15 @@ class RetirePreflight:
     - ``target_identity_known`` — the lane / worktree / pane target is positively
       resolved; a destructive op against an unknown target is refused.
     - ``verification_passed`` — the lane's verification (tests / checks) passed.
-    - ``issue_closed`` — the lane's Redmine issue is durably closed (not merely
-      ``implementation_done`` / Review-approved). This IS the owner's close decision:
-      a durably closed issue already carries the owner-close approval, so the retire
-      actuation does not re-require a separate owner approval (Redmine #13602 Option A).
+    - ``issue_closed`` — the lane's Redmine issue is durably closed under the close
+      contract that applies to its issue type (not merely ``implementation_done`` /
+      Review-approved). That contract differs by type and this field abstracts over it: a
+      child Task/Test/Bug under a US closes via ``task_close`` (replayable journal + origin-
+      reachable commit hash + parent-US carry) WITHOUT its own owner_close_approval — the
+      owner close approval is collected once at the US level; a US or a standalone issue (no
+      parent US) closes only with its own owner_close_approval-backed close (central preset
+      ``US-Level Audit Model``). Retire reads only the closed *fact*, never which contract
+      produced it, and never re-collects the owner close approval (Redmine #13602 Option A).
     - ``callbacks_drained`` — no outstanding coordinator callback is owed (this is where
       an unresolved *owner-approval-waiting* callback still blocks — retirement waits on a
       pending owner decision, it just does not demand a fresh approval once the issue is
@@ -274,13 +281,16 @@ class RetirePreflight:
 
     Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately NO
     ``owner_approval_present`` field here. Requiring a separate owner approval on every
-    routine retire double-gated the already-owner-approved issue close and made lane drain
-    depend on owner hand-work; ``worktree-lifecycle-boundary.md`` and the portable retire
+    routine retire double-gated the issue's own close contract and made lane drain depend on
+    owner hand-work; ``worktree-lifecycle-boundary.md`` and the portable retire
     ``safety_preflight`` (redmine_closed / worktree_clean / origin_reachable /
     pending_prompt_absent / callback_drained / target_identity_known) never listed owner
-    approval as a field. The exceptional destructive cases (force / dirty discard / unpushed
-    / foreign target / release / credential / destructive project state) keep their own
-    gates upstream and are out of scope here.
+    approval as a field. This does NOT relax any close contract (the owner_close_approval a
+    US / standalone issue needs, or the ``task_close`` a child needs, is still enforced at
+    close time, upstream of ``issue_closed``) and does NOT touch the separate session-boundary
+    pane-kill approval. The exceptional destructive cases (force / dirty discard / unpushed /
+    foreign target / release / credential / destructive project state) keep their own gates
+    upstream and are out of scope here.
     """
 
     is_git_workspace: bool
@@ -355,7 +365,8 @@ def decide_retire_integration(
       checked unconditionally — no policy field can switch them off, because the config
       schema has no key for them. Routine green-preflight retirement is coordinator
       authority: there is no owner-approval invariant (Redmine #13602 Option A) — the
-      owner's close decision already lives in ``issue_closed``.
+      issue's applicable close contract (child ``task_close`` / US-or-standalone
+      owner_close_approval) is enforced upstream and abstracted by ``issue_closed``.
     - The **merge gate** is the only thing ``merge_on_retire`` controls: ``false`` skips
       the merge requirement (the opt-out), but every other gate still applies, so opting
       out of the merge can never make an unsafe retirement ``ok``.

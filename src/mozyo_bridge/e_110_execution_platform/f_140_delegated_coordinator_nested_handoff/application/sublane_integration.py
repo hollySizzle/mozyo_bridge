@@ -115,8 +115,12 @@ class RetireInvariants:
 
     Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
     ``owner_approval_present`` invariant — routine green-preflight retirement is coordinator
-    authority. The owner's close decision is already carried by ``issue_closed``; an
-    outstanding owner-approval-waiting still blocks via ``callbacks_drained``.
+    authority. ``issue_closed`` abstracts over the close contract that applied to the issue
+    type (a child Task/Test/Bug via ``task_close`` with no owner_close_approval; a US /
+    standalone issue via an owner_close_approval-backed close — central preset
+    ``US-Level Audit Model``), which the coordinator asserts as a single closed fact; retire
+    never re-collects the owner close approval. An outstanding owner-approval-waiting still
+    blocks via ``callbacks_drained``.
     """
 
     target_identity_known: bool = False

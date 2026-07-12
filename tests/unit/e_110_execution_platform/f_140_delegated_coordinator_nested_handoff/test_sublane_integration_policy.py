@@ -268,6 +268,13 @@ class ConfigUndisableableInvariantsTest(unittest.TestCase):
         # coordinator authority. There is no owner-approval field / gate; a clean preflight
         # (issue closed, callbacks drained, durable record present, target known, verified,
         # latest generation admissible) retires without any owner-approval assertion.
+        #
+        # ``issue_closed`` is a single closed *fact* that abstracts over the close contract of
+        # the issue type (child Task/Test/Bug -> task_close with no owner_close_approval;
+        # US/standalone -> owner_close_approval-backed close). The decision reads only the
+        # closed fact and is agnostic to which contract produced it (R1-F1 j#76452): the same
+        # green preflight retires regardless of whether owner close approval was ever part of
+        # that issue's close, because that contract is enforced upstream at close time.
         decision = decide_retire_integration(
             SublaneIntegrationPolicy.default(),
             RetirePreflight(is_git_workspace=True, **_all_invariants_ok()),
