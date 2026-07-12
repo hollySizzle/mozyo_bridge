@@ -351,6 +351,23 @@ def render_workflow_event_marker(
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
 
 
+def render_gate_note(gate: str, *, body: str = "", **marker_fields: object) -> str:
+    """Render a **canonical gate-record note**: prose body + the embedded gate marker (pure).
+
+    The single canonical renderer for a callback-required gate journal (#13520 review F1a): a gate
+    recorded through this path always carries the structured
+    :func:`render_workflow_event_marker` token, so the callback watcher can **discover** it
+    (:func:`markers_from_source`) instead of relying on a hand-written fixture marker or prose. The
+    marker is appended after the human-readable ``body`` (blank body -> just the marker). ``gate``
+    must be a callback-required kind (:data:`GATE_BEARING_KINDS`); ``marker_fields`` are forwarded
+    to :func:`render_workflow_event_marker` (conclusion / callback / commit_bearing / …). Pure;
+    the caller (the application writer) posts the returned text as a Redmine journal note.
+    """
+    marker = render_workflow_event_marker(gate, **marker_fields)  # type: ignore[arg-type]
+    body_s = str(body or "").rstrip()
+    return f"{body_s}\n\n{marker}" if body_s else marker
+
+
 __all__ = (
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
@@ -363,4 +380,5 @@ __all__ = (
     "MappingRedmineJournalSource",
     "markers_from_source",
     "render_workflow_event_marker",
+    "render_gate_note",
 )

@@ -22,7 +22,12 @@ Actions (mutually exclusive):
 - ``--run-once`` — one **production pass**: discover fresh handoff-worthy gate candidates from
   ``--source-issue`` (structured markers), ingest/classify, deliver once, sweep. Actuates.
 - ``--watch`` — the bounded background-watcher loop: run a production pass per Herdr-event wake
-  (``--max-passes`` / ``--wake-interval``), re-reading Redmine every wake outcome. Actuates.
+  (``--max-passes`` / ``--wake-target`` stable ``wait agent-status`` event, else ``--wake-interval``),
+  re-reading Redmine every wake outcome. Actuates.
+- ``--emit-gate`` — record a canonical callback-required gate journal on Redmine (``--issue`` +
+  ``--gate`` [+ ``--body``]) with the discoverable ``[mozyo:workflow-event:...]`` marker embedded,
+  through the credential-gated, opt-in note transport. This is the production **producer** the
+  watcher discovers; fail-closed (``write_optin_unset``) without ``MOZYO_REDMINE_DELIVERY_WRITE``.
 
 Always exits 0 for a successful read / record / pass; a source / store error is a
 ``SystemExit`` with a redacted message (never a credential / URL / pane id).
@@ -264,6 +269,36 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         ]
         return _emit(payload, as_json=as_json, text_lines=lines)
 
+    if getattr(args, "emit_gate", False):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
+            emit_gate_record,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
+            redmine_delivery_transport_from_env,
+        )
+
+        issue = (getattr(args, "issue", None) or "").strip()
+        gate = (getattr(args, "gate", None) or "").strip()
+        if not issue or not gate:
+            raise SystemExit("--emit-gate requires --issue and --gate")
+        # Credential-gated, opt-in production writer (MOZYO_REDMINE_DELIVERY_WRITE). None ->
+        # write_optin_unset (nothing written, fail-closed — never a silent success).
+        transport = redmine_delivery_transport_from_env()
+        receipt = emit_gate_record(
+            issue, gate, body=(getattr(args, "body", None) or ""), transport=transport
+        )
+        payload = {"action": "emit-gate", "issue": issue, "gate": gate, **receipt.as_payload()}
+        lines = [
+            "action: emit-gate",
+            f"issue: #{issue}",
+            f"gate: {gate}",
+            f"recorded: {receipt.recorded}",
+            f"reason: {receipt.reason}",
+        ]
+        if receipt.location:
+            lines.append(f"location: {receipt.location}")
+        return _emit(payload, as_json=as_json, text_lines=lines)
+
     if getattr(args, "run_once", False) or getattr(args, "watch", False):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
             discover_candidates,
@@ -354,6 +389,14 @@ def register_callbacks(sub) -> None:
         "--watch", action="store_true",
         help="Bounded background-watcher loop; one production pass per wake (--max-passes).",
     )
+    action.add_argument(
+        "--emit-gate", dest="emit_gate", action="store_true",
+        help="Record a canonical callback-required gate journal on Redmine WITH the discoverable "
+             "marker (--issue + --gate; credential-gated, opt-in; fail-closed without the opt-in).",
+    )
+    p.add_argument("--issue", help="Issue id for --emit-gate.")
+    p.add_argument("--gate", help="Callback-required gate kind for --emit-gate (implementation_done | review_request | review_result | owner_close_approval_waiting | blocked).")
+    p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
     p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")
     p.add_argument(
         "--wake-interval", dest="wake_interval", type=float, default=0.0,
