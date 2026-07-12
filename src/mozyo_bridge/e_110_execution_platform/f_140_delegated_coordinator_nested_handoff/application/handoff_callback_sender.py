@@ -40,10 +40,20 @@ class HandoffDeliveryResult:
     ``reason`` is its reason token. The adapter maps this onto a closed send outcome; a
     ``send_fn`` that could not even produce a result (an exception) is treated as
     :data:`SEND_UNCERTAIN` by :class:`HandoffCallbackSender` (fail-safe, no auto-retry).
+
+    ``persist_ok`` / ``persist_reason`` are **best-effort durable-receipt evidence** (#13520
+    review F6): whether the sanctioned ``--persist-delivery`` path wrote a Redmine delivery
+    receipt, and its reason token (``ok`` / ``write_optin_unset`` / ``transport_error`` …).
+    They are *observability only* and DELIBERATELY do NOT affect the send outcome: the
+    authoritative durable callback record is the home-scoped outbox row, not the Redmine
+    receipt, so a confirmed turn-start is ``delivered`` even when the receipt did not persist
+    (``persist_ok`` is None when no receipt was reported / parsed).
     """
 
     status: str
     reason: str
+    persist_ok: "bool | None" = None
+    persist_reason: str = ""
 
 
 class HandoffCallbackSender:

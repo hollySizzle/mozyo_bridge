@@ -70,12 +70,27 @@ _RECOGNIZED_CHANNELS = frozenset(
     {MARKER_CHANNEL_HANDOFF, MARKER_CHANNEL_WORKFLOW_EVENT}
 )
 
-#: The gate-bearing kinds a marker may name (mirrors the adapter's core-owned
-#: ``WORKFLOW_GATE_KINDS``; kept local so this domain stays inside its bounded context and
-#: does not import the e_140 adapter). A non-gate kind (``implementation_request`` /
-#: ``design_consultation`` / ``reply`` / ``start`` / ``close`` …) is skipped, never guessed.
+#: The **callback-required** gate kinds a marker may name — the states that must wake the
+#: coordinator (``skills/mozyo-bridge-agent/references/workflow.md`` ``### coordinator callback
+#: を要する state``: ``implementation_done | review_request | review_result |
+#: owner_close_approval_waiting | blocked``). #13520 review F5: this is DELIBERATELY broader than
+#: the provider review-gate vocabulary ``WORKFLOW_GATE_KINDS`` (which excludes owner-close because
+#: "close approval is satisfied" is a core decision, not a provider-observable fact) — a callback
+#: only *wakes the coordinator to read the journal*, it authorizes nothing, so ``blocked`` and
+#: ``owner_close_approval_waiting`` legitimately trigger a callback. Kept local so this domain
+#: stays inside its bounded context and does not import the e_140 adapter. A non-gate kind
+#: (``implementation_request`` / ``design_consultation`` / ``reply`` / ``start`` / ``close`` …)
+#: is skipped, never guessed. ``review_result`` / ``owner_close_approval_waiting`` are the
+#: marker-facing names; :data:`...redmine_event_intake.MARKER_GATE_ALIASES` maps them onto the
+#: runtime ``review`` / ``owner_close_approval`` gates.
 GATE_BEARING_KINDS: frozenset[str] = frozenset(
-    {"implementation_done", "review_request", "review_result"}
+    {
+        "implementation_done",
+        "review_request",
+        "review_result",
+        "owner_close_approval_waiting",
+        "blocked",
+    }
 )
 
 #: ``[mozyo:<channel>:<body>]`` — the body is the ':'-separated key=value field list.

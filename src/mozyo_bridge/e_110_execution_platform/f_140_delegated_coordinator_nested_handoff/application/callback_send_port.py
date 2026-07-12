@@ -21,6 +21,21 @@ Boundaries the port holds:
   anchors.
 - **no raw Herdr / tmux on the LLM surface.** The port is background-runtime code; it never
   exposes a raw ``herdr agent wait/read/list/send`` to an LLM role.
+
+Durability contract (#13520 review F6, design D1)
+-------------------------------------------------
+The **authoritative durable callback record is the home-scoped callback outbox row**
+(``workflow-runtime.sqlite``, design answer j#75098 Q3), not the Redmine delivery receipt.
+``--persist-delivery`` writes a *best-effort, credential-gated Redmine delivery receipt* — a
+human-visible notification pointer — through the same staged transport all handoff deliveries
+use; it can legitimately report ``write_optin_unset`` (the ``MOZYO_REDMINE_DELIVERY_WRITE`` opt-in
+is unset) or a transport failure WITHOUT affecting durability or the delivered outcome. The port
+therefore parses the receipt only as **observable evidence** (surfaced on
+:class:`...handoff_callback_sender.HandoffDeliveryResult`); a confirmed turn-start is ``delivered``
+regardless of whether the receipt persisted. On local outbox loss, recovery is by re-reading the
+**exact Redmine gate journal** (the fresh-turn sweep / host-restart reconciler), never the delivery
+receipt. (This supersedes the earlier j#75108 phrasing that the receipt "records the outcome
+durably"; the outbox is the durability mechanism, the receipt is a best-effort human pointer.)
 """
 
 from __future__ import annotations
@@ -67,6 +82,28 @@ def _parse_outcome(stdout: str) -> Optional["tuple[str, str]"]:
     return None
 
 
+def _parse_receipt(stdout: str) -> Optional["tuple[bool, str]"]:
+    """Extract ``(persisted, reason)`` from the ``--persist-delivery`` receipt JSON, or ``None``.
+
+    With ``--record-format json --persist-delivery`` the handoff also prints the delivery
+    ``DeliveryReceipt`` JSON (``persisted`` / ``reason`` / ``record_class`` — distinct from the
+    outcome JSON, which carries ``status`` / ``reason``). This is **best-effort observability
+    only** (#13520 review F6): it never changes the send outcome. ``None`` when no receipt line
+    was printed (e.g. ``--persist-delivery`` produced no receipt) or it did not parse.
+    """
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = _json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "persisted" in obj and "record_class" in obj:
+            return bool(obj["persisted"]), str(obj.get("reason", ""))
+    return None
+
+
 @dataclass
 class HandoffCallbackSendPort:
     """A real, fail-safe callback ``send_fn`` over ``mozyo-bridge handoff send``.
@@ -92,23 +129,32 @@ class HandoffCallbackSendPort:
             "--mode", "standard",
             "--target-repo", "auto",
             "--record-format", "json",
-            # Persist the callback delivery outcome durably through the sanctioned handoff
-            # delivery-record path (#13520 review F1-R1 / j#75108). The write transport is
-            # credential-gated (a local receipt otherwise) — the same gated path all handoff
-            # deliveries use — so the outcome is recorded durably where the environment allows.
+            # Emit a best-effort, credential-gated Redmine delivery RECEIPT through the sanctioned
+            # handoff delivery-record path (#13520 review F6). This is a human-visible notification
+            # pointer, NOT the durability mechanism: the outbox row is the authoritative durable
+            # record (see the module "Durability contract"). The receipt is parsed only as
+            # observable evidence and never gates the delivered outcome.
             "--persist-delivery",
         ]
         try:
             rc, stdout = self.runner(argv)
         except Exception:  # noqa: BLE001 - a runner blow-up is fail-safe uncertain, never a crash/retry
             return HandoffDeliveryResult("blocked", "inject_failed")
-        parsed = _parse_outcome(stdout or "")
+        stdout = stdout or ""
+        receipt = _parse_receipt(stdout)
+        persist_ok = receipt[0] if receipt is not None else None
+        persist_reason = receipt[1] if receipt is not None else ""
+        parsed = _parse_outcome(stdout)
         if parsed is not None:
-            return HandoffDeliveryResult(parsed[0], parsed[1])
+            return HandoffDeliveryResult(
+                parsed[0], parsed[1], persist_ok=persist_ok, persist_reason=persist_reason
+            )
         # No parseable structured outcome: fail safe. A clean rc still cannot confirm a
         # turn-start, so treat it as uncertain (no auto-retry); a nonzero rc is likewise
         # unconfirmed. Never optimistically report delivered without the structured outcome.
-        return HandoffDeliveryResult("blocked", "turn_start_unconfirmed")
+        return HandoffDeliveryResult(
+            "blocked", "turn_start_unconfirmed", persist_ok=persist_ok, persist_reason=persist_reason
+        )
 
 
 __all__ = (

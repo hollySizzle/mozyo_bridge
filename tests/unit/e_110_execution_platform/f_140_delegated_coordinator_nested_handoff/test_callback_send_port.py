@@ -67,6 +67,39 @@ class HandoffCallbackSendPortTest(unittest.TestCase):
         # A clean rc without a structured outcome cannot confirm a turn-start -> uncertain.
         self.assertEqual((result.status, result.reason), ("blocked", "turn_start_unconfirmed"))
 
+    def test_persist_receipt_is_surfaced_as_observable_evidence(self):
+        # #13520 review F6: the port parses the --persist-delivery receipt (distinct JSON line)
+        # and surfaces it as evidence, without affecting the send outcome.
+        stdout = (
+            '{"status": "sent", "reason": "ok"}\n'
+            '{"persisted": true, "reason": "ok", "record_class": "delivery_notification", '
+            '"provider": "redmine", "location": "redmine:issue=13518:journal=75094"}'
+        )
+        result = HandoffCallbackSendPort(runner=lambda argv: (0, stdout))(_row())
+        self.assertEqual((result.status, result.reason), ("sent", "ok"))
+        self.assertTrue(result.persist_ok)
+        self.assertEqual(result.persist_reason, "ok")
+
+    def test_delivered_not_gated_on_failed_persist(self):
+        # A confirmed turn-start is still `sent/ok` even when the durable Redmine receipt did NOT
+        # persist (outbox is the durability authority; the receipt is best-effort evidence).
+        stdout = (
+            '{"status": "sent", "reason": "ok"}\n'
+            '{"persisted": false, "reason": "write_optin_unset", '
+            '"record_class": "delivery_notification", "provider": "redmine", "location": null}'
+        )
+        result = HandoffCallbackSendPort(runner=lambda argv: (0, stdout))(_row())
+        self.assertEqual((result.status, result.reason), ("sent", "ok"))  # NOT gated on persist
+        self.assertFalse(result.persist_ok)
+        self.assertEqual(result.persist_reason, "write_optin_unset")
+
+    def test_no_receipt_line_leaves_persist_evidence_unknown(self):
+        result = HandoffCallbackSendPort(
+            runner=lambda argv: (0, '{"status": "sent", "reason": "ok"}')
+        )(_row())
+        self.assertIsNone(result.persist_ok)
+        self.assertEqual(result.persist_reason, "")
+
 
 if __name__ == "__main__":
     unittest.main()

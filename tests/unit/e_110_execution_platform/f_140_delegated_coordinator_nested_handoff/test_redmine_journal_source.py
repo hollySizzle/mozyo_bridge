@@ -225,6 +225,27 @@ class RenderWorkflowEventMarkerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             render_workflow_event_marker("reply")
 
+    def test_blocked_is_callback_required_and_round_trips(self):
+        # #13520 review F5: the callback-required vocabulary (workflow.md ### coordinator
+        # callback を要する state) includes blocked — a coordinator must be woken on a blocker.
+        token = render_workflow_event_marker("blocked")
+        self.assertEqual(token, "[mozyo:workflow-event:gate=blocked]")
+        markers = extract_markers_from_note("13518", "75300", f"blocked on X {token}")
+        self.assertEqual(markers[0].gate, "blocked")
+
+    def test_owner_close_approval_waiting_round_trips_to_owner_close_approval(self):
+        # #13520 review F5: the marker-facing owner_close_approval_waiting state maps onto the
+        # runtime owner_close_approval gate.
+        token = render_workflow_event_marker("owner_close_approval_waiting")
+        markers = extract_markers_from_note("13518", "75301", token)
+        self.assertEqual(markers[0].gate, "owner_close_approval")
+
+    def test_still_rejects_non_callback_gate_close(self):
+        # `close` reaches a terminal gate but is not a coordinator-callback state (the coordinator
+        # drives close, it is not woken to it) — the producer must not mint a marker for it.
+        with self.assertRaises(ValueError):
+            render_workflow_event_marker("close")
+
 
 if __name__ == "__main__":
     unittest.main()
