@@ -93,6 +93,35 @@ def _resolve_workspace_id(args: argparse.Namespace) -> str:
     return str(ws or os.environ.get("MOZYO_WORKSPACE_ID") or "").strip()
 
 
+def _require_partition_workspace_id(args: argparse.Namespace) -> str:
+    """Resolve the attested workspace for a MUTATING callback action, fail-closed on blank.
+
+    #13518 review R3-F3: a mutating action (``--deliver`` / ``--run-once`` / ``--watch`` /
+    ``--sweep``) claims, reconciles, and routes real callback rows over the shared home DB. An
+    unresolved (blank) workspace id would claim / reconcile across ALL workspaces
+    (``claim_pending(None)`` / ``recover_inflight(None)``) and let the sender route a foreign row on
+    ambient cwd/env — the exact cross-workspace duplicate/misroute R2-F5 was meant to fence. So a
+    mutating action REQUIRES a non-empty, authority-verified workspace id (the workspace registry
+    anchor, else ``MOZYO_WORKSPACE_ID``) and claims exactly that partition.
+
+    The blank / legacy all-workspace bucket is available ONLY behind the explicit
+    ``--allow-unpartitioned-callbacks`` debug/migration surface — never as the default production
+    behaviour.
+    """
+    ws = _resolve_workspace_id(args)
+    if ws:
+        return ws
+    if getattr(args, "allow_unpartitioned_callbacks", False):
+        return ""  # explicit debug/migration: legacy un-partitioned all-workspace claim/reclaim
+    raise SystemExit(
+        "workflow callbacks refuses a mutating action (--deliver / --run-once / --watch / "
+        "--sweep) without a resolved workspace identity: over a shared home DB it would claim, "
+        "reconcile, and route callback rows across ALL workspaces. Anchor this repo's workspace "
+        "(workspace_registry) or set MOZYO_WORKSPACE_ID, then re-run. For an explicit legacy / "
+        "migration sweep over the un-partitioned bucket, pass --allow-unpartitioned-callbacks."
+    )
+
+
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
     """Build the live poll source from daemon-trusted credentials (patchable test seam)."""
     since = (getattr(args, "since", None) or "").strip() or None
@@ -258,7 +287,9 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
     outbox = _outbox_from_args(args)
 
     if getattr(args, "sweep", False):
-        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=_resolve_workspace_id(args))
+        processor = CallbackOutboxProcessor(
+            outbox, _NULL_SOURCE, workspace_id=_require_partition_workspace_id(args)
+        )
         report = processor.sweep()
         payload = {"action": "sweep", **report.as_payload()}
         lines = [
@@ -299,8 +330,9 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         return _emit(payload, as_json=as_json, text_lines=lines)
 
     if getattr(args, "deliver", False):
+        ws = _require_partition_workspace_id(args)  # R3-F3: fail-closed before any claim / send
         sender = _callback_sender(args)  # the real handoff send port (actuates one send per row)
-        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=_resolve_workspace_id(args))
+        processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=ws)
         report = processor.deliver(sender, limit=int(getattr(args, "limit", 32) or 32))
         payload = {"action": "deliver", **report.as_payload()}
         lines = [
@@ -404,6 +436,9 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
             watch,
         )
 
+        # R3-F3: a production pass claims + routes real rows — fail-closed before any pass on a
+        # blank/unverified workspace (claim exactly this partition; sender pins to it).
+        ws = _require_partition_workspace_id(args)
         explicit = list(getattr(args, "candidate", None) or [])
         source_issue = (getattr(args, "source_issue", None) or "").strip()
         sender = _callback_sender(args)
@@ -416,11 +451,11 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         source = _journal_source(args) if needs_source else _NULL_SOURCE
 
         def _pass() -> dict:
-            processor = CallbackOutboxProcessor(outbox, source, workspace_id=_resolve_workspace_id(args))
+            processor = CallbackOutboxProcessor(outbox, source, workspace_id=ws)
             candidates = list(explicit)
             if source_issue:
                 candidates.extend(
-                    discover_candidates(source, source_issue, workspace_id=_resolve_workspace_id(args))
+                    discover_candidates(source, source_issue, workspace_id=ws)
                 )
             return run_once(processor, sender, candidates=candidates, cursor=cursor)
 
@@ -540,6 +575,13 @@ def register_callbacks(sub) -> None:
     p.add_argument("--cursor", help="Efficiency cursor to persist on --ingest.")
     p.add_argument("--limit", type=int, default=32, help="Max rows to claim per --deliver pass.")
     p.add_argument("--store-path", dest="store_path", help="Override the workflow-runtime.sqlite path (test/debug).")
+    p.add_argument(
+        "--allow-unpartitioned-callbacks", dest="allow_unpartitioned_callbacks", action="store_true",
+        help="DEBUG/MIGRATION ONLY: allow a mutating action (--deliver / --run-once / --watch / "
+             "--sweep) to run against the legacy un-partitioned (all-workspace) bucket when no "
+             "workspace identity resolves. Default production fails closed (#13518 review R3-F3) — "
+             "never route/reclaim across workspaces on a shared home DB without an attested id.",
+    )
     p.add_argument("--json", action="store_true", help="Emit a structured JSON result.")
     p.set_defaults(func=cmd_workflow_callbacks)
 

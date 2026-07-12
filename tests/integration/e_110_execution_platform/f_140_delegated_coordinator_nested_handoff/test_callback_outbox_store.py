@@ -170,6 +170,27 @@ class InflightRecoveryTest(_OutboxTestCase):
         self.outbox.enqueue(_key("75094"))
         self.assertEqual(self.outbox.recover_inflight(stale_seconds=0), ())
 
+    def test_recover_inflight_is_workspace_partitioned(self):
+        # #13518 review R3-F3: recover_inflight scopes to a workspace exactly like claim_pending —
+        # a workspace-A processor never reclaims workspace B's stale inflight rows on a shared DB.
+        ka = CallbackOutboxKey(
+            source="redmine", issue="13518", journal="75094",
+            normalized_gate="implementation_done", callback_route="coordinator", workspace_id="A",
+        )
+        kb = CallbackOutboxKey(
+            source="redmine", issue="13518", journal="75094",
+            normalized_gate="implementation_done", callback_route="coordinator", workspace_id="B",
+        )
+        self.outbox.enqueue(ka)
+        self.outbox.enqueue(kb)
+        self.outbox.claim_pending(workspace_id="A")
+        self.outbox.claim_pending(workspace_id="B")
+        recovered = self.outbox.recover_inflight(stale_seconds=0, workspace_id="A")
+        self.assertEqual([r.workspace_id for r in recovered], ["A"])  # only A reclaimed
+        by_ws = {r.workspace_id: r.state for r in self.outbox.read()}
+        self.assertEqual(by_ws["A"], CALLBACK_PENDING)  # reclaimed
+        self.assertEqual(by_ws["B"], CALLBACK_INFLIGHT)  # untouched
+
 
 class ConcurrentClaimFencingTest(unittest.TestCase):
     """F2 regression (#13520 j#75147): two processors never double-send the same callback."""

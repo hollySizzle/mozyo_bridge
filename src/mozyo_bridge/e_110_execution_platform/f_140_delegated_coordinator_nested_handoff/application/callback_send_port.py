@@ -116,21 +116,25 @@ class HandoffCallbackSendPort:
 
     runner: CallbackSendRunner = _default_runner
     mozyo_bridge_bin: str = "mozyo-bridge"
-    #: The workspace this sender is attested for (#13520 review R2-F5). When both this and the
-    #: row carry a workspace id and they DIFFER, the send is refused (fail-closed) rather than
-    #: routing another workspace's callback via the ambient cwd/env — a sender pins to the row's
-    #: stored/attested workspace, it never delivers a foreign workspace's row. "" (either side)
-    #: skips the check (legacy / single-workspace, back-compat).
+    #: The workspace this sender is attested for (#13520 review R2-F5 / #13518 review R3-F3). When
+    #: attested (non-blank), the sender routes a row ONLY when the row's workspace id EXACTLY
+    #: matches — a foreign row OR a row with no workspace id is refused (fail-closed), rather than
+    #: routing on the ambient cwd/env. An attested sender never delivers a workspace it cannot
+    #: positively confirm the row belongs to. "" (attested blank) skips the check — the legacy /
+    #: single-workspace / explicit-migration bucket, reachable in production only behind the CLI's
+    #: --allow-unpartitioned-callbacks surface.
     attested_workspace_id: str = ""
 
     def __call__(self, row: CallbackOutboxRow) -> HandoffDeliveryResult:
         row_ws = str(getattr(row, "workspace_id", "") or "").strip()
         attested = str(self.attested_workspace_id or "").strip()
-        if row_ws and attested and row_ws != attested:
-            # Fail-closed workspace pin: refuse to route a foreign workspace's callback. Not a
-            # deterministic pre-injection refusal that dead-letters — return uncertain so the row
-            # stays for the correct-workspace watcher (never delivered here, never mis-sent).
-            return HandoffDeliveryResult("blocked", "workspace_mismatch")
+        if attested and row_ws != attested:
+            # Fail-closed workspace pin (R3-F3): an attested sender routes only an EXACT-match row.
+            # A foreign row (different workspace) or an unattested row (no workspace id) is refused —
+            # not a deterministic dead-letter but ``blocked`` so the row stays for its correct
+            # workspace's sender (never delivered here, never mis-sent on ambient env).
+            reason = "workspace_mismatch" if row_ws else "workspace_unattested_row"
+            return HandoffDeliveryResult("blocked", reason)
         argv = [
             self.mozyo_bridge_bin, "handoff", "send",
             "--to", "codex",

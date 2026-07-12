@@ -76,6 +76,13 @@ class _CliTestCase(unittest.TestCase):
         self.snapshot = Path(self._tmp.name) / "issue.json"
         self.snapshot.write_text(_json.dumps(_SNAPSHOT), encoding="utf-8")
         self.outbox = CallbackOutbox(path=self.store_path)
+        # #13518 review R3-F3: pin a deterministic workspace so the mutating actions (deliver /
+        # run-once / sweep) run partitioned + hermetic, independent of ambient MOZYO_WORKSPACE_ID
+        # or the dev machine's workspace anchor. The fail-closed / --allow-unpartitioned behaviour
+        # is exercised explicitly in PartitionRequirementTest, which re-patches this seam.
+        self._orig_resolve_ws = cli._resolve_workspace_id
+        cli._resolve_workspace_id = lambda args: "ws_cli_test"
+        self.addCleanup(setattr, cli, "_resolve_workspace_id", self._orig_resolve_ws)
 
     def _candidate(self, spec: str):
         return cli._parse_candidate(spec)
@@ -361,6 +368,71 @@ class RunOnceCliTest(_CliTestCase):
         finally:
             cli._callback_sender = orig
         self.assertEqual(rc, 0)
+
+
+class PartitionRequirementTest(_CliTestCase):
+    """#13518 review R3-F3: a mutating action over a shared home DB must REQUIRE a resolved
+    workspace and claim / reclaim / route exactly that partition. An env-less / anchor-less
+    process fails closed (zero claims / sends), and the legacy all-workspace bucket is reachable
+    only behind the explicit --allow-unpartitioned-callbacks debug/migration surface."""
+
+    def _seed_foreign_pending(self, workspace_id: str) -> None:
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutboxKey
+
+        self.outbox.enqueue(
+            CallbackOutboxKey(
+                source="redmine", issue="13518", journal="75094",
+                normalized_gate="implementation_done", callback_route="coordinator",
+                workspace_id=workspace_id,
+            ),
+            notification_kind="implementation_done",
+        )
+
+    def test_envless_deliver_fails_closed_and_sends_nothing(self):
+        # No resolvable workspace + no --allow-unpartitioned: refuse before any claim / send.
+        cli._resolve_workspace_id = lambda args: ""
+        self._seed_foreign_pending("ws_foreign")
+        sends = []
+        cli._callback_sender = lambda args: (lambda row: sends.append(row) or SEND_DELIVERED)
+        with self.assertRaises(SystemExit):
+            cli.cmd_workflow_callbacks(_args(deliver=True, store_path=str(self.store_path)))
+        self.assertEqual(sends, [])  # zero sends
+        # The foreign row was never claimed — it stays pending for its own workspace's sender.
+        self.assertEqual([r.workspace_id for r in self.outbox.read(states=[CALLBACK_PENDING])], ["ws_foreign"])
+
+    def test_envless_run_once_fails_closed(self):
+        cli._resolve_workspace_id = lambda args: ""
+        with self.assertRaises(SystemExit):
+            cli.cmd_workflow_callbacks(_args(run_once=True, store_path=str(self.store_path)))
+
+    def test_envless_sweep_fails_closed(self):
+        cli._resolve_workspace_id = lambda args: ""
+        with self.assertRaises(SystemExit):
+            cli.cmd_workflow_callbacks(_args(sweep=True, store_path=str(self.store_path)))
+
+    def test_allow_unpartitioned_claims_legacy_bucket(self):
+        # The explicit debug/migration surface restores the legacy all-workspace claim/send.
+        cli._resolve_workspace_id = lambda args: ""
+        self._seed_foreign_pending("ws_foreign")
+        sends = []
+        cli._callback_sender = lambda args: (lambda row: sends.append(row) or SEND_DELIVERED)
+        rc = cli.cmd_workflow_callbacks(
+            _args(deliver=True, store_path=str(self.store_path), allow_unpartitioned_callbacks=True)
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(sends), 1)  # legacy bucket: the foreign row is claimed + sent
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
+
+    def test_partitioned_deliver_ignores_foreign_workspace_row(self):
+        # A resolved workspace claims ONLY its own partition; a foreign row is left untouched.
+        cli._resolve_workspace_id = lambda args: "ws_mine"
+        self._seed_foreign_pending("ws_foreign")
+        sends = []
+        cli._callback_sender = lambda args: (lambda row: sends.append(row) or SEND_DELIVERED)
+        rc = cli.cmd_workflow_callbacks(_args(deliver=True, store_path=str(self.store_path)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(sends, [])  # the foreign row is not claimed by ws_mine
+        self.assertEqual([r.workspace_id for r in self.outbox.read(states=[CALLBACK_PENDING])], ["ws_foreign"])
 
 
 class ParseCandidateTest(unittest.TestCase):

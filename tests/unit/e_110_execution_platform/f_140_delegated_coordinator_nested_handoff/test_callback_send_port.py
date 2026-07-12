@@ -122,6 +122,18 @@ class HandoffCallbackSendPortTest(unittest.TestCase):
         port = HandoffCallbackSendPort(runner=lambda argv: (0, '{"status": "sent", "reason": "ok"}'))
         self.assertEqual(port(_row(workspace_id="B")).status, "sent")
 
+    def test_attested_sender_refuses_a_row_with_no_workspace(self):
+        # #13518 review R3-F3: an attested sender requires an EXACT workspace match — a row with no
+        # workspace id (a legacy / unattested row) is refused, never routed on ambient env.
+        calls = []
+        port = HandoffCallbackSendPort(
+            runner=lambda argv: calls.append(argv) or (0, '{"status": "sent", "reason": "ok"}'),
+            attested_workspace_id="A",
+        )
+        result = port(_row(workspace_id=""))
+        self.assertEqual((result.status, result.reason), ("blocked", "workspace_unattested_row"))
+        self.assertEqual(calls, [])  # nothing was fired for the unattested row
+
 
 if __name__ == "__main__":
     unittest.main()

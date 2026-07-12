@@ -421,7 +421,11 @@ class CallbackOutbox:
             conn.close()
 
     def recover_inflight(
-        self, *, stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS, now: Optional[str] = None
+        self,
+        *,
+        stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
+        now: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ) -> tuple[CallbackOutboxRow, ...]:
         """Reconcile ``inflight`` rows whose claim **lease has expired** (crash recovery).
 
@@ -433,16 +437,30 @@ class CallbackOutbox:
         nothing was sent); ``1`` (crash after the send edge) -> :data:`CALLBACK_UNCERTAIN`, never
         auto-retried. The claim token is cleared on reclaim (a new owner will re-claim). A row
         with an empty ``claimed_at`` (a legacy pre-F2 row) is treated as stale.
+
+        ``workspace_id`` (#13518 review R3-F3) **partitions the reclaim** exactly like
+        :meth:`claim_pending`: when supplied, only that workspace's stale inflight rows are
+        reconciled, so a workspace-A processor never mutates workspace B's rows on a shared home
+        DB. ``None`` (the default) is the un-partitioned legacy behaviour (single-workspace / test /
+        explicit migration); the production processor always pins its attested workspace.
         """
         stamp = now or _utc_now()
         cutoff = _utc_cutoff(stale_seconds)
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                _SELECT + " WHERE state=? AND (claimed_at='' OR claimed_at <= ?) ORDER BY seq",
-                (CALLBACK_INFLIGHT, cutoff),
-            ).fetchall()
+            if workspace_id is None:
+                rows = conn.execute(
+                    _SELECT + " WHERE state=? AND (claimed_at='' OR claimed_at <= ?) ORDER BY seq",
+                    (CALLBACK_INFLIGHT, cutoff),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    _SELECT
+                    + " WHERE state=? AND workspace_id=? AND (claimed_at='' OR claimed_at <= ?) "
+                    "ORDER BY seq",
+                    (CALLBACK_INFLIGHT, str(workspace_id), cutoff),
+                ).fetchall()
             recovered: list[CallbackOutboxRow] = []
             for r in rows:
                 row = _row(r)

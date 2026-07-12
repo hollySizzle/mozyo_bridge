@@ -350,7 +350,11 @@ class CallbackOutboxProcessor:
         report = DeliveryReport()
         # Recover only lease-expired (stale) inflight rows — never a concurrent processor's
         # fresh active claim (#13520 review F2). A default lease is used unless overridden.
-        report.recovered.extend(self._outbox.recover_inflight(stale_seconds=stale_seconds, now=now))
+        report.recovered.extend(
+            self._outbox.recover_inflight(
+                stale_seconds=stale_seconds, now=now, workspace_id=self._workspace_id or None
+            )
+        )
         for row in self._outbox.claim_pending(
             limit=limit, now=now, workspace_id=self._workspace_id or None
         ):
@@ -404,7 +408,11 @@ class CallbackOutboxProcessor:
         doctrine relies on instead of an LLM-turn poll.
         """
         report = SweepReport()
-        report.recovered.extend(self._outbox.recover_inflight(stale_seconds=stale_seconds, now=now))
+        report.recovered.extend(
+            self._outbox.recover_inflight(
+                stale_seconds=stale_seconds, now=now, workspace_id=self._workspace_id or None
+            )
+        )
         report.pending.extend(self._outbox.read(states=[CALLBACK_PENDING]))
         report.dead_letter.extend(self._outbox.read(states=[CALLBACK_DEAD_LETTER]))
         return report
