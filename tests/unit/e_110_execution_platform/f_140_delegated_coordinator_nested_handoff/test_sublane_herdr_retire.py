@@ -263,6 +263,8 @@ class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
             verified=True,
             durable_record=True,
             target_identity_known=True,
+            latest_generation_admissible=True,  # #13518 R3-F2 fail-closed invariant asserted
+            review_generation_json=None,
             execute=execute,
             repo=str(repo),
             json=True,
