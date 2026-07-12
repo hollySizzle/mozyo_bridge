@@ -36,6 +36,7 @@ from typing import Mapping, Optional, Sequence
 from mozyo_bridge.core.state.workspace_registry import (
     _is_linked_worktree,
     _main_worktree_root,
+    load_workspace_by_path,
     read_anchor,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -67,26 +68,45 @@ def herdr_workspace_segment(repo_root: Path, *, home: Optional[Path] = None) -> 
     read-back) always agree:
 
     - a **linked git worktree** (a sublane lane checkout) → the **main checkout's**
-      registry / anchor ``workspace_id`` (#13152 identity inheritance). Under the
-      shared project workspace model (#13377 Opt3, superseding the per-lane
-      ``wt_<hash>`` workspace of #13331 j#73357) a lane's agents live in the
-      project workspace as ``mzb1_<project-ws>_<role>_<lane>`` slots, so the
-      ``workspace`` segment is the project identity and the *lane* segment is the
-      discriminant. The legacy per-lane token (:func:`derive_lane_workspace_token`)
-      is no longer minted for new slots; it survives only as the compatibility key
-      for pre-#13377 rows (legacy resolve / retire) and as the lane metadata
-      record's stable per-worktree join key;
+      ``workspace_id``, inherited with the SAME precedence as the canonical
+      worktree inheritance (:func:`workspace_registry._inherited_worktree_result` /
+      :func:`resolve_canonical_session`, #13152): the main **registry row** first,
+      then the main **anchor**. Reading only the anchor (the pre-#13595 shape)
+      missed a *registry-only* main — anchor absent (anchors are untracked), row
+      present — where the identity still inherits; a ``--dry-run`` there fell
+      fail-closed while the canonical execute path inherited it, and (this being the
+      single mint==resolve resolver) send / retire / projection missed it too
+      (Redmine #13595 R1-F1). Under the shared project workspace model (#13377 Opt3,
+      superseding the per-lane ``wt_<hash>`` workspace of #13331 j#73357) a lane's
+      agents live in the project workspace as ``mzb1_<project-ws>_<role>_<lane>``
+      slots, so the ``workspace`` segment is the project identity and the *lane*
+      segment is the discriminant. The legacy per-lane token
+      (:func:`derive_lane_workspace_token`) is no longer minted for new slots; it
+      survives only as the compatibility key for pre-#13377 rows (legacy resolve /
+      retire) and as the lane metadata record's stable per-worktree join key;
     - otherwise (**standalone / main checkout**) → the registry / anchor
       ``workspace_id``, read-only (no registration), byte-for-byte the prior
       behaviour. ``""`` when no anchor resolves (the caller decides whether that is
       fatal — :func:`prepare_session` fails closed; the resolve sites treat ``""``
       as "not a resolvable workspace").
+
+    Read-only in every branch (no registration / anchor / ``last_seen`` write). The
+    inheritance change is monotonic: a main with a row + agreeing anchor and an
+    anchor-only main are byte-for-byte unchanged; only a registry-only main flips
+    ``""`` -> the canonically-inherited id (the same value
+    :func:`register_workspace` would produce), so no consumer's non-empty result
+    changes — a previously fail-closed registry-only main now resolves correctly.
     """
     resolved = Path(repo_root).expanduser().resolve()
     if _is_linked_worktree(resolved):
         main_root = _main_worktree_root(resolved)
         if main_root is None:
             return ""
+        record = load_workspace_by_path(main_root, home=home)
+        if record is not None:
+            workspace_id = _norm(record.workspace_id)
+            if workspace_id:
+                return workspace_id
         anchor = read_anchor(main_root)
         return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
     anchor = read_anchor(resolved)

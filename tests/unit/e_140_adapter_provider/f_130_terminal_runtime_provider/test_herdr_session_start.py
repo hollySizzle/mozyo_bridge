@@ -1469,6 +1469,155 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.tab_creates, [])
 
+    def _linked_fixture(self, tmp, *, lane="issue_13595_m"):
+        """A registered main + a linked lane worktree + isolated home / fake binary."""
+        main = Path(tmp) / "main"
+        self._init_repo(main)
+        wt = Path(tmp) / "lane"
+        self._git(main, "worktree", "add", str(wt), "-b", lane)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = self._binpath(Path(tmp))
+        return main, wt, home, binpath
+
+    def test_dry_run_linked_worktree_registry_only_main_inherits_read_only(self) -> None:
+        # Redmine #13595 R1-F1: a linked-worktree dry-run whose MAIN is registry-only
+        # (anchor deleted, registry row kept — a real state, anchors are untracked)
+        # must inherit the main's id read-only, matching the canonical worktree
+        # inheritance (`_inherited_worktree_result`, #13152), NOT fail closed. The
+        # main registry stays byte/mtime invariant, no main anchor is recreated, and
+        # no herdr write fires.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                anchor_path(main).unlink()  # registry-only main
+                before = _fingerprint([registry_path(home)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex", "claude"],
+                    lane_id="issue_13595_m",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+                after = _fingerprint([registry_path(home)])
+                main_anchor_absent = not anchor_path(main).exists()
+                wt_anchor_absent = not anchor_path(wt).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # inherited from the registry row
+        self.assertEqual({s.outcome for s in result.slots}, {SLOT_PLANNED})
+        self.assertEqual(before, after)  # main registry untouched
+        self.assertTrue(main_anchor_absent)  # NOT recreated
+        self.assertTrue(wt_anchor_absent)  # no worktree anchor written
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_dry_run_linked_worktree_anchor_only_main_inherits_read_only(self) -> None:
+        # Matrix: linked-worktree dry-run whose MAIN is anchor-only (registry file
+        # removed, anchor kept). Inherits from the main anchor, read-only, no herdr
+        # write, main anchor byte/mtime invariant.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                registry_path(home).unlink()  # anchor-only main
+                before = _fingerprint([anchor_path(main)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex"],
+                    lane_id="issue_13595_m",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+                after = _fingerprint([anchor_path(main)])
+                registry_absent = not registry_path(home).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # inherited from the anchor
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)  # main anchor untouched
+        self.assertTrue(registry_absent)  # NOT recreated
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def test_dry_run_linked_worktree_unregistered_main_fails_closed(self) -> None:
+        # Matrix: linked-worktree dry-run whose MAIN has neither a registry row nor
+        # an anchor. No identity to inherit -> fail closed (no fake id, no write).
+        from mozyo_bridge.core.state.workspace_registry import anchor_path, registry_path
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError) as ctx:
+                    prepare_session(
+                        repo_root=wt,
+                        providers=["codex"],
+                        lane_id="issue_13595_m",
+                        env={HERDR_ENV: str(binpath)},
+                        runner=herdr.run,
+                        dry_run=True,
+                    )
+                reg_absent = not registry_path(home).exists()
+                main_anchor_absent = not anchor_path(main).exists()
+                wt_anchor_absent = not anchor_path(wt).exists()
+        self.assertIn("main checkout", str(ctx.exception))
+        self.assertTrue(reg_absent)
+        self.assertTrue(main_anchor_absent)
+        self.assertTrue(wt_anchor_absent)
+        self.assertEqual(herdr.calls, [])
+
+    def test_execute_linked_worktree_registry_only_main_mints_inherited_id(self) -> None:
+        # mint == resolve (Redmine #13595 R1-F1): the SAME registry-first inheritance
+        # the dry-run preview uses is what the execute launch mints under. A
+        # registry-only main is inherited (not fail-closed) and no main registry /
+        # anchor write occurs (the launch is a herdr-side effect only).
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr(created_workspace="wH")
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                anchor_path(main).unlink()  # registry-only main
+                before = _fingerprint([registry_path(home)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex"],
+                    lane_id="issue_13595_m",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+                after = _fingerprint([registry_path(home)])
+                main_anchor_absent = not anchor_path(main).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # mint under the inherited id
+        names = {s.provider: s.assigned_name for s in result.slots}
+        self.assertEqual(
+            names["codex"], encode_assigned_name(main_ws, "codex", "issue_13595_m")
+        )
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+        self.assertEqual(before, after)  # no main registry write from the launch
+        self.assertTrue(main_anchor_absent)  # main anchor not recreated
+
     def test_prepare_session_linked_worktree_joins_live_host_workspace(self) -> None:
         """A second lane joins the sublane host the first lane's slots occupy —
         no new workspace, and never the coordinator's (Redmine #13380)."""

@@ -30,9 +30,13 @@ sender env** に置き換える。
     mint、heal は生存 slot の `tab_id` を読んで同一 tab へ復帰する。** identity model はこの
     配置分離・細分化で変わらない (mzb1 名は workspace segment に project identity を持ち続け、
     tab は placement のみ)。判別は git topology (`_is_linked_worktree`) +
-    `_main_worktree_root` 経由の main anchor 読みで行う (#13152 継承)。registry schema は
+    `_main_worktree_root` 経由の main identity 読みで行い、その継承 precedence は canonical
+    worktree inheritance (`_inherited_worktree_result` / `resolve_canonical_session`) と同じ
+    **main registry row → main anchor** である (#13152 / #13595 R1-F1。旧実装は main anchor
+    のみ読み、registry-only main を fail-closed していた)。registry schema は
     無変更。mint (§5) と全 resolve 側 (send / retire / projection) は単一 resolver
-    `herdr_workspace_segment` を共有する。placement 判断 (workspace / tab) の pure core は
+    `herdr_workspace_segment` を共有する (mint == resolve; registry-only main の継承もこの
+    共有 resolver で一致する)。placement 判断 (workspace / tab) の pure core は
     sibling module `herdr_lane_topology` (`_launch_target_for_lane` / `_tab_target_for_lane`)。
     - **legacy (correction history): #13331 j#73357 の per-lane workspace token
       (`derive_lane_workspace_token`, `wt_<hash>`)。** 2026-07-07〜08 の移行期に linked
@@ -212,8 +216,11 @@ flow:
    registry row も無い) / 両 anchor 名併存 (write path と同じ曖昧性) の場合は fake identity を作らず
    actionable に fail-closed し、silent registration しない (旧実装は dry-run 分岐前に
    `register_workspace` を呼び registry + anchor を mutate していた)。**linked git worktree lane
-   (Redmine #13377 / j#73613)** は main checkout の anchor から project workspace_id を継承する
-   (main 未登録なら fail-closed)。lane segment は明示 `--lane` か、`sublane create` が書いた lane
+   (Redmine #13377 / j#73613)** は shared resolver `herdr_workspace_segment` 経由で main checkout の
+   **registry row → anchor** precedence で project workspace_id を継承する (#13152 canonical
+   inheritance と同値、#13595 R1-F1。registry-only main も継承し、mint==resolve を維持。main が
+   registry row も anchor も持たなければ fail-closed)。dry-run / execute とも同 resolver を使うため
+   preview は execute と一致する。lane segment は明示 `--lane` か、`sublane create` が書いた lane
    metadata record の `lane_id` から復元し、どちらも無ければ fail-closed する (lane worktree から
    project workspace の default slot — coordinator pair — を誤 mint しない)。launch 先 herdr
    workspace は lane-aware join (`_launch_target_for_lane`, Redmine #13380) で決める: (1) 自
