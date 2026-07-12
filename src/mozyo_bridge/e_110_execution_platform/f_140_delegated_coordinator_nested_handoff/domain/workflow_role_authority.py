@@ -92,7 +92,9 @@ DEFAULT_LANE = "default"
 # canonicalized (whitespace-trimmed) scope distinguishes scopes that share a readable slug.
 # The digest is a 48-bit *collision-resistant* fingerprint, not a proof of injectivity — a
 # residual same-lane collision between two distinct scopes is astronomically unlikely but not
-# impossible, and is caught at parse time by the slot-collision check (Redmine #13583 R2-F2).
+# impossible. A collision between scopes present in the SAME declaration is caught at parse time
+# by the slot-collision check (an availability failure, not a misroute); a cross-revision alias
+# is NOT caught and remains a 48-bit residual risk (Redmine #13583 R2-F2; see project_gateway_lane_id).
 # ---------------------------------------------------------------------------
 LANE_SCHEME = "pgwv1"
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -141,11 +143,17 @@ def project_gateway_lane_id(project_scope: object) -> str:
     #13583 R3) plus a short stable **48-bit collision-resistant digest** of the canonicalized scope
     (and a slug that reduces to empty still derives a stable id from the digest alone). The digest
     makes a collision between two distinct canonicalized scopes astronomically unlikely but not
-    provably impossible; a real same-lane collision within one declaration is caught at parse time
-    by the slot-collision check (:func:`parse_role_bindings`), which fails closed — so a collision
-    is a rare availability issue, never a misroute (Redmine #13583 R2-F2). The result can never
-    equal :data:`DEFAULT_LANE` (the ``pgwv1_`` prefix guarantees it structurally), so a project
-    gateway lane can never collide with the grandparent's default lane. Fails closed
+    provably impossible. Two colliding scopes **present in the same declaration** are caught at
+    parse time by the slot-collision check (:func:`parse_role_bindings`), which fails closed — a
+    within-declaration collision is an availability failure, not a misroute. That check does *not*
+    cover a **cross-revision alias**: :func:`resolve_role_for_lane` matches on the derived
+    ``lane_id`` alone, so if one revision mints a lane for scope A and a later revision declares a
+    distinct scope B whose digest collides onto the same lane id, the surviving lane can be read as
+    B — a 48-bit residual risk this contract does **not** claim to preclude (Redmine #13583 R2-F2).
+    Provable never-misroute would need a full-scope identity / migration fence (a separate Design
+    Consultation, see the spec §3). The result can never equal :data:`DEFAULT_LANE` (the ``pgwv1_``
+    prefix guarantees it structurally), so a project gateway lane can never collide with the
+    grandparent's default lane. Fails closed
     (:class:`WorkflowRoleAuthorityError`) on an empty scope — a grandparent has no project scope
     and is not derived here; a project gateway must name one.
     """

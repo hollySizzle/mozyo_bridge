@@ -300,7 +300,9 @@ class ParseRoleBindingsTest(unittest.TestCase):
 
     def test_canonicalized_scope_collision_fails_closed(self):
         # R2-F2: a padded and an unpadded scope canonicalize to the same lane, so declaring both
-        # is a slot collision caught at parse time (fail-closed availability, never a misroute).
+        # in ONE declaration is a slot collision caught at parse time (a within-declaration
+        # collision is an availability failure, not a misroute; a cross-revision alias is not
+        # caught here — see project_gateway_lane_id's contract).
         parsed = parse_role_bindings(
             _record(
                 {"role": "project_gateway", "project_scope": "same"},
