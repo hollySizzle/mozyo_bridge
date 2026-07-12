@@ -55,11 +55,14 @@ schema（version 1）:
 canonical role 語彙は `grandparent_coordinator | project_gateway`（closed）。旧 `root_coordinator`
 は **compat 入力 alias** として `grandparent_coordinator` へ正規化するが、新規正本語彙へは書かない。
 
-schema は **closed** で fail-closed に検証する: top-level key は `{schema, version, bindings}` のみ、
-`bindings` は present な list 必須（欠落 / null は invalid、空 topology は明示 `[]` のみ）、entry key は
-`{role, project_scope, source_pointer}` のみ、role は非空 string、scope / source_pointer は present なら
-string（非文字列を暗黙 `str()` 変換しない）。present だが malformed な宣言は file 不在の fall-through
-と同一に扱わず invalid にする。
+schema は **closed** かつ **exactly typed** で fail-closed に検証する: top-level key は
+`{schema, version, bindings}` のみ、`schema` は exact literal string（whitespace padding / 非 string を
+受理しない）、`version` は exact int（JSON `true` / `1.0` は Python loose equality で `== 1` になるため
+bool / float を明示排除）、`bindings` は present な list 必須（欠落 / null は invalid、空 topology は
+明示 `[]` のみ）、entry key は `{role, project_scope, source_pointer}` のみ、role は非空 string、
+scope / source_pointer は key present なら string（explicit `null` は空 scope へ decay させず reject、
+非文字列を暗黙 `str()` 変換しない）。present だが malformed な宣言は file 不在の fall-through と同一に
+扱わず invalid にする。
 
 ## 3. Lane identity（Q2-A: root=default、gateway=deterministic project-scoped lane）
 
@@ -68,11 +71,15 @@ string（非文字列を暗黙 `str()` 変換しない）。present だが malfo
   既に attest 済みで、file には持たない。
 - `grandparent_coordinator` は default lane（`lane_id = "default"`, project_scope 空）。
 - `project_gateway` の lane id は pure / versioned resolver `project_gateway_lane_id(project_scope)`
-  で導出する。scheme tag（`pgwv1`）+ **budget 内に bound した** readable slug + 生 scope の短い digest
-  で構成し、(a) 決定論的、(b) machine 間で安定、(c) 相異 scope が衝突しない（project-scope lane
-  uniqueness、injectivity は digest が担うので slug 切詰めは衝突を生まない）、(d) `default` へ decay
-  しない、(e) mzb1 assigned-name（`NAME_MAX_LENGTH=128`、非 `[A-Za-z0-9]` は 3 char escape）へ実 ws +
-  provider と合成しても収まる、を保証する。empty scope は fail-closed。
+  で導出する。scope はまず whitespace trim で **canonicalize** し（`"scope"` と `"  scope  "` は
+  設計上同一 lane）、scheme tag（`pgwv1`）+ **budget 内に bound した** readable slug + canonicalized
+  scope の短い digest で構成する。保証は (a) 決定論的、(b) machine 間で安定、(c) project-scope lane
+  uniqueness は **48-bit collision-resistant digest** が担い、相異 scope の衝突は天文学的に稀だが
+  provably impossible ではない。実衝突は同一宣言内であれば parse 時 slot-collision で fail-closed
+  される（misroute ではなく rare availability risk）。slug は digest と独立なので切詰めは衝突挙動を
+  変えない、(d) `pgwv1_` prefix により `default` へ decay しない（構造保証）、(e) mzb1 assigned-name
+  （`NAME_MAX_LENGTH=128`、非 `[A-Za-z0-9]` は 3 char escape）へ実 ws + provider と合成しても収まる。
+  empty scope は fail-closed。provable injectivity を要求する場合は別 Design Consultation とする。
 - project_gateway と root grandparent は同一 slot を奪い合わない: grandparent は default、gateway は
   derived lane。同一 lane_id を導く 2 binding は slot collision として fail-closed。
 

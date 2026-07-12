@@ -89,8 +89,17 @@ class ProjectGatewayLaneIdTest(unittest.TestCase):
         self.assertNotEqual(project_gateway_lane_id("default"), DEFAULT_LANE)
 
     def test_distinct_scopes_do_not_collide_even_when_slug_matches(self):
-        # "a.b" and "a-b" slug to the same readable core; the digest keeps them distinct.
+        # "a.b" and "a-b" slug to the same readable core; the collision-resistant digest
+        # distinguishes them (not a proof of injectivity — R2-F2).
         self.assertNotEqual(project_gateway_lane_id("a.b"), project_gateway_lane_id("a-b"))
+
+    def test_scope_is_whitespace_canonicalized(self):
+        # R2-F2: the scope is trimmed before derivation, so a padded scope is the SAME lane by
+        # design. This is intentional canonicalization, pinned here so it cannot regress silently.
+        self.assertEqual(
+            project_gateway_lane_id("cloud-drive"),
+            project_gateway_lane_id("  cloud-drive  "),
+        )
 
     def test_empty_scope_fails_closed(self):
         with self.assertRaises(WorkflowRoleAuthorityError):
@@ -244,6 +253,62 @@ class ParseRoleBindingsTest(unittest.TestCase):
         self.assertFalse(
             parse_role_bindings(_record({"role": "grandparent_coordinator", "source_pointer": 5})).ok
         )
+
+    # --- R2-F1: explicit null + JSON scalar types must fail closed (key presence distinguished). ---
+
+    def test_explicit_null_project_scope_fails_closed(self):
+        # R2-F1: a present `"project_scope": null` must NOT decay to the empty scope; it fails closed.
+        parsed = parse_role_bindings(
+            _record({"role": "grandparent_coordinator", "project_scope": None})
+        )
+        self.assertFalse(parsed.ok)
+        self.assertEqual(parsed.reason, REASON_ROLE_BINDING_INVALID)
+
+    def test_explicit_null_source_pointer_fails_closed(self):
+        # R2-F1: a present `"source_pointer": null` fails closed rather than becoming "".
+        self.assertFalse(
+            parse_role_bindings(
+                _record({"role": "grandparent_coordinator", "source_pointer": None})
+            ).ok
+        )
+
+    def test_bool_version_fails_closed(self):
+        # R2-F1: JSON `true` compares `== 1` under Python loose equality; it is not version 1.
+        self.assertFalse(
+            parse_role_bindings({"schema": SCHEMA_NAME, "version": True, "bindings": []}).ok
+        )
+
+    def test_float_version_fails_closed(self):
+        # R2-F1: `1.0 == 1` in Python; a float is not the exact integer version.
+        self.assertFalse(
+            parse_role_bindings({"schema": SCHEMA_NAME, "version": 1.0, "bindings": []}).ok
+        )
+
+    def test_whitespace_padded_schema_fails_closed(self):
+        # R2-F1: the schema discriminator is an exact literal string; padding is not tolerated.
+        self.assertFalse(
+            parse_role_bindings(
+                {"schema": f"  {SCHEMA_NAME}  ", "version": SCHEMA_VERSION, "bindings": []}
+            ).ok
+        )
+
+    def test_non_string_schema_fails_closed(self):
+        # R2-F1: a non-string schema discriminator is rejected (no coercion).
+        self.assertFalse(
+            parse_role_bindings({"schema": 1, "version": SCHEMA_VERSION, "bindings": []}).ok
+        )
+
+    def test_canonicalized_scope_collision_fails_closed(self):
+        # R2-F2: a padded and an unpadded scope canonicalize to the same lane, so declaring both
+        # is a slot collision caught at parse time (fail-closed availability, never a misroute).
+        parsed = parse_role_bindings(
+            _record(
+                {"role": "project_gateway", "project_scope": "same"},
+                {"role": "project_gateway", "project_scope": "  same  "},
+            )
+        )
+        self.assertFalse(parsed.ok)
+        self.assertEqual(parsed.reason, REASON_ROLE_BINDING_INVALID)
 
 
 class ResolveRoleForLaneTest(unittest.TestCase):
