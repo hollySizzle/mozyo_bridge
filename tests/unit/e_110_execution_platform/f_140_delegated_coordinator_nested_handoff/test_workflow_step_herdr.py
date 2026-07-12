@@ -230,40 +230,58 @@ class RoleAuthorityWiringTest(unittest.TestCase):
         base.update(kw)
         return WorkflowRoleResolution(**base)
 
-    def test_resolved_grandparent_no_longer_blocks(self):
+    def test_resolved_grandparent_forwards_consultation(self):
+        # Increment 3 (Redmine #13583): a resolved grandparent no longer no-ops — it names the
+        # executable one-step consultation forward (execution=ready + a direction-specific primitive
+        # that rides its own fence, so it is NOT in the generic `executable` set).
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
             ROLE_GRANDPARENT_COORDINATOR,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+            EXECUTION_READY,
+            OWNER_PARENT,
             STATE_GRANDPARENT_CONSULTATION,
         )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
-            REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+            PRIMITIVE_HERDR_FORWARD_CONSULT,
+            REASON_HERDR_FORWARD_CONSULT_READY,
         )
 
         res = self._resolution(role=ROLE_GRANDPARENT_COORDINATOR)
         out = resolve_herdr_workflow_step(self._default_lane(), role_authority=res)
         self.assertEqual(out.state, STATE_GRANDPARENT_CONSULTATION)
-        self.assertEqual(out.execution, EXECUTION_NO_OP)
-        self.assertEqual(out.reason, REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING)
+        self.assertEqual(out.execution, EXECUTION_READY)
+        self.assertEqual(out.reason, REASON_HERDR_FORWARD_CONSULT_READY)
         self.assertEqual(out.caller_role, ROLE_GRANDPARENT_COORDINATOR)
-        self.assertEqual(out.primitive, PRIMITIVE_NONE)
-        self.assertFalse(out.executable)
+        self.assertEqual(out.primitive, PRIMITIVE_HERDR_FORWARD_CONSULT)
+        self.assertEqual(out.next_owner, OWNER_PARENT)
+        self.assertFalse(out.executable)  # rides its own dedicated forward fence, not the generic set
         self.assertTrue(out.ok)  # resolved -> no longer a fail-closed block
 
-    def test_resolved_project_gateway_carries_scope(self):
+    def test_resolved_project_gateway_forwards_child_intake_with_scope(self):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
             ROLE_PROJECT_GATEWAY,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+            EXECUTION_READY,
+            OWNER_CHILD,
             STATE_PARENT_WORK_INTAKE,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+            PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
+            REASON_HERDR_FORWARD_CHILD_INTAKE_READY,
         )
 
         res = self._resolution(role=ROLE_PROJECT_GATEWAY, project_scope="cloud-drive", lane_id="pgwv1_x")
         out = resolve_herdr_workflow_step(self._default_lane(), role_authority=res)
         self.assertEqual(out.state, STATE_PARENT_WORK_INTAKE)
+        self.assertEqual(out.execution, EXECUTION_READY)
+        self.assertEqual(out.reason, REASON_HERDR_FORWARD_CHILD_INTAKE_READY)
+        self.assertEqual(out.primitive, PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE)
+        self.assertEqual(out.next_owner, OWNER_CHILD)
         self.assertEqual(out.caller_role, ROLE_PROJECT_GATEWAY)
         self.assertEqual(out.project_scope, "cloud-drive")
+        self.assertFalse(out.executable)
 
     def test_blocked_authority_fails_closed_with_fixed_reason(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (

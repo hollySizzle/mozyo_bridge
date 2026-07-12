@@ -362,6 +362,59 @@ def _execute_herdr_dispatch_leg(
     return (0 if result.ok else 1), text
 
 
+def _is_herdr_forward_leg(outcome: WorkflowStepOutcome) -> bool:
+    """True when the outcome is the executable Increment-3 herdr coordinator-forward leg (#13583).
+
+    A resolved grandparent / project-gateway lane forwards a single ticketless consultation /
+    work-intake. Like the herdr worker-dispatch leg, this rides its own dedicated duplicate fence
+    and is driven by a dedicated executor — it is deliberately NOT part of the generic
+    ``WorkflowStepOutcome.executable`` set (which is the tmux ``_primitive_argv`` rail).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+        PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
+        PRIMITIVE_HERDR_FORWARD_CONSULT,
+    )
+
+    return (
+        outcome.execution == EXECUTION_READY
+        and outcome.primitive
+        in (PRIMITIVE_HERDR_FORWARD_CONSULT, PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE)
+    )
+
+
+def _execute_herdr_forward_leg(
+    outcome: WorkflowStepOutcome, args: argparse.Namespace
+) -> tuple[int, str]:
+    """Run the fenced one-step herdr coordinator forward; return (rc, summary text) (#13583 Inc 3).
+
+    Delegates to :func:`...herdr_workflow_step.execute_herdr_forward_leg`, which re-resolves the
+    sender identity + durable role authority at action time (safety-contract point 2), resolves the
+    single live target from the herdr inventory, and drives the dedicated forward fence around one
+    ticketless send. ``rc`` is ``0`` for a delivered / never-send (zero-send) outcome and ``1`` for
+    a fence-unavailable / uncertain outcome the operator must reconcile.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (
+        execute_herdr_forward_leg,
+    )
+
+    result = execute_herdr_forward_leg(args, outcome)
+    text = (
+        f"forward_result: {'sent' if result.sent else 'zero_send'}\n"
+        f"target_status: {result.target_status}\n"
+        f"fence_state: {result.fence_state}\n"
+        f"reason: {result.reason}\n"
+        f"detail: {result.detail}"
+    )
+    # rc 0 = a resolved step: a delivered forward, or a legitimate fail-closed zero-send (missing /
+    # duplicate / drift / self — a valid "nothing to send" step). rc 1 = an outcome the operator
+    # must reconcile: an uncertain / failed send, or a do-not-send fence-unavailable.
+    if result.sent:
+        ok = result.send is not None and result.send.result == "delivered"
+    else:
+        ok = result.reason != "herdr_forward_fence_unavailable"
+    return (0 if ok else 1), text
+
+
 def _herdr_step_preflight(args: argparse.Namespace) -> WorkflowStepOutcome | None:
     """Herdr-native ``workflow step`` resolution for the current lane, or ``None`` under tmux.
 
@@ -464,15 +517,17 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     )
     outcome = reconciled.outcome
 
-    # The increment-2 herdr worker-dispatch leg is executable but rides its own fence, not the
-    # generic `executable` set (Redmine #13489). Treat it as an executable leg here.
+    # The increment-2 herdr worker-dispatch leg and the increment-3 herdr coordinator-forward leg
+    # are executable but ride their own dedicated fences, not the generic `executable` set (Redmine
+    # #13489 / #13583). Treat each as an executable leg here.
     is_herdr_dispatch = _is_herdr_dispatch_leg(outcome)
+    is_herdr_forward = _is_herdr_forward_leg(outcome)
 
     # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work
     # no-op): report the resolved outcome, mutate nothing.
-    if dry_run or (not outcome.executable and not is_herdr_dispatch):
+    if dry_run or (not outcome.executable and not is_herdr_dispatch and not is_herdr_forward):
         reported = outcome
-        if dry_run and (outcome.executable or is_herdr_dispatch):
+        if dry_run and (outcome.executable or is_herdr_dispatch or is_herdr_forward):
             # Reflect that the executable leg was not actually run.
             reported = dataclasses.replace(outcome, execution=EXECUTION_DRY_RUN)
         if as_json:
@@ -485,9 +540,12 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
                 print(line)
         return 0 if reported.ok else 1
 
-    # Executable leg: dispatch the internal primitive, or the fenced herdr worker dispatch.
+    # Executable leg: dispatch the internal primitive, the fenced herdr worker dispatch, or the
+    # fenced herdr coordinator forward.
     if is_herdr_dispatch:
         rc, primitive_out = _execute_herdr_dispatch_leg(outcome, args)
+    elif is_herdr_forward:
+        rc, primitive_out = _execute_herdr_forward_leg(outcome, args)
     else:
         rc, primitive_out = _execute_primitive(outcome, args, session=session)
     executed = dataclasses.replace(outcome, execution=EXECUTION_EXECUTED)
