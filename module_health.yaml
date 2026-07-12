@@ -1069,7 +1069,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
-    lines: 1470
+    lines: 1495
     reason: >-
       Release check/bump/publish/workflow helpers in one module. Splitting
       touches release gates, so it is sequenced carefully. Path re-keyed from
@@ -1078,6 +1078,11 @@ allowlist:
       to the Redmine-numbered Epic/Feature path for the #12622/#12626 layout
       correction (byte-identical move, line count unchanged), landing in the
       same commit as the move per the #12591 j#65488 / #12624 atomicity rule.
+      Baseline 1470 -> 1495 for #13601: the TestPyPI exact-candidate dispatch
+      (source_sha/expected_version/source_ref inputs, 40-hex SHA validation, and
+      deterministic nonce-based run correlation) is cohesive with the existing
+      publish helper and is not split ad hoc while the release-gate split is
+      still sequenced.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
