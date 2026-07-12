@@ -59,11 +59,15 @@ def _build_repo(root: Path, version: str = "0.10.0") -> Path:
     return root / "pyproject.toml"
 
 
-@unittest.skipIf(
-    hasattr(os, "geteuid") and os.geteuid() == 0,
-    "read-only enforcement does not hold for root",
-)
 class ComputePartialWriteRegressionTest(unittest.TestCase):
+    # NOTE: only the read-only (R5) case is skipped under root, where a 0444
+    # file is still writable. The partial-write (R6) case drives the failure
+    # through a monkeypatch and is user-privilege-independent, so it must run
+    # in every environment — do not hoist this skip to the class level.
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "read-only enforcement does not hold for root",
+    )
     def test_second_mirror_write_failure_rolls_back_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
