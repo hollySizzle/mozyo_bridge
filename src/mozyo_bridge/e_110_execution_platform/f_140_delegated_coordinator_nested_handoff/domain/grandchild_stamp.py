@@ -52,11 +52,13 @@ Boundaries (the same non-authoritative contract the #12465/#12466 layer pins):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (
     LANE_KIND_IMPLEMENTATION,
+    LANE_KINDS,
     OPTION_DELEGATION_PARENT,
     OPTION_LANE_KIND,
     DelegationProjection,
@@ -213,6 +215,14 @@ def resolve_grandchild_stamp_plan(
             raise GrandchildStampError(
                 f"declared lane parent {redact_unit_token(lane.delegation_parent)} must "
                 "be a stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
+        # Validate the KIND against the allowed set here (generic, no raw echo) so
+        # a path-like / secret-shaped kind never reaches derive_delegation_tree's
+        # raw-value error (Redmine #13571 j#75577 R10-F4).
+        if lane.lane_kind not in LANE_KINDS:
+            raise GrandchildStampError(
+                "declared lane kind is not a valid delegation kind; expected one "
+                f"of {sorted(LANE_KINDS)}"
             )
     if not _is_stable_unit(grandchild_unit):
         raise GrandchildStampError(
@@ -403,15 +413,19 @@ def _repo_token(path: Optional[str]) -> str:
 
     Returns the checkout basename only (a portable project identity), never the
     raw absolute host path, so a mismatch reason that reaches the Redmine journal
-    / JSON surface cannot leak a private home path (public/private durable-record
-    boundary). ``none`` when no repo is set.
+    / JSON surface cannot leak a private directory chain (public/private
+    durable-record boundary). Handles POSIX (``/``), Windows (``\\``), and UNC
+    separators so a Windows path is basenamed rather than returned whole (Redmine
+    #13571 j#75577 R10-F3). ``none`` when no repo is set.
     """
     if not path:
         return "none"
-    norm = path.strip().rstrip("/")
+    norm = str(path).strip().rstrip("/\\")
     if not norm:
         return "none"
-    return norm.rsplit("/", 1)[-1] or norm
+    # Split on both separators; the last non-empty segment is the basename.
+    segments = [seg for seg in re.split(r"[/\\]", norm) if seg]
+    return segments[-1] if segments else "none"
 
 
 #: The placeholder a malformed (non-stable) unit id is redacted to.
@@ -433,6 +447,14 @@ def _is_stable_unit(unit_id: Optional[object]) -> bool:
         return False
     s = str(unit_id).strip()
     if not s or s.startswith(("/", "~", ".")) or "\\" in s:
+        return False
+    # No whitespace / control / non-printable character anywhere: a stable unit is
+    # a single-line, printable identity, so a newline / tab / control char cannot
+    # inject into a durable record field boundary or a live breadcrumb (Redmine
+    # #13571 j#75577 R10-F1). ``isspace`` catches internal whitespace that
+    # ``strip`` (leading/trailing only) leaves; ``isprintable`` is False for any
+    # control / non-printable char (and for a space, which ``isspace`` also rejects).
+    if not s.isprintable() or any(ch.isspace() for ch in s):
         return False
     # Windows drive-root / drive-relative (``C:`` / ``C:/x`` / ``C:x``), independent
     # of the running platform's separator.

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
@@ -67,6 +68,11 @@ _EXIT_GATE_BLOCKED = 3
 
 #: Tokens that declare "no parent" (tree root) in a ``--lane`` spec's ``parent=``.
 _ROOT_PARENT_TOKENS = frozenset({"", "-", "none", "root"})
+
+#: The canonical tmux pane id shape a ``--lane`` ``pane=`` value must match
+#: (``%<digits>``, e.g. ``%3``). The plan feeds the value straight to
+#: ``set-option -p -t <pane>`` (Redmine #13571 j#75577 R10-F2).
+_PANE_ID_RE = re.compile(r"%\d+")
 
 
 def _canonical_repo_identity(path: Optional[str]) -> Optional[str]:
@@ -132,13 +138,22 @@ def _parse_lane_spec(raw: str) -> DeclaredLane:
             parent = None if value.lower() in _ROOT_PARENT_TOKENS else value
         elif key == "pane":
             if value:
+                # A pane target must be a canonical tmux pane id `%<digits>`; the
+                # plan feeds it straight to `set-option -p -t <pane>`, so an
+                # arbitrary value (e.g. a path) must fail closed before any plan /
+                # tmux write, with no raw echo (Redmine #13571 j#75577 R10-F2).
+                if not _PANE_ID_RE.fullmatch(value):
+                    raise GrandchildStampError(
+                        "each --lane pane= must be a canonical tmux pane id "
+                        "(%<digits>, e.g. %3)"
+                    )
                 panes.append(value)
         else:
-            # Echo the key only when it is a plain identifier (a likely typo such
-            # as `kidn=`); a path-like key is redacted so it cannot leak.
-            safe_key = key if key.isidentifier() else "<redacted>"
+            # Never echo the operator-supplied key: even a plain identifier may be
+            # a private / secret-shaped token, so state only the expected fields
+            # (Redmine #13571 j#75577 R10-F4).
             raise GrandchildStampError(
-                f"unknown --lane field {safe_key!r}; expected kind/unit/parent/pane"
+                "unknown --lane field; expected one of kind/unit/parent/pane"
             )
     if not kind or not unit:
         raise GrandchildStampError(

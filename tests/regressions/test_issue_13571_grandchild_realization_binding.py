@@ -547,6 +547,63 @@ class UnitIdentityPrivacyTest(unittest.TestCase):
         self.assertIn("ws-gc/lane-gc", out)
 
 
+class ControlCharAndWindowsRepoRedactionTest(unittest.TestCase):
+    """#13571 j#75577 R10-F1 / R10-F3: control chars and Windows repo separators."""
+
+    def test_binding_rejects_control_or_whitespace_unit(self) -> None:
+        # R10-F1: a control / whitespace unit is not stable -> unbound, redacted.
+        for bad in ("ws/gc\nX", "ws/g c", "ws/gc\tX", "ws/gc\x00"):
+            target = GrandchildTargetIdentity(
+                unit_id=bad, delegation_parent=_DELEG_UNIT, repo_identity="/ws/child"
+            )
+            binding = resolve_realized_grandchild_binding(
+                [], target=target, delegated_coordinator_unit=_DELEG_UNIT
+            )
+            self.assertEqual(BINDING_UNBOUND, binding.outcome, msg=repr(bad))
+            self.assertNotIn("X", binding.reason)
+            self.assertIn(REDACTED_UNIT_TOKEN, binding.reason)
+
+    def test_repo_token_basenames_windows_and_unc(self) -> None:
+        # R10-F3: `_repo_token` handles POSIX / Windows / UNC separators.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            _repo_token,
+        )
+
+        win = "C:" + chr(92) + "synthetic" + chr(92) + "private" + chr(92) + "proj"
+        unc = chr(92) + chr(92) + "server" + chr(92) + "share" + chr(92) + "proj"
+        self.assertEqual("proj", _repo_token(win))
+        self.assertEqual("proj", _repo_token(unc))
+        self.assertEqual("proj", _repo_token("/synthetic/private/proj"))
+
+    def test_windows_repo_mismatch_reason_does_not_leak_chain(self) -> None:
+        # R10-F3 end to end: a Windows live repo that mismatches the target must
+        # not leak the directory chain in the mismatch reason.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+            InventoryUnit,
+        )
+
+        win_chain = "C:" + chr(92) + "synthetic" + chr(92) + "private" + chr(92) + "repo-b"
+        unit = InventoryUnit(
+            unit_id=_GC_UNIT,
+            lane_kind="implementation",
+            delegation_depth=2,
+            delegation_parent=_DELEG_UNIT,
+            status="derived",
+            repo_identity=win_chain,
+            has_codex_gateway=True,
+            ambiguous=False,
+        )
+        target = GrandchildTargetIdentity(
+            unit_id=_GC_UNIT, delegation_parent=_DELEG_UNIT, repo_identity="/ws/repo-a"
+        )
+        binding = resolve_realized_grandchild_binding(
+            [unit], target=target, delegated_coordinator_unit=_DELEG_UNIT
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+        self.assertNotIn("synthetic", binding.reason)
+        self.assertNotIn(chr(92) + "private", binding.reason)
+
+
 class ParentIdentityStableUnitTest(unittest.TestCase):
     """#13571 j#75508 R7-F2: the delegation parent is a stable unit, never a path.
 
@@ -748,6 +805,88 @@ class StampProducerStableUnitTest(unittest.TestCase):
                     self.assertNotIn("## Grandchild lane realization", out)
                     self.assertNotIn("realization_record", out)
 
+    def test_control_or_whitespace_unit_fails_closed_no_injection(self) -> None:
+        # #13571 j#75577 R10-F1: a newline / control / whitespace in a declared
+        # unit / parent / grandchild must fail closed before any plan, so it cannot
+        # split a record field or inject into a live breadcrumb.
+        marker = "INJECTED"
+        bad_units = ("ws/gc\n" + marker, "ws/g c", "ws/gc\t" + marker, "ws/gc\x00")
+        for bad in bad_units:
+            for realization, ar in (("launch", None), ("adopt", "because")):
+                for as_json in (True, False):
+                    rc, out = self._run(
+                        self._chain(gc_unit=bad), bad, realization,
+                        adopt_reason=ar, as_json=as_json,
+                    )
+                    self.assertTrue(str(rc).startswith("die:"), msg=f"{bad!r}/{realization}")
+                    self.assertNotIn(marker, out, msg=f"{bad!r}/{realization}")
+                    self.assertNotIn("## Grandchild lane realization", out)
+
+    def test_control_unit_apply_performs_zero_tmux(self) -> None:
+        tmux = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client"
+        with mock.patch(f"{tmux}.run_tmux") as run_tmux, mock.patch(f"{tmux}.require_tmux") as require_tmux:
+            rc, out = self._run(
+                self._chain(gc_unit="ws/gc\nINJECT"), "ws/gc\nINJECT", "launch", apply=True
+            )
+            self.assertTrue(str(rc).startswith("die:"))
+            self.assertEqual(0, run_tmux.call_count)
+            self.assertEqual(0, require_tmux.call_count)
+
+    def test_non_canonical_pane_fails_closed_no_leak(self) -> None:
+        # #13571 j#75577 R10-F2: a pane= that is not a canonical %<digits> tmux
+        # pane id (e.g. a path) must fail closed before any plan / tmux write.
+        path = self._PATH_GC
+        for pane in (path, "not-a-pane", "3", "%", "%3a"):
+            lanes = [
+                "kind=coordinator,unit=gk/p,parent=-",
+                "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+                f"kind=implementation,unit=mz/gc,parent=mz/d,pane={pane}",
+            ]
+            for realization, ar in (("launch", None), ("adopt", "because")):
+                for as_json in (True, False):
+                    rc, out = self._run(lanes, "mz/gc", realization, adopt_reason=ar, as_json=as_json)
+                    self.assertTrue(str(rc).startswith("die:"), msg=f"{pane!r}/{realization}")
+                    self.assertNotIn(path, out, msg=f"{pane!r}/{realization}")
+
+    def test_non_canonical_pane_apply_performs_zero_tmux(self) -> None:
+        path = self._PATH_GC
+        tmux = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client"
+        lanes = [
+            "kind=coordinator,unit=gk/p,parent=-",
+            "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+            f"kind=implementation,unit=mz/gc,parent=mz/d,pane={path}",
+        ]
+        with mock.patch(f"{tmux}.run_tmux") as run_tmux, mock.patch(f"{tmux}.require_tmux") as require_tmux:
+            rc, out = self._run(lanes, "mz/gc", "launch", apply=True)
+            self.assertTrue(str(rc).startswith("die:"))
+            self.assertEqual(0, run_tmux.call_count)
+            self.assertEqual(0, require_tmux.call_count)
+            self.assertNotIn(path, out)
+
+    def test_canonical_pane_still_succeeds(self) -> None:
+        lanes = [
+            "kind=coordinator,unit=gk/p,parent=-",
+            "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+            "kind=implementation,unit=mz/gc,parent=mz/d,pane=%42",
+        ]
+        rc, out = self._run(lanes, "mz/gc", "launch")
+        self.assertEqual(0, rc)
+
+    def test_path_like_kind_fails_closed_generic_no_raw(self) -> None:
+        # #13571 j#75577 R10-F4: an invalid/path-like kind must fail closed with a
+        # generic allowed-set error, never reflecting the raw kind value.
+        pkind = "/" + "Users" + "/synthetic/kind"
+        lanes = [
+            "kind=coordinator,unit=gk/p,parent=-",
+            "kind=delegated_coordinator,unit=mz/d,parent=gk/p",
+            f"kind={pkind},unit=mz/gc,parent=mz/d,pane=%3",
+        ]
+        for realization, ar in (("launch", None), ("adopt", "because")):
+            for as_json in (True, False):
+                rc, out = self._run(lanes, "mz/gc", realization, adopt_reason=ar, as_json=as_json)
+                self.assertTrue(str(rc).startswith("die:"), msg=f"{realization}/{as_json}")
+                self.assertNotIn(pkind, out, msg=f"{realization}/{as_json}")
+
     def test_parser_error_apply_performs_zero_tmux(self) -> None:
         path = self._PATH_GC
         tmux = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client"
@@ -758,13 +897,17 @@ class StampProducerStableUnitTest(unittest.TestCase):
             self.assertEqual(0, require_tmux.call_count)
             self.assertNotIn(path, out)
 
-    def test_parser_error_still_echoes_identifier_typo_key(self) -> None:
-        # A plain-identifier typo key stays helpful (only path-like keys redact).
-        rc, out = self._run(
-            ["kidn=x,kind=implementation,unit=mz/gc"], "mz/gc", "launch"
-        )
-        self.assertTrue(str(rc).startswith("die:"))
-        self.assertIn("kidn", out)
+    def test_unknown_field_error_never_echoes_the_key(self) -> None:
+        # #13571 j#75577 R10-F4: an unknown --lane key (even a plain identifier)
+        # is never echoed — a private / secret-shaped identifier must not reach the
+        # error surface. Only the expected field list is stated.
+        for key in ("kidn", "my_secret_token_abc123", "sk_live_deadbeef"):
+            rc, out = self._run(
+                [f"{key}=x,kind=implementation,unit=mz/gc"], "mz/gc", "launch"
+            )
+            self.assertTrue(str(rc).startswith("die:"), msg=key)
+            self.assertNotIn(key, out, msg=key)
+            self.assertIn("expected one of kind/unit/parent/pane", out)
 
     def test_record_only_delegated_coordinator_path_is_redacted(self) -> None:
         # A valid chain with a path-like record-only --delegated-coordinator:
