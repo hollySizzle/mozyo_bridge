@@ -122,6 +122,19 @@ def _require_partition_workspace_id(args: argparse.Namespace) -> str:
     )
 
 
+def _watch_sender_attested(args: argparse.Namespace) -> bool:
+    """Whether the launch-time coordinator sender identity is attested for a managed watcher.
+
+    #13518 review R3-F1: the managed watcher RECORDS this in its resolved config so an un-attested
+    watcher is visible — it may still observe / plan, but its downstream sends fail-closed on the
+    workspace pin (they never route on ambient env). Attested = a workspace id resolves from an
+    authority (the registry anchor, else ``MOZYO_WORKSPACE_ID``) AND the coordinator role env
+    (``MOZYO_AGENT_ROLE``) is present. This is a recorded observation, not the send-time authority
+    (the send port still enforces the exact workspace pin — R3-F3).
+    """
+    return bool(_resolve_workspace_id(args)) and bool((os.environ.get("MOZYO_AGENT_ROLE") or "").strip())
+
+
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
     """Build the live poll source from daemon-trusted credentials (patchable test seam)."""
     since = (getattr(args, "since", None) or "").strip() or None
@@ -465,11 +478,49 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
 
         if getattr(args, "watch", False):
             max_passes = int(getattr(args, "max_passes", 1) or 1)
-            passes = watch(_wake_wait_fn(args), _pass, max_passes=max_passes)
-            payload = {"action": "watch", "passes": passes}
-            lines = [f"action: watch", f"passes: {len(passes)}"] + [
-                f"  wake={p['wake']} {_watch_pass_summary(p['pass'])}" for p in passes
-            ]
+            wake_target = (getattr(args, "wake_target", None) or "").strip()
+            managed = bool(source_issue and wake_target)
+            if managed:
+                # #13518 review R3-F1: the PRODUCTION managed-watcher composition. A --watch with a
+                # source issue to re-read AND a stable Herdr wake target is a managed watcher — it
+                # composes through the fail-closed `resolve_watcher_config` (source issue / attested
+                # workspace it owns / stable wake target) and `run_managed_watch`, which is the
+                # restart owner within its bounded budget (every wake outcome re-reads Redmine; a
+                # raising pass is recorded, not fatal). This is the sanctioned entrypoint that
+                # consumes the composition root — no longer only its unit test.
+                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_watcher_runtime import (  # noqa: E501
+                    resolve_watcher_config,
+                    run_managed_watch,
+                )
+                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_wake import (  # noqa: E501
+                    DEFAULT_WAKE_STATUS,
+                    DEFAULT_WAKE_TIMEOUT_MS,
+                )
+
+                config = resolve_watcher_config(
+                    source_issue=source_issue,
+                    workspace_id=ws,
+                    wake_target=wake_target,
+                    sender_attested=_watch_sender_attested(args),
+                    max_passes=max_passes,
+                    wake_status=(getattr(args, "wake_status", None) or DEFAULT_WAKE_STATUS),
+                    wake_timeout_ms=int(getattr(args, "wake_timeout_ms", 0) or DEFAULT_WAKE_TIMEOUT_MS),
+                )
+                passes = run_managed_watch(config, run_pass=_pass, wait_fn=_wake_wait_fn(args))
+                payload = {"action": "watch", "managed": True, "config": config.as_payload(), "passes": passes}
+                lines = (
+                    [f"action: watch (managed)", f"passes: {len(passes)}",
+                     f"  sender_attested: {config.sender_attested}"]
+                    + [f"  wake={p['wake']} {_watch_pass_summary(p['pass'])}" for p in passes]
+                )
+            else:
+                # Ad-hoc bounded watch (no managed composition): interval / best-effort wake, drains
+                # the existing outbox. Kept for back-compat; not the production restart owner.
+                passes = watch(_wake_wait_fn(args), _pass, max_passes=max_passes)
+                payload = {"action": "watch", "managed": False, "passes": passes}
+                lines = [f"action: watch", f"passes: {len(passes)}"] + [
+                    f"  wake={p['wake']} {_watch_pass_summary(p['pass'])}" for p in passes
+                ]
             return _emit(payload, as_json=as_json, text_lines=lines)
 
         report = _pass()

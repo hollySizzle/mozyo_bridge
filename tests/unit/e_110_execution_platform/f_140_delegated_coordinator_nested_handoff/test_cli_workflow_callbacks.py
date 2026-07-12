@@ -414,6 +414,85 @@ class RunOnceCliTest(_CliTestCase):
         self.assertEqual(rc, 0)
 
 
+class ManagedWatchCliTest(_CliTestCase):
+    """#13518 review R3-F1: --watch with a source issue AND a stable Herdr wake target is the
+    PRODUCTION managed-watcher composition — it resolves a fail-closed WatcherConfig and drives
+    run_managed_watch (the restart owner within its bounded budget), through THIS real CLI
+    entrypoint, not only the composition root's own unit test."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_wake = cli._wake_wait_fn
+        self._orig_attest = cli._watch_sender_attested
+        self._orig_sender = cli._callback_sender
+        cli._wake_wait_fn = lambda args: (lambda: False)  # deterministic timeout hint, no real Herdr
+        cli._watch_sender_attested = lambda args: True
+        cli._callback_sender = lambda args: (lambda row: SEND_DELIVERED)
+        self.addCleanup(setattr, cli, "_wake_wait_fn", self._orig_wake)
+        self.addCleanup(setattr, cli, "_watch_sender_attested", self._orig_attest)
+        self.addCleanup(setattr, cli, "_callback_sender", self._orig_sender)
+
+    def _managed_args(self, **over):
+        base = dict(
+            watch=True, json=True, store_path=str(self.store_path),
+            redmine_json=str(self.snapshot), source_issue="13518",
+            wake_target="mzb1_ws_codex_default", max_passes=2,
+        )
+        base.update(over)
+        return _args(**base)
+
+    def _run_json(self, ns):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_workflow_callbacks(ns)
+        return rc, _json.loads(buf.getvalue())
+
+    def test_watch_with_source_and_target_uses_managed_composition(self):
+        rc, out = self._run_json(self._managed_args())
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["managed"])  # the managed composition root was the caller
+        self.assertEqual(len(out["passes"]), 2)  # bounded budget honoured
+        self.assertEqual(out["config"]["workspace_id"], "ws_cli_test")  # attested workspace it owns
+        self.assertEqual(out["config"]["wake_target"], "mzb1_ws_codex_default")
+        self.assertEqual(out["config"]["source_issue"], "13518")
+        self.assertTrue(out["config"]["sender_attested"])
+
+    def test_watch_without_wake_target_is_adhoc_not_managed(self):
+        rc, out = self._run_json(self._managed_args(wake_target=None))
+        self.assertEqual(rc, 0)
+        self.assertFalse(out["managed"])  # no stable wake target -> ad-hoc, not the managed path
+
+    def test_managed_watch_survives_a_raising_pass_across_the_budget(self):
+        # The managed watcher is the restart owner: a pass that raises is recorded as an error pass
+        # on EVERY wake, never crashing the entrypoint, and the loop runs its full bounded budget.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            callback_runtime,
+        )
+
+        def _boom(*a, **k):
+            raise RuntimeError("pass exploded")
+
+        orig = callback_runtime.run_once
+        callback_runtime.run_once = _boom
+        try:
+            rc, out = self._run_json(self._managed_args(max_passes=3))
+        finally:
+            callback_runtime.run_once = orig
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["managed"])
+        self.assertEqual(len(out["passes"]), 3)  # survived and kept going for the full budget
+        self.assertTrue(all("error" in p["pass"] for p in out["passes"]))
+
+    def test_managed_watch_still_requires_a_resolved_workspace(self):
+        # R3-F1 composes atop R3-F3: a managed watch without a resolved workspace fails closed.
+        cli._resolve_workspace_id = lambda args: ""
+        with self.assertRaises(SystemExit):
+            self._run_json(self._managed_args())
+
+
 class PartitionRequirementTest(_CliTestCase):
     """#13518 review R3-F3: a mutating action over a shared home DB must REQUIRE a resolved
     workspace and claim / reclaim / route exactly that partition. An env-less / anchor-less
