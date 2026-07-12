@@ -132,12 +132,13 @@ documents:
     type: task
     status: active
     canonical_path: vibes/docs/tasks/new-session-onboarding.md
-    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406 / #13472)。読む順序 / Redmine 機能カタログ (Epic/Feature) / 現在地の見つけ方 / session boundary-prompt の必須 anchor / vibes/docs レイアウト / herdr lane 運用への pointer。state snapshot (日付・主戦場・open backlog) を焼かず、live state は Redmine journal を正本とする discovery / prompt contract。
+    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406 / #13472 / #13615)。読む順序 / Redmine 機能カタログ (Epic/Feature) / 現在地の見つけ方 / session boundary-prompt の必須 anchor / transition bundle / Herdr recovery分類 / vibes/docs レイアウトへの pointer。state snapshot (日付・主戦場・open backlog) を焼かず、live state は Redmine journal を正本とする discovery / prompt contract。
     audit_role: new_session_onboarding_task
     related_document_refs:
       - rule-project-agent-workflow
       - rule-workflow-docs-boundary
       - logic-session-boundary
+      - spec-session-continuity-user-harness
       - task-herdr-lane-operations
       - task-external-project-herdr-adoption
 
@@ -150,6 +151,21 @@ documents:
     related_document_refs:
       - skill-project-map-reference
       - spec-bounded-context-map
+
+  - id: spec-session-continuity-user-harness
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/session-continuity-user-harness.md
+    purpose: 新規sessionがchat memoryやpane scrollbackに依存せず、router / central preset / cataloged docs / Redmine durable state / temporary transition bundle / boundary promptからactive workflowと承認境界を復元するuser harness仕様。恒久contractと`vibes/docs/temps/`の時点snapshotを分離し、lane/runtime/sender-shell/auth stateと受領後cleanupまで定義する (Redmine #13529 / #13615)。
+    audit_role: session_continuity_user_harness_spec
+    related_document_refs:
+      - task-new-session-onboarding
+      - logic-session-boundary
+      - rule-workflow-docs-boundary
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - spec-herdr-native-identity
+      - task-herdr-lane-operations
 
   - id: spec-bounded-context-map
     type: spec
@@ -677,6 +693,7 @@ documents:
       - rule-llm-rule-authoring
       - skill-workflow-reference
       - spec-project-map
+      - spec-session-continuity-user-harness
 
   - id: logic-cockpit-attention-state
     type: logic
@@ -1415,6 +1432,7 @@ file_conventions:
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/grandchild_dispatch.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/grandchild_stamp.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/grandchild_stamp.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_handoff_grandchild_realization.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_projection.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_display.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegated_coordinator_route_plan.py
@@ -1429,6 +1447,7 @@ file_conventions:
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_backend_neutral_resolver.py
       - tests/scenarios/test_delegated_coordinator_route_plan.py
       - tests/regressions/test_issue_12474_delegated_route_gaps.py
+      - tests/regressions/test_issue_13571_grandchild_realization_binding.py
       - tests/support/delegation_route_fakes.py
       - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_role_profile_field_resolution.py
       - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_role_profile_default_resolution.py

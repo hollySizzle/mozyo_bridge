@@ -98,9 +98,29 @@ if [ -z "$bin_path" ]; then
   exit 1
 fi
 
-# Required surface: these must succeed (set -e aborts on failure).
-mozyo-bridge --version
-mozyo --version
+# Required surface: the two console entry points must both report the EXACT
+# dev version we pinned. `--version` prints `<prog> <version>` (argparse
+# `%(prog)s {__version__}`), so the version token is the last whitespace field.
+# Both entry points share the runtime `__version__`, and the TestPyPI dev build
+# mirrors that literal to the pinned version (Redmine #13586); if either CLI
+# disagrees, the installed artifact is not the pinned build and smoke evidence
+# would be inaccurate, so fail non-zero rather than merely displaying it.
+assert_cli_version() {
+  cli_name="$1"
+  raw="$("$cli_name" --version)"   # e.g. "mozyo-bridge 0.10.0.dev123"
+  got="${raw##* }"                 # last whitespace field == version token
+  if [ "$got" != "$version" ]; then
+    echo "error: '$cli_name --version' reported '$got' but the requested" >&2
+    echo "       TestPyPI dev version is '$version'. The installed artifact" >&2
+    echo "       does not match the pinned version; refusing so smoke" >&2
+    echo "       evidence cannot silently tie to the wrong build." >&2
+    exit 1
+  fi
+  echo "OK: $cli_name --version == $version"
+}
+
+assert_cli_version mozyo-bridge
+assert_cli_version mozyo
 mozyo-bridge project-gateway consult --help >/dev/null
 echo "OK: mozyo-bridge project-gateway consult --help"
 

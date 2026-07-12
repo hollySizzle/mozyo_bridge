@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     GATEWAY_READY_CAPTURE_LINES,
 )
@@ -90,6 +91,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     derive_directory_lane_token,
     derive_lane_workspace_token,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+    resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
@@ -142,6 +146,42 @@ class HerdrSublaneActuatorOps:
 
     def worktree_exists(self, branch: str) -> bool:
         return self._git().worktree_exists(branch)
+
+    def preflight_dispatch_sender(self) -> tuple[bool, str]:
+        """Verify the command-shell sender before any lane mutation (#13613)."""
+
+        try:
+            anchor = read_anchor(self.repo_root)
+        except Exception as exc:  # fail closed at the external read boundary
+            return False, f"workspace anchor unreadable ({exc})"
+        anchor_workspace_id = _norm(
+            anchor.get("workspace_id") if isinstance(anchor, Mapping) else ""
+        )
+        result = resolve_sender_identity(
+            self.env,
+            anchor_workspace_id=anchor_workspace_id or None,
+        )
+        if not result.ok or result.identity is None:
+            return False, f"{result.reason}: {result.detail}"
+        try:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
+                resolve_coordinator_provider,
+            )
+
+            coordinator_provider = resolve_coordinator_provider(str(self.repo_root))
+        except Exception as exc:  # config/binding IO is fail-closed here
+            return False, f"coordinator provider binding is unreadable ({exc})"
+        if result.identity.role != coordinator_provider:
+            return False, (
+                f"sender provider {result.identity.role!r} is not the configured "
+                f"coordinator provider {coordinator_provider!r}"
+            )
+        if result.identity.lane_id != DEFAULT_LANE:
+            return False, (
+                f"sender lane {result.identity.lane_id!r} is not the coordinator "
+                f"default lane {DEFAULT_LANE!r}"
+            )
+        return True, "sender identity matches the coordinator binding and default lane"
 
     def create_worktree(
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None

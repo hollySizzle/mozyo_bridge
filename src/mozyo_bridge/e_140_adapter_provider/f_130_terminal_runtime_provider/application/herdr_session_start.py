@@ -129,6 +129,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SLOT_STALE as LIVENESS_STALE,
     classify_named_slot,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.codex_shell_identity import (
+    CodexShellIdentity,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
     MOZYO_AGENT_ROLE_ENV,
@@ -858,6 +861,16 @@ def _execute_slot(
     # extended verbatim — no quoting needed on this list surface.
     if launch_argv_extra:
         launch_argv.extend(launch_argv_extra)
+    # Codex applies its own environment policy to tool-shell subprocesses.  The
+    # herdr --env flags above attest the TUI process, but do not by themselves
+    # prove that a Codex tool shell receives the same identity (#13614).  Append
+    # managed -c overrides last so repo-local launch extras cannot replace the
+    # attested tuple.  We set only these three values and do not widen ambient
+    # environment inheritance.
+    if plan.provider == PROVIDER_CODEX:
+        launch_argv.extend(
+            CodexShellIdentity(workspace_id=workspace_id, lane_id=lane).launch_argv()
+        )
     started = _invoke(
         binary,
         launch_argv,

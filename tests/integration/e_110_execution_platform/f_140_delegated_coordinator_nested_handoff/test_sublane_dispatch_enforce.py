@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATE_READY,
     DISPATCH_WORKER_DISPATCHED,
     REASON_FILL_STOP,
+    REASON_MISSING_IDENTITY,
     render_actuation_journal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (  # noqa: E501
@@ -144,6 +145,38 @@ def _create_req(**kw):
 
 
 class CreateGateTests(unittest.TestCase):
+    def test_sender_attestation_fails_before_every_side_effect(self):
+        class MissingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return False, "missing_sender_env: sender identity is absent"
+
+        ops = MissingSenderOps()
+        outcome = SublaneActuateUseCase(ops).run(
+            _create_req(), execute=True, fill_inputs=_dispatch_next_inputs()
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_MISSING_IDENTITY, outcome.blocked_reasons)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertIn("missing_sender_env", outcome.reason)
+        self.assertEqual(ops.calls, [])
+        next_action = outcome.as_payload()["next_action"]
+        self.assertEqual(next_action["action"], "restore_attested_coordinator_shell")
+        self.assertIn(
+            "manual_mozyo_env_injection", next_action["forbidden_methods"]
+        )
+
+    def test_sender_attestation_is_not_required_for_create_only(self):
+        class MissingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                raise AssertionError("create-only must not inspect dispatch sender")
+
+        ops = MissingSenderOps()
+        outcome = SublaneActuateUseCase(ops).run(
+            _create_req(), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertNotIn("dispatch", ops.calls)
+
     def test_stop_without_override_fails_closed_before_side_effects(self):
         ops = FakeActuatorOps()
         outcome = SublaneActuateUseCase(ops).run(

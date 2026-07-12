@@ -32,7 +32,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
-    REASON_SENDER_UNATTESTED,
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
     REASON_MISSING_IDENTITY,
@@ -306,33 +305,52 @@ class MissingIdentityTests(unittest.TestCase):
 
 
 class SenderAttestationPreflightTests(unittest.TestCase):
-    """#13518 j#75671 / review R2-F3: no partial launch on an unattested coordinator sender."""
+    """#13518 R3-F4a → #13613: the single sender-attestation authority is the ops-level
+    ``preflight_dispatch_sender`` (which compares the sender identity to the workspace anchor /
+    registry / coordinator provider), NOT a presence-only ``sender_attested`` boolean derived from
+    a merely non-empty MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE. A wrong-but-nonempty env therefore no
+    longer passes as attested. No presence-only second authority is retained on the use case."""
 
-    def test_unattested_sender_blocks_before_actuation(self):
-        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
-        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, sender_attested=False)
+    def test_failing_ops_preflight_blocks_before_actuation(self):
+        # A resolved-but-mismatched sender identity fails the ops preflight and blocks BEFORE any
+        # worktree side effect (a wrong-nonempty env would have passed the old presence-only path).
+        class MismatchedSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return False, "sender_workspace_mismatch: resolved != anchor"
+
+        ops = MismatchedSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_BLOCKED)
-        self.assertIn(REASON_SENDER_UNATTESTED, outcome.blocked_reasons)
-        # Fail-closed BEFORE any worktree side effect (a partial launch is exactly what j#75671
-        # forbids): create_worktree was never called.
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertIn("sender_workspace_mismatch", outcome.reason)
         self.assertFalse([c for c in ops.calls if isinstance(c, tuple) and c[0] == "create_worktree"])
 
-    def test_none_sender_attested_is_backcompat_no_op(self):
-        # An un-measured attestation (None) does not arm the gate — existing callers are unchanged.
+    def test_absent_ops_preflight_is_backcompat_no_op(self):
+        # An ops port without preflight_dispatch_sender (tmux / legacy) is not gated — the #13613
+        # attestation is opt-in per the backend port, keeping existing callers byte-for-byte.
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
-        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, sender_attested=None)
+        self.assertFalse(hasattr(ops, "preflight_dispatch_sender"))
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
-    def test_attested_sender_proceeds(self):
-        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
-        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, sender_attested=True)
+    def test_passing_ops_preflight_proceeds(self):
+        class AttestedSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return True, "sender_attested"
+
+        ops = AttestedSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
     def test_no_dispatch_is_not_gated_by_sender(self):
         # --no-dispatch creates/adopts but dispatches no worker, so the sender gate does not arm.
-        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        class ExplodingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                raise AssertionError("create-only must not inspect dispatch sender")
+
+        ops = ExplodingSenderOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(
-            _req(journal=None), execute=True, dispatch=False, sender_attested=False
+            _req(journal=None), execute=True, dispatch=False
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 

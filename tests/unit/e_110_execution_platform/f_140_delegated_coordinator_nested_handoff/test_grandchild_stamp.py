@@ -44,15 +44,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OPTION_LANE_KIND,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
+    BINDING_AMBIGUOUS,
+    BINDING_MISMATCH,
+    BINDING_MISSING,
+    BINDING_REALIZED,
+    BINDING_UNBOUND,
     DeclaredLane,
     GATE_BLOCKED,
     GATE_REALIZED,
     GATE_SAME_LANE_OK,
     GrandchildStampError,
+    GrandchildTargetIdentity,
+    InventoryUnit,
     REALIZATION_ADOPT,
     REALIZATION_LAUNCH,
     evaluate_grandchild_realization_gate,
     find_realized_grandchild_unit,
+    resolve_realized_grandchild_binding,
     resolve_grandchild_stamp_plan,
 )
 
@@ -539,48 +547,252 @@ class RealizationGateTest(unittest.TestCase):
         self.assertIn("grandchild_required_but_not_realized", r.reason)
 
 
+_GC_REPO = "/ws/child"
+
+
+def _gc_target(*, unit_id="mozyo/gc", parent="mozyo/d", repo_identity=_GC_REPO):
+    """The exact dispatch-selected grandchild identity the gate binds to.
+
+    A bindable target requires a canonical repo (the mandatory `--target-repo`
+    gate value) and both unit components, so `repo_identity` defaults to a repo.
+    """
+    return GrandchildTargetIdentity(
+        unit_id=unit_id, delegation_parent=parent, repo_identity=repo_identity
+    )
+
+
+def _gc_unit(
+    *,
+    unit_id="mozyo/gc",
+    lane_kind="implementation",
+    depth=2,
+    parent="mozyo/d",
+    status="derived",
+    repo_identity=_GC_REPO,
+    has_codex_gateway=True,
+    ambiguous=False,
+):
+    """A live-inventory unit re-resolved for the grandchild (route-bound by default)."""
+    return InventoryUnit(
+        unit_id=unit_id,
+        lane_kind=lane_kind,
+        delegation_depth=depth,
+        delegation_parent=parent,
+        status=status,
+        repo_identity=repo_identity,
+        has_codex_gateway=has_codex_gateway,
+        ambiguous=ambiguous,
+    )
+
+
 class FindRealizedGrandchildTest(unittest.TestCase):
+    """The realization gate binds to the EXACT dispatch-selected grandchild.
+
+    Redmine #13571 / #12454 j#75444 F1/F2: never "the first depth-2 implementation
+    lane under the coordinator". The exact target is re-resolved against the live
+    inventory (workspace/lane, display KIND, gateway ROLE, repo, parent, depth,
+    ambiguity), and the verdict must not depend on inventory scan order.
+    """
+
     def _rows(self):
         return [
-            ("gk/p", "coordinator", 0, None, "derived"),
-            ("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived"),
-            ("mozyo/gc", "implementation", 2, "mozyo/d", "derived"),
+            _gc_unit(unit_id="gk/p", lane_kind="coordinator", depth=0, parent="", repo_identity=None),
+            _gc_unit(unit_id="mozyo/d", lane_kind="delegated_coordinator", depth=1, parent="gk/p"),
+            _gc_unit(),
         ]
 
     def test_finds_realized_grandchild(self) -> None:
         self.assertEqual(
             "mozyo/gc",
-            find_realized_grandchild_unit(self._rows(), delegated_coordinator_unit="mozyo/d"),
+            find_realized_grandchild_unit(
+                self._rows(), target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            ),
         )
 
     def test_wrong_parent_no_match(self) -> None:
+        # A target whose declared parent is not the coordinator this gate runs
+        # under is a mismatch, not a silent match.
         self.assertIsNone(
-            find_realized_grandchild_unit(self._rows(), delegated_coordinator_unit="other/x")
+            find_realized_grandchild_unit(
+                self._rows(),
+                target=_gc_target(parent="other/x"),
+                delegated_coordinator_unit="other/x",
+            )
         )
 
     def test_diagnostic_status_no_match(self) -> None:
-        rows = [("mozyo/gc", "implementation", 2, "mozyo/d", "diagnostic")]
+        rows = [_gc_unit(status="diagnostic")]
         self.assertIsNone(
-            find_realized_grandchild_unit(rows, delegated_coordinator_unit="mozyo/d")
+            find_realized_grandchild_unit(
+                rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            )
         )
 
     def test_wrong_depth_no_match(self) -> None:
         # A same-lane worker masquerading at depth 1 is not a realized grandchild.
-        rows = [("mozyo/gc", "implementation", 1, "mozyo/d", "derived")]
+        rows = [_gc_unit(depth=1)]
         self.assertIsNone(
-            find_realized_grandchild_unit(rows, delegated_coordinator_unit="mozyo/d")
+            find_realized_grandchild_unit(
+                rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            )
         )
 
     def test_none_depth_no_match(self) -> None:
-        rows = [("mozyo/gc", "implementation", None, "mozyo/d", "derived")]
+        rows = [_gc_unit(depth=None)]
         self.assertIsNone(
-            find_realized_grandchild_unit(rows, delegated_coordinator_unit="mozyo/d")
+            find_realized_grandchild_unit(
+                rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            )
         )
+
+    def test_missing_target_is_missing_binding(self) -> None:
+        # The dispatch selected a grandchild that is not visible in the inventory.
+        rows = [_gc_unit(unit_id="mozyo/other")]
+        binding = resolve_realized_grandchild_binding(
+            rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+        )
+        self.assertEqual(BINDING_MISSING, binding.outcome)
+        self.assertIsNone(binding.matched_unit)
+
+    def test_unbound_when_no_target(self) -> None:
+        binding = resolve_realized_grandchild_binding(
+            self._rows(), target=None, delegated_coordinator_unit="mozyo/d"
+        )
+        self.assertEqual(BINDING_UNBOUND, binding.outcome)
+        self.assertIsNone(binding.matched_unit)
+
+    def test_unbound_when_target_missing_repo(self) -> None:
+        # F2 (b): repo is part of the exact identity; a target without a canonical
+        # repo is not bindable and fails closed (never realized on unit alone).
+        binding = resolve_realized_grandchild_binding(
+            self._rows(),
+            target=_gc_target(repo_identity=None),
+            delegated_coordinator_unit="mozyo/d",
+        )
+        self.assertEqual(BINDING_UNBOUND, binding.outcome)
+
+    def test_unbound_when_unit_component_missing(self) -> None:
+        # F2 (d): a half unit id (`ws/`, `/lane`, `/`) is not bindable.
+        for bad in ("mozyo/", "/gc", "/", "nogc"):
+            binding = resolve_realized_grandchild_binding(
+                self._rows(),
+                target=_gc_target(unit_id=bad),
+                delegated_coordinator_unit="mozyo/d",
+            )
+            self.assertEqual(BINDING_UNBOUND, binding.outcome, msg=f"unit_id={bad!r}")
+
+    def test_stale_sibling_before_target_does_not_win(self) -> None:
+        # The #13571 defect: a stale/unrelated depth-2 implementation sibling that
+        # appears BEFORE the real target under the same coordinator must not be
+        # returned by first-match. Exact-identity binding ignores it.
+        rows = [_gc_unit(unit_id="mozyo/stale"), _gc_unit()]
+        self.assertEqual(
+            "mozyo/gc",
+            find_realized_grandchild_unit(
+                rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            ),
+        )
+
+    def test_order_independent_stale_sibling_after_target(self) -> None:
+        # The same set with the stale sibling AFTER the target: order must not
+        # change the verdict (still binds to the exact target).
+        rows = [_gc_unit(), _gc_unit(unit_id="mozyo/stale")]
+        self.assertEqual(
+            "mozyo/gc",
+            find_realized_grandchild_unit(
+                rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            ),
+        )
+
+    def test_only_stale_sibling_present_is_missing_not_realized(self) -> None:
+        # With ONLY a stale sibling present (the real target absent), the old
+        # first-match returned the sibling -> false realized. Now: missing.
+        rows = [_gc_unit(unit_id="mozyo/stale")]
+        self.assertIsNone(
+            find_realized_grandchild_unit(
+                rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+            )
+        )
+
+    def test_duplicate_target_identity_is_ambiguous(self) -> None:
+        rows = [_gc_unit(), _gc_unit()]
+        binding = resolve_realized_grandchild_binding(
+            rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+        )
+        self.assertEqual(BINDING_AMBIGUOUS, binding.outcome)
+        self.assertIsNone(binding.matched_unit)
+
+    def test_conflicting_folded_unit_is_ambiguous(self) -> None:
+        # F2 (c): a single folded unit flagged ambiguous (conflicting/weak panes)
+        # must not realize even though its facts otherwise re-verify.
+        rows = [_gc_unit(ambiguous=True)]
+        binding = resolve_realized_grandchild_binding(
+            rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+        )
+        self.assertEqual(BINDING_AMBIGUOUS, binding.outcome)
+
+    def test_repo_mismatch_fails_closed(self) -> None:
+        # Same unit/kind/depth/parent but a DIFFERENT canonical repo: the target
+        # was dispatched for repo A, the visible lane resolves repo B -> mismatch.
+        rows = [_gc_unit(repo_identity="/ws/repo-b")]
+        binding = resolve_realized_grandchild_binding(
+            rows,
+            target=_gc_target(repo_identity="/ws/repo-a"),
+            delegated_coordinator_unit="mozyo/d",
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+        self.assertIn("repo", binding.reason)
+
+    def test_repo_mismatch_reason_redacts_absolute_path(self) -> None:
+        # F3 (b): the mismatch reason must not leak a raw absolute host path; only
+        # the portable basename is emitted. The private prefix is built at runtime
+        # so the tracked source carries no home-path-shaped literal.
+        private = "/" + "home" + "/synthetic/dev"
+        rows = [_gc_unit(repo_identity=f"{private}/repo-b")]
+        binding = resolve_realized_grandchild_binding(
+            rows,
+            target=_gc_target(repo_identity=f"{private}/repo-a"),
+            delegated_coordinator_unit="mozyo/d",
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+        self.assertIn("repo-a", binding.reason)
+        self.assertIn("repo-b", binding.reason)
+        self.assertNotIn(private, binding.reason)
+
+    def test_repo_match_realizes(self) -> None:
+        rows = [_gc_unit(repo_identity="/ws/repo-a/")]
+        binding = resolve_realized_grandchild_binding(
+            rows,
+            target=_gc_target(repo_identity="/ws/repo-a"),
+            delegated_coordinator_unit="mozyo/d",
+        )
+        self.assertEqual(BINDING_REALIZED, binding.outcome)
+        self.assertEqual("mozyo/gc", binding.matched_unit)
+
+    def test_wrong_kind_fails_closed(self) -> None:
+        # A unit whose display KIND is not implementation is not the grandchild.
+        rows = [_gc_unit(lane_kind="codex")]
+        binding = resolve_realized_grandchild_binding(
+            rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+
+    def test_missing_codex_gateway_fails_closed(self) -> None:
+        # F2 (a): a depth-2 implementation lane whose codex gateway vanished
+        # (Claude-only remnant carrying the stamped KIND) is NOT route-bound.
+        rows = [_gc_unit(has_codex_gateway=False)]
+        binding = resolve_realized_grandchild_binding(
+            rows, target=_gc_target(), delegated_coordinator_unit="mozyo/d"
+        )
+        self.assertEqual(BINDING_MISMATCH, binding.outcome)
+        self.assertIn("gateway_role", binding.reason)
 
 
 def _gate_args(**over) -> argparse.Namespace:
     base = dict(
         delegated_coordinator_unit="mozyo/d",
+        grandchild_unit="mozyo/gc",
+        grandchild_repo=_GC_REPO,
         require_grandchild=True,
         parent_issue="12454",
         child_issue="12484",
@@ -612,13 +824,69 @@ class CmdGateTest(unittest.TestCase):
 
     def test_realized_when_grandchild_present(self) -> None:
         rows = [
-            ("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived"),
-            ("mozyo/gc", "implementation", 2, "mozyo/d", "derived"),
+            _gc_unit(unit_id="mozyo/d", lane_kind="delegated_coordinator", depth=1, parent="gk/p"),
+            _gc_unit(),
         ]
         with mock.patch(self._PATCH, return_value=rows):
             rc, out = self._run(_gate_args())
         self.assertEqual(0, rc)
         self.assertIn("verdict: realized", out)
+
+    def test_blocked_when_codex_gateway_absent(self) -> None:
+        # F2 (a) at the CLI seam: the exact unit is present at depth-2
+        # implementation but its codex gateway vanished (Claude-only remnant) ->
+        # not route-bound, blocked.
+        rows = [_gc_unit(has_codex_gateway=False)]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args())
+        self.assertEqual(3, rc)
+        self.assertIn("verdict: blocked", out)
+        self.assertIn("identity_mismatch", out)
+
+    def test_blocked_when_unit_ambiguous(self) -> None:
+        # F2 (c): the exact unit folds conflicting/weak candidate panes -> the live
+        # identity is ambiguous, blocked (order can't flip it to realized).
+        rows = [_gc_unit(ambiguous=True)]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args())
+        self.assertEqual(3, rc)
+        self.assertIn("identity_binding: ambiguous_identity", out)
+
+    def test_blocked_when_repo_omitted(self) -> None:
+        # F2 (b): without --grandchild-repo the target is not bindable -> unbound,
+        # blocked (a same-lane worker is never acceptance on unit alone).
+        rows = [_gc_unit()]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args(grandchild_repo=None))
+        self.assertEqual(3, rc)
+        self.assertIn("identity_binding: unbound", out)
+
+    def test_blocked_when_only_stale_sibling_present(self) -> None:
+        # The #13571 defect at the CLI seam: a stale/unrelated depth-2
+        # implementation sibling under the same coordinator must NOT satisfy the
+        # gate when the dispatch selected a different exact grandchild unit.
+        rows = [
+            ("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived"),
+            ("mozyo/stale", "implementation", 2, "mozyo/d", "derived"),
+        ]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args())
+        self.assertEqual(3, rc)
+        self.assertIn("verdict: blocked", out)
+        self.assertIn("identity_binding: missing", out)
+
+    def test_blocked_when_repo_mismatch(self) -> None:
+        # Exact unit present but resolves a different canonical repo than the one
+        # the dispatch selected -> fail closed (identity, never proximity).
+        rows = [
+            ("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived", "/ws/repo-a"),
+            ("mozyo/gc", "implementation", 2, "mozyo/d", "derived", "/ws/repo-b"),
+        ]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args(grandchild_repo="/ws/repo-a"))
+        self.assertEqual(3, rc)
+        self.assertIn("verdict: blocked", out)
+        self.assertIn("identity_binding: identity_mismatch", out)
 
     def test_same_lane_ok_when_not_required(self) -> None:
         with mock.patch(self._PATCH, return_value=[]):
@@ -646,6 +914,19 @@ class GateParserRegistrationTest(unittest.TestCase):
         ])
         self.assertEqual("cmd_handoff_grandchild_gate", ns.func.__name__)
         self.assertFalse(ns.require_grandchild)
+
+    def test_gate_binds_exact_grandchild_unit_and_repo(self) -> None:
+        parser = build_parser()
+        ns = parser.parse_args([
+            "handoff", "delegate-grandchild-gate",
+            "--delegated-coordinator-unit", "mozyo/d",
+            "--grandchild-unit", "mozyo/gc",
+            "--grandchild-repo", "/ws/child",
+        ])
+        self.assertEqual("mozyo/gc", ns.grandchild_unit)
+        self.assertEqual("/ws/child", ns.grandchild_repo)
+        # Default is fail-closed: a grandchild IS required unless opted out.
+        self.assertTrue(ns.require_grandchild)
 
 
 if __name__ == "__main__":

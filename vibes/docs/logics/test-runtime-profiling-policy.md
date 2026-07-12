@@ -124,8 +124,35 @@ profiling が通常テストの信頼性を落とさないための不変条件:
 `.github/workflows/test.yml` の **full lane** の test step が
 `mozyo-bridge tests profile` (default lane)。これ一つで「テスト実行 (gate) +
 runtime summary」を同時に得る (二重実行しない)。CI は fresh `pip install .` 後に
-走るので installed == working tree であり、in-process discovery と
-`python -m unittest` の差は出ない。
+走るので installed == working tree であり、テスト *内容* は一致する。
+
+### repo-root import parity (Redmine #13555)
+
+ただし installed console-script と `python -m unittest` には **import path の差**が
+ある。`python -m unittest discover -s tests` は起動 cwd (= repo root) を
+`sys.path[0]` に載せるため、repo-root の test package が持つ
+`from tests.support ...` / `from tests.unit ...` の cross-package import が
+collection 時に解決する。一方 installed console-script entry point は起動 cwd を
+`sys.path` に載せないため、同じ discovery が全 Python matrix で
+`ModuleNotFoundError: No module named 'tests'` を出し collection error になった
+(latest main Test run `29129232080`, head `32916f84`、2 collection errors)。
+
+したがって `commands_test_runtime._run_suite` は **discovery の間だけ repo root を
+`sys.path` に bootstrap** し、`python -m` の cwd semantics を再現する
+(`_repo_root_importable`)。この bootstrap は:
+
+- repo root が既に path に在る local `python -m` / editable-install lane では
+  **no-op** (二重挿入せず、既存 entry を除去しない)。
+- discovery 後に `sys.path` を復元する (in-process caller の isolation)。
+- `top_level_dir` を **変えない**ため、discover される module 名 / test ID は不変
+  (`tests` を top_level_dir とする現行 discovery 命名を維持。詳細は
+  `tests-placement-discovery-policy.md`)。selection / verdict / runtime summary /
+  slow budget semantics も不変。
+
+これにより installed full lane と local `python -m` lane は test 内容だけでなく
+**collectability も一致**する。regression pin は
+`tests/regressions/test_issue_13555_installed_tests_profile_repo_root_import.py`
+(installed-path 条件を isolated fake repo で再現)。
 
 quick / full のレーン分割 (Redmine #12753) では、`tests profile` は全件を担う
 **full lane** 専用。PR の **quick lane** は `tests resolve` で affected subset のみ

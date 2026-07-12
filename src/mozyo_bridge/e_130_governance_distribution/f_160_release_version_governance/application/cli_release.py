@@ -204,13 +204,15 @@ def register(sub) -> None:
         "--testpypi",
         action="store_true",
         help=(
-            "Dispatch the TestPyPI workflow via `gh workflow run "
-            "testpypi.yml --ref main` (no workflow input; the run "
-            "builds the version committed in `main`'s pyproject.toml, "
-            "so bump/commit/push first). Requires --version, which is "
-            "validated and recorded as the expected version -- not "
-            "passed as a dispatch input. Run-id polling is delegated "
-            "to `release check workflow` / `release workflow wait`."
+            "Dispatch the exact-candidate TestPyPI workflow via `gh "
+            "workflow run testpypi.yml --ref main` with the exact "
+            "reviewed candidate as inputs (Redmine #13601). The workflow "
+            "event ref stays `main`; --source-sha is the artifact "
+            "authority, --expected-version the version it must carry, and "
+            "--source-ref the approved origin ref it must currently "
+            "resolve from. All three are required. The run is correlated "
+            "to a unique dispatch nonce (no latest-one guessing); polling "
+            "is delegated to `release workflow wait`."
         ),
     )
     publish_mode.add_argument(
@@ -233,11 +235,36 @@ def register(sub) -> None:
         ),
     )
     release_publish.add_argument(
+        "--source-sha",
+        dest="source_sha",
+        help=(
+            "Exact 40-hex commit SHA to build and publish under `--testpypi` "
+            "(artifact authority; validated as an immutable full SHA)."
+        ),
+    )
+    release_publish.add_argument(
+        "--expected-version",
+        dest="expected_version",
+        help=(
+            "Exact package version X.Y.Z that --source-sha must carry in both "
+            "mirror files, passed to the workflow as a fail-closed gate under "
+            "`--testpypi`."
+        ),
+    )
+    release_publish.add_argument(
+        "--source-ref",
+        dest="source_ref",
+        help=(
+            "Approved origin integration/release-candidate ref that must "
+            "currently resolve to --source-sha (lineage evidence) under "
+            "`--testpypi`."
+        ),
+    )
+    release_publish.add_argument(
         "--version",
         help=(
-            "Expected version literal X.Y.Z for `--testpypi`. Validated "
-            "and recorded, not passed as a workflow dispatch input; the "
-            "run builds the version committed in pyproject.toml."
+            "Deprecated alias for --expected-version under `--testpypi` "
+            "(kept for backward compatibility)."
         ),
     )
     release_publish.add_argument(

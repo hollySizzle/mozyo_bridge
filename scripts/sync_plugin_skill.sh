@@ -51,17 +51,36 @@ if [ ! -f "$src/SKILL.md" ]; then
 fi
 
 if [ "$check_only" -eq 1 ]; then
-  # Dry-run: rsync emits one itemized-changes line per file it would
-  # transfer or delete. Any output means drift. Reading the mirror
-  # directory is read-only.
+  # Dry-run: compare canonical and mirror by file content and file set
+  # only. Reading both trees is read-only.
+  #
+  # We deliberately do NOT use `rsync --itemize-changes` here. `rsync -a`
+  # preserves mtime, so its itemized dry-run reports checkout-induced
+  # timestamp-only differences (`>f..t......` / `.d..t......`) as drift
+  # even when every byte is identical. That made this CI gate depend on
+  # the runner's clock and fail non-deterministically (Redmine #13580).
+  # `diff -r` compares file contents and directory membership and ignores
+  # mtime entirely, so a byte-identical mirror passes regardless of
+  # checkout timestamps, while content changes, missing files, and extra
+  # files are still reported with their paths.
   if [ ! -d "$dest" ]; then
     echo "plugin skill mirror missing: $dest" >&2
     echo "Rerun 'scripts/sync_plugin_skill.sh' (no --check, from the repo root) to regenerate the mirror." >&2
     exit 1
   fi
-  output=$(rsync -an --delete --itemize-changes "$src" "$dest")
-  if [ -n "$output" ]; then
-    echo "plugin skill mirror drift detected; would change:" >&2
+  # `set -e` would abort on diff's non-zero exit, so capture it in an
+  # AND-OR list. diff exit codes: 0 = identical, 1 = differences found,
+  # >1 = trouble (e.g. unreadable path).
+  output=$(diff -r "$src" "$dest") && diff_status=0 || diff_status=$?
+  if [ "$diff_status" -gt 1 ]; then
+    echo "plugin skill mirror check failed while comparing:" >&2
+    echo "  source: $src" >&2
+    echo "  destination: $dest" >&2
+    echo "$output" >&2
+    exit "$diff_status"
+  fi
+  if [ "$diff_status" -ne 0 ]; then
+    echo "plugin skill mirror drift detected; content or file set differs:" >&2
     echo "$output" >&2
     echo "" >&2
     echo "Rerun 'scripts/sync_plugin_skill.sh' (no --check, from the repo root) to regenerate the mirror." >&2

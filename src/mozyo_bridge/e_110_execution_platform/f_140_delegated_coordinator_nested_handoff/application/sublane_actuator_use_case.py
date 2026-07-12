@@ -33,7 +33,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_FILL_STOP,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
-    REASON_SENDER_UNATTESTED,
     REASON_STAMP_FAILED,
     REASON_WORK_UNIT_BLOCKED,
     REASON_WORKTREE_CREATE_FAILED,
@@ -159,7 +158,6 @@ class SublaneActuateUseCase:
         target_repo: str = "auto",
         fill_inputs: Optional[FillDecisionInputs] = None,
         override_fill_stop: Optional[str] = None,
-        sender_attested: Optional[bool] = None,
     ) -> SublaneActuationOutcome:
         # 1. Fail closed on missing identity (#13432: a non-git workspace relaxes
         # --branch/--worktree and defaults the omitted worktree to the workspace root).
@@ -199,21 +197,6 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3c. Action-time sender-attestation preflight (#13518 j#75671 / review R2-F3): creating a
-        # lane / worktree and only THEN failing the governed dispatch on an unattested sender is a
-        # partial launch that forces raw-input recovery — fail closed BEFORE any side effect. Armed
-        # only when the caller supplies a measured `sender_attested` (`None` = no-op, back-compat).
-        if execute and dispatch and sender_attested is False:
-            return self._blocked(
-                request,
-                launch_action=None,
-                reason="the coordinator sender identity is not attested; refusing to create a "
-                "lane / worktree before a verified sender. Re-attest the sender "
-                "(MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE), then re-run — the request replays.",
-                reasons=(REASON_SENDER_UNATTESTED,),
-                dispatch=dispatch,
-            )
-
         # 3b. Dispatch admission gate (#13290, live-dispatch path only): consult the
         # caller-supplied fill decision (the single #12855 authority) and fail closed
         # on a concrete stop unless an explicit override reason is supplied. When no
@@ -241,6 +224,23 @@ class SublaneActuateUseCase:
                 )
             fill_decision_token = admission.fill_decision
             fill_override_reason = admission.override_reason
+
+            # #13613: optional herdr sender attestation must fail before mutation;
+            # absence preserves tmux and existing test-port compatibility.
+            sender_preflight = getattr(self.ops, "preflight_dispatch_sender", None)
+            if callable(sender_preflight):
+                sender_ok, sender_detail = sender_preflight()
+                if not sender_ok:
+                    return self._blocked(
+                        request,
+                        launch_action=None,
+                        reason="dispatch sender attestation failed before actuation; "
+                        f"{sender_detail}",
+                        reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
+                        dispatch=dispatch,
+                        fill_decision=fill_decision_token,
+                        fill_override_reason=fill_override_reason,
+                    )
 
         # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
         # identity field present (step 1 passed) the pure decision does not currently

@@ -82,6 +82,12 @@ resolver はこれを fail-closed に読む。
   error 文言はこの herdr-native な原因と正規 route を明示する (tmux 世代の `target_unavailable`
   文言に留めない)。operator が lane を直接叩く必要がある debug 時は attested lane agent pane から
   実行する。
+- **agent identity と command-shell attestation は別に測る (Redmine #13614)。** live inventoryに
+  `mzb1_<workspace>_<role>_<lane>` agentが存在することや、TUI launch時にenvを注入した事実だけでは、
+  そのagentが使うtool-exec subprocessに同じenvが伝播した証明にならない。handoff直前の実command
+  contextで3変数とrepo anchorを照合し、`present | missing | conflict`を記録する。`missing` / `conflict`
+  は標準sendをfail-closedにし、手動env注入でattestationを捏造しない。これはenv-less operator shellを
+  authority化しない既存境界の明確化であり、route authorityを増やさない。
 
 ## 3. Target-resolution semantics
 
