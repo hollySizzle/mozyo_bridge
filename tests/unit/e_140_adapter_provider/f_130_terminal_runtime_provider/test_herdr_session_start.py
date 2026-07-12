@@ -43,6 +43,20 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
 
+def _fingerprint(paths):
+    """(bytes, mtime_ns) per path — a strong purity probe for a --dry-run.
+
+    Comparing content AND mtime catches both a byte rewrite and a
+    content-identical touch that only advances the timestamp (the exact
+    `updated_at` / `last_seen` / anchor mtime mutation reported for #13595).
+    """
+    fp = {}
+    for p in paths:
+        st = p.stat()
+        fp[str(p)] = (p.read_bytes(), st.st_mtime_ns)
+    return fp
+
+
 class _Herdr:
     """A fake herdr CLI (0.7.1 shape) keyed on argv; records start argv + env.
 
@@ -716,19 +730,208 @@ class SessionStartTest(unittest.TestCase):
                         runner=herdr.run,
                     )
 
+    def _run_dry_run(self, repo, home, binpath, herdr, *, providers=("claude",), lane="lane-1"):
+        """Run a --dry-run under the given HOME; return the result."""
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            return prepare_session(
+                repo_root=repo,
+                providers=list(providers),
+                lane_id=lane,
+                env={HERDR_ENV: str(binpath)},
+                runner=herdr.run,
+                dry_run=True,
+            )
+
     def test_dry_run_plans_without_side_effects(self) -> None:
+        # Redmine #13595: a --dry-run on a REGISTERED repo returns the planned slot
+        # read-only and mutates NOTHING — registry + anchor bytes AND mtimes are
+        # byte-for-byte unchanged (the reported defect bumped `updated_at` /
+        # `last_seen` / anchor bytes), and no herdr launch / workspace create fires.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
-            result, anchor, repo = self._prepare(
-                tmp, providers=["claude"], herdr=herdr, dry_run=True
-            )
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                before = _fingerprint([registry_path(home), anchor_path(repo)])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home), anchor_path(repo)])
         self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(result.workspace_id, ws)  # read-only preview of the real id
+        # Registry + anchor untouched: identical bytes and identical mtimes.
+        self.assertEqual(before, after)
+        # No herdr side effect: no launch, no workspace create, no base pane reclaim.
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
-        # A dry-run plans nothing to launch, so no workspace is created and no base
-        # pane is reclaimed (Redmine #13330).
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.base_pane_id, "")
+
+    def test_dry_run_unregistered_repo_fails_closed_without_registering(self) -> None:
+        # Redmine #13595 core: a --dry-run on an UNREGISTERED repo must NOT create
+        # the registry / anchor (the exact defect) and must fail closed with
+        # actionable guidance rather than mint a fake assigned identity. The failure
+        # is BEFORE any herdr call.
+        from mozyo_bridge.core.state.workspace_registry import anchor_path, registry_path
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._run_dry_run(repo, home, binpath, herdr)
+            reg = registry_path(home)
+            anc = anchor_path(repo)
+            self.assertFalse(reg.exists())  # registry NOT created by the dry-run
+            self.assertFalse(anc.exists())  # anchor NOT created by the dry-run
+        self.assertIn("workspace register", str(ctx.exception))
+        self.assertEqual(herdr.calls, [])  # fails before any inventory read / launch
+
+    def test_dry_run_registry_only_resolves_from_row_without_rewriting_anchor(self) -> None:
+        # Matrix: registry row present, anchor deleted. A --dry-run resolves the id
+        # from the registry row read-only and does NOT recreate the anchor.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                anchor_path(repo).unlink()
+                before = _fingerprint([registry_path(home)])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home)])
+            self.assertFalse(anchor_path(repo).exists())  # NOT recreated
+        self.assertEqual(result.workspace_id, ws)
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)  # registry untouched
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_dry_run_anchor_only_resolves_without_recreating_registry(self) -> None:
+        # Matrix: anchor present, registry file removed. A --dry-run resolves from
+        # the anchor read-only and does NOT recreate the registry.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                registry_path(home).unlink()
+                before = _fingerprint([anchor_path(repo)])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([anchor_path(repo)])
+            self.assertFalse(registry_path(home).exists())  # NOT recreated
+        self.assertEqual(result.workspace_id, ws)
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)  # anchor untouched
+
+    def test_dry_run_anchor_registry_mismatch_prefers_anchor(self) -> None:
+        # Matrix: anchor and registry disagree on workspace_id. A --dry-run mirrors
+        # `register_workspace`'s precedence (the anchor pins the id) and mutates
+        # nothing.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            other_id = "f" * 32
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                anc = anchor_path(repo)
+                data = json.loads(anc.read_text(encoding="utf-8"))
+                self.assertNotEqual(data["workspace_id"], other_id)
+                data["workspace_id"] = other_id
+                anc.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                before = _fingerprint([registry_path(home), anc])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home), anchor_path(repo)])
+        self.assertEqual(result.workspace_id, other_id)  # anchor wins
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)
+
+    def test_dry_run_dual_anchor_fails_closed_without_mutation(self) -> None:
+        # Matrix: both the new and legacy anchor names exist — the same ambiguity
+        # `register_workspace` refuses. A --dry-run fails closed (never guesses)
+        # and mutates nothing.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            legacy_anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                legacy = legacy_anchor_path(repo)
+                legacy.write_text(anchor_path(repo).read_text(encoding="utf-8"), encoding="utf-8")
+                before = _fingerprint([registry_path(home), anchor_path(repo), legacy])
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home), anchor_path(repo), legacy])
+        self.assertIn("workspace.json", str(ctx.exception))
+        self.assertEqual(before, after)  # nothing mutated
+        self.assertEqual(herdr.calls, [])
 
     def test_cold_start_creates_workspace_launches_with_flag_and_reclaims(self) -> None:
         # Redmine #13330: a pure cold start explicitly creates the workspace, launches
@@ -1221,6 +1424,50 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
             herdr.pane_closes,
             [["pane", "close", "wH:p1"], ["pane", "close", "wH:t1-root"]],
         )
+
+    def test_dry_run_on_linked_worktree_is_read_only_preview(self) -> None:
+        # Redmine #13595 matrix (linked-worktree): a --dry-run from a lane worktree
+        # inherits the MAIN checkout's identity read-only (as the execute path does)
+        # and mutates nothing — the main registry + anchor are byte/mtime invariant,
+        # no worktree anchor is created, and no herdr launch fires.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            self._init_repo(main)
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13595_dry")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = self._binpath(Path(tmp))
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                before = _fingerprint([registry_path(home), anchor_path(main)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex", "claude"],
+                    lane_id="issue_13595_dry",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+                after = _fingerprint([registry_path(home), anchor_path(main)])
+                wt_anchor_exists = anchor_path(wt).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # inherited, read-only
+        self.assertEqual(
+            {s.outcome for s in result.slots}, {SLOT_PLANNED}
+        )
+        self.assertEqual(before, after)  # main registry + anchor untouched
+        self.assertFalse(wt_anchor_exists)  # no worktree anchor written
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.tab_creates, [])
 
     def test_prepare_session_linked_worktree_joins_live_host_workspace(self) -> None:
         """A second lane joins the sublane host the first lane's slots occupy —

@@ -767,7 +767,9 @@ def register_lifecycle(sub) -> None:
         dest="dry_run",
         action="store_true",
         help="Plan only: report which slots would launch / adopt without any side "
-        "effect (no launch, no rename).",
+        "effect — no launch, no rename, and no workspace registration / anchor write "
+        "(Redmine #13595). An unregistered workspace fails closed with actionable "
+        "guidance rather than being registered.",
     )
     add_repo_option(herdr_session_start)
     _add_lifecycle_json(herdr_session_start)

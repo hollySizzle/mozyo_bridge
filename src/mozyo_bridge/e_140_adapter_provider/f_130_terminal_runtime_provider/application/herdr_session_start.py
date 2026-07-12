@@ -108,7 +108,11 @@ if TYPE_CHECKING:
     )
 
 from mozyo_bridge.core.state.workspace_registry import (
+    ANCHOR_LEGACY_RELATIVE,
+    ANCHOR_RELATIVE,
     _is_linked_worktree,
+    anchor_resolution,
+    load_workspace_by_path,
     read_anchor,
     register_workspace,
 )
@@ -461,6 +465,46 @@ class _SlotPlan:
     locator: str = ""  # adopted live locator (kind == "adopt") / stale residue pane (kind == "stale"); else ""
 
 
+def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
+    """Resolve a registered workspace's ``workspace_id`` for ``--dry-run``, read-only.
+
+    The query-side mirror of :func:`register_workspace`'s identity precedence
+    (Redmine #13595): an existing **anchor** pins the id, else an existing
+    **registry row** for this canonical path — but purely read-only (never create
+    the registry, write ``last_seen``, or touch the anchor; the exact defect this
+    fixes called ``register_workspace`` before the dry-run branch). Fails closed
+    rather than minting a fake assigned identity: both anchor names present is the
+    same ambiguity the write path refuses (guess nothing), and no anchor + no
+    registry row means no durable identity yet (register first). Linked worktrees
+    never reach here — the :func:`prepare_session` inheritance branch
+    (:func:`herdr_workspace_segment`) resolves them read-only.
+    """
+    if anchor_resolution(resolved_root).both_exist:
+        raise HerdrSessionStartError(
+            f"both {ANCHOR_RELATIVE.as_posix()} and "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist in {resolved_root}; the new "
+            "name is authoritative but a dry-run refuses to guess which identity a "
+            f"real session-start would use — remove the legacy "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} and re-run "
+            "`mozyo-bridge workspace register`, then --dry-run"
+        )
+    anchor = read_anchor(resolved_root)
+    if isinstance(anchor, dict):
+        workspace_id = _norm(anchor.get("workspace_id"))
+        if workspace_id:
+            return workspace_id
+    record = load_workspace_by_path(resolved_root)
+    if record is not None:
+        workspace_id = _norm(record.workspace_id)
+        if workspace_id:
+            return workspace_id
+    raise HerdrSessionStartError(
+        f"dry-run cannot resolve a durable workspace identity for {resolved_root} "
+        "and refuses to register it (a dry-run has no side effect) or mint a fake "
+        "one; run `mozyo-bridge workspace register` first, then re-run with --dry-run"
+    )
+
+
 def prepare_session(
     *,
     repo_root: Path,
@@ -479,6 +523,13 @@ def prepare_session(
     ``register_workspace`` / ``read_anchor``). Raises :class:`HerdrSessionStartError`
     on any fail-closed condition (unknown provider, unconfigured binary, duplicate
     assigned name, a launch that yields no usable locator).
+
+    ``dry_run`` is side-effect free by contract (Redmine #13595): it resolves the
+    workspace identity read-only (:func:`_resolve_workspace_id_readonly` — never
+    ``register_workspace``), classifies each slot as ``planned`` (or adopts /
+    surfaces a live / stale slot read-only), and issues no ``herdr`` workspace /
+    tab / agent write. A workspace with no durable identity yet fails closed with
+    actionable guidance rather than being silently registered.
 
     ``agent_launch`` (Redmine #13425) is the repo-local launch-argv override the launch
     site resolved from ``.mozyo-bridge/config.yaml``. When provided, each launched slot's
@@ -570,6 +621,14 @@ def prepare_session(
                     "the lane via `sublane create` so its lane metadata record "
                     "carries the lane id (Redmine #13377)"
                 )
+    elif dry_run:
+        # Query / command split (Redmine #13595): a dry-run resolves the durable
+        # workspace identity WITHOUT any write. The prior code called
+        # `register_workspace(repo_root)` here unconditionally, so a `--dry-run`
+        # (documented "without any side effect") created the registry + anchor on an
+        # unregistered repo and bumped `updated_at` / `last_seen` / anchor bytes on a
+        # registered one. Resolve read-only; fail closed when no identity resolves.
+        workspace_id = _resolve_workspace_id_readonly(resolved_root)
     else:
         register_workspace(repo_root)
         anchor = read_anchor(repo_root)
