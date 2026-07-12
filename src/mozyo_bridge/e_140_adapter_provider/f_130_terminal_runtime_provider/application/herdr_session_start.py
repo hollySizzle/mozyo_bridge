@@ -100,7 +100,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
 if TYPE_CHECKING:
     from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
@@ -115,6 +115,11 @@ from mozyo_bridge.core.state.workspace_registry import (
     load_workspace_by_path,
     read_anchor,
     register_workspace,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    evaluate_attestation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -133,14 +138,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SLOT_STALE as LIVENESS_STALE,
     classify_named_slot,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.codex_shell_identity import (
-    CodexShellIdentity,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
-    MOZYO_AGENT_ROLE_ENV,
-    MOZYO_LANE_ID_ENV,
-    MOZYO_WORKSPACE_ID_ENV,
     PROVIDER_CLAUDE,
     PROVIDER_CODEX,
 )
@@ -152,13 +151,16 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
-    HERDR_BINARY_ENV,
     Runner,
     _bounded_detail,
     resolve_herdr_binary,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     TerminalTransportError,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    build_agent_start_argv,
+    resolve_attest_launcher,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
@@ -180,6 +182,10 @@ SLOT_LAUNCHED = "launched"
 SLOT_PLANNED = "planned"
 # A host-restart shell / name residue: surfaced read-only (#13518 j#75329; see herdr_slot_liveness).
 SLOT_STALE = LIVENESS_STALE
+# A live slot whose startup self-attestation is absent / stale / missing / conflicting
+# (Redmine #13637): the durable name matches a live agent, but its injected identity
+# env is unverified, so it is surfaced read-only and never blind-adopted.
+SLOT_UNATTESTED = "unattested"
 
 
 @dataclass(frozen=True)
@@ -461,8 +467,9 @@ class _SlotPlan:
 
     provider: str
     assigned_name: str
-    kind: str  # "adopt" | "launch" | "planned" | "stale"
+    kind: str  # "adopt" | "launch" | "planned" | "stale" | "unattested"
     locator: str = ""  # adopted live locator (kind == "adopt") / stale residue pane (kind == "stale"); else ""
+    detail: str = ""  # fail-closed reason for kind == "unattested" (Redmine #13637); else ""
 
 
 def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
@@ -516,6 +523,7 @@ def prepare_session(
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
+    attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
 
@@ -589,6 +597,9 @@ def prepare_session(
         except InvalidPermissionMode as exc:
             raise HerdrSessionStartError(str(exc)) from exc
     binary = _resolve_binary_or_die(env)
+    # The mozyo-bridge launcher the #13637 self-check wraps the provider through
+    # (resolved once, shared by every launched slot; "" disables wrapping).
+    attest_launcher = resolve_attest_launcher(env)
 
     # Redmine #13377 (design j#73613, Opt3 — shared project workspace): the mzb1
     # `workspace` segment. A linked git worktree (a sublane lane checkout) inherits the
@@ -640,6 +651,10 @@ def prepare_session(
 
     result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
     runner = runner or subprocess.run
+    # Startup self-attestation reader (Redmine #13637): the adopt gate joins each
+    # live name-match with its recorded self-attestation. Injectable for tests;
+    # defaults to the home-scoped store (fail-open to None -> adopt fails closed).
+    attestation_read = attestation_reader or HerdrIdentityAttestationStore().read
     rows = _list_rows(binary, runner, timeout)
 
     # Pass 1 — classify every slot (adopt / launch / dry-run plan) before launching,
@@ -656,12 +671,32 @@ def prepare_session(
                 "names must be unique — refuse to launch / rename over a duplicate"
             )
         if len(existing) == 1:
-            # Composite liveness (Redmine #13518 j#75329): a host-restart shell residue (name
-            # matches, no detected agent) is classified stale and surfaced, never blind-adopted.
-            kind = "stale" if classify_named_slot(existing[0]) == LIVENESS_STALE else "adopt"
-            plans.append(
-                _SlotPlan(provider, assigned_name, kind, _agent_locator(existing[0]))
-            )
+            live_locator = _agent_locator(existing[0])
+            if classify_named_slot(existing[0]) == LIVENESS_STALE:
+                # Composite liveness (Redmine #13518 j#75329): a host-restart shell residue
+                # (name matches, no detected agent) is stale and surfaced, never blind-adopted.
+                plans.append(
+                    _SlotPlan(provider, assigned_name, "stale", live_locator)
+                )
+            else:
+                # Startup self-attestation gate (Redmine #13637, Design Answer j#76462):
+                # adopt a live name-match ONLY when a `present` self-attestation is
+                # generation-bound to THIS live locator; absent / stale / missing /
+                # conflicting -> surfaced read-only as `unattested` (never blind-adopted
+                # or auto-repaired — herdr cannot read or mutate a live process env).
+                join = evaluate_attestation(
+                    attestation_read(assigned_name),
+                    live_locator=live_locator,
+                    expected_workspace_id=workspace_id,
+                    expected_role=provider,
+                    expected_lane=lane,
+                )
+                kind = "adopt" if join.ok else "unattested"
+                plans.append(
+                    _SlotPlan(
+                        provider, assigned_name, kind, live_locator, detail=join.reason
+                    )
+                )
         elif dry_run:
             plans.append(_SlotPlan(provider, assigned_name, "planned"))
         else:
@@ -773,6 +808,7 @@ def prepare_session(
                 target_tab=target_tab,
                 split_tab=split_tab,
                 binary=binary,
+                attest_launcher=attest_launcher,
                 env=env,
                 runner=runner,
                 timeout=timeout,
@@ -814,6 +850,7 @@ def _execute_slot(
     target_tab: str = "",
     split_tab: bool = False,
     binary: str,
+    attest_launcher: str = "",
     env: Mapping[str, str],
     runner: Runner,
     timeout: float,
@@ -849,87 +886,42 @@ def _execute_slot(
                 "owner-approved close + same-slot relaunch (dirty worktree preserved)"
             ),
         )
-    # Launch the agent with the durable name applied at start (herdr 0.7.1 real
-    # syntax: `agent start <NAME> [--cwd] [--workspace ID] [--env K=V]... [--no-focus]
-    # -- <argv>`). The NAME positional applies directly (probe: result.agent.name ==
-    # NAME), so no separate `agent rename` is needed. `--workspace` pins placement into
-    # the resolved target workspace (Redmine #13330) so herdr never auto-creates a new
-    # workspace — the source of the empty base pane. The self-identity vars ride on
-    # repeated `--env` flags, NOT the client process env — the server-spawned agent
-    # does not inherit the client env (coordinator-measured). `--no-focus` avoids
-    # stealing the operator's focus. The client env is still passed through for PATH etc.
-    #
-    # MOZYO_HERDR_BINARY (Redmine #13331 j#73312 scope addition): the launched agent is
-    # itself a mozyo operator (a lane worker / gateway that runs its own `handoff send`),
-    # and every herdr code path resolves the herdr binary ONLY from the trusted
-    # environment (`_resolve_binary_or_die`, `herdr_transport._resolve_binary`) — never a
-    # repo-local binary. The three self-identity vars were the only injected env, so a
-    # launched agent knew *who* it was but not *how* to reach herdr, forcing an inline
-    # `MOZYO_HERDR_BINARY=$(command -v herdr)` before every send (coordinator-measured,
-    # j#73312 finding #1). Injecting the already-resolved binary here propagates the
-    # trusted value the same way the identity vars are propagated: as an `--env` flag on
-    # the server-spawned agent, from a value the launcher already resolved from ITS trusted
-    # env (never widened to a repo-local path).
-    launch_argv = [
-        "agent",
-        "start",
-        plan.assigned_name,
-        "--cwd",
-        str(repo_root),
-        "--workspace",
-        target_workspace,
-        "--env",
-        f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
-        "--env",
-        f"{MOZYO_AGENT_ROLE_ENV}={plan.provider}",
-        "--env",
-        f"{MOZYO_LANE_ID_ENV}={lane}",
-        "--env",
-        f"{HERDR_BINARY_ENV}={binary}",
-        "--no-focus",
-        "--",
-        plan.provider,
-    ]
-    # Lane=tab placement (Redmine #13411): a non-default lane's gateway + worker
-    # land in ONE dedicated herdr tab inside the host workspace. `--tab` pins the
-    # tab the same way `--workspace` pins the workspace; `--split right` places the
-    # second slot beside the first (or a healing launch beside its live sibling) so
-    # the pair shares the tab. Inserted right after `--workspace <ws>`; the default
-    # lane passes no `target_tab`, so its argv is byte-for-byte the pre-#13411 shape.
-    if target_tab:
-        insert_at = launch_argv.index("--workspace") + 2
-        tab_flags = ["--tab", target_tab]
-        if split_tab:
-            tab_flags.extend(["--split", "right"])
-        launch_argv[insert_at:insert_at] = tab_flags
-    # Reproducible permission mode for managed Claude agents (Redmine #11925 /
-    # #13360): the tmux managed-pane chokepoint has always appended
-    # `--permission-mode <mode>`; without the same suffix here every herdr lane
-    # worker boots prompt-gated and stalls on its first gated command
-    # (coordinator-measured, 2026-07-07: all four wave workers blocked). The mode
-    # arrives pre-resolved (and pre-validated) from `prepare_session` — resolving
-    # here, mid-launch-sequence, is exactly what left a partial lane on an invalid
-    # env override (review j#73404). Codex never gets the flag.
-    if plan.provider == "claude" and claude_permission_mode:
-        launch_argv.extend(["--permission-mode", claude_permission_mode])
-    # Config-driven launch argv (Redmine #13425): appended AFTER the mozyo-managed
-    # `--permission-mode` flag (answer j#73949 Q4 render order) so the managed posture
-    # keeps its position; the config schema fail-closes on a token that re-specifies a
-    # managed flag, so a config value can never override it. herdr passes each token as a
-    # distinct `agent start ... -- {provider}` argv element (no shell), so the tokens are
-    # extended verbatim — no quoting needed on this list surface.
-    if launch_argv_extra:
-        launch_argv.extend(launch_argv_extra)
-    # Codex applies its own environment policy to tool-shell subprocesses.  The
-    # herdr --env flags above attest the TUI process, but do not by themselves
-    # prove that a Codex tool shell receives the same identity (#13614).  Append
-    # managed -c overrides last so repo-local launch extras cannot replace the
-    # attested tuple.  We set only these three values and do not widen ambient
-    # environment inheritance.
-    if plan.provider == PROVIDER_CODEX:
-        launch_argv.extend(
-            CodexShellIdentity(workspace_id=workspace_id, lane_id=lane).launch_argv()
+    if plan.kind == "unattested":
+        # A live slot whose startup self-attestation is absent / stale / missing /
+        # conflicting (Redmine #13637): surfaced read-only with the exact fail-closed
+        # reason and its live locator. herdr cannot read or repair a running process's
+        # env, so recovery is an OWNER-approved close + same-slot relaunch (which re-runs
+        # the self-check and writes a fresh present record) — never an automatic
+        # destructive repair here.
+        return SlotResult(
+            provider=plan.provider,
+            assigned_name=plan.assigned_name,
+            outcome=SLOT_UNATTESTED,
+            locator=plan.locator,
+            detail=(
+                f"{plan.detail}; requires an owner-approved close + same-slot relaunch "
+                "(the relaunch re-runs the startup self-attestation self-check)"
+            ),
         )
+    # Launch the agent with the durable name applied at start. The full `agent start`
+    # argv (self-identity `--env`, trusted `MOZYO_HERDR_BINARY`, managed
+    # `--permission-mode`, config launch tokens, Codex `-c` overrides, lane `--tab`
+    # placement, and the #13637 startup self-attestation wrap) is assembled by the
+    # cohesive sibling `herdr_launch_argv.build_agent_start_argv` (pure).
+    launch_argv = build_agent_start_argv(
+        assigned_name=plan.assigned_name,
+        provider=plan.provider,
+        repo_root=repo_root,
+        workspace_id=workspace_id,
+        lane=lane,
+        target_workspace=target_workspace,
+        target_tab=target_tab,
+        split_tab=split_tab,
+        binary=binary,
+        attest_launcher=attest_launcher,
+        claude_permission_mode=claude_permission_mode,
+        launch_argv_extra=launch_argv_extra,
+    )
     started = _invoke(
         binary,
         launch_argv,
@@ -1063,6 +1055,7 @@ __all__ = (
     "SLOT_LAUNCHED",
     "SLOT_PLANNED",
     "SLOT_STALE",
+    "SLOT_UNATTESTED",
     "HerdrSessionStartError",
     "SessionStartResult",
     "SlotResult",

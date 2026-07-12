@@ -60,6 +60,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     cmd_herdr_session_start,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (
+    cmd_herdr_agent_attest,
+)
 
 
 def _add_doctor_diagnostic_options(parser: argparse.ArgumentParser) -> None:
@@ -774,3 +777,27 @@ def register_lifecycle(sub) -> None:
     add_repo_option(herdr_session_start)
     _add_lifecycle_json(herdr_session_start)
     herdr_session_start.set_defaults(func=cmd_herdr_session_start)
+
+    # `agent-attest` is the managed-launch wrapper (Redmine #13637): the launch
+    # execs the provider THROUGH this command so the agent's own process can
+    # self-inspect its injected identity env before `exec`ing the provider, and
+    # record a generation-bound startup self-attestation. It is not an operator
+    # command — it is the wrapper the launch argv points at.
+    herdr_agent_attest = herdr_sub.add_parser(
+        "agent-attest",
+        help=(
+            "Managed-launch internal wrapper (Redmine #13637): self-inspect this "
+            "agent's injected identity env, record a generation-bound startup "
+            "self-attestation, then exec the provider given after `--`."
+        ),
+    )
+    herdr_agent_attest.add_argument("--assigned-name", dest="assigned_name", default="")
+    herdr_agent_attest.add_argument("--workspace-id", dest="workspace_id", default="")
+    herdr_agent_attest.add_argument("--role", dest="role", default="")
+    herdr_agent_attest.add_argument("--lane", dest="lane", default="")
+    herdr_agent_attest.add_argument(
+        "provider_argv",
+        nargs=argparse.REMAINDER,
+        help="The provider command to exec, after a `--` separator.",
+    )
+    herdr_agent_attest.set_defaults(func=cmd_herdr_agent_attest)

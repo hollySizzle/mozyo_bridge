@@ -35,12 +35,38 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SLOT_LAUNCHED,
     SLOT_PLANNED,
     SLOT_STALE,
+    SLOT_UNATTESTED,
     HerdrSessionStartError,
     herdr_workspace_segment,
     prepare_session,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
+
+
+def _present_attestation_reader(ws, role, lane, locator):
+    """A reader that returns a generation-matched ``present`` record for this slot.
+
+    The #13637 adopt gate adopts a live name-match only when a ``present`` startup
+    self-attestation is bound to the live locator; a test exercising the (unchanged)
+    adopt behaviour injects this so a live agent that WAS launched with attestation
+    still adopts.
+    """
+    name = encode_assigned_name(ws, role, lane)
+    record = IdentityAttestationRecord(
+        assigned_name=name,
+        workspace_id=ws,
+        role=role,
+        lane_id=lane,
+        locator=locator,
+        verdict=VERDICT_PRESENT,
+        observed_at="2026-07-12T00:00:00+00:00",
+    )
+    return lambda queried: record if queried == name else None
 
 
 def _fingerprint(paths):
@@ -244,6 +270,52 @@ class SessionStartTest(unittest.TestCase):
             )
             anchor = read_anchor(repo)
         return result, anchor, repo
+
+    def _fake_launcher_env(self, tmp):
+        # A resolvable absolute `mozyo-bridge` on the launch env PATH, so the #13637
+        # self-check wrapper is applied to the launch.
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir()
+        launcher = bindir / "mozyo-bridge"
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return {"PATH": str(bindir)}, str(launcher)
+
+    def test_launch_wraps_provider_in_self_attest_when_launcher_resolves(self) -> None:
+        # Redmine #13637: a launch execs the provider THROUGH `mozyo-bridge herdr
+        # agent-attest`, passing the expected identity, so the agent self-attests before
+        # exec. The provider is still the first element after the LAST `--`.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            result, anchor, _ = self._prepare(
+                tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env
+            )
+            ws = anchor["workspace_id"]
+        start = herdr.start_argvs[0]
+        # herdr `--` is followed by the resolved launcher, then the wrapper subcommand.
+        first_sep = start.index("--")
+        self.assertEqual(start[first_sep + 1], launcher)
+        self.assertIn("agent-attest", start)
+        self.assertIn("--assigned-name", start)
+        self.assertIn(encode_assigned_name(ws, "claude", "lane-1"), start)
+        self.assertIn("--role", start)
+        self.assertIn("claude", start)
+        # The provider is after the LAST `--` (the wrapper's own separator).
+        last_sep = len(start) - 1 - start[::-1].index("--")
+        self.assertEqual(start[last_sep + 1], "claude")
+        # The injected identity env is unchanged (still on herdr --env flags).
+        self.assertIn(f"MOZYO_WORKSPACE_ID={ws}", start)
+
+    def test_launch_is_byte_invariant_when_launcher_unresolvable(self) -> None:
+        # No resolvable mozyo-bridge on the launch env PATH -> no wrapper, byte-invariant
+        # pre-#13637 launch (`-- <provider>`), the safe fallback.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
+        start = herdr.start_argvs[0]
+        self.assertNotIn("agent-attest", start)
+        self.assertEqual(start[-2:], ["--", "claude"])
 
     def test_launch_mints_names_at_start_no_rename(self) -> None:
         herdr = _Herdr()
@@ -605,6 +677,12 @@ class SessionStartTest(unittest.TestCase):
                     lane_id="lane-1",
                     env={HERDR_ENV: str(binpath)},
                     runner=herdr.run,
+                    # The live agent WAS launched with attestation: a present record
+                    # generation-bound to its live locator lets the adopt gate adopt it
+                    # (Redmine #13637; without this it is surfaced `unattested`).
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w1:pOLD"
+                    ),
                 )
         slot = result.slots[0]
         self.assertEqual(slot.outcome, SLOT_ADOPTED)
@@ -613,11 +691,16 @@ class SessionStartTest(unittest.TestCase):
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
 
-    def _prepare_with_rows(self, tmp, *, existing, providers, lane):
+    def _prepare_with_rows(
+        self, tmp, *, existing, providers, lane, attestation_reader=None
+    ):
         """Register a temp workspace and run prepare_session against ``existing`` rows.
 
         ``existing`` is built from the resolved ``workspace_id`` (a callable ``ws -> rows``) so
-        the seeded durable names match what the run mints.
+        the seeded durable names match what the run mints. ``attestation_reader`` is
+        forwarded so an adopt scenario can inject a matching self-attestation record
+        (Redmine #13637); by default there is no record, so a live name-match is
+        surfaced ``unattested`` rather than adopted.
         """
         from mozyo_bridge.core.state.workspace_registry import register_workspace
 
@@ -638,6 +721,9 @@ class SessionStartTest(unittest.TestCase):
                 lane_id=lane,
                 env={HERDR_ENV: str(binpath)},
                 runner=herdr.run,
+                attestation_reader=(
+                    attestation_reader(ws) if attestation_reader else None
+                ),
             )
         return result, herdr
 
@@ -694,11 +780,91 @@ class SessionStartTest(unittest.TestCase):
                 ],
                 providers=["codex"],
                 lane="lane-1",
+                attestation_reader=lambda ws: _present_attestation_reader(
+                    ws, "codex", "lane-1", "w19:pC"
+                ),
             )
         slot = result.slots[0]
         self.assertEqual(slot.outcome, SLOT_ADOPTED)
         self.assertEqual(slot.locator, "w19:pC")
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def _live_codex_row(self, ws):
+        return [
+            {
+                "name": encode_assigned_name(ws, "codex", "lane-1"),
+                "pane_id": "w19:pC",
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        ]
+
+    def _assert_unattested_readonly(self, result, herdr) -> None:
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_UNATTESTED)
+        self.assertEqual(slot.locator, "w19:pC")  # live locator, for owner-gated recovery
+        self.assertIn("owner-approved", slot.detail)
+        # Read-only: never launched over, never a destructive close.
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["pane", "close"]])
+
+    def test_live_agent_without_attestation_record_is_unattested(self) -> None:
+        # Redmine #13637: a live name-match with NO startup self-attestation record (a
+        # legacy / pre-feature slot — the exact observed default-worker case) is not
+        # blind-adopted; it is surfaced read-only as unattested.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=self._live_codex_row,
+                providers=["codex"],
+                lane="lane-1",
+            )  # default: no attestation record
+        self._assert_unattested_readonly(result, herdr)
+
+    def test_live_agent_with_stale_locator_record_is_unattested(self) -> None:
+        # A present record from an earlier generation (its recorded locator no longer
+        # matches the live locator) is never re-used as this process's attestation.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=self._live_codex_row,
+                providers=["codex"],
+                lane="lane-1",
+                attestation_reader=lambda ws: _present_attestation_reader(
+                    ws, "codex", "lane-1", "w1:pOLD"  # stale locator != live w19:pC
+                ),
+            )
+        self._assert_unattested_readonly(result, herdr)
+
+    def test_live_agent_with_missing_verdict_record_is_unattested(self) -> None:
+        # The agent booted without its identity triplet (self-attestation = missing).
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            IdentityAttestationRecord,
+            VERDICT_MISSING,
+        )
+
+        def _missing_reader(ws):
+            name = encode_assigned_name(ws, "codex", "lane-1")
+            rec = IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=ws,
+                role="codex",
+                lane_id="lane-1",
+                locator="w19:pC",
+                verdict=VERDICT_MISSING,
+                observed_at="2026-07-12T00:00:00+00:00",
+            )
+            return lambda q: rec if q == name else None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=self._live_codex_row,
+                providers=["codex"],
+                lane="lane-1",
+                attestation_reader=_missing_reader,
+            )
+        self._assert_unattested_readonly(result, herdr)
 
     def test_duplicate_name_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1283,7 +1449,13 @@ class SessionStartCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         by_provider = {}
         for argv in herdr.start_argvs:
-            by_provider[argv[argv.index("--") + 1]] = argv
+            # The provider is the first element after the LAST `--`: the #13637
+            # self-attestation wrapper (present when `mozyo-bridge` resolves on the
+            # launch env PATH) inserts its own `-- <provider>` after the herdr
+            # `agent start ... --`, so keying on the last separator finds the provider
+            # whether or not the launch was wrapped.
+            last_sep = len(argv) - 1 - argv[::-1].index("--")
+            by_provider[argv[last_sep + 1]] = argv
         return by_provider
 
     def test_cli_session_start_threads_auto_permission_default(self) -> None:

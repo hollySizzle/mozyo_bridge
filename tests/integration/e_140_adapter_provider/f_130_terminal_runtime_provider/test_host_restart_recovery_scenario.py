@@ -77,12 +77,31 @@ class HostRestartRecoveryScenarioTest(unittest.TestCase):
             binpath = Path(tmp) / "fake-herdr"
             binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            # The still-live claude worker WAS launched with attestation: a present
+            # record generation-bound to its live locator lets the adopt gate resume it
+            # (Redmine #13637). The codex shell residue is `stale` before the gate.
+            from mozyo_bridge.core.state.herdr_identity_attestation import (
+                IdentityAttestationRecord,
+                VERDICT_PRESENT,
+            )
+
+            claude_name = encode_assigned_name(ws, "claude", LANE)
+            claude_rec = IdentityAttestationRecord(
+                assigned_name=claude_name,
+                workspace_id=ws,
+                role="claude",
+                lane_id=LANE,
+                locator="w19:p4",
+                verdict=VERDICT_PRESENT,
+                observed_at="2026-07-12T00:00:00+00:00",
+            )
             result = prepare_session(
                 repo_root=repo,
                 providers=["codex", "claude"],
                 lane_id=LANE,
                 env={HERDR_ENV: str(binpath)},
                 runner=herdr.run,
+                attestation_reader=lambda n: claude_rec if n == claude_name else None,
             )
         return result, herdr
 
