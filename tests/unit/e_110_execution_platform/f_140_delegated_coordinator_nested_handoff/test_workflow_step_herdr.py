@@ -303,6 +303,32 @@ class RoleAuthorityWiringTest(unittest.TestCase):
         )
         self.assertEqual(out.reason, REASON_HERDR_WORKER_STEP_READY)
 
+    def test_missing_authority_full_outcome_byte_invariant(self):
+        # R2: byte invariance is the FULL outcome payload, not just the reason token. A missing
+        # binding must produce exactly the same outcome as passing no authority at all.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+            STATUS_MISSING,
+            WorkflowRoleResolution,
+        )
+
+        cases = [
+            (classify_herdr_workflow_lane(provider="codex", lane_id="default", repo_root="/w"),
+             {}, "default"),
+            (classify_herdr_workflow_lane(provider="claude", lane_id="issue_1", repo_root="/w"),
+             dict(anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR), "issue_1"),
+            (classify_herdr_workflow_lane(provider="codex", lane_id="issue_1", repo_root="/w"),
+             dict(worker_liveness=WORKER_LIVE, anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR),
+             "issue_1"),
+        ]
+        for lane, kw, lane_id in cases:
+            baseline = resolve_herdr_workflow_step(lane, **kw)
+            with_missing = resolve_herdr_workflow_step(
+                lane,
+                role_authority=WorkflowRoleResolution(status=STATUS_MISSING, lane_id=lane_id),
+                **kw,
+            )
+            self.assertEqual(with_missing.as_payload(), baseline.as_payload())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

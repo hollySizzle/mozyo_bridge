@@ -55,6 +55,12 @@ schema（version 1）:
 canonical role 語彙は `grandparent_coordinator | project_gateway`（closed）。旧 `root_coordinator`
 は **compat 入力 alias** として `grandparent_coordinator` へ正規化するが、新規正本語彙へは書かない。
 
+schema は **closed** で fail-closed に検証する: top-level key は `{schema, version, bindings}` のみ、
+`bindings` は present な list 必須（欠落 / null は invalid、空 topology は明示 `[]` のみ）、entry key は
+`{role, project_scope, source_pointer}` のみ、role は非空 string、scope / source_pointer は present なら
+string（非文字列を暗黙 `str()` 変換しない）。present だが malformed な宣言は file 不在の fall-through
+と同一に扱わず invalid にする。
+
 ## 3. Lane identity（Q2-A: root=default、gateway=deterministic project-scoped lane）
 
 - effective runtime key = `(current attested workspace_id, binding lane_id, binding project_scope)`。
@@ -62,9 +68,11 @@ canonical role 語彙は `grandparent_coordinator | project_gateway`（closed）
   既に attest 済みで、file には持たない。
 - `grandparent_coordinator` は default lane（`lane_id = "default"`, project_scope 空）。
 - `project_gateway` の lane id は pure / versioned resolver `project_gateway_lane_id(project_scope)`
-  で導出する。scheme tag（`pgwv1`）+ readable slug + 生 scope の短い digest で構成し、(a) 決定論的、
-  (b) machine 間で安定、(c) 相異 scope が衝突しない（project-scope lane uniqueness）、(d) `default`
-  へ decay しない、を保証する。empty scope は fail-closed。
+  で導出する。scheme tag（`pgwv1`）+ **budget 内に bound した** readable slug + 生 scope の短い digest
+  で構成し、(a) 決定論的、(b) machine 間で安定、(c) 相異 scope が衝突しない（project-scope lane
+  uniqueness、injectivity は digest が担うので slug 切詰めは衝突を生まない）、(d) `default` へ decay
+  しない、(e) mzb1 assigned-name（`NAME_MAX_LENGTH=128`、非 `[A-Za-z0-9]` は 3 char escape）へ実 ws +
+  provider と合成しても収まる、を保証する。empty scope は fail-closed。
 - project_gateway と root grandparent は同一 slot を奪い合わない: grandparent は default、gateway は
   derived lane。同一 lane_id を導く 2 binding は slot collision として fail-closed。
 

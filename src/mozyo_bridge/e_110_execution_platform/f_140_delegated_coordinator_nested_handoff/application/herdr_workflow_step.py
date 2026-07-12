@@ -453,9 +453,12 @@ def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
 
     Returns a :class:`WorkflowRoleResolution`: ``resolved`` (grandparent / project gateway),
     ``blocked`` (malformed / ambiguous / provider mismatch — fail closed), or ``missing`` (no
-    binding for this lane -> the caller keeps the existing herdr classification). The
-    ``provider_binding`` load degrades to the compatibility default on a broken config rather
-    than crashing the step (a broken config is surfaced by the workflow-runtime surfaces).
+    binding for this lane -> the caller keeps the existing herdr classification). A **broken**
+    provider config (Redmine #13583 R1) does NOT degrade to the compat default — the expected
+    provider becomes unresolvable, so a lane that actually has a binding fails closed
+    (``provider_mismatch``) rather than resolving on an unverified default surface. A **missing**
+    config is not broken: ``load_workflow_binding`` returns the compat default without raising, so
+    an unconfigured repo keeps the legacy codex/claude expectation.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
         load_workflow_binding,
@@ -466,7 +469,6 @@ def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
         ROLE_PROJECT_GATEWAY as BINDING_PROJECT_GATEWAY,
         ROLE_ROOT_COORDINATOR as BINDING_ROOT_COORDINATOR,
-        RoleProviderBinding,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
         resolve_role_for_lane,
@@ -478,12 +480,16 @@ def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
     parsed = load_parsed_role_bindings(repo_root)
     try:
         binding, _warnings = load_workflow_binding(repo_root)
-    except Exception:  # noqa: BLE001 - a broken config degrades to the compat default here
-        binding = RoleProviderBinding.default()
+    except Exception:  # noqa: BLE001 - a broken config fails closed, never a default surface (R1)
+        binding = None
 
     def _expected(role: str):
-        # The authority's canonical grandparent_coordinator maps to provider_binding's compat
-        # ``root_coordinator`` role for the expected-provider lookup (both default to codex).
+        # A broken provider config cannot confirm the coordinator surface: return None so the
+        # pure resolver fails closed (provider_mismatch) when a binding matches this lane. The
+        # authority's canonical grandparent_coordinator maps to provider_binding's compat
+        # ``root_coordinator`` role for the lookup (both default to codex).
+        if binding is None:
+            return None
         key = (
             BINDING_ROOT_COORDINATOR
             if role == ROLE_GRANDPARENT_COORDINATOR
