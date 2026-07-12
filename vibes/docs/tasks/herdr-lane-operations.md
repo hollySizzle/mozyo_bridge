@@ -43,6 +43,17 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 - lane の**細分化** (**#13411 lane=tab / gateway+worker=split**): sublane host workspace 内で、非 default lane ごとに専用 herdr tab を割り当て、gateway + worker を同 tab 内 split pair として並置する。7 lane = 14 loose pane ではなく 7 tab に整理される (owner intent #13377 j#73654 の密度懸念に対応)。tab join は live inventory の `tab_id` のみが authority (label は cosmetic、lane key 由来)。fresh lane は `herdr tab create` で tab を mint、heal / 混在 adopt+launch は生存 slot の `tab_id` を読んで**同一 tab へ復帰** (pair 不分裂)。tab root pane は base pane と同型で全 launch 成功後に reclaim、tab 内最終 pane close で herdr が tab を自動消滅させる。retire は assigned-name の `pane close` のままで tab 配置に非依存 (最終 pane close で tab / host が自動消滅)。identity / route / projection は不変。pre-#13411 に loose pane で起動された legacy lane は heal でも loose のまま、full relaunch で tab へ移行する。owner は display knob (#12391 範疇) としていつでも override 可。
 - **legacy lane (pre-#13377)**: 旧 model の lane は独自 herdr workspace (`wt_<hash>` segment, default lane) を持つ。読み (list / status / dispatch-worker) と retire は互換対応済み。新規 create は常に shared model。legacy lane への coordinator dispatch は互換対象外 — 生かしたまま運用せず、順次 retire する。
 
+## `sublane list` の metadata / runtime 読み分け
+
+`sublane list --lane <label> --json` は lane metadata store と live Herdr inventory の read-only projectionであり、`sublanes` が非空という事実だけでは metadata record の存在を証明しない。shared-model lane は metadata record がなくても live assigned-name rowから表示される。
+
+- row の `stale_hints` が `lane_record_missing` を含む: metadata record は absent。gateway / worker locatorがあれば live slotは別軸で presentになり得る。この組合せのprimary verdictは `lane-unregistered` とし、runtime stateを別途併記する。
+- `lane_slots_missing` を含む: active metadata recordは presentだが、対応するlive managed slotは absent (`runtime-unavailable`)。
+- `sublanes: []`: 対象laneのmetadata recordもlive rowもprojectionに現れていない。Git branch/worktreeの有無はGitから別に測る。
+- store / projectionがunreadable、またはrecord-backedか判別不能: metadataは`unknown`としてfail-closedにする。
+
+dispatch / handoff / retire可否は、Git branch/worktree、metadata record、gateway+workerのlive routabilityを独立して記録してから判断する。完全なstate / verdict語彙は [[spec-session-continuity-user-harness]] `### Routable lane state の区別` を正本とする。
+
 ## lane 作成 (標準形)
 
 1. dispatch decision journal を issue に記録 (durable anchor)。
