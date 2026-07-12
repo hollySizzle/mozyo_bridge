@@ -121,6 +121,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     evaluate_attestation,
 )
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
     InvalidPermissionMode,
@@ -600,6 +601,11 @@ def prepare_session(
     # The mozyo-bridge launcher the #13637 self-check wraps the provider through
     # (resolved once, shared by every launched slot; "" disables wrapping).
     attest_launcher = resolve_attest_launcher(env)
+    # The self-attestation store home, injected onto the wrapper (`--env
+    # MOZYO_BRIDGE_HOME`) so its write lands in the SAME store the adopt reader /
+    # doctor read — a herdr-spawned wrapper does not inherit the client's home
+    # (review j#76492 Finding 1). Resolved via `mozyo_bridge_home()` to match the reader.
+    store_home = str(mozyo_bridge_home())
 
     # Redmine #13377 (design j#73613, Opt3 — shared project workspace): the mzb1
     # `workspace` segment. A linked git worktree (a sublane lane checkout) inherits the
@@ -651,10 +657,12 @@ def prepare_session(
 
     result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
     runner = runner or subprocess.run
-    # Startup self-attestation reader (Redmine #13637): the adopt gate joins each
-    # live name-match with its recorded self-attestation. Injectable for tests;
-    # defaults to the home-scoped store (fail-open to None -> adopt fails closed).
-    attestation_read = attestation_reader or HerdrIdentityAttestationStore().read
+    # Startup self-attestation reader (Redmine #13637): the adopt gate joins each live
+    # name-match with its record. Injectable for tests; defaults to the store pinned to
+    # the SAME `store_home` the wrapper writes to (j#76492 F1), fail-open None.
+    attestation_read = (
+        attestation_reader or HerdrIdentityAttestationStore(home=Path(store_home)).read
+    )
     rows = _list_rows(binary, runner, timeout)
 
     # Pass 1 — classify every slot (adopt / launch / dry-run plan) before launching,
@@ -809,6 +817,7 @@ def prepare_session(
                 split_tab=split_tab,
                 binary=binary,
                 attest_launcher=attest_launcher,
+                store_home=store_home,
                 env=env,
                 runner=runner,
                 timeout=timeout,
@@ -851,6 +860,7 @@ def _execute_slot(
     split_tab: bool = False,
     binary: str,
     attest_launcher: str = "",
+    store_home: str = "",
     env: Mapping[str, str],
     runner: Runner,
     timeout: float,
@@ -903,10 +913,9 @@ def _execute_slot(
                 "(the relaunch re-runs the startup self-attestation self-check)"
             ),
         )
-    # Launch the agent with the durable name applied at start. The full `agent start`
-    # argv (self-identity `--env`, trusted `MOZYO_HERDR_BINARY`, managed
-    # `--permission-mode`, config launch tokens, Codex `-c` overrides, lane `--tab`
-    # placement, and the #13637 startup self-attestation wrap) is assembled by the
+    # Launch with the durable name at start; the full `agent start` argv (self-identity
+    # `--env`, `MOZYO_HERDR_BINARY`, `--permission-mode`, config tokens, Codex `-c`
+    # overrides, lane `--tab`, and the #13637 self-attestation wrap) is assembled by the
     # cohesive sibling `herdr_launch_argv.build_agent_start_argv` (pure).
     launch_argv = build_agent_start_argv(
         assigned_name=plan.assigned_name,
@@ -919,6 +928,7 @@ def _execute_slot(
         split_tab=split_tab,
         binary=binary,
         attest_launcher=attest_launcher,
+        store_home=store_home,
         claude_permission_mode=claude_permission_mode,
         launch_argv_extra=launch_argv_extra,
     )
