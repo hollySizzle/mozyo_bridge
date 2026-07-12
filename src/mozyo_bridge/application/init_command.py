@@ -521,13 +521,15 @@ def _source_home_registry() -> str:
 def _confident_workspace_root(cwd: str) -> Path | None:
     """Return the workspace root for ``cwd`` only when its identity is confident.
 
-    Walks up from ``cwd`` using the same markers bare ``mozyo`` uses and returns
-    the root only when that root actually bears a repo / workspace marker
+    Resolves ``cwd`` with the same Git-root-first resolver bare ``mozyo`` uses
+    (Redmine #13641: a reachable Git worktree root wins, else the marker walk)
+    and returns the root only when that root actually bears a repo / workspace
+    marker
     (``.git`` / ``.tmux.conf`` / ``pyproject.toml`` / ``.mozyo-bridge/scaffold.json``).
-    Returns ``None`` when ``cwd`` is empty or the walk fell through to a
+    Returns ``None`` when ``cwd`` is empty or the resolution fell through to a
     marker-less directory, so smart ``init`` fails closed rather than adopting an
-    unidentifiable cwd into a derived session. Uses ``find_repo_root`` (a pure
-    cwd walk-up) rather than ``resolve_repo_root`` so the root reflects where the
+    unidentifiable cwd into a derived session. Uses ``find_repo_root`` (anchored
+    on the cwd) rather than ``resolve_repo_root`` so the root reflects where the
     pane actually is, not a ``MOZYO_REPO`` override.
     """
     from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS, find_repo_root

@@ -307,8 +307,9 @@ def _worker_dispatch_argv(
     ``sublane dispatch-worker`` already selected — not from the driving process's
     cwd. Under ``terminal_transport.backend: herdr`` the send-path backend predicate
     (``herdr_effective_backend_selected`` → ``load_repo_local_config(repo_root_from_args(args))``)
-    reads the config at ``repo_root_from_args``, which defaults to a marker walk from
-    cwd. In-project (``mozyo_bridge``) the herdr selection is a *committed* config, so
+    reads the config at ``repo_root_from_args``, which defaults to a Git-root-first
+    resolve from cwd (Redmine #13641: a reachable Git root wins, else the marker
+    walk). In-project (``mozyo_bridge``) the herdr selection is a *committed* config, so
     every checkout / lane worktree carries it and cwd resolution happens to agree; in
     an **external** adopted project the herdr selection lives only at the adopted root,
     so a drive whose cwd resolves elsewhere re-derived ``backend: tmux`` and validated

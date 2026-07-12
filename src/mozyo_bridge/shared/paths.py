@@ -52,10 +52,16 @@ WORKSPACE_MARKERS = (
 # workspace — otherwise the bare-`mozyo` adoption gate refuses an adopted
 # project and the repo-local backend selection never reads its config.
 REPO_LOCAL_CONFIG_MARKER = ".mozyo-bridge/config.yaml"
-# Markers that establish a repo / workspace root for identity inference. The
-# walk returns the deepest ancestor bearing ANY marker, so adding workspace
-# markers can only stop the walk earlier (at a more specific root) — it never
-# overrides a deeper git / pyproject root.
+# Markers that drive the FALLBACK marker walk in :func:`find_repo_root` — the
+# walk reached ONLY when no Git worktree root is above the cwd (see that
+# function's Git-root-first contract, Redmine #13641). Within that fallback walk
+# the deepest ancestor bearing ANY marker wins. This set does NOT describe the
+# primary resolution: when a Git root IS reachable it is the workspace and wins
+# over every deeper non-git marker listed here (``pyproject.toml`` /
+# ``.tmux.conf`` / config / anchor / scaffold). So a Git root can and does
+# override a deeper ``pyproject.toml`` root — the deliberate reversal of the
+# pre-#13641 marker-only behavior, where adding a workspace marker could only
+# stop the walk earlier and never overrode a deeper git / pyproject root.
 REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS + (REPO_LOCAL_CONFIG_MARKER,)
 # Markers that establish mozyo ADOPTION of an already-resolved root (Redmine
 # #13379). Identity inference (which ancestor is the root) and adoption (did
