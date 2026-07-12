@@ -140,17 +140,28 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
-          # source_ref must be a NAMED ref on origin whose CURRENT tip is exactly
-          # source_sha. A bare SHA, a local-only ref, or a ref that merely has
-          # source_sha as an ancestor is refused (ls-remote returns the tip only).
-          RESOLVED="$(git ls-remote origin "$SOURCE_REF" | awk 'NR==1 {print $1}')"
-          if [ -z "$RESOLVED" ]; then
-            echo "::error::source_ref '$SOURCE_REF' does not resolve to a ref on origin"; exit 1
+          # F2 (Redmine #13601 j#76006): require EXACTLY ONE named origin ref
+          # whose CURRENT tip is source_sha. The previous `ls-remote | awk NR==1`
+          # accepted a refspec/glob (e.g. `refs/heads/*`) and passed on a
+          # first-line coincidence. Reject glob/refspec metacharacters and
+          # whitespace, then require exactly one non-peel match equal to
+          # source_sha. Ancestor-only / local-only SHAs remain refused (ls-remote
+          # returns only the ref tip).
+          case "$SOURCE_REF" in
+            *[!A-Za-z0-9._/-]* | "")
+              echo "::error::source_ref must be a single plain ref name (no globs/refspec metacharacters/whitespace)"; exit 1 ;;
+          esac
+          # Annotated-tag peel lines end in `^{}`; drop them so a tag counts once.
+          MATCHES="$(git ls-remote origin "$SOURCE_REF" | awk '$2 !~ /\^\{\}$/ {print $1}')"
+          COUNT="$(printf '%s\n' "$MATCHES" | grep -c . || true)"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::source_ref '$SOURCE_REF' resolved to $COUNT origin refs; require exactly one"; exit 1
           fi
+          RESOLVED="$(printf '%s\n' "$MATCHES" | head -n1)"
           if [ "$RESOLVED" != "$SOURCE_SHA" ]; then
             echo "::error::source_ref '$SOURCE_REF' tip $RESOLVED != source_sha $SOURCE_SHA"; exit 1
           fi
-          echo "source_ref '$SOURCE_REF' tip == source_sha"
+          echo "source_ref '$SOURCE_REF' -> exactly one origin ref tip == source_sha"
 
       - name: Verify version mirror == expected_version (manual)
         if: github.event_name == 'workflow_dispatch'
@@ -183,6 +194,26 @@ jobs:
           print(f"version mirror == expected_version ({expected})")
           PY
 
+      - name: Verify candidate Test workflow matches trusted main (manual)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          # F1 (Redmine #13601 j#76006): a candidate could weaken its OWN
+          # .github/workflows/test.yml and obtain a green Test run at source_sha.
+          # Selecting the Test run by workflow path only proves the workflow
+          # FAMILY, not that the run executed trusted content. Require the
+          # candidate's test.yml to be byte-identical to trusted origin/main's
+          # test.yml, so the green Test run accepted below actually ran the
+          # trusted definition. This comparison is inline in the main-defined
+          # (trusted) workflow and executes no candidate code.
+          git fetch --no-tags origin main
+          TRUSTED="$(git show FETCH_HEAD:.github/workflows/test.yml)"
+          CANDIDATE="$(git show HEAD:.github/workflows/test.yml)"
+          if [ "$TRUSTED" != "$CANDIDATE" ]; then
+            echo "::error::candidate .github/workflows/test.yml differs from trusted origin/main; refusing (fail-closed). Rebase the candidate onto a main whose Test definition it matches."; exit 1
+          fi
+          echo "candidate Test workflow == trusted origin/main"
+
       - name: Verify successful Test CI for source SHA (manual)
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -192,9 +223,9 @@ jobs:
         run: |
           set -euo pipefail
           # Require a completed + success run of the TRUSTED `Test` workflow
-          # (.github/workflows/test.yml) for exactly this head_sha. Selecting by
-          # the workflow file path pins the canonical Test workflow, not some
-          # other workflow renamed "Test".
+          # (.github/workflows/test.yml) for exactly this head_sha. The prior
+          # step proved the candidate's test.yml equals trusted main, so this
+          # success attests trusted CI content ran, not a candidate-weakened one.
           SUCCESSES="$(gh api -H "Accept: application/vnd.github+json" \
             "/repos/$REPO/actions/workflows/test.yml/runs?head_sha=$SOURCE_SHA&status=completed" \
             --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
@@ -209,15 +240,20 @@ jobs:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: |
           set -euo pipefail
-          # Fail-closed: a lookup error is treated as "cannot prove unused",
-          # so the publish does not proceed on an unknown uniqueness state.
+          # F3 (Redmine #13601 j#76006): a malformed / partial payload must NOT
+          # be read as "unused". Fail closed on any lookup error AND on any
+          # payload that does not carry the documented `releases` object schema,
+          # so an unknown/unprovable uniqueness state never green-lights publish.
+          # MOZYO_TESTPYPI_JSON_URL is overridable only so the regression test
+          # can point the SAME gate body at a local fixture; production uses the
+          # real TestPyPI JSON endpoint.
           python3 - <<'PY'
           import json, os, sys, urllib.error, urllib.request
           expected = os.environ["EXPECTED_VERSION"]
-          url = "https://test.pypi.org/pypi/mozyo-bridge/json"
+          url = os.environ.get("MOZYO_TESTPYPI_JSON_URL") or "https://test.pypi.org/pypi/mozyo-bridge/json"
           try:
               with urllib.request.urlopen(url, timeout=20) as response:
-                  data = json.loads(response.read().decode("utf-8"))
+                  raw = response.read().decode("utf-8")
           except urllib.error.HTTPError as exc:
               if exc.code == 404:
                   print("project not yet on TestPyPI; version is unused")
@@ -227,8 +263,18 @@ jobs:
           except Exception as exc:  # noqa: BLE001 - any transport error is fail-closed
               print(f"::error::TestPyPI lookup unreachable ({exc}); refusing (fail-closed)")
               sys.exit(1)
-          releases = data.get("releases") if isinstance(data, dict) else None
-          if isinstance(releases, dict) and expected in releases:
+          try:
+              data = json.loads(raw)
+          except (ValueError, TypeError) as exc:
+              print(f"::error::TestPyPI payload is not valid JSON ({exc}); refusing (fail-closed)")
+              sys.exit(1)
+          # Require the documented schema BEFORE declaring the version unused: a
+          # 200 response missing `releases`, or with a non-dict `releases`, is an
+          # unprovable state, not proof of absence.
+          if not isinstance(data, dict) or not isinstance(data.get("releases"), dict):
+              print("::error::TestPyPI payload has no `releases` object; cannot prove version unused (fail-closed)")
+              sys.exit(1)
+          if expected in data["releases"]:
               print(f"::error::version {expected} already published on TestPyPI")
               sys.exit(1)
           print(f"version {expected} is unused on TestPyPI")
