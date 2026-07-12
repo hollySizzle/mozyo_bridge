@@ -716,11 +716,55 @@ class StampProducerStableUnitTest(unittest.TestCase):
             self.assertTrue(str(rc).startswith("die:"), msg=f"{realization}: {rc}")
             self.assertNotIn(self._PATH_PARENT, out, msg=realization)
 
-    def test_drive_dot_multisegment_unit_fails_closed(self) -> None:
+    def test_drive_dot_multisegment_unit_fails_closed_launch_and_adopt(self) -> None:
+        # #13571 j#75565 R9-F1 (4): pin BOTH launch and adopt for drive / dot /
+        # multi-segment declared units.
         for bad in ("C:/x", "ws/.", "ws/..", "ws/a/b"):
-            rc, out = self._run(self._chain(gc_unit=bad), bad, "launch")
-            self.assertTrue(str(rc).startswith("die:"), msg=f"{bad}: {rc}")
-            self.assertNotIn(bad, out, msg=bad)
+            for realization, ar in (("launch", None), ("adopt", "because")):
+                rc, out = self._run(
+                    self._chain(gc_unit=bad), bad, realization, adopt_reason=ar
+                )
+                self.assertTrue(str(rc).startswith("die:"), msg=f"{bad}/{realization}: {rc}")
+                self.assertNotIn(bad, out, msg=f"{bad}/{realization}")
+
+    def test_parser_error_does_not_leak_raw_lane(self) -> None:
+        # #13571 j#75565 R9-F1: the pre-validation `--lane` parser error (missing
+        # kind / missing unit / bare token / path-like key) must fail closed
+        # without echoing the raw operator input, across launch/adopt x text/json.
+        path = self._PATH_GC
+        malformed_specs = (
+            [f"unit={path},pane=%3"],          # missing kind
+            [f"kind=implementation,parent={path},pane=%3"],  # missing unit
+            [path],                             # bare token (no `=`)
+            [f"{path}=x,kind=implementation,unit=mz/gc"],  # path-like key
+        )
+        for spec in malformed_specs:
+            for realization, ar in (("launch", None), ("adopt", "because")):
+                for as_json in (True, False):
+                    rc, out = self._run(spec, "mz/gc", realization, adopt_reason=ar, as_json=as_json)
+                    self.assertTrue(str(rc).startswith("die:"), msg=f"{spec}/{realization}")
+                    self.assertNotIn(path, out, msg=f"{spec}/{realization}/{as_json}")
+                    # No plan / realization record was produced.
+                    self.assertNotIn("## Grandchild lane realization", out)
+                    self.assertNotIn("realization_record", out)
+
+    def test_parser_error_apply_performs_zero_tmux(self) -> None:
+        path = self._PATH_GC
+        tmux = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client"
+        with mock.patch(f"{tmux}.run_tmux") as run_tmux, mock.patch(f"{tmux}.require_tmux") as require_tmux:
+            rc, out = self._run([f"unit={path},pane=%3"], path, "launch", apply=True)
+            self.assertTrue(str(rc).startswith("die:"))
+            self.assertEqual(0, run_tmux.call_count)
+            self.assertEqual(0, require_tmux.call_count)
+            self.assertNotIn(path, out)
+
+    def test_parser_error_still_echoes_identifier_typo_key(self) -> None:
+        # A plain-identifier typo key stays helpful (only path-like keys redact).
+        rc, out = self._run(
+            ["kidn=x,kind=implementation,unit=mz/gc"], "mz/gc", "launch"
+        )
+        self.assertTrue(str(rc).startswith("die:"))
+        self.assertIn("kidn", out)
 
     def test_record_only_delegated_coordinator_path_is_redacted(self) -> None:
         # A valid chain with a path-like record-only --delegated-coordinator:

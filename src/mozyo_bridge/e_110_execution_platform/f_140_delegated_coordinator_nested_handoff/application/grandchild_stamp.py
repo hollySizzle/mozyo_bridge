@@ -103,7 +103,11 @@ def _parse_lane_spec(raw: str) -> DeclaredLane:
     ``pane`` may repeat (one per declared pane); ``parent`` is the direct-parent
     unit pointer or a root token (:data:`_ROOT_PARENT_TOKENS`) for the tree root.
     ``kind`` and ``unit`` are required. Raises :class:`GrandchildStampError` on a
-    malformed spec so the caller fails closed with one error type.
+    malformed spec so the caller fails closed with one error type. The error text
+    never echoes the raw ``--lane`` value / token, only the sanitized grammar —
+    an operator-supplied value may be a private path, and this runs before the
+    domain stable-unit validator, so a raw echo would leak it (Redmine #13571
+    j#75565 R9-F1).
     """
     kind: Optional[str] = None
     unit: Optional[str] = None
@@ -115,7 +119,8 @@ def _parse_lane_spec(raw: str) -> DeclaredLane:
             continue
         if "=" not in token:
             raise GrandchildStampError(
-                f"--lane field must be KEY=VALUE; got {token!r} in {raw!r}"
+                "each --lane field must be written KEY=VALUE (comma-separated "
+                "kind=/unit=/parent=/pane= pairs)"
             )
         key, value = token.split("=", 1)
         key, value = key.strip(), value.strip()
@@ -129,12 +134,15 @@ def _parse_lane_spec(raw: str) -> DeclaredLane:
             if value:
                 panes.append(value)
         else:
+            # Echo the key only when it is a plain identifier (a likely typo such
+            # as `kidn=`); a path-like key is redacted so it cannot leak.
+            safe_key = key if key.isidentifier() else "<redacted>"
             raise GrandchildStampError(
-                f"unknown --lane field {key!r}; expected kind/unit/parent/pane"
+                f"unknown --lane field {safe_key!r}; expected kind/unit/parent/pane"
             )
     if not kind or not unit:
         raise GrandchildStampError(
-            f"--lane requires kind= and unit=; got {raw!r}"
+            "each --lane requires both kind= and unit="
         )
     return DeclaredLane(
         unit_id=unit,
