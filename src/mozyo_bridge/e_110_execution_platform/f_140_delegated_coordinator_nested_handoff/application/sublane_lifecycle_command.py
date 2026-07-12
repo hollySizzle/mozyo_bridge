@@ -225,6 +225,11 @@ class RetireAssertions:
     verification_passed: bool = False
     durable_record_recorded: bool = False
     target_identity_known: bool = False
+    #: The latest review generation is admissible for integration (#13518 review R2-F7 / R3-F2).
+    #: FAIL-CLOSED default: the actual `sublane retire` integration decision no longer default-admits
+    #: a stale last-write-wins approval — the coordinator must positively assert (from the durable
+    #: review journals) OR the CLI must measure it via `evaluate_integration_admissible`.
+    latest_generation_admissible: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +411,7 @@ class SublaneRetireUseCase:
             owner_approval_present=assertions.owner_approval_present,
             callbacks_drained=assertions.callbacks_drained,
             durable_record_recorded=assertions.durable_record_recorded,
+            latest_generation_admissible=assertions.latest_generation_admissible,
         )
         decision = decide_retire_integration(policy, preflight)
         result = preflight_sublane_retire(
@@ -621,6 +627,56 @@ def cmd_sublane_create(args: argparse.Namespace) -> int:
     return 1 if outcome.plan.status == CREATE_BLOCKED else 0
 
 
+def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
+    """Resolve the latest-generation integration admissibility for a retire (#13518 R3-F2).
+
+    Priority: (1) a coordinator-supplied durable review observation (``--review-generation-json``)
+    is MEASURED at action-time through the pure review-generation fence
+    (:func:`...review_generation.evaluate_integration_admissible`) — an unreadable / malformed file
+    or an inadmissible latest generation fails closed. (2) Otherwise the operator's durable-record
+    assertion (``--latest-generation-admissible``). (3) Absent both, ``False`` (fail-closed) — the
+    actual integration decision never default-admits a stale last-write-wins approval.
+    """
+    path = (getattr(args, "review_generation_json", None) or "").strip()
+    if path:
+        try:
+            import json
+
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (  # noqa: E501
+                ReviewDecision,
+                ReviewGeneration,
+                evaluate_integration_admissible,
+            )
+
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            gen = ReviewGeneration(
+                issue=str(raw.get("issue", "")),
+                review_request_journal=str(raw.get("review_request_journal", "")),
+                target_head=str(raw.get("target_head", "")),
+            )
+            decisions = [
+                ReviewDecision(
+                    generation=ReviewGeneration(
+                        issue=str(d.get("issue", raw.get("issue", ""))),
+                        review_request_journal=str(
+                            d.get("review_request_journal", raw.get("review_request_journal", ""))
+                        ),
+                        target_head=str(d.get("target_head", raw.get("target_head", ""))),
+                    ),
+                    kind=str(d.get("kind", "")),
+                    seq=int(d.get("seq", 0)),
+                    blocking=bool(d.get("blocking", False)),
+                    disposition=str(d.get("disposition", "unresolved")),
+                    journal_id=str(d.get("journal_id", "")),
+                )
+                for d in (raw.get("decisions") or [])
+            ]
+            return bool(evaluate_integration_admissible(gen, decisions).admissible)
+        except Exception:  # noqa: BLE001 - unreadable / malformed durable observation -> fail closed
+            return False
+    return bool(getattr(args, "latest_generation_admissible", False))
+
+
 def cmd_sublane_retire(args: argparse.Namespace) -> int:
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
@@ -629,6 +685,11 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         verification_passed=bool(getattr(args, "verified", False)),
         durable_record_recorded=bool(getattr(args, "durable_record", False)),
         target_identity_known=bool(getattr(args, "target_identity_known", False)),
+        # #13518 R3-F2: when a durable review observation is supplied, MEASURE latest-generation
+        # admissibility at action-time via the review-generation fence (unreadable / malformed ->
+        # fail-closed). Otherwise fall back to the operator's durable-record assertion. Absent both
+        # the fence stays fail-closed (False), so the actual integration never default-admits.
+        latest_generation_admissible=_resolve_latest_generation_admissible(args),
     )
     repo_root = _repo_root(args)
     # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the

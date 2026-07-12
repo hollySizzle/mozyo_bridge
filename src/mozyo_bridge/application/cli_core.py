@@ -687,6 +687,28 @@ def register_lifecycle(sub) -> None:
         help="The lane / worktree / pane target is positively resolved.",
     )
     sublane_retire.add_argument(
+        "--latest-generation-admissible",
+        dest="latest_generation_admissible",
+        action="store_true",
+        help=(
+            "#13518 R2-F7 / R3-F2: assert (from the durable review journals) that the LATEST review "
+            "generation is approved AND carries no unresolved blocking finding. Fail-closed when "
+            "unset: the actual retire/integration no longer default-admits a stale approval. Ignored "
+            "when --review-generation-json is supplied (that MEASURES it at action-time)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--review-generation-json",
+        dest="review_generation_json",
+        default=None,
+        help=(
+            "#13518 R3-F2: path to a coordinator-produced durable review observation "
+            "{issue, review_request_journal, target_head, decisions:[{kind,seq,blocking,disposition,"
+            "journal_id}]}. When supplied, latest-generation admissibility is MEASURED at action-time "
+            "via the review-generation fence (an unreadable / malformed file fails closed)."
+        ),
+    )
+    sublane_retire.add_argument(
         "--execute",
         dest="execute",
         action="store_true",

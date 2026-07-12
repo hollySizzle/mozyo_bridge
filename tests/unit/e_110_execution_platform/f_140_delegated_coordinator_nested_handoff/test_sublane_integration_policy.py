@@ -59,6 +59,7 @@ def _all_invariants_ok() -> dict[str, bool]:
         owner_approval_present=True,
         callbacks_drained=True,
         durable_record_recorded=True,
+        latest_generation_admissible=True,
     )
 
 
@@ -135,6 +136,23 @@ class RetireIntegrationHappyPathTest(unittest.TestCase):
 
 class RetireIntegrationBlockedTriggersTest(unittest.TestCase):
     """The four acceptance triggers each fail closed to integration_blocked."""
+
+    def test_inadmissible_latest_generation_blocks(self) -> None:
+        # #13518 R2-F7 / R3-F2: the actual retire/integration decision fences a stale / unclean
+        # latest review generation — not only the non-CLI use case.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            INTEGRATION_STALE_REVIEW_GENERATION,
+        )
+
+        ok = _all_invariants_ok()
+        ok["latest_generation_admissible"] = False
+        decision = decide_retire_integration(
+            SublaneIntegrationPolicy.default(),
+            RetirePreflight(is_git_workspace=True, **ok),
+        )
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
+        self.assertFalse(decision.merge_performed)
 
     def test_dirty_worktree_blocks(self) -> None:
         decision = decide_retire_integration(

@@ -99,12 +99,19 @@ BLOCKED_ISSUE_NOT_CLOSED = "issue_not_closed"
 BLOCKED_OWNER_APPROVAL_MISSING = "owner_approval_missing"
 BLOCKED_UNRESOLVED_CALLBACK = "unresolved_callback"
 BLOCKED_DURABLE_RECORD_MISSING = "durable_record_missing"
+#: The retire/integration was refused because the latest review generation is not admissible — a
+#: stale approval for an older generation, or an unresolved blocking finding in the latest
+#: generation (#13518 review R2-F7 / R3-F2). Integration requires the latest generation to be
+#: approved AND clean, never merely "an approval exists somewhere". Defined here (above the
+#: precedence tuple) so it can rank among the fundamental invariants.
+INTEGRATION_STALE_REVIEW_GENERATION = "stale_review_generation"
 
 #: Precedence order for the *primary* blocked reason (most fundamental first): an
 #: unidentified target, then the close / owner / callback / durable invariants, then the
 #: worktree / verification / merge gates. The full set is always reported too.
 _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_PREFLIGHT_FAILURE,
+    INTEGRATION_STALE_REVIEW_GENERATION,
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_OWNER_APPROVAL_MISSING,
     BLOCKED_UNRESOLVED_CALLBACK,
@@ -268,13 +275,14 @@ class RetirePreflight:
     owner_approval_present: bool = True
     callbacks_drained: bool = True
     durable_record_recorded: bool = True
-
-
-#: The retire/integration was refused because the latest review generation is not admissible —
-#: a stale approval for an older generation, or an unresolved blocking finding in the latest
-#: generation (#13518 review R2-F7). Integration requires the latest generation to be approved and
-#: clean, never merely "an approval exists somewhere".
-INTEGRATION_STALE_REVIEW_GENERATION = "stale_review_generation"
+    #: The LATEST review generation is admissible for integration (#13518 review R2-F7 / R3-F2): the
+    #: latest generation is approved AND carries no unresolved blocking finding — never merely "an
+    #: approval exists somewhere". The field default is the satisfied value so the pure decision and
+    #: the config-integration path (which pre-checks it) stay byte-for-byte; the CLI retire path
+    #: (:class:`...sublane_lifecycle_command.RetireAssertions`) supplies it FAIL-CLOSED (default
+    #: unsatisfied), so the actual `sublane retire` integration can no longer default-admit a stale
+    #: last-write-wins approval.
+    latest_generation_admissible: bool = True
 
 
 @dataclass(frozen=True)
@@ -349,6 +357,11 @@ def decide_retire_integration(
         blockers.add(BLOCKED_DURABLE_RECORD_MISSING)
     if not preflight.verification_passed:
         blockers.add(BLOCKED_VERIFICATION_FAILURE)
+    if not preflight.latest_generation_admissible:
+        # #13518 review R2-F7 / R3-F2: the latest review generation is not admissible (a stale
+        # approval for an older generation, or an unresolved blocking finding in the latest). The
+        # actual integration decision — not only the non-CLI use case — now fences it.
+        blockers.add(INTEGRATION_STALE_REVIEW_GENERATION)
 
     # Git-specific gates — only in a Git workspace.
     merge_attempted = False

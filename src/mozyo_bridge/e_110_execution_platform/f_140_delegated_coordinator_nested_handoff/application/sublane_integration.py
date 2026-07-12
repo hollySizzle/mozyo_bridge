@@ -38,8 +38,6 @@ from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
-    INTEGRATION_BLOCKED,
-    INTEGRATION_STALE_REVIEW_GENERATION,
     LAUNCH_CREATE_WORKTREE,
     LaunchPreflight,
     RetireDecision,
@@ -183,17 +181,12 @@ class SublaneIntegrationUseCase:
         retirement *before* any merge runs. A merge conflict then re-decides to
         ``integration_blocked``.
         """
-        # R2-F7 integration latest-generation fence: refuse BEFORE any git probe / merge when the
-        # latest review generation is inadmissible (a stale approval / an unresolved blocking finding
-        # in the latest generation). This is the "latest generation is clean", not "an approval
-        # exists somewhere", requirement — a last-write-wins stale approval never integrates.
-        if not invariants.latest_generation_admissible:
-            return RetireDecision(
-                state=INTEGRATION_BLOCKED,
-                blocked_reasons=(INTEGRATION_STALE_REVIEW_GENERATION,),
-                primary_reason=INTEGRATION_STALE_REVIEW_GENERATION,
-            )
-
+        # R2-F7 / R3-F2 integration latest-generation fence: the inadmissible-generation stop is now
+        # threaded through the pure :func:`decide_retire_integration` as a first-class preflight
+        # invariant (the SAME authority the actual CLI retire path uses — no separate early-return
+        # that only this non-CLI use case honoured). A stale last-write-wins approval never
+        # integrates: the fence blocks BEFORE any merge because a merge is attempted only after every
+        # non-merge gate (this one included) already passes.
         is_git = self.operations.is_git_workspace()
         target = self.policy.integration_branch
         worktree_dirty = self.operations.worktree_dirty() if is_git else False
@@ -214,6 +207,7 @@ class SublaneIntegrationUseCase:
             owner_approval_present=invariants.owner_approval_present,
             callbacks_drained=invariants.callbacks_drained,
             durable_record_recorded=invariants.durable_record_recorded,
+            latest_generation_admissible=invariants.latest_generation_admissible,
         )
 
         # First decide WITHOUT attempting the merge. If anything blocks (including an
