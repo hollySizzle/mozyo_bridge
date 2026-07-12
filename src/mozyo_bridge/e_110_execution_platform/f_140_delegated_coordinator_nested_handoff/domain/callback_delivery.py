@@ -32,7 +32,7 @@ application layer's job.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     MARKER_GATE_ALIASES,
@@ -86,6 +86,38 @@ SEND_NOT_SENT = "not_sent"
 SEND_UNCERTAIN = "uncertain"
 
 SEND_OUTCOMES = frozenset({SEND_DELIVERED, SEND_NOT_SENT, SEND_UNCERTAIN})
+
+
+@dataclass(frozen=True)
+class CallbackSendResult:
+    """A send's closed outcome plus best-effort durable-receipt evidence (#13520 review R2-F6).
+
+    ``outcome`` is a member of :data:`SEND_OUTCOMES` (the store transition authority).
+    ``persist_ok`` / ``persist_reason`` are **observability only** — whether the sanctioned
+    ``--persist-delivery`` Redmine receipt was written and its reason token — and NEVER change the
+    outcome (the outbox row is the durability authority). ``persist_ok`` is ``None`` when no receipt
+    was reported. A sender may return a bare :data:`SEND_OUTCOMES` string instead (legacy /
+    evidence-less); :func:`normalize_send_result` accepts both.
+    """
+
+    outcome: str
+    persist_ok: Optional[bool] = None
+    persist_reason: str = ""
+
+
+def normalize_send_result(value: object) -> CallbackSendResult:
+    """Normalize a sender return (a bare outcome string OR a :class:`CallbackSendResult`).
+
+    A string is taken as the outcome with no persist evidence; a :class:`CallbackSendResult` passes
+    through; anything else (including an unknown outcome token) fails safe to
+    :data:`SEND_UNCERTAIN` with no evidence (a send whose fate is unreadable is never auto-retried).
+    """
+    if isinstance(value, CallbackSendResult):
+        outcome = value.outcome if value.outcome in SEND_OUTCOMES else SEND_UNCERTAIN
+        return CallbackSendResult(outcome, persist_ok=value.persist_ok, persist_reason=value.persist_reason)
+    if isinstance(value, str) and value in SEND_OUTCOMES:
+        return CallbackSendResult(value)
+    return CallbackSendResult(SEND_UNCERTAIN)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +304,8 @@ __all__ = (
     "SEND_NOT_SENT",
     "SEND_UNCERTAIN",
     "SEND_OUTCOMES",
+    "CallbackSendResult",
+    "normalize_send_result",
     "send_outcome_for_delivery",
     "normalize_gate_name",
     "CallbackClassification",

@@ -27,6 +27,7 @@ from typing import Callable
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+    CallbackSendResult,
     SEND_UNCERTAIN,
     send_outcome_for_delivery,
 )
@@ -63,17 +64,25 @@ class HandoffCallbackSender:
     :class:`HandoffDeliveryResult`. Any exception it raises is caught and mapped to
     :data:`SEND_UNCERTAIN` — a send that blew up mid-flight may or may not have injected, so it
     is never auto-retried (a duplicate delivery is the failure to avoid).
+
+    Returns a :class:`...domain.callback_delivery.CallbackSendResult` carrying the mapped outcome
+    plus the send's best-effort durable-receipt evidence (``persist_ok`` / ``persist_reason``) so a
+    ``write_optin_unset`` / transport failure / persisted receipt is **observable** downstream
+    (#13520 review R2-F6) — the outcome is unchanged by the evidence (the outbox is the authority).
     """
 
     def __init__(self, send_fn: Callable[[CallbackOutboxRow], HandoffDeliveryResult]) -> None:
         self._send_fn = send_fn
 
-    def __call__(self, row: CallbackOutboxRow) -> str:
+    def __call__(self, row: CallbackOutboxRow) -> CallbackSendResult:
         try:
             result = self._send_fn(row)
         except Exception:  # noqa: BLE001 - a mid-send failure is fail-safe uncertain, never a retry
-            return SEND_UNCERTAIN
-        return send_outcome_for_delivery(result.status, result.reason)
+            return CallbackSendResult(SEND_UNCERTAIN)
+        outcome = send_outcome_for_delivery(result.status, result.reason)
+        return CallbackSendResult(
+            outcome, persist_ok=result.persist_ok, persist_reason=result.persist_reason
+        )
 
 
 __all__ = (

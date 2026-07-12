@@ -25,6 +25,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECOVERY_READY,
     STEP_PRESERVE_DIRTY_WORKTREE,
     STEP_REATTEST_SENDER,
+    STEP_RECONCILE_UNCERTAIN,
     STEP_RELAUNCH_STALE_SLOT,
     STEP_REPLAY_OUTBOX,
     STEP_RESTART_WATCHER,
@@ -151,6 +152,36 @@ class RebootScenarioTest(unittest.TestCase):
         self.assertIn(STEP_RESUME_EXACT_JOURNAL, kinds)
         self.assertNotIn(STEP_RELAUNCH_STALE_SLOT, kinds)
         self.assertEqual(plan.status, RECOVERY_NEEDS_RECOVERY)
+
+
+class UncertainReplayFenceTest(unittest.TestCase):
+    """#13520 review R2-F4: uncertain rows are NEVER replayed; only pending is replay-eligible."""
+
+    def test_pending_only_replays_and_does_not_reconcile(self):
+        plan = build_recovery_plan(_healthy(outbox_pending=2, outbox_uncertain=0))
+        kinds = _kinds(plan)
+        self.assertIn(STEP_REPLAY_OUTBOX, kinds)
+        self.assertNotIn(STEP_RECONCILE_UNCERTAIN, kinds)
+
+    def test_uncertain_only_reconciles_and_never_replays(self):
+        plan = build_recovery_plan(_healthy(outbox_pending=0, outbox_uncertain=3))
+        kinds = _kinds(plan)
+        self.assertNotIn(STEP_REPLAY_OUTBOX, kinds)  # uncertain is NOT replayed (may be injected)
+        self.assertIn(STEP_RECONCILE_UNCERTAIN, kinds)
+        # A manual uncertain reconcile alone does not trigger an automated watcher restart.
+        self.assertNotIn(STEP_RESTART_WATCHER, kinds)
+        reconcile = next(s for s in plan.steps if s.kind == STEP_RECONCILE_UNCERTAIN)
+        self.assertTrue(reconcile.requires_owner_approval)  # a resend needs new durable authorization
+
+    def test_mixed_backlog_replays_pending_and_separately_reconciles_uncertain(self):
+        plan = build_recovery_plan(_healthy(outbox_pending=1, outbox_uncertain=1))
+        kinds = _kinds(plan)
+        self.assertIn(STEP_REPLAY_OUTBOX, kinds)
+        self.assertIn(STEP_RECONCILE_UNCERTAIN, kinds)
+        # The replay step's detail scopes to pending only (never "N uncertain ... replay").
+        replay = next(s for s in plan.steps if s.kind == STEP_REPLAY_OUTBOX)
+        self.assertIn("pending", replay.detail)
+        self.assertNotIn("uncertain", replay.detail)
 
 
 if __name__ == "__main__":

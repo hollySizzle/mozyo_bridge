@@ -198,6 +198,21 @@ def _parse_candidate(spec: str) -> CallbackCandidate:
     )
 
 
+def _watch_pass_summary(pass_result: dict) -> str:
+    """Render one watch pass safely — a normal pass OR an error pass (#13520 review R2-F2).
+
+    ``watch()`` records a pass that raised as ``{"error": <type>}`` (the background watcher survives
+    a transient Redmine/store error and continues to its next wake). This must NOT ``KeyError`` on
+    the missing ``deliver`` key: an error pass is surfaced as ``error=<type>`` instead of a count.
+    """
+    if not isinstance(pass_result, dict):
+        return "error=malformed_pass"
+    if "error" in pass_result:
+        return f"error={pass_result['error']}"
+    delivered = (pass_result.get("deliver") or {}).get("delivered") or []
+    return f"delivered={len(delivered)}"
+
+
 def _emit(payload: dict, *, as_json: bool, text_lines: list[str]) -> int:
     if as_json:
         print(_json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -265,6 +280,10 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         ]
         lines += [
             f"  #{d.key.issue} j#{d.key.journal} {d.send_outcome} -> {d.resulting_state}"
+            # #13520 review R2-F6: surface the durable-receipt evidence so a write_optin_unset /
+            # transport failure is observable (it never changes the outcome above).
+            + (f" [persist={'ok' if d.persist_ok else d.persist_reason or 'unknown'}]"
+               if d.persist_ok is not None or d.persist_reason else "")
             for d in report.delivered
         ]
         return _emit(payload, as_json=as_json, text_lines=lines)
@@ -365,8 +384,7 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
             passes = watch(_wake_wait_fn(args), _pass, max_passes=max_passes)
             payload = {"action": "watch", "passes": passes}
             lines = [f"action: watch", f"passes: {len(passes)}"] + [
-                f"  wake={p['wake']} delivered={len(p['pass']['deliver']['delivered'])}"
-                for p in passes
+                f"  wake={p['wake']} {_watch_pass_summary(p['pass'])}" for p in passes
             ]
             return _emit(payload, as_json=as_json, text_lines=lines)
 

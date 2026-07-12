@@ -131,6 +131,22 @@ class WakeWaitFnTest(unittest.TestCase):
         self.assertFalse(wait())  # fail-safe fallback: bounded sleep hint, never a crash
 
 
+class WatchPassSummaryTest(unittest.TestCase):
+    """#13520 review R2-F2: the CLI renders an error pass without KeyError and surfaces it."""
+
+    def test_error_pass_is_surfaced_not_keyerror(self):
+        self.assertEqual(cli._watch_pass_summary({"error": "RuntimeError"}), "error=RuntimeError")
+
+    def test_normal_pass_shows_delivered_count(self):
+        self.assertEqual(
+            cli._watch_pass_summary({"deliver": {"delivered": [1, 2]}}), "delivered=2"
+        )
+
+    def test_malformed_pass_is_safe(self):
+        self.assertEqual(cli._watch_pass_summary(None), "error=malformed_pass")
+        self.assertEqual(cli._watch_pass_summary({}), "delivered=0")
+
+
 class RegistrationTest(unittest.TestCase):
     def test_callbacks_is_registered_under_workflow(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow import (

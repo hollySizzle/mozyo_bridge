@@ -54,6 +54,10 @@ STEP_RESTART_WATCHER = "restart_watcher"
 STEP_REPLAY_OUTBOX = "replay_outbox"
 STEP_RESUME_EXACT_JOURNAL = "resume_exact_journal"
 STEP_PRESERVE_DIRTY_WORKTREE = "preserve_dirty_worktree"
+#: Uncertain rows are NEVER replayed (they may already be injected — #13520 j#75276 / review
+#: F2/R2-F4). They are surfaced for an operator/coordinator reconcile against the exact journal +
+#: delivery evidence; any resend needs a NEW durable authorization, not a replay of this row.
+STEP_RECONCILE_UNCERTAIN = "reconcile_uncertain"
 
 
 @dataclass(frozen=True)
@@ -196,13 +200,16 @@ def build_recovery_plan(obs: AuthorityObservation) -> RecoveryPlan:
                 requires_verified_reattestation=True,
             )
         )
-    backlog = int(obs.outbox_pending) + int(obs.outbox_uncertain)
-    if obs.outbox_present and backlog > 0:
+    # PENDING rows only are claim/deliver-eligible (the send edge was never crossed). UNCERTAIN
+    # rows are terminal-until-reconciled: they may already be injected, so they are NEVER replayed
+    # (#13520 j#75276 "uncertain send を blind retry しない" / review F2/R2-F4). The UNIQUE fence
+    # dedups distinct rows; it does NOT make re-sending the SAME row safe.
+    if obs.outbox_present and int(obs.outbox_pending) > 0:
         steps.append(
             RecoveryStep(
                 STEP_REPLAY_OUTBOX,
-                detail=f"{obs.outbox_pending} pending / {obs.outbox_uncertain} uncertain rows; "
-                "fenced idempotent replay (the outbox UNIQUE fence prevents duplicate sends)",
+                detail=f"{obs.outbox_pending} pending row(s); claim + deliver-once (pending only — "
+                "the send edge was never crossed, so a claim cannot duplicate)",
             )
         )
         steps.append(
@@ -211,13 +218,26 @@ def build_recovery_plan(obs: AuthorityObservation) -> RecoveryPlan:
                 detail="re-read the exact Redmine gate journal (the authority) before delivering",
             )
         )
-    # A watcher restart is always safe/idempotent and re-reads Redmine; recommend it when there is
-    # anything to resume (backlog, a relaunched slot, or a re-attestation).
-    if steps and any(s.kind != STEP_PRESERVE_DIRTY_WORKTREE for s in steps):
+    if obs.outbox_present and int(obs.outbox_uncertain) > 0:
+        steps.append(
+            RecoveryStep(
+                STEP_RECONCILE_UNCERTAIN,
+                detail=f"{obs.outbox_uncertain} uncertain row(s); do NOT replay — reconcile against "
+                "the exact journal + delivery evidence; a resend needs a NEW durable authorization",
+                requires_owner_approval=True,
+            )
+        )
+    # A watcher restart is safe/idempotent (it re-reads Redmine and only claims PENDING rows).
+    # Recommend it when there is automated recovery to drive (pending replay, a relaunched slot, a
+    # re-attestation) — NOT for a manual uncertain reconcile or a mere dirty-worktree note (a
+    # watcher restart never touches uncertain rows, so it cannot advance that step).
+    _non_watcher_triggers = {STEP_PRESERVE_DIRTY_WORKTREE, STEP_RECONCILE_UNCERTAIN}
+    if any(s.kind not in _non_watcher_triggers for s in steps):
         steps.append(
             RecoveryStep(
                 STEP_RESTART_WATCHER,
-                detail="restart the bounded callback watcher (re-reads Redmine on every wake)",
+                detail="restart the bounded callback watcher (re-reads Redmine on every wake; "
+                "claims pending rows only)",
             )
         )
 
@@ -247,6 +267,7 @@ __all__ = (
     "STEP_REPLAY_OUTBOX",
     "STEP_RESUME_EXACT_JOURNAL",
     "STEP_PRESERVE_DIRTY_WORKTREE",
+    "STEP_RECONCILE_UNCERTAIN",
     "RuntimeSlot",
     "AuthorityObservation",
     "RecoveryStep",

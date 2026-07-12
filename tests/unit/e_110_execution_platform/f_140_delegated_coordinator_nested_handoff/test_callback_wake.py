@@ -62,9 +62,20 @@ class BuildHerdrEventWaitTest(unittest.TestCase):
              "--status", "working", "--timeout", "50000"],
         )
 
-    def test_nonzero_exit_is_timeout_falsy(self):
-        wait = build_herdr_event_wait("/opt/herdr", "t", runner=lambda argv: (1, "timed out"))
-        self.assertFalse(wait())  # non-zero -> falsy timeout hint (still re-reads Redmine)
+    def test_herdr_bounded_timeout_is_falsy_timed_out(self):
+        # A non-zero exit WITH a timeout indicator is herdr's own bounded --timeout elapse.
+        wait = build_herdr_event_wait("/opt/herdr", "t", runner=lambda argv: (1, "wait timed out"))
+        sig = resolve_wake(wait)
+        self.assertEqual(sig.kind, WAKE_TIMED_OUT)
+        self.assertTrue(sig.should_reread)
+
+    def test_nonzero_non_timeout_exit_is_wake_error_not_timeout(self):
+        # #13520 review R2-F2: a non-zero exit with NO timeout indicator must be an error, not
+        # collapsed to timeout.
+        wait = build_herdr_event_wait("/opt/herdr", "t", runner=lambda argv: (3, "connection refused"))
+        sig = resolve_wake(wait)
+        self.assertEqual(sig.kind, WAKE_ERROR)
+        self.assertTrue(sig.should_reread)  # correctness unaffected: still re-reads Redmine
 
     def test_runner_exception_propagates_to_wake_error(self):
         def boom(argv):
@@ -75,6 +86,16 @@ class BuildHerdrEventWaitTest(unittest.TestCase):
         sig = resolve_wake(wait)
         self.assertEqual(sig.kind, WAKE_ERROR)
         self.assertTrue(sig.should_reread)
+
+    def test_outer_subprocess_timeout_propagates_to_wake_error(self):
+        import subprocess
+
+        def hang(argv):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=1.0)  # herdr hung past the outer bound
+
+        wait = build_herdr_event_wait("/opt/herdr", "t", runner=hang)
+        sig = resolve_wake(wait)
+        self.assertEqual(sig.kind, WAKE_ERROR)  # a hung child is an error, not a benign timeout
 
 
 if __name__ == "__main__":

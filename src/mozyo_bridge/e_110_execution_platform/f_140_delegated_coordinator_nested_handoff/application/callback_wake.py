@@ -80,17 +80,39 @@ def resolve_wake(wait_fn: Callable[[], object], *, detail: str = "") -> WakeSign
     return WakeSignal(kind=WAKE_WOKE if observed else WAKE_TIMED_OUT, detail=detail)
 
 
-def _default_wait_runner(argv: list) -> "tuple[int, str]":
-    """Run a bounded ``herdr wait agent-status`` and capture ``(returncode, stderr)`` (production).
+#: The outer subprocess bound is herdr's own ``--timeout`` plus this margin (seconds), so a hung
+#: child cannot pin the background runtime past a bounded point.
+WAKE_OUTER_TIMEOUT_MARGIN_SECONDS = 5.0
 
-    The ``--timeout`` bounds herdr's own wait; an outer subprocess timeout is a safety margin so a
-    hung child cannot pin the background runtime. A subprocess timeout surfaces as a raised
-    ``TimeoutExpired`` — :func:`resolve_wake` catches it (fail-safe ``WAKE_ERROR``, still re-read).
+#: stderr tokens that mean herdr's own bounded wait elapsed (a benign timeout, not an error). A
+#: non-zero exit WITHOUT one of these is an actual wait error (distinguished — #13520 review R2-F2).
+_TIMEOUT_INDICATORS = ("timed out", "timeout", "no change", "deadline")
+
+
+class HerdrWaitError(RuntimeError):
+    """A herdr wait exited non-zero for a reason other than its own bounded timeout (fail-safe).
+
+    Raised by the production wait so :func:`resolve_wake` records ``WAKE_ERROR`` (distinct from a
+    benign bounded timeout, which returns falsy -> ``WAKE_TIMED_OUT``). Correctness is unaffected
+    (both re-read Redmine); the distinction is observability the finding required.
     """
-    proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; the sanctioned herdr wait CLI
-        argv, capture_output=True, text=True, check=False
-    )
-    return proc.returncode, proc.stderr or ""
+
+
+def _make_default_wait_runner(outer_timeout_seconds: float) -> HerdrWaitRunner:
+    """Build the production runner with an outer subprocess timeout (a hung child cannot pin us).
+
+    ``subprocess.run(timeout=...)`` raises :class:`subprocess.TimeoutExpired` if the child exceeds
+    the outer bound; that propagates out of the wait and :func:`resolve_wake` records it as
+    ``WAKE_ERROR`` (herdr hung — an error, NOT a benign bounded timeout).
+    """
+
+    def _run(argv: list) -> "tuple[int, str]":
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; the sanctioned herdr wait CLI
+            argv, capture_output=True, text=True, check=False, timeout=outer_timeout_seconds
+        )
+        return proc.returncode, proc.stderr or ""
+
+    return _run
 
 
 def build_herdr_event_wait(
@@ -105,22 +127,34 @@ def build_herdr_event_wait(
 
     Returns a zero-arg callable suitable for :func:`resolve_wake`. Each call blocks on
     ``herdr wait agent-status <target> --status <status> --timeout <ms>`` (a *change into* the
-    status) and returns **truthy** when herdr observed the change (rc 0) and **falsy** on a bounded
-    timeout / other non-zero exit. This is the stable Herdr CLI event surface (design j#75098 Q1),
-    never the raw control socket and never exposed to an LLM role; the wake is only a scheduling
-    hint, so the exact ``(target, status)`` affects latency, not correctness — the runtime re-reads
-    the exact Redmine journal on every wake. A spawn / reap failure propagates so ``resolve_wake``
-    records it as ``WAKE_ERROR`` (fail-safe). ``runner`` is injected in tests.
+    status) and returns **truthy** when herdr observed the change (rc 0), **falsy** on herdr's own
+    bounded ``--timeout`` elapse (a benign timeout hint), and **raises** :class:`HerdrWaitError` on a
+    non-timeout non-zero exit — so :func:`resolve_wake` distinguishes a bounded timeout
+    (``WAKE_TIMED_OUT``) from a real wait error (``WAKE_ERROR``) instead of collapsing every non-zero
+    exit into a timeout (#13520 review R2-F2). The default runner also imposes an OUTER subprocess
+    timeout (herdr ``--timeout`` + :data:`WAKE_OUTER_TIMEOUT_MARGIN_SECONDS`) so a hung child cannot
+    pin the runtime; a spawn / reap / outer-timeout failure propagates to ``WAKE_ERROR`` (fail-safe).
+    This is the stable Herdr CLI event surface (design j#75098 Q1), never the raw control socket and
+    never exposed to an LLM role; the wake is only a hint (the runtime re-reads the exact Redmine
+    journal every wake), so ``(target, status)`` affects latency, not correctness. ``runner`` is
+    injected in tests.
     """
-    run: HerdrWaitRunner = runner if runner is not None else _default_wait_runner
+    outer_timeout = int(timeout_ms) / 1000.0 + WAKE_OUTER_TIMEOUT_MARGIN_SECONDS
+    run: HerdrWaitRunner = runner if runner is not None else _make_default_wait_runner(outer_timeout)
     argv = [
         str(binary), "wait", "agent-status", str(target),
         "--status", str(status), "--timeout", str(int(timeout_ms)),
     ]
 
     def _wait() -> object:
-        rc, _stderr = run(list(argv))
-        return rc == 0  # rc 0 = observed the change (woke); non-zero = timeout / other (re-read)
+        rc, stderr = run(list(argv))
+        if rc == 0:
+            return True  # observed the change (woke)
+        lowered = str(stderr or "").lower()
+        if any(token in lowered for token in _TIMEOUT_INDICATORS):
+            return False  # herdr's own bounded timeout -> WAKE_TIMED_OUT (benign, still re-read)
+        # A non-zero exit with no timeout indicator is a real wait error, not a timeout.
+        raise HerdrWaitError(f"herdr wait exited {rc} without a timeout indicator")
 
     return _wait
 
@@ -133,7 +167,9 @@ __all__ = (
     "WakeSignal",
     "resolve_wake",
     "HerdrWaitRunner",
+    "HerdrWaitError",
     "DEFAULT_WAKE_STATUS",
     "DEFAULT_WAKE_TIMEOUT_MS",
+    "WAKE_OUTER_TIMEOUT_MARGIN_SECONDS",
     "build_herdr_event_wait",
 )

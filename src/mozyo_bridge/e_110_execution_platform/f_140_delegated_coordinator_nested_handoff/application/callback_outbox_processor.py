@@ -51,9 +51,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     UNCLASSIFIED_SOURCE_UNREADABLE,
     SEND_DELIVERED,
     SEND_NOT_SENT,
-    SEND_OUTCOMES,
-    SEND_UNCERTAIN,
     classify_callback_gate,
+    normalize_send_result,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     SOURCE_REDMINE,
@@ -148,6 +147,11 @@ class DeliveryOutcome:
     send_outcome: str
     resulting_state: str
     ownership_lost: bool = False
+    #: Best-effort durable-receipt evidence (#13520 review R2-F6): whether the sanctioned
+    #: ``--persist-delivery`` Redmine receipt persisted (``None`` = no receipt reported), and its
+    #: reason token. Observability only — it never changed ``send_outcome`` / ``resulting_state``.
+    persist_ok: "bool | None" = None
+    persist_reason: str = ""
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -158,6 +162,8 @@ class DeliveryOutcome:
             "send_outcome": self.send_outcome,
             "resulting_state": self.resulting_state,
             "ownership_lost": self.ownership_lost,
+            "persist_ok": self.persist_ok,
+            "persist_reason": self.persist_reason,
         }
 
 
@@ -341,9 +347,10 @@ class CallbackOutboxProcessor:
             # send — a de-owned processor never fires a duplicate callback.
             if not self._outbox.mark_sending(row.key, claim_token=token, now=now):
                 continue
-            outcome = sender(row)
-            if outcome not in SEND_OUTCOMES:
-                outcome = SEND_UNCERTAIN
+            # The sender may return a bare SEND_* token (legacy / test) or a CallbackSendResult
+            # carrying durable-receipt evidence; normalize both (unknown -> uncertain, fail-safe).
+            send_result = normalize_send_result(sender(row))
+            outcome = send_result.outcome
             # The terminal mark is token-conditional. If it no-ops (rowcount 0 / ABSENT), the
             # lease expired mid-send and another processor reconciled the row — the report must
             # reflect the ACTUAL persisted state, not the intended one (#13520 review F2-R1), so
@@ -365,6 +372,8 @@ class CallbackOutboxProcessor:
                     send_outcome=outcome,
                     resulting_state=resulting,
                     ownership_lost=not applied,
+                    persist_ok=send_result.persist_ok,
+                    persist_reason=send_result.persist_reason,
                 )
             )
         return report

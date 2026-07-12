@@ -47,17 +47,17 @@ def _row() -> CallbackOutboxRow:
 class HandoffCallbackSenderTest(unittest.TestCase):
     def test_delivered_maps_from_sent_ok(self):
         sender = HandoffCallbackSender(lambda row: HandoffDeliveryResult("sent", "ok"))
-        self.assertEqual(sender(_row()), SEND_DELIVERED)
+        self.assertEqual(sender(_row()).outcome, SEND_DELIVERED)
 
     def test_not_sent_maps_from_deterministic_block(self):
         sender = HandoffCallbackSender(lambda row: HandoffDeliveryResult("blocked", "invalid_args"))
-        self.assertEqual(sender(_row()), SEND_NOT_SENT)
+        self.assertEqual(sender(_row()).outcome, SEND_NOT_SENT)
 
     def test_uncertain_maps_from_ambiguous_block(self):
         sender = HandoffCallbackSender(
             lambda row: HandoffDeliveryResult("blocked", "turn_start_unconfirmed")
         )
-        self.assertEqual(sender(_row()), SEND_UNCERTAIN)
+        self.assertEqual(sender(_row()).outcome, SEND_UNCERTAIN)
 
     def test_post_injection_block_is_uncertain_not_retryable(self):
         # #13520 review F2: a post-injection rail outcome must not become a retryable not_sent.
@@ -66,14 +66,24 @@ class HandoffCallbackSenderTest(unittest.TestCase):
                 sender = HandoffCallbackSender(
                     lambda row, r=reason: HandoffDeliveryResult("blocked", r)
                 )
-                self.assertEqual(sender(_row()), SEND_UNCERTAIN)
+                self.assertEqual(sender(_row()).outcome, SEND_UNCERTAIN)
+
+    def test_persist_evidence_propagates_through_the_sender(self):
+        # #13520 review R2-F6: the sender surfaces the send port's persist receipt evidence.
+        sender = HandoffCallbackSender(
+            lambda row: HandoffDeliveryResult("sent", "ok", persist_ok=False, persist_reason="write_optin_unset")
+        )
+        result = sender(_row())
+        self.assertEqual(result.outcome, SEND_DELIVERED)  # outcome unchanged by evidence
+        self.assertFalse(result.persist_ok)
+        self.assertEqual(result.persist_reason, "write_optin_unset")
 
     def test_send_fn_exception_is_fail_safe_uncertain(self):
         def boom(row):
             raise RuntimeError("mid-send explosion")
 
         sender = HandoffCallbackSender(boom)
-        self.assertEqual(sender(_row()), SEND_UNCERTAIN)
+        self.assertEqual(sender(_row()).outcome, SEND_UNCERTAIN)
 
     def test_send_fn_is_invoked_once_per_row(self):
         calls = []

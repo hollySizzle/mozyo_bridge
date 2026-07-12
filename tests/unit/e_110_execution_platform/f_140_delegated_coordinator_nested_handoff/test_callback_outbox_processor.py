@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CallbackOutboxProcessor,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+    CallbackSendResult,
     SEND_DELIVERED,
     SEND_NOT_SENT,
     SEND_UNCERTAIN,
@@ -176,6 +177,25 @@ class DeliverTest(_ProcessorTestCase):
         proc = self._ingest_one()
         proc.deliver(lambda row: "surprise")
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_UNCERTAIN)
+
+    def test_persist_receipt_evidence_propagates_to_delivery_outcome(self):
+        # #13520 review R2-F6: a CallbackSendResult's persist evidence reaches the report payload;
+        # the delivered outcome is unchanged (the outbox row is the durability authority).
+        proc = self._ingest_one()
+        report = proc.deliver(
+            lambda row: CallbackSendResult(SEND_DELIVERED, persist_ok=False, persist_reason="transport_error")
+        )
+        outcome = report.delivered[0]
+        self.assertEqual(outcome.resulting_state, "delivered")  # NOT gated on the failed persist
+        self.assertFalse(outcome.persist_ok)
+        self.assertEqual(outcome.persist_reason, "transport_error")
+        self.assertEqual(outcome.as_payload()["persist_reason"], "transport_error")
+
+    def test_bare_string_sender_leaves_persist_evidence_absent(self):
+        proc = self._ingest_one()
+        report = proc.deliver(lambda row: SEND_DELIVERED)  # legacy string sender
+        self.assertIsNone(report.delivered[0].persist_ok)
+        self.assertEqual(report.delivered[0].persist_reason, "")
 
     def test_deliver_recovers_a_crashed_inflight_row_first(self):
         proc = self._ingest_one()
