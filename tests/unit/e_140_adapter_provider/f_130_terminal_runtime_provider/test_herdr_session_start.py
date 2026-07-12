@@ -246,7 +246,8 @@ class SessionStartTest(unittest.TestCase):
             self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
             for argv in herdr.start_argvs:
                 # argv = ["agent", "start", <NAME>, "--cwd", ...]
-                self.assertEqual(argv[2], names[argv[-1]])  # -- <provider> is argv[-1]
+                provider = argv[argv.index("--") + 1]
+                self.assertEqual(argv[2], names[provider])
 
     def test_launch_injects_self_identity_via_env_flags(self) -> None:
         herdr = _Herdr()
@@ -268,6 +269,57 @@ class SessionStartTest(unittest.TestCase):
         self.assertIn("MOZYO_LANE_ID=lane-1", start)
         # `-- <provider>` terminates the argv.
         self.assertEqual(start[-2:], ["--", "claude"])
+
+    def test_codex_launch_propagates_identity_to_tool_shell_policy(self) -> None:
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            _, anchor, _ = self._prepare(
+                tmp, providers=["codex"], herdr=herdr
+            )
+            ws = anchor["workspace_id"]
+
+        start = herdr.start_argvs[0]
+        separator = start.index("--")
+        self.assertEqual(start[separator + 1], "codex")
+        self.assertEqual(
+            start[separator + 2 :],
+            [
+                "-c",
+                f'shell_environment_policy.set.MOZYO_WORKSPACE_ID="{ws}"',
+                "-c",
+                'shell_environment_policy.set.MOZYO_AGENT_ROLE="codex"',
+                "-c",
+                'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"',
+            ],
+        )
+
+    def test_codex_managed_identity_overrides_follow_config_launch_argv(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+            AgentLaunchConfig,
+        )
+
+        herdr = _Herdr()
+        cfg = AgentLaunchConfig.from_record(
+            {"launch_argv": {"codex": {"sublane": ["-c", 'model="test"']}}}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["codex"],
+                herdr=herdr,
+                agent_launch=cfg,
+            )
+
+        start = herdr.start_argvs[0]
+        separator = start.index("--")
+        self.assertEqual(
+            start[separator + 1 : separator + 4],
+            ["codex", "-c", 'model="test"'],
+        )
+        self.assertEqual(
+            start[-2:],
+            ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"'],
+        )
 
     def test_launch_injects_herdr_binary_env(self) -> None:
         # Redmine #13331 j#73312 scope addition #1: the launched agent is itself a
@@ -383,8 +435,12 @@ class SessionStartTest(unittest.TestCase):
         )
         codex = by_provider["codex"]
         self.assertEqual(
-            codex[codex.index("--"):],
+            codex[codex.index("--") : codex.index("--") + 4],
             ["--", "codex", "--config", "model_reasoning_effort=high"],
+        )
+        self.assertEqual(
+            codex[-2:],
+            ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="issue_x"'],
         )
 
     def test_launch_argv_config_uses_default_lane_class_for_no_lane(self) -> None:
@@ -415,13 +471,17 @@ class SessionStartTest(unittest.TestCase):
             )
         codex = herdr.start_argvs[0]
         self.assertEqual(
-            codex[codex.index("--"):],
+            codex[codex.index("--") : codex.index("--") + 4],
             ["--", "codex", "--config", "model_reasoning_effort=xhigh"],
         )
+        self.assertEqual(
+            codex[-2:],
+            ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="default"'],
+        )
 
-    def test_launch_argv_none_config_is_byte_invariant(self) -> None:
-        # No config (agent_launch=None) appends nothing — byte-for-byte the pre-#13425
-        # launch, so an unconfigured launch site is unaffected.
+    def test_launch_argv_none_config_keeps_claude_byte_invariant(self) -> None:
+        # No repo config still leaves Claude byte-invariant. Codex receives only the
+        # managed identity policy required by #13614.
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(
@@ -429,7 +489,13 @@ class SessionStartTest(unittest.TestCase):
             )
         for argv in herdr.start_argvs:
             provider = argv[argv.index("--") + 1]
-            self.assertEqual(argv[-2:], ["--", provider])
+            if provider == "claude":
+                self.assertEqual(argv[-2:], ["--", provider])
+            else:
+                self.assertEqual(
+                    argv[-2:],
+                    ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"'],
+                )
 
     def test_launch_without_policy_default_is_flagless(self) -> None:
         # No default and no env override: the historical bare `-- claude` launch is
