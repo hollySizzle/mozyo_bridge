@@ -41,6 +41,9 @@ from mozyo_bridge.scaffold.rules import (
     scaffold_status,
     write_scaffold,
 )
+from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import (
+    version_mirror,
+)
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import resolve_repo_root
 
@@ -883,43 +886,22 @@ def cmd_release_workflow_wait(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-_CONTRACT_DOC_RELATIVE = Path("vibes/docs/logics/release-helper-contract.md")
-_MIRROR_SET_ANCHOR = "release-version mirror set は以下の"
+# The mirror-set constants (contract path, anchor, per-extension version-field
+# handlers) and the PEP 440 version recognizer live in the stdlib-only
+# ``version_mirror`` module (this Feature package) so this installed helper and
+# the dependency-free TestPyPI dev-version script (``scripts/
+# compute_testpypi_dev_version.py``) build on one source of truth. The mirror
+# resolution / extract / rewrite functions below are thin wrappers that
+# translate ``version_mirror.MirrorError`` into ``die`` for the helper's
+# operator-facing exit contract.
 
-# Per-file-extension version field handlers. The set of file extensions
-# accepted here is the helper's interpretation surface; the SET OF FILES
-# is read from the contract doc at runtime. Adding a new mirror file
-# whose extension is not represented here will strict-fail at
-# `_load_mirror_set`, so the helper cannot silently mutate an
-# unrecognized file shape.
-_MIRROR_KIND_HANDLERS: dict[str, dict[str, object]] = {
-    ".toml": {
-        "pattern": re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE),
-        "format": 'version = "{value}"',
-        "label": "[project].version",
-    },
-    ".py": {
-        "pattern": re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE),
-        "format": '__version__ = "{value}"',
-        "label": "__version__",
-    },
-}
-
-
-# Loose PEP 440 / SemVer hybrid recognizer. Tight enough to reject shell
-# meta or paths, loose enough to admit the documented shapes
-# (`0.1.0a1`, `0.1.0`, `0.1.0rc1`, `0.1.1`, etc.). The helper does not
-# pick between alpha / beta / GA; it only validates the literal shape.
-_VERSION_RE = re.compile(
-    r"^[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?$"
-)
 _TAG_RE = re.compile(
     r"^v[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?$"
 )
 
 
 def _validate_version(value: str) -> None:
-    if not _VERSION_RE.match(value):
+    if not version_mirror.is_valid_version(value):
         die(
             f"version literal {value!r} does not match the accepted PEP 440 "
             "shape (`X.Y.Z`, `X.Y.ZaN`, `X.Y.ZbN`, `X.Y.ZrcN`, optional "
@@ -935,114 +917,39 @@ def _validate_tag(value: str) -> None:
         )
 
 
-def _parse_mirror_set_paths(contract_text: str) -> list[str]:
-    """Extract the mirror-set bullet list from the contract doc.
-
-    The contract doc names the mirror set as a bullet list immediately
-    following the anchor phrase ``release-version mirror set は以下の``.
-    Each bullet's first backtick-quoted token is the file path. The
-    bullet list ends at the first blank line after the bullets start.
-    """
-    start = contract_text.find(_MIRROR_SET_ANCHOR)
-    if start < 0:
-        die(
-            "release-helper-contract.md does not contain the mirror-set "
-            f"anchor {_MIRROR_SET_ANCHOR!r}; update the contract before "
-            "running release bump"
-        )
-    paths: list[str] = []
-    bullet_started = False
-    for line in contract_text[start:].splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("- `"):
-            bullet_started = True
-            after = stripped[3:]
-            close = after.find("`")
-            if close < 0:
-                continue
-            paths.append(after[:close])
-        elif bullet_started and not stripped:
-            break
-    if not paths:
-        die(
-            "release-helper-contract.md mirror-set section has no bullet "
-            "entries; cannot determine which files to operate on"
-        )
-    return paths
-
-
 def _load_mirror_set(repo_root: Path) -> list[tuple[Path, dict[str, object]]]:
     """Return the contract-declared mirror set as `(absolute_path, handler)`.
 
-    The set is read from ``release-helper-contract.md`` so it stays in
-    lockstep with the contract; this is the same doc the contract requires
-    the helper to follow when the set changes. Files whose extension is not
-    represented in ``_MIRROR_KIND_HANDLERS`` are strict-fail rather than
-    silently skipped — the helper would otherwise miss a contract-mandated
-    target.
+    Thin wrapper over ``version_mirror.load_mirror_set`` that translates a
+    ``MirrorError`` (missing contract doc / anchor / mirror file / unhandled
+    extension) into the helper's ``die`` exit contract. The mirror set is read
+    from ``release-helper-contract.md`` so it stays in lockstep with the
+    contract.
     """
-    contract_path = repo_root / _CONTRACT_DOC_RELATIVE
-    if not contract_path.exists():
-        die(
-            f"contract doc not found at {contract_path}; cannot determine "
-            "the release-version mirror set"
-        )
     try:
-        contract_text = contract_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        die(f"failed to read contract doc {contract_path}: {exc}")
+        return version_mirror.load_mirror_set(repo_root)
+    except version_mirror.MirrorError as exc:
+        die(str(exc))
         raise AssertionError("unreachable")
-    paths = _parse_mirror_set_paths(contract_text)
-    resolved: list[tuple[Path, dict[str, object]]] = []
-    for raw in paths:
-        path = repo_root / raw
-        if not path.exists():
-            die(
-                f"contract names mirror set file {raw!r} but it does not "
-                f"exist at {path}; update the contract or restore the file "
-                "before running release bump"
-            )
-        ext = path.suffix.lower()
-        handler = _MIRROR_KIND_HANDLERS.get(ext)
-        if handler is None:
-            die(
-                f"contract names mirror set file {raw!r} but the helper has "
-                f"no version-field handler for extension {ext!r}; update "
-                "_MIRROR_KIND_HANDLERS together with the contract before "
-                "running release bump"
-            )
-        resolved.append((path, handler))
-    return resolved
 
 
 def _extract_current_version(path: Path, handler: dict[str, object]) -> str:
     text = path.read_text(encoding="utf-8")
-    pattern = handler["pattern"]
-    assert isinstance(pattern, re.Pattern)
-    match = pattern.search(text)
-    if match is None:
-        die(
-            f"could not locate version literal in {path} using regex "
-            f"{pattern.pattern!r}; mirror set may have drifted from the "
-            "contract"
-        )
+    try:
+        return version_mirror.extract_version(text, handler)
+    except version_mirror.MirrorError as exc:
+        die(f"{exc} (file: {path})")
         raise AssertionError("unreachable")
-    return match.group(1)
 
 
 def _replace_version(path: Path, handler: dict[str, object], new_version: str) -> bool:
     """Replace the version literal in `path`. Returns True if file changed."""
     text = path.read_text(encoding="utf-8")
-    pattern = handler["pattern"]
-    fmt = handler["format"]
-    assert isinstance(pattern, re.Pattern) and isinstance(fmt, str)
-    rewritten, count = pattern.subn(fmt.format(value=new_version), text, count=1)
-    if count == 0:
-        die(
-            f"could not rewrite version literal in {path}; pattern "
-            f"{pattern.pattern!r} did not match. Aborting before "
-            "partially-mutated mirror set."
-        )
+    try:
+        rewritten = version_mirror.replace_version(text, handler, new_version)
+    except version_mirror.MirrorError as exc:
+        die(f"{exc} (file: {path})")
+        raise AssertionError("unreachable")
     if rewritten == text:
         return False
     path.write_text(rewritten, encoding="utf-8")

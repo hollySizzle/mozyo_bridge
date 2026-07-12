@@ -41,8 +41,12 @@ jobs:
         run: python -m pip install build
 
       - name: Compute unique dev version
-        # Only the automatic main-CI path rewrites the version. Manual dispatch
-        # keeps the committed release version for exact-version validation.
+        # Only the automatic main-CI path rewrites the version. `--write`
+        # rewrites EVERY release-version mirror file (pyproject.toml +
+        # src/mozyo_bridge/__init__.py) to the same exact dev version, so the
+        # wheel METADATA and the runtime __version__ / CLI --version agree
+        # (Redmine #13586). Manual dispatch keeps the committed release version
+        # for exact-version validation.
         if: github.event_name == 'workflow_run'
         run: |
           # Collision-proof unique dev segment: a UTC timestamp (readable,
