@@ -299,6 +299,42 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
             lines.append(f"location: {receipt.location}")
         return _emit(payload, as_json=as_json, text_lines=lines)
 
+    if getattr(args, "recovery_plan", False):
+        from mozyo_bridge.core.state.workflow_runtime_store import (
+            CALLBACK_PENDING,
+            CALLBACK_UNCERTAIN,
+        )
+        from mozyo_bridge.core.state.workspace_registry import read_anchor
+        from mozyo_bridge.application.commands_common import repo_root_from_args
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_recovery_command import (
+            build_observation,
+            recovery_plan_from_observation,
+        )
+
+        repo_root = repo_root_from_args(args)
+        anchor = read_anchor(repo_root)
+        registry_ws = (anchor.get("workspace_id") if isinstance(anchor, dict) else "") or ""
+        # The expected workspace comes from the durable anchor (--workspace-id); default to the
+        # registry value when unset (then the mismatch check is trivially satisfied).
+        expected_ws = (getattr(args, "workspace_id", None) or registry_ws).strip()
+        obs = build_observation(
+            workspace_id_expected=expected_ws,
+            workspace_id_registry=registry_ws,
+            redmine_anchor_readable=True,  # a full poll is heavy; the operator flags an unreadable anchor
+            repo_root=str(repo_root),
+            outbox_present=True,
+            outbox_pending=len(outbox.read(states=[CALLBACK_PENDING])),
+            outbox_uncertain=len(outbox.read(states=[CALLBACK_UNCERTAIN])),
+            env=os.environ,
+        )
+        plan = recovery_plan_from_observation(obs)
+        payload = {"action": "recovery-plan", **plan.as_payload()}
+        lines = [f"action: recovery-plan", f"status: {plan.status}"]
+        lines += [f"  blocker: {b}" for b in plan.blockers]
+        lines += [f"  step: {s.kind} — {s.detail}" for s in plan.steps]
+        lines += [f"  note: {n}" for n in plan.notes]
+        return _emit(payload, as_json=as_json, text_lines=lines)
+
     if getattr(args, "run_once", False) or getattr(args, "watch", False):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
             discover_candidates,
@@ -394,6 +430,13 @@ def register_callbacks(sub) -> None:
         help="Record a canonical callback-required gate journal on Redmine WITH the discoverable "
              "marker (--issue + --gate; credential-gated, opt-in; fail-closed without the opt-in).",
     )
+    action.add_argument(
+        "--recovery-plan", dest="recovery_plan", action="store_true",
+        help="Emit the READ-ONLY host-restart recovery plan (reconciles Redmine/Git/registry/"
+             "state-DB/runtime authorities; fail-closed + never-clobber; --workspace-id sets the "
+             "expected anchor workspace).",
+    )
+    p.add_argument("--workspace-id", dest="workspace_id", help="Expected anchor workspace id for --recovery-plan.")
     p.add_argument("--issue", help="Issue id for --emit-gate.")
     p.add_argument("--gate", help="Callback-required gate kind for --emit-gate (implementation_done | review_request | review_result | owner_close_approval_waiting | blocked).")
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
