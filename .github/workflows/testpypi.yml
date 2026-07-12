@@ -1,9 +1,54 @@
 name: Publish to TestPyPI
 
+# Exact-SHA internal-beta gate (Redmine #13601).
+#
+# The manual path is decoupled from public `main` promotion and Redmine Version
+# close so an internal beta can be published from an exact, reviewed integration
+# head without first advancing public history (which would recreate the
+# `Version close -> origin/main -> TestPyPI -> ... -> Version close` cycle this
+# workflow exists to break).
+#
+# Trust model (Redmine #13601 j#75969 / j#75978):
+#   - The workflow DEFINITION / event ref stays fixed to `main`. An arbitrary
+#     staging ref is NEVER selected as the workflow authority, so no untrusted
+#     ref can request OIDC.
+#   - The ARTIFACT authority is the exact `source_sha` build input, checked out
+#     only inside the trusted (main-defined) build job.
+#   - The RELEASE-APPROVAL authority stays with the Redmine gate + the external
+#     `testpypi` environment protection (owner required reviewer + main-only
+#     deployment branch policy), configured separately before dispatch.
+#   - The build job carries NO `id-token: write`. Only the publish job — which
+#     merely downloads the built artifact and uploads it — holds `id-token:
+#     write` + `environment: testpypi`, so Trusted Publishing credentials are
+#     never exposed to the checkout/build/verify steps.
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('TestPyPI exact {0} @ {1} (nonce {2})', inputs.expected_version, inputs.source_sha, inputs.dispatch_nonce)
+      || 'TestPyPI dev (auto main-CI)' }}
+
 on:
-  # Manual exact-version publish (release-candidate check): builds the version
-  # committed in pyproject.toml.
+  # Manual exact-candidate publish (internal-beta release-candidate check).
+  # The event ref stays `main`; the exact reviewed candidate is passed as
+  # `source_sha` and validated fail-closed before build/publish.
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact 40-hex commit SHA to build and publish (artifact authority)."
+        required: true
+        type: string
+      expected_version:
+        description: "Exact package version that source_sha must carry in BOTH mirror files."
+        required: true
+        type: string
+      source_ref:
+        description: "Approved origin integration/release-candidate ref that must currently resolve to source_sha (lineage evidence). ancestor-only / local-only SHAs are refused."
+        required: true
+        type: string
+      dispatch_nonce:
+        description: "Unique token embedded in run-name for deterministic dispatch<->run correlation (no latest-one guessing)."
+        required: true
+        type: string
   # Automatic dev publish: after the required `Test` checks pass on `main`,
   # publish a unique PEP 440 `.devN` artifact so the normal-PATH pipx runtime
   # can be aligned to `main` without source-runtime or ad-hoc reinstalls.
@@ -12,25 +57,182 @@ on:
     types: [completed]
     branches: [main]
 
+# Serialize by target version: two manual dispatches for the SAME
+# expected_version cannot race the TestPyPI upload; the dev path serializes per
+# triggering head_sha. Duplicate publishes are ALSO rejected TestPyPI-side, so
+# this only removes the local race, it is not the sole uniqueness guard.
+concurrency:
+  group: >-
+    testpypi-${{ github.event_name == 'workflow_dispatch'
+      && format('exact-{0}', inputs.expected_version)
+      || format('dev-{0}', github.event.workflow_run.head_sha) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
-  publish:
+  build:
+    # Trusted build + fail-closed verification. Runs from the main-defined
+    # workflow, checks out the exact candidate SHA, and produces the artifact.
+    # Carries NO id-token: the OIDC credential lives only in `publish`.
     runs-on: ubuntu-latest
     # Manual dispatch always runs; the automatic path runs only when the
     # triggering `Test` run on `main` actually succeeded (never on failure).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
-    environment: testpypi
     permissions:
       contents: read
-      id-token: write
-
+    outputs:
+      resolved_version: ${{ steps.resolve_version.outputs.version }}
     steps:
+      - name: Resolve checkout SHA
+        id: checkout_sha
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SHA: ${{ inputs.source_sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$RUN_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v6
         with:
-          # On the automatic path, check out the exact commit that passed CI so
-          # the artifact maps to a known SHA. Manual dispatch uses its own ref.
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+          # ARTIFACT authority: build the exact candidate SHA. The workflow
+          # DEFINITION is still `main` (this file), so untrusted candidate code
+          # never becomes the workflow authority. fetch-depth 0 so the origin
+          # ref-resolution gate below can consult remote refs.
+          ref: ${{ steps.checkout_sha.outputs.sha }}
+          fetch-depth: 0
+
+      # --- Manual exact-candidate fail-closed gates (trusted, main-defined) ---
+      # Each gate is inline in this main-defined YAML and reads candidate DATA
+      # only (SHA, version literals) — it never executes candidate code to make
+      # a gating decision, so a tampered candidate tree cannot fake a pass.
+
+      - name: Verify exact source SHA == HEAD (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]* | "") echo "::error::source_sha must be 40-hex lowercase"; exit 1 ;;
+          esac
+          if [ "${#SOURCE_SHA}" -ne 40 ]; then
+            echo "::error::source_sha must be exactly 40 hex chars (got ${#SOURCE_SHA})"; exit 1
+          fi
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::checked-out HEAD $HEAD_SHA != source_sha $SOURCE_SHA"; exit 1
+          fi
+          echo "HEAD == source_sha ($SOURCE_SHA)"
+
+      - name: Verify source_ref resolves to source SHA on origin (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          # source_ref must be a NAMED ref on origin whose CURRENT tip is exactly
+          # source_sha. A bare SHA, a local-only ref, or a ref that merely has
+          # source_sha as an ancestor is refused (ls-remote returns the tip only).
+          RESOLVED="$(git ls-remote origin "$SOURCE_REF" | awk 'NR==1 {print $1}')"
+          if [ -z "$RESOLVED" ]; then
+            echo "::error::source_ref '$SOURCE_REF' does not resolve to a ref on origin"; exit 1
+          fi
+          if [ "$RESOLVED" != "$SOURCE_SHA" ]; then
+            echo "::error::source_ref '$SOURCE_REF' tip $RESOLVED != source_sha $SOURCE_SHA"; exit 1
+          fi
+          echo "source_ref '$SOURCE_REF' tip == source_sha"
+
+      - name: Verify version mirror == expected_version (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          # Trusted inline check: the 2-file mirror set is duplicated here on
+          # purpose (main-defined, no candidate code executed). Keep it in
+          # lockstep with vibes/docs/logics/release-helper-contract.md.
+          python3 - <<'PY'
+          import os, re, sys
+          expected = os.environ["EXPECTED_VERSION"]
+          mirror = {
+              "pyproject.toml": r'(?m)^version\s*=\s*"([^"]+)"',
+              "src/mozyo_bridge/__init__.py": r'(?m)^__version__\s*=\s*"([^"]+)"',
+          }
+          seen = {}
+          for path, pattern in mirror.items():
+              with open(path, encoding="utf-8") as fh:
+                  match = re.search(pattern, fh.read())
+              if not match:
+                  print(f"::error::no version literal found in {path}")
+                  sys.exit(1)
+              seen[path] = match.group(1)
+          values = set(seen.values())
+          if values != {expected}:
+              print(f"::error::version mirror {seen} != expected_version {expected!r}")
+              sys.exit(1)
+          print(f"version mirror == expected_version ({expected})")
+          PY
+
+      - name: Verify successful Test CI for source SHA (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Require a completed + success run of the TRUSTED `Test` workflow
+          # (.github/workflows/test.yml) for exactly this head_sha. Selecting by
+          # the workflow file path pins the canonical Test workflow, not some
+          # other workflow renamed "Test".
+          SUCCESSES="$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/actions/workflows/test.yml/runs?head_sha=$SOURCE_SHA&status=completed" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+          if [ "${SUCCESSES:-0}" -lt 1 ]; then
+            echo "::error::no completed+success Test run for source_sha $SOURCE_SHA"; exit 1
+          fi
+          echo "Test CI success runs for source_sha: $SUCCESSES"
+
+      - name: Verify expected_version is unused on TestPyPI (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          # Fail-closed: a lookup error is treated as "cannot prove unused",
+          # so the publish does not proceed on an unknown uniqueness state.
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+          expected = os.environ["EXPECTED_VERSION"]
+          url = "https://test.pypi.org/pypi/mozyo-bridge/json"
+          try:
+              with urllib.request.urlopen(url, timeout=20) as response:
+                  data = json.loads(response.read().decode("utf-8"))
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  print("project not yet on TestPyPI; version is unused")
+                  sys.exit(0)
+              print(f"::error::TestPyPI lookup failed ({exc}); refusing (fail-closed)")
+              sys.exit(1)
+          except Exception as exc:  # noqa: BLE001 - any transport error is fail-closed
+              print(f"::error::TestPyPI lookup unreachable ({exc}); refusing (fail-closed)")
+              sys.exit(1)
+          releases = data.get("releases") if isinstance(data, dict) else None
+          if isinstance(releases, dict) and expected in releases:
+              print(f"::error::version {expected} already published on TestPyPI")
+              sys.exit(1)
+          print(f"version {expected} is unused on TestPyPI")
+          PY
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -40,38 +242,78 @@ jobs:
       - name: Install build tools
         run: python -m pip install build
 
-      - name: Compute unique dev version
-        # Only the automatic main-CI path rewrites the version. `--write`
-        # rewrites EVERY release-version mirror file (pyproject.toml +
-        # src/mozyo_bridge/__init__.py) to the same exact dev version, so the
-        # wheel METADATA and the runtime __version__ / CLI --version agree
-        # (Redmine #13586). Manual dispatch keeps the committed release version
-        # for exact-version validation.
-        if: github.event_name == 'workflow_run'
+      - name: Resolve build version
+        id: resolve_version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          DEV_RUN_ID: ${{ github.event.workflow_run.id }}
+          DEV_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEV_RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
-          # Collision-proof unique dev segment: a UTC timestamp (readable,
-          # time-ordered) concatenated with the triggering `Test` run's
-          # globally-unique id. Two `Test` runs that complete in the same second
-          # still differ by run id; a re-run of the same run fires later so the
-          # timestamp differs. Both parts are all-digits, so the result is a
-          # valid PEP 440 `.devN` segment.
-          TS="$(date -u +%Y%m%d%H%M%S)"
-          RUN_ID="${{ github.event.workflow_run.id }}"
-          DEV_NUMBER="${TS}${RUN_ID}"
-          DEV_VERSION="$(python scripts/compute_testpypi_dev_version.py --dev-number "$DEV_NUMBER" --write)"
-          echo "Computed dev version: $DEV_VERSION"
-          {
-            echo "### TestPyPI dev publish"
-            echo ""
-            echo "- version: \`$DEV_VERSION\`"
-            echo "- commit: \`${{ github.event.workflow_run.head_sha }}\`"
-            echo "- source CI run: ${{ github.event.workflow_run.html_url }}"
-            echo ""
-            echo "Record this version <-> commit mapping with the smoke evidence."
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Automatic dev path: rewrite EVERY release-version mirror file to
+            # the same exact dev version so the wheel METADATA and runtime
+            # __version__ / CLI --version agree (Redmine #13586). Manual dispatch
+            # keeps the committed release version (already fail-closed verified
+            # to equal expected_version above).
+            TS="$(date -u +%Y%m%d%H%M%S)"
+            DEV_NUMBER="${TS}${DEV_RUN_ID}"
+            DEV_VERSION="$(python scripts/compute_testpypi_dev_version.py --dev-number "$DEV_NUMBER" --write)"
+            echo "version=$DEV_VERSION" >> "$GITHUB_OUTPUT"
+            {
+              echo "### TestPyPI dev publish"
+              echo ""
+              echo "- version: \`$DEV_VERSION\`"
+              echo "- commit: \`$DEV_HEAD_SHA\`"
+              echo "- source CI run: $DEV_RUN_URL"
+              echo ""
+              echo "Record this version <-> commit mapping with the smoke evidence."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+            {
+              echo "### TestPyPI exact-candidate publish"
+              echo ""
+              echo "- version: \`$EXPECTED_VERSION\`"
+              echo "- source_sha: \`$SOURCE_SHA\`"
+              echo "- source_ref: \`$SOURCE_REF\`"
+              echo ""
+              echo "Fail-closed gates passed: HEAD==source_sha, source_ref->source_sha,"
+              echo "version mirror==expected_version, Test CI success, version unused."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Build package
         run: python -m build
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: testpypi-dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    # OIDC publish job: downloads the artifact built + verified by `build` and
+    # uploads it. This is the ONLY job carrying id-token: write + the protected
+    # `testpypi` environment, so Trusted Publishing credentials never touch the
+    # checkout / build / verify surface.
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: testpypi-dist
+          path: dist/
 
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1

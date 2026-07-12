@@ -29,6 +29,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -810,7 +811,10 @@ def cmd_release_check_workflow(args: argparse.Namespace) -> int:
 def cmd_release_workflow_runs(args: argparse.Namespace) -> int:
     """List recent runs of a workflow with the columns the contract names."""
     _require_command("gh", hint=_GH_HINT)
-    fields = "databaseId,createdAt,status,conclusion,headSha,url,workflowName"
+    # `name` carries the run-name, which the TestPyPI exact-candidate dispatch
+    # stamps with `dispatch_nonce`; surfacing it lets operators correlate a
+    # dispatch to its run deterministically (Redmine #13601).
+    fields = "databaseId,name,createdAt,status,conclusion,headSha,url,workflowName"
     result = _run(
         [
             "gh",
@@ -836,7 +840,7 @@ def cmd_release_workflow_runs(args: argparse.Namespace) -> int:
         raise AssertionError("unreachable")
     if not isinstance(runs, list):
         die("gh run list returned non-array JSON")
-    print("RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL")
+    print("RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL\tRUN_NAME")
     for entry in runs:
         if not isinstance(entry, dict):
             continue
@@ -847,6 +851,7 @@ def cmd_release_workflow_runs(args: argparse.Namespace) -> int:
             str(entry.get("conclusion") or ""),
             str(entry.get("headSha") or ""),
             str(entry.get("url") or ""),
+            str(entry.get("name") or ""),
         ]
         print("\t".join(row))
     return EXIT_CLEAN
@@ -899,6 +904,11 @@ _TAG_RE = re.compile(
     r"^v[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?$"
 )
 
+# Exact 40-hex lowercase commit SHA. The TestPyPI exact-candidate dispatch
+# (Redmine #13601) treats the SHA as the artifact authority, so it must be a
+# full immutable SHA, never an abbreviation or a ref name.
+_SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 
 def _validate_version(value: str) -> None:
     if not version_mirror.is_valid_version(value):
@@ -914,6 +924,15 @@ def _validate_tag(value: str) -> None:
         die(
             f"tag {value!r} must match `vX.Y.Z` shape (optionally with "
             "`aN` / `bN` / `rcN` / `.postN` / `.devN` suffix)"
+        )
+
+
+def _validate_source_sha(value: str) -> None:
+    if not _SOURCE_SHA_RE.match(value):
+        die(
+            f"source SHA {value!r} must be an exact 40-hex lowercase commit SHA "
+            "(the artifact authority for the exact-candidate TestPyPI dispatch); "
+            "abbreviations and ref names are refused"
         )
 
 
@@ -1077,9 +1096,85 @@ def _bump_to(
 # ---------------------------------------------------------------------------
 
 
-def _gh_dispatch_testpypi(version: str) -> dict[str, str]:
+def _new_dispatch_nonce() -> str:
+    """Return a unique token embedded in the workflow run-name.
+
+    The TestPyPI workflow (Redmine #13601) echoes ``dispatch_nonce`` into its
+    ``run-name`` so the just-dispatched run can be correlated by exact nonce
+    match rather than a latest-one guess. Split out so tests can pin a fixed
+    nonce.
+    """
+    return uuid.uuid4().hex
+
+
+def _correlate_dispatch_run(
+    nonce: str, *, attempts: int = 6, delay: float = 2.0
+) -> dict[str, str]:
+    """Deterministically correlate the dispatched run by its run-name nonce.
+
+    The workflow embeds ``dispatch_nonce`` in its run-name, so the just-
+    dispatched run is identified by exact nonce match — never by picking the
+    most recent run (which could be a concurrent dev-path publish or another
+    operator's dispatch). Returns a dict whose ``match`` is one of
+    ``"one"`` / ``"none"`` / ``"many"``; only an exact single match is a green
+    path, everything else is surfaced fail-closed to the caller.
+    """
+    matches: list[dict[str, object]] = []
+    for attempt in range(max(1, attempts)):
+        result = _run(
+            [
+                "gh",
+                "run",
+                "list",
+                "--workflow",
+                "testpypi.yml",
+                "--limit",
+                "40",
+                "--json",
+                "databaseId,name,url,createdAt,headSha,status",
+            ]
+        )
+        runs: list[dict[str, object]] = []
+        if result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout)
+                if isinstance(payload, list):
+                    runs = [entry for entry in payload if isinstance(entry, dict)]
+            except json.JSONDecodeError:
+                runs = []
+        matches = [entry for entry in runs if nonce in str(entry.get("name") or "")]
+        if matches:
+            break
+        if attempt + 1 < max(1, attempts):
+            time.sleep(delay)
+    if len(matches) == 1:
+        entry = matches[0]
+        return {
+            "match": "one",
+            "run_id": str(entry.get("databaseId") or ""),
+            "name": str(entry.get("name") or ""),
+            "url": str(entry.get("url") or ""),
+            "created_at": str(entry.get("createdAt") or ""),
+            "head_sha": str(entry.get("headSha") or ""),
+            "status": str(entry.get("status") or ""),
+        }
+    if len(matches) > 1:
+        return {"match": "many"}
+    return {"match": "none"}
+
+
+def _gh_dispatch_testpypi(
+    source_sha: str, expected_version: str, source_ref: str, nonce: str
+) -> dict[str, str]:
+    """Dispatch the main-fixed exact-candidate TestPyPI workflow.
+
+    The workflow definition / event ref stays ``main``; the exact reviewed
+    candidate is passed as inputs. The workflow checks out ``source_sha`` and
+    fail-closed verifies SHA / version mirror / Test CI / uniqueness / ref
+    lineage before build+publish. Run correlation is by ``dispatch_nonce``, not
+    latest-one guessing.
+    """
     _require_command("gh", hint=_GH_HINT)
-    _validate_version(version)
     dispatch = _run(
         [
             "gh",
@@ -1088,6 +1183,14 @@ def _gh_dispatch_testpypi(version: str) -> dict[str, str]:
             "testpypi.yml",
             "--ref",
             "main",
+            "-f",
+            f"source_sha={source_sha}",
+            "-f",
+            f"expected_version={expected_version}",
+            "-f",
+            f"source_ref={source_ref}",
+            "-f",
+            f"dispatch_nonce={nonce}",
         ]
     )
     if dispatch.returncode != 0:
@@ -1095,50 +1198,7 @@ def _gh_dispatch_testpypi(version: str) -> dict[str, str]:
             "gh workflow run testpypi.yml failed: "
             f"{dispatch.stderr.strip() or dispatch.stdout.strip()}"
         )
-
-    # `gh workflow run` does not return the run-id directly; surface it via a
-    # follow-up list call. The most recent run on the workflow is the one we
-    # just dispatched. The helper sleeps once to give the run a moment to
-    # register before listing — this is best-effort and the operator can
-    # always re-list via `release workflow runs --workflow testpypi.yml`.
-    time.sleep(2)
-    list_result = _run(
-        [
-            "gh",
-            "run",
-            "list",
-            "--workflow",
-            "testpypi.yml",
-            "--limit",
-            "1",
-            "--json",
-            "databaseId,url,createdAt,headSha,status",
-        ]
-    )
-    runs: list[dict[str, object]] = []
-    if list_result.returncode == 0:
-        try:
-            payload = json.loads(list_result.stdout)
-            if isinstance(payload, list):
-                runs = [entry for entry in payload if isinstance(entry, dict)]
-        except json.JSONDecodeError:
-            runs = []
-    if not runs:
-        return {
-            "run_id": "",
-            "url": "",
-            "created_at": "",
-            "head_sha": "",
-            "status": "",
-        }
-    entry = runs[0]
-    return {
-        "run_id": str(entry.get("databaseId") or ""),
-        "url": str(entry.get("url") or ""),
-        "created_at": str(entry.get("createdAt") or ""),
-        "head_sha": str(entry.get("headSha") or ""),
-        "status": str(entry.get("status") or ""),
-    }
+    return _correlate_dispatch_run(nonce)
 
 
 def _gh_release_create_command(
@@ -1158,22 +1218,80 @@ def _gh_release_create_command(
 
 
 def _publish_testpypi(args: argparse.Namespace) -> int:
-    version = getattr(args, "version", None)
-    if not version:
-        die("release publish --testpypi requires --version <X.Y.Z>")
-    info = _gh_dispatch_testpypi(version)
-    _print_section("dispatched TestPyPI workflow")
-    print(f"workflow: testpypi.yml")
-    print(f"ref: main")
-    print(f"version: {version}")
-    print(f"run_id: {info['run_id'] or '(unresolved; re-run `release workflow runs --workflow testpypi.yml`)'}")
-    print(f"url: {info['url']}")
-    print(f"head_sha: {info['head_sha']}")
-    print(f"status: {info['status']}")
+    """Dispatch the exact-candidate TestPyPI workflow (Redmine #13601).
+
+    Requires the exact ``--source-sha`` (artifact authority), an
+    ``--expected-version`` the SHA must carry, and a ``--source-ref`` (approved
+    origin lineage the SHA must currently resolve from). The legacy
+    ``--version`` flag is accepted as an alias for ``--expected-version``. The
+    dispatch is correlated to its run deterministically by nonce; ambiguous or
+    not-yet-registered correlation is surfaced fail-closed rather than guessing
+    the most recent run.
+    """
+    source_sha = getattr(args, "source_sha", None)
+    expected_version = getattr(args, "expected_version", None) or getattr(
+        args, "version", None
+    )
+    source_ref = getattr(args, "source_ref", None)
+    if not source_sha:
+        die("release publish --testpypi requires --source-sha <40-hex commit SHA>")
+    if not expected_version:
+        die(
+            "release publish --testpypi requires --expected-version <X.Y.Z> "
+            "(or the --version alias)"
+        )
+    if not source_ref:
+        die(
+            "release publish --testpypi requires --source-ref <approved origin "
+            "ref that resolves to source_sha>"
+        )
+    _validate_source_sha(source_sha)
+    _validate_version(expected_version)
+    nonce = _new_dispatch_nonce()
+    info = _gh_dispatch_testpypi(source_sha, expected_version, source_ref, nonce)
+
+    _print_section("dispatched TestPyPI workflow (exact candidate)")
+    print("workflow: testpypi.yml")
+    print("ref: main")
+    print(f"source_sha: {source_sha}")
+    print(f"source_ref: {source_ref}")
+    print(f"expected_version: {expected_version}")
+    print(f"dispatch_nonce: {nonce}")
+
+    if info.get("match") == "one":
+        run_id = info.get("run_id", "")
+        print(f"run_id: {run_id}")
+        print(f"run_name: {info.get('name', '')}")
+        print(f"url: {info.get('url', '')}")
+        print(f"run_head_sha: {info.get('head_sha', '')}")
+        print(f"status: {info.get('status', '')}")
+        print("")
+        print(
+            "Next: `mozyo-bridge release workflow wait --run-id "
+            f"{run_id} --timeout <seconds>`"
+        )
+        return EXIT_CLEAN
+
+    # Fail-closed: never fall back to a latest-one guess. The nonce lives in the
+    # run-name, so the operator can always correlate deterministically later.
+    print("run_id: (not deterministically correlated)")
     print("")
-    print("Next: `mozyo-bridge release workflow wait --run-id "
-          f"{info['run_id'] or '<run-id>'} --timeout <seconds>`")
-    return EXIT_CLEAN
+    if info.get("match") == "many":
+        print(
+            "result: blocker (multiple runs matched the dispatch nonce; "
+            "do NOT assume the latest)"
+        )
+    else:
+        print(
+            "result: blocker (dispatched run not yet correlated by nonce; "
+            "do NOT assume the latest)"
+        )
+    print(
+        "Correlate deterministically by nonce: `mozyo-bridge release workflow "
+        f"runs --workflow testpypi.yml` and pick the run whose name contains "
+        f"{nonce!r}."
+    )
+    return EXIT_BLOCKER
 
 
 def _publish_pypi(args: argparse.Namespace) -> int:

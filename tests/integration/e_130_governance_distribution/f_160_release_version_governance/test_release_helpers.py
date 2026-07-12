@@ -646,6 +646,7 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
         runs = [
             {
                 "databaseId": 1,
+                "name": "TestPyPI exact 0.10.0 @ deadbeef (nonce abc123)",
                 "createdAt": "2026-05-14T00:00:00Z",
                 "status": "completed",
                 "conclusion": "success",
@@ -654,6 +655,7 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
             },
             {
                 "databaseId": 2,
+                "name": "TestPyPI dev (auto main-CI)",
                 "createdAt": "2026-05-14T01:00:00Z",
                 "status": "in_progress",
                 "conclusion": None,
@@ -672,9 +674,22 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
                     )
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
         text = out.getvalue()
-        self.assertIn("RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL", text)
-        self.assertIn("1\t2026-05-14T00:00:00Z\tcompleted\tsuccess\tabc\thttps://example/1", text)
-        self.assertIn("2\t2026-05-14T01:00:00Z\tin_progress\t\tdef\thttps://example/2", text)
+        # The RUN_NAME column carries the run-name (with the dispatch nonce) so
+        # operators can correlate a dispatch to its run deterministically.
+        self.assertIn(
+            "RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL\tRUN_NAME",
+            text,
+        )
+        self.assertIn(
+            "1\t2026-05-14T00:00:00Z\tcompleted\tsuccess\tabc\thttps://example/1\t"
+            "TestPyPI exact 0.10.0 @ deadbeef (nonce abc123)",
+            text,
+        )
+        self.assertIn(
+            "2\t2026-05-14T01:00:00Z\tin_progress\t\tdef\thttps://example/2\t"
+            "TestPyPI dev (auto main-CI)",
+            text,
+        )
 
 
 class ReleaseWorkflowWaitTest(unittest.TestCase):
@@ -780,12 +795,32 @@ class ReleaseBumpPublishParserTest(unittest.TestCase):
                 self.parse("release", "publish", "--testpypi", "--pypi")
 
     def test_release_publish_testpypi(self) -> None:
+        # Exact-candidate dispatch (Redmine #13601): source-sha / expected-version
+        # / source-ref parse through; the legacy --version alias still parses.
+        args = self.parse(
+            "release",
+            "publish",
+            "--testpypi",
+            "--source-sha",
+            "a" * 40,
+            "--expected-version",
+            "0.10.0",
+            "--source-ref",
+            "int_13472_session_continuity",
+        )
+        self.assertTrue(args.testpypi)
+        self.assertEqual("a" * 40, args.source_sha)
+        self.assertEqual("0.10.0", args.expected_version)
+        self.assertEqual("int_13472_session_continuity", args.source_ref)
+        self.assertFalse(args.execute)
+
+    def test_release_publish_testpypi_version_alias(self) -> None:
         args = self.parse(
             "release", "publish", "--testpypi", "--version", "0.3.0a1"
         )
         self.assertTrue(args.testpypi)
         self.assertEqual("0.3.0a1", args.version)
-        self.assertFalse(args.execute)
+        self.assertIsNone(args.expected_version)
 
     def test_release_publish_pypi_dryrun(self) -> None:
         args = self.parse(
@@ -1196,27 +1231,57 @@ class ReleasePublishTest(unittest.TestCase):
                         )
                     )
 
-    def test_testpypi_dispatch_validates_version_without_workflow_input(self) -> None:
+    # Exact-candidate dispatch inputs (Redmine #13601).
+    SOURCE_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+    NONCE = "deadbeefcafef00d"
+
+    def _testpypi_namespace(self, **overrides) -> argparse.Namespace:
+        base = dict(
+            testpypi=True,
+            pypi=False,
+            plan=False,
+            tag=None,
+            notes_file=None,
+            execute=False,
+            source_sha=self.SOURCE_SHA,
+            expected_version="0.10.0",
+            source_ref="int_13472_session_continuity",
+            version=None,
+            repo=None,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_testpypi_dispatch_passes_exact_inputs_and_correlates_by_nonce(self) -> None:
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
-        dispatch_call = []
+        calls = []
 
         def fake_run(argv, cwd=None, check=False, env=None):
-            dispatch_call.append(list(argv))
+            calls.append(list(argv))
             if "workflow" in argv and "run" in argv:
                 return subprocess.CompletedProcess(
                     args=argv, returncode=0, stdout="", stderr=""
                 )
-            # gh run list response
+            # gh run list: one run whose run-name carries the nonce.
             payload = json.dumps(
                 [
                     {
                         "databaseId": 9999,
+                        "name": f"TestPyPI exact 0.10.0 @ {self.SOURCE_SHA} (nonce {self.NONCE})",
                         "url": "https://example/run/9999",
                         "createdAt": "2026-05-14T11:00:00Z",
-                        "headSha": "abc",
+                        "headSha": "mainhead",
                         "status": "queued",
-                    }
+                    },
+                    {
+                        "databaseId": 8888,
+                        "name": "TestPyPI dev (auto main-CI)",
+                        "url": "https://example/run/8888",
+                        "createdAt": "2026-05-14T10:00:00Z",
+                        "headSha": "otherhead",
+                        "status": "completed",
+                    },
                 ]
             )
             return subprocess.CompletedProcess(
@@ -1225,23 +1290,14 @@ class ReleasePublishTest(unittest.TestCase):
 
         with patch.object(release_mod, "_run", side_effect=fake_run):
             with patch.object(release_mod, "_require_command"):
-                with patch.object(release_mod.time, "sleep"):
-                    with contextlib.redirect_stdout(io.StringIO()) as out:
-                        rc = release_mod.cmd_release_publish(
-                            argparse.Namespace(
-                                testpypi=True,
-                                pypi=False,
-                                plan=False,
-                                tag=None,
-                                notes_file=None,
-                                execute=False,
-                                version="0.3.0a1",
-                                repo=None,
+                with patch.object(release_mod, "_new_dispatch_nonce", return_value=self.NONCE):
+                    with patch.object(release_mod.time, "sleep"):
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            rc = release_mod.cmd_release_publish(
+                                self._testpypi_namespace()
                             )
-                        )
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
-        self.assertEqual(2, len(dispatch_call))
-        dispatch_argv = dispatch_call[0]
+        dispatch_argv = calls[0]
         self.assertEqual(
             dispatch_argv,
             [
@@ -1251,9 +1307,121 @@ class ReleasePublishTest(unittest.TestCase):
                 "testpypi.yml",
                 "--ref",
                 "main",
+                "-f",
+                f"source_sha={self.SOURCE_SHA}",
+                "-f",
+                "expected_version=0.10.0",
+                "-f",
+                "source_ref=int_13472_session_continuity",
+                "-f",
+                f"dispatch_nonce={self.NONCE}",
             ],
         )
-        self.assertIn("9999", out.getvalue())
+        text = out.getvalue()
+        # Correlated deterministically to the nonce-matching run, not the latest.
+        self.assertIn("run_id: 9999", text)
+        self.assertIn(self.NONCE, text)
+
+    def test_testpypi_dispatch_fail_closed_when_no_nonce_match(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            if "workflow" in argv and "run" in argv:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+            # No run carries the nonce -> must NOT fall back to latest-one.
+            payload = json.dumps(
+                [
+                    {
+                        "databaseId": 8888,
+                        "name": "TestPyPI dev (auto main-CI)",
+                        "url": "https://example/run/8888",
+                        "createdAt": "2026-05-14T10:00:00Z",
+                        "headSha": "otherhead",
+                        "status": "completed",
+                    }
+                ]
+            )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=payload, stderr=""
+            )
+
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod, "_new_dispatch_nonce", return_value=self.NONCE):
+                    with patch.object(release_mod.time, "sleep"):
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            rc = release_mod.cmd_release_publish(
+                                self._testpypi_namespace()
+                            )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+        text = out.getvalue()
+        self.assertIn("not deterministically correlated", text)
+        self.assertNotIn("run_id: 8888", text)
+
+    def test_testpypi_dispatch_fail_closed_when_multiple_nonce_matches(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            if "workflow" in argv and "run" in argv:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+            payload = json.dumps(
+                [
+                    {"databaseId": 1, "name": f"a nonce {self.NONCE}", "status": "queued"},
+                    {"databaseId": 2, "name": f"b nonce {self.NONCE}", "status": "queued"},
+                ]
+            )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=payload, stderr=""
+            )
+
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod, "_new_dispatch_nonce", return_value=self.NONCE):
+                    with patch.object(release_mod.time, "sleep"):
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            rc = release_mod.cmd_release_publish(
+                                self._testpypi_namespace()
+                            )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+        self.assertIn("multiple runs matched", out.getvalue())
+
+    def test_testpypi_requires_source_sha_expected_version_and_ref(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        for missing in ("source_sha", "expected_version", "source_ref"):
+            with self.subTest(missing=missing):
+                ns = self._testpypi_namespace(**{missing: None})
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        release_mod.cmd_release_publish(ns)
+
+    def test_testpypi_version_alias_supplies_expected_version(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        captured = {}
+
+        def fake_dispatch(source_sha, expected_version, source_ref, nonce):
+            captured["expected_version"] = expected_version
+            return {"match": "one", "run_id": "77", "name": "", "url": "", "head_sha": "", "status": ""}
+
+        ns = self._testpypi_namespace(expected_version=None, version="0.10.0")
+        with patch.object(release_mod, "_gh_dispatch_testpypi", side_effect=fake_dispatch):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = release_mod.cmd_release_publish(ns)
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertEqual("0.10.0", captured["expected_version"])
+
+    def test_testpypi_rejects_non_hex_source_sha(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        ns = self._testpypi_namespace(source_sha="not-a-sha")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                release_mod.cmd_release_publish(ns)
 
 
 class ReleaseCheckDriftTest(unittest.TestCase):
