@@ -112,12 +112,16 @@ class RetireInvariants:
     use case never infers them from git. Defaults are the *unsatisfied* / safe-failing
     values for the safety-critical ones so a caller that forgets a field fails closed —
     except the ones that are true by construction at a retire attempt.
+
+    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
+    ``owner_approval_present`` invariant — routine green-preflight retirement is coordinator
+    authority. The owner's close decision is already carried by ``issue_closed``; an
+    outstanding owner-approval-waiting still blocks via ``callbacks_drained``.
     """
 
     target_identity_known: bool = False
     verification_passed: bool = False
     issue_closed: bool = False
-    owner_approval_present: bool = False
     callbacks_drained: bool = False
     durable_record_recorded: bool = False
     #: The latest review generation is admissible for integration (#13518 review R2-F7 / R4-F3): the
@@ -177,10 +181,9 @@ class SublaneIntegrationUseCase:
         The runtime preflight is the final authority: git facts are probed through the
         port, the invariants come from the durable record, and the pure
         :func:`decide_retire_integration` decides. The merge is attempted **only** when
-        every non-merge gate already passes — so a dirty worktree, a missing owner
-        approval, an open issue, an undrained callback, or a failed verification blocks
-        retirement *before* any merge runs. A merge conflict then re-decides to
-        ``integration_blocked``.
+        every non-merge gate already passes — so a dirty worktree, an open issue, an
+        undrained callback, or a failed verification blocks retirement *before* any merge
+        runs. A merge conflict then re-decides to ``integration_blocked``.
         """
         # R2-F7 / R3-F2 integration latest-generation fence: the inadmissible-generation stop is now
         # threaded through the pure :func:`decide_retire_integration` as a first-class preflight
@@ -205,7 +208,6 @@ class SublaneIntegrationUseCase:
             target_identity_known=invariants.target_identity_known,
             verification_passed=invariants.verification_passed,
             issue_closed=invariants.issue_closed,
-            owner_approval_present=invariants.owner_approval_present,
             callbacks_drained=invariants.callbacks_drained,
             durable_record_recorded=invariants.durable_record_recorded,
             latest_generation_admissible=invariants.latest_generation_admissible,
@@ -232,7 +234,6 @@ class SublaneIntegrationUseCase:
                         target_identity_known=invariants.target_identity_known,
                         verification_passed=invariants.verification_passed,
                         issue_closed=invariants.issue_closed,
-                        owner_approval_present=invariants.owner_approval_present,
                         callbacks_drained=invariants.callbacks_drained,
                         durable_record_recorded=invariants.durable_record_recorded,
                         # R4-F3: propagate the fence (default is now fail-closed) so a merge-conflict

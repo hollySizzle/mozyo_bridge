@@ -279,7 +279,7 @@ class CreateUseCaseTests(unittest.TestCase):
 class RetireUseCaseTests(unittest.TestCase):
     def _all_true(self):
         return RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True,
             target_identity_known=True, latest_generation_admissible=True,
         )
@@ -307,7 +307,7 @@ class RetireUseCaseTests(unittest.TestCase):
         # fences a stale/unclean latest review generation. Every other invariant satisfied, only the
         # generation fence unsatisfied -> the retire integration is blocked (no default-True bypass).
         assertions = RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True, target_identity_known=True,
             latest_generation_admissible=False,
         )
@@ -347,7 +347,7 @@ class RecordPathRedactionTests(unittest.TestCase):
 
     def _all_true(self):
         return RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True,
             target_identity_known=True, latest_generation_admissible=True,
         )

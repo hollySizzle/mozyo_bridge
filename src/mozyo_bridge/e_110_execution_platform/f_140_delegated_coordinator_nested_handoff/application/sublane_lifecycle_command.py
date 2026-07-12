@@ -217,10 +217,15 @@ class RetireAssertions:
     These mirror the #12604 :class:`RetireInvariants`: facts no probe can infer, supplied
     by the coordinator from the Redmine issue / journal state. Every default is the
     unsatisfied (safe-failing) value, so a caller that omits a flag fails closed.
+
+    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
+    ``owner_approval_present`` assertion / ``--owner-approved`` flag — routine
+    green-preflight retirement is coordinator authority. ``issue_closed`` already carries
+    the owner-close decision; an outstanding owner-approval-waiting still blocks via
+    ``callbacks_drained``.
     """
 
     issue_closed: bool = False
-    owner_approval_present: bool = False
     callbacks_drained: bool = False
     verification_passed: bool = False
     durable_record_recorded: bool = False
@@ -408,7 +413,6 @@ class SublaneRetireUseCase:
             target_identity_known=assertions.target_identity_known,
             verification_passed=assertions.verification_passed,
             issue_closed=assertions.issue_closed,
-            owner_approval_present=assertions.owner_approval_present,
             callbacks_drained=assertions.callbacks_drained,
             durable_record_recorded=assertions.durable_record_recorded,
             latest_generation_admissible=assertions.latest_generation_admissible,
@@ -680,7 +684,6 @@ def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
 def cmd_sublane_retire(args: argparse.Namespace) -> int:
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
-        owner_approval_present=bool(getattr(args, "owner_approved", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
         verification_passed=bool(getattr(args, "verified", False)),
         durable_record_recorded=bool(getattr(args, "durable_record", False)),

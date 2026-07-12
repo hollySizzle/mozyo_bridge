@@ -32,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     BLOCKED_DIRTY_WORKTREE,
+    BLOCKED_DURABLE_RECORD_MISSING,
     INTEGRATION_STALE_REVIEW_GENERATION,
     BLOCKED_MERGE_CONFLICT,
     INTEGRATION_BLOCKED,
@@ -90,7 +91,6 @@ def _ok_invariants() -> RetireInvariants:
         target_identity_known=True,
         verification_passed=True,
         issue_closed=True,
-        owner_approval_present=True,
         callbacks_drained=True,
         durable_record_recorded=True,
         latest_generation_admissible=True,  # R4-F3: fail-closed default -> must assert explicitly
@@ -162,7 +162,7 @@ class RetireUseCaseTest(unittest.TestCase):
         )
         invariants = RetireInvariants(
             target_identity_known=True, verification_passed=True, issue_closed=True,
-            owner_approval_present=True, callbacks_drained=True, durable_record_recorded=True,
+            callbacks_drained=True, durable_record_recorded=True,
             latest_generation_admissible=False,
         )
         decision = use_case.evaluate_retire(invariants=invariants)
@@ -180,7 +180,7 @@ class RetireUseCaseTest(unittest.TestCase):
         )
         invariants = RetireInvariants(
             target_identity_known=True, verification_passed=True, issue_closed=True,
-            owner_approval_present=True, callbacks_drained=True, durable_record_recorded=True,
+            callbacks_drained=True, durable_record_recorded=True,
             # latest_generation_admissible omitted -> fail-closed default
         )
         decision = use_case.evaluate_retire(invariants=invariants)
@@ -213,15 +213,16 @@ class RetireUseCaseTest(unittest.TestCase):
             target_identity_known=True,
             verification_passed=True,
             issue_closed=True,
-            owner_approval_present=False,  # owner approval missing
             callbacks_drained=True,
-            durable_record_recorded=True,
+            durable_record_recorded=False,  # a config-undisableable invariant is missing
+            latest_generation_admissible=True,
         )
         use_case = SublaneIntegrationUseCase(
             operations=ops, policy=SublaneIntegrationPolicy.default()
         )
         decision = use_case.evaluate_retire(invariants=invariants)
         self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(BLOCKED_DURABLE_RECORD_MISSING, decision.blocked_reasons)
         self.assertFalse(ops.merge_called)
 
     def test_merge_conflict_redecides_to_blocked(self) -> None:

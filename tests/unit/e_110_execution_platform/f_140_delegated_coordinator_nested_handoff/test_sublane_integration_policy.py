@@ -29,7 +29,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED_DURABLE_RECORD_MISSING,
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_MERGE_CONFLICT,
-    BLOCKED_OWNER_APPROVAL_MISSING,
     BLOCKED_PREFLIGHT_FAILURE,
     BLOCKED_TARGET_BRANCH_UNRESOLVED,
     BLOCKED_UNRESOLVED_CALLBACK,
@@ -56,7 +55,6 @@ def _all_invariants_ok() -> dict[str, bool]:
         target_identity_known=True,
         verification_passed=True,
         issue_closed=True,
-        owner_approval_present=True,
         callbacks_drained=True,
         durable_record_recorded=True,
         latest_generation_admissible=True,
@@ -254,7 +252,7 @@ class RuntimePreflightAuthorityTest(unittest.TestCase):
 
 
 class ConfigUndisableableInvariantsTest(unittest.TestCase):
-    """owner approval / close / callback / durable anchor cannot be disabled by config."""
+    """close / callback / durable anchor cannot be disabled by config."""
 
     def test_issue_not_closed_blocks_even_with_merge_opt_out(self) -> None:
         invariants = _all_invariants_ok()
@@ -265,14 +263,18 @@ class ConfigUndisableableInvariantsTest(unittest.TestCase):
         )
         self.assertEqual(decision.primary_reason, BLOCKED_ISSUE_NOT_CLOSED)
 
-    def test_owner_approval_missing_blocks(self) -> None:
-        invariants = _all_invariants_ok()
-        invariants["owner_approval_present"] = False
+    def test_routine_green_preflight_retires_without_owner_approval(self) -> None:
+        # Redmine #13602 (Option A) regression: routine green-preflight retirement is
+        # coordinator authority. There is no owner-approval field / gate; a clean preflight
+        # (issue closed, callbacks drained, durable record present, target known, verified,
+        # latest generation admissible) retires without any owner-approval assertion.
         decision = decide_retire_integration(
             SublaneIntegrationPolicy.default(),
-            RetirePreflight(is_git_workspace=True, **invariants),
+            RetirePreflight(is_git_workspace=True, **_all_invariants_ok()),
         )
-        self.assertIn(BLOCKED_OWNER_APPROVAL_MISSING, decision.blocked_reasons)
+        self.assertEqual(decision.state, RETIRE_OK)
+        self.assertEqual(decision.blocked_reasons, ())
+        self.assertNotIn("owner_approval_missing", decision.blocked_reasons)
 
     def test_unresolved_callback_blocks(self) -> None:
         invariants = _all_invariants_ok()
@@ -294,27 +296,27 @@ class ConfigUndisableableInvariantsTest(unittest.TestCase):
 
     def test_invariants_apply_even_in_non_git_workspace(self) -> None:
         invariants = _all_invariants_ok()
-        invariants["owner_approval_present"] = False
+        invariants["durable_record_recorded"] = False
         decision = decide_retire_integration(
             SublaneIntegrationPolicy.default(),
             RetirePreflight(is_git_workspace=False, **invariants),
         )
         self.assertEqual(decision.state, INTEGRATION_BLOCKED)
-        self.assertIn(BLOCKED_OWNER_APPROVAL_MISSING, decision.blocked_reasons)
+        self.assertIn(BLOCKED_DURABLE_RECORD_MISSING, decision.blocked_reasons)
 
 
 class MultipleBlockersTest(unittest.TestCase):
     def test_all_blockers_reported_primary_by_precedence(self) -> None:
         invariants = _all_invariants_ok()
-        invariants["owner_approval_present"] = False
+        invariants["issue_closed"] = False
         decision = decide_retire_integration(
             SublaneIntegrationPolicy.default(),
             RetirePreflight(
                 is_git_workspace=True, worktree_dirty=True, merge_conflict=True, **invariants
             ),
         )
-        # Owner approval (an invariant) precedes the worktree / merge gates.
-        self.assertEqual(decision.primary_reason, BLOCKED_OWNER_APPROVAL_MISSING)
+        # The issue-closed invariant precedes the worktree / merge gates.
+        self.assertEqual(decision.primary_reason, BLOCKED_ISSUE_NOT_CLOSED)
         self.assertIn(BLOCKED_DIRTY_WORKTREE, decision.blocked_reasons)
         self.assertIn(BLOCKED_MERGE_CONFLICT, decision.blocked_reasons)
 

@@ -89,14 +89,21 @@ RETIRE_STATES = frozenset({RETIRE_OK, INTEGRATION_BLOCKED})
 
 # Concrete ``integration_blocked`` reasons. The first group is the runtime / Git
 # preflight (the acceptance's explicit triggers); the second is the config-undisableable
-# invariants (owner approval / close / callback / durable anchor).
+# invariants (close / callback / durable anchor).
+#
+# Redmine #13602 (Design Consultation j#76403, Option A): routine green-preflight
+# retirement is coordinator authority — there is NO universal owner-approval retire gate.
+# The owner's close approval lives upstream in ``issue_closed`` (a durably closed issue is
+# already the owner's close decision); the retire *actuation* does not re-require a separate
+# owner approval, so ``owner_approval_missing`` no longer exists as a blocked reason. The
+# exceptional owner/design escalations (force / dirty discard / unpushed / foreign / release
+# / credential / destructive project state) keep their own gates and refusals.
 BLOCKED_PREFLIGHT_FAILURE = "preflight_failure"
 BLOCKED_DIRTY_WORKTREE = "dirty_worktree"
 BLOCKED_VERIFICATION_FAILURE = "verification_failure"
 BLOCKED_TARGET_BRANCH_UNRESOLVED = "target_branch_unresolved"
 BLOCKED_MERGE_CONFLICT = "merge_conflict"
 BLOCKED_ISSUE_NOT_CLOSED = "issue_not_closed"
-BLOCKED_OWNER_APPROVAL_MISSING = "owner_approval_missing"
 BLOCKED_UNRESOLVED_CALLBACK = "unresolved_callback"
 BLOCKED_DURABLE_RECORD_MISSING = "durable_record_missing"
 #: The retire/integration was refused because the latest review generation is not admissible — a
@@ -113,7 +120,6 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_PREFLIGHT_FAILURE,
     INTEGRATION_STALE_REVIEW_GENERATION,
     BLOCKED_ISSUE_NOT_CLOSED,
-    BLOCKED_OWNER_APPROVAL_MISSING,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_DURABLE_RECORD_MISSING,
     BLOCKED_DIRTY_WORKTREE,
@@ -257,10 +263,24 @@ class RetirePreflight:
       resolved; a destructive op against an unknown target is refused.
     - ``verification_passed`` — the lane's verification (tests / checks) passed.
     - ``issue_closed`` — the lane's Redmine issue is durably closed (not merely
-      ``implementation_done`` / Review-approved).
-    - ``owner_approval_present`` — the owner close approval journal exists.
-    - ``callbacks_drained`` — no outstanding coordinator callback is owed.
+      ``implementation_done`` / Review-approved). This IS the owner's close decision:
+      a durably closed issue already carries the owner-close approval, so the retire
+      actuation does not re-require a separate owner approval (Redmine #13602 Option A).
+    - ``callbacks_drained`` — no outstanding coordinator callback is owed (this is where
+      an unresolved *owner-approval-waiting* callback still blocks — retirement waits on a
+      pending owner decision, it just does not demand a fresh approval once the issue is
+      closed and no callback is owed).
     - ``durable_record_recorded`` — the durable retire record / anchor is present.
+
+    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately NO
+    ``owner_approval_present`` field here. Requiring a separate owner approval on every
+    routine retire double-gated the already-owner-approved issue close and made lane drain
+    depend on owner hand-work; ``worktree-lifecycle-boundary.md`` and the portable retire
+    ``safety_preflight`` (redmine_closed / worktree_clean / origin_reachable /
+    pending_prompt_absent / callback_drained / target_identity_known) never listed owner
+    approval as a field. The exceptional destructive cases (force / dirty discard / unpushed
+    / foreign target / release / credential / destructive project state) keep their own
+    gates upstream and are out of scope here.
     """
 
     is_git_workspace: bool
@@ -272,7 +292,6 @@ class RetirePreflight:
     target_identity_known: bool = True
     verification_passed: bool = True
     issue_closed: bool = True
-    owner_approval_present: bool = True
     callbacks_drained: bool = True
     durable_record_recorded: bool = True
     #: The LATEST review generation is admissible for integration (#13518 review R2-F7 / R3-F2 /
@@ -332,9 +351,11 @@ def decide_retire_integration(
     Authority rules (the two hard acceptance invariants):
 
     - The **invariants** (``target_identity_known`` / ``issue_closed`` /
-      ``owner_approval_present`` / ``callbacks_drained`` / ``durable_record_recorded`` /
-      ``verification_passed``) are checked unconditionally — no policy field can switch
-      them off, because the config schema has no key for them.
+      ``callbacks_drained`` / ``durable_record_recorded`` / ``verification_passed``) are
+      checked unconditionally — no policy field can switch them off, because the config
+      schema has no key for them. Routine green-preflight retirement is coordinator
+      authority: there is no owner-approval invariant (Redmine #13602 Option A) — the
+      owner's close decision already lives in ``issue_closed``.
     - The **merge gate** is the only thing ``merge_on_retire`` controls: ``false`` skips
       the merge requirement (the opt-out), but every other gate still applies, so opting
       out of the merge can never make an unsafe retirement ``ok``.
@@ -348,8 +369,6 @@ def decide_retire_integration(
         blockers.add(BLOCKED_PREFLIGHT_FAILURE)
     if not preflight.issue_closed:
         blockers.add(BLOCKED_ISSUE_NOT_CLOSED)
-    if not preflight.owner_approval_present:
-        blockers.add(BLOCKED_OWNER_APPROVAL_MISSING)
     if not preflight.callbacks_drained:
         blockers.add(BLOCKED_UNRESOLVED_CALLBACK)
     if not preflight.durable_record_recorded:
@@ -455,7 +474,6 @@ __all__ = (
     "BLOCKED_TARGET_BRANCH_UNRESOLVED",
     "BLOCKED_MERGE_CONFLICT",
     "BLOCKED_ISSUE_NOT_CLOSED",
-    "BLOCKED_OWNER_APPROVAL_MISSING",
     "BLOCKED_UNRESOLVED_CALLBACK",
     "BLOCKED_DURABLE_RECORD_MISSING",
     "SublaneIntegrationPolicy",
