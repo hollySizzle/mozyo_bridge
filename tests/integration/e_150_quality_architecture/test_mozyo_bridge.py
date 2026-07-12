@@ -246,6 +246,69 @@ class PathResolutionTest(unittest.TestCase):
             config = load_repo_local_config(None, start=nested)
             self.assertTrue(config.terminal_transport.herdr_enabled)
 
+    def test_find_repo_root_prefers_git_root_over_nested_scaffold(self) -> None:
+        # Git-root-first (Redmine #13641): a monorepo project subtree carrying its
+        # own `.mozyo-bridge/scaffold.json` must NOT collapse the workspace onto
+        # the subtree. When a Git worktree root is reachable above, it wins.
+        with tempfile.TemporaryDirectory() as tmp:
+            git_root = Path(tmp) / "gk-3500-it-operations"
+            proj = git_root / "projects" / "giken-cloud-drive-management"
+            nested = proj / "src"
+            nested.mkdir(parents=True)
+            (git_root / ".git").mkdir()  # Git worktree root
+            (proj / ".mozyo-bridge").mkdir()
+            (proj / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )  # nested project-local scaffold marker
+
+            self.assertEqual(git_root.resolve(), find_repo_root(nested))
+
+    def test_git_root_config_shadows_nested_scaffold_backend_from_subtree(
+        self,
+    ) -> None:
+        # The same walk feeds the bare-`mozyo` config/backend selection: with a
+        # Git root `.mozyo-bridge/config.yaml: terminal_transport.backend: herdr`
+        # above a nested `scaffold.json`-only subtree, the config load from the
+        # subtree cwd must read the Git root's herdr selection, not fall through
+        # to the (absent) subtree config and its tmux default (Redmine #13641).
+        from mozyo_bridge.application.repo_local_config_loader import (
+            load_repo_local_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            git_root = Path(tmp) / "gk-3500-it-operations"
+            proj = git_root / "projects" / "giken-cloud-drive-management"
+            nested = proj / "src"
+            nested.mkdir(parents=True)
+            (git_root / ".git").mkdir()
+            (git_root / ".mozyo-bridge").mkdir()
+            (git_root / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  backend: herdr\n",
+                encoding="utf-8",
+            )
+            (proj / ".mozyo-bridge").mkdir()
+            (proj / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            config = load_repo_local_config(None, start=nested)
+            self.assertTrue(config.terminal_transport.herdr_enabled)
+
+    def test_find_repo_root_non_git_nested_scaffold_fallback_preserved(self) -> None:
+        # Behavior-preserving fallback (Redmine #13641 acceptance): with NO Git
+        # root anywhere above, a nested `scaffold.json` still resolves to its own
+        # scaffold root via the marker walk — the non-git contract is unchanged.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "scaffolded-workspace"
+            nested = workspace / "a" / "b"
+            nested.mkdir(parents=True)
+            (workspace / ".mozyo-bridge").mkdir()
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            self.assertEqual(workspace.resolve(), find_repo_root(nested))
+
     def test_resolve_repo_root_prefers_explicit_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(Path(tmp).resolve(), resolve_repo_root(tmp))

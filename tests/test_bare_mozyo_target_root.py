@@ -67,6 +67,32 @@ class SelectTargetRootTest(unittest.TestCase):
         root = cli._select_bare_target_root([])
         self.assertEqual(root, sub.resolve())
 
+    def test_git_root_adopted_config_beats_nested_scaffold_subtree(self):
+        # Redmine #13641: bare `mozyo` from a monorepo project subtree (nested
+        # `.mozyo-bridge/scaffold.json`, no `.git`) must resolve the Git root and
+        # honor its adopted `.mozyo-bridge/config.yaml`, not collapse the
+        # workspace onto the subtree and fall through to the tmux default.
+        self._adopt(self.base)  # Git root carries the adopted config.yaml
+        (self.base / ".git").mkdir()  # Git worktree root
+        proj = self.base / "projects" / "cloud-drive"
+        (proj / ".mozyo-bridge").mkdir(parents=True)
+        (proj / ".mozyo-bridge" / "scaffold.json").write_text("{}", encoding="utf-8")
+        os.chdir(proj)
+        root = cli._select_bare_target_root([])
+        self.assertEqual(root, self.base)
+
+    def test_git_root_first_does_not_adopt_unadopted_git_root(self):
+        # Redmine #13641 / #13379: Git-root-first is an identity decision, not an
+        # adoption decision. An unadopted Git root reached from a nested subtree
+        # is never silently adopted; the fresh target stays the canonical cwd so
+        # no real agent starts in an unadopted directory.
+        (self.base / ".git").mkdir()  # unadopted Git root (no config / anchor)
+        sub = self.base / "projects" / "cloud-drive" / "src"
+        sub.mkdir(parents=True)
+        os.chdir(sub)
+        root = cli._select_bare_target_root([])
+        self.assertEqual(root, sub.resolve())
+
     def test_explicit_repo_beats_env_and_cwd(self):
         self._adopt(self.base)  # cwd is adopted...
         os.chdir(self.base)
