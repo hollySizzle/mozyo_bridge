@@ -82,6 +82,17 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 - **coordinator 宛の handoff callback は coordinator が busy だと `precondition_not_idle` で不達になりがち。durable record (Redmine journal) の poll が正** — stall 判定は必ず journal 再取得 → 結果なし確認 → pane 実測 (`herdr agent read`) → 再送、の順。
 - `blocked` 表示の agent_status は permission prompt / 一時状態の場合がある。pane read で実体確認してから介入する。
 
+### recovery classification（再送・relaunch前）
+
+| observed state | classification | next action | 禁止 |
+| --- | --- | --- | --- |
+| permission prompt / approval wait | `permission_wait` | durable gateと要求権限を照合し、正規approval経路へ | agent死としてrelaunchしない |
+| logout / `authentication required` / process終了 | `agent_auth_unavailable` | credentialを記録せずre-authまたはfresh agent relaunch | routing bug扱い、blind resend |
+| agentはliveだが実command shellに`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`が無い/不整合 | `sender_identity_missing_or_conflict` | dispatchを止め、runtime propagation/proxy gapをdurable化 | 手動env注入、raw Herdr send |
+| assigned-name/lane slotが無い、または複数 | `route_runtime_unavailable` | lane metadata + live inventoryを再取得し、standard relaunch/preflightへ | tmux-era candidate空振りだけで断定 |
+
+`sublane create --execute`がlaunch後にdispatchだけfailした場合は、起動済みslot、未配送anchor、失敗理由をjournalに残す。partial laneを成功扱いせず、同じcommandをblind replayしない (Redmine #13613)。
+
 ## live smoke の原則
 
 - **本番機構で行う**: lane の smoke は必ず linked git worktree で。scratch 単独 repo は registry canonicalization の差を隠す (#13331 j#73348 の教訓)。

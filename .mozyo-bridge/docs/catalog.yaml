@@ -132,11 +132,13 @@ documents:
     type: task
     status: active
     canonical_path: vibes/docs/tasks/new-session-onboarding.md
-    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406)。読む順序 / Redmine 機能カタログ (Epic/Feature) / vibes/docs レイアウト / herdr 運用要点への pointer。state snapshot を焼かず、live state は Redmine journal を正本とする。
+    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406 / #13615)。読む順序 / Redmine 機能カタログ / session boundary prompt / transition bundle / Herdr recovery分類への pointer。state snapshot を焼かず、live state は Redmine journal を正本とする。
     audit_role: new_session_onboarding_task
     related_document_refs:
       - rule-project-agent-workflow
       - rule-workflow-docs-boundary
+      - logic-session-boundary
+      - spec-session-continuity-user-harness
       - task-herdr-lane-operations
       - task-external-project-herdr-adoption
 
@@ -149,6 +151,21 @@ documents:
     related_document_refs:
       - skill-project-map-reference
       - spec-bounded-context-map
+
+  - id: spec-session-continuity-user-harness
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/session-continuity-user-harness.md
+    purpose: 新規sessionがchat memoryやpane scrollbackに依存せず、router / central preset / cataloged docs / Redmine durable state / temporary transition bundle / boundary promptからactive workflowと承認境界を復元するuser harness仕様。lane/runtime/sender-shell/auth stateを分離し、受領後cleanupまで定義する (Redmine #13529 / #13615)。
+    audit_role: session_continuity_user_harness_spec
+    related_document_refs:
+      - task-new-session-onboarding
+      - logic-session-boundary
+      - rule-workflow-docs-boundary
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - spec-herdr-native-identity
+      - task-herdr-lane-operations
 
   - id: spec-bounded-context-map
     type: spec
@@ -661,6 +678,7 @@ documents:
       - rule-llm-rule-authoring
       - skill-workflow-reference
       - spec-project-map
+      - spec-session-continuity-user-harness
 
   - id: logic-cockpit-attention-state
     type: logic
