@@ -168,15 +168,33 @@ def main(argv: list[str]) -> int:
         new_version = build_dev_version(base, args.dev_number)
         if args.write:
             # Two-phase: compute every rewrite first (which raises before any
-            # write if a literal cannot be rewritten), then write them all, so
-            # a failure never leaves the mirror set partially updated.
-            rewrites: list[tuple[Path, str]] = []
+            # write if a literal cannot be rewritten), then write them all.
+            # Validation failures raise here, before any file is touched.
+            rewrites: list[tuple[Path, str, str]] = []
             for path, handler, text in entries:
                 rewrites.append(
-                    (path, version_mirror.replace_version(text, handler, new_version))
+                    (path, text, version_mirror.replace_version(text, handler, new_version))
                 )
-            for path, new_text in rewrites:
-                path.write_text(new_text, encoding="utf-8")
+            # Write phase with rollback: a write-time I/O failure on a later
+            # mirror file (e.g. a read-only or full disk) must not leave the
+            # set half-rewritten. Restore every already-written file to its
+            # original bytes before propagating the error, so the postcondition
+            # "a failure never leaves the mirror set partially updated" holds
+            # for I/O failures too, not just validation failures.
+            written: list[tuple[Path, str]] = []  # (path, original_text)
+            try:
+                for path, original_text, new_text in rewrites:
+                    path.write_text(new_text, encoding="utf-8")
+                    written.append((path, original_text))
+            except OSError:
+                for done_path, original_text in reversed(written):
+                    try:
+                        done_path.write_text(original_text, encoding="utf-8")
+                    except OSError:
+                        # Best-effort rollback; the original error is the one
+                        # that matters and is re-raised below.
+                        pass
+                raise
     except (DevVersionError, version_mirror.MirrorError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
