@@ -655,9 +655,12 @@ def register_lifecycle(sub) -> None:
         dest="issue_closed",
         action="store_true",
         help=(
-            "The lane's Redmine issue is durably closed. Redmine #13602 (Option A): this "
-            "IS the owner-close decision — routine green-preflight retirement is coordinator "
-            "authority and takes no separate --owner-approved flag."
+            "The lane's Redmine issue is durably closed under the close contract that "
+            "applies to its issue type (a child Task/Test/Bug via task_close; a US / "
+            "standalone issue via an owner_close_approval-backed close). Redmine #13602 "
+            "(Option A): routine green-preflight retirement is coordinator authority and "
+            "takes no separate --owner-approved flag regardless of which close contract "
+            "applied — retire actuation never re-collects the owner close approval."
         ),
     )
     sublane_retire.add_argument(
