@@ -92,6 +92,62 @@ class CanonicalGateRecordE2ETest(unittest.TestCase):
         row = self.outbox.read()[0]
         self.assertEqual((row.normalized_gate, row.state), ("review_request", CALLBACK_DELIVERED))
 
+    def test_production_entrypoint_records_and_gate_is_discoverable(self):
+        # #13520 review R2-F1: drive the PRODUCTION CLI entrypoint (`workflow callbacks --emit-gate`)
+        # end-to-end — the note is posted through the governed writer's env-resolved transport (not
+        # a direct emit_gate_record call), then discovered -> outbox -> one-send.
+        import argparse
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            cli_workflow_callbacks as cli,
+        )
+
+        transport = _CapturingTransport()
+        store = str(Path(self._tmp.name) / "wf.sqlite")
+        with patch.object(cli, "_outbox_from_args", lambda args: self.outbox), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            lambda: transport,
+        ):
+            rc = cli.cmd_workflow_callbacks(
+                argparse.Namespace(
+                    emit_gate=True, issue="13518", gate="implementation_done", body="done",
+                    json=True, store_path=store, sweep=False, ingest=False, deliver=False,
+                    run_once=False, watch=False, recovery_plan=False,
+                )
+            )
+        self.assertEqual(rc, 0)  # recorded -> exit 0
+        source = _JournalSource(transport)
+        cands = discover_candidates(source, "13518")
+        self.assertEqual([c.notification_kind for c in cands], ["implementation_done"])
+        run_once(CallbackOutboxProcessor(self.outbox, source), lambda row: SEND_DELIVERED,
+                 candidates=cands, stale_seconds=0)
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_DELIVERED)
+
+    def test_production_entrypoint_fail_closed_exit_when_not_recorded(self):
+        # #13520 review R2-F1: opt-in unset -> nothing written AND a non-zero exit (a caller reading
+        # only the return code can never treat an un-written gate as recorded).
+        import argparse
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            cli_workflow_callbacks as cli,
+        )
+
+        with patch.object(cli, "_outbox_from_args", lambda args: self.outbox), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            lambda: None,  # opt-in unset
+        ):
+            rc = cli.cmd_workflow_callbacks(
+                argparse.Namespace(
+                    emit_gate=True, issue="13518", gate="implementation_done", body="",
+                    json=True, store_path=str(Path(self._tmp.name) / "wf.sqlite"),
+                    sweep=False, ingest=False, deliver=False, run_once=False, watch=False,
+                    recovery_plan=False,
+                )
+            )
+        self.assertEqual(rc, 1)  # NOT recorded -> fail-closed non-zero exit
+
     def test_owner_close_waiting_gate_records_and_delivers(self):
         transport = _CapturingTransport()
         emit_gate_record("13518", "owner_close_approval_waiting", transport=transport)

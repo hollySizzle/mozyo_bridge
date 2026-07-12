@@ -24,12 +24,15 @@ Actions (mutually exclusive):
 - ``--watch`` — the bounded background-watcher loop: run a production pass per Herdr-event wake
   (``--max-passes`` / ``--wake-target`` stable ``wait agent-status`` event, else ``--wake-interval``),
   re-reading Redmine every wake outcome. Actuates.
-- ``--emit-gate`` — record a canonical callback-required gate journal on Redmine (``--issue`` +
-  ``--gate`` [+ ``--body``]) with the discoverable ``[mozyo:workflow-event:...]`` marker embedded,
-  through the credential-gated, opt-in note transport. This is the production **producer** the
-  watcher discovers; fail-closed (``write_optin_unset``) without ``MOZYO_REDMINE_DELIVERY_WRITE``.
+- ``--emit-gate`` — the canonical **governed** gate-record writer: record a callback-required gate
+  journal on Redmine (``--issue`` + ``--gate`` [+ ``--body``]) with the discoverable
+  ``[mozyo:workflow-event:...]`` marker embedded, through the credential-gated, opt-in note
+  transport. This is the production **producer** the watcher discovers; a not-recorded gate
+  (opt-in ``write_optin_unset`` / transport failure) exits **non-zero** (fail-closed at the process
+  gate — a caller can never treat an un-written gate as recorded).
 
-Always exits 0 for a successful read / record / pass; a source / store error is a
+Always exits 0 for a successful read / record / pass (``--emit-gate`` exits non-zero when the gate
+was NOT recorded); a source / store error is a
 ``SystemExit`` with a redacted message (never a credential / URL / pane id).
 """
 
@@ -316,7 +319,11 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         ]
         if receipt.location:
             lines.append(f"location: {receipt.location}")
-        return _emit(payload, as_json=as_json, text_lines=lines)
+        _emit(payload, as_json=as_json, text_lines=lines)
+        # #13520 review R2-F1: fail-closed at the PROCESS gate too — a not-recorded gate (opt-in
+        # unset / transport failure) must NOT exit 0, so a caller that reads only the return code
+        # can never treat an un-written gate as recorded. The structured receipt still prints above.
+        return 0 if receipt.recorded else 1
 
     if getattr(args, "recovery_plan", False):
         from mozyo_bridge.core.state.workflow_runtime_store import (
@@ -445,8 +452,10 @@ def register_callbacks(sub) -> None:
     )
     action.add_argument(
         "--emit-gate", dest="emit_gate", action="store_true",
-        help="Record a canonical callback-required gate journal on Redmine WITH the discoverable "
-             "marker (--issue + --gate; credential-gated, opt-in; fail-closed without the opt-in).",
+        help="The canonical governed gate-record writer: record a callback-required gate journal on "
+             "Redmine WITH the discoverable marker (--issue + --gate; credential-gated, opt-in). "
+             "Fail-closed: a not-recorded gate (opt-in unset / transport failure) exits NON-ZERO so "
+             "a caller cannot treat an un-written gate as recorded.",
     )
     action.add_argument(
         "--recovery-plan", dest="recovery_plan", action="store_true",
