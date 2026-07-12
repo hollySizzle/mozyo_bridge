@@ -88,8 +88,11 @@ DEFAULT_LANE = "default"
 # ---------------------------------------------------------------------------
 # Versioned project-gateway lane-id derivation. The scheme tag is embedded so a future
 # derivation change is observable and cannot silently collide with a lane minted under an
-# older scheme; the readable slug keeps the id human-auditable, the digest keeps distinct
-# scopes distinct (project-scope lane uniqueness, mid-review audit item).
+# older scheme; the readable slug keeps the id human-auditable, and a short digest of the
+# canonicalized (whitespace-trimmed) scope distinguishes scopes that share a readable slug.
+# The digest is a 48-bit *collision-resistant* fingerprint, not a proof of injectivity — a
+# residual same-lane collision between two distinct scopes is astronomically unlikely but not
+# impossible, and is caught at parse time by the slot-collision check (Redmine #13583 R2-F2).
 # ---------------------------------------------------------------------------
 LANE_SCHEME = "pgwv1"
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -97,7 +100,8 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 #: once encoded into an mzb1 assigned name (``mzb1_<ws>_<role>_<lane>`` — each non-``[A-Za-z0-9]``
 #: byte escapes to 3 chars) with a 32-hex workspace id + a provider token, stays within the herdr
 #: ``NAME_MAX_LENGTH`` (128) so the project-gateway lane can actually be launched / adopted. The
-#: full digest below carries injectivity, so truncating the readable slug never risks a collision.
+#: digest below (not the slug) is what distinguishes scopes, so truncating the readable slug does
+#: not change collision behaviour — two scopes that share a slug still get distinct digests.
 _SLUG_BUDGET = 16
 
 
@@ -130,12 +134,18 @@ class WorkflowRoleAuthorityError(ValueError):
 def project_gateway_lane_id(project_scope: object) -> str:
     """Derive the deterministic, versioned project-gateway lane id for ``project_scope`` (pure).
 
-    The lane id is ``<scheme>_<slug>-<digest>`` — a readable slug of the scope (bounded to
+    The scope is first **canonicalized** by trimming surrounding whitespace (``_norm``), so
+    ``"scope"`` and ``"  scope  "`` derive the *same* lane by design. The lane id is then
+    ``<scheme>_<slug>-<digest>`` — a readable slug of the canonicalized scope (bounded to
     :data:`_SLUG_BUDGET` chars so the lane fits the mzb1 assigned-name length limit, Redmine
-    #13583 R3) plus a short stable digest of the *exact* raw scope so two distinct scopes never
-    collide onto one lane (and a slug that reduces to empty still derives a stable id from the
-    digest alone). The result can never equal :data:`DEFAULT_LANE`, so a project gateway lane can
-    never collide with the grandparent's default lane. Fails closed
+    #13583 R3) plus a short stable **48-bit collision-resistant digest** of the canonicalized scope
+    (and a slug that reduces to empty still derives a stable id from the digest alone). The digest
+    makes a collision between two distinct canonicalized scopes astronomically unlikely but not
+    provably impossible; a real same-lane collision within one declaration is caught at parse time
+    by the slot-collision check (:func:`parse_role_bindings`), which fails closed — so a collision
+    is a rare availability issue, never a misroute (Redmine #13583 R2-F2). The result can never
+    equal :data:`DEFAULT_LANE` (the ``pgwv1_`` prefix guarantees it structurally), so a project
+    gateway lane can never collide with the grandparent's default lane. Fails closed
     (:class:`WorkflowRoleAuthorityError`) on an empty scope — a grandparent has no project scope
     and is not derived here; a project gateway must name one.
     """
@@ -254,17 +264,19 @@ class WorkflowRoleResolution:
 def _entry_type_error(index: int, entry: Mapping) -> str:
     """Return a fixed error message if an entry's fields are the wrong type, else ``""`` (R2).
 
-    ``role`` must be a non-empty string; ``project_scope`` / ``source_pointer``, when present, must
-    be strings. A non-string value is rejected rather than silently ``str()``-coerced (a
-    ``project_scope: 123`` must not become the scope ``"123"``).
+    ``role`` must be a non-empty string; ``project_scope`` / ``source_pointer``, when the key is
+    **present**, must be strings. A non-string value is rejected rather than silently
+    ``str()``-coerced (a ``project_scope: 123`` must not become the scope ``"123"``), and an
+    explicit JSON ``null`` is rejected too — key *presence* is distinguished from ``None`` so a
+    ``"project_scope": null`` fails closed rather than decaying to the empty scope (Redmine #13583
+    R2-F1).
     """
     role = entry.get("role")
     if not isinstance(role, str) or not role.strip():
         return f"binding #{index} role must be a non-empty string; got {role!r}"
     for field in ("project_scope", "source_pointer"):
-        value = entry.get(field)
-        if value is not None and not isinstance(value, str):
-            return f"binding #{index} {field} must be a string when present; got {value!r}"
+        if field in entry and not isinstance(entry[field], str):
+            return f"binding #{index} {field} must be a string when present; got {entry[field]!r}"
     return ""
 
 
@@ -272,17 +284,21 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
     """Parse + fail-closed validate a static binding declaration into :class:`ParsedRoleBindings`.
 
     ``record`` is the decoded JSON object (or ``None`` for an absent file -> :meth:`empty`). The
-    schema is **closed** (Redmine #13583 R2): the declaration must carry exactly ``schema`` ==
-    :data:`SCHEMA_NAME`, ``version`` == :data:`SCHEMA_VERSION`, and a ``bindings`` **list**
-    (present and a list — a missing / null ``bindings`` is *not* an empty authority; only an
-    explicit ``[]`` is). Each entry has only ``{role, project_scope?, source_pointer?}`` with
-    string values; the ``lane_id`` is derived, never read from the file. A **present-but-malformed
-    declaration never falls through like an absent file** — it fails closed (an ``invalid`` result
-    with a fixed reason) on:
+    schema is **closed** and **exactly typed** (Redmine #13583 R2): the declaration must carry
+    ``schema`` as the exact literal string :data:`SCHEMA_NAME` (no whitespace padding, no coercion)
+    and ``version`` as the exact integer :data:`SCHEMA_VERSION` (a JSON ``true`` / ``1.0`` is *not*
+    version 1), plus a ``bindings`` **list** (present and a list — a missing / null ``bindings`` is
+    *not* an empty authority; only an explicit ``[]`` is). Each entry has only
+    ``{role, project_scope?, source_pointer?}``; when an optional field's key is present it must be
+    a string — an explicit ``null`` fails closed rather than decaying to the empty scope. The
+    ``lane_id`` is derived, never read from the file. A **present-but-malformed declaration never
+    falls through like an absent file** — it fails closed (an ``invalid`` result with a fixed
+    reason) on:
 
-    - a wrong schema / version, an unknown top-level key, or a missing / non-list ``bindings``;
+    - a wrong / non-string schema, a non-integer or wrong version, an unknown top-level key, or a
+      missing / non-list ``bindings``;
     - an entry that is not an object, an unknown entry key, a non-string / unknown / out-of-vocabulary
-      role, or a non-string project scope / source pointer;
+      role, or a present-but-non-string (incl. explicit ``null``) project scope / source pointer;
     - a grandparent with a non-empty project scope, or a project gateway with an empty scope;
     - two grandparent entries, or two entries that derive the same lane id (slot collision).
     """
@@ -297,13 +313,19 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
         return ParsedRoleBindings.invalid(
             f"unknown top-level key(s) {sorted(unknown_top)}; allowed: {sorted(_ALLOWED_TOP_KEYS)}"
         )
-    if _norm(record.get("schema")) != SCHEMA_NAME:
+    # The schema discriminator is an exact literal string — no whitespace tolerance and no
+    # type coercion, so a padded / non-string discriminator fails closed (Redmine #13583 R2-F1).
+    if record.get("schema") != SCHEMA_NAME:
         return ParsedRoleBindings.invalid(
             f"unexpected schema {record.get('schema')!r}; expected {SCHEMA_NAME!r}"
         )
-    if record.get("version") != SCHEMA_VERSION:
+    # The version is an exact integer literal. JSON ``true`` and ``1.0`` compare ``== 1`` under
+    # Python's loose numeric equality, so ``bool`` / ``float`` are excluded explicitly rather than
+    # accepted as the version (Redmine #13583 R2-F1).
+    version = record.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != SCHEMA_VERSION:
         return ParsedRoleBindings.invalid(
-            f"unexpected schema version {record.get('version')!r}; expected {SCHEMA_VERSION}"
+            f"unexpected schema version {version!r}; expected exactly {SCHEMA_VERSION} (int)"
         )
     raw_bindings = record.get("bindings")
     if not isinstance(raw_bindings, list):
