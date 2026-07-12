@@ -17,6 +17,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WAKE_ERROR,
     WAKE_TIMED_OUT,
     WAKE_WOKE,
+    build_herdr_event_wait,
     resolve_wake,
 )
 
@@ -43,6 +44,37 @@ class ResolveWakeTest(unittest.TestCase):
     def test_every_outcome_rereads(self):
         for wait_fn in (lambda: True, lambda: False, lambda: (_ for _ in ()).throw(OSError())):
             self.assertTrue(resolve_wake(wait_fn).should_reread)
+
+
+class BuildHerdrEventWaitTest(unittest.TestCase):
+    """#13520 review F1b: the production wait binds the stable `herdr wait agent-status` event."""
+
+    def test_builds_the_stable_wait_argv(self):
+        calls = []
+        wait = build_herdr_event_wait(
+            "/opt/herdr", "mzb1_ws_codex_default",
+            status="working", timeout_ms=50000, runner=lambda argv: (calls.append(argv) or (0, "")),
+        )
+        self.assertTrue(wait())  # rc 0 -> observed the change (woke)
+        self.assertEqual(
+            calls[0],
+            ["/opt/herdr", "wait", "agent-status", "mzb1_ws_codex_default",
+             "--status", "working", "--timeout", "50000"],
+        )
+
+    def test_nonzero_exit_is_timeout_falsy(self):
+        wait = build_herdr_event_wait("/opt/herdr", "t", runner=lambda argv: (1, "timed out"))
+        self.assertFalse(wait())  # non-zero -> falsy timeout hint (still re-reads Redmine)
+
+    def test_runner_exception_propagates_to_wake_error(self):
+        def boom(argv):
+            raise OSError("no herdr binary")
+
+        wait = build_herdr_event_wait("/opt/herdr", "t", runner=boom)
+        # resolve_wake catches it -> WAKE_ERROR, fail-safe, still re-reads.
+        sig = resolve_wake(wait)
+        self.assertEqual(sig.kind, WAKE_ERROR)
+        self.assertTrue(sig.should_reread)
 
 
 if __name__ == "__main__":

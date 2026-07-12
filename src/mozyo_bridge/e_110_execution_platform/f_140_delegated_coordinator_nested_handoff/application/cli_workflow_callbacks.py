@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json as _json
+import os
 import sys
 from pathlib import Path
 from typing import Callable, Optional
@@ -136,14 +137,38 @@ def _herdr_wake_wait(interval_seconds: float) -> object:
 
 
 def _wake_wait_fn(args: argparse.Namespace) -> Callable[[], object]:
-    """Build the ``--watch`` wake primitive (a real bounded background-watcher wait; seam).
+    """Build the ``--watch`` wake primitive (#13520 review F1b).
 
-    Bound to a bounded interval wait (``--wake-interval``, default 0 for a one-shot / test pass;
-    an operator sets the 45–55s watcher cadence). The stable Herdr CLI-event wait is an
-    injectable optimization (patched by the #13490 live harness) — the loop re-reads Redmine on
-    every wake outcome regardless, so a plain bounded wait is correct and fail-safe.
+    Production binds this to the **stable Herdr CLI event** ``wait agent-status`` when a
+    ``--wake-target`` is given and the trusted herdr binary resolves: each wake blocks on a real
+    herdr runtime state change (bounded by ``--wake-timeout-ms``), the sanctioned event surface of
+    design j#75098 Q1 (never the raw socket, never on the LLM surface). When no wake target is
+    configured (a one-shot / test pass) or the herdr binary cannot be resolved from the trusted
+    environment, it falls back to a bounded interval sleep (``--wake-interval``) — still fail-safe,
+    because the loop re-reads the exact Redmine journal on every wake outcome regardless. The
+    #13490 live harness supplies the cockpit-bound wake target.
     """
     interval = float(getattr(args, "wake_interval", 0) or 0)
+    target = (getattr(args, "wake_target", None) or "").strip()
+    if target:
+        try:
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
+                resolve_herdr_binary,
+            )
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_wake import (
+                DEFAULT_WAKE_STATUS,
+                DEFAULT_WAKE_TIMEOUT_MS,
+                build_herdr_event_wait,
+            )
+
+            binary = resolve_herdr_binary(os.environ).path
+            status = (getattr(args, "wake_status", None) or DEFAULT_WAKE_STATUS).strip()
+            timeout_ms = int(getattr(args, "wake_timeout_ms", 0) or DEFAULT_WAKE_TIMEOUT_MS)
+            return build_herdr_event_wait(
+                binary, target, status=status, timeout_ms=timeout_ms
+            )
+        except Exception:  # noqa: BLE001 - binary unresolved / import issue -> fail-safe bounded sleep
+            pass
     return lambda: _herdr_wake_wait(interval)
 
 
@@ -333,6 +358,19 @@ def register_callbacks(sub) -> None:
     p.add_argument(
         "--wake-interval", dest="wake_interval", type=float, default=0.0,
         help="Background-watcher wake cadence seconds for --watch (0 = one-shot; operator sets 45-55).",
+    )
+    p.add_argument(
+        "--wake-target", dest="wake_target",
+        help="Herdr agent/target to wait on via the stable `wait agent-status` event for --watch "
+             "(when set + herdr resolves, the real Herdr CLI event drives wakes; else --wake-interval).",
+    )
+    p.add_argument(
+        "--wake-status", dest="wake_status", default="working",
+        help="Herdr runtime status the --wake-target waits for a change into (default: working).",
+    )
+    p.add_argument(
+        "--wake-timeout-ms", dest="wake_timeout_ms", type=int, default=0,
+        help="Bounded `wait agent-status --timeout` window in ms for --watch (0 = default 50000).",
     )
     p.add_argument(
         "--candidate", action="append", type=_parse_candidate, metavar="ISSUE:JOURNAL:ROUTE[:KIND]",

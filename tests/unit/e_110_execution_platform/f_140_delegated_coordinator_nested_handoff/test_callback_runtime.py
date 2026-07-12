@@ -155,6 +155,22 @@ class WatchTest(unittest.TestCase):
         watch(boom, lambda: seen.append("error-pass") or {}, max_passes=1)
         self.assertEqual(seen, ["timeout-pass", "error-pass"])
 
+    def test_watch_survives_a_raising_pass(self):
+        # #13520 review F1b (background lifecycle): a pass that raises (transient Redmine/store
+        # error) is caught and recorded, and the watcher survives to its next bounded wake.
+        seen = []
+
+        def flaky_pass():
+            seen.append(1)
+            if len(seen) == 1:
+                raise RuntimeError("transient redmine read error")
+            return {"deliver": {"delivered": []}}
+
+        result = watch(lambda: True, flaky_pass, max_passes=2)
+        self.assertEqual(len(seen), 2)  # the loop did NOT crash on the first raising pass
+        self.assertEqual(result[0]["pass"], {"error": "RuntimeError"})
+        self.assertEqual(result[1]["pass"], {"deliver": {"delivered": []}})
+
     def test_watch_zero_passes_is_noop(self):
         ran = []
         watch(lambda: True, lambda: ran.append(1) or {}, max_passes=0)

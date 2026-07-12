@@ -112,12 +112,22 @@ def watch(
     authority (``should_reread`` is always True). ``max_passes`` bounds the loop so a background
     watcher never degrades into an unbounded poll; the real daemon calls this repeatedly under
     operator supervision. Returns one ``{wake, pass}`` record per iteration.
+
+    Background lifecycle resilience (#13520 review F1b): a single pass that raises (a transient
+    Redmine read / store error) is caught and recorded as ``{"error": <type>}`` rather than
+    crashing the watcher or holding a turn — the loop survives to its next bounded wake, exactly
+    as it survives a wait restart. Correctness is unaffected: the outbox fence makes every pass
+    idempotent, so a skipped/failed pass loses nothing (the next pass re-reads Redmine).
     """
     results: list = []
     for _ in range(max(0, int(max_passes))):
         signal = resolve_wake(wait_fn, detail=wake_detail)
         # should_reread is always True; the wake outcome is telemetry, the pass is unconditional.
-        results.append({"wake": signal.kind, "pass": run_pass()})
+        try:
+            outcome: dict = run_pass()
+        except Exception as exc:  # noqa: BLE001 - a failed pass must not kill the background watcher
+            outcome = {"error": type(exc).__name__}
+        results.append({"wake": signal.kind, "pass": outcome})
     return results
 
 

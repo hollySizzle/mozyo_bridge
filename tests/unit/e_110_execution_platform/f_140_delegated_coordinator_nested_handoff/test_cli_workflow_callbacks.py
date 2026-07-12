@@ -81,6 +81,56 @@ class _CliTestCase(unittest.TestCase):
         return cli._parse_candidate(spec)
 
 
+class WakeWaitFnTest(unittest.TestCase):
+    """#13520 review F1b: --watch binds the real Herdr event when a --wake-target resolves."""
+
+    def test_no_wake_target_falls_back_to_bounded_interval(self):
+        wait = cli._wake_wait_fn(_args(watch=True, wake_interval=0.0))
+        self.assertFalse(wait())  # bounded sleep with interval 0 returns a falsy timeout hint
+
+    def test_wake_target_builds_the_stable_herdr_event_wait(self):
+        from unittest.mock import patch
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure import (
+            herdr_transport,
+        )
+
+        recorded = {}
+
+        class _Bin:
+            path = "/opt/herdr"
+
+        def _fake_build(binary, target, *, status, timeout_ms, runner=None):
+            recorded.update(binary=binary, target=target, status=status, timeout_ms=timeout_ms)
+            return lambda: True
+
+        with patch.object(herdr_transport, "resolve_herdr_binary", lambda env: _Bin()), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.callback_wake.build_herdr_event_wait",
+            _fake_build,
+        ):
+            wait = cli._wake_wait_fn(
+                _args(watch=True, wake_target="mzb1_ws_codex_default",
+                      wake_status="working", wake_timeout_ms=42000)
+            )
+        self.assertTrue(wait())
+        self.assertEqual(recorded["target"], "mzb1_ws_codex_default")
+        self.assertEqual(recorded["binary"], "/opt/herdr")
+        self.assertEqual((recorded["status"], recorded["timeout_ms"]), ("working", 42000))
+
+    def test_unresolvable_binary_falls_back_to_sleep(self):
+        from unittest.mock import patch
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure import (
+            herdr_transport,
+        )
+
+        def _raise(env):
+            raise RuntimeError("herdr not on trusted PATH")
+
+        with patch.object(herdr_transport, "resolve_herdr_binary", _raise):
+            wait = cli._wake_wait_fn(_args(watch=True, wake_target="t", wake_interval=0.0))
+        self.assertFalse(wait())  # fail-safe fallback: bounded sleep hint, never a crash
+
+
 class RegistrationTest(unittest.TestCase):
     def test_callbacks_is_registered_under_workflow(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow import (
