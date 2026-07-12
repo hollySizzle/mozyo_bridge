@@ -135,23 +135,42 @@ def _watch_sender_attested(args: argparse.Namespace) -> bool:
     return bool(_resolve_workspace_id(args)) and bool((os.environ.get("MOZYO_AGENT_ROLE") or "").strip())
 
 
+#: Explicit review_result decision kinds that are NOT an approval, so they carry no
+#: generation-admission obligation and stay unfenced (back-compat). Anything else — including an
+#: unspecified decision — is treated as an approval and is fenced FAIL-CLOSED (#13518 review R4-F2).
+_NON_APPROVAL_REVIEW_DECISIONS = frozenset({"changes_requested", "finding", "progress"})
+
+#: A review_result APPROVAL was written without the durable generation observation + consumer id
+#: the admission fence REQUIRES (#13518 review R4-F2). Fail-closed: an approval can never be recorded
+#: outside the generation lease + pre-approval reread fence, even when the caller omits the flags.
+REASON_APPROVAL_FENCE_INPUTS_MISSING = "approval_requires_generation_observation_and_consumer"
+
+
 def _review_approval_refusal(args: argparse.Namespace, issue: str, gate: str):
     """Return a fail-closed refusal reason for a review_result APPROVAL write, or ``None`` to allow.
 
-    #13518 review R3-F2: when the coordinator supplies a durable review observation
-    (``--review-generation-json``) and a ``--consumer-id`` for a ``review_result`` gate, the
-    approval write is fenced through :func:`...review_admission.admit_review_approval` — a durable
-    single-consumer generation lease + the pre-approval reread fence. A refusal (a duplicate
-    consumer, or a stale approval predating a newer unresolved blocking finding) returns its reason
-    so the caller fails closed (nothing written). When no observation is supplied, or the gate is not
-    a review_result, the write is unfenced here (``None``) — back-compat for non-approval gates.
+    #13518 review R3-F2 / R4-F2: a ``review_result`` APPROVAL is mechanically distinguished from a
+    non-approval decision (changes_requested / finding / progress) by ``--review-decision``. An
+    approval — whether ``--review-decision approval`` OR an UNSPECIFIED review_result decision
+    (fail-closed default) — MUST pass the admission fence: a durable single-consumer generation lease
+    + the pre-approval reread fence (:func:`...review_admission.admit_review_approval`). The fence is
+    NOT optional: an approval with no durable review observation (``--review-generation-json``) or no
+    ``--consumer-id`` is refused (:data:`REASON_APPROVAL_FENCE_INPUTS_MISSING`) rather than silently
+    admitted, so a stale / duplicate approval writer can never bypass the fence by omitting the flags.
+
+    Back-compat (``None``, unfenced) is limited to a gate that is not ``review_result`` OR an
+    EXPLICIT non-approval review_result decision — never an approval.
     """
     if gate != "review_result":
         return None
+    decision = (getattr(args, "review_decision", None) or "").strip().lower()
+    if decision in _NON_APPROVAL_REVIEW_DECISIONS:
+        return None  # an explicit non-approval decision carries no generation-admission obligation
+    # An approval (explicit `approval`, or an unspecified review_result decision) MUST be fenced.
     path = (getattr(args, "review_generation_json", None) or "").strip()
     consumer = (getattr(args, "consumer_id", None) or "").strip()
     if not path or not consumer:
-        return None
+        return REASON_APPROVAL_FENCE_INPUTS_MISSING
     try:
         import json
 
@@ -682,6 +701,14 @@ def register_callbacks(sub) -> None:
         "--consumer-id", dest="consumer_id",
         help="#13518 R3-F2: the approving consumer id for the review_result generation lease "
              "(a duplicate consumer of the same generation is refused).",
+    )
+    p.add_argument(
+        "--review-decision", dest="review_decision",
+        choices=["approval", "changes_requested", "finding", "progress"],
+        help="#13518 R4-F2: the review_result decision kind. An `approval` (or an UNSPECIFIED "
+             "review_result decision — fail-closed default) MUST pass the generation-admission fence "
+             "(--review-generation-json + --consumer-id required, else refused). An explicit "
+             "non-approval decision (changes_requested / finding / progress) is unfenced.",
     )
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
     p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")

@@ -562,8 +562,10 @@ class PartitionRequirementTest(_CliTestCase):
 
 
 class EmitGateReviewApprovalFenceTest(_CliTestCase):
-    """#13518 review R3-F2: --emit-gate --gate review_result APPROVAL is fenced through the durable
-    generation lease + pre-approval reread fence BEFORE it is written; a refusal fails closed."""
+    """#13518 review R3-F2 / R4-F2: --emit-gate --gate review_result APPROVAL is fenced through the
+    durable generation lease + pre-approval reread fence BEFORE it is written, and the fence is
+    MANDATORY — an approval can never bypass it by omitting the flags (fail-closed by default). Only
+    an explicit non-approval decision (changes_requested / finding / progress) is unfenced."""
 
     def _obs(self, decisions, source_request_seq=10, **top):
         base = {
@@ -579,7 +581,7 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
         base = dict(
             emit_gate=True, json=True, issue="13586", gate="review_result", body="",
             store_path=str(self.store_path),
-            review_generation_json=None, consumer_id=None,
+            review_generation_json=None, consumer_id=None, review_decision=None,
         )
         base.update(over)
         return _args(**base)
@@ -593,6 +595,31 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
             rc = cli.cmd_workflow_callbacks(ns)
         return rc, _json.loads(buf.getvalue())
 
+    # --- missing --------------------------------------------------------------
+    def test_missing_observation_approval_is_refused_fail_closed(self):
+        # R4-F2: an approval with NO durable observation / consumer is REFUSED (not silently
+        # written) — a stale/duplicate approver cannot bypass the fence by omitting the flags.
+        rc, out = self._run_json(self._emit_args())  # unspecified decision -> treated as approval
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["recorded"])
+        self.assertEqual(out["reason"], "approval_requires_generation_observation_and_consumer")
+
+    def test_explicit_approval_without_consumer_is_refused(self):
+        obs = self._obs([{"kind": "approval", "seq": 11}])
+        rc, out = self._run_json(self._emit_args(review_decision="approval",
+                                                 review_generation_json=obs, consumer_id=None))
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["reason"], "approval_requires_generation_observation_and_consumer")
+
+    # --- malformed ------------------------------------------------------------
+    def test_malformed_observation_is_refused(self):
+        bad = Path(self._tmp.name) / "bad.json"
+        bad.write_text("{ not json", encoding="utf-8")
+        rc, out = self._run_json(self._emit_args(review_generation_json=str(bad), consumer_id="A"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["reason"], "review_generation_observation_unreadable")
+
+    # --- stale ----------------------------------------------------------------
     def test_stale_approval_predating_newer_blocking_finding_is_refused(self):
         obs = self._obs([
             {"kind": "approval", "seq": 11},
@@ -603,10 +630,11 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
         self.assertFalse(out["recorded"])
         self.assertEqual(out["reason"], "newer_unresolved_blocking_finding")
 
+    # --- duplicate ------------------------------------------------------------
     def test_duplicate_consumer_is_refused(self):
         obs = self._obs([{"kind": "approval", "seq": 11}], source_request_seq=10)
-        # First consumer takes the durable lease (clean generation -> would be admissible; the write
-        # itself needs the opt-in transport, absent here, but the fence has already granted).
+        # First consumer takes the durable lease (clean generation -> fence grants; the write itself
+        # still needs the opt-in transport, absent here, so it is not the lease reason).
         first = self._run_json(self._emit_args(review_generation_json=obs, consumer_id="reviewer-A"))
         self.assertNotEqual(first[1].get("reason"), REASON_LEASE_HELD_BY_OTHER_REASON)
         # A DIFFERENT consumer on the same generation is refused by the durable lease.
@@ -614,18 +642,34 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(out["reason"], REASON_LEASE_HELD_BY_OTHER_REASON)
 
-    def test_unfenced_when_no_observation_supplied(self):
-        # Back-compat: without a review observation the emit-gate path is not fenced here (the write
-        # still fails closed on the opt-in transport being unset, but not on the generation fence).
-        rc, out = self._run_json(self._emit_args())
-        self.assertNotIn(out.get("reason"), (REASON_LEASE_HELD_BY_OTHER_REASON,
-                                             "newer_unresolved_blocking_finding"))
+    # --- clean ----------------------------------------------------------------
+    def test_clean_approval_passes_the_fence(self):
+        # A clean approved generation with a fresh consumer PASSES the generation fence — the only
+        # remaining refusal is the opt-in transport (write_optin_unset), never a fence reason.
+        obs = self._obs([{"kind": "approval", "seq": 11}], source_request_seq=10)
+        rc, out = self._run_json(self._emit_args(review_decision="approval",
+                                                 review_generation_json=obs, consumer_id="reviewer-A"))
+        self.assertNotIn(out.get("reason"), (
+            REASON_LEASE_HELD_BY_OTHER_REASON, "newer_unresolved_blocking_finding",
+            "approval_requires_generation_observation_and_consumer",
+            "review_generation_observation_unreadable",
+        ))
+
+    # --- back-compat (non-approval / non-review_result) -----------------------
+    def test_explicit_non_approval_decision_is_unfenced(self):
+        # A changes_requested / finding / progress review_result carries no generation-admission
+        # obligation, so it is not fenced even with no observation (back-compat).
+        for decision in ("changes_requested", "finding", "progress"):
+            rc, out = self._run_json(self._emit_args(review_decision=decision))
+            self.assertNotEqual(
+                out.get("reason"), "approval_requires_generation_observation_and_consumer",
+                f"{decision} should be unfenced",
+            )
 
     def test_non_review_result_gate_is_not_fenced(self):
-        obs = self._obs([{"kind": "approval", "seq": 11}])
-        rc, out = self._run_json(self._emit_args(gate="implementation_done",
-                                                 review_generation_json=obs, consumer_id="X"))
-        self.assertNotEqual(out.get("reason"), REASON_LEASE_HELD_BY_OTHER_REASON)
+        rc, out = self._run_json(self._emit_args(gate="implementation_done"))
+        self.assertNotEqual(out.get("reason"),
+                            "approval_requires_generation_observation_and_consumer")
 
 
 class ParseCandidateTest(unittest.TestCase):
