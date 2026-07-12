@@ -33,7 +33,7 @@ class CodexShellIdentityTest(unittest.TestCase):
         self.assertFalse(any("inherit" in item for item in argv))
 
     def test_toml_round_trip_covers_unicode_and_control_escapes(self) -> None:
-        for lane in ('ascii"quoted', "line\nfeed", "日本語", "lane-😀"):
+        for lane in ('ascii"quoted', "line\nfeed", "日本語", "lane-😀", "lane-\x7f"):
             with self.subTest(lane=lane):
                 value = CodexShellIdentity("workspace", lane).launch_argv()[-1]
                 rendered = value.split("=", 1)[1]

@@ -36,7 +36,9 @@ class CodexShellIdentity:
         # Surrogates are not TOML Unicode scalar values, so retain real Unicode.
         if any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
             raise ValueError("Codex shell identity contains a non-scalar surrogate")
-        return json.dumps(value, ensure_ascii=False)
+        # JSON leaves DEL (U+007F) literal even though TOML basic strings forbid
+        # it. TOML's Unicode escape form preserves the scalar exactly.
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007F")
 
     def launch_argv(self) -> tuple[str, ...]:
         values = (
