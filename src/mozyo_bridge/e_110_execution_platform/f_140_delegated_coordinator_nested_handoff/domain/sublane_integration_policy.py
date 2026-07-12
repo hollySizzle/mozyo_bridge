@@ -275,14 +275,13 @@ class RetirePreflight:
     owner_approval_present: bool = True
     callbacks_drained: bool = True
     durable_record_recorded: bool = True
-    #: The LATEST review generation is admissible for integration (#13518 review R2-F7 / R3-F2): the
-    #: latest generation is approved AND carries no unresolved blocking finding — never merely "an
-    #: approval exists somewhere". The field default is the satisfied value so the pure decision and
-    #: the config-integration path (which pre-checks it) stay byte-for-byte; the CLI retire path
-    #: (:class:`...sublane_lifecycle_command.RetireAssertions`) supplies it FAIL-CLOSED (default
-    #: unsatisfied), so the actual `sublane retire` integration can no longer default-admit a stale
-    #: last-write-wins approval.
-    latest_generation_admissible: bool = True
+    #: The LATEST review generation is admissible for integration (#13518 review R2-F7 / R3-F2 /
+    #: R4-F3): the latest generation is approved AND carries no unresolved blocking finding — never
+    #: merely "an approval exists somewhere". This is an authority-bearing safety invariant, so its
+    #: default is the UNSATISFIED (fail-closed) value: a caller — pure decision, programmatic use
+    #: case, or CLI — that omits it is BLOCKED (``stale_review_generation``), never default-admitted.
+    #: Every caller must positively supply the measured / durable-record-asserted admissibility.
+    latest_generation_admissible: bool = False
 
 
 @dataclass(frozen=True)

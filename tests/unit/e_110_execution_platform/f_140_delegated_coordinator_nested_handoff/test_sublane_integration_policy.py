@@ -154,6 +154,22 @@ class RetireIntegrationBlockedTriggersTest(unittest.TestCase):
         self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
         self.assertFalse(decision.merge_performed)
 
+    def test_omitting_generation_field_blocks_fail_closed(self) -> None:
+        # #13518 R4-F3: the pure decision default for latest_generation_admissible is fail-closed —
+        # a caller that OMITS it (every other invariant satisfied) is blocked, never default-admitted.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            INTEGRATION_STALE_REVIEW_GENERATION,
+        )
+
+        ok = _all_invariants_ok()
+        ok.pop("latest_generation_admissible")  # omit it -> must default fail-closed
+        decision = decide_retire_integration(
+            SublaneIntegrationPolicy.default(),
+            RetirePreflight(is_git_workspace=True, **ok),
+        )
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
+
     def test_dirty_worktree_blocks(self) -> None:
         decision = decide_retire_integration(
             SublaneIntegrationPolicy.default(),

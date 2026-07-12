@@ -120,12 +120,13 @@ class RetireInvariants:
     owner_approval_present: bool = False
     callbacks_drained: bool = False
     durable_record_recorded: bool = False
-    #: The latest review generation is admissible for integration (#13518 review R2-F7): the latest
-    #: generation is approved with NO unresolved blocking finding
-    #: (:func:`...domain.review_generation.evaluate_integration_admissible`). Defaults ``True`` so a
-    #: caller that does not supply it is byte-for-byte back-compatible; the coordinator sets it
-    #: ``False`` to fence a stale approval / an unresolved blocking finding out of integration.
-    latest_generation_admissible: bool = True
+    #: The latest review generation is admissible for integration (#13518 review R2-F7 / R4-F3): the
+    #: latest generation is approved with NO unresolved blocking finding
+    #: (:func:`...domain.review_generation.evaluate_integration_admissible`). Like every other
+    #: invariant here it defaults to the UNSATISFIED (fail-closed) value — a caller that omits it is
+    #: BLOCKED, never default-admitted; the coordinator supplies the measured / durable-record
+    #: admissibility. (Previously this one field defaulted True, an inconsistent bypass — R4-F3.)
+    latest_generation_admissible: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +235,10 @@ class SublaneIntegrationUseCase:
                         owner_approval_present=invariants.owner_approval_present,
                         callbacks_drained=invariants.callbacks_drained,
                         durable_record_recorded=invariants.durable_record_recorded,
+                        # R4-F3: propagate the fence (default is now fail-closed) so a merge-conflict
+                        # re-decision does not spuriously add stale_review_generation after step 1
+                        # already admitted the generation.
+                        latest_generation_admissible=invariants.latest_generation_admissible,
                     ),
                 )
         return decision

@@ -93,6 +93,7 @@ def _ok_invariants() -> RetireInvariants:
         owner_approval_present=True,
         callbacks_drained=True,
         durable_record_recorded=True,
+        latest_generation_admissible=True,  # R4-F3: fail-closed default -> must assert explicitly
     )
 
 
@@ -169,8 +170,26 @@ class RetireUseCaseTest(unittest.TestCase):
         self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
         self.assertFalse(ops.merge_called)  # no merge on a stale generation
 
-    def test_admissible_generation_default_is_backcompat(self) -> None:
-        # The fence defaults admissible=True, so an unchanged caller retires exactly as before.
+    def test_omitted_generation_invariant_blocks_fail_closed(self) -> None:
+        # #13518 R4-F3: the programmatic use case's RetireInvariants defaults the generation fence to
+        # UNSATISFIED (fail-closed) — a caller that omits it (every other invariant satisfied) is
+        # blocked, never default-admitted. No merge is attempted on the stale generation.
+        ops = FakeGitOperations(git=True)
+        use_case = SublaneIntegrationUseCase(
+            operations=ops, policy=SublaneIntegrationPolicy.default()
+        )
+        invariants = RetireInvariants(
+            target_identity_known=True, verification_passed=True, issue_closed=True,
+            owner_approval_present=True, callbacks_drained=True, durable_record_recorded=True,
+            # latest_generation_admissible omitted -> fail-closed default
+        )
+        decision = use_case.evaluate_retire(invariants=invariants)
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
+        self.assertFalse(ops.merge_called)
+
+    def test_explicit_admissible_generation_retires_ok(self) -> None:
+        # With the generation invariant explicitly asserted True (and all others), retire is OK.
         ops = FakeGitOperations(git=True)
         use_case = SublaneIntegrationUseCase(
             operations=ops, policy=SublaneIntegrationPolicy.default()
