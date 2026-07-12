@@ -1258,7 +1258,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1013
+    lines: 1072
     reason: >-
       Herdr session-start composition root. It was de-listed at ~970 lines after
       the #13411 topology extraction (see the note below) and sat at exactly 1000
@@ -1266,11 +1266,15 @@ allowlist:
       upstream Bugs #13613 (fail-before-mutation sender-attestation preflight) and
       #13614 (launch-time Codex tool-shell identity) into the #13518 branch added
       the `CodexShellIdentity` import + its `-c` override append in the codex
-      launch path (+13 lines -> 1013). This is integrated upstream behaviour, not
-      new #13518 surface, so it is allowlisted rather than trimmed; a split
-      follow-up (extract the launch-argv assembly to a cohesive sibling) is the
-      scheduled reduction.
-    owner_issue: "#13518"
+      launch path (+13 lines -> 1013). Bug #13595 (dry-run purity) then added the
+      read-only identity query for the query/command split — the
+      `_resolve_workspace_id_readonly` helper (fail-closed, no register) plus the
+      dry-run branch that replaces the unconditional `register_workspace` call
+      (+59 lines -> 1072). Both increments are integrated / correctness-required
+      behaviour, not gratuitous surface, so allowlisted rather than trimmed; the
+      scheduled reduction (extract the launch-argv assembly to a cohesive sibling)
+      still applies.
+    owner_issue: "#13595"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 

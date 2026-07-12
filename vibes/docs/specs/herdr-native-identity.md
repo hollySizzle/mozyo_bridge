@@ -204,8 +204,14 @@ flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。
 2. workspace segment を単一 resolver `herdr_workspace_segment(repo_root)` で得る (§1 の workspace
-   field と同定義)。**standalone / main checkout** は `register_workspace` / `read_anchor` を再利用し
-   registry workspace_id を得る (空なら fail-closed、従来どおり)。**linked git worktree lane
+   field と同定義)。**standalone / main checkout** は execute path では `register_workspace` /
+   `read_anchor` を再利用し registry workspace_id を得る (空なら fail-closed、従来どおり)。
+   **`--dry-run` は query / command 分離 (Redmine #13595): `register_workspace` を呼ばず
+   `_resolve_workspace_id_readonly` で read-only 解決する** (anchor が id を pin、無ければ registry
+   row。registry / anchor / `last_seen` を一切 write しない)。durable identity が未確定 (anchor も
+   registry row も無い) / 両 anchor 名併存 (write path と同じ曖昧性) の場合は fake identity を作らず
+   actionable に fail-closed し、silent registration しない (旧実装は dry-run 分岐前に
+   `register_workspace` を呼び registry + anchor を mutate していた)。**linked git worktree lane
    (Redmine #13377 / j#73613)** は main checkout の anchor から project workspace_id を継承する
    (main 未登録なら fail-closed)。lane segment は明示 `--lane` か、`sublane create` が書いた lane
    metadata record の `lane_id` から復元し、どちらも無ければ fail-closed する (lane worktree から
