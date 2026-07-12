@@ -58,8 +58,8 @@ lane を bundle / journal に記す場合、「target lane label」を live で 
 lane_state:
   git_branch_worktree:      # Git branch head / worktree の存在。`git branch` / worktree で確認
     - present | absent
-  registered_lane_metadata: # lane_metadata record の存在。`sublane list --lane <label> --json` の `sublanes`
-    - present | absent      #   が非空なら present、`sublanes: []` なら absent
+  registered_lane_metadata: # lane_metadata record の存在。live inventory row の存在とは別に判定
+    - present | absent | unknown
   live_routable_runtime:    # dispatch 可能な live herdr slot (gateway/worker pane) の存在
     - present | absent
 ```
@@ -70,12 +70,14 @@ lane_state:
 routable_verdict:
   routable:            # 3 state すべて present。標準 dispatch の対象
   branch-only:         # git_branch_worktree=present だが他 2 state が absent
-  lane-unregistered:   # registered_lane_metadata=absent (`sublane list` が `sublanes: []`)。branch の有無は別問題
+  lane-unregistered:   # registered_lane_metadata=absent。branch / live runtime の値は別途併記
   runtime-unavailable: # registered_lane_metadata=present だが live_routable_runtime=absent
 ```
 
+- `sublane list --lane <label> --json` の `sublanes` 非空を、そのまま metadata record の存在証明にしない。backend=herdr の projection は live assigned-name row だけでも lane row を返す。返却 row の `stale_hints` に `lane_record_missing` があれば `registered_lane_metadata=absent`、`lane_slots_missing` があれば metadata は present だが live runtime は absent と判定する。`sublanes: []` は対象 lane の record / live row がどちらも projection に現れなかったことを示す。store / projection が unreadable、または record-backed か判別できない出力は `unknown` として fail-closed にする。
+- primary verdict は次の順に判定する: 3 state presentなら `routable`; metadata absent + live runtime presentなら `lane-unregistered`; Git present + metadata absent + live runtime absentなら `branch-only`; それ以外のmetadata absentは`lane-unregistered`; metadata present + live runtime absentなら `runtime-unavailable`。metadata unknownではverdictもunknownとしてfail-closedにする。`lane_record_missing` は metadata layer 欠落の証拠に限り、live routing / liveness の存在・不在を導かない。live locator を観測しても metadata を推測で再構成せず、issue / lane attribution の durable dispositionを先に作る。
 - routable でない lane を「dispatch 先が消えた / 送達失敗」と report しない。正しい理由は上記 verdict のどれか (branch は在るが lane 未登録、等) であり、bundle の `target lane` 記載だけを根拠に routable と判定しない。
-- backend=herdr では `agents targets` は tmux-era primitive/debug 面 (`### Runtime fingerprint gate (backend=herdr)` / `task-herdr-lane-operations`)。その empty candidate を「routable lane 不在」の根拠にしない。lane state は `sublane list --lane <label> --json` (registered_lane_metadata) と live slot 実測で判定する。
+- backend=herdr では `agents targets` は tmux-era primitive/debug 面 (`### Runtime fingerprint gate (backend=herdr)` / `task-herdr-lane-operations`)。その empty candidate を「routable lane 不在」の根拠にしない。lane state は `sublane list --lane <label> --json` の row / `stale_hints` と live slot 実測を合わせて判定する。
 
 ### Runtime fingerprint gate (backend=herdr)
 

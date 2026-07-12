@@ -17,8 +17,8 @@
 
 ## Harness work
 
-- #13617 session retrospective / harness bundle整合: Start j#76081、direct-edit gate j#76082
-- #13616 durable-anchor-only fresh-session QA: 次actor
+- #13617 session retrospective / harness bundle整合: Start j#76081、direct-edit gate j#76082、QA correction request j#76105
+- #13616 durable-anchor-only fresh-session QA: j#76103 changes_requested（metadata recordとlive rowのcollapse）、j#76104 portable-path correction
 - #13618 snapshot-free correction未昇格: current mainのintegration regression
 - Stable docs:
   - `vibes/docs/specs/session-continuity-user-harness.md`
@@ -64,10 +64,10 @@ Process bugs:
 1. workspace registryからcheckoutを解決し、workspace id、checkout existence、Redmine project、Git originを照合する。
 2. catalogから`spec-session-continuity-user-harness`をexact idでresolveして本文を読む。
 3. Redmineのlatest journalsを再取得し、bundleとの差分はRedmineを採用する。
-4. Git branch/worktree、registered lane metadata、live runtime、agent auth、sender command-shell identity、delivery stateをcollapseせず復元する。
+4. Git branch/worktree、registered lane metadata、live runtime、agent auth、sender command-shell identity、delivery stateをcollapseせず復元する。Herdr `sublane list`の非空rowだけでmetadata presentとせず、`lane_record_missing`はmetadata absent、live gateway/workerは別stateとして判定する。
 5. main/integration/active issue heads、latest main CI、package version、TestPyPI waiting stateをread-only再取得する。
 6. #13524のrelease chainとowner approvalの対象/除外を復元する。local greenだけでrelease-readyとしない。
-7. QA結果を#13616へ記録し、#13615のUS-level review_requestを作る。bundle受領後のcleanup dispositionも記録する。
+7. #13617 j#76105 correctionをorigin-reachable commitで再検証し、QA結果を#13616へ記録する。green後にだけ#13615のUS-level review_requestを作る。bundle受領後のcleanup dispositionも記録する。
 
 ## Holds / non-goals
 
