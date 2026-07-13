@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     active_lane_snapshots,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
+    ISSUE_LEASE_LOST,
     ISSUE_SOURCE_UNREADABLE,
     SupervisedWorkspace,
     WorkspaceCallbackSupervisor,
@@ -243,8 +244,13 @@ class SupervisorLeaseFenceTest(unittest.TestCase):
                 return SEND_DELIVERED
 
         sender = _TakeoverSender()
-        # Fresh clock per read: acquire (issue-0 fence) then the issue-1 renew (past takeover time).
-        clocks = iter(["2026-07-13T00:00:00+00:00", "2026-07-13T01:00:00+00:00"])
+        # Fresh clock per read: acquire (t0), issue-0 send-boundary renew (still owned, extends),
+        # then issue-1 boundary renew (past the takeover time -> ownership lost).
+        clocks = iter([
+            "2026-07-13T00:00:00+00:00",  # acquire (superX lease -> expires ~00:01:40)
+            "2026-07-13T00:00:10+00:00",  # issue-0 send-boundary renew (superX still owns)
+            "2026-07-13T01:00:00+00:00",  # issue-1 boundary renew (superB has taken over)
+        ])
         sup = WorkspaceCallbackSupervisor(
             holder="superX",
             lease_store=self.lease_store,
@@ -264,6 +270,43 @@ class SupervisorLeaseFenceTest(unittest.TestCase):
         self.assertEqual(w.skipped_reason, SKIP_LEASE_LOST)
         self.assertEqual(len(w.issues), 1)  # only the first issue's outcome recorded
         # The new holder owns the lease; superX's holder-conditional release was a no-op.
+        self.assertEqual(self.lease_store.holder_of("wsA").holder, "superB")
+
+    def test_takeover_during_source_read_yields_zero_send(self) -> None:
+        # R2-F1: a takeover DURING a single issue's (slow) source read must zero-send that issue —
+        # the send-boundary fence catches it before the outbox delivery.
+        lease_store = self.lease_store
+
+        class _TakeoverOnReadSource:
+            """On its first journal read, a second supervisor takes the (expired) lease over."""
+
+            def __init__(self, inner) -> None:
+                self.inner = inner
+                self.fired = False
+
+            def read_entries(self, issue_id):
+                if not self.fired:
+                    self.fired = True
+                    lease_store.acquire("wsA", "superB", now="2026-07-13T00:30:00+00:00", ttl_seconds=600)
+                return self.inner.read_entries(issue_id)
+
+        sender_calls = []
+        clocks = iter([
+            "2026-07-13T00:00:00+00:00",  # acquire (superX lease -> expires ~00:01:40)
+            "2026-07-13T01:00:00+00:00",  # send-boundary renew (superB has taken over -> lost)
+        ])
+        sup = WorkspaceCallbackSupervisor(
+            holder="superX", lease_store=self.lease_store, store=self.store, outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws], roster_fn=lambda ws: (("13683",), ""),
+            redmine_source_fn=lambda ws: _TakeoverOnReadSource(self.source),
+            sender_fn=lambda ws: (lambda row: sender_calls.append(row) or SEND_DELIVERED),
+            clock=lambda: next(clocks), lease_ttl_seconds=100,
+        )
+        report = sup.run_once()
+        w = report.workspaces[0]
+        self.assertEqual(sender_calls, [])  # zero-send: the send boundary was fenced
+        self.assertEqual(w.issues[0].error, ISSUE_LEASE_LOST)
+        self.assertEqual(w.skipped_reason, "lease_lost_midsweep")
         self.assertEqual(self.lease_store.holder_of("wsA").holder, "superB")
 
     def test_slow_multi_issue_sweep_renews_and_keeps_ownership(self) -> None:
@@ -328,6 +371,18 @@ class SupervisorWakeConsumeTest(unittest.TestCase):
         w = report.workspaces[0]
         self.assertEqual(set(w.supervised_issues), {"13683", "13684"})  # loss recovery = full roster
         self.assertEqual(self.wake_store.pending(), ())  # still consumed
+
+    def test_lease_refused_duplicate_does_not_consume_wake(self) -> None:
+        # R2-F2: the wake drain happens only AFTER the lease is acquired, so a lease-refused
+        # duplicate supervisor never consumes (and destroys) the real owner's wake.
+        self.wake_store.enqueue("wsA", "13683")
+        # Another supervisor already holds wsA's lease (live).
+        self.lease_store.acquire("wsA", "otherOwner", now="2026-07-13T00:00:00+00:00", ttl_seconds=600)
+        report = self._supervisor().run_once(mode=SUPERVISION_LOCAL_WAKE)
+        self.assertFalse(report.workspaces[0].lease_acquired)
+        self.assertEqual(report.workspaces[0].skipped_reason, SKIP_LEASE_REFUSED)
+        # The wake survives for the real owner (NOT drained by the refused duplicate).
+        self.assertEqual([h.as_tuple() for h in self.wake_store.pending()], [("wsA", "13683")])
 
     def test_absent_wake_store_is_fine(self) -> None:
         sup = WorkspaceCallbackSupervisor(

@@ -101,6 +101,20 @@ _NULL_SOURCE = _NullSource()
 ISSUE_SOURCE_UNREADABLE = "redmine_source_unreadable"
 #: A per-issue error token: the whole issue pass raised (recorded, not fatal to the sweep).
 ISSUE_PASS_ERROR = "issue_pass_error"
+#: A per-issue error token: the send-boundary ownership fence tripped (a takeover during this
+#: issue's source reads), so the outbox delivery was skipped — zero-send (Redmine #13683 R2-F1).
+ISSUE_LEASE_LOST = "lease_lost_before_send"
+
+#: The launch-time lane-identity env a background supervisor must NOT inherit (Redmine #13683
+#: R2-F3). A supervisor is not a lane agent, so carrying another lane's role / lane / workspace id
+#: into a target workspace's send would misroute on a foreign identity (or, in a login service,
+#: present a stale identity). These are scrubbed from the send env and only ``MOZYO_WORKSPACE_ID``
+#: is re-set to the target workspace — so a herdr send that needs an attested lane-sender identity
+#: fails **closed** (``missing_sender_env``) rather than misrouting on a stale ambient identity. The
+#: sanctioned background system-actor sender-identity contract (a supervisor is not a claude/codex
+#: lane provider, so :func:`...herdr_target_resolution.resolve_sender_identity` has no slot for it)
+#: is a design-consultation seam, not resolved by ambient env.
+_SCRUBBED_LANE_IDENTITY_ENV = ("MOZYO_AGENT_ROLE", "MOZYO_LANE_ID", "MOZYO_WORKSPACE_ID")
 
 
 class WorkspaceCallbackSupervisor:
@@ -161,15 +175,14 @@ class WorkspaceCallbackSupervisor:
         only wake-named roster issues for ``local_wake``), and per issue supplies durable events +
         drains the callback outbox partition. Returns a redaction-safe :class:`SupervisorReport`.
 
-        Local-wake primacy (R1-F2): the durable wake queue is drained first and its
-        ``(workspace_id, issue)`` wakes are merged with any explicit ``wake_hints`` — so a
-        mozyo-originated gate commit that enqueued a wake drives this pass. Bounded reconciliation
-        (the whole-roster mode) is the loss recovery: a dropped wake is still caught because the
-        roster is re-read regardless.
+        Local-wake primacy (R1-F2 / R2-F2): each leased workspace drains ITS OWN durable wake
+        queue **after** acquiring the lease (in :meth:`_supervise_workspace`), so only the lease
+        owner ever consumes its workspace's wakes — a lease-refused duplicate supervisor never
+        drains (and destroys) another owner's wakes. Explicit ``wake_hints`` are grouped by
+        workspace and merged with the drained wakes. Bounded reconciliation (the whole-roster
+        mode) is the loss recovery: a dropped wake is still caught because the roster is re-read.
         """
-        drained = self._drain_wake_store()
-        merged_hints = tuple(drained) + tuple(wake_hints)
-        wake_by_ws = _group_wake_hints(merged_hints)
+        wake_by_ws = _group_wake_hints(wake_hints)
         outcomes: list[WorkspaceSupervisionOutcome] = []
         for ws in self._workspaces_fn():
             outcomes.append(
@@ -179,16 +192,17 @@ class WorkspaceCallbackSupervisor:
             )
         return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
 
-    def _drain_wake_store(self) -> tuple[tuple[str, str], ...]:
-        """Consume the durable local-wake queue into ``(workspace_id, issue)`` hints (fail-open).
+    def _drain_wake_for(self, workspace_id: str) -> tuple[str, ...]:
+        """Consume THIS workspace's durable local wakes into issue ids (fail-open, lease-owned).
 
-        A wake-store read failure is swallowed (returns ``()``) — a lost wake is recovered by the
-        bounded reconciliation pass, so the wake queue never breaks the sweep (R1-F2).
+        Called only after the lease is acquired (R2-F2), so a non-owner never consumes another
+        workspace's wakes. A wake-store read failure is swallowed (returns ``()``) — a lost wake is
+        recovered by the bounded reconciliation pass, so the queue never breaks the sweep.
         """
         if self._wake_store is None:
             return ()
         try:
-            return tuple(h.as_tuple() for h in self._wake_store.drain())
+            return tuple(h.issue for h in self._wake_store.drain(workspace_id=workspace_id))
         except Exception:  # noqa: BLE001 - a wake read never breaks the sweep (reconciliation recovers)
             return ()
 
@@ -214,6 +228,10 @@ class WorkspaceCallbackSupervisor:
                 skipped_reason=SKIP_LEASE_REFUSED,
             )
         try:
+            # R2-F2: drain this workspace's durable wakes ONLY now that we own the lease, so a
+            # lease-refused duplicate can never consume another owner's wakes. Merge the
+            # lease-owned drained wakes with any explicit hints for this workspace.
+            wake_issues = tuple(wake_issues) + self._drain_wake_for(wsid)
             roster, roster_error = self._roster_fn(ws)
             if roster_error:
                 # A roster read that failed is degraded, not "nothing active" — fail closed on the
@@ -250,9 +268,13 @@ class WorkspaceCallbackSupervisor:
                 ):
                     lease_lost = True
                     break
-                issue_outcomes.append(
-                    self._supervise_issue(wsid, issue, source, sender, binding)
-                )
+                issue_outcome = self._supervise_issue(wsid, issue, source, sender, binding)
+                issue_outcomes.append(issue_outcome)
+                if issue_outcome.error == ISSUE_LEASE_LOST:
+                    # The send-boundary fence tripped mid-issue (a takeover during this issue's
+                    # source reads): the lease is gone, so stop before any further workspace work.
+                    lease_lost = True
+                    break
             return WorkspaceSupervisionOutcome(
                 workspace_id=wsid,
                 lease_acquired=True,
@@ -302,6 +324,19 @@ class WorkspaceCallbackSupervisor:
         except Exception:  # noqa: BLE001 - a source read failure degrades this issue, never the sweep
             error = ISSUE_SOURCE_UNREADABLE
             candidates = ()
+
+        # Send-boundary ownership fence (R2-F1): the source reads above can be slow enough to cross
+        # the lease TTL; a takeover DURING them means we no longer own the workspace. Re-verify (and
+        # extend) ownership immediately before the outbox delivery — the sole irreversible
+        # side-effect (the send). If the lease was lost, skip the outbox pass entirely: zero-send,
+        # and the row stays pending/claimable for the new owner (the event append above is
+        # idempotent, so a late append before this fence is harmless).
+        if not self._lease_store.renew(
+            workspace_id, self._holder, now=self._clock(), ttl_seconds=self._ttl
+        ):
+            return IssueSupervisionOutcome(
+                issue=issue, events_supplied=events_supplied, error=ISSUE_LEASE_LOST
+            )
 
         try:
             processor = CallbackOutboxProcessor(
@@ -431,7 +466,11 @@ def workspace_send_runner(
     import subprocess
 
     def _run(argv: list) -> "tuple[int, str]":
-        env = {**os.environ, "MOZYO_WORKSPACE_ID": str(workspace_id or "")}
+        # R2-F3: build a DETERMINISTIC env — scrub the inherited lane identity (a supervisor is not
+        # the launching lane's agent) and pin only this workspace's id. A herdr send that needs a
+        # lane-sender role/lane now fails closed rather than misrouting on the ambient identity.
+        env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_LANE_IDENTITY_ENV}
+        env["MOZYO_WORKSPACE_ID"] = str(workspace_id or "")
         proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; sanctioned handoff CLI
             argv,
             capture_output=True,
@@ -526,6 +565,7 @@ __all__ = (
     "WorkspaceCallbackSupervisor",
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",
+    "ISSUE_LEASE_LOST",
     "default_workspaces",
     "default_roster",
     "default_redmine_source",

@@ -141,6 +141,55 @@ class DefaultSenderIdentityTest(unittest.TestCase):
         self.assertEqual(seen["cwd"], "/canonical/repoA")
         self.assertEqual(seen["env"].get("MOZYO_WORKSPACE_ID"), "wsA")
 
+    def test_runner_scrubs_inherited_lane_identity(self) -> None:
+        # R2-F3: a supervisor launched in a lane's env must NOT carry that lane's role/lane/ws into
+        # a target workspace's send — those are scrubbed, only the target workspace id is set.
+        seen = {}
+
+        class _Proc:
+            returncode = 0
+            stdout = "ok"
+
+        def fake_run(argv, **kwargs):
+            seen["env"] = dict(kwargs.get("env") or {})
+            return _Proc()
+
+        polluted = {
+            "MOZYO_AGENT_ROLE": "codex",  # a foreign lane's identity
+            "MOZYO_LANE_ID": "foreign-lane",
+            "MOZYO_WORKSPACE_ID": "foreignWs",
+            "PATH": "/usr/bin",  # a benign var survives
+        }
+        with mock.patch.dict("os.environ", polluted, clear=True), mock.patch("subprocess.run", fake_run):
+            workspace_send_runner("/canonical/repoA", "wsA")(["mozyo-bridge", "handoff", "send"])
+        env = seen["env"]
+        self.assertNotIn("MOZYO_AGENT_ROLE", env)  # scrubbed (no foreign role carryover)
+        self.assertNotIn("MOZYO_LANE_ID", env)  # scrubbed
+        self.assertEqual(env.get("MOZYO_WORKSPACE_ID"), "wsA")  # only the target ws id, deterministic
+        self.assertEqual(env.get("PATH"), "/usr/bin")  # unrelated env preserved
+
+    def test_two_workspaces_do_not_cross_contaminate_identity(self) -> None:
+        envs = []
+
+        class _Proc:
+            returncode = 0
+            stdout = _DELIVERED_STDOUT
+
+        def fake_run(argv, **kwargs):
+            envs.append(dict(kwargs.get("env") or {}))
+            return _Proc()
+
+        polluted = {"MOZYO_AGENT_ROLE": "claude", "MOZYO_LANE_ID": "some-lane", "MOZYO_WORKSPACE_ID": "wsZ"}
+        with mock.patch.dict("os.environ", polluted, clear=True), mock.patch("subprocess.run", fake_run):
+            default_sender(SupervisedWorkspace("wsA", "/canonical/repoA"))(_row("wsA"))
+            default_sender(SupervisedWorkspace("wsB", "/canonical/repoB"))(_row("wsB"))
+        self.assertEqual(envs[0].get("MOZYO_WORKSPACE_ID"), "wsA")
+        self.assertEqual(envs[1].get("MOZYO_WORKSPACE_ID"), "wsB")
+        # No ambient/foreign lane identity carried into either send.
+        for env in envs:
+            self.assertNotIn("MOZYO_AGENT_ROLE", env)
+            self.assertNotIn("MOZYO_LANE_ID", env)
+
 
 if __name__ == "__main__":
     unittest.main()
