@@ -148,6 +148,15 @@ class AgentProviderRuntimeSnapshot:
             return None
         return self._discovery_aliases.get(alias)
 
+    def discovery_aliases(self) -> dict[str, str]:
+        """A plain ``{pane/window alias: provider_id}`` copy (for display / the fallback).
+
+        Symmetric with :meth:`commands` / :meth:`process_owners`; lets the
+        no-injected-snapshot fallback project the whole alias map off this one snapshot
+        instead of re-reading the registry (Redmine #13569 R3-F2).
+        """
+        return dict(self._discovery_aliases)
+
     def provider_for_process(self, process: object) -> str | None:
         """The provider a ``process`` basename identifies, or ``None``.
 

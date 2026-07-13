@@ -1920,9 +1920,10 @@ target-repo-authoritative:
   `args.snapshot`; `commands_agents` / `ResolveAgentTargetsUseCase` / `LiveAgentDiscovery`
   thread it into `discover_agents` (which classifies each pane by the injected vocabulary).
   `agent_discovery` / `pane_resolver` no longer freeze an import-time vocabulary or import the
-  `e_140` registry at module level — the built-in fallback is read lazily through the new
-  `agent_provider_vocab` leaf (a lazy, cached, function-local registry read), and `AGENT_KINDS`
-  / `AGENT_LABELS` are PEP-562 lazy module attributes.
+  `e_140` registry at module level — the built-in fallback is read through the new
+  `agent_provider_vocab` leaf, and `AGENT_KINDS` / `AGENT_LABELS` are PEP-562 lazy module
+  attributes. (R2 still reached the registry from that leaf through five function-local reads;
+  R3-F2 below removes that dependency entirely.)
 - *Herdr read-back / projection recognize the launched pair* — `HerdrSublaneActuatorOps`'s
   `_lane_slots` / `read_lane` and `project_herdr_sublanes` roster the binding-resolved
   (gateway, worker) pair (the same pair `_launch_providers` launches), so a rebound lane is
@@ -1939,6 +1940,29 @@ target-repo-authoritative:
 - *No silent planner default reduction* — `delegation_route_planner.RouteRequest`'s gateway /
   worker providers are required (keyword-only, no literal default), so a route plan can never
   silently reduce to the built-in pair when a caller omits the binding.
+
+**R3 corrections (Redmine #13569 j#77298).** R2 was still entrance-only in two places:
+
+- *The sublane launch preflight now receives the injected snapshot from the REAL parser* —
+  R2-F2b taught `_sublane_start_provider_preflight_blocked` to key on an injected snapshot,
+  but the `sublane create` subparser only `set_defaults(func=…)`, never `snapshot=`, so
+  `cmd_sublane_start` always saw `args.snapshot is None` and fell back to the built-in
+  snapshot. `register_lifecycle` now `set_defaults(func=…, snapshot=snapshot)` on that
+  subparser (mirroring the `agents` subparsers), so a provider rebound only in the injected
+  registry is recognized as launchable instead of being misjudged unknown and zero-started.
+- *The e_110 discovery / pane-resolution domain no longer depends on the e_140 registry at
+  all* — the R2 `agent_provider_vocab` leaf moved the registry read from module level to five
+  *function-local* imports, which is still an `e_110 domain -> e_140 registry` edge and still
+  five separate caches. R3-F2 removes it: the leaf holds ONE core-owned
+  `AgentProviderRuntimeSnapshot` supplied by the composition. The `e_140` provider-registry
+  factory (the one place that reads the registry) calls `agent_provider_vocab.set_default_snapshot`
+  at its import — an `e_140 -> e_110` edge, the sanctioned direction — and the package
+  bootstrap (`mozyo_bridge/__init__`) imports that factory so the default is registered before
+  any consumer (even a module-level `from pane_resolver import AGENT_COMMANDS` frozen at
+  import) reaches the fallback. The `builtin_*` accessors are thin projections of that one
+  snapshot, so all fallback consumers share exactly the vocabulary the composition built. A
+  full-AST test pins that NO `e_140` import (module OR function-local) exists anywhere in the
+  `f_120` subtree.
 
 ## Follow-up Split
 

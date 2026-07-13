@@ -515,7 +515,13 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     _add_dispatch_admission_flags(sublane_create)
     add_repo_option(sublane_create)
     _add_lifecycle_json(sublane_create)
-    sublane_create.set_defaults(func=cmd_sublane_start)
+    # Redmine #13569 R3-F1: carry the SAME composition-injected snapshot onto the parsed
+    # namespace so `cmd_sublane_start`'s launchability preflight resolves against the
+    # injected registry (not the built-in fallback). Without this `set_defaults`,
+    # `args.snapshot` is absent in the real parser path and a rebound provider that exists
+    # only in the injected snapshot is misjudged unknown -> zero-start (the R2-F2b bug,
+    # unresolved in real composition because only the agents subparser was wired).
+    sublane_create.set_defaults(func=cmd_sublane_start, snapshot=snapshot)
 
     # Worker-dispatch ack drive (Redmine #12988): the lane gateway forwards the
     # anchored implementation_request to its same-lane worker and records the

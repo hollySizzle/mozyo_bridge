@@ -25,6 +25,9 @@ from typing import Optional
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
     AgentProviderRuntimeSnapshot,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_vocab import (
+    set_default_snapshot,
+)
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
     LAUNCHABLE_PROTOCOLS,
 )
@@ -84,6 +87,15 @@ def build_runtime_snapshot(
 #: call sites keep the built-in vocabulary and behavior; a test / future composition
 #: injects a different snapshot to exercise a synthetic provider set.
 BUILTIN_AGENT_PROVIDER_SNAPSHOT: AgentProviderRuntimeSnapshot = build_runtime_snapshot()
+
+# Redmine #13569 R3-F2: this factory (the ONE place that reads the registry) is also the
+# ONE place that supplies the e_110 consumers' no-injection fallback. Registering the
+# built-in snapshot as their single core-owned default here — an e_140 -> e_110 edge, the
+# sanctioned direction — is what lets the e_110 discovery/pane-resolution domain drop its
+# own e_140 registry import entirely (module AND function-local). Any composition that
+# needs a consumer's fallback imports this factory (build_parser does), which runs this
+# registration; the e_110 domain never reaches back into the registry itself.
+set_default_snapshot(BUILTIN_AGENT_PROVIDER_SNAPSHOT)
 
 
 __all__ = (
