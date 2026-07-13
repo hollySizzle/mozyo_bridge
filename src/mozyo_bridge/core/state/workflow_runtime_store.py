@@ -211,6 +211,9 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
     detail              TEXT NOT NULL DEFAULT '',
     payload             TEXT NOT NULL DEFAULT '',
     workspace_id        TEXT NOT NULL DEFAULT '',
+    target_lane         TEXT NOT NULL DEFAULT '',
+    target_receiver     TEXT NOT NULL DEFAULT '',
+    target_generation   TEXT NOT NULL DEFAULT '',
     seq                 INTEGER NOT NULL,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
@@ -259,6 +262,33 @@ def _ensure_callback_ownership_columns(conn: sqlite3.Connection) -> None:
     """
     have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
     for name, decl in _CALLBACK_OWNERSHIP_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
+
+
+#: The callback-outbox durable target-tuple columns (Redmine #13683 review R4-F2). The row holds
+#: the intended target ``lane`` / ``receiver`` (binding-resolved provider) and a ``generation`` /
+#: correlation seam, so the background_service delivery authority binds the re-resolved live target
+#: to the row's durable expectation (a wrong lane / receiver / unknown generation fails closed).
+#: ``target_generation`` is the seam #13684's correlated review-result routing populates; #13683
+#: fixes the field so the dependency does not invert (j#77069). Added defensively (additive).
+_CALLBACK_TARGET_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("target_lane", "TEXT NOT NULL DEFAULT ''"),
+    ("target_receiver", "TEXT NOT NULL DEFAULT ''"),
+    ("target_generation", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _ensure_callback_target_columns(conn: sqlite3.Connection) -> None:
+    """Add the R4-F2 durable target-tuple columns to a callback table that lacks them (idempotent).
+
+    ``ALTER TABLE ADD COLUMN`` is additive and preserves rows; a no-op once present. An older build
+    that does not read these columns is unaffected (they simply default ``''``), so the change is
+    backward / forward compatible without a container version bump (same posture as the ownership
+    columns).
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+    for name, decl in _CALLBACK_TARGET_COLUMNS:
         if name not in have:
             conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
 
@@ -421,6 +451,7 @@ class WorkflowRuntimeStore:
             conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
             conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
             _ensure_callback_ownership_columns(conn)
+            _ensure_callback_target_columns(conn)
             _migrate_callback_outbox_workspace(conn)
             conn.execute(
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
@@ -434,6 +465,7 @@ class WorkflowRuntimeStore:
             conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
             conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
             _ensure_callback_ownership_columns(conn)
+            _ensure_callback_target_columns(conn)
             _migrate_callback_outbox_workspace(conn)
             conn.commit()
         else:

@@ -46,6 +46,9 @@ def discover_candidates(
     *,
     route: str = DEFAULT_CALLBACK_ROUTE,
     workspace_id: str = "",
+    target_lane: str = "",
+    target_receiver: str = "",
+    target_generation: str = "",
 ) -> list[CallbackCandidate]:
     """Discover callback candidates from a source issue's structured gate markers (#13520 F1-R1).
 
@@ -67,6 +70,9 @@ def discover_candidates(
                 callback_route=route,
                 notification_kind=marker.gate,
                 workspace_id=str(workspace_id or "").strip(),
+                target_lane=str(target_lane or "").strip(),
+                target_receiver=str(target_receiver or "").strip(),
+                target_generation=str(target_generation or "").strip(),
             )
         )
     return candidates

@@ -81,6 +81,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callbacks import (
     register_callbacks,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_supervisor import (
+    register_supervisor,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
@@ -688,6 +691,7 @@ def register(sub) -> None:
     register_watch(workflow_sub)
     register_glance(workflow_sub)
     register_callbacks(workflow_sub)
+    register_supervisor(workflow_sub)
 
     fence_p = workflow_sub.add_parser(
         "dispatch-fence",

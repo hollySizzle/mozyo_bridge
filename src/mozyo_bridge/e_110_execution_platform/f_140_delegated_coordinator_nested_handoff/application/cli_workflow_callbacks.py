@@ -122,6 +122,57 @@ def _require_partition_workspace_id(args: argparse.Namespace) -> str:
     )
 
 
+def _activate_supervisor_process() -> None:
+    """Activate a bounded supervisor pass after a gate commit (#13683 review R3-F1, design j#77216 b6).
+
+    The design answer makes the source activation mechanism a Phase A requirement (only the
+    installed-artifact service residency / live dogfood defers to Phase B): a canonical gate commit
+    must START / wake / activate a supervisor pass, not merely enqueue a wake into a passive queue.
+    This spawns a **detached, bounded** ``workflow supervisor --run-once --local-wake`` so the wake
+    just enqueued is consumed by the lease owner without waiting for the reconciliation interval.
+    Best-effort: a spawn failure is swallowed (the wake is still recovered by bounded reconciliation).
+    Patched in tests to activate an in-process supervisor (the E2E drives gate -> activation ->
+    consume -> delivery without calling ``run_once`` itself).
+    """
+    import subprocess
+    import sys
+
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell; detached bounded supervisor run
+            [sys.executable, "-m", "mozyo_bridge", "workflow", "supervisor", "--run-once", "--local-wake"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 - a spawn failure never fails an already-recorded gate
+        pass
+
+
+def _best_effort_emit_supervisor_wake(args: argparse.Namespace, issue: str) -> None:
+    """Enqueue a supervisor local wake for (workspace, issue) after a recorded gate, then activate.
+
+    #13683 R1-F2 + R3-F1: the workspace is the attested id this surface owns
+    (:func:`_resolve_workspace_id`); a blank id (un-partitioned legacy bucket) or a blank issue is a
+    no-op. The wake is enqueued to the durable coalesced queue AND a bounded supervisor pass is
+    **activated** (:func:`_activate_supervisor_process`) so the gate commit actually starts the
+    consume -> delivery, not just leaves a passive queue entry. Wholly best-effort: any failure is
+    swallowed — the gate is already recorded on Redmine (the durable authority), and the supervisor's
+    bounded reconciliation recovers a lost wake.
+    """
+    ws = _resolve_workspace_id(args)
+    iss = str(issue or "").strip()
+    if not ws or not iss:
+        return
+    try:
+        from mozyo_bridge.core.state.supervisor_wake import SupervisorWakeStore
+
+        SupervisorWakeStore().enqueue(ws, iss)
+    except Exception:  # noqa: BLE001 - a wake emit never fails an already-recorded gate
+        pass
+    _activate_supervisor_process()
+
+
 def _watch_sender_attested(args: argparse.Namespace) -> bool:
     """Whether the launch-time coordinator sender identity is attested for a managed watcher.
 
@@ -483,6 +534,13 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         if receipt.location:
             lines.append(f"location: {receipt.location}")
         _emit(payload, as_json=as_json, text_lines=lines)
+        # #13683 review R1-F2: the canonical gate writer is the PRIMARY supervisor trigger — after a
+        # gate is RECORDED, emit a best-effort local wake for (workspace, issue) so the workspace
+        # callback supervisor re-reads that issue without waiting for the reconciliation interval.
+        # Best-effort: a wake-store failure never fails the (already-recorded) gate; a lost wake is
+        # recovered by the supervisor's bounded reconciliation.
+        if receipt.recorded:
+            _best_effort_emit_supervisor_wake(args, issue)
         # #13520 review R2-F1: fail-closed at the PROCESS gate too — a not-recorded gate (opt-in
         # unset / transport failure) must NOT exit 0, so a caller that reads only the return code
         # can never treat an un-written gate as recorded. The structured receipt still prints above.

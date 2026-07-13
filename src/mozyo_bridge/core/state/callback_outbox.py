@@ -125,6 +125,14 @@ class CallbackOutboxRow:
     payload: str
     claim_token: str = ""
     workspace_id: str = ""
+    #: The durable intended-target tuple (Redmine #13683 review R4-F2): the row's expected delivery
+    #: ``lane`` / ``receiver`` (binding-resolved provider) and a ``generation`` / correlation seam.
+    #: The background_service delivery authority binds the re-resolved live target to these, so a
+    #: wrong lane / receiver / unknown generation fails closed. ``target_generation`` is the seam
+    #: #13684's correlated review-result routing populates.
+    target_lane: str = ""
+    target_receiver: str = ""
+    target_generation: str = ""
 
     @property
     def key(self) -> CallbackOutboxKey:
@@ -155,6 +163,9 @@ class CallbackOutboxRow:
             "payload": self.payload,
             "claim_token": self.claim_token,
             "workspace_id": self.workspace_id,
+            "target_lane": self.target_lane,
+            "target_receiver": self.target_receiver,
+            "target_generation": self.target_generation,
         }
 
 
@@ -174,7 +185,8 @@ class CallbackEnqueueResult:
 _SELECT = (
     "SELECT source, issue, journal, normalized_gate, callback_route, state, "
     "attempts, max_attempts, send_attempted, notification_kind, "
-    "notification_summary, gate_mismatch, detail, payload, claim_token, workspace_id "
+    "notification_summary, gate_mismatch, detail, payload, claim_token, workspace_id, "
+    "target_lane, target_receiver, target_generation "
     "FROM callback_outbox"
 )
 
@@ -197,6 +209,9 @@ def _row(r: tuple) -> CallbackOutboxRow:
         payload=r[13],
         claim_token=r[14] if len(r) > 14 else "",
         workspace_id=r[15] if len(r) > 15 else "",
+        target_lane=r[16] if len(r) > 16 else "",
+        target_receiver=r[17] if len(r) > 17 else "",
+        target_generation=r[18] if len(r) > 18 else "",
     )
 
 
@@ -274,6 +289,9 @@ class CallbackOutbox:
         max_attempts: int = CALLBACK_DEFAULT_MAX_ATTEMPTS,
         detail: str = "",
         payload: str = "",
+        target_lane: str = "",
+        target_receiver: str = "",
+        target_generation: str = "",
         cursor_source: Optional[str] = None,
         cursor: Optional[str] = None,
         now: Optional[str] = None,
@@ -308,8 +326,8 @@ class CallbackOutbox:
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT state FROM callback_outbox WHERE source=? AND issue=? AND journal=? "
-                "AND normalized_gate=? AND callback_route=? AND workspace_id=?",
+                "SELECT state, target_receiver FROM callback_outbox WHERE source=? AND issue=? "
+                "AND journal=? AND normalized_gate=? AND callback_route=? AND workspace_id=?",
                 key.as_row(),
             ).fetchone()
             if existing is None:
@@ -322,8 +340,8 @@ class CallbackOutbox:
                     "INSERT INTO callback_outbox (source, issue, journal, normalized_gate, "
                     "callback_route, workspace_id, state, attempts, max_attempts, send_attempted, "
                     "notification_kind, notification_summary, gate_mismatch, detail, payload, "
-                    "seq, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "target_lane, target_receiver, target_generation, seq, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(workspace_id, source, issue, journal, normalized_gate, callback_route) "
                     "DO NOTHING",
                     (
@@ -335,6 +353,9 @@ class CallbackOutbox:
                         1 if gate_mismatch else 0,
                         detail,
                         payload,
+                        str(target_lane or ""),
+                        str(target_receiver or ""),
+                        str(target_generation or ""),
                         next_seq,
                         stamp,
                         stamp,
@@ -345,6 +366,26 @@ class CallbackOutbox:
             else:
                 current = str(existing[0])
                 inserted = False
+                # R5-F2 backfill: a row created before the target tuple (schema migration / an
+                # earlier ingest that could not resolve it) gets its UNSET expectation atomically
+                # backfilled from this ingest — only when the persisted receiver is blank AND this
+                # ingest supplies one, and touching nothing else (state / attempts / claim / a
+                # terminal row are never reset). The ``target_receiver=''`` guard makes it a no-op
+                # once a tuple is set, so a set expectation is never overwritten.
+                if not str(existing[1] or "").strip() and str(target_receiver or "").strip():
+                    conn.execute(
+                        "UPDATE callback_outbox SET target_lane=?, target_receiver=?, "
+                        "target_generation=?, updated_at=? WHERE source=? AND issue=? AND journal=? "
+                        "AND normalized_gate=? AND callback_route=? AND workspace_id=? "
+                        "AND target_receiver=''",
+                        (
+                            str(target_lane or ""),
+                            str(target_receiver or ""),
+                            str(target_generation or ""),
+                            stamp,
+                            *key.as_row(),
+                        ),
+                    )
             if cursor_source is not None and cursor is not None:
                 conn.execute(
                     "INSERT INTO callback_cursor (source, cursor, updated_at) VALUES (?, ?, ?) "
@@ -718,6 +759,59 @@ class CallbackOutbox:
             return str(row[0]) if row is not None else CALLBACK_ABSENT
         finally:
             conn.close()
+
+    def verify_claim(
+        self,
+        key: CallbackOutboxKey,
+        claim_token: str,
+        *,
+        now: Optional[str] = None,
+        stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
+    ) -> bool:
+        """Confirm ``claim_token`` still owns the row AND its claim lease has not expired (read-only).
+
+        Redmine #13683 review R3-F4: a background-service authority must re-verify its outbox claim
+        against the durable store immediately before delivery — a non-empty ``claim_token`` on an
+        in-memory row is not proof it is still the current owner. This reads the persisted
+        ``claim_token`` + ``claimed_at`` for the key and returns True only when (a) the token matches
+        the persisted one (still ours — not recovered + re-claimed elsewhere) AND (b) ``claimed_at``
+        is within the lease window (not a stale claim eligible for recovery). A blank token, a
+        missing row, or an unreadable / never-migrated store returns False (fail-closed).
+        """
+        token = str(claim_token or "").strip()
+        if not token:
+            return False
+        self._ensure_migrated_if_exists()
+        conn = self._connect_ro()
+        if conn is None:
+            return False
+        try:
+            if not self._table_present(conn):
+                return False
+            row = conn.execute(
+                "SELECT claim_token, claimed_at FROM callback_outbox WHERE source=? AND issue=? "
+                "AND journal=? AND normalized_gate=? AND callback_route=? AND workspace_id=?",
+                key.as_row(),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return False
+        persisted_token = str(row[0] or "")
+        claimed_at = str(row[1] or "")
+        if persisted_token != token:
+            return False  # recovered + re-claimed elsewhere (de-owned)
+        # The lease is live iff claimed_at is at/after the stale cutoff (both ISO-8601 UTC-second, so
+        # a lexicographic compare is chronological). A blank claimed_at is treated as stale.
+        if not claimed_at:
+            return False
+        base = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        cutoff = (base - timedelta(seconds=int(stale_seconds))).astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return claimed_at > cutoff
 
     def read_cursor(self, source: str) -> Optional[str]:
         """Return the persisted cursor token for ``source``, or ``None`` if unset."""

@@ -86,6 +86,12 @@ class CallbackCandidate:
     #: so a shared home DB partitions rows / claims by workspace. Default ``""`` is the legacy /
     #: single-workspace bucket; the production watcher supplies its attested workspace id.
     workspace_id: str = ""
+    #: The durable intended-target tuple (#13683 review R4-F2): the expected delivery ``lane`` /
+    #: ``receiver`` (binding-resolved provider) + a ``generation`` / correlation seam, recorded on
+    #: the outbox row so the background_service delivery authority binds the live target to it.
+    target_lane: str = ""
+    target_receiver: str = ""
+    target_generation: str = ""
 
 
 @dataclass(frozen=True)
@@ -283,6 +289,9 @@ class CallbackOutboxProcessor:
                     if classification.mismatch
                     else "",
                     payload=candidate.payload,
+                    target_lane=candidate.target_lane,
+                    target_receiver=candidate.target_receiver,
+                    target_generation=candidate.target_generation,
                     cursor_source=self._source_name,
                     cursor=cursor,
                     now=now,
