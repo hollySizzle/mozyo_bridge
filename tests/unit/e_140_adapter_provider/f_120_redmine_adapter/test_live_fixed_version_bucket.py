@@ -48,8 +48,12 @@ from mozyo_bridge.redmine_context import API_KEY_ENV, BASE_URL_ENV
 
 _HOST = "https://redmine.example"
 _PROJECT = "giken-3800-mozyo-bridge"
+#: The numeric id the declared identifier resolves to. The Issues REST filter takes this,
+#: never the identifier (R1-F1 j#76747).
+_PROJECT_ID = 38
 _HOME = Path("/nonexistent-home-for-test")
 _ENV = {BASE_URL_ENV: _HOST, API_KEY_ENV: "k"}
+_UNSET = object()
 
 
 class _FakeResponse:
@@ -64,9 +68,22 @@ class _FakeResponse:
 
 
 class _RouteOpener:
-    """Routes a request to the canned versions / issues payload and records every call."""
+    """Routes a request to the canned project / versions / issues payload, recording calls."""
 
-    def __init__(self, *, versions: object = None, issues: object = None):
+    def __init__(
+        self,
+        *,
+        project: object = _UNSET,
+        versions: object = None,
+        issues: object = None,
+    ):
+        # The project read defaults to a well-formed project so a test that only cares
+        # about the version / issue legs does not have to restate it.
+        self._project = (
+            {"project": {"id": _PROJECT_ID, "identifier": _PROJECT}}
+            if project is _UNSET
+            else project
+        )
         self._versions = versions
         self._issues = issues
         self.requests: list[object] = []
@@ -74,7 +91,12 @@ class _RouteOpener:
     def __call__(self, request, timeout):
         self.requests.append(request)
         path = urllib.parse.urlparse(request.full_url).path
-        payload = self._versions if path.endswith("/versions.json") else self._issues
+        if path.endswith("/versions.json"):
+            payload = self._versions
+        elif path.startswith("/projects/"):
+            payload = self._project
+        else:
+            payload = self._issues
         if isinstance(payload, Exception):
             raise payload
         return _FakeResponse(payload)
@@ -142,7 +164,7 @@ class LiveBucketReadTest(unittest.TestCase):
             **kwargs,
         )
 
-    def test_reads_project_scoped_versions_then_project_scoped_issues(self) -> None:
+    def test_resolves_the_numeric_project_id_then_reads_versions_and_issues(self) -> None:
         opener = _RouteOpener(
             versions=_versions_payload({"id": 292, "name": "枠", "status": "open"}),
             issues=_issues_payload(_issue(1), _issue(2, parent=1)),
@@ -150,22 +172,50 @@ class LiveBucketReadTest(unittest.TestCase):
         live = self._read(opener, bucket_id="292")
 
         self.assertEqual(live.project_identifier, _PROJECT)
+        self.assertEqual(live.project_id, _PROJECT_ID)
         self.assertEqual(live.version_id, "292")
         self.assertEqual(live.version_name, "枠")
+        # The identifier is only good for the two project *path* segments; the issues
+        # filter needs the numeric id, so it is resolved first.
         self.assertEqual(
             opener.paths,
-            [f"/projects/{_PROJECT}/versions.json", "/issues.json"],
+            [
+                f"/projects/{_PROJECT}.json",
+                f"/projects/{_PROJECT}/versions.json",
+                "/issues.json",
+            ],
         )
-        # The issues read is project-scoped: a *shared* Version must not pull in another
-        # project's issues (j#76650 step 4).
-        issues_query = opener.query_of(1)
-        self.assertEqual(issues_query["project_id"], _PROJECT)
+        # R1-F1 (j#76747): the Issues REST contract takes a NUMERIC project id, not an
+        # identifier. Sending the identifier here would leave the "no other project's
+        # issues" guarantee resting on undocumented server permissiveness.
+        issues_query = opener.query_of(2)
+        self.assertEqual(issues_query["project_id"], str(_PROJECT_ID))
+        self.assertNotEqual(issues_query["project_id"], _PROJECT)
         self.assertEqual(issues_query["fixed_version_id"], "292")
         self.assertEqual(issues_query["status_id"], "*")
-        # Read-only: both calls are GETs with no body.
+        # Read-only: every call is a GET with no body.
         for request in opener.requests:
             self.assertEqual(request.get_method(), "GET")
             self.assertIsNone(request.data)
+
+    def test_shared_version_owner_project_is_not_used_as_the_scope(self) -> None:
+        # A *shared* Version's embedded `project` is the project that OWNS it, which need
+        # not be the project being scoped. Scoping the issues read to it would plan against
+        # the wrong project's issues, so the id must come from the project read.
+        opener = _RouteOpener(
+            versions=_versions_payload(
+                {
+                    "id": 292,
+                    "name": "枠",
+                    "status": "open",
+                    "project": {"id": 99, "name": "owner-project"},
+                }
+            ),
+            issues=_issues_payload(_issue(1)),
+        )
+        live = self._read(opener, bucket_id="292")
+        self.assertEqual(live.project_id, _PROJECT_ID)
+        self.assertEqual(opener.query_of(2)["project_id"], str(_PROJECT_ID))  # not "99"
 
     def test_pure_provider_resolves_the_bucket_and_leaf_rule_is_reused(self) -> None:
         opener = _RouteOpener(
@@ -251,6 +301,23 @@ class BlockedReadTest(unittest.TestCase):
         )
         self.assertEqual(opener.requests, [])
 
+    def test_unresolvable_project_id_blocks_before_the_version_read(self) -> None:
+        # Without a numeric project id there is no documented way to scope the issues
+        # read, so the whole live read blocks rather than fall back to the identifier.
+        for project in (
+            {"project": {"id": 38, "identifier": "some-other-project"}},  # mismatch
+            {"project": {"identifier": _PROJECT}},  # no id
+            {"project": {"id": "38", "identifier": _PROJECT}},  # not numeric
+            {"project": {"id": True, "identifier": _PROJECT}},  # bool
+            {"project": {"id": 0, "identifier": _PROJECT}},  # non-positive
+        ):
+            with self.subTest(project=project):
+                opener = _RouteOpener(project=project)
+                reason = self._block(opener, bucket_id="292")
+                self.assertEqual(reason, LIVE_PROJECT_UNRESOLVED)
+                # Blocked at the project read: no version or issue read happens.
+                self.assertEqual(len(opener.requests), 1)
+
     def test_version_not_visible_to_the_project_blocks(self) -> None:
         # A Version id belonging to another project is not in this project's list: a
         # block, never a silent cross-project read or an empty bucket.
@@ -259,7 +326,7 @@ class BlockedReadTest(unittest.TestCase):
         )
         reason = self._block(opener, bucket_id="999")
         self.assertEqual(reason, LIVE_VERSION_NOT_FOUND)
-        self.assertEqual(len(opener.requests), 1)  # versions read only; no issues read
+        self.assertEqual(len(opener.requests), 2)  # project + versions; no issues read
 
     def test_unknown_version_name_blocks(self) -> None:
         opener = _RouteOpener(
@@ -290,12 +357,16 @@ class BlockedReadTest(unittest.TestCase):
                 reason = self._block(opener, bucket_id="292")
                 self.assertEqual(reason, LIVE_VERSION_NOT_OPEN)
                 # Blocked at the status gate: the issues read never happens.
-                self.assertEqual(len(opener.requests), 1)
+                self.assertEqual(len(opener.requests), 2)  # project + versions only
 
     def test_no_selector_blocks(self) -> None:
         self.assertEqual(self._block(_RouteOpener()), LIVE_VERSION_NOT_FOUND)
 
-    def test_transport_failure_on_either_read_blocks(self) -> None:
+    def test_transport_failure_on_any_of_the_three_reads_blocks(self) -> None:
+        project_down = _RouteOpener(project=urllib.error.URLError("down"))
+        self.assertEqual(
+            self._block(project_down, bucket_id="292"), READ_TRANSPORT_ERROR
+        )
         versions_down = _RouteOpener(versions=urllib.error.URLError("down"))
         self.assertEqual(
             self._block(versions_down, bucket_id="292"), READ_TRANSPORT_ERROR

@@ -30,10 +30,13 @@ Credential boundary (reused verbatim from ``redmine_context`` / review #56232):
   ``redmine_read_transport.no_redirect_read``, so a 30x from the trusted base can
   never carry ``X-Redmine-API-Key`` to the ``Location`` host. The refusal surfaces as
   ``transport_error`` — an unreadable Version, never an empty one.
-- an optional ``project_id`` scopes the read (``GET /issues.json?project_id=<id>``).
-  Redmine Versions can be **shared** across projects, so an unscoped
-  ``fixed_version_id`` read can return another project's issues; the governed live
-  dispatch path always scopes it, while the legacy ``--live`` debug caller does not.
+- an optional ``project_id`` scopes the read (``GET /issues.json?project_id=<numeric id>``).
+  Redmine Versions can be **shared** across projects, so an unscoped ``fixed_version_id``
+  read can return another project's issues; the governed live dispatch path always scopes
+  it, while the legacy ``--live`` debug caller does not. The Issues REST contract requires
+  this filter to be a **numeric project id, not a project identifier**
+  (https://www.redmine.org/projects/redmine/wiki/Rest_Issues); callers resolve the id via
+  the Projects endpoint (see ``redmine_project_source``) rather than passing a slug.
 
 Fail-closed posture (#12923 acceptance — live-read absence must never be read as
 an *empty* Version):
@@ -152,9 +155,10 @@ class LiveRedmineVersionIssueSource:
         self._base_url = normalize_base_url(base_url)
         # A Redmine Version can be *shared* across projects, so a bare
         # fixed_version_id read can return issues belonging to other projects.
-        # ``project_id`` (an identifier or numeric id) scopes the read to the one
-        # project the caller declared (#13687 j#76650). ``None`` keeps the
-        # pre-existing unscoped read for the snapshot/debug ``--live`` caller.
+        # ``project_id`` scopes the read to the one project the caller declared
+        # (#13687 j#76650). It must be the project's NUMERIC id — the Issues REST
+        # contract does not accept a project identifier here (R1-F1 j#76747).
+        # ``None`` keeps the pre-existing unscoped read for the ``--live`` debug caller.
         self._project_id = (project_id or "").strip() or None
         self._timeout = timeout
         self._page_limit = max(1, page_limit)
@@ -313,10 +317,10 @@ def live_version_issue_source_from_env(
     here: it surfaces as an explicit :class:`RedmineVersionReadUnavailable`
     (``provider_unavailable`` / ``credential_missing``) when
     ``read_version_issues`` is finally called, which is more informative than a
-    silent ``None``. ``project_id`` (optional) scopes the read to one project so a
-    shared Version cannot pull in another project's issues (#13687); omitted, the
-    read stays unscoped as before. ``environ`` / ``home`` / ``opener`` are
-    injectable for hermetic tests.
+    silent ``None``. ``project_id`` (optional) is the project's **numeric** id and
+    scopes the read to one project so a shared Version cannot pull in another
+    project's issues (#13687); omitted, the read stays unscoped as before.
+    ``environ`` / ``home`` / ``opener`` are injectable for hermetic tests.
     """
     creds = resolve_redmine_credentials(home, environ=environ)
     return LiveRedmineVersionIssueSource(

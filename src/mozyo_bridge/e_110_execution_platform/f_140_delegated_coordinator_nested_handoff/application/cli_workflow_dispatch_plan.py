@@ -503,15 +503,18 @@ def register_dispatch_plan(workflow_sub) -> None:
         default=False,
         help=(
             "Read the bucket live and read-only from the trusted Redmine (#13687): the "
-            "project's versions (GET /projects/<identifier>/versions.json) and the "
-            "selected Version's issues (GET /issues.json?project_id=<identifier>&"
-            "fixed_version_id=<id>&status_id=*), using MOZYO_REDMINE_URL / "
-            "MOZYO_REDMINE_API_KEY or the home credential file. The project identifier "
-            "and its declared host come from the repo's project defaults and the host "
-            "must match the trusted credential host. Stricter than snapshot mode and "
-            "fail-closed with exit 2: a credential/host/transport failure, a Version not "
-            "available to the project, an ambiguous name, or a Version not confirmed "
-            "'open' is a BLOCKED read, never an empty plan. Requires --bucket-source "
+            "project's numeric id (GET /projects/<identifier>.json), its versions "
+            "(GET /projects/<identifier>/versions.json) and the selected Version's issues "
+            "(GET /issues.json?project_id=<numeric id>&fixed_version_id=<id>&status_id=*, "
+            "which the Issues REST contract requires to be a numeric id, not an "
+            "identifier), using MOZYO_REDMINE_URL / MOZYO_REDMINE_API_KEY or the home "
+            "credential file. The project identifier and its declared host come from the "
+            "repo's project defaults and the host must match the trusted credential host. "
+            "Stricter than snapshot mode and "
+            "fail-closed with exit 2: a credential/host/transport failure, an unresolvable "
+            "project id, a Version not available to the project, an ambiguous name, or a "
+            "Version not confirmed 'open' is a BLOCKED read, never an empty plan. "
+            "Requires --bucket-source "
             "fixed-version; performs no write, no actuation and no handoff."
         ),
     )
