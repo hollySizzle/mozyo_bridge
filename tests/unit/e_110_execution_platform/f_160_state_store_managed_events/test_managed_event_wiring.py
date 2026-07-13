@@ -22,6 +22,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from tests.support.agent_provider_binaries import with_provider_path
+
 from mozyo_bridge.managed_events import KIND_CREATED, ManagedEventLog
 
 
@@ -43,8 +45,15 @@ class CommandBoundaryAppendTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name) / "home"
+        # These boundaries build a real launch command, which since #13441 resolves the
+        # provider's executable from the trusted env. Inject a hermetic PATH (and blank
+        # any inherited trusted override) so the test never depends on a `claude` binary
+        # existing on the host — the exact dependency that turned CI red on every matrix
+        # while passing locally (review R1-F4).
         env_patch = patch.dict(
-            "os.environ", {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+            "os.environ",
+            with_provider_path({"MOZYO_BRIDGE_HOME": str(self.home)}),
+            clear=False,
         )
         env_patch.start()
         self.addCleanup(env_patch.stop)

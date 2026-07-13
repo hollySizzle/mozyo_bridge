@@ -1734,14 +1734,63 @@ fails closed rather than mis-driving a pane. This is the same "Why Not Arbitrary
 Plugin Yet" posture as the rest of this document: no external plugin API, no third-party
 module load, no arbitrary script as a trusted provider.
 
+### Whole-plan preflight (the fail-closed boundary)
+
+Resolution is **not** lazy. `preflight_launch_providers` resolves EVERY provider that a
+run will launch — profile, protocol, capability, trusted executable, managed policy —
+before the first side effect (`workspace create` / `tab create` / `agent start`). Only
+`launch` plans are preflighted, so an adopt-only or dry-run session still needs no
+provider binary (byte-invariant).
+
+This is a hard requirement, not a nicety, and it was violated in the first cut (review
+R1-F1): resolving inside each slot's builder meant a `(codex, claude)` pair created the
+workspace, created the tab, and **started codex** before discovering claude's binary was
+missing — leaving a live agent in a partial lane. The permission-mode policy already held
+this invariant (j#73404); executable resolution now holds it too. The argv builder is pure
+and takes a pre-resolved `ResolvedProviderLaunch`, so it *cannot* fail after a sibling has
+started.
+
+### Managed flags are spelled by data, at every chokepoint
+
+The managed-flag concept (`permission_mode`) is core-owned; its **spelling** is profile
+data. Both launch chokepoints — the tmux command string and the herdr argv builder —
+resolve the spelling and the provider's applicability from the profile
+(`managed_permission_mode` capability), so renaming a flag in the packaged YAML moves
+every renderer with no source edit, and a capable new provider gets its own flag.
+
+The first cut only converted the herdr builder and left the tmux path with a literal
+`--permission-mode` and an `agent != "claude"` gate (review R1-F2), which meant a data
+rename silently moved one path and not the other. A partial conversion is worse than none:
+it makes the data *look* authoritative while the real launch ignores it.
+
+### Identity vocabulary is fail-closed
+
+A profile may not claim the core sentinel `unknown` (the resolvers' "no provider
+identified" outcome) as a `provider_id` or `discovery_alias`, may not claim a
+receiver-agnostic host process (`node` — both CLIs are Node programs, so it names a
+runtime, not a provider), and process names are **exact-one** across providers (a
+duplicate is a load-time error, like discovery aliases — otherwise the consumer map
+silently resolves last-wins). The built-in data happened to satisfy all three; that was a
+coincidence of the data, not an invariant, so it is enforced (review R1-F3).
+
+### Tests must not depend on a host provider binary
+
+Provider resolution reads the trusted environment, so a test that does not inject one
+resolves the *developer's* binary. That made the first cut's "full suite green" a
+host-dependent result while CI — which has no `claude` at all — was red on every matrix
+(review R1-F4). Every launch test now injects a hermetic executable + `PATH` (and blanks
+the trusted overrides, which beat `PATH`) via `tests/support/agent_provider_binaries.py`.
+The standing gate is: the suite must pass with **no provider binary on `PATH`** and with
+the trusted overrides poisoned.
+
 ### Increment 1 scope
 
 In scope: the schema / packaged built-ins / loader / validator, the trusted executable
-resolver, and the bounded consumers (launch argv, managed reserved concepts, discovery
-vocabulary). Out of scope (a later increment): the handoff / status / doctor / retire
-consumer sweep, the `workflow_step_herdr` role-authority redesign (that stays #13583
-`provider_binding` authority — a role is never derived from a provider profile), and
-default pair / topology assignment.
+resolver, the whole-plan preflight, and the bounded consumers (launch argv, managed
+reserved concepts, discovery vocabulary). Out of scope (a later increment): the handoff /
+status / doctor / retire consumer sweep, the `workflow_step_herdr` role-authority redesign
+(that stays #13583 `provider_binding` authority — a role is never derived from a provider
+profile), and default pair / topology assignment.
 
 ## Follow-up Split
 

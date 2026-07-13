@@ -27,7 +27,11 @@ if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
 from support.herdr_fake import FakeHerdr
-from support.agent_provider_binaries import DEFAULT_PROVIDER_COMMANDS, FakeAgentBinaries
+from support.agent_provider_binaries import (
+    DEFAULT_PROVIDER_COMMANDS,
+    FakeAgentBinaries,
+    neutralized_overrides,
+)
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
@@ -64,8 +68,20 @@ atexit.register(shutil.rmtree, PROVIDER_BINS.bin_dir.parent, True)
 
 
 def _launch_env(binpath, **extra):
-    """The trusted launch env: the herdr binary plus a PATH of hermetic provider stubs."""
-    return {HERDR_ENV: str(binpath), "PATH": str(PROVIDER_BINS.bin_dir), **extra}
+    """The trusted launch env: the herdr binary plus a PATH of hermetic provider stubs.
+
+    The provider trusted-override vars are blanked (empty == unset): a scenario that
+    merges this into `os.environ` with `clear=False` would otherwise inherit an ambient
+    override, which BEATS PATH and would resolve someone else's binary. Same isolation
+    reason as the `MOZYO_CLAUDE_PERMISSION_MODE` pop below (review j#74373), applied to
+    the #13441 executable rail.
+    """
+    return {
+        HERDR_ENV: str(binpath),
+        "PATH": str(PROVIDER_BINS.bin_dir),
+        **neutralized_overrides(),
+        **extra,
+    }
 
 
 def _launched_provider(start_argv):

@@ -147,6 +147,23 @@ FORBIDDEN_PROFILE_TOKENS: frozenset[str] = frozenset(
     }
 ) | FORBIDDEN_PROVIDER_AUTHORITIES
 
+#: Core-owned identity sentinels a profile may never claim as a ``provider_id`` or a
+#: ``discovery_alias`` (Redmine #13441 review R1-F3). ``unknown`` is the *outcome* the
+#: role resolvers return when no provider is identified (``AGENT_KIND_UNKNOWN``); a
+#: profile registering it would make "unidentified" indistinguishable from a real
+#: provider and let an unresolved pane resolve to one. The built-in data happens not to
+#: use these names — but that is a coincidence of the data, not an invariant, so it is
+#: enforced here rather than assumed.
+RESERVED_IDENTITY_TOKENS: frozenset[str] = frozenset({"unknown"})
+
+#: Process basenames that identify a *host runtime*, not a provider, and so may never
+#: appear in a profile's ``process_names`` (Redmine #13441 review R1-F3). Both built-in
+#: CLIs are Node programs, so a ``node`` process is receiver-agnostic: claiming it would
+#: let ANY node process be identified as that provider and mis-resolve a pane's role.
+#: ``pane_resolver`` keeps ``node`` as a weak *agent-process* hint precisely because it
+#: cannot name a role; a profile must not be able to give it one.
+RECEIVER_AGNOSTIC_PROCESSES: frozenset[str] = frozenset({"node"})
+
 #: Executable-metadata keys a profile may carry. Deliberately *not* here: any key
 #: that could carry a host path, an argv, a module path, an entry point, or a
 #: callable. A profile names a command basename and a trusted-env override
@@ -183,6 +200,17 @@ def _reject_forbidden_token(token: str, *, field: str, provider_id: str) -> None
             f"{field}: workflow role, provider binding, routing / gate / approval "
             f"authority, and default launch topology stay core-owned and are never "
             f"declared by a provider profile (Redmine #13441 j#76725)"
+        )
+
+
+def _reject_reserved_identity(token: str, *, field: str, provider_id: str) -> None:
+    """Fail closed when a profile claims a core identity sentinel (R1-F3)."""
+    if token in RESERVED_IDENTITY_TOKENS:
+        raise AgentProviderProfileError(
+            f"agent provider profile {provider_id!r} may not claim the reserved core "
+            f"identity token {token!r} in {field}: it is the sentinel the role resolvers "
+            f"return for an UNidentified agent, so a provider claiming it would make "
+            f"'no provider identified' resolve to a real provider"
         )
 
 
@@ -320,6 +348,22 @@ class AgentProviderProfile:
         _reject_forbidden_token(
             self.provider_id, field="provider_id", provider_id=self.provider_id
         )
+        _reject_reserved_identity(
+            self.provider_id, field="provider_id", provider_id=self.provider_id
+        )
+        for alias in self.discovery_aliases:
+            _reject_reserved_identity(
+                alias, field="discovery_aliases", provider_id=self.provider_id
+            )
+        for process in self.process_names:
+            if process in RECEIVER_AGNOSTIC_PROCESSES:
+                raise AgentProviderProfileError(
+                    f"agent provider profile {self.provider_id!r} may not claim the "
+                    f"receiver-agnostic host process {process!r} in process_names: both "
+                    f"built-in CLIs run on it, so it identifies a runtime, not a "
+                    f"provider — claiming it would let any such process be resolved as "
+                    f"this provider (Redmine #13441 R1-F3)"
+                )
         if not isinstance(self.protocol, InteractionProtocol):
             raise AgentProviderProfileError(
                 f"agent provider profile {self.provider_id!r} 'protocol' must be an "
@@ -564,6 +608,28 @@ class AgentProviderProfileRegistry:
             names.update(profile.process_names)
         return frozenset(names)
 
+    def process_owners(self) -> dict[str, str]:
+        """``{process basename: provider_id}``, exact-one across providers.
+
+        A process basename claimed by two providers is rejected (Redmine #13441 review
+        R1-F3). Consumers build a ``{process: provider}`` lookup from these profiles, so
+        a duplicate would silently resolve **last-wins** — a pane running provider A's
+        process would be identified as provider B purely by registration order. Discovery
+        that guesses is exactly what the fail-closed posture forbids, so this is an error
+        at load, not a silent pick.
+        """
+        owners: dict[str, str] = {}
+        for profile in self.profiles():
+            for process in profile.process_names:
+                if process in owners and owners[process] != profile.provider_id:
+                    raise AgentProviderProfileError(
+                        f"process name {process!r} is claimed by both "
+                        f"{owners[process]!r} and {profile.provider_id!r}; a duplicate "
+                        f"would make process-based role resolution last-wins"
+                    )
+                owners[process] = profile.provider_id
+        return owners
+
     def discovery_aliases(self) -> dict[str, str]:
         """``{alias: provider_id}`` over every declared discovery alias.
 
@@ -660,14 +726,18 @@ class AgentProviderProfileConfig:
         registry = AgentProviderProfileRegistry()
         for profile in self.profiles:
             registry.register(profile)
-        # Force the ambiguity check now, at load, rather than at the first
-        # discovery call on a live pane.
+        # Force BOTH ambiguity checks now, at load, rather than at the first discovery
+        # call on a live pane. Checking only aliases (the pre-R1-F3 shape) left the
+        # process-name axis silently last-wins.
         registry.discovery_aliases()
+        registry.process_owners()
         return registry
 
 
 __all__ = (
     "AGENT_PROVIDER_PROFILE_RESOURCE",
+    "RECEIVER_AGNOSTIC_PROCESSES",
+    "RESERVED_IDENTITY_TOKENS",
     "AgentCapability",
     "AgentProviderProfile",
     "AgentProviderProfileConfig",

@@ -552,8 +552,9 @@ class BootstrapInjectionTest(unittest.TestCase):
                     # their shell (#11925 override rail) to keep this test
                     # hermetic regardless of the launching environment.
                     "MOZYO_CLAUDE_PERMISSION_MODE": "",
-                    # #13441: argv[0] resolves from the trusted PATH.
-                    "PATH": str(SHARED_PROVIDER_BINS.bin_dir),
+                    # #13441: argv[0] resolves from the trusted PATH; blank any inherited
+                    # trusted override so the fixture PATH is authoritative (R1-F4).
+                    **with_provider_path(),
                 },
                 clear=False,
             ), \

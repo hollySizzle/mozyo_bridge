@@ -128,7 +128,7 @@ from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
     InvalidPermissionMode,
-    resolve_claude_permission_mode,
+    permission_mode_argv,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
@@ -174,6 +174,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     build_agent_start_argv,
     resolve_attest_launcher,
+)
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
+    ResolvedProviderLaunch,
+    preflight_launch_providers,
+)
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
+    AgentProviderProfileError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _close_base_pane,
@@ -387,17 +394,18 @@ def prepare_session(
                 "once — remove the duplicate `--agent` argument"
             )
         seen_slots.add(slot)
-    # Resolve (and validate) the Claude permission policy BEFORE any side effect
-    # (review j#73404): the lane chokepoint requests (codex, claude), so a
-    # validation that only fires inside the claude slot's launch would leave the
-    # codex gateway already started — a partial lane — when the env override is
-    # invalid. Resolving once up front fails closed with zero workspace create /
-    # agent start, and `_execute_slot` receives the resolved mode verbatim.
-    claude_permission_mode: Optional[str] = None
-    if "claude" in providers:
+    # Validate the managed permission policy BEFORE any side effect (review j#73404):
+    # the lane chokepoint requests (codex, claude), so a validation that only fires
+    # inside the claude slot's launch would leave the codex gateway already started — a
+    # partial lane — when the env override is invalid. Applicability is now data-driven
+    # (#13441 R1-F2): every requested provider is asked, and one answers only if its
+    # profile declares the managed permission concept. Validating here (rather than only
+    # in the launch preflight below) keeps an invalid override fail-closed even on an
+    # adopt-only run, exactly as before.
+    for provider in providers:
         try:
-            claude_permission_mode = resolve_claude_permission_mode(
-                "claude", policy_default=claude_permission_mode_default, env=env
+            permission_mode_argv(
+                provider, policy_default=claude_permission_mode_default, env=env
             )
         except InvalidPermissionMode as exc:
             raise HerdrSessionStartError(str(exc)) from exc
@@ -525,6 +533,30 @@ def prepare_session(
         else:
             plans.append(_SlotPlan(provider, assigned_name, "launch"))
 
+    # Whole-plan launch preflight — the LAST point before any herdr write (#13441 review
+    # R1-F1). Every provider that will actually be launched has its profile, protocol,
+    # capability, trusted executable, and managed policy resolved HERE, so a provider that
+    # cannot be resolved aborts the run with zero `workspace create`, zero `tab create`,
+    # and zero `agent start`. Resolving lazily inside each slot's builder (the pre-R1-F1
+    # shape) meant a (codex, claude) pair created the workspace, created the tab, and
+    # started codex before discovering that claude's binary was missing — leaving a live
+    # agent in a partial lane. This is the same invariant the permission-mode validation
+    # above already held (j#73404); executable resolution now holds it too.
+    #
+    # Only `launch` plans are preflighted: an adopt-only / dry-run session starts no
+    # process, so it must not begin to require a resolvable provider binary that the
+    # pre-#13441 code never needed (byte-invariant for adopt / dry-run).
+    try:
+        resolved_launches = preflight_launch_providers(
+            [plan.provider for plan in plans if plan.kind == "launch"],
+            env,
+            permission_mode_default=claude_permission_mode_default,
+        )
+    except AgentProviderProfileError as exc:
+        # Includes AgentProviderExecutableError (unknown / undrivable / missing /
+        # ambiguous / unsafe-PATH). Re-raised on this module's fail-closed boundary.
+        raise HerdrSessionStartError(str(exc)) from exc
+
     # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
     # to launch (all adopt / dry-run) means no workspace create and no reclaim —
     # byte-invariant. Placement is lane-aware (#13380 dedicated sublane host): a
@@ -647,7 +679,7 @@ def prepare_session(
                 env=env,
                 runner=runner,
                 timeout=timeout,
-                claude_permission_mode=claude_permission_mode,
+                resolved=resolved_launches.get(plan.provider),
                 launch_argv_extra=launch_argv_extra,
                 order_deferred=order_deferred,
             )
@@ -692,7 +724,7 @@ def _execute_slot(
     env: Mapping[str, str],
     runner: Runner,
     timeout: float,
-    claude_permission_mode: Optional[str] = None,
+    resolved: Optional[ResolvedProviderLaunch] = None,
     launch_argv_extra: Sequence[str] = (),
     order_deferred: bool = False,
 ) -> SlotResult:
@@ -766,9 +798,8 @@ def _execute_slot(
         binary=binary,
         attest_launcher=attest_launcher,
         store_home=store_home,
-        claude_permission_mode=claude_permission_mode,
+        resolved=resolved,
         launch_argv_extra=launch_argv_extra,
-        env=env,
     )
     started = _invoke(
         binary,

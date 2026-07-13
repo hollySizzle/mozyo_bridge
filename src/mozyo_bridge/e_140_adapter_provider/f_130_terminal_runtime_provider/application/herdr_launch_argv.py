@@ -10,23 +10,22 @@ classification / placement / reclaim (the scheduled module-health reduction, see
 ``module_health.yaml``), and gives the argv assembly a single pure, directly-testable
 function.
 
+Pure: :func:`build_agent_start_argv` is a total string-list transform (no I/O), and
 :func:`resolve_attest_launcher` reads only the passed ``env`` mapping.
 
-:func:`build_agent_start_argv` is a total string-list transform over its arguments with
-ONE trusted-environment read (Redmine #13441): argv[0] is the provider's verified
-absolute executable, resolved from the passed ``env`` (its ``PATH`` / the profile's
-trusted override) by ``agent_provider_executable``. That read is deliberate — argv[0] can
-no longer be a bare name decided by the exec-time ``PATH`` (Design Answer j#76725 Q1) —
-and it fails closed *before* the caller creates a pane, so an unresolvable or ambiguous
-binary never becomes a live process. Pass ``env`` explicitly to keep a call hermetic;
-``None`` reads ``os.environ``.
+argv[0] is the provider's verified absolute executable and the managed policy tokens are
+profile-spelled, but neither is resolved HERE: both arrive pre-resolved on the
+:class:`ResolvedProviderLaunch` that ``preflight_launch_providers`` produced before the
+caller's first side effect (Redmine #13441, review R1-F1). Keeping this builder pure is
+what guarantees it cannot fail after a sibling provider has already been started — the
+partial-lane residue the lazy per-slot resolution used to leave behind.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.codex_shell_identity import (
     CodexShellIdentity,
@@ -43,15 +42,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     HERDR_BINARY_ENV,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
-    resolve_agent_argv0,
+    ResolvedProviderLaunch,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
-    managed_flag_for,
     provider_has_capability,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
     AgentCapability,
-    ManagedFlagConcept,
 )
 
 #: Optional launch-env override naming the absolute mozyo-bridge launcher used to
@@ -109,38 +106,36 @@ def _provider_command(
     *,
     workspace_id: str,
     lane: str,
-    claude_permission_mode: Optional[str],
+    resolved: ResolvedProviderLaunch,
     launch_argv_extra: Sequence[str],
-    env: Optional[Mapping[str, str]] = None,
 ) -> list[str]:
     """The provider command the herdr pane runs (`<abs executable> [flags...]`).
 
-    Provider knowledge is now *data* (Redmine #13441): the profile registry supplies
-    argv[0], the managed-flag spelling, and the tool-shell capability, so this builder
-    holds no ``claude`` / ``codex`` branch and a new same-protocol provider needs no
-    edit here.
+    Provider knowledge is *data* (Redmine #13441): ``resolved`` carries the profile's
+    verified absolute argv[0] and its profile-spelled managed policy tokens, and the
+    tool-shell behavior is a declared capability — so this builder holds no ``claude`` /
+    ``codex`` branch and a new same-protocol provider needs no edit here.
 
-    argv[0] is the **verified absolute realpath** resolved from the trusted environment
-    (Design Answer j#76725 Q1), not the bare provider name: leaving argv[0] bare would
-    let the exec-time ``PATH`` decide which binary runs. This is the one token exempted
-    from byte-invariance; every remaining token, and the render order, are unchanged.
-    Resolution fails closed *before* the caller creates a pane.
+    ``resolved`` is produced by ``preflight_launch_providers`` BEFORE the caller creates
+    a workspace, a tab, or any agent (review R1-F1). This builder therefore performs no
+    environment lookup of its own: it cannot fail, so it cannot fail *after* a sibling
+    provider has already been started and left a partial lane behind.
 
-    Reproducible permission mode for managed agents (Redmine #11925 / #13360): the tmux
-    managed-pane chokepoint has always appended ``--permission-mode <mode>``; without the
-    same suffix here every herdr lane worker boots prompt-gated and stalls on its first
-    gated command. The mode arrives pre-resolved (and pre-validated) from
-    ``prepare_session``, and the *flag spelling* now comes from the provider's profile.
-    Config-driven launch tokens (Redmine #13425) are appended AFTER the managed flag
-    (answer j#73949 Q4 render order) so the managed posture keeps its position. A provider
-    declaring ``tool_shell_env_overrides`` applies its own tool-shell env policy, so the
-    attested identity is re-expressed as ``-c`` overrides appended last (Codex, #13614) —
-    repo-local extras can never replace the attested tuple.
+    argv[0] is the **verified absolute realpath** (Design Answer j#76725 Q1), not the bare
+    provider name: leaving argv[0] bare would let the exec-time ``PATH`` decide which
+    binary runs. It is the one token exempted from byte-invariance; every remaining token,
+    and the render order, are unchanged.
+
+    Reproducible permission mode for managed agents (Redmine #11925 / #13360): without the
+    managed tokens here every herdr lane worker boots prompt-gated and stalls on its first
+    gated command. Config-driven launch tokens (Redmine #13425) are appended AFTER the
+    managed tokens (answer j#73949 Q4 render order) so the managed posture keeps its
+    position. A provider declaring ``tool_shell_env_overrides`` applies its own tool-shell
+    env policy, so the attested identity is re-expressed as ``-c`` overrides appended last
+    (Codex, #13614) — repo-local extras can never replace the attested tuple.
     """
-    cmd = [resolve_agent_argv0(provider, env)]
-    permission_flag = managed_flag_for(provider, ManagedFlagConcept.PERMISSION_MODE)
-    if permission_flag and claude_permission_mode:
-        cmd.extend([permission_flag, claude_permission_mode])
+    cmd = [resolved.executable]
+    cmd.extend(resolved.managed_argv)
     if launch_argv_extra:
         cmd.extend(launch_argv_extra)
     if provider_has_capability(provider, AgentCapability.TOOL_SHELL_ENV_OVERRIDES):
@@ -164,11 +159,10 @@ def build_agent_start_argv(
     binary: str,
     attest_launcher: str,
     store_home: str,
-    claude_permission_mode: Optional[str],
+    resolved: ResolvedProviderLaunch,
     launch_argv_extra: Sequence[str],
-    env: Optional[Mapping[str, str]] = None,
 ) -> list[str]:
-    """Assemble the full ``herdr agent start`` argv for one launched slot.
+    """Assemble the full ``herdr agent start`` argv for one launched slot (pure).
 
     The durable ``assigned_name`` is applied at start (positional), so no separate
     ``agent rename``. ``--workspace`` pins placement (Redmine #13330) so herdr never
@@ -224,9 +218,8 @@ def build_agent_start_argv(
         provider,
         workspace_id=workspace_id,
         lane=lane,
-        claude_permission_mode=claude_permission_mode,
+        resolved=resolved,
         launch_argv_extra=launch_argv_extra,
-        env=env,
     )
     if attest_launcher:
         run_cmd = [

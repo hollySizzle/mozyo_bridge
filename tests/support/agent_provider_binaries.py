@@ -79,7 +79,27 @@ class FakeAgentBinaries:
         developer's real ``claude``. ``extra`` adds further env entries (e.g. a
         provider's trusted-override variable).
         """
-        return {"PATH": str(self.bin_dir), **extra}
+        return {"PATH": str(self.bin_dir), **neutralized_overrides(), **extra}
+
+
+def neutralized_overrides() -> dict[str, str]:
+    """Every provider's trusted-executable override var, blanked out.
+
+    A test that patches ``os.environ`` with ``clear=False`` inherits the developer's
+    real environment. If that environment happens to set a provider's trusted override
+    (``MOZYO_AGENT_CLAUDE_BINARY`` …), the override BEATS the hermetic ``PATH`` this
+    fixture installs and the test silently resolves someone else's binary — or fails on
+    a machine that sets it. Blanking each override (empty == unset to the resolver) makes
+    the fixture's ``PATH`` authoritative regardless of the ambient environment.
+
+    The variable NAMES come from the profile registry, so this stays correct if a
+    profile renames its override or a new provider is added.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+        AGENT_PROVIDER_PROFILES,
+    )
+
+    return {p.executable.env_override: "" for p in AGENT_PROVIDER_PROFILES}
 
 
 def fake_binaries_env(root: Path, **extra: str) -> tuple["FakeAgentBinaries", dict[str, str]]:
@@ -104,12 +124,19 @@ def provider_bin_path(provider: str) -> str:
 
 
 def with_provider_path(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """``env`` with the shared hermetic provider ``PATH`` applied last (so it wins).
+    """``env`` made hermetic for provider resolution: fixture ``PATH``, no overrides.
 
-    Applied last on purpose: an env copied from the real ``os.environ`` would otherwise
-    keep the host's ``PATH`` and resolve the developer's real ``claude`` / ``codex``.
+    The ``PATH`` and the blanked overrides are applied LAST on purpose: an env copied
+    from the real ``os.environ`` would otherwise keep the host's ``PATH`` (resolving the
+    developer's real ``claude`` / ``codex``) or a stray trusted override that beats
+    ``PATH`` entirely. Nothing about provider resolution may depend on the host
+    (Redmine #13441 review R1-F4).
     """
-    return {**(dict(env) if env else {}), "PATH": str(SHARED_PROVIDER_BINS.bin_dir)}
+    return {
+        **(dict(env) if env else {}),
+        "PATH": str(SHARED_PROVIDER_BINS.bin_dir),
+        **neutralized_overrides(),
+    }
 
 
 def assert_argv0_is(testcase, argv: list[str], expected: str) -> None:
