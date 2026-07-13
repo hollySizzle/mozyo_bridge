@@ -96,28 +96,43 @@ def lane_lifecycle_path(home: Path | None = None) -> Path:
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+#: Sentinel for a component row whose version is present but not an exact integer
+#: (a REAL like ``2.5``, TEXT, BLOB, …). It is deliberately outside
+#: :data:`_RECOGNIZED_SCHEMA_VERSIONS` so the caller fails closed on it (R4-F1).
+_VERSION_MALFORMED = -1
+
+
 def _recorded_version(conn: sqlite3.Connection) -> Optional[int]:
     """This component's recorded ``state_schema_components`` version, or ``None``.
 
     ``None`` means the component has never registered — a fresh install, which this
     build may create. A *present* version is the store's own statement of the shape
     its rows are in, and only this build's recognized versions may be written under.
+
+    A present-but-malformed value — a REAL ``2.5``, TEXT, BLOB, anything that is not
+    an exact integer — returns :data:`_VERSION_MALFORMED`, never a coerced number
+    (R4-F1). ``int(2.5)`` would silently truncate a ``2.5`` REAL to ``2`` and let it
+    pass the recognized-version check, re-stamping an unknown schema this build does
+    not understand. Both the SQLite storage class (``typeof``) and the returned
+    Python type must say integer; only then is the row a version we may act on.
     """
     try:
         row = conn.execute(
-            "SELECT schema_version FROM state_schema_components WHERE component = ?",
+            "SELECT typeof(schema_version), schema_version "
+            "FROM state_schema_components WHERE component = ?",
             (LANE_LIFECYCLE_COMPONENT,),
         ).fetchone()
     except sqlite3.DatabaseError:
         return None
-    if row is None or row[0] is None:
+    if row is None or row[1] is None:
         return None
-    try:
-        return int(row[0])
-    except (TypeError, ValueError):
-        # A non-integer version is not a version we recognize; treat it as one so the
-        # caller fails closed rather than assuming a fresh install and re-stamping it.
-        return -1
+    storage_class, value = row
+    # `typeof` is SQLite's own view (a non-integer REAL keeps class `real`); the
+    # Python-side `isinstance` guards against a driver ever handing back a float that
+    # `typeof` reported as integer. `bool` is an `int` subclass and is not a version.
+    if storage_class != "integer" or not isinstance(value, int) or isinstance(value, bool):
+        return _VERSION_MALFORMED
+    return value
 
 
 def ensure_lane_lifecycle_schema(path: Path) -> None:
@@ -156,10 +171,15 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
         # under a schema we do not understand.
         recorded = _recorded_version(conn)
         if recorded is not None and recorded not in _RECOGNIZED_SCHEMA_VERSIONS:
+            detail = (
+                "a present-but-malformed value (not an exact integer)"
+                if recorded == _VERSION_MALFORMED
+                else f"version {recorded}"
+            )
             raise LaneLifecycleError(
-                f"lane lifecycle component is at schema version {recorded}; this "
-                f"build understands {sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The "
-                f"store is left untouched (downgrade-safe); use a newer build."
+                f"lane lifecycle component records {detail}; this build understands "
+                f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The store is left untouched "
+                f"(downgrade-safe); use a newer build."
             )
         with conn:
             conn.execute(_TABLE_SQL)
