@@ -30,8 +30,8 @@ from typing import Callable, Iterable
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import pane_lines
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
-    AGENT_PROVIDER_PROFILES,
     agent_discovery_aliases,
+    agent_process_owners,
     agent_provider_ids,
 )
 from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS
@@ -41,9 +41,10 @@ AGENT_KIND_CLAUDE = "claude"
 AGENT_KIND_CODEX = "codex"
 AGENT_KIND_UNKNOWN = "unknown"
 # The known agent kinds are the registered provider ids (Redmine #13441) plus the
-# core-owned `unknown` sentinel, which is a *resolver outcome*, not a provider — a
-# profile can never register it (`FORBIDDEN_PROFILE_TOKENS` guards the authority
-# axes; `unknown` is simply never a provider id in the packaged data).
+# core-owned `unknown` sentinel, which is a *resolver outcome*, not a provider. A
+# profile can never register it: `RESERVED_IDENTITY_TOKENS` rejects it as a provider id
+# or discovery alias at load (review R1-F3). It used to be safe only because the
+# packaged data happened not to use the name — a coincidence, not an invariant.
 _PROVIDER_IDS = agent_provider_ids()
 AGENT_KINDS = _PROVIDER_IDS | {AGENT_KIND_UNKNOWN}
 # `{window/pane alias -> provider id}` for name-based classification.
@@ -81,11 +82,7 @@ VIEW_KIND_NORMAL_WINDOW = "normal_window"
 # native binaries are receiver-agnostic (both CLIs are node-based), so they are
 # deliberately NOT here — a weak hint must still name the role to be usable, and
 # automatic handoff never targets on a weak hint regardless.
-_PROCESS_ROLE_HINTS = {
-    process: profile.provider_id
-    for profile in AGENT_PROVIDER_PROFILES
-    for process in profile.process_names
-}
+_PROCESS_ROLE_HINTS = agent_process_owners()
 
 
 @dataclass(frozen=True)

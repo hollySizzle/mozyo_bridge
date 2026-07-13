@@ -111,6 +111,11 @@ def agent_discovery_aliases() -> dict[str, str]:
     return AGENT_PROVIDER_PROFILES.discovery_aliases()
 
 
+def agent_process_owners() -> dict[str, str]:
+    """``{process basename: provider_id}`` — exact-one, validated at load (R1-F3)."""
+    return AGENT_PROVIDER_PROFILES.process_owners()
+
+
 def reserved_managed_flags() -> dict[str, tuple[str, ...]]:
     """``{provider_id: reserved flags}`` — the ``RESERVED_MANAGED_FLAGS`` replacement.
 
@@ -141,15 +146,51 @@ def require_profile(provider_id: str) -> AgentProviderProfile:
     return AGENT_PROVIDER_PROFILES.require(provider_id)
 
 
+# --- Non-raising accessors -------------------------------------------------
+#
+# The launch path must fail closed on an unknown provider, so it uses the
+# ``require``-based accessors above. Introspection surfaces (``doctor``, the
+# permission-mode policy resolver) are asked about arbitrary agent labels and must
+# answer "no" rather than raise — a diagnostic that crashes on an unknown label is
+# worse than one that reports nothing. These two are that boundary.
+
+
+def provider_supports(provider_id: str, capability: AgentCapability) -> bool:
+    """Whether ``provider_id`` is registered AND declares ``capability``.
+
+    ``False`` for an unknown provider (never raises), so a policy/diagnostic caller
+    can ask about any agent label safely.
+    """
+    profile = AGENT_PROVIDER_PROFILES.get(provider_id)
+    return profile is not None and profile.has_capability(capability)
+
+
+def provider_managed_flag(
+    provider_id: str, concept: ManagedFlagConcept
+) -> Optional[str]:
+    """``provider_id``'s spelling of ``concept``, or ``None`` (unknown provider ok).
+
+    This is what lets a managed flag be *spelled by data* at the launch chokepoints:
+    rename the flag in the profile and every renderer follows, with no source edit.
+    """
+    profile = AGENT_PROVIDER_PROFILES.get(provider_id)
+    if profile is None:
+        return None
+    return profile.managed_flag(concept)
+
+
 __all__ = (
     "AGENT_PROVIDER_PROFILES",
     "agent_commands",
     "agent_discovery_aliases",
     "agent_process_names",
+    "agent_process_owners",
     "agent_provider_ids",
     "load_agent_provider_config",
     "managed_flag_for",
     "provider_has_capability",
+    "provider_managed_flag",
+    "provider_supports",
     "require_profile",
     "reserved_managed_flags",
 )

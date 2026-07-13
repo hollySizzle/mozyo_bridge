@@ -41,7 +41,8 @@ effect.
 from __future__ import annotations
 
 import os
-from typing import Mapping, Optional
+from dataclasses import dataclass
+from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
     AGENT_PROVIDER_PROFILES,
@@ -213,9 +214,73 @@ def resolve_agent_argv0(
     return resolve_agent_executable(provider_id, env, registry=registry)
 
 
+@dataclass(frozen=True)
+class ResolvedProviderLaunch:
+    """Everything a launch needs for one provider, resolved BEFORE any side effect.
+
+    ``executable`` is the verified absolute ``argv[0]``; ``managed_argv`` is the
+    profile-spelled managed policy tokens (e.g. ``("--permission-mode", "auto")``) or
+    ``()``. Both are *values*, so the slot builder renders an argv without performing
+    any further environment lookup — the thing that resolved is exactly the thing that
+    runs.
+    """
+
+    provider_id: str
+    executable: str
+    managed_argv: tuple[str, ...] = ()
+
+
+def preflight_launch_providers(
+    providers: Sequence[str],
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    permission_mode_default: Optional[str] = None,
+    registry: Optional[AgentProviderProfileRegistry] = None,
+) -> "dict[str, ResolvedProviderLaunch]":
+    """Resolve EVERY launch provider up front, or raise having touched nothing.
+
+    Redmine #13441 review R1-F1. Resolving lazily inside the per-slot builder meant a
+    session that launches a pair created the workspace, created the tab, and started
+    the FIRST provider before the SECOND provider's executable was found to be missing
+    — leaving a partial lane with a live agent behind. Resolution is a pure question
+    about the environment, so it belongs entirely before the first side effect.
+
+    This resolves, for every provider in ``providers``: the profile (unknown -> raise),
+    the interaction protocol and required capability (undrivable -> raise), the trusted
+    executable (missing / ambiguous / unsafe PATH / bad override -> raise), and the
+    managed permission policy (invalid mode -> raise). Only if ALL of them succeed does
+    it return; the caller may then create a workspace, a tab, and agents knowing no
+    provider can still fail resolution.
+
+    The caller MUST invoke this before its first mutation and pass the results down,
+    rather than re-resolving per slot.
+    """
+    # Imported here: the permission policy lives in the execution-platform context and
+    # imports this package's registry, so a module-level import would be a cycle.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+        permission_mode_argv,
+    )
+
+    resolved: dict[str, ResolvedProviderLaunch] = {}
+    for provider_id in providers:
+        if provider_id in resolved:
+            continue
+        executable = resolve_agent_executable(provider_id, env, registry=registry)
+        resolved[provider_id] = ResolvedProviderLaunch(
+            provider_id=provider_id,
+            executable=executable,
+            managed_argv=permission_mode_argv(
+                provider_id, policy_default=permission_mode_default, env=env
+            ),
+        )
+    return resolved
+
+
 __all__ = (
     "LAUNCHABLE_PROTOCOLS",
     "AgentProviderExecutableError",
+    "ResolvedProviderLaunch",
+    "preflight_launch_providers",
     "require_launchable",
     "resolve_agent_argv0",
     "resolve_agent_executable",

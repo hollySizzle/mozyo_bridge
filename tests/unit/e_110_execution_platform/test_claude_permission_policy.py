@@ -32,7 +32,7 @@ _TESTS_ROOT = Path(__file__).resolve().parents[2]
 if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
-from support.agent_provider_binaries import FakeAgentBinaries
+from support.agent_provider_binaries import FakeAgentBinaries, neutralized_overrides
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODE_ENV,
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -61,7 +61,13 @@ def _trusted_env(env=None):
     ``os.environ`` would otherwise carry the host's PATH and resolve the developer's
     real ``claude`` / ``codex``, which is exactly what these tests must not do.
     """
-    return {**(env or {}), "PATH": str(PROVIDER_BINS.bin_dir)}
+    return {
+        **(env or {}),
+        "PATH": str(PROVIDER_BINS.bin_dir),
+        # Blank any trusted override inherited from the developer's environment: an
+        # override BEATS PATH, so without this the fixture PATH is not authoritative.
+        **neutralized_overrides(),
+    }
 
 
 def _argv0(provider):

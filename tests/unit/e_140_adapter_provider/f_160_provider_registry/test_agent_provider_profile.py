@@ -27,9 +27,13 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
+_TESTS_ROOT = Path(__file__).resolve().parents[2]
+if str(_TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT))
 
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
     AgentProviderExecutableError,
+    preflight_launch_providers,
     require_launchable,
     resolve_agent_argv0,
     resolve_agent_executable,
@@ -233,6 +237,11 @@ class SyntheticProviderLaunchArgvTest(unittest.TestCase):
             with patch.object(profile_module, "AGENT_PROVIDER_PROFILES", registry), patch.object(
                 agent_provider_executable, "AGENT_PROVIDER_PROFILES", registry
             ):
+                resolved = preflight_launch_providers(
+                    ["mistral-cli"],
+                    {"PATH": str(bindir)},
+                    permission_mode_default="auto",
+                )["mistral-cli"]
                 argv = herdr_launch_argv.build_agent_start_argv(
                     assigned_name="mzb1_ws_mistral-cli_lane",
                     provider="mistral-cli",
@@ -246,9 +255,8 @@ class SyntheticProviderLaunchArgvTest(unittest.TestCase):
                     binary="/usr/bin/herdr",
                     attest_launcher="",
                     store_home=str(Path(tmp) / "home"),
-                    claude_permission_mode="auto",
+                    resolved=resolved,
                     launch_argv_extra=[],
-                    env={"PATH": str(bindir)},
                 )
 
         run_cmd = argv[argv.index("--") + 1 :]
@@ -259,11 +267,16 @@ class SyntheticProviderLaunchArgvTest(unittest.TestCase):
 class ArgvZeroCompatibilityTest(unittest.TestCase):
     """Built-in launches: argv[0] absolute; every other token byte-invariant (Q1)."""
 
-    def _argv(self, provider, bindir, **over):
+    def _argv(self, provider, bindir, *, permission_mode_default=None, **over):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
             build_agent_start_argv,
         )
 
+        resolved = preflight_launch_providers(
+            [provider],
+            {"PATH": str(bindir)},
+            permission_mode_default=permission_mode_default,
+        )[provider]
         kwargs = dict(
             assigned_name="mzb1_ws_x_lane",
             provider=provider,
@@ -277,9 +290,8 @@ class ArgvZeroCompatibilityTest(unittest.TestCase):
             binary="/usr/bin/herdr",
             attest_launcher="",
             store_home="/home",
-            claude_permission_mode=None,
+            resolved=resolved,
             launch_argv_extra=[],
-            env={"PATH": str(bindir)},
         )
         kwargs.update(over)
         return build_agent_start_argv(**kwargs)
@@ -289,7 +301,7 @@ class ArgvZeroCompatibilityTest(unittest.TestCase):
             bindir = Path(tmp) / "bin"
             expected = _install_binary(bindir, "claude")
             _install_binary(bindir, "codex")
-            argv = self._argv("claude", bindir, claude_permission_mode="auto")
+            argv = self._argv("claude", bindir, permission_mode_default="auto")
         run_cmd = argv[argv.index("--") + 1 :]
         # argv[0] is the resolved absolute realpath — never the bare name, and never a
         # host path literal in the assertion: it is the path this test injected.
@@ -325,7 +337,7 @@ class ArgvZeroCompatibilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp) / "bin"
             _install_binary(bindir, "codex")
-            argv = self._argv("codex", bindir, claude_permission_mode="auto")
+            argv = self._argv("codex", bindir, permission_mode_default="auto")
         self.assertNotIn("--permission-mode", argv)
 
 
@@ -639,6 +651,263 @@ class PackagedArtifactTest(unittest.TestCase):
         ).to_registry()
         with self.assertRaises(AgentProviderProfileError):
             registry.register(registry.require("mistral-cli"))
+
+
+class R1F1PreflightBeforeSideEffectsTest(unittest.TestCase):
+    """R1-F1: an unresolvable provider must leave ZERO herdr side effects behind.
+
+    The pre-correction code resolved argv[0] lazily inside each slot's builder, so a
+    ``(codex, claude)`` pair created the workspace, created the tab, and STARTED codex
+    before discovering claude's binary was missing — a partial lane with a live agent.
+    These pin the whole-plan preflight.
+    """
+
+    def _run(self, providers, resolvable):
+        import stat as _stat
+
+        from tests.support.herdr_fake import FakeHerdr
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+            HerdrSessionStartError,
+            prepare_session,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            herdr_bin = Path(tmp) / "herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(herdr_bin.stat().st_mode | _stat.S_IEXEC)
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            for name in resolvable:
+                _install_binary(bindir, name)
+
+            herdr = FakeHerdr()
+            env = {"MOZYO_HERDR_BINARY": str(herdr_bin), "PATH": str(bindir)}
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=providers,
+                        lane_id="lane-1",
+                        env=env,
+                        runner=herdr.run,
+                    )
+            return [" ".join(call[:3]) for call in herdr.calls]
+
+    def _mutations(self, calls):
+        return [
+            c
+            for c in calls
+            if any(
+                verb in c
+                for verb in ("workspace create", "tab create", "agent start")
+            )
+        ]
+
+    def test_single_unresolvable_provider_creates_no_workspace_or_tab(self) -> None:
+        calls = self._run(["claude"], resolvable=[])
+        self.assertEqual([], self._mutations(calls))
+
+    def test_second_provider_failure_starts_no_agent_at_all(self) -> None:
+        # The regression that matters: codex resolves, claude does not. Nothing may be
+        # created, and codex must NOT be started — no partial lane.
+        calls = self._run(["codex", "claude"], resolvable=["codex"])
+        self.assertEqual([], self._mutations(calls))
+
+    def test_adopt_only_session_does_not_require_a_provider_binary(self) -> None:
+        # The preflight covers `launch` plans only: a dry-run starts no process, so it
+        # must not begin to require a resolvable binary the pre-#13441 code never needed.
+        import stat as _stat
+
+        from tests.support.herdr_fake import FakeHerdr
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+            prepare_session,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            herdr_bin = Path(tmp) / "herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(herdr_bin.stat().st_mode | _stat.S_IEXEC)
+            herdr = FakeHerdr()
+            empty_bin = Path(tmp) / "bin"
+            empty_bin.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                # A dry run needs a durable workspace identity (#13595) — register it, so
+                # this test isolates the provider-binary question and nothing else.
+                register_workspace(repo)
+                # No provider binary anywhere, yet the dry run still plans successfully:
+                # the preflight covers `launch` plans only.
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude", "codex"],
+                    lane_id="lane-1",
+                    env={
+                        "MOZYO_HERDR_BINARY": str(herdr_bin),
+                        "PATH": str(empty_bin),
+                    },
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+        self.assertEqual(["planned", "planned"], [s.outcome for s in result.slots])
+
+
+class R1F2ManagedFlagIsDataDrivenTest(unittest.TestCase):
+    """R1-F2: the managed flag spelling comes from the profile on BOTH chokepoints."""
+
+    def _registry_with(self, spelling, provider_id="claude", command="claude"):
+        return AgentProviderProfileConfig.from_record(
+            _config_record(
+                {
+                    provider_id: {
+                        "protocol": "interactive_cli_tui",
+                        "executable": {
+                            "command": command,
+                            "env_override": "MOZYO_AGENT_X_BINARY",
+                        },
+                        "discovery_aliases": [provider_id],
+                        "process_names": [provider_id],
+                        "capabilities": [
+                            "interactive_tui",
+                            "launch_argv_override",
+                            "managed_permission_mode",
+                        ],
+                        "managed_flags": {"permission_mode": spelling},
+                    }
+                }
+            )
+        ).to_registry()
+
+    def test_tmux_chokepoint_follows_a_data_rename(self) -> None:
+        # Renaming the flag in the packaged data must move the TMUX renderer too. Before
+        # the correction it kept emitting the literal `--permission-mode`.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+            permission_mode_flag,
+        )
+
+        with patch.object(
+            profile_module, "AGENT_PROVIDER_PROFILES", self._registry_with("--approval-mode")
+        ):
+            self.assertEqual(
+                " --approval-mode auto",
+                permission_mode_flag("claude", policy_default="auto", env={}),
+            )
+
+    def test_synthetic_provider_gets_its_own_flag_on_the_tmux_path(self) -> None:
+        # Previously `agent != "claude"` meant a capable synthetic provider got NO flag.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+            permission_mode_flag,
+        )
+
+        registry = self._registry_with(
+            "--approval", provider_id="mistral-cli", command="mistral-cli"
+        )
+        with patch.object(profile_module, "AGENT_PROVIDER_PROFILES", registry):
+            self.assertEqual(
+                " --approval auto",
+                permission_mode_flag("mistral-cli", policy_default="auto", env={}),
+            )
+
+    def test_provider_without_the_capability_still_gets_no_flag(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+            permission_mode_flag,
+        )
+
+        self.assertEqual("", permission_mode_flag("codex", policy_default="auto", env={}))
+
+    def test_unregistered_label_never_raises_and_gets_no_flag(self) -> None:
+        # Diagnostics ask about arbitrary labels; answering must not crash.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+            permission_mode_flag,
+        )
+
+        self.assertEqual("", permission_mode_flag("nope", policy_default="auto", env={}))
+
+
+class R1F3IdentityVocabularyTest(unittest.TestCase):
+    """R1-F3: reserved sentinels, receiver-agnostic processes, exact-one process names."""
+
+    def _mk(self, pid, **over):
+        record = {
+            "protocol": "interactive_cli_tui",
+            "executable": {"command": pid, "env_override": "X"},
+            "discovery_aliases": [pid],
+            "process_names": [pid],
+            "capabilities": ["interactive_tui"],
+            "managed_flags": {},
+        }
+        record.update(over)
+        return record
+
+    def test_provider_id_may_not_be_the_unknown_sentinel(self) -> None:
+        # `unknown` is what the role resolvers return for an UNidentified agent; a
+        # provider claiming it would make "no provider" resolve to a real provider.
+        with self.assertRaises(AgentProviderProfileError) as ctx:
+            AgentProviderProfileConfig.from_record(
+                _config_record({"unknown": self._mk("unknown")})
+            ).to_registry()
+        self.assertIn("reserved core identity", str(ctx.exception))
+
+    def test_discovery_alias_may_not_be_the_unknown_sentinel(self) -> None:
+        with self.assertRaises(AgentProviderProfileError):
+            AgentProviderProfileConfig.from_record(
+                _config_record({"x": self._mk("x", discovery_aliases=["unknown"])})
+            ).to_registry()
+
+    def test_receiver_agnostic_node_process_is_rejected(self) -> None:
+        # Both built-in CLIs are Node programs, so `node` names a runtime, not a
+        # provider: claiming it would let any node process resolve as that provider.
+        with self.assertRaises(AgentProviderProfileError) as ctx:
+            AgentProviderProfileConfig.from_record(
+                _config_record({"x": self._mk("x", process_names=["node"])})
+            ).to_registry()
+        self.assertIn("receiver-agnostic", str(ctx.exception))
+
+    def test_duplicate_process_name_across_providers_is_rejected(self) -> None:
+        # Previously accepted, and the consumer map resolved last-wins.
+        with self.assertRaises(AgentProviderProfileError) as ctx:
+            AgentProviderProfileConfig.from_record(
+                _config_record(
+                    {
+                        "a": self._mk("a", process_names=["shared"]),
+                        "b": self._mk("b", process_names=["shared"]),
+                    }
+                )
+            ).to_registry()
+        self.assertIn("last-wins", str(ctx.exception))
+
+    def test_builtin_process_owners_are_exact_one(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+            agent_process_owners,
+        )
+
+        self.assertEqual({"claude": "claude", "codex": "codex"}, agent_process_owners())
+
+
+class R1F4HostIndependenceTest(unittest.TestCase):
+    """R1-F4: provider resolution never falls back to the host's ambient environment."""
+
+    def test_bare_command_never_resolves_from_the_ambient_process_path(self) -> None:
+        # The whole point of the trusted boundary: an empty env resolves nothing, even
+        # on a developer machine where `claude` is on the real PATH. This is what makes
+        # the suite portable — CI has no provider binary at all.
+        with self.assertRaises(AgentProviderExecutableError):
+            resolve_agent_executable("claude", {})
+
+    def test_resolution_uses_only_the_passed_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = _install_binary(Path(tmp) / "bin", "claude")
+            resolved = resolve_agent_executable(
+                "claude", {"PATH": str(Path(tmp) / "bin")}
+            )
+        self.assertEqual(expected, resolved)
 
 
 if __name__ == "__main__":
