@@ -77,10 +77,18 @@ _ENV_PROBE_MODULE = (
     "class EnvProbe(unittest.TestCase):\n"
     "    def test_probe(self):\n"
     "        keys = ('HOME','TMPDIR','MOZYO_BRIDGE_HOME','TMUX',"
-    "'MOZYO_WORKSPACE_ID','MOZYO_LANE_ID')\n"
+    "'MOZYO_WORKSPACE_ID','MOZYO_LANE_ID','PYTHONUSERBASE','GIT_AUTHOR_NAME')\n"
     "        data = {k: os.environ.get(k) for k in keys}\n"
     "        data['cwd'] = os.getcwd()\n"
     "        pathlib.Path(pathlib.Path.cwd(), 'env_probe.json').write_text(json.dumps(data))\n"
+)
+_STDOUT_FAIL_MODULE = (
+    "import sys, unittest\n"
+    "class NoisyFail(unittest.TestCase):\n"
+    "    def test_noisy(self):\n"
+    "        print('SHARD_STDOUT_MARKER')\n"
+    "        print('SHARD_STDERR_MARKER', file=sys.stderr)\n"
+    "        self.assertEqual('x', 'y')\n"
 )
 
 
@@ -108,6 +116,7 @@ def _namespace(root: Path, **over) -> argparse.Namespace:
         pattern="test*.py",
         top_level_dir=None,
         jobs=2,
+        shards=None,
         durations=None,
         serial_policy=None,
         shard_timeout=None,
@@ -257,7 +266,7 @@ class SerialBucketTest(unittest.TestCase):
 
 
 class IsolationTest(unittest.TestCase):
-    def test_shard_env_isolates_state_and_strips_live_session(self) -> None:
+    def test_shard_env_isolates_home_and_strips_live_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _make_tree(root, {"test_env": _ENV_PROBE_MODULE})
@@ -271,7 +280,6 @@ class IsolationTest(unittest.TestCase):
             with mock.patch.dict(os.environ, fake_env, clear=False):
                 parent_home = os.environ.get("HOME")
                 parent_mozyo = os.environ["MOZYO_BRIDGE_HOME"]
-                parent_tmp = os.environ.get("TMPDIR")
                 code, _ = _run(root, jobs=1)
             self.assertEqual(code, 0)
             probe = json.loads((root / "env_probe.json").read_text(encoding="utf-8"))
@@ -279,17 +287,66 @@ class IsolationTest(unittest.TestCase):
             self.assertIsNone(probe["TMUX"])
             self.assertIsNone(probe["MOZYO_WORKSPACE_ID"])
             self.assertIsNone(probe["MOZYO_LANE_ID"])
-            # MOZYO_BRIDGE_HOME (shared state store) + TMPDIR are per-shard.
+            # HOME / MOZYO_BRIDGE_HOME / TMPDIR are all per-shard, not the parent's
+            # (acceptance #3: each shard gets its own HOME/TMP/state).
+            self.assertTrue(probe["HOME"])
+            self.assertNotEqual(probe["HOME"], parent_home)
             self.assertTrue(probe["MOZYO_BRIDGE_HOME"])
             self.assertNotEqual(probe["MOZYO_BRIDGE_HOME"], parent_mozyo)
             self.assertTrue(probe["TMPDIR"])
-            self.assertNotEqual(probe["TMPDIR"], parent_tmp)
-            # HOME is inherited (not overridden) so git identity / user site-packages
-            # match the serial run — this is the parity fix, not a leak.
-            self.assertEqual(probe["HOME"], parent_home)
+            # The fresh HOME is kept functional: user-site base + git identity.
+            self.assertTrue(probe["PYTHONUSERBASE"])
+            self.assertTrue(probe["GIT_AUTHOR_NAME"])
             # The shard runs with cwd pinned to the target repo root (matching the
             # serial `discover` cwd; resolve for the macOS /var -> /private/var link).
             self.assertEqual(Path(probe["cwd"]).resolve(), root.resolve())
+
+
+class OutputCaptureTest(unittest.TestCase):
+    def test_failing_shard_retains_stdout_stderr_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_tree(root, {"test_noisy": _STDOUT_FAIL_MODULE})
+            code, payload = _run(root, jobs=1)
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["success"])
+            shard = payload["shards"][0]
+            # exit code + captured streams are retained on the shard result.
+            self.assertEqual(shard["returncode"], 1)
+            combined = (shard["stdout_tail"] or "") + (shard["stderr_tail"] or "")
+            self.assertIn("SHARD_STDERR_MARKER", combined)
+
+
+class FailfastSchedulingTest(unittest.TestCase):
+    def test_failfast_skips_queued_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prefix = _make_tree(
+                root,
+                {
+                    "test_fail": _FAIL_MODULE,
+                    "test_p1": _PASS_MODULE.format(cls="P1"),
+                    "test_p2": _PASS_MODULE.format(cls="P2"),
+                    "test_p3": _PASS_MODULE.format(cls="P3"),
+                },
+            )
+            # Weight the failing module heaviest so LPT places it in shard 0, which
+            # a single worker (jobs=1) runs first; with over-partition there are 4
+            # shards, so the later ones must be skipped once shard 0 fails.
+            durations = root / "dur.json"
+            durations.write_text(
+                json.dumps({f"{prefix}.test_fail": 100.0}), encoding="utf-8"
+            )
+            code, payload = _run(
+                root, jobs=1, failfast=True, durations=str(durations)
+            )
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["success"])
+            self.assertGreater(payload["shard_count"], 1)
+            skipped = [
+                s for s in payload["shards"] if "not run" in (s["detail"] or "")
+            ]
+            self.assertTrue(skipped, "expected queued shards to be skipped by failfast")
 
 
 if __name__ == "__main__":

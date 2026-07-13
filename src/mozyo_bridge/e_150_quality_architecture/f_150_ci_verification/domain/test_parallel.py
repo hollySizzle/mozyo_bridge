@@ -39,6 +39,14 @@ import yaml
 # CPU count; this constant is only the floor when nothing else is known.
 MIN_JOBS = 1
 
+# Shards are over-partitioned relative to the worker count so a bounded pool of
+# ``jobs`` workers drains a queue of finer shards. This (a) balances load — a slow
+# module no longer pins one fat shard while others idle — and (b) makes
+# ``--failfast`` meaningful: once a shard fails, the still-queued shards are never
+# launched. The default target shard count is ``jobs * DEFAULT_SHARDS_PER_JOB``,
+# capped at the number of parallel modules (never more shards than modules).
+DEFAULT_SHARDS_PER_JOB = 4
+
 # Repo-root policy document (serial-bucket patterns + default jobs / timeout).
 DEFAULT_POLICY_RELPATH = "test_parallel_policy.yaml"
 
@@ -159,6 +167,8 @@ class ShardResult:
     replay_command: str = ""
     duration_seconds: float | None = None
     failed_test_ids: tuple[str, ...] = ()
+    stdout_tail: str = ""
+    stderr_tail: str = ""
 
     @property
     def ok(self) -> bool:
@@ -221,17 +231,26 @@ def plan_shards(
     jobs: int,
     policy: ParallelPolicy,
     weights: dict[str, float] | None = None,
+    shard_count: int | None = None,
 ) -> ShardPlan:
     """Partition discovered modules into a deterministic set of shards.
 
     ``module_tests`` maps each discovered dotted module name to its tuple of
     unittest ids (from the authoritative :func:`unittest.TestLoader.discover`
     pass). Modules matched by ``policy.serial_modules`` go to a single serial
-    shard; the rest are LPT bin-packed into ``min(jobs, n_parallel_modules)``
-    parallel shards. Raises :class:`TestParallelError` if ``jobs`` < 1.
+    shard; the rest are LPT bin-packed into parallel shards.
+
+    Shards are **over-partitioned** relative to ``jobs`` (the worker count): the
+    parallel shard count is ``shard_count`` when given, else
+    ``jobs * DEFAULT_SHARDS_PER_JOB``, always capped at the number of parallel
+    modules. A bounded pool of ``jobs`` workers then drains this finer queue,
+    which balances load and lets ``--failfast`` skip still-queued shards. Raises
+    :class:`TestParallelError` if ``jobs`` < 1 or ``shard_count`` < 1.
     """
     if jobs < MIN_JOBS:
         raise TestParallelError(f"jobs must be >= {MIN_JOBS}, got {jobs}")
+    if shard_count is not None and shard_count < 1:
+        raise TestParallelError(f"shard_count must be >= 1, got {shard_count}")
 
     weight_basis = "durations" if weights else "test_count"
 
@@ -255,7 +274,8 @@ def plan_shards(
     # LPT: assign heaviest modules first, each to the currently-lightest bin.
     # Ties break on module name (the sort below) and then lowest bin index, so
     # the partition is fully determined by the inputs.
-    bin_count = max(1, min(jobs, len(parallel_modules))) if parallel_modules else 0
+    target_shards = shard_count if shard_count is not None else jobs * DEFAULT_SHARDS_PER_JOB
+    bin_count = max(1, min(target_shards, len(parallel_modules))) if parallel_modules else 0
     bins: list[list[str]] = [[] for _ in range(bin_count)]
     bin_load = [0.0] * bin_count
     ordered = sorted(
@@ -429,6 +449,7 @@ def load_policy(policy_path: Path | str, *, missing_ok: bool = True) -> Parallel
 
 __all__ = (
     "MIN_JOBS",
+    "DEFAULT_SHARDS_PER_JOB",
     "DEFAULT_POLICY_RELPATH",
     "SHARD_PASSED",
     "SHARD_FAILED",

@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_parallel import (
+    DEFAULT_SHARDS_PER_JOB,
     KIND_PARALLEL,
     KIND_SERIAL,
     SHARD_CRASHED,
@@ -78,11 +79,35 @@ class PlanShardsTest(unittest.TestCase):
         self.assertEqual(len(plan.parallel_shards), 2)
 
     def test_lpt_balances_by_weight(self) -> None:
-        # Heaviest-first LPT: 6 alone balances against 3+2+1.
+        # Heaviest-first LPT into an explicit 2 bins: 6 alone balances 3+2+1.
         module_tests = _module_tests({"big": 6, "m3": 3, "m2": 2, "m1": 1})
-        plan = plan_shards(module_tests, jobs=2, policy=ParallelPolicy())
+        plan = plan_shards(
+            module_tests, jobs=2, policy=ParallelPolicy(), shard_count=2
+        )
         weights = sorted(s.weight for s in plan.parallel_shards)
         self.assertEqual(weights, [6.0, 6.0])
+
+    def test_over_partitions_beyond_jobs_by_default(self) -> None:
+        # Default target is jobs * DEFAULT_SHARDS_PER_JOB, capped at module count.
+        module_tests = _module_tests({f"m{i}": 1 for i in range(20)})
+        plan = plan_shards(module_tests, jobs=2, policy=ParallelPolicy())
+        self.assertEqual(len(plan.parallel_shards), 2 * DEFAULT_SHARDS_PER_JOB)
+        # Every module still assigned exactly once (coverage preserved).
+        assigned = [m for s in plan.shards for m in s.modules]
+        self.assertEqual(sorted(assigned), sorted(module_tests))
+
+    def test_shard_count_capped_at_module_count(self) -> None:
+        module_tests = _module_tests({"a": 1, "b": 1})
+        plan = plan_shards(
+            module_tests, jobs=1, policy=ParallelPolicy(), shard_count=99
+        )
+        self.assertEqual(len(plan.parallel_shards), 2)
+
+    def test_shard_count_below_one_raises(self) -> None:
+        with self.assertRaises(TestParallelError):
+            plan_shards(
+                _module_tests({"a": 1}), jobs=1, policy=ParallelPolicy(), shard_count=0
+            )
 
     def test_durations_weight_basis_overrides_count(self) -> None:
         module_tests = _module_tests({"a": 1, "b": 1, "c": 1})

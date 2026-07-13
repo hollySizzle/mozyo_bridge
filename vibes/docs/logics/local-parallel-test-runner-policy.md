@@ -17,8 +17,9 @@ TestPyPI/PyPI publish、version bump は non-goal (#13732 boundary)。
 | --- | --- |
 | serial と parallel で同一 test 集合・同一 verdict | parent も worker も authoritative な `TestLoader().discover(start_dir, pattern, top_level_dir)` を `_repo_root_importable` 下で使う。parent が discover した module→id を worker に配り、worker は割当 module を **同名 load** して実行するため、shard 群が走らせた id の union は discover 集合に一致する |
 | shard failure を aggregate green にしない | aggregate は **全 shard passed かつ union(ran ids) == discovered ids** のときだけ green。failure / timeout / worker crash / collection import error はいずれも fail-closed で red (`domain/test_parallel.py` の `aggregate`) |
-| parallel run が live Herdr lane/process へ副作用を出さない | shard ごとに固有 `MOZYO_BRIDGE_HOME` (state store) / `TMPDIR` (default tmux socket も分離) を与え、live cockpit-session env pin (`TMUX` / `TMUX_PANE` / `MOZYO_WORKSPACE_ID` / `MOZYO_LANE_ID` / `MOZYO_AGENT_ROLE`) を除去する。`HOME` / `MOZYO_REPO` は **inherited** (serial env との一致=parity を優先。下記) |
-| deterministic shard plan + `--jobs` + fail-fast + replay | module weight (duration manifest or discovered test count) で LPT bin-packing。`--jobs` (既定 host CPU 数)、`--failfast`、shard ごとの `python -m unittest -v tests.<module>` replay command を出力 |
+| parallel run が live Herdr lane/process へ副作用を出さない | shard ごとに固有 `HOME` / `TMPDIR` / `MOZYO_BRIDGE_HOME` を与え、live cockpit-session env pin (`TMUX` / `TMUX_PANE` / `MOZYO_WORKSPACE_ID` / `MOZYO_LANE_ID` / `MOZYO_AGENT_ROLE`) を除去する。fresh `HOME` は parity を壊さないよう **functional** に保つ (`PYTHONUSERBASE`=実 user-base で nested `python` の user-site 解決、`GIT_AUTHOR_*`/`GIT_COMMITTER_*` で git identity)。`MOZYO_REPO` は inherit (下記) |
+| 各 shard の stdout/stderr/exit を収集する | subprocess の stdout/stderr を bounded tail + `returncode` として全 shard の `ShardResult` に保持し、JSON/text output に surface (failure 時は再現可能な一次 evidence) |
+| deterministic shard plan + `--jobs` + fail-fast + replay | module weight (duration manifest or discovered test count) で LPT bin-packing。shards は jobs より **over-partition** (既定 `jobs*4`、module 数 cap)し bounded pool で drain。`--jobs`(既定 host CPU 数)、`--shards`、`--failfast`(失敗観測後は queue 中 shard を launch せず skipped)、shard ごとの `python -m unittest -v tests.<module>` replay を出力 |
 | serial discover との count/outcome parity・失敗系 fail-closed の固定 | 上記 parity + fail-closed を unit (planner/aggregator/policy) と integration (fixture tree の end-to-end) の regression で固定する |
 | current host の実測記録・速度を hard gate にしない | 速度値は pass/fail 閾値に **しない**。verdict は test 集合の green/red のみ。壁時計は informational として出力・issue journal に記録する |
 
@@ -64,26 +65,40 @@ timeout (kill)、worker crash (result 未出力)、collection import error、mod
 取りこぼし。これが受け入れ条件「shard failure を aggregate green にしない」の
 機械的固定である。
 
-### isolation は「serial env に忠実」を優先して collision surface だけ分離する
+### isolation: shard ごとに固有 HOME/TMP/state、ただし fresh HOME を functional に保つ
 
-原則は **shard env を serial run にできる限り近づける** ことである (shard verdict が
-serial verdict と一致するため)。分離するのは shard 間で衝突する / live lane に触れる
-ものだけ:
+acceptance #3 は「各 shard へ **固有 HOME**/TMPDIR/MOZYO state を与える」ことを要求する。
+`_shard_env` は shard ごとに固有 `HOME` / `TMPDIR` / `TMP` / `TEMP` /
+`MOZYO_BRIDGE_HOME` (home-scoped SQLite state store) を作り、live cockpit-session pin
+(`TMUX` / `TMUX_PANE` / `MOZYO_WORKSPACE_ID` / `MOZYO_LANE_ID` / `MOZYO_AGENT_ROLE`) を
+除去する。
 
-- `MOZYO_BRIDGE_HOME` (home-scoped SQLite state store) を shard ごとに固有化。
-- `TMPDIR` / `TMP` / `TEMP` を shard ごとに固有化 (default tmux socket も operator の
-  実 socket から分離される)。
-- live cockpit-session pin (`TMUX` / `TMUX_PANE` / `MOZYO_WORKSPACE_ID` /
-  `MOZYO_LANE_ID` / `MOZYO_AGENT_ROLE`) を除去。
+課題は **fresh HOME が parity を壊さない**ことである。素の fresh HOME は (a) interpreter
+の user site-packages (PyYAML 等が pip-user-install される場所) を隠し、(b) git identity
+を持たないため、nested `python -m mozyo_bridge` (`test_pre_commit_hook` が hook 経由で
+spawn) や `git commit` を行う hermetic test を壊す (R1 dogfood で観測した 5 test 赤の
+実因)。是正は「固有 HOME を諦める」ではなく「固有 HOME を機能させる」:
 
-`HOME` と `MOZYO_REPO` は **inherit** する (override しない)。これは dogfood で判明した
-parity 事故の是正である: `HOME` を差し替えると nested `python -m mozyo_bridge` /
-`git commit` を spawn する test が壊れ (user site-packages の PyYAML が見えず、git
-identity も無い)、`MOZYO_REPO` を pin すると divergent-cwd の repo 解決を検証する test
-が壊れた。operator の Herdr/tmux state は `MOZYO_BRIDGE_HOME` + `TMPDIR` + 除去した pin
-で既に分離されるため、`HOME` を継承しても live lane には漏れない。子 `PYTHONPATH` は
+- `PYTHONUSERBASE` = parent の実 user-base を子へ渡す → fresh HOME でも nested `python`
+  が user-site を解決する。
+- `GIT_AUTHOR_*` / `GIT_COMMITTER_*` を deterministic に設定 → `git commit` が operator
+  `~/.gitconfig` 非依存で成立する。
+
+`MOZYO_REPO` は **inherit** する (pin しない): repo 解決が serial と同じ cwd/env 規則に
+従い、pin すると divergent-cwd 解決を検証する test を壊すため。子 `PYTHONPATH` は
 absolute な mozyo_bridge package dir に固定し、foreign cwd / relative `PYTHONPATH=src`
-でも import が解決するようにする。
+でも import が解決するようにする (system site-packages は自動、user-site は
+`PYTHONUSERBASE` が担う)。
+
+### over-partition と `--failfast`
+
+parallel shard 数は worker 数 (`--jobs`) と **切り離す**。既定の shard 数は
+`jobs * 4` (module 数 cap、`--shards` で明示可)で、`jobs` 個の worker が finer な shard
+queue を drain する。これにより (a) load balance が改善し (遅い module が 1 個の太い
+shard を占有して他が idle する事態を避ける)、(b) `--failfast` が意味を持つ: shard が
+失敗したら未起動 (queue 中) の shard は launch せず `not run (--failfast)` として skipped
+にする (in-flight の subprocess は kill せず完了させる)。full dogfood では 324 module を
+jobs=10 で 40 shard に分割し、wall clock が serial 比で更に改善した。
 
 ## serial bucket 方針 (明示 bucket と、既定が空である根拠)
 

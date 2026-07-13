@@ -20,15 +20,14 @@
 #   scenarios / regressions tests touch no real tmux / network / owner / Redmine
 #   and no real host-global singleton. Work that touches those lives in `smoke/**`,
 #   which is OUTSIDE the `tests/` discovery root and is never run by this runner.
-#   Each shard additionally gets an isolated MOZYO_BRIDGE_HOME (the shared state
-#   store) and TMPDIR, and has the live cockpit-session env pins stripped (TMUX /
-#   TMUX_PANE / MOZYO_WORKSPACE_ID / MOZYO_LANE_ID / MOZYO_AGENT_ROLE), so tests
-#   that mutate cwd (os.chdir) or the home-scoped state store are isolated ACROSS
-#   PROCESSES. (HOME and MOZYO_REPO are deliberately inherited, not overridden, so
-#   the shard env matches the serial env — see the runner's `_shard_env`.) There
-#   is therefore no discovered module that is unsafe to run in its own process
-#   shard, so the serial bucket is empty; this is confirmed by dogfooding the full
-#   suite in parallel (same test set and green/red verdict as the serial run).
+#   Each shard additionally gets its own HOME / TMPDIR / MOZYO_BRIDGE_HOME (the
+#   fresh HOME kept functional via PYTHONUSERBASE + a git identity), and has the
+#   live cockpit-session env pins stripped (TMUX / TMUX_PANE / MOZYO_WORKSPACE_ID /
+#   MOZYO_LANE_ID / MOZYO_AGENT_ROLE), so tests that mutate cwd (os.chdir), HOME,
+#   or the home-scoped state store are isolated ACROSS PROCESSES. There is
+#   therefore no discovered module that is unsafe to run in its own process shard,
+#   so the serial bucket is empty; this is confirmed by dogfooding the full suite
+#   in parallel (same test set and green/red verdict as the serial run).
 #
 # WHEN TO ADD AN ENTRY:
 #   Add a pattern here only with evidence that a module is unsafe even under

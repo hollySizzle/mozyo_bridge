@@ -31,8 +31,9 @@ def register_parallel(tests_sub) -> None:
             "Same discovery as `python -m unittest discover -s tests`; same test "
             "set and green/red verdict as the serial run, aggregated fail-closed "
             "(a shard failure / timeout / crash / import error never reads as "
-            "green). Each shard gets an isolated HOME/TMPDIR/MOZYO state and "
-            "cannot touch the live Herdr lane."
+            "green). Each shard runs in its own HOME/TMPDIR/MOZYO_BRIDGE_HOME "
+            "(kept functional for nested python/git) and cannot touch the live "
+            "Herdr lane."
         ),
     )
     add_repo_option(parallel)
@@ -59,8 +60,19 @@ def register_parallel(tests_sub) -> None:
         type=int,
         default=None,
         help=(
-            "Number of parallel shards (default: host CPU count, or the policy's "
-            "default_jobs). The plan caps this at the number of parallel modules."
+            "Number of concurrent shard workers (default: host CPU count, or the "
+            "policy's default_jobs). Shards are over-partitioned relative to jobs "
+            "so the workers drain a finer queue."
+        ),
+    )
+    parallel.add_argument(
+        "--shards",
+        type=int,
+        default=None,
+        help=(
+            "Number of parallel shards to partition modules into (default: "
+            "jobs * 4, capped at the module count). More shards balance load and "
+            "make --failfast skip more queued work."
         ),
     )
     parallel.add_argument(
@@ -96,7 +108,11 @@ def register_parallel(tests_sub) -> None:
         "--failfast",
         action="store_true",
         default=False,
-        help="Stop launching further shards once one fails (aggregate stays red).",
+        help=(
+            "Once a shard fails, stop launching still-queued shards and pass "
+            "unittest --failfast to each shard (aggregate stays red; in-flight "
+            "shards finish)."
+        ),
     )
     parallel.add_argument(
         "--format",

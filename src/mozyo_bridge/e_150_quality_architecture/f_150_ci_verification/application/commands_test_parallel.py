@@ -26,15 +26,13 @@ that union exactly matches the discovered set — a crashed worker, a timeout, a
 collection-time import error, or a dropped module all keep the aggregate red
 (acceptance: "shard failure を aggregate green にしない").
 
-Isolation protects the operator's live Herdr lane (acceptance #3) while staying
-faithful to the serial env for parity: each shard gets a fresh
-``MOZYO_BRIDGE_HOME`` (the shared state store) and ``TMPDIR`` (which also moves
-the default tmux socket off the operator's real one), and cannot see ``TMUX`` /
-``TMUX_PANE`` / ``MOZYO_WORKSPACE_ID`` / ``MOZYO_LANE_ID`` / ``MOZYO_AGENT_ROLE``.
-``HOME`` and ``MOZYO_REPO`` are inherited, not overridden — overriding them
-diverged the shard from the serial env and broke otherwise-hermetic tests that
-spawn a nested ``python`` / ``git`` (user site-packages, git identity) or exercise
-divergent-cwd repo resolution. See ``_shard_env`` for the full rationale.
+Isolation protects the operator's live Herdr lane (acceptance #3): each shard
+gets its own ``HOME`` / ``TMPDIR`` / ``MOZYO_BRIDGE_HOME`` and cannot see ``TMUX``
+/ ``TMUX_PANE`` / ``MOZYO_WORKSPACE_ID`` / ``MOZYO_LANE_ID`` / ``MOZYO_AGENT_ROLE``.
+The fresh ``HOME`` is made *functional* so it does not break parity — the shard
+gets ``PYTHONUSERBASE`` (so a nested ``python`` still finds user-site deps) and a
+deterministic git identity (so ``git commit`` works without ``~/.gitconfig``). See
+``_shard_env`` for the full rationale.
 """
 
 from __future__ import annotations
@@ -49,7 +47,11 @@ import tempfile
 import time
 import unittest
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    FIRST_COMPLETED as _FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    wait as _wait,
+)
 from pathlib import Path
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_runtime import (
@@ -204,73 +206,91 @@ def _load_durations(path: str | None) -> dict[str, float] | None:
 # Shard execution (parent)                                                    #
 # --------------------------------------------------------------------------- #
 
+# Deterministic git identity for shards (the fresh HOME has no ~/.gitconfig, so a
+# test that runs `git commit` would otherwise fail "please tell me who you are").
+_SHARD_GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "mozyo-tests-shard",
+    "GIT_AUTHOR_EMAIL": "shard@mozyo-tests.localhost",
+    "GIT_COMMITTER_NAME": "mozyo-tests-shard",
+    "GIT_COMMITTER_EMAIL": "shard@mozyo-tests.localhost",
+}
+
+
 def _shard_env(repo_root: Path, shard_home: Path) -> dict[str, str]:
-    """Environment for one shard subprocess: isolate the collision surface only.
+    """Isolated environment for one shard subprocess (acceptance #3: 固有 HOME).
 
-    The guiding rule is *stay as close to the serial run as possible* so a shard's
-    verdict matches the serial verdict; diverge only for what actually collides
-    across shards or touches the operator's live lane:
+    Each shard gets its own ``HOME`` / ``TMPDIR`` / ``MOZYO_BRIDGE_HOME`` so a test
+    can never read or write the operator's home-scoped config/state or the live
+    Herdr lane, and the live cockpit-session pins are stripped. The challenge is
+    doing this *without* breaking parity: a bare fresh HOME hides the interpreter's
+    user site-packages (where deps like PyYAML may be pip-user-installed) and has
+    no git identity, which broke otherwise-hermetic tests that spawn a nested
+    ``python -m mozyo_bridge`` or ``git commit``. So the fresh HOME is made
+    functional:
 
-    - **MOZYO_BRIDGE_HOME** — the home-scoped SQLite state store two shards would
-      otherwise share. Isolated per shard.
-    - **TMPDIR / TMP / TEMP** — a fresh temp root per shard (keeps the default tmux
-      socket, temp files, etc. from colliding, and never lands in the operator's
-      real ``$TMPDIR`` tmux socket).
-    - **live cockpit-session pins** (``TMUX`` / ``TMUX_PANE`` / ``MOZYO_WORKSPACE_ID``
-      / ``MOZYO_LANE_ID`` / ``MOZYO_AGENT_ROLE``) — stripped so no test can attach
-      to or act on the running Herdr lane.
+    - ``PYTHONUSERBASE`` is pinned to the parent's real user base, so a nested
+      ``python`` resolves user-site packages regardless of the shard's HOME.
+    - ``GIT_AUTHOR_*`` / ``GIT_COMMITTER_*`` give a deterministic identity so
+      ``git commit`` works without the operator's ``~/.gitconfig``.
 
-    Deliberately **inherited**, not overridden: ``HOME`` (so git identity, the
-    Python user site-packages, and shell config match the serial run — overriding
-    it broke tests that spawn a nested ``python -m mozyo_bridge`` or ``git commit``)
-    and ``MOZYO_REPO`` (so repo resolution follows the same cwd/env rules as serial
-    — pinning it broke tests that exercise divergent-cwd resolution). The operator's
-    Herdr/tmux state is already isolated via MOZYO_BRIDGE_HOME + TMPDIR + the
-    stripped pins, so keeping HOME does not leak into the live lane.
+    ``MOZYO_REPO`` is inherited (not pinned): repo resolution then follows the same
+    cwd/env rules as the serial run, and pinning it broke tests that exercise
+    divergent-cwd resolution.
     """
     env = dict(os.environ)
+    home = shard_home / "home"
     tmp = shard_home / "tmp"
     mozyo = shard_home / "mozyo"
-    for directory in (tmp, mozyo):
+    for directory in (home, tmp, mozyo):
         directory.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
     env["TMP"] = str(tmp)
     env["TEMP"] = str(tmp)
     env["MOZYO_BRIDGE_HOME"] = str(mozyo)
+    # Keep the fresh HOME functional (see docstring): user-site deps + git identity.
+    user_base = _user_base()
+    if user_base:
+        env["PYTHONUSERBASE"] = user_base
+    env.update(_SHARD_GIT_IDENTITY)
     for key in STRIPPED_ENV_KEYS:
         env.pop(key, None)
     # The shard subprocess runs with cwd=<target repo> and re-imports mozyo_bridge
     # via `-m`; a relative `PYTHONPATH=src` dev setup or a foreign target cwd (the
     # fixture tests) would otherwise fail to import the package. Pin the child's
-    # PYTHONPATH to the *absolute* mozyo_bridge package dir (plus the resolved
-    # site-packages, harmless when HOME is inherited) so the import resolves
-    # regardless of cwd.
+    # PYTHONPATH to the *absolute* mozyo_bridge package dir so the import resolves
+    # regardless of cwd (system site-packages are automatic; user-site is covered
+    # by PYTHONUSERBASE above).
     env["PYTHONPATH"] = os.pathsep.join(_child_python_path(env.get("PYTHONPATH")))
     return env
 
 
-def _child_python_path(existing: str | None) -> tuple[str, ...]:
-    """Absolute path entries a shard child needs to import mozyo_bridge + deps.
+def _user_base() -> str | None:
+    """The parent's real Python user base, resolved before the HOME override.
 
-    Puts the mozyo_bridge package dir first as an absolute path (so a foreign cwd
-    or a relative ``PYTHONPATH=src`` still resolves), then the resolved
-    site-packages, then any inherited ``PYTHONPATH``. Deliberately excludes any
-    tests/ discovery dir — the worker adds its own target's ``tests/`` via
-    :func:`_shard_names_importable`, so copying the parent's would cross-contaminate
-    module resolution.
+    Passed to the shard as ``PYTHONUSERBASE`` so a nested ``python`` under the
+    shard's fresh HOME still finds pip-user-installed deps.
     """
-    import mozyo_bridge  # local import: avoid a package-load cycle at import time
     import site
 
-    entries: list[str] = [str(Path(mozyo_bridge.__file__).resolve().parent.parent)]
     try:
-        entries.extend(site.getsitepackages())
+        return site.getuserbase()
     except Exception:  # pragma: no cover - not all environments expose this
-        pass
-    try:
-        entries.append(site.getusersitepackages())
-    except Exception:  # pragma: no cover
-        pass
+        return None
+
+
+def _child_python_path(existing: str | None) -> tuple[str, ...]:
+    """Absolute path entries a shard child needs to import mozyo_bridge.
+
+    Puts the mozyo_bridge package dir first as an absolute path (so a foreign cwd
+    or a relative ``PYTHONPATH=src`` still resolves), then any inherited
+    ``PYTHONPATH``. Deliberately excludes any tests/ discovery dir — the worker
+    adds its own target's ``tests/`` via :func:`_shard_names_importable`, so
+    copying the parent's would cross-contaminate module resolution.
+    """
+    import mozyo_bridge  # local import: avoid a package-load cycle at import time
+
+    entries: list[str] = [str(Path(mozyo_bridge.__file__).resolve().parent.parent)]
     if existing:
         entries.extend(p for p in existing.split(os.pathsep) if p)
 
@@ -297,40 +317,61 @@ def _replay_command(shard: Shard) -> str:
     return f"python -m unittest -v {modules}"
 
 
+# How much of a shard's stdout/stderr to retain (acceptance: 各 shard へ ...
+# stdout/stderr/exit を収集する). Bounded so a chatty shard can't blow up memory
+# or the JSON output, but large enough to carry a failure's evidence.
+_OUTPUT_TAIL_LIMIT = 8000
+
+
+def _tail(stream: str | bytes | None) -> str:
+    """Bounded trailing slice of a captured stream (str or bytes), for evidence."""
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        stream = stream.decode("utf-8", "replace")
+    return stream[-_OUTPUT_TAIL_LIMIT:]
+
+
 def _classify_shard(
     shard: Shard,
     *,
     returncode: int | None,
     result_payload: dict | None,
     timed_out: bool,
+    stdout_tail: str,
     stderr_tail: str,
     duration: float,
 ) -> ShardResult:
-    """Turn a subprocess outcome into a fail-closed :class:`ShardResult`."""
+    """Turn a subprocess outcome into a fail-closed :class:`ShardResult`.
+
+    The shard's captured stdout/stderr tails and exit code are retained on the
+    result (not just on a crash) so a failure's first-hand evidence is available
+    from the aggregate output without re-running.
+    """
     replay = _replay_command(shard)
-    if timed_out:
+
+    def build(status: str, *, ran=(), counts=None, detail=None, failed=()) -> ShardResult:
         return ShardResult(
             index=shard.index,
             kind=shard.kind,
-            status=SHARD_TIMEOUT,
-            ran_test_ids=(),
-            counts={},
+            status=status,
+            ran_test_ids=tuple(ran),
+            counts=counts or {},
             returncode=returncode,
-            detail="shard exceeded the shard timeout",
+            detail=detail,
             replay_command=replay,
             duration_seconds=duration,
+            failed_test_ids=tuple(failed),
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
         )
+
+    if timed_out:
+        return build(SHARD_TIMEOUT, detail="shard exceeded the shard timeout")
     if result_payload is None:
-        return ShardResult(
-            index=shard.index,
-            kind=shard.kind,
-            status=SHARD_CRASHED,
-            ran_test_ids=(),
-            counts={},
-            returncode=returncode,
-            detail=f"no result emitted (returncode={returncode}); stderr: {stderr_tail}",
-            replay_command=replay,
-            duration_seconds=duration,
+        return build(
+            SHARD_CRASHED,
+            detail=f"no result emitted (returncode={returncode})",
         )
     ran_ids = tuple(result_payload.get("ran_test_ids", ()))
     failed_ids = tuple(result_payload.get("failed_test_ids", ()))
@@ -340,29 +381,20 @@ def _classify_shard(
     }
     success = bool(result_payload.get("success", False))
     if success and returncode == 0:
-        status = SHARD_PASSED
-        detail = None
-    elif not success:
-        status = SHARD_FAILED
+        return build(SHARD_PASSED, ran=ran_ids, counts=counts, failed=failed_ids)
+    if not success:
         detail = (
             f"{counts.get(OUTCOME_FAILED, 0)} failed / "
             f"{counts.get(OUTCOME_ERRORED, 0)} errored"
         )
-    else:
-        # Reported success but a non-zero exit — treat as a crash, not green.
-        status = SHARD_CRASHED
-        detail = f"success reported but returncode={returncode}"
-    return ShardResult(
-        index=shard.index,
-        kind=shard.kind,
-        status=status,
-        ran_test_ids=ran_ids,
+        return build(SHARD_FAILED, ran=ran_ids, counts=counts, detail=detail, failed=failed_ids)
+    # Reported success but a non-zero exit — treat as a crash, not green.
+    return build(
+        SHARD_CRASHED,
+        ran=ran_ids,
         counts=counts,
-        returncode=returncode,
-        detail=detail,
-        replay_command=replay,
-        duration_seconds=duration,
-        failed_test_ids=failed_ids,
+        detail=f"success reported but returncode={returncode}",
+        failed=failed_ids,
     )
 
 
@@ -409,6 +441,7 @@ def _run_shard(
     started = time.perf_counter()
     timed_out = False
     returncode: int | None = None
+    stdout_tail = ""
     stderr_tail = ""
     try:
         proc = subprocess.run(
@@ -420,13 +453,12 @@ def _run_shard(
             timeout=timeout,
         )
         returncode = proc.returncode
-        stderr_tail = (proc.stderr or "")[-2000:]
+        stdout_tail = _tail(proc.stdout)
+        stderr_tail = _tail(proc.stderr)
     except subprocess.TimeoutExpired as exc:
         timed_out = True
-        stderr_tail = (exc.stderr or b"" if isinstance(exc.stderr, bytes) else exc.stderr or "")
-        if isinstance(stderr_tail, bytes):
-            stderr_tail = stderr_tail.decode("utf-8", "replace")
-        stderr_tail = stderr_tail[-2000:]
+        stdout_tail = _tail(exc.stdout)
+        stderr_tail = _tail(exc.stderr)
     duration = time.perf_counter() - started
 
     result_payload: dict | None = None
@@ -439,6 +471,7 @@ def _run_shard(
     return _classify_shard(
         shard,
         returncode=returncode,
+        stdout_tail=stdout_tail,
         result_payload=result_payload,
         timed_out=timed_out,
         stderr_tail=stderr_tail,
@@ -471,11 +504,14 @@ def _execute_plan(
     failfast: bool,
     timeout: float | None,
 ) -> list[ShardResult]:
-    """Run the parallel shards concurrently, then the serial shard on its own.
+    """Run the parallel shards through a bounded pool, then the serial shard alone.
 
-    ``--failfast`` stops launching further shards once one has failed; the
-    un-run shards are recorded as failed (``not run``) so the aggregate stays red
-    rather than silently green.
+    Shards are over-partitioned relative to ``jobs`` (the worker count), so a pool
+    of ``jobs`` workers drains a queue of finer shards. With ``--failfast``, once a
+    completed shard has failed no further queued shard is launched; the un-started
+    shards are recorded as failed (``not run``) so the aggregate stays red rather
+    than silently green. (In-flight shards are allowed to finish — a subprocess is
+    not forcibly killed mid-run.)
     """
 
     def run(shard: Shard) -> ShardResult:
@@ -497,16 +533,32 @@ def _execute_plan(
 
     if parallel:
         max_workers = max(1, min(plan.jobs, len(parallel)))
+        pending = iter(parallel)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(run, shard): shard for shard in parallel}
-            for future in futures:
-                shard = futures[future]
-                result = future.result()
-                results[shard.index] = result
-                if failfast and not result.ok:
-                    aborted = True
-        # ThreadPoolExecutor already-submitted futures all complete; with
-        # failfast we simply stop before running the serial phase.
+            inflight: dict = {}
+
+            def submit_next() -> bool:
+                shard = next(pending, None)
+                if shard is None:
+                    return False
+                inflight[pool.submit(run, shard)] = shard
+                return True
+
+            for _ in range(max_workers):
+                if not submit_next():
+                    break
+            while inflight:
+                done, _pending = _wait(inflight, return_when=_FIRST_COMPLETED)
+                for future in done:
+                    shard = inflight.pop(future)
+                    result = future.result()
+                    results[shard.index] = result
+                    if failfast and not result.ok:
+                        aborted = True
+                # Refill only while not aborted; once aborted we stop launching
+                # further queued shards (they are marked skipped below).
+                while not aborted and len(inflight) < max_workers and submit_next():
+                    pass
 
     for shard in serial:
         if aborted:
@@ -516,6 +568,9 @@ def _execute_plan(
         results[shard.index] = result
         if failfast and not result.ok:
             aborted = True
+
+    for shard in plan.shards:
+        results.setdefault(shard.index, _skipped_shard(shard, "not run (--failfast)"))
 
     return [results[shard.index] for shard in plan.shards]
 
@@ -567,7 +622,11 @@ def cmd_tests_parallel(args: argparse.Namespace) -> int:
 
     jobs = _resolve_jobs(args, policy)
     timeout = _resolve_timeout(args, policy)
-    plan = plan_shards(module_tests, jobs=jobs, policy=policy, weights=weights)
+    shards = getattr(args, "shards", None)
+    shard_count = max(1, int(shards)) if shards is not None else None
+    plan = plan_shards(
+        module_tests, jobs=jobs, policy=policy, weights=weights, shard_count=shard_count
+    )
 
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="mozyo-tests-parallel-") as tmp:
@@ -742,11 +801,12 @@ def _render_text(
     for result in results:
         shard = plan.shards[result.index]
         secs = f"{result.duration_seconds:6.2f}s" if result.duration_seconds else "   -  "
+        exit_str = "-" if result.returncode is None else str(result.returncode)
         tag = "PASS" if result.ok else result.status.upper()
         line = (
             f"  shard {result.index} [{result.kind}] "
             f"modules={len(shard.modules)} tests={shard.expected_count} "
-            f"{secs}  {tag}"
+            f"{secs} exit={exit_str}  {tag}"
         )
         if result.detail and not result.ok:
             line += f"  -- {result.detail}"
@@ -771,6 +831,15 @@ def _render_text(
             print(f"failed tests ({len(verdict.failed_test_ids)}):")
             for test_id in verdict.failed_test_ids:
                 print(f"  - {test_id}")
+        for result in results:
+            if result.ok:
+                continue
+            tail = (result.stderr_tail or result.stdout_tail or "").strip()
+            if tail:
+                clipped = tail[-1200:]
+                print(f"shard {result.index} output tail (exit={result.returncode}):")
+                for out_line in clipped.splitlines()[-20:]:
+                    print(f"  | {out_line}")
         print("replay the failed shards serially from the repo root:")
         for result in results:
             if not result.ok and result.replay_command:
@@ -786,6 +855,7 @@ def _render_json(
     payload = {
         "success": verdict.success,
         "jobs": plan.jobs,
+        "shard_count": len(plan.shards),
         "weight_basis": plan.weight_basis,
         "total_modules": plan.total_modules,
         "wall_clock_seconds": round(wall, 6),
@@ -803,7 +873,10 @@ def _render_json(
                     if result.duration_seconds is not None
                     else None
                 ),
+                "returncode": result.returncode,
                 "detail": result.detail,
+                "stdout_tail": result.stdout_tail,
+                "stderr_tail": result.stderr_tail,
                 "replay_command": result.replay_command,
             }
             for result in results
