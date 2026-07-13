@@ -309,6 +309,28 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: blocker", output)
             self.assertIn(slash_secret, output)
 
+    def test_call_terminated_literal_secret_still_blocks(self) -> None:
+        # Redmine #13695: a real credential literal passed as the final call
+        # argument leaves a call-closing `)` glued to the captured value. The
+        # tree scan must separate that punctuation and still flag the leaked
+        # literal instead of misreading the `)` as an expression and returning
+        # clean (the pre-fix blind spot that let the canary through).
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        secret_key = "sup" + "er-secret-key123"
+        leak_line = 'cache = RedmineContextCache(api_key="' + secret_key + '")'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "config.py", leak_line + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("result: blocker", output)
+            self.assertIn(secret_key, output)
+
 
 class SecretValueClassifierTest(unittest.TestCase):
     """Redmine #12175: pin the second-stage credential-value classifier that
@@ -373,6 +395,48 @@ class SecretValueClassifierTest(unittest.TestCase):
             self.assertTrue(
                 release_mod._secret_value_is_real(value),
                 msg=f"expected real token secret: {value!r}",
+            )
+
+    def test_accepts_call_terminated_literals_and_still_rejects_expressions(
+        self,
+    ) -> None:
+        # Redmine #13695: a real credential literal passed as the final call
+        # argument, the last list/dict element, or a trailing-comma assignment
+        # leaves a closing `)` `]` `}` or separator `,` `;` glued to the captured
+        # value. That punctuation is enclosing syntax, not part of the secret, so
+        # it must be separated before classification — quoted and unquoted alike.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "ab" + "c123"
+        accept_values = (
+            '"' + token + '")',  # quoted literal, call-closing paren
+            "'" + token + "')",  # single-quoted, call-closing paren
+            '"' + token + '"]',  # quoted literal, list-closing bracket
+            '"' + token + '"}',  # quoted literal, dict/set-closing brace
+            '"' + token + '");',  # quoted literal, call close + semicolon
+            token + ")",  # unquoted token, call-closing paren
+            token + "],",  # unquoted token, list close + comma
+        )
+        for value in accept_values:
+            self.assertTrue(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected real call-terminated secret: {value!r}",
+            )
+
+        # Separating trailing closers must not re-admit a genuine expression
+        # that merely ends in one: its unmatched *opening* bracket survives the
+        # strip and still marks it as code structure, not a literal.
+        reject_values = (
+            "get_key()",  # call expression as last arg
+            "os.environ[API_KEY])",  # index expression ending in a closer
+            'config["API_KEY"])',  # subscript expression
+            "build({key})",  # nested call / dict expression
+            "factory(make())",  # nested call
+        )
+        for value in reject_values:
+            self.assertFalse(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected non-secret expression: {value!r}",
             )
 
     def test_assignment_classifier_pins_request_cases(self) -> None:
