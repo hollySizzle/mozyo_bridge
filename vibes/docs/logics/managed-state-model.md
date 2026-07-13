@@ -299,7 +299,15 @@ Table naming:
     re-declare) が成立しない。両者を 1 field に畳むと、unbound lane が再読不能な anchor を持てて
     しまう。`DecisionPointer` は source 語彙と **positive decimal な issue/journal id** を要求する。
     v1 row の anchor は issue を欠くため `decision` が `None` (再読不能) として **可視化**され、
-    推測で back-fill しない。
+    推測で back-fill しない。id validation は **ASCII decimal** で行う (`str.isdigit()` は `²` /
+    全角 `１` / Arabic-Indic `١` を True にするため使わない)。
+  - **container guard は component guard ではない** (#13689 R3-F1)。本 component は DDL/DML の前に
+    自分の `state_schema_components.schema_version` を読み、**未知の newer version なら
+    `LaneLifecycleError` で fail-closed** し、table / metadata / rows を一切変更しない (`### backup /
+    downgrade / partial migration` の「古い CLI が新しい container **または component schema** を見たら
+    unsupported として DB を書き換えない」の実装)。rows は lifecycle authority であり、metadata を
+    v2 へ書き戻すと **newer semantics を知らない code が authority を更新できてしまう**。read/write は
+    `unknown` / `None` / error へ落ち、active を推定しない。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
 
 Ownership rules:

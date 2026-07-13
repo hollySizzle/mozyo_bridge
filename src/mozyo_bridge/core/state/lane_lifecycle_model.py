@@ -291,12 +291,34 @@ class DecisionPointerError(ValueError):
     """A durable decision pointer is missing / malformed (R1-F5); fail closed."""
 
 
+#: ASCII decimal digits. ``str.isdigit()`` is **not** this test: it is true for
+#: ``²``, ``１`` (full-width) and ``١`` (Arabic-Indic), none of which ``int()`` will
+#: parse or Redmine will accept (R3-F2).
+_ASCII_DIGITS = frozenset("0123456789")
+
+#: Far beyond any real Redmine id. Bounds the input so an oversized string is a
+#: rejected id rather than an unbounded parse (CPython raises on huge ``int()``
+#: conversions, which would escape this module's error contract).
+_MAX_ID_DIGITS = 18
+
+
 def _positive_decimal(value: str, *, field: str) -> str:
-    """A Redmine id: a positive decimal. Anything else cannot address a record."""
-    if not value.isdigit() or int(value) <= 0:
+    """A Redmine id: a positive ASCII decimal. Anything else cannot address a record.
+
+    Every rejection raises :class:`DecisionPointerError` — the closed contract this
+    module's callers rely on (R3-F2). Deliberately does **not** call ``int()``: the
+    old ``isdigit()`` + ``int()`` pair accepted Unicode digits (storing an anchor no
+    Redmine call could ever resolve) and let CPython's raw ``ValueError`` escape on
+    a non-ASCII or oversized string — including out of
+    :attr:`LaneLifecycleRecord.decision`, which promises ``None`` on an unreadable
+    anchor and instead raised.
+    """
+    if not value or len(value) > _MAX_ID_DIGITS or not _ASCII_DIGITS.issuperset(value):
         raise DecisionPointerError(
-            f"a redmine {field} must be a positive decimal id, got {value!r}"
+            f"a redmine {field} must be a positive ASCII decimal id, got {value!r}"
         )
+    if not value.strip("0"):
+        raise DecisionPointerError(f"a redmine {field} is never zero, got {value!r}")
     return value
 
 
