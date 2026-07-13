@@ -489,6 +489,17 @@ fence は何も修復せず、live process env を読まない (herdr は不可)
 owner 判断 (runtime を `doctor runtime` で検証し source と一致する互換 runtime で heal /
 recreate、split lane は retire + recreate) である。
 
+> **acceptance (coordinator ratified、Redmine #13705 j#77203 = Close condition #1 の durable
+> amendment)。** 上記 forward-gate + reinstall-gate による residual の扱いは、coordinator
+> acceptance authority (owner delegation、production release 以外) により承認され、issue
+> #13705 の Close condition #1 は次へ改訂された: *incompatible/provenance 不明 runtime による
+> heal/start は、本 fence を carry する runtime の official mutating front door において
+> workspace/tab/agent side effect 0 で fail-closed する。fence code を持たない旧世代 client は
+> 本 issue scope では技術的に停止不能であり、その残余は #13524 の installed/source fingerprint
+> 一致・local reinstall gate が green になるまで dogfood/release 候補へ進めないことで閉じる。*
+> fence-less client 自体を backend/server authority で拒否する強保証が将来必要なら別 ticket
+> (本 issue へ scope 膨張させない)。
+
 ## 6. Close-evidence contract (pure-herdr round trip)
 
 close 判定には次の durable evidence を要求する:
