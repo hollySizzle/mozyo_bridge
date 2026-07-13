@@ -33,7 +33,7 @@ def _skill_dir_info(
     *,
     present: bool,
     references_missing: list[str] | None = None,
-    path: str = "/home/op/.claude/skills/mozyo-bridge-agent",
+    path: str = "/workspace/agent/.claude/skills/mozyo-bridge-agent",
 ) -> dict[str, Any]:
     return {
         "present": present,
@@ -48,7 +48,7 @@ def _plugin_info(
 ) -> dict[str, Any]:
     return {
         "present": present,
-        "root": "/home/op/.claude/plugins/cache/mozyo-bridge/mozyo-bridge-agent",
+        "root": "/workspace/agent/.claude/plugins/cache/mozyo-bridge/mozyo-bridge-agent",
         "versions": versions or [],
     }
 
@@ -58,7 +58,7 @@ def _skill_view(
     global_info: dict[str, Any],
     project_info: dict[str, Any],
     plugin_info: dict[str, Any],
-    global_home: str = "/home/op/.claude",
+    global_home: str = "/workspace/agent/.claude",
     project_dir: str = "/work/project",
     install_hint: str = _INSTALL_HINT,
 ) -> dict[str, Any]:
@@ -160,7 +160,7 @@ class EvaluateClaudeSkillSectionPolicyTest(unittest.TestCase):
         verdict = evaluate_claude_skill_section(
             _skill_view(
                 global_info=_skill_dir_info(
-                    present=True, path="/home/op/.claude/skills/mozyo-bridge-agent"
+                    present=True, path="/workspace/agent/.claude/skills/mozyo-bridge-agent"
                 ),
                 project_info=_skill_dir_info(
                     present=True, path="/work/project/.claude/skills/mozyo-bridge-agent"
@@ -172,7 +172,7 @@ class EvaluateClaudeSkillSectionPolicyTest(unittest.TestCase):
         self.assertEqual(
             (
                 precedence_warning(
-                    "/home/op/.claude/skills/mozyo-bridge-agent",
+                    "/workspace/agent/.claude/skills/mozyo-bridge-agent",
                     "/work/project/.claude/skills/mozyo-bridge-agent",
                 ),
             ),

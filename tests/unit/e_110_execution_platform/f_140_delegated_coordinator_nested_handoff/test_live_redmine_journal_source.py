@@ -36,6 +36,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     markers_from_source,
 )
 
+# Explicit non-secret placeholders. Source Tree Hygiene strict-fails on a
+# credential-shaped literal in a tracked file, so these carry a `fake-` marker
+# that the scanner classifies as a placeholder rather than a leaked key. The
+# redaction canary stays a distinct value: the assertions below prove the key
+# never reaches an error message and is never forwarded across a redirect.
+_FAKE_API_KEY = "fake-api-key"
+_REDACTION_CANARY_KEY = "fake-api-key-leak-canary"
+
 
 def _handoff_marker(issue, journal, kind, to="codex"):
     return f"[mozyo:handoff:source=redmine:issue={issue}:journal={journal}:kind={kind}:to={to}]"
@@ -73,7 +81,7 @@ class ReadEntriesContractTest(unittest.TestCase):
     def test_read_entries_reuses_mapping_parse(self):
         transport = _RecordingTransport(self._mcp_payload())
         source = LiveRedmineJournalSource(
-            base_url="https://redmine.example", api_key="k", transport=transport
+            base_url="https://redmine.example", api_key=_FAKE_API_KEY, transport=transport
         )
         entries = source.read_entries("13289")
         # 72671 (prose) + 72700 (marker); 72710 empty-note dropped by the reused parse.
@@ -83,7 +91,7 @@ class ReadEntriesContractTest(unittest.TestCase):
     def test_markers_from_source_extracts_structured_gate(self):
         transport = _RecordingTransport(self._mcp_payload())
         source = LiveRedmineJournalSource(
-            base_url="https://redmine.example", api_key="k", transport=transport
+            base_url="https://redmine.example", api_key=_FAKE_API_KEY, transport=transport
         )
         markers = markers_from_source(source, "13289")
         self.assertEqual([(m.journal, m.gate) for m in markers], [("72700", "review_request")])
@@ -98,24 +106,24 @@ class ReadEntriesContractTest(unittest.TestCase):
             }
         }
         source = LiveRedmineJournalSource(
-            base_url="https://redmine.example", api_key="k", transport=_RecordingTransport(payload)
+            base_url="https://redmine.example", api_key=_FAKE_API_KEY, transport=_RecordingTransport(payload)
         )
         self.assertEqual([e.journal_id for e in source.read_entries("13289")], ["72700"])
 
     def test_transport_receives_trusted_base_and_key(self):
         transport = _RecordingTransport(self._mcp_payload())
         source = LiveRedmineJournalSource(
-            base_url="https://redmine.example", api_key="secret-key", transport=transport, since="x"
+            base_url="https://redmine.example", api_key=_FAKE_API_KEY, transport=transport, since="x"
         )
         source.read_entries("13289")
         self.assertEqual(transport.calls[0]["base_url"], "https://redmine.example")
-        self.assertEqual(transport.calls[0]["api_key"], "secret-key")
+        self.assertEqual(transport.calls[0]["api_key"], _FAKE_API_KEY)
         self.assertEqual(transport.calls[0]["issue_id"], "13289")
         self.assertEqual(transport.calls[0]["since"], "x")
 
     def test_missing_issue_id_fails_closed(self):
         source = LiveRedmineJournalSource(
-            base_url="https://redmine.example", api_key="k", transport=_RecordingTransport({})
+            base_url="https://redmine.example", api_key=_FAKE_API_KEY, transport=_RecordingTransport({})
         )
         with self.assertRaises(LiveRedmineJournalError):
             source.read_entries("")
@@ -137,7 +145,7 @@ class SinceCursorTest(unittest.TestCase):
     def test_cursor_keeps_only_strictly_newer_and_undated(self):
         source = LiveRedmineJournalSource(
             base_url="https://redmine.example",
-            api_key="k",
+            api_key=_FAKE_API_KEY,
             transport=_RecordingTransport(self._payload()),
             since="2026-07-05T08:00:00Z",
         )
@@ -147,7 +155,7 @@ class SinceCursorTest(unittest.TestCase):
     def test_no_cursor_reads_all(self):
         source = LiveRedmineJournalSource(
             base_url="https://redmine.example",
-            api_key="k",
+            api_key=_FAKE_API_KEY,
             transport=_RecordingTransport(self._payload()),
         )
         self.assertEqual([e.journal_id for e in source.read_entries("13289")], ["1", "2", "3"])
@@ -155,7 +163,7 @@ class SinceCursorTest(unittest.TestCase):
     def test_cursor_equal_timestamp_is_excluded(self):
         source = LiveRedmineJournalSource(
             base_url="https://redmine.example",
-            api_key="k",
+            api_key=_FAKE_API_KEY,
             transport=_RecordingTransport(self._payload()),
             since="2026-07-05T09:00:00Z",
         )
@@ -199,19 +207,19 @@ class ErrorRedactionTest(unittest.TestCase):
             raise LiveRedmineJournalError(f"redmine issue {issue_id} journal fetch failed (URLError)")
 
         source = LiveRedmineJournalSource(
-            base_url="https://redmine.secret-host.example", api_key="TOP-SECRET", transport=_boom
+            base_url="https://redmine.secret-host.example", api_key=_REDACTION_CANARY_KEY, transport=_boom
         )
         with self.assertRaises(LiveRedmineJournalError) as ctx:
             source.read_entries("13289")
         msg = str(ctx.exception)
-        self.assertNotIn("TOP-SECRET", msg)
+        self.assertNotIn(_REDACTION_CANARY_KEY, msg)
         self.assertNotIn("secret-host", msg)
 
 
 class DefaultTransportSignatureTest(unittest.TestCase):
     def test_default_transport_is_the_urllib_fetch(self):
         # The dataclass default is the real urllib transport (no accidental fake baked in).
-        source = LiveRedmineJournalSource(base_url="https://x", api_key="k")
+        source = LiveRedmineJournalSource(base_url="https://x", api_key=_FAKE_API_KEY)
         self.assertIs(source.transport, urllib_issue_detail_fetch)
 
 
@@ -266,7 +274,7 @@ class RedirectCredentialBoundaryTest(unittest.TestCase):
         with self.assertRaises(LiveRedmineJournalError):
             urllib_issue_detail_fetch(
                 base_url=f"http://127.0.0.1:{base_port}",
-                api_key="LEAK-CANARY",
+                api_key=_REDACTION_CANARY_KEY,
                 issue_id="1",
                 since=None,
             )
