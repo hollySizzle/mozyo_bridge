@@ -12,11 +12,23 @@ from mozyo_bridge.application.commands import (
     cmd_agents_list,
     cmd_agents_targets,
 )
-from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import AGENT_KINDS
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+    agent_kinds,
+)
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
 
 
-def register(sub) -> None:
-    """Register the `agents` subcommand tree onto ``sub``."""
+def register(sub, *, snapshot: AgentProviderRuntimeSnapshot | None = None) -> None:
+    """Register the `agents` subcommand tree onto ``sub``.
+
+    ``snapshot`` (Redmine #13569 Increment 2A) supplies the ``--agent`` choice
+    vocabulary from an injected provider snapshot; ``None`` uses the built-in
+    providers, so the default composition (``compose_parser`` invokes this with no
+    snapshot) is byte-identical.
+    """
+    agent_choices = sorted(agent_kinds(snapshot))
     agents = sub.add_parser(
         "agents",
         help=(
@@ -53,7 +65,7 @@ def register(sub) -> None:
     )
     agents_list.add_argument(
         "--agent",
-        choices=sorted(AGENT_KINDS),
+        choices=agent_choices,
         help=(
             "Filter by classified agent kind. `claude` and `codex` match "
             "panes whose tmux window name equals that agent label "
@@ -92,7 +104,7 @@ def register(sub) -> None:
     )
     agents_targets.add_argument(
         "--agent",
-        choices=sorted(AGENT_KINDS),
+        choices=agent_choices,
         help="Filter by classified agent kind (claude / codex).",
     )
     agents_targets.add_argument(
@@ -121,7 +133,7 @@ def register(sub) -> None:
     )
     agents_attention.add_argument(
         "--agent",
-        choices=sorted(AGENT_KINDS),
+        choices=agent_choices,
         help="Filter by classified agent kind (claude / codex).",
     )
     agents_attention.add_argument(

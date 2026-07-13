@@ -1809,6 +1809,43 @@ status / doctor / retire consumer sweep, the `workflow_step_herdr` role-authorit
 (that stays #13583 `provider_binding` authority — a role is never derived from a provider
 profile), and default pair / topology assignment.
 
+### Increment 2A — the injected runtime snapshot (Redmine #13569)
+
+The Increment 1 consumers still each reached provider knowledge through the *global*
+built-in singleton (an import-time `agent_provider_ids()` call or a hard-coded
+`{"claude", "codex"}` literal). Increment 2A adds the seam the whole-plan-preflight lesson
+(R2-F1) demands one level up: a single injected value all consumers share.
+
+- **`AgentProviderRuntimeSnapshot`** (`e_110.../f_120_agent_discovery_pane_resolution/domain/`)
+  is a core-owned, frozen projection of ONE registry's *mechanical* vocabulary — provider
+  ids, command basenames, discovery-alias / process-owner maps, and the mechanical
+  launchability (protocol + interactive-TUI capability, the exact `require_launchable`
+  predicate). It carries no role, no `provider_binding`, no route, and no default topology.
+- **`build_runtime_snapshot(registry=…)`** (`e_140.../f_160_provider_registry/application/`)
+  is the one place that reads a registry and projects it, so the execution-platform
+  consumers never import the registry singleton. `BUILTIN_AGENT_PROVIDER_SNAPSHOT` is seeded
+  once from the packaged profiles and is every consumer's default.
+- The consumers — CLI `--agent` / `--to` / `--select-role` choices, `agent_discovery`,
+  `pane_resolver` (including the per-receiver strong-identity check), `target_selector`,
+  the handoff receiver vocabulary, and `herdr_target_resolution` — take an optional
+  injected `snapshot` (default `None` → built-in, byte-identical). A synthetic same-protocol
+  provider present only in an injected snapshot is recognized by all of them with **no
+  provider literal added to any consumer source and no global monkeypatch**.
+
+**Known vs expected (the split).** Registering a profile makes a provider *known /
+recognizable*, never *expected*. `status` / `doctor` / `launch` now classify observed
+windows against the **known** snapshot but judge *missing* / *ready* against the
+**expected** topology — the separate, deliberately literal default-pair contract
+(`default_agent_topology.DEFAULT_EXPECTED_AGENTS`, the single source `LAUNCH_PROVIDERS` and
+the tmux status/doctor "expected" judgment both reference). So a profile-only provider is
+recognizable yet never reported missing. For the built-in pair known == expected, so the
+split is byte-identical for the shipped providers.
+
+Still out of scope for 2A (Increment 2B): the `provider_binding`-aware project-gateway /
+delegated-route / sublane launch-dispatch-retire sweep. Unchanged in both increments: the
+`workflow_step_herdr` / `grandchild_stamp` durable role authority and the default topology
+(a role / default pair is never derived from a provider profile).
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

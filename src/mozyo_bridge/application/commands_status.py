@@ -87,6 +87,9 @@ from mozyo_bridge.application.status_session_port import (
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     AGENT_LABELS,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import (
+    DEFAULT_EXPECTED_AGENTS,
+)
 
 if TYPE_CHECKING:  # avoid an import cycle / heavy import on the hot path
     import argparse
@@ -142,12 +145,25 @@ class ResolveSessionStatusUseCase:
     def __init__(self, sessions: StatusSessionPort) -> None:
         self._sessions = sessions
 
-    def resolve(self, query: StatusQuery) -> SessionStatusView:
+    def resolve(
+        self,
+        query: StatusQuery,
+        *,
+        expected_providers: "tuple[str, ...] | None" = None,
+    ) -> SessionStatusView:
+        # `expected_providers` is the topology the session is expected to run (Redmine
+        # #13569 known-vs-expected split); it defaults to the built-in launch pair and is
+        # a SEPARATE input from the known registry vocabulary used for recognition.
+        expected = (
+            DEFAULT_EXPECTED_AGENTS if expected_providers is None else expected_providers
+        )
         session = query.session
         if not self._sessions.session_exists(session):
             return SessionStatusView(session=session, present=False)
 
         windows = self._sessions.list_windows(session)
+        # Recognition uses the KNOWN providers (the registry vocabulary): any observed
+        # window whose name is a recognized provider is an agent window.
         agent_windows = tuple(name for name in windows if name in AGENT_LABELS)
         if not agent_windows:
             return SessionStatusView(
@@ -158,8 +174,13 @@ class ResolveSessionStatusUseCase:
             )
 
         panes_ok, panes_text = self._sessions.capture_panes(session)
+        # "Missing" is judged against the EXPECTED topology, NOT the full registry
+        # (Redmine #13569 known-vs-expected split): a profile-only provider that is
+        # recognizable but not part of the default launch pair must never be reported
+        # missing. For the built-in providers the expected set equals the known set, so
+        # this is byte-identical to the previous behavior.
         missing = tuple(
-            sorted(agent for agent in AGENT_LABELS if agent not in agent_windows)
+            sorted(agent for agent in expected if agent not in agent_windows)
         )
         return SessionStatusView(
             session=session,

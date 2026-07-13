@@ -41,6 +41,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     register_delegate_launch_adopt,
     register_grandchild_dispatch,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_receiver_vocab import (
+    receiver_choices,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     KIND_LABELS,
     MODE_QUEUE_ENTER,
@@ -129,9 +135,15 @@ def configure_handoff_parser(
     target_required: bool = False,
     target_repo_required: bool = False,
     source_required: bool = True,
+    snapshot: "AgentProviderRuntimeSnapshot | None" = None,
 ) -> None:
     if include_to:
-        parser_.add_argument("--to", required=True, choices=["claude", "codex"], help="Semantic receiver agent")
+        parser_.add_argument(
+            "--to",
+            required=True,
+            choices=receiver_choices(snapshot),
+            help="Semantic receiver agent",
+        )
     parser_.add_argument(
         "--source",
         required=source_required,

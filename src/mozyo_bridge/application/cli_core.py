@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import argparse
 
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    agent_provider_ids,
+)
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.application.commands import (
     cmd_doctor,
@@ -149,7 +152,7 @@ def register_lifecycle(sub) -> None:
             "to the current pane when no target is given."
         ),
     )
-    init.add_argument("agent", choices=["claude", "codex"])
+    init.add_argument("agent", choices=sorted(agent_provider_ids()))
     init.add_argument("target", nargs="?")
     init.add_argument(
         "--window-only",
@@ -757,7 +760,7 @@ def register_lifecycle(sub) -> None:
         "--agent",
         dest="agent",
         action="append",
-        choices=["claude", "codex"],
+        choices=sorted(agent_provider_ids()),
         help="Provider agent to prepare (repeatable). Default: both claude and codex.",
     )
     herdr_session_start.add_argument(

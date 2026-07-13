@@ -28,6 +28,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import pane_lines
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
     agent_discovery_aliases,
@@ -49,6 +52,20 @@ _PROVIDER_IDS = agent_provider_ids()
 AGENT_KINDS = _PROVIDER_IDS | {AGENT_KIND_UNKNOWN}
 # `{window/pane alias -> provider id}` for name-based classification.
 _DISCOVERY_ALIASES = agent_discovery_aliases()
+
+
+def agent_kinds(snapshot: AgentProviderRuntimeSnapshot | None = None) -> frozenset[str]:
+    """The known agent kinds — provider ids plus the ``unknown`` sentinel.
+
+    ``snapshot`` (Redmine #13569 Increment 2A) lets a caller resolve the vocabulary
+    from an injected provider snapshot instead of the module's built-in constant, so
+    the CLI ``--agent`` choices (and any other vocabulary consumer) can be composed
+    against a synthetic provider set without monkeypatching the global registry. The
+    default (``None``) is the built-in :data:`AGENT_KINDS`, so existing callers are
+    behavior-preserving.
+    """
+    ids = _PROVIDER_IDS if snapshot is None else snapshot.provider_ids
+    return frozenset(ids) | {AGENT_KIND_UNKNOWN}
 
 # Role identity model (Redmine #11822). Agent role is not the window name nor a
 # single pane option — it is the *output of a resolver* over the pane's runtime
@@ -215,13 +232,22 @@ def infer_repo_root(cwd: str) -> str | None:
     return None
 
 
-def classify_agent_kind(window_name: str) -> str:
+def classify_agent_kind(
+    window_name: str,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> str:
     """The provider a window name names, or ``unknown`` (Redmine #13441).
 
     Resolves through the profiles' declared discovery aliases, so a new
     same-protocol provider is recognized by adding a profile entry rather than a
     branch here. An unaliased name stays ``unknown`` exactly as before.
+
+    ``snapshot`` (Redmine #13569 Increment 2A) resolves against an injected provider
+    vocabulary instead of the module's built-in alias map; ``None`` keeps the built-in.
     """
+    if snapshot is not None:
+        return snapshot.provider_for_alias(window_name) or AGENT_KIND_UNKNOWN
     return _DISCOVERY_ALIASES.get(window_name, AGENT_KIND_UNKNOWN)
 
 
@@ -245,15 +271,17 @@ class RoleResolution:
     evidence: tuple[str, ...] = ()
 
 
-def _normalize_role(value: str | None) -> str:
+def _normalize_role(value: str | None, provider_ids: "frozenset[str] | set[str]") -> str:
     """Map a raw role-ish string to a registered provider id, else ``unknown``.
 
     The pane option carries a *provider* token, so this checks the registered
     provider vocabulary (Redmine #13441) rather than a hard-coded pair. An
     unregistered token stays ``unknown``, so an unrecognized role never routes.
+    ``provider_ids`` is the vocabulary to check against — the built-in set by default,
+    or an injected snapshot's ids (Redmine #13569 Increment 2A).
     """
     text = (value or "").strip()
-    return text if text in _PROVIDER_IDS else AGENT_KIND_UNKNOWN
+    return text if text in provider_ids else AGENT_KIND_UNKNOWN
 
 
 def resolve_agent_role(
@@ -261,6 +289,7 @@ def resolve_agent_role(
     pane_option_role: str | None = None,
     window_name: str | None = None,
     process: str | None = None,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
 ) -> RoleResolution:
     """Resolve a pane's agent role from its runtime facts (pure, Redmine #11822).
 
@@ -282,9 +311,18 @@ def resolve_agent_role(
     panes carry no option). Live tmux state remains the liveness / preflight
     source of truth (#11698) — this resolver decides *identity*, never liveness.
     """
-    option_role = _normalize_role(pane_option_role)
-    window_role = _normalize_role(window_name)
-    process_role = _PROCESS_ROLE_HINTS.get((process or "").strip(), AGENT_KIND_UNKNOWN)
+    if snapshot is not None:
+        provider_ids: "frozenset[str] | set[str]" = snapshot.provider_ids
+        process_role = (
+            snapshot.provider_for_process((process or "").strip()) or AGENT_KIND_UNKNOWN
+        )
+    else:
+        provider_ids = _PROVIDER_IDS
+        process_role = _PROCESS_ROLE_HINTS.get(
+            (process or "").strip(), AGENT_KIND_UNKNOWN
+        )
+    option_role = _normalize_role(pane_option_role, provider_ids)
+    window_role = _normalize_role(window_name, provider_ids)
     evidence = (
         f"option={(pane_option_role or '').strip() or '-'}",
         f"window={(window_name or '').strip() or '-'}",

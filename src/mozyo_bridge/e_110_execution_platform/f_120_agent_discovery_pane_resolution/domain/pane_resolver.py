@@ -15,10 +15,14 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     infer_repo_root,
     resolve_agent_role,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
     agent_commands,
     agent_process_names,
+    agent_process_owners,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     pane_lines,
@@ -39,6 +43,12 @@ from mozyo_bridge.shared.paths import READ_MARK_PREFIX, normalize_path_unicode
 AGENT_PROCESSES = set(agent_process_names()) | {"node"}
 AGENT_COMMANDS = agent_commands()
 AGENT_LABELS = frozenset(AGENT_COMMANDS)
+# `{process basename -> provider id}` for the strong per-receiver identity check
+# (`is_receiver_agent_process`). Registry-derived so a provider whose process
+# basename differs from its id resolves correctly; `node` is deliberately absent
+# (it is receiver-agnostic, handled by the weak branch). An injected snapshot
+# (Redmine #13569 Increment 2A) overrides this default per call.
+_PROCESS_OWNERS = agent_process_owners()
 # Pseudo-target label (Redmine #12015): resolves to the sender workspace's main
 # coordinator Codex (the default-lane Codex), so a sublane can call back the
 # coordinator without hand-picking its `%pane`. Not an `AGENT_LABELS` member —
@@ -744,7 +754,9 @@ def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | Non
     return find_agent_window(agent, session)
 
 
-def resolve_target(target: str) -> str:
+def resolve_target(
+    target: str, *, snapshot: AgentProviderRuntimeSnapshot | None = None
+) -> str:
     """Resolve a CLI ``--target`` to a tmux pane id (`%n`).
 
     Every branch returns a pane id: downstream consumers (notably
@@ -791,11 +803,12 @@ def resolve_target(target: str) -> str:
             )
         )
         raise AssertionError("unreachable")
-    if target not in AGENT_LABELS:
+    labels = AGENT_LABELS if snapshot is None else snapshot.provider_ids
+    if target not in labels:
         die(
             f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
             "location (`session:window.pane`), an agent label "
-            f"({', '.join(sorted(AGENT_LABELS))}), or `{COORDINATOR_LABEL}` "
+            f"({', '.join(sorted(labels))}), or `{COORDINATOR_LABEL}` "
             "(the sender workspace's main coordinator pane)."
         )
     session = current_session_name()
@@ -824,12 +837,21 @@ def pane_info(target: str) -> dict[str, str]:
     raise AssertionError("unreachable")
 
 
-def is_agent_process(command: str) -> bool:
+def is_agent_process(
+    command: str, *, snapshot: AgentProviderRuntimeSnapshot | None = None
+) -> bool:
     name = Path(command or "").name
-    return name in AGENT_PROCESSES or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
+    known = AGENT_PROCESSES if snapshot is None else None
+    is_known = name in known if known is not None else snapshot.is_agent_process(name)
+    return is_known or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
 
 
-def is_receiver_agent_process(command: str, receiver: str) -> bool:
+def is_receiver_agent_process(
+    command: str,
+    receiver: str,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> bool:
     """Per-receiver foreground process check for the relaxed `queue-enter` rail.
 
     Stricter than :func:`is_agent_process`. The contract
@@ -859,9 +881,15 @@ def is_receiver_agent_process(command: str, receiver: str) -> bool:
     name = Path(command or "").name
     if not name:
         return False
-    if receiver == "claude" and name == "claude":
-        return True
-    if receiver == "codex" and name == "codex":
+    # Strong identity: the foreground basename is a provider-owned process AND its
+    # owning provider IS the named receiver. Registry/snapshot-derived (Redmine
+    # #13569 Increment 2A) rather than a hard-coded `claude`/`codex` pair, so a
+    # synthetic same-protocol provider is recognized and cross-binding stays fully
+    # detectable (a `codex` process for receiver=`claude` still returns False). For
+    # the built-in providers the process basename equals the provider id, so this is
+    # byte-identical to the previous literal check.
+    owners = _PROCESS_OWNERS if snapshot is None else snapshot.process_owners()
+    if owners.get(name) == receiver:
         return True
     # Weak identity branch: `node` literal and versioned native binary
     # basenames are receiver-agnostic. See docstring; do not pretend either

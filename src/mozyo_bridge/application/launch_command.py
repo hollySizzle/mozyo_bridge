@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Protocol, runtime_checkable
 
-from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import AGENT_LABELS
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import DEFAULT_EXPECTED_AGENTS  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application import agent_provider_executable as _agent_exe
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -150,7 +150,7 @@ def build_mozyo_json_payload(
         "cwd": cwd,
         "created": list(created),
         "windows": windows,
-        "ready": AGENT_LABELS.issubset(present),
+        "ready": set(DEFAULT_EXPECTED_AGENTS).issubset(present),
         "attach": attach_command,
         "attach_target": session,
         "attached": False,

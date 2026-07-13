@@ -13,6 +13,13 @@ from __future__ import annotations
 
 import argparse
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_receiver_vocab import (
+    receiver_choices,
+)
+
 
 def add_handoff_select_args(parser: argparse.ArgumentParser) -> None:
     """Add `handoff send --select` semantic-selection flags (Redmine #12663).
@@ -46,7 +53,11 @@ def add_handoff_select_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_message_select_args(parser: argparse.ArgumentParser) -> None:
+def add_message_select_args(
+    parser: argparse.ArgumentParser,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> None:
     """Add `message --select-role` semantic-selection flags (Redmine #12663).
 
     The operator / ticketless ``message`` rail has no ``--to`` flag, so
@@ -54,11 +65,15 @@ def add_message_select_args(parser: argparse.ArgumentParser) -> None:
     trigger). Combined with ``--target-repo`` (default: the sender's own repo)
     and the optional session / project discriminators, it reuses the same
     fail-closed selector ``handoff send --select`` uses.
+
+    ``snapshot`` (Redmine #13569 Increment 2A) supplies the ``--select-role``
+    receiver vocabulary from an injected provider snapshot; ``None`` uses the
+    built-in receivers (byte-identical).
     """
     parser.add_argument(
         "--select-role",
         dest="select_role",
-        choices=["claude", "codex"],
+        choices=receiver_choices(snapshot),
         help=(
             "Resolve the target pane semantically by receiver role instead of an "
             "explicit `%%pane` (Redmine #12663). Combine with `--target-repo` "
