@@ -133,6 +133,16 @@ def configure_q_enter_parser(parser_: argparse.ArgumentParser) -> None:
             "(`grandparent_coordinator` / `project_gateway`)."
         ),
     )
+    parser_.add_argument(
+        "--forward-action-id",
+        dest="forward_action_id",
+        default="",
+        help=(
+            "consultation_callback: echo the opaque forward generation id (Redmine #13583) the "
+            "consultation carried, so a positively-delivered callback completes the exact forward "
+            "generation. Omit for a plain callback."
+        ),
+    )
 
 
 def _emit_submit_outcome(outcome: SubmitOutcome, *, record_format: str) -> None:
@@ -266,9 +276,15 @@ def cmd_handoff_q_enter(args: argparse.Namespace) -> int:
     args.submit_delivery_id = delivery_id
 
     if plan.ticketless:
-        return orchestrate_handoff(
-            args, default_kind=plan.default_kind, ticketless=True
+        rc = orchestrate_handoff(args, default_kind=plan.default_kind, ticketless=True)
+        # Redmine #13583 R1-F1: a positively-delivered consultation_callback that echoes a
+        # forward_action_id completes the correlated forward generation (best-effort; rc unchanged).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (  # noqa: E501
+            complete_forward_generation_on_callback,
         )
+
+        complete_forward_generation_on_callback(args, delivered=(rc == 0))
+        return rc
     if plan.rail == RAIL_ANCHORED_REPLY:
         return orchestrate_handoff(args, default_kind=plan.default_kind)
     return orchestrate_handoff(args)

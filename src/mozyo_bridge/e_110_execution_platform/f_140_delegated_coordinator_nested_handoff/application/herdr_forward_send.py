@@ -220,10 +220,20 @@ class ForwardSendOutcome:
 
 
 class ForwardSendPort(Protocol):
-    """The one-step forward send seam (injected so tests count sends without a live herdr)."""
+    """The one-step forward send seam (injected so tests count sends without a live herdr).
+
+    ``action_id`` is the reserved generation's opaque ``forward_action_id``: the port injects it into
+    the outbound ticketless payload so the returning callback can echo it and complete the exact
+    forward generation (Redmine #13583 R1-F1).
+    """
 
     def send(
-        self, plan: ForwardRoutePlan, target: ForwardTargetResolution, *, args: argparse.Namespace
+        self,
+        plan: ForwardRoutePlan,
+        target: ForwardTargetResolution,
+        action_id: str,
+        *,
+        args: argparse.Namespace,
     ) -> ForwardSendOutcome:
         ...
 
@@ -246,25 +256,6 @@ class ForwardExecutionResult:
     send: Optional[ForwardSendOutcome] = None
 
 
-def _fence_state_token(fence, key) -> str:
-    """Map the durable fence's current state to the pure ``FENCE_*`` decision token (fail-soft).
-
-    An ``absent`` key is :data:`FENCE_OPEN` (the single send may proceed); any live / terminal state
-    (reserved / delivered / uncertain / cancelled) is :data:`FENCE_HELD` (duplicate zero-send); an
-    unreadable / un-bootstrapped fence is :data:`FENCE_UNAVAILABLE` (do-not-send, fail closed).
-    """
-    from mozyo_bridge.core.state.forward_outbox_fence import (
-        FORWARD_ABSENT,
-        ForwardOutboxFenceError,
-    )
-
-    try:
-        state = fence.state_of(key)
-    except ForwardOutboxFenceError:
-        return FENCE_UNAVAILABLE
-    return FENCE_OPEN if state == FORWARD_ABSENT else FENCE_HELD
-
-
 def execute_herdr_forward(
     resolution: WorkflowRoleResolution,
     *,
@@ -281,94 +272,102 @@ def execute_herdr_forward(
 ) -> ForwardExecutionResult:
     """Resolve, fence, and perform the single one-step forward for a resolved role (fail-closed).
 
-    Sequence: derive the pure plan; resolve the live target; map the durable fence state; decide
-    send / zero-send purely; on a decided send reserve the fence (a lost reserve race / already-held
-    key never sends), perform **exactly one** send through ``send_port``, and record delivered /
-    uncertain. Every non-send path returns ``sent=False`` with a fixed reason and performs zero
-    sends. ``fence`` / ``send_port`` / ``rows`` / ``decode`` / ``locator_of`` are injected so the
-    whole choreography is testable without a live herdr.
+    Sequence (Design Answer j#76528): (1) the durable store must be usable — an un-bootstrapped /
+    lost store is a do-not-send ``herdr_forward_fence_unavailable`` (R1-F2: the execution path never
+    auto-creates it); (2) a route whose generation is already **active** (reserved / delivered /
+    uncertain) is a duplicate zero-send **before** the target is resolved (a duplicate must not even
+    read the inventory); (3) resolve the live target — a missing / duplicate / drift / self target is
+    a zero-send that consumes **no** generation; (4) reserve the route, minting a fresh opaque
+    ``forward_action_id`` (a lost reserve race never sends); (5) perform **exactly one** send through
+    ``send_port`` with the minted action id, and record ``delivered`` / ``uncertain`` guarded by that
+    id. Every non-send path performs zero sends. ``fence`` / ``send_port`` / ``rows`` / ``decode`` /
+    ``locator_of`` are injected so the whole choreography is testable without a live herdr.
     """
     from mozyo_bridge.core.state.forward_outbox_fence import (
-        ForwardFenceKey,
         ForwardOutboxFenceError,
+        ForwardRouteKey,
     )
 
     plan = plan_forward_route(resolution.role, resolution.project_scope)
     if plan is None:  # defensive: only the two resolved coordinator roles reach here
         return ForwardExecutionResult(
-            sent=False,
-            decision=ZERO_SEND,
-            target_status="",
-            fence_state="",
+            sent=False, decision=ZERO_SEND, target_status="", fence_state="",
             reason="herdr_forward_no_route",
             detail=f"role {resolution.role!r} has no one-step forward",
         )
 
-    target = resolve_forward_target(
-        plan,
-        workspace_id=workspace_id,
-        sender_lane_id=sender_lane_id,
-        target_provider=target_provider,
-        gateway_lane_ids=gateway_lane_ids,
-        rows=rows,
-        decode=decode,
-        locator_of=locator_of,
-    )
-
-    key = ForwardFenceKey(
+    route = ForwardRouteKey(
         workspace_id=workspace_id,
         from_lane_id=(sender_lane_id or "").strip() or _DEFAULT_LANE,
         from_role=plan.from_role,
         to_role=plan.to_role,
         project_scope=plan.project_scope,
-        target_assigned_name=target.assigned_name,
     )
-    fence_state = _fence_state_token(fence, key) if target.status == TARGET_OK else FENCE_OPEN
-    decision: ForwardSendDecision = decide_forward_send(target.status, fence_state)
+
+    # (1) the store must be usable; the execution path never bootstraps it (R1-F2).
+    if not fence.is_bootstrapped():
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status="", fence_state=FENCE_UNAVAILABLE,
+            reason="herdr_forward_fence_unavailable",
+            detail="forward store is not bootstrapped (missing / lost); run `workflow forward-fence "
+            "--bootstrap` (or --recover after reconcile). The execution path never auto-creates it.",
+        )
+
+    # (2) an already-active generation is a duplicate zero-send before any target/inventory read.
+    try:
+        if fence.is_active(route):
+            return ForwardExecutionResult(
+                sent=False, decision=ZERO_SEND, target_status="", fence_state=FENCE_HELD,
+                reason="herdr_forward_duplicate",
+                detail="a forward generation for this route is already reserved / delivered / "
+                "uncertain; the next send waits for the correlated callback to complete it",
+            )
+    except ForwardOutboxFenceError as exc:
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status="", fence_state=FENCE_UNAVAILABLE,
+            reason="herdr_forward_fence_unavailable", detail=f"forward store unreadable: {exc}",
+        )
+
+    # (3) resolve the live target; a bad target consumes no generation.
+    target = resolve_forward_target(
+        plan, workspace_id=workspace_id, sender_lane_id=sender_lane_id,
+        target_provider=target_provider, gateway_lane_ids=gateway_lane_ids, rows=rows,
+        decode=decode, locator_of=locator_of,
+    )
+    decision: ForwardSendDecision = decide_forward_send(target.status, FENCE_OPEN)
     if not decision.sends:
         return ForwardExecutionResult(
-            sent=False,
-            decision=decision.decision,
-            target_status=target.status,
-            fence_state=fence_state,
-            reason=decision.reason,
+            sent=False, decision=decision.decision, target_status=target.status,
+            fence_state=FENCE_OPEN, reason=decision.reason,
             detail=f"{target.detail}; {decision.detail}",
         )
 
-    # Decided send: reserve the fence (at-most-once), then exactly one send.
+    # (4) reserve the route (mint the generation); a lost race never sends.
     try:
-        reserve = fence.reserve(key)
+        reserve = fence.reserve(route)
     except ForwardOutboxFenceError as exc:
         return ForwardExecutionResult(
-            sent=False,
-            decision=ZERO_SEND,
-            target_status=target.status,
-            fence_state=FENCE_UNAVAILABLE,
-            reason="herdr_forward_fence_unavailable",
+            sent=False, decision=ZERO_SEND, target_status=target.status,
+            fence_state=FENCE_UNAVAILABLE, reason="herdr_forward_fence_unavailable",
             detail=f"fence reserve failed: {exc}",
         )
     if not reserve.won:
         return ForwardExecutionResult(
-            sent=False,
-            decision=ZERO_SEND,
-            target_status=target.status,
-            fence_state=FENCE_HELD,
+            sent=False, decision=ZERO_SEND, target_status=target.status, fence_state=FENCE_HELD,
             reason="herdr_forward_duplicate",
             detail=f"fence not won (prior {reserve.prior_state}); {reserve.detail}",
         )
 
-    outcome = send_port.send(plan, target, args=args)
+    # (5) exactly one send with the minted action id; record the outcome guarded by that id.
+    outcome = send_port.send(plan, target, reserve.action_id, args=args)
     if outcome.result == SEND_DELIVERED:
-        fence.mark_delivered(key, detail=outcome.detail)
+        fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
     else:
         # A failed / unknown send is uncertain: never auto-retried; a reconcile precedes any re-send.
-        fence.mark_uncertain(key, detail=outcome.detail or f"send {outcome.result}")
+        fence.mark_uncertain(route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}")
     return ForwardExecutionResult(
-        sent=True,
-        decision=decision.decision,
-        target_status=target.status,
-        fence_state=fence_state,
-        detail=target.detail,
+        sent=True, decision=decision.decision, target_status=target.status,
+        fence_state=FENCE_OPEN, detail=f"{target.detail}; action_id={reserve.action_id}",
         send=outcome,
     )
 
@@ -387,11 +386,17 @@ class OrchestrateHandoffForwardSendPort:
     / fail-closed -> a failed send the caller records ``uncertain`` (never blind-retried).
     """
 
-    def __init__(self, *, repo_root: str) -> None:
+    def __init__(self, *, repo_root: str, receiver_provider: str) -> None:
         self._repo_root = repo_root
+        self._receiver_provider = receiver_provider
 
     def send(
-        self, plan: ForwardRoutePlan, target: ForwardTargetResolution, *, args: argparse.Namespace
+        self,
+        plan: ForwardRoutePlan,
+        target: ForwardTargetResolution,
+        action_id: str,
+        *,
+        args: argparse.Namespace,
     ) -> ForwardSendOutcome:
         import contextlib
         import io
@@ -416,7 +421,9 @@ class OrchestrateHandoffForwardSendPort:
         # inherit the base (record format, repo), then set the forward-specific send fields. The
         # base args is never mutated (the workflow step still reports its own outcome).
         send_args = argparse.Namespace(**vars(args))
-        send_args.to = "codex"
+        # R1-F3: the receiver kind is the action-time provider_binding provider for the target role,
+        # not a hard-coded codex; the target resolution used the same provider (consistent authority).
+        send_args.to = self._receiver_provider
         send_args.target = target.locator
         send_args.target_lane = target.lane_id
         send_args.target_repo = self._repo_root
@@ -424,6 +431,8 @@ class OrchestrateHandoffForwardSendPort:
         send_args.mode = "queue-enter"
         send_args.summary = None
         send_args.callback_methods = list(CALLBACK_METHODS)
+        # R1-F1: inject the minted forward generation id so the returning callback echoes it.
+        send_args.forward_action_id = action_id
         if plan.ticketless_kind == TICKETLESS_CONSULTATION:
             send_args.transition_role = ROLE_GRANDPARENT_COORDINATOR
             send_args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR

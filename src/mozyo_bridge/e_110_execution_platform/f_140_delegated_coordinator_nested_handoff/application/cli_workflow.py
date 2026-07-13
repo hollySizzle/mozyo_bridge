@@ -602,6 +602,40 @@ def cmd_workflow_dispatch_fence(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_workflow_forward_fence(args: argparse.Namespace) -> int:
+    """Operator surface for the herdr coordinator-forward generation store (Redmine #13583 R1-F2).
+
+    The forward store's ``workflow step`` execution path NEVER auto-creates it (an auto-create after
+    a total loss would resurrect a lost store and let an already-delivered forward re-send). This is
+    the sanctioned explicit init: ``--bootstrap`` (safe first init — both DB + sidecar absent) or
+    ``--recover`` (deliberate loss recovery: a fresh store under a new nonce; invoke ONLY after
+    reconciling the lost forward). With no flag, reports status.
+    """
+    from mozyo_bridge.core.state.forward_outbox_fence import (
+        ForwardOutboxFence,
+        ForwardOutboxFenceError,
+    )
+
+    fence = ForwardOutboxFence()
+    try:
+        if getattr(args, "fence_recover", False):
+            fence.recover()
+            print(f"forward store recovered (fresh store) at {fence.path}")
+            print("reconcile the lost forward before relying on the new generation series")
+            return 0
+        if getattr(args, "fence_bootstrap", False):
+            fence.bootstrap()
+            print(f"forward store bootstrapped at {fence.path}")
+            return 0
+    except ForwardOutboxFenceError as exc:
+        print(f"forward store error: {exc}")
+        print("a store loss/replacement needs `workflow forward-fence --recover`")
+        return 1
+    state = "bootstrapped" if fence.is_bootstrapped() else "absent / not bootstrapped"
+    print(f"forward store: {state} at {fence.path}")
+    return 0
+
+
 def register(sub) -> None:
     """Register ``workflow`` (``step`` / ``fill-decision`` / ``admission`` / ...).
 
@@ -674,6 +708,26 @@ def register(sub) -> None:
         help="Deliberate loss recovery: mint a fresh store under a new nonce.",
     )
     fence_p.set_defaults(func=cmd_workflow_dispatch_fence)
+
+    forward_fence_p = workflow_sub.add_parser(
+        "forward-fence",
+        description=(
+            "Operator surface for the herdr coordinator-forward generation store (Redmine #13583). "
+            "`--bootstrap` initializes it; `--recover` mints a fresh store after a loss (only after "
+            "reconciling the lost forward); no flag reports status. The `workflow step` execution "
+            "path never auto-creates the store (a loss must not resurrect a delivered forward)."
+        ),
+        help="Bootstrap / recover / status the herdr forward generation store.",
+    )
+    forward_fence_p.add_argument(
+        "--bootstrap", dest="fence_bootstrap", action="store_true",
+        help="Initialize the forward store (safe first init; refuses on a detected loss).",
+    )
+    forward_fence_p.add_argument(
+        "--recover", dest="fence_recover", action="store_true",
+        help="Deliberate loss recovery: mint a fresh forward store under a new nonce.",
+    )
+    forward_fence_p.set_defaults(func=cmd_workflow_forward_fence)
 
     step = workflow_sub.add_parser(
         "step",

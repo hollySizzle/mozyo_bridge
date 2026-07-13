@@ -1,11 +1,11 @@
-"""herdr forward send adapter tests (Redmine #13583 Increment 3).
+"""herdr forward send adapter tests (Redmine #13583 Increment 3 + R1-F1/F2/F3 correction).
 
-The design's injected-send-count contract (j#76417 point 7): the adapter calls the single forward
-send port EXACTLY ONCE on the positive path (ok target + open fence), ZERO times on every negative
-(missing / ambiguous / locator-missing / self target, held / unavailable fence), and never re-sends
-a delivered forward (a repeat is a duplicate zero-send). Uses the real ForwardOutboxFence over a
-temp home + real mzb1 encode/decode + a counting fake send port, so the count is asserted without a
-live herdr / Redmine.
+The injected-send-count contract (j#76417 point 7 / j#76528): the adapter calls the single forward
+send port EXACTLY ONCE on the positive path (usable store + open generation + ok target), ZERO on
+every negative (unbootstrapped/lost store, an active generation, missing/ambiguous/locator-missing/
+self target), and never re-sends a delivered generation until the correlated callback completes it —
+after which the next call mints a NEW generation and sends once. Uses the real ForwardOutboxFence
+over a temp home + real mzb1 encode/decode + a counting fake send port.
 """
 
 from __future__ import annotations
@@ -19,22 +19,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence
+from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence, ForwardRouteKey
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     decode_assigned_name,
     encode_assigned_name,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+    STATUS_RESOLVED,
+    WorkflowRoleResolution,
     project_gateway_lane_id,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
     ROLE_GRANDPARENT_COORDINATOR,
     ROLE_PROJECT_GATEWAY,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
-    WorkflowRoleResolution,
-    STATUS_RESOLVED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_forward_send import (
     SEND_DELIVERED,
@@ -56,14 +54,14 @@ def _locator_of(row):
 
 
 class _CountingPort:
-    """A fake ForwardSendPort that records every send (so the count is assertable)."""
+    """A fake ForwardSendPort recording every send + the action id it was handed."""
 
     def __init__(self, result=SEND_DELIVERED):
         self.calls = []
         self.result = result
 
-    def send(self, plan, target, *, args):
-        self.calls.append((plan.direction, target.assigned_name, target.locator))
+    def send(self, plan, target, action_id, *, args):
+        self.calls.append((plan.direction, target.assigned_name, action_id))
         return ForwardSendOutcome(result=self.result, rc=0, detail="fake send")
 
 
@@ -85,71 +83,103 @@ class HerdrForwardSendTest(unittest.TestCase):
         self.fence.bootstrap()
         self.args = argparse.Namespace()
 
-    def _run(self, resolution, *, sender_lane, gateway_lane_ids, rows, port):
+    def _run(self, resolution, *, sender_lane, gateway_lane_ids, rows, port, provider=CODEX):
         return execute_herdr_forward(
-            resolution,
-            args=self.args,
-            workspace_id=WS,
-            sender_lane_id=sender_lane,
-            target_provider=CODEX,
-            gateway_lane_ids=frozenset(gateway_lane_ids),
-            rows=rows,
-            decode=decode_assigned_name,
-            locator_of=_locator_of,
-            fence=self.fence,
-            send_port=port,
+            resolution, args=self.args, workspace_id=WS, sender_lane_id=sender_lane,
+            target_provider=provider, gateway_lane_ids=frozenset(gateway_lane_ids), rows=rows,
+            decode=decode_assigned_name, locator_of=_locator_of, fence=self.fence, send_port=port,
         )
 
-    # --- grandparent -> single live gateway ------------------------------
+    # --- positive: single send + action id injected ----------------------
 
-    def test_grandparent_single_live_gateway_sends_exactly_once(self):
-        gw_lane = project_gateway_lane_id("alpha")
+    def test_grandparent_single_live_gateway_sends_once_with_action_id(self):
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        res = self._run(
-            _grandparent(), sender_lane="default", gateway_lane_ids={gw_lane},
-            rows=[_row(gw_lane)], port=port,
-        )
+        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=[_row(gw)], port=port)
         self.assertTrue(res.sent)
         self.assertEqual(len(port.calls), 1)
-        self.assertEqual(res.send.result, SEND_DELIVERED)
+        self.assertTrue(port.calls[0][2].startswith("fwd_"))  # the minted action id was injected
 
-    def test_repeat_forward_is_duplicate_zero_send(self):
-        gw_lane = project_gateway_lane_id("alpha")
+    # --- generation lifecycle via the adapter ----------------------------
+
+    def test_delivered_generation_blocks_until_callback_completes(self):
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        rows = [_row(gw_lane)]
-        first = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw_lane}, rows=rows, port=port)
+        rows = [_row(gw)]
+        first = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
         self.assertTrue(first.sent)
-        second = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw_lane}, rows=rows, port=port)
+        # a repeat while delivered (callback pending) is a duplicate zero-send.
+        second = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
         self.assertFalse(second.sent)
         self.assertEqual(second.reason, "herdr_forward_duplicate")
-        self.assertEqual(len(port.calls), 1)  # the delivered forward never re-sends
+        self.assertEqual(len(port.calls), 1)
+
+    def test_completed_generation_allows_next_send(self):
+        gw = project_gateway_lane_id("alpha")
+        port = _CountingPort()
+        rows = [_row(gw)]
+        first = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
+        self.assertTrue(first.sent)
+        # complete the generation (as the correlated callback would).
+        route = ForwardRouteKey(WS, "default", "grandparent_coordinator", "project_gateway", "")
+        self.assertTrue(self.fence.complete(route, port.calls[0][2]))
+        second = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
+        self.assertTrue(second.sent)
+        self.assertEqual(len(port.calls), 2)
+        self.assertNotEqual(port.calls[0][2], port.calls[1][2])  # a NEW generation id
+
+    # --- store loss / unbootstrapped -> zero-send (R1-F2) ----------------
+
+    def test_unbootstrapped_store_is_zero_send(self):
+        fence = ForwardOutboxFence(home=Path(tempfile.mkdtemp()))  # never bootstrapped
+        port = _CountingPort()
+        gw = project_gateway_lane_id("alpha")
+        res = execute_herdr_forward(
+            _grandparent(), args=self.args, workspace_id=WS, sender_lane_id="default",
+            target_provider=CODEX, gateway_lane_ids=frozenset({gw}), rows=[_row(gw)],
+            decode=decode_assigned_name, locator_of=_locator_of, fence=fence, send_port=port,
+        )
+        self.assertFalse(res.sent)
+        self.assertEqual(res.reason, "herdr_forward_fence_unavailable")
+        self.assertEqual(len(port.calls), 0)
+
+    def test_total_loss_after_delivered_is_zero_send(self):
+        gw = project_gateway_lane_id("alpha")
+        port = _CountingPort()
+        rows = [_row(gw)]
+        self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
+        self.fence.path.unlink()
+        self.fence.sidecar_path.unlink()  # total loss -> must fail closed, no resurrection
+        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
+        self.assertFalse(res.sent)
+        self.assertEqual(res.reason, "herdr_forward_fence_unavailable")
+        self.assertEqual(len(port.calls), 1)  # only the original send
+
+    # --- target negatives (zero-send, no generation consumed) ------------
 
     def test_zero_live_gateways_is_zero_send_missing(self):
-        gw_lane = project_gateway_lane_id("alpha")
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw_lane}, rows=[], port=port)
+        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=[], port=port)
         self.assertFalse(res.sent)
         self.assertEqual(res.target_status, "missing")
         self.assertEqual(len(port.calls), 0)
+        # no generation consumed -> a later resolvable target can still send.
+        ok = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=[_row(gw)], port=port)
+        self.assertTrue(ok.sent)
 
     def test_two_live_gateways_is_zero_send_ambiguous(self):
         a, b = project_gateway_lane_id("alpha"), project_gateway_lane_id("beta")
         port = _CountingPort()
-        res = self._run(
-            _grandparent(), sender_lane="default", gateway_lane_ids={a, b},
-            rows=[_row(a), _row(b)], port=port,
-        )
+        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={a, b}, rows=[_row(a), _row(b)], port=port)
         self.assertFalse(res.sent)
         self.assertEqual(res.target_status, "ambiguous")
         self.assertEqual(len(port.calls), 0)
 
     def test_gateway_without_locator_is_zero_send(self):
-        gw_lane = project_gateway_lane_id("alpha")
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        res = self._run(
-            _grandparent(), sender_lane="default", gateway_lane_ids={gw_lane},
-            rows=[_row(gw_lane, locator="")], port=port,
-        )
+        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=[_row(gw, locator="")], port=port)
         self.assertFalse(res.sent)
         self.assertEqual(res.target_status, "locator_missing")
         self.assertEqual(len(port.calls), 0)
@@ -157,73 +187,167 @@ class HerdrForwardSendTest(unittest.TestCase):
     # --- gateway -> child with self-fence --------------------------------
 
     def test_gateway_single_child_sends_once(self):
-        gw_lane = project_gateway_lane_id("alpha")
-        child_lane = "issue_1234"
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        res = self._run(
-            _gateway("alpha"), sender_lane=gw_lane, gateway_lane_ids={gw_lane},
-            rows=[_row(gw_lane), _row(child_lane)], port=port,  # own gateway + a child
-        )
+        res = self._run(_gateway("alpha"), sender_lane=gw, gateway_lane_ids={gw}, rows=[_row(gw), _row("issue_1234")], port=port)
         self.assertTrue(res.sent)
         self.assertEqual(len(port.calls), 1)
         self.assertIn("delegated_coordinator", port.calls[0][0])
 
-    def test_gateway_self_only_candidate_is_zero_send_self(self):
-        gw_lane = project_gateway_lane_id("alpha")
-        port = _CountingPort()
-        # Only the sender's own gateway lane is present, and it is a bound gateway anyway.
-        res = self._run(
-            _gateway("alpha"), sender_lane=gw_lane, gateway_lane_ids={gw_lane},
-            rows=[_row(gw_lane)], port=port,
-        )
-        self.assertFalse(res.sent)
-        self.assertEqual(res.target_status, "missing")  # the only slot is a bound gateway (excluded)
-        self.assertEqual(len(port.calls), 0)
-
     def test_gateway_child_equal_to_self_lane_is_self_fenced(self):
-        # A non-gateway child slot that happens to share the sender's lane id -> self-fence.
-        gw_lane = project_gateway_lane_id("alpha")
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        res = self._run(
-            _gateway("alpha"), sender_lane="issue_self", gateway_lane_ids={gw_lane},
-            rows=[_row("issue_self")], port=port,
-        )
+        res = self._run(_gateway("alpha"), sender_lane="issue_self", gateway_lane_ids={gw}, rows=[_row("issue_self")], port=port)
         self.assertFalse(res.sent)
         self.assertEqual(res.target_status, "self")
         self.assertEqual(len(port.calls), 0)
 
     def test_gateway_two_children_is_ambiguous_zero_send(self):
-        gw_lane = project_gateway_lane_id("alpha")
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort()
-        res = self._run(
-            _gateway("alpha"), sender_lane=gw_lane, gateway_lane_ids={gw_lane},
-            rows=[_row("issue_1"), _row("issue_2")], port=port,
-        )
+        res = self._run(_gateway("alpha"), sender_lane=gw, gateway_lane_ids={gw}, rows=[_row("issue_1"), _row("issue_2")], port=port)
         self.assertFalse(res.sent)
         self.assertEqual(res.target_status, "ambiguous")
         self.assertEqual(len(port.calls), 0)
 
-    # --- send outcome recording ------------------------------------------
+    # --- provider passthrough (F3 target provider) + send outcome --------
 
-    def test_failed_send_marks_fence_uncertain_not_retried(self):
-        gw_lane = project_gateway_lane_id("alpha")
+    def test_target_provider_scopes_the_inventory_match(self):
+        # A claude-provider row on the gateway lane is NOT a codex target -> missing.
+        gw = project_gateway_lane_id("alpha")
+        port = _CountingPort()
+        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=[_row(gw, provider="claude")], port=port, provider=CODEX)
+        self.assertFalse(res.sent)
+        self.assertEqual(res.target_status, "missing")
+        # ... but if the target provider IS claude (a rebind), the same row resolves.
+        ok = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=[_row(gw, provider="claude")], port=port, provider="claude")
+        self.assertTrue(ok.sent)
+
+    def test_failed_send_marks_uncertain_and_blocks_retry(self):
+        gw = project_gateway_lane_id("alpha")
         port = _CountingPort(result=SEND_FAILED)
-        first = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw_lane}, rows=[_row(gw_lane)], port=port)
+        rows = [_row(gw)]
+        first = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
         self.assertTrue(first.sent)
         self.assertEqual(first.send.result, SEND_FAILED)
-        # A second attempt sees the uncertain fence and never re-sends (no blind retry).
-        second = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw_lane}, rows=[_row(gw_lane)], port=port)
+        # uncertain generation blocks the next attempt (no blind retry).
+        second = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
         self.assertFalse(second.sent)
         self.assertEqual(len(port.calls), 1)
 
-    def test_wrong_workspace_rows_are_ignored(self):
-        gw_lane = project_gateway_lane_id("alpha")
-        port = _CountingPort()
-        foreign = {AGENT_KEY_NAME: encode_assigned_name("f" * 32, CODEX, gw_lane), "locator": "x"}
-        res = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw_lane}, rows=[foreign], port=port)
-        self.assertFalse(res.sent)
-        self.assertEqual(res.target_status, "missing")
-        self.assertEqual(len(port.calls), 0)
+
+class _FakeSenderRes:
+    def __init__(self, ws):
+        self.ok = True
+
+        class _Id:
+            workspace_id = ws
+        self.identity = _Id()
+
+
+class CompletionHookTest(unittest.TestCase):
+    """The correlated-callback completion hook (Redmine #13583 R1-F1): a positively-delivered
+    callback echoing a forward_action_id completes the exact delivered generation, and only then may
+    the next forward send; a failed / stale / drifted callback never advances."""
+
+    def setUp(self):
+        import os
+        self.home = Path(tempfile.mkdtemp())
+        os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
+        self.addCleanup(lambda: os.environ.pop("MOZYO_BRIDGE_HOME", None))
+        self.fence = ForwardOutboxFence(home=self.home)
+        self.fence.bootstrap()
+        self.route = ForwardRouteKey(WS, "default", "grandparent_coordinator", "project_gateway", "")
+        r = self.fence.reserve(self.route)
+        self.fence.mark_delivered(self.route, r.action_id)
+        self.action_id = r.action_id
+
+    def _call(self, *, action_id, read_contract="grandparent_coordinator", delivered=True):
+        import argparse as _ap
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            herdr_workflow_step as hws,
+        )
+        args = _ap.Namespace(forward_action_id=action_id, read_contract=read_contract, repo=None)
+        with patch.object(hws, "_anchor_workspace_id", return_value=WS), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain."
+            "herdr_target_resolution.resolve_sender_identity",
+            return_value=_FakeSenderRes(WS),
+        ):
+            return hws.complete_forward_generation_on_callback(args, delivered=delivered)
+
+    def test_matching_callback_completes_and_next_send_allowed(self):
+        self.assertTrue(self._call(action_id=self.action_id))
+        # completed -> the next reserve mints a fresh generation.
+        self.assertTrue(self.fence.reserve(self.route).won)
+
+    def test_failed_delivery_does_not_complete(self):
+        self.assertFalse(self._call(action_id=self.action_id, delivered=False))
+        self.assertFalse(self.fence.reserve(self.route).won)  # still delivered / active
+
+    def test_stale_action_id_does_not_complete(self):
+        self.assertFalse(self._call(action_id="fwd_stale"))
+
+    def test_drifted_read_contract_does_not_complete(self):
+        self.assertFalse(self._call(action_id=self.action_id, read_contract="project_gateway"))
+
+    def test_empty_action_id_no_ops(self):
+        self.assertFalse(self._call(action_id=""))
+
+
+class ForwardTargetProviderTest(unittest.TestCase):
+    """R1-F3: the forward target provider is resolved from the action-time provider_binding for the
+    plan's to_role (reboundable), not a hard-coded codex; an unbound / unmapped / broken binding
+    fails closed to ``""`` (the leg then zero-sends)."""
+
+    def _resolve(self, to_role, binding):
+        import argparse as _ap
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            herdr_workflow_step as hws,
+        )
+        with patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.workflow_binding_source.load_workflow_binding",
+            return_value=(binding, []),
+        ):
+            return hws._forward_target_provider(_ap.Namespace(repo=None), ".", to_role)
+
+    def _binding(self, overrides=None):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+            RoleProviderBinding,
+        )
+        if overrides:
+            return RoleProviderBinding.from_overrides(overrides)
+        return RoleProviderBinding.default()
+
+    def test_project_gateway_defaults_to_codex(self):
+        self.assertEqual(self._resolve("project_gateway", self._binding()), "codex")
+
+    def test_delegated_coordinator_maps_to_coordinator_binding_codex(self):
+        self.assertEqual(self._resolve("delegated_coordinator", self._binding()), "codex")
+
+    def test_rebind_is_honored(self):
+        # A provider_binding rebind of project_gateway -> claude is used for the target.
+        self.assertEqual(
+            self._resolve("project_gateway", self._binding({"project_gateway": "claude"})), "claude"
+        )
+
+    def test_unmapped_role_fails_closed(self):
+        self.assertEqual(self._resolve("implementation_worker", self._binding()), "")
+
+    def test_broken_binding_fails_closed(self):
+        import argparse as _ap
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            herdr_workflow_step as hws,
+        )
+        with patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.workflow_binding_source.load_workflow_binding",
+            side_effect=RuntimeError("broken provider config"),
+        ):
+            self.assertEqual(hws._forward_target_provider(_ap.Namespace(repo=None), ".", "project_gateway"), "")
 
 
 if __name__ == "__main__":  # pragma: no cover

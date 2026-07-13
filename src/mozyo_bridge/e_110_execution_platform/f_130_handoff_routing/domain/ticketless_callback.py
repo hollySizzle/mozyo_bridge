@@ -197,6 +197,10 @@ class TicketlessCallback:
     callback_reason: str
     read_contract: str
     redmine_anchor_required: Optional[bool] = None
+    #: Echoed opaque forward generation correlation id (Redmine #13583 R1-F1); ``""`` for a plain
+    #: ticketless callback. When a herdr forward carried a ``forward_action_id``, the returning
+    #: callback echoes it so the forward's exact generation can be completed on positive delivery.
+    forward_action_id: str = ""
 
     def __post_init__(self) -> None:
         classification = _clean_choice(
@@ -260,9 +264,15 @@ class TicketlessCallback:
                     f"dispatch_decision={decision!r} (derived {derived})"
                 )
 
+        object.__setattr__(
+            self,
+            "forward_action_id",
+            str(self.forward_action_id).strip() if self.forward_action_id is not None else "",
+        )
+
     def to_structured_dict(self) -> dict[str, object]:
         """Structured, free-text-free fields for the handoff callback payload."""
-        return {
+        payload: dict[str, object] = {
             "classification": self.classification,
             "dispatch_decision": self.dispatch_decision,
             "next_action_owner": self.next_action_owner,
@@ -270,6 +280,9 @@ class TicketlessCallback:
             "read_contract": self.read_contract,
             "redmine_anchor_required": bool(self.redmine_anchor_required),
         }
+        if self.forward_action_id:
+            payload["forward_action_id"] = self.forward_action_id
+        return payload
 
     def marker_fields(self) -> list[tuple[str, str]]:
         """Marker key/value pairs for the ticketless landing marker.
@@ -351,6 +364,7 @@ def ticketless_callback_from_payload(
         callback_reason=callback_reason,  # type: ignore[arg-type]
         read_contract=read_contract,  # type: ignore[arg-type]
         redmine_anchor_required=redmine_anchor_required,  # type: ignore[arg-type]
+        forward_action_id=payload.get("forward_action_id", ""),  # type: ignore[arg-type]
     )
 
 

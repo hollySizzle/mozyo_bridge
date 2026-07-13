@@ -128,12 +128,30 @@ provider_mismatch）は fixed reason + `next_owner=operator`。
     **唯一 live な bound project_gateway lane**（0/2+/locator-missing は zero-send）; project_gateway
     は **same-lane self-fence** 付き child delegated_coordinator（self/missing/ambiguous は zero-send）。
     provider/pane/placement を role authority へ昇格しない（binding が authority、provider は slot 特定）。
-  - **dedicated duplicate fence**（`core/state/forward_outbox_fence.py`）: forward 自身の anchor-free
-    identity を UNIQUE key に持ち、anchored worker `DispatchAuthorization`/Redmine journal へ偽装しない。
-    reserved/delivered/uncertain は duplicate zero-send、unknown は uncertain（blind retry なし）。
-  - **payload 再利用**: message は既存 ticketless `TicketlessConsultation` / `TicketlessWorkIntake`
-    + callback（`ticketless_callback` / `q_enter_consultation_callback`）契約を再利用。domain/design
-    answer と Redmine anchor 作成は自動化しない。
+  - **correlated generation lifecycle**（`core/state/forward_outbox_fence.py`、R1-F1 / Design Answer
+    j#76528）: fence key は **route identity**（`workspace_id, from_lane_id, from_role, to_role,
+    project_scope`）のみ。target assigned name は action-time attestation で key に含めない（target
+    rename は generation を advance しない）。route ごとに exact-1 active generation を持ち、first
+    admissible step が opaque `forward_action_id`（`secrets.token_hex`）を mint。reserved/delivered/
+    uncertain の間は duplicate zero-send、uncertain は blind retry しない。generation は **correlated
+    callback** が完了させる: outbound の `TicketlessConsultation`/`TicketlessWorkIntake` が
+    `forward_action_id` を carry し、返る `TicketlessCallback` が echo。callback が positive delivery
+    された時のみ echoed id + reverse route（callback の `read_contract` = forward の from_role）を
+    action-time 照合し delivered→completed へ CAS（`complete_forward_generation_on_callback`、
+    stale/duplicate/drift は no-op）。completed 後の次 step だけ new generation を mint し送信できる。
+    anchored worker `DispatchOutboxFence`/`callback_outbox` へ偽装・再利用しない。
+  - **loss policy**（R1-F2）: execution path は store を auto-bootstrap しない（全損 resurrection 防止）。
+    unbootstrapped/total-loss/corrupt/replaced は zero-send `herdr_forward_fence_unavailable`。init/
+    recovery は明示 operator `workflow forward-fence --bootstrap` / `--recover` のみ。
+  - **provider authority**（R1-F3）: target provider は plan.to_role の action-time `provider_binding`
+    から解決（`project_gateway`→`project_gateway` binding、`delegated_coordinator`→`coordinator`
+    binding、いずれも既定 codex・reboundable）。target resolution と semantic receiver（`--to`）双方に
+    同一 provider を使用。unknown/unbound/unsupported は zero-send。
+  - **payload 再利用 + correlation field**: message は既存 ticketless `TicketlessConsultation` /
+    `TicketlessWorkIntake` + callback（`ticketless_callback` / `q_enter_consultation_callback`）契約を
+    再利用し、`forward_action_id`（opaque、role/approval/anchor authority でない）を additive field
+    として往復させる（非 forward は `""`=byte-invariant）。domain/design answer と Redmine anchor
+    作成は自動化しない。
   - **cli leg**（`cli_workflow.py`）: `--dry-run` は route/result のみ（fence/send write ゼロ = purity）。
     executable は非 dry-run で dedicated forward leg を一回だけ発火。tmux path / binding 無し lane は
     byte-invariant。既存 tmux-era project-gateway primitive への個別 fallback は追加しない。
