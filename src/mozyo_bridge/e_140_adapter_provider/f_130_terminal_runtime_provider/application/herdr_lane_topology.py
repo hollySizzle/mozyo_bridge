@@ -312,6 +312,125 @@ def _tab_target_for_lane(
     return next(iter(own_tabs)) if own_tabs else ""
 
 
+def resolve_launch_order(
+    providers: Sequence[str], config_order: Optional[Sequence[str]]
+) -> list:
+    """The requested providers, reordered by the configured launch order (pure).
+
+    Config-driven placement (Redmine #13646, Design Answer j#76564 Q2): ``config_order`` is
+    a full provider permutation naming who occupies the container FIRST (and therefore who
+    splits beside them). Reordering the REQUESTED providers is the only way to realize a
+    role order, because herdr ``agent start`` has no pane-target flag — order is launch
+    order (live ``--help`` characterization j#76559).
+
+    It never grows the request: a single-provider heal stays a single provider (an ``order``
+    naming both providers must not launch an unrequested peer). ``None`` returns the
+    requested sequence unchanged (byte-invariant).
+    """
+    if config_order is None:
+        return list(providers)
+    rank = {provider: index for index, provider in enumerate(config_order)}
+    return sorted(providers, key=lambda provider: rank.get(provider, len(rank)))
+
+
+def resolve_split_direction(lane_class: str, config_split: Optional[str]) -> str:
+    """The ``--split`` direction a splitting slot of ``lane_class`` uses (``""`` = none).
+
+    Config-driven placement (Redmine #13646, Design Answer j#76564 Q3): a configured
+    ``split`` wins; otherwise the legacy discipline applies — ``right`` for a ``sublane``
+    slot (byte-for-byte the pre-#13646 literal) and NO split for the ``default``
+    (coordinator) pair, which delegates to the herdr server default unless explicitly
+    configured. ``""`` means the caller emits no ``--split`` flag at all.
+    """
+    if config_split is not None:
+        return config_split
+    return "right" if lane_class == "sublane" else ""
+
+
+def initial_container_occupancy(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    target_workspace: str,
+    lane_id: str,
+    *,
+    lane_class: str,
+    target_tab: str,
+    lane_slot_tabs: Sequence[str],
+    count_default_lane: bool,
+) -> int:
+    """How many of this lane's slots already occupy the container a launch splits into.
+
+    The container differs by lane class (Redmine #13411 tab axis + #13646 default axis):
+
+    - a ``sublane``'s container is its dedicated lane TAB, so only same-lane live slots
+      ALREADY IN ``target_tab`` count. Read from the whole live inventory, not this run's
+      requested plans (review j#74433 finding 1): a single-provider heal requests one
+      provider, so the lane's OTHER live slot is in the inventory but never in ``plans`` —
+      counting requested adopts alone would drop the split a heal beside a live tabbed
+      sibling needs. A freshly minted tab starts empty (0), so its first launch occupies
+      and its second splits. A loose (pre-#13411, tab-less) heal has no ``target_tab`` and
+      counts 0, so it stays loose — byte-invariant.
+    - the ``default`` lane has no tab, so its container is the project WORKSPACE itself:
+      the coordinator pair's own live slots in ``target_workspace``. This is what makes a
+      fresh pair's 2nd slot split beside the 1st and a heal split beside the live sibling.
+      ``count_default_lane`` is False when nothing launches or no split is configured, so
+      an unset default lane never reads it and stays byte-for-byte the pre-#13646 launch.
+
+    Live slots count regardless of how this run classified them (adopt / unattested /
+    stale): they occupy a pane either way, and a launch must split beside a live pane.
+    """
+    if lane_class == "sublane":
+        return sum(1 for tab in lane_slot_tabs if tab == target_tab) if target_tab else 0
+    if not count_default_lane:
+        return 0
+    return len(_lane_live_slot_tabs(rows, workspace_id, target_workspace, lane_id))
+
+
+def resolve_placement_policy(
+    lane_placement: object, lane_class: str
+) -> "tuple[Optional[str], Optional[tuple[str, ...]]]":
+    """The lane class's configured ``(split, order)``, or ``(None, None)`` when unset.
+
+    The one adapter between the repo-local ``lane_placement`` config record (Redmine
+    #13646) and the pure placement decisions below, so the session-start composition root
+    holds no config-shape knowledge and this module keeps no config import (it only calls
+    ``.resolve(lane_class)``). ``None`` config — or a lane class the config omits — yields
+    ``(None, None)``: inherit the legacy launch discipline everywhere (byte-invariant).
+    """
+    if lane_placement is None:
+        return None, None
+    resolved = lane_placement.resolve(lane_class)  # type: ignore[attr-defined]
+    return resolved.split, resolved.order
+
+
+def slot_placement(
+    kind: str,
+    provider: str,
+    *,
+    split_direction: str,
+    occupancy: int,
+    config_order: Optional[Sequence[str]],
+) -> "tuple[str, bool]":
+    """One slot's ``(--split value, order_deferred)`` decision (pure).
+
+    A slot splits only when it actually LAUNCHES into an already-occupied container; the
+    container's first launch occupies it and emits no ``--split``. Adopted / planned /
+    stale / unattested slots launch nothing, so they never carry a placement flag.
+
+    ``order_deferred`` (Design Answer j#76564 Q2) flags the one case the configured order
+    cannot be satisfied physically: the configured PRIMARY (``config_order[0]`` — the
+    provider that should occupy the container) is launching as a split beside a sibling
+    that is already live. herdr ``agent start`` has no pane-target flag and moving a live
+    pane is forbidden (no live relayout), so the launch proceeds in the configured
+    direction and the caller records ``order_deferred_until_full_relaunch`` instead of
+    silently claiming the order was applied. A full relaunch of the pair realizes it.
+    """
+    if kind != "launch" or occupancy <= 0:
+        return "", False
+    deferred = bool(config_order is not None and provider == config_order[0])
+    return split_direction, deferred
+
+
 def _host_workspace_label(repo_root: Path) -> str:
     """Operator-readable label for a minted sublane host workspace (cosmetic only).
 
@@ -456,6 +575,11 @@ __all__ = (
     "_host_workspace_label",
     "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "initial_container_occupancy",
+    "resolve_launch_order",
+    "resolve_placement_policy",
+    "resolve_split_direction",
+    "slot_placement",
     "_parse_started_agent",
     "_parse_tab_created",
     "_parse_workspace_created",

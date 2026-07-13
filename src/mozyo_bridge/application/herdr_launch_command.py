@@ -255,14 +255,20 @@ class LiveHerdrLaunchOps:
             load_repo_local_config,
         )
 
-        agent_launch = load_repo_local_config(repo_root).agent_launch
+        # Config-driven pane placement (Redmine #13646): the bare `mozyo` coordinator pair
+        # is the `default` lane_class, so the config's `lane_placement.default` split /
+        # order decides the pair's geometry (e.g. `split: down` for the owner's vertical
+        # main window) and which provider occupies first. Unconfigured repos keep the herdr
+        # server default placement and the requested provider order, byte-for-byte.
+        repo_config = load_repo_local_config(repo_root)
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
             lane_id="",
             env=self._env,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-            agent_launch=agent_launch,
+            agent_launch=repo_config.agent_launch,
+            lane_placement=repo_config.lane_placement,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:

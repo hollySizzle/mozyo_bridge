@@ -261,7 +261,10 @@ flow:
    tab_id 無し) の heal は loose のまま launch する (pair を新 tab へ分裂させない。full relaunch で
    tab へ移行)。自 slot が複数 tab に split したら fail-closed。default lane は tab を使わない
    (byte-invariant)。launch は `agent start --workspace <host> --tab <tab_id>` で行い、tab 内 2
-   slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は `--split right`。tab root pane は
+   slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は `--split <dir>` を付ける。方向と
+   provider 順序は `lane_placement` config で lane class 別に宣言できる (Redmine #13646、下記
+   §lane_placement)。未設定時は従来どおり sublane が `--split right`、default lane は `--split`
+   を出さず herdr server 既定へ委任する (byte-invariant)。tab root pane は
    #13330 の workspace base pane と同型で全 launch 成功後に reclaim し、tab 内最終 pane close で
    herdr が tab を自動消滅させる (workspace 自動消滅と対称)。**
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
@@ -357,6 +360,70 @@ fail-closed / safety 不変条件:
 
 live smoke (cold start bare `mozyo` 後に root pane が残らないこと、adopt 経路が byte-invariant で
 あること) は coordinator の post-review 実機 acceptance で確認する。
+
+## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646)
+
+herdr pane pair の **split 方向**と**役割順序** (どちらの provider が先 = 左 / 上に置かれるか) を
+lane class 別に宣言する closed config block。`.mozyo-bridge/config.yaml`:
+
+```yaml
+lane_placement:
+  default:                    # coordinator / auditor pair (bare `mozyo`)
+    split: down               # right | down
+    order: [codex, claude]    # exact permutation
+  sublane:                    # lane gateway / worker
+    split: right
+    order: [codex, claude]
+```
+
+### Schema (fail-closed)
+
+- lane class key: `default` | `sublane` (`agent_launch` と同じ lane-class 軸。ただし別関心 =
+  pane geometry であり、launch-argv token 軸とは resolve を分離し混同しない)。
+- `split`: `right` | `down`。herdr 0.7.1 `agent start --split right|down` の語彙 (実 `--help` 照合)。
+- `order`: `[codex, claude]` / `[claude, codex]` の **exact permutation**。欠落 / 重複 / 未知 provider /
+  非 list は fail-closed (部分順序が silent に provider を落とさない)。
+- lane class object 自体・`split`・`order` はそれぞれ **個別に optional**。欠落した field だけが
+  legacy 規律を継承する (空 `{}` は no-op)。
+- unknown class / unknown key / unknown value / unsupported version は fail-closed。
+
+### Compatibility (byte-invariance)
+
+- **未設定は現行 launch argv と byte 一致**: `sublane` は従来どおり 1st slot が tab を占有し 2nd slot が
+  `--split right`、`default` は `--tab` も `--split` も出さず herdr server 既定へ委任する。
+- 設定した field だけが差分を生む。`default` を設定しても `sublane` の launch は不変 (逆も同様)。
+
+### Launch semantics
+
+- **fresh pair**: `prepare_session` が `order` で requested providers を並べ替える。1st slot が container
+  (default = project workspace / sublane = lane tab) を占有し (`--split` 無し)、2nd slot が
+  `--split <dir>` で隣に置かれる。`--split` は `--tab` と独立に出せる (herdr 0.7.1 は両者を独立 optional
+  flag として受理) ため、tab を持たない default pair も縦分割できる。
+- **single-provider request**: `order` は **未要求の peer を暗黙 launch しない**。heal は欠けた provider
+  だけを launch する。
+- **heal**: 生存 sibling の隣へ configured `--split <dir>` で launch する。既存 pane は swap / move /
+  bounce しない。
+- **order best-effort**: herdr `agent start` に pane-target flag は存在しない (実 `--help` 照合) ため、
+  役割順序は **launch 順としてのみ**実現できる。configured primary (`order[0]`) が後から復旧し、生存
+  sibling の隣へ split するしかない場合は物理順序を満たせないので、その slot の `detail` に
+  `order_deferred_until_full_relaunch` を出す (silent に「order 適用済み」と主張しない)。full relaunch で
+  configured order が物理的に実現する。
+
+### Boundary
+
+- `lane_placement` は **future launch policy** であり、live layout / liveness / route authority ではない。
+  config を読むだけで既存 live pair を移動しない (herdr は same-tab re-split を拒否する。live 再配置は
+  operator の CLI 操作のまま)。
+- config key は `pane_placement` では **なく** `lane_placement`。repo-local schema boundary
+  (`_FORBIDDEN_KEY_PARTS`) は `pane` を含む key を allowed-key 判定より前に拒否するため、live pane
+  addressing に見えない名前へ寄せている (boundary screen は緩めない)。
+
+### 拡張点 (v1 非対象)
+
+owner の「親子孫 3 層それぞれで変えたい」要望のうち、**layer 別 (親 / 子 / 孫 lane role 別) の key 分けは
+v1 に含めない**: launch 経路の語彙は現状 lane_class (`default` / `sublane`) の 2 値であり、layer 別 keying
+には lane-role 語彙の launch 時解決が別途必要。schema は lane class key を追加するだけで拡張でき
+(closed set に新 class を足す)、既存 class の意味論は変わらないため、この拡張点は塞がっていない。
 
 ## 6. Close-evidence contract (pure-herdr round trip)
 

@@ -105,6 +105,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 if TYPE_CHECKING:
     from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
         AgentLaunchConfig,
+        LanePlacementConfig,
     )
 
 from mozyo_bridge.core.state.workspace_registry import (
@@ -163,6 +164,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     build_agent_start_argv,
     resolve_attest_launcher,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
+    _close_base_pane,
+    _create_tab,
+    _create_workspace,
+    _invoke,
+    _list_rows,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
     _host_workspace_label,
@@ -174,6 +182,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _tab_target_for_lane,
     _workspace_prefix,
     herdr_workspace_segment,
+    initial_container_occupancy,
+    resolve_launch_order,
+    resolve_placement_policy,
+    resolve_split_direction,
+    slot_placement,
 )
 from mozyo_bridge.shared.errors import die
 
@@ -289,47 +302,6 @@ def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
         raise HerdrSessionStartError(str(exc)) from exc
 
 
-def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
-    """Run herdr ``agent list`` and return raw rows (fail-closed)."""
-    completed = _invoke(binary, ["agent", "list"], runner, timeout, env=None)
-    rows = _extract_list_rows(completed.stdout)
-    if rows is None:
-        raise HerdrSessionStartError(
-            "herdr agent list payload was not a recognised JSON array or agents object"
-        )
-    return rows
-
-
-def _invoke(
-    binary: str,
-    tail: Sequence[str],
-    runner: Runner,
-    timeout: float,
-    *,
-    env: Optional[Mapping[str, str]],
-) -> "subprocess.CompletedProcess[str]":
-    """Run ``binary tail...`` fail-closed; raise on any mechanical / non-zero failure."""
-    argv = [binary, *tail]
-    try:
-        completed = runner(
-            argv, capture_output=True, text=True, timeout=timeout, env=env
-        )
-    except FileNotFoundError:
-        raise HerdrSessionStartError(f"herdr binary not found: {binary!r}")
-    except subprocess.TimeoutExpired:
-        raise HerdrSessionStartError(f"herdr command timed out: {list(tail)!r}")
-    except OSError as exc:
-        raise HerdrSessionStartError(
-            f"herdr command failed ({exc.__class__.__name__}): {list(tail)!r}"
-        )
-    if completed.returncode != 0:
-        raise HerdrSessionStartError(
-            _bounded_detail(completed.stderr)
-            or f"herdr {list(tail)!r} exited {completed.returncode}"
-        )
-    return completed
-
-
 def _find_named_agent(
     rows: Sequence[Mapping[str, object]], assigned_name: str
 ) -> list:
@@ -361,100 +333,6 @@ def _lane_id_from_metadata(resolved_root: Path) -> str:
     return _norm(getattr(record, "lane_id", "")) or _norm(
         getattr(record, "lane_label", "")
     )
-
-
-def _create_workspace(
-    binary: str,
-    repo_root: Path,
-    runner: Runner,
-    timeout: float,
-    env: Mapping[str, str],
-    label: str = "",
-) -> tuple[str, str]:
-    """Explicitly create a herdr workspace; return ``(workspace_id, root_pane_id)``.
-
-    Making the workspace ourselves (rather than letting the first ``agent start``
-    auto-create it) is what turns the empty base pane into a *known* handle we can
-    reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
-    operator's focus. ``label`` (Redmine #13380) names a minted sublane host
-    workspace for the operator — cosmetic only, never a join key. Fails closed if
-    the response is unparseable.
-    """
-    argv = ["workspace", "create", "--cwd", str(repo_root)]
-    if label:
-        argv.extend(["--label", label])
-    argv.append("--no-focus")
-    completed = _invoke(
-        binary,
-        argv,
-        runner,
-        timeout,
-        env=dict(env),
-    )
-    parsed = _parse_workspace_created(completed.stdout)
-    if parsed is None:
-        raise HerdrSessionStartError(
-            "herdr workspace create returned no parseable workspace id / root pane "
-            "(expected result.workspace.workspace_id + result.root_pane.pane_id in a "
-            "workspace_created payload); refuse to guess a pane to reclaim"
-        )
-    return parsed
-
-
-def _create_tab(
-    binary: str,
-    workspace_id: str,
-    runner: Runner,
-    timeout: float,
-    env: Mapping[str, str],
-    label: str = "",
-) -> tuple[str, str]:
-    """Explicitly create a herdr tab in ``workspace_id``; return ``(tab_id, root_pane_id)``.
-
-    Lane=tab subdivision (Redmine #13411): a non-default lane gets its OWN tab in
-    the sublane host workspace, its gateway + worker placed as a split pair inside
-    it. Minting the tab ourselves turns its empty root pane into a *known* handle
-    to reclaim by id (the tab analogue of the #13330 workspace base pane), never
-    one we scan for. ``--label`` (the lane label) is cosmetic and operator-readable
-    only — every join decision keys on the live ``tab_id``, never the label.
-    ``--no-focus`` avoids stealing the operator's focus. Fails closed if the
-    response is unparseable.
-    """
-    argv = ["tab", "create", "--workspace", workspace_id]
-    if label:
-        argv.extend(["--label", label])
-    argv.append("--no-focus")
-    completed = _invoke(binary, argv, runner, timeout, env=dict(env))
-    parsed = _parse_tab_created(completed.stdout)
-    if parsed is None:
-        raise HerdrSessionStartError(
-            "herdr tab create returned no parseable tab id / root pane "
-            "(expected result.tab.tab_id + result.root_pane.pane_id in a "
-            "tab_created payload); refuse to guess a pane to reclaim"
-        )
-    return parsed
-
-
-def _close_base_pane(
-    binary: str,
-    pane_id: str,
-    runner: Runner,
-    timeout: float,
-    env: Mapping[str, str],
-) -> tuple[bool, str]:
-    """Reclaim a created root pane; **never hard-fail** (cosmetic residue only).
-
-    Used for both the #13330 workspace base pane and the #13411 lane tab root
-    pane. Returns ``(True, "")`` on a clean close, else ``(False, <detail>)``. A
-    failed reclaim only leaves the harmless empty root pane behind — the agent
-    slots are already live — so it is recorded, not raised (Redmine #13330 ruling
-    j#73225).
-    """
-    try:
-        _invoke(binary, ["pane", "close", pane_id], runner, timeout, env=dict(env))
-    except HerdrSessionStartError as exc:
-        return False, _bounded_detail(str(exc)) or "herdr pane close failed"
-    return True, ""
 
 
 @dataclass(frozen=True)
@@ -524,6 +402,7 @@ def prepare_session(
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
+    lane_placement: "Optional[LanePlacementConfig]" = None,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
@@ -549,6 +428,16 @@ def prepare_session(
     for the coordinator pair (no-lane session), ``sublane`` for a lane worker / gateway.
     ``None`` (the default) appends nothing — byte-for-byte the pre-#13425 launch, so the
     ``sublane_claude_model`` regression fix is opt-in on the launch site passing a config.
+
+    ``lane_placement`` (Redmine #13646, Design Answer j#76564) is the repo-local herdr
+    pane-pair placement policy the launch site resolved from ``.mozyo-bridge/config.yaml``.
+    It reorders the requested ``providers`` (the configured provider launches first and
+    occupies; the rest split beside it) and supplies each splitting launch's ``--split
+    <dir>`` — including the tab-less ``default`` pair, previously left to the herdr server
+    default. ``order`` never adds an unrequested peer; a configured primary that can only
+    split beside a live sibling is reported ``order_deferred_until_full_relaunch`` rather
+    than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` keeps
+    the requested order and the legacy split discipline (byte-for-byte pre-#13646).
 
     ``claude_permission_mode_default`` is the launch-context policy default for the
     managed Claude permission mode (Redmine #11925 / #13360 / #13397): sublane lane
@@ -656,6 +545,17 @@ def prepare_session(
             )
 
     result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
+
+    # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
+    # lane class's `(split, order)` ONCE, then reorder the requested providers so the
+    # first-launched slot occupies the container. `lane_class` is the same axis
+    # `agent_launch` keys on, resolved independently (no merge). An unset config yields
+    # `(None, None)`, so every downstream decision stays byte-for-byte pre-#13646. The
+    # decisions are pure (`herdr_lane_topology`).
+    lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
+    config_split, config_order = resolve_placement_policy(lane_placement, lane_class)
+    providers = resolve_launch_order(providers, config_order)
+
     runner = runner or subprocess.run
     # Startup self-attestation reader (Redmine #13637): the adopt gate joins each live
     # name-match with its record. Injectable for tests; defaults to the store pinned to
@@ -779,33 +679,43 @@ def prepare_session(
             result.tab_pane_id = tab_pane_id
         result.herdr_tab_id = target_tab
 
-    # Config-driven launch argv (Redmine #13425): the lane_class is `default` for the
-    # coordinator pair (no-lane session) and `sublane` for a lane worker / gateway. The
-    # per-slot argv comes from the single-source resolver; `None` config yields `[]`
-    # everywhere, so an unconfigured launch is byte-for-byte the pre-#13425 command.
-    lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
-
-    # Split placement inside the lane tab (Redmine #13411): the first slot to land
-    # in a tab occupies it; every subsequent slot — the second of a fresh pair, or a
-    # healing launch beside an already-live sibling — is placed with `--split right`.
-    # The tab starts occupied by this lane's live slots ALREADY IN target_tab, read
-    # from the whole inventory (review j#74433 finding 1) — not just this run's
-    # requested adopts — so a single-provider heal beside a live tabbed sibling still
-    # splits. A freshly minted tab has no such slots, so its first launch does not
-    # split and its second does.
-    tab_occupancy = (
-        sum(1 for tab in lane_slot_tabs if tab == target_tab) if target_tab else 0
+    # Split placement (Redmine #13411 tab axis + #13646 config-driven direction). The first
+    # slot to land in a container occupies it; every subsequent launching slot — the second
+    # of a fresh pair, or a heal beside an already-live sibling — is placed with
+    # `--split <dir>`. Both decisions are pure (`herdr_lane_topology`).
+    split_direction = resolve_split_direction(lane_class, config_split)
+    occupancy = initial_container_occupancy(
+        rows,
+        workspace_id,
+        target_workspace,
+        result.lane_id,
+        lane_class=lane_class,
+        target_tab=target_tab,
+        lane_slot_tabs=lane_slot_tabs,
+        count_default_lane=bool(
+            launch_plans and target_workspace and config_split is not None
+        ),
     )
 
-    # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into
-    # the resolved target workspace/tab). A launch failure raises here, before reclaim.
+    # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into the
+    # resolved target workspace/tab). A launch failure raises here, before reclaim.
+    # `occupancy` grows per launch so the first launched slot occupies and the rest split.
     for plan in plans:
+        # Config-driven launch argv (Redmine #13425): per-slot `-- {provider}` extras from
+        # the single-source resolver; `None` config yields `[]`, so an unconfigured launch
+        # is byte-for-byte the pre-#13425 command. `lane_class` is resolved once above.
         launch_argv_extra = (
             agent_launch.resolve_launch_argv(plan.provider, lane_class)
             if agent_launch is not None
             else []
         )
-        split_tab = bool(target_tab) and plan.kind == "launch" and tab_occupancy > 0
+        slot_split, order_deferred = slot_placement(
+            plan.kind,
+            plan.provider,
+            split_direction=split_direction,
+            occupancy=occupancy,
+            config_order=config_order,
+        )
         result.slots.append(
             _execute_slot(
                 plan,
@@ -814,7 +724,7 @@ def prepare_session(
                 lane=result.lane_id,
                 target_workspace=target_workspace,
                 target_tab=target_tab,
-                split_tab=split_tab,
+                split=slot_split,
                 binary=binary,
                 attest_launcher=attest_launcher,
                 store_home=store_home,
@@ -823,10 +733,11 @@ def prepare_session(
                 timeout=timeout,
                 claude_permission_mode=claude_permission_mode,
                 launch_argv_extra=launch_argv_extra,
+                order_deferred=order_deferred,
             )
         )
-        if plan.kind == "launch" and target_tab:
-            tab_occupancy += 1
+        if plan.kind == "launch":
+            occupancy += 1
 
     # Reclaim the empty root panes we created — only after EVERY launch succeeded
     # (a launch failure raised above, so reaching here means all agents are live and
@@ -857,7 +768,7 @@ def _execute_slot(
     lane: str,
     target_workspace: str,
     target_tab: str = "",
-    split_tab: bool = False,
+    split: str = "",
     binary: str,
     attest_launcher: str = "",
     store_home: str = "",
@@ -866,6 +777,7 @@ def _execute_slot(
     timeout: float,
     claude_permission_mode: Optional[str] = None,
     launch_argv_extra: Sequence[str] = (),
+    order_deferred: bool = False,
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -925,7 +837,7 @@ def _execute_slot(
         lane=lane,
         target_workspace=target_workspace,
         target_tab=target_tab,
-        split_tab=split_tab,
+        split=split,
         binary=binary,
         attest_launcher=attest_launcher,
         store_home=store_home,
@@ -983,12 +895,18 @@ def _execute_slot(
             "refuse to trust a mislocated launch (the gateway/worker pair must "
             "share one dedicated lane tab)"
         )
+    # `order_deferred` (see `slot_placement`): the configured primary could only be placed
+    # as a split beside an already-live sibling, so the physical order waits for a full
+    # relaunch. Say so rather than silently claim the order was applied.
+    detail = "launched with the durable name and self-identity env (--env) at start"
+    if order_deferred:
+        detail += "; order_deferred_until_full_relaunch (no swap/bounce)"
     return SlotResult(
         provider=plan.provider,
         assigned_name=plan.assigned_name,
         outcome=SLOT_LAUNCHED,
         locator=locator,
-        detail="launched with the durable name and self-identity env (--env) at start",
+        detail=detail,
     )
 
 
@@ -1033,13 +951,16 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
     agents = getattr(args, "agent", None) or [PROVIDER_CLAUDE, PROVIDER_CODEX]
     lane_id = getattr(args, "lane", None) or ""
     dry_run = bool(getattr(args, "dry_run", False))
-    # Config-driven launch argv (Redmine #13425): resolved from the repo the command runs
-    # in. lane_class is derived inside `prepare_session` from the resolved lane.
+    # Config-driven launch argv (Redmine #13425) + pane placement (Redmine #13646):
+    # resolved from the repo the command runs in. lane_class is derived inside
+    # `prepare_session` from the resolved lane. One load serves both surfaces.
     try:
-        agent_launch = load_repo_local_config(repo_root).agent_launch
+        repo_config = load_repo_local_config(repo_root)
     except RepoLocalConfigError as exc:
-        die(f"herdr session-start failed: invalid agent_launch config: {exc}")
+        die(f"herdr session-start failed: invalid repo-local config: {exc}")
         raise AssertionError("unreachable")
+    agent_launch = repo_config.agent_launch
+    lane_placement = repo_config.lane_placement
     try:
         result = prepare_session(
             repo_root=repo_root,
@@ -1049,6 +970,7 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
             dry_run=dry_run,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=agent_launch,
+            lane_placement=lane_placement,
         )
     except HerdrSessionStartError as exc:
         die(f"herdr session-start failed: {exc}")

@@ -75,9 +75,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
     _lane_state,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
+    _list_rows,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     HerdrSessionStartError,
-    _list_rows,
     _resolve_binary_or_die,
     herdr_workspace_segment,
     prepare_session,
@@ -230,7 +232,13 @@ class HerdrSublaneActuatorOps:
             load_repo_local_config,
         )
 
-        agent_launch = load_repo_local_config(self.repo_root).agent_launch
+        # Config-driven pane placement (Redmine #13646): the lane's slots are the `sublane`
+        # lane_class, so the config's `lane_placement.sublane` split / order decides the
+        # gateway/worker pair's geometry inside the lane tab and which provider occupies it
+        # first. Read from the SAME source checkout as `agent_launch` (one config source).
+        # An unconfigured repo keeps the legacy `--split right` and the requested order.
+        repo_config = load_repo_local_config(self.repo_root)
+        agent_launch = repo_config.agent_launch
         try:
             prepare_session(
                 repo_root=Path(worktree_path),
@@ -239,6 +247,7 @@ class HerdrSublaneActuatorOps:
                 env=self.env,
                 runner=self.runner,
                 timeout=self.timeout,
+                lane_placement=repo_config.lane_placement,
                 # Lane creation is a managed-pane chokepoint: pass the cockpit /
                 # sublane policy default (#11925) so lane Claude workers launch
                 # reproducibly auto, exactly like the tmux `cockpit append` path

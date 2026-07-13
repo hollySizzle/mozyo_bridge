@@ -86,6 +86,10 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     parse_launch_argv_record,
     validate_launch_argv,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (
+    LanePlacementConfig,
+    LanePlacementError,
+)
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import CliCompositionConfig
 from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
@@ -117,6 +121,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "sublane_integration",
         "work_unit",
         "agent_launch",
+        "lane_placement",
         "provider_binding",
         "terminal_transport",
     }
@@ -151,6 +156,7 @@ DEFAULT_MERGE_ON_RETIRE: bool = True
 AGENT_LAUNCH_KEYS: frozenset[str] = frozenset(
     {"version", "sublane_claude_model", "launch_argv"}
 )
+
 
 # The provider / lane-class vocabulary, reserved managed-flag set, and launch_argv
 # validators (Redmine #13425) live in the self-contained sibling
@@ -738,9 +744,9 @@ class RepoLocalConfig:
 
     Composes the configurable surfaces — :attr:`cli`, :attr:`providers`,
     :attr:`presentation`, :attr:`delegation`, :attr:`sublane_integration`,
-    :attr:`work_unit`, :attr:`agent_launch`, :attr:`provider_binding` — each
-    behavior-preserving by default. The default (no fields set) reproduces the
-    current ``mozyo-bridge`` behavior exactly.
+    :attr:`work_unit`, :attr:`agent_launch`, :attr:`lane_placement`,
+    :attr:`provider_binding` — each behavior-preserving by default. The default (no
+    fields set) reproduces the current ``mozyo-bridge`` behavior exactly.
 
     This layer does no file IO and no parsing: :meth:`from_record` normalizes an
     already-parsed mapping into typed records and fails closed on any unknown
@@ -765,6 +771,9 @@ class RepoLocalConfig:
     )
     agent_launch: AgentLaunchConfig = field(
         default_factory=AgentLaunchConfig.default
+    )
+    lane_placement: LanePlacementConfig = field(
+        default_factory=LanePlacementConfig.default
     )
     provider_binding: RoleProviderBindingConfig = field(
         default_factory=RoleProviderBindingConfig.default
@@ -876,6 +885,21 @@ class RepoLocalConfig:
         # ``agent_launch`` block resolves to the behavior-preserving default (no
         # ``--model`` flag), so a repo with no block launches exactly as before.
         agent_launch = AgentLaunchConfig.from_record(record.get("agent_launch"))
+        # The lane-class pane-pair placement knob (#13646) declares the herdr split
+        # direction / provider order per lane class. It is parsed by its own
+        # self-contained domain schema (the sibling that also owns the vocabulary); its
+        # LanePlacementError is re-raised as a RepoLocalConfigError so the loader keeps a
+        # single fail-closed boundary. An absent ``lane_placement`` block resolves to the
+        # behavior-preserving default (no split / order override), so a repo with no block
+        # launches exactly as before. The ``pane``-shaped key screen already ran above.
+        try:
+            lane_placement = LanePlacementConfig.from_record(
+                record.get("lane_placement")
+            )
+        except LanePlacementError as exc:
+            raise RepoLocalConfigError(
+                f"lane_placement config is invalid: {exc}"
+            ) from exc
         # The role -> provider binding override knob (#13157) live-wires the #12673
         # RoleProviderBinding seam. It is parsed by its own self-contained domain schema;
         # its RoleProviderBindingConfigError is re-raised as a RepoLocalConfigError so the
@@ -913,6 +937,7 @@ class RepoLocalConfig:
             sublane_integration=sublane_integration,
             work_unit=work_unit,
             agent_launch=agent_launch,
+            lane_placement=lane_placement,
             provider_binding=provider_binding,
             terminal_transport=terminal_transport,
         )
@@ -932,6 +957,8 @@ __all__ = (
     "PresentationSelectionConfig",
     "SublaneIntegrationConfig",
     "AgentLaunchConfig",
+    "LanePlacementConfig",
+    "LanePlacementError",
     "RoleProviderBindingConfig",
     "RoleProviderBindingConfigError",
     "TerminalTransportConfig",
