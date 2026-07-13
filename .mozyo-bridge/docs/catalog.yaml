@@ -1150,6 +1150,23 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-coordinator-autonomy-evaluation
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/coordinator-autonomy-evaluation.md
+    purpose: 長時間operator離席下のcoordinator runを、throughput、人間介入、correctness、安全、auditability、unattended production readinessへ分解して評価し、2026-07-12〜13の実績・失敗・次回benchmark metricを固定する正本。live workflow stateはRedmineを正本とする。
+    audit_role: coordinator_autonomy_evaluation_logic
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-smoke-test-frame
+      - logic-delegated-coordinator-real-machine-acceptance
+      - logic-delegated-coordinator-cockpit-display
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-role-profile-handoff-expansion
     type: logic
     status: active
