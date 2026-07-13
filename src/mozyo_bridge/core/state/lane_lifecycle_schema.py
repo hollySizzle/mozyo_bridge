@@ -147,6 +147,70 @@ def _recorded_version(conn: sqlite3.Connection) -> Optional[int]:
     return value
 
 
+#: Read-only schema-classification outcomes (Redmine #13681 R3-F1, j#77307).
+READONLY_COMPONENT_ABSENT = "absent"
+READONLY_COMPONENT_RECOGNIZED = "recognized"
+READONLY_COMPONENT_UNSUPPORTED = "unsupported"
+
+
+def _table_present(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def readonly_component_status(conn: sqlite3.Connection) -> str:
+    """Classify this component for a NON-CREATING read (Redmine #13681 R3-F1, j#77307).
+
+    A read-only mirror of the write-side downgrade guard in
+    :func:`ensure_lane_lifecycle_schema`: it never writes (no DDL, no metadata upsert),
+    and returns one of
+
+    - :data:`READONLY_COMPONENT_ABSENT` — a fresh store: neither the component metadata
+      row nor the table exists. The caller reads no rows without creating anything.
+    - :data:`READONLY_COMPONENT_RECOGNIZED` — the recorded component ``schema_version`` is
+      one this build understands (:data:`_RECOGNIZED_SCHEMA_VERSIONS`) AND the table is
+      present. The caller may read the authority rows.
+    - :data:`READONLY_COMPONENT_UNSUPPORTED` — an unknown / newer / malformed component
+      version, a metadata row without its table (a partial / migrating store), a table
+      without its metadata / a missing components registry, or a query failure. The caller
+      fails closed, exactly as the guarded write path raises ``LaneLifecycleError`` on a
+      newer container *or component* schema (``managed-state-model.md``
+      ``### backup / downgrade / partial migration``): an older build never reads
+      authority rows whose newer semantics it does not agree to.
+    """
+    try:
+        has_meta = _table_present(conn, "state_schema_components")
+        has_table = _table_present(conn, _TABLE)
+    except sqlite3.DatabaseError:
+        return READONLY_COMPONENT_UNSUPPORTED
+    if not has_meta:
+        # No components registry at all — only a genuinely fresh store (no table either).
+        return (
+            READONLY_COMPONENT_ABSENT
+            if not has_table
+            else READONLY_COMPONENT_UNSUPPORTED
+        )
+    recorded = _recorded_version(conn)
+    if recorded is None:
+        # The component was never registered.
+        return (
+            READONLY_COMPONENT_ABSENT
+            if not has_table
+            else READONLY_COMPONENT_UNSUPPORTED
+        )
+    if recorded not in _RECOGNIZED_SCHEMA_VERSIONS:
+        # A newer / malformed component version -> unsupported (downgrade-safe).
+        return READONLY_COMPONENT_UNSUPPORTED
+    # A recognized version is only readable when its table is actually present.
+    return (
+        READONLY_COMPONENT_RECOGNIZED if has_table else READONLY_COMPONENT_UNSUPPORTED
+    )
+
+
 def ensure_lane_lifecycle_schema(path: Path) -> None:
     """Create / validate the container, this component's table + owner index.
 
@@ -241,9 +305,13 @@ __all__ = (
     "LANE_LIFECYCLE_COMPONENT",
     "LANE_LIFECYCLE_RECOVERY_POLICY",
     "LANE_LIFECYCLE_SCHEMA_VERSION",
+    "READONLY_COMPONENT_ABSENT",
+    "READONLY_COMPONENT_RECOGNIZED",
+    "READONLY_COMPONENT_UNSUPPORTED",
     "COLUMNS",
     "TABLE",
     "LaneLifecycleError",
     "ensure_lane_lifecycle_schema",
     "lane_lifecycle_path",
+    "readonly_component_status",
 )

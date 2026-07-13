@@ -53,6 +53,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     encode_release_pins,
     lane_lifecycle_path,
     load_lane_lifecycle,
+    load_lane_lifecycle_readonly,
     rehydrate_allowed,
     release_transition_allowed,
     resolve_lane_owner,
@@ -1523,6 +1524,65 @@ class FailClosedReadTest(unittest.TestCase):
         )
         self.assertEqual(resolve_lane_owner(WS, ISSUE, home=self.home).lane_id, LANE_A)
         self.assertEqual(len(load_lane_lifecycle(home=self.home)), 1)
+
+
+class ReadonlyLoaderGuardTest(unittest.TestCase):
+    """R3-F1 (j#77307): the non-creating reader honours the schema-version downgrade guard."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        self.store = LaneLifecycleStore(home=self.home)
+
+    def _seed_row(self) -> None:
+        self.store.declare_active(
+            LaneLifecycleKey(WS, LANE_A), decision=_decision(), issue_id=ISSUE
+        )
+
+    def test_absent_store_reads_empty_without_creating(self) -> None:
+        # No store file at all: () and nothing created.
+        self.assertEqual(load_lane_lifecycle_readonly(home=self.home), ())
+        self.assertFalse(lane_lifecycle_path(self.home).exists())
+
+    def test_recognized_version_reads_rows(self) -> None:
+        self._seed_row()
+        rows = load_lane_lifecycle_readonly(home=self.home)
+        self.assertIsNotNone(rows)
+        self.assertEqual(len(rows), 1)
+
+    def test_unsupported_component_version_fails_closed(self) -> None:
+        # A future / unknown component schema must fail closed to None — never read the
+        # authority rows under semantics this build does not understand (matching the
+        # guarded write path). Mirrors load_lane_lifecycle's behaviour.
+        self._seed_row()
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 999 "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(load_lane_lifecycle(home=self.home))  # guarded path
+        self.assertIsNone(load_lane_lifecycle_readonly(home=self.home))  # readonly path
+
+    def test_table_present_without_metadata_fails_closed(self) -> None:
+        # A partial store (lifecycle table exists, but its component metadata row is gone)
+        # is unsupported, not a fresh empty read.
+        self._seed_row()
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            conn.execute(
+                "DELETE FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(load_lane_lifecycle_readonly(home=self.home))
 
 
 if __name__ == "__main__":

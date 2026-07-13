@@ -400,6 +400,35 @@ class SublaneSupersedeTest(unittest.TestCase):
             self.assertNotIn(f"{WS}:pNEWc", closed_locators)
             self.assertNotIn(f"{WS}:pNEWw", closed_locators)
 
+    def test_duplicate_live_original_slot_never_records_released(self) -> None:
+        # R3-F2: when the original's codex slot is live at two locators (ambiguous
+        # inventory), the release fails closed — nothing is closed and the generation is
+        # NOT marked released, so a still-live pinned process is never lost.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            rows = [
+                _row("codex", ORIG, f"{WS}:p2"),
+                _row("codex", ORIG, f"{WS}:p2b"),  # duplicate live identity
+                _row("claude", ORIG, f"{WS}:p3"),
+                _row("codex", REC, f"{WS}:p10"),
+                _row("claude", REC, f"{WS}:p11"),
+            ]
+            attest = {
+                encode_assigned_name(WS, "codex", REC): _attest("codex", REC, f"{WS}:p10"),
+                encode_assigned_name(WS, "claude", REC): _attest("claude", REC, f"{WS}:p11"),
+            }
+            ops = _FakeOps(rows=rows, attestations=attest)
+            outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.supersede.applied)
+            self.assertNotEqual(outcome.release.process_release, RELEASE_RELEASED)
+            self.assertNotEqual(
+                store.get(LaneLifecycleKey(WS, ORIG)).process_release, RELEASE_RELEASED
+            )
+            self.assertEqual(ops.close_calls, [])
+
     def test_incomplete_identity_fails_closed_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
@@ -472,6 +501,28 @@ class PinMatchedClosePlanTest(unittest.TestCase):
         ]
         # Even though `good` would match, the corrupt `foreign` fails the whole plan.
         self.assertIsNone(self._plan([good, foreign], rows))
+
+    def test_exact_pair_match_is_order_independent(self):
+        # R3-F2: the matcher keys on the exact (assigned_name, locator) pair, so a
+        # single-locator live inventory matches regardless of row position.
+        pin = self._pin(WS, "codex", ORIG, f"{WS}:p2")
+        rows_a = [_row("claude", ORIG, f"{WS}:p3"), _row("codex", ORIG, f"{WS}:p2")]
+        rows_b = list(reversed(rows_a))
+        self.assertEqual(self._plan([pin], rows_a).close_targets, (("codex", f"{WS}:p2"),))
+        self.assertEqual(self._plan([pin], rows_b).close_targets, (("codex", f"{WS}:p2"),))
+
+    def test_duplicate_live_identity_fails_closed_regardless_of_order(self):
+        # R3-F2: the same assigned name live at TWO locators is an ambiguous inventory —
+        # fail closed (None) independent of row order, so a still-live pinned slot is
+        # never silently dropped (and later falsely recorded released).
+        pin = self._pin(WS, "codex", ORIG, f"{WS}:p-old")
+        name = pin.assigned_name
+        forward = [
+            {"name": name, "pane_id": f"{WS}:p-old"},
+            {"name": name, "pane_id": f"{WS}:p-new"},
+        ]
+        self.assertIsNone(self._plan([pin], forward))
+        self.assertIsNone(self._plan([pin], list(reversed(forward))))
 
 
 if __name__ == "__main__":

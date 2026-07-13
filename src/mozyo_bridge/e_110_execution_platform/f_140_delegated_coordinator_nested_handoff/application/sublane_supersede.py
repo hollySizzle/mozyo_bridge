@@ -678,6 +678,14 @@ def _pin_matched_close_plan(
     ``None`` so the caller closes nothing), rather than a partial set that might include a
     foreign pane. The pins, re-resolved against the live inventory, are the sole authority
     for what this stale action may close (``ReleasePin`` contract).
+
+    The live inventory is matched as a **set of exact ``(assigned_name, locator)`` pairs**
+    (R2-F1 j#77292 + R3-F2 j#77307), never a name→last-locator map: a pin is a target iff
+    its exact pair is live, which is independent of the row order and never lets an
+    already-recycled locator masquerade as the pinned one. If the same assigned name is
+    live at **more than one locator** (an ambiguous inventory), the generation fails closed
+    rather than guess which live pane is the pinned process — so a still-live pinned slot is
+    never silently dropped and recorded ``released``.
     """
     want_lane = _norm_lane(lane_id)
 
@@ -692,14 +700,16 @@ def _pin_matched_close_plan(
             and identity.role == role
         )
 
-    live_locator: dict[str, str] = {}
+    live_pairs: set[tuple[str, str]] = set()
+    locators_by_name: dict[str, set[str]] = {}
     for row in rows:
         if not isinstance(row, Mapping):
             continue
         name = _norm(row.get(AGENT_KEY_NAME))
         locator = _agent_locator(row)
         if name and locator:
-            live_locator[name] = locator
+            live_pairs.add((name, locator))
+            locators_by_name.setdefault(name, set()).add(locator)
 
     targets: list[tuple[str, str]] = []
     for pin in pins:
@@ -709,7 +719,12 @@ def _pin_matched_close_plan(
             # A pin naming a foreign unit / role, or an undecodable one: the pin set is
             # corrupt. Fail the whole generation closed rather than risk a foreign close.
             return None
-        if live_locator.get(pin.assigned_name) == pin.locator:
+        if len(locators_by_name.get(pin.assigned_name, ())) > 1:
+            # The pinned assigned name is live at more than one locator — an ambiguous
+            # inventory. Fail the whole generation closed rather than guess which live pane
+            # is the pinned process (and never record `released` over an unresolved slot).
+            return None
+        if (pin.assigned_name, pin.locator) in live_pairs:
             targets.append((pin.role, pin.locator))
     return HerdrRetireClosePlan(
         workspace_id=workspace_id, lane_id=lane_id, close_targets=tuple(targets)
