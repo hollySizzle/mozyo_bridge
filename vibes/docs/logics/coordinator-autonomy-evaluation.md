@@ -135,7 +135,7 @@ default-role authority」は実装完了後のreview待ちなのでworkerがidle
 route identityと表示labelが不一致である。これはpane増加そのものではないが、operatorが
 orphan paneと誤認しやすいdisplay driftである。
 
-`sublane list`には11件の`detached` recordも見えたが、これらは`lane_slots_missing` / 
+`sublane list`には11件の`detached` recordも見えたが、これらは`lane_slots_missing` /
 `worktree_unresolved`でlive paneを持たない。live resource leakとmetadata cleanup debtを
 同じ「pane爆発」として数えてはいけない。
 
