@@ -26,6 +26,14 @@ Credential boundary (reused verbatim from ``redmine_context`` / review #56232):
   (:func:`resolve_redmine_credentials`), is sent only in the request header, and
   is never echoed into a payload, log, or the :class:`RedmineVersionReadUnavailable`
   reason.
+- **no redirect is ever followed** (#13687 j#76650 Finding 1): the default opener is
+  ``redmine_read_transport.no_redirect_read``, so a 30x from the trusted base can
+  never carry ``X-Redmine-API-Key`` to the ``Location`` host. The refusal surfaces as
+  ``transport_error`` — an unreadable Version, never an empty one.
+- an optional ``project_id`` scopes the read (``GET /issues.json?project_id=<id>``).
+  Redmine Versions can be **shared** across projects, so an unscoped
+  ``fixed_version_id`` read can return another project's issues; the governed live
+  dispatch path always scopes it, while the legacy ``--live`` debug caller does not.
 
 Fail-closed posture (#12923 acceptance — live-read absence must never be read as
 an *empty* Version):
@@ -57,6 +65,9 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
     resolve_redmine_credentials,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_read_transport import (
+    no_redirect_read,
 )
 from mozyo_bridge.redmine_context import (
     API_KEY_ENV as _API_KEY_HINT,
@@ -98,8 +109,15 @@ class RedmineVersionReadUnavailable(Exception):
 
 
 def _default_opener(request: urllib.request.Request, timeout: float):
-    """Open ``request`` via the stdlib. Indirected so tests inject a fake."""
-    return urllib.request.urlopen(request, timeout=timeout)
+    """Open ``request`` without ever following a redirect. Indirected so tests inject a fake.
+
+    Credential boundary (#13687 j#76650 Finding 1): a plain ``urlopen`` follows a 30x and
+    the stdlib copies ``X-Redmine-API-Key`` onto the redirect target, leaking the key to
+    the ``Location`` host. :func:`no_redirect_read` refuses the redirect before that request
+    is built; the refusal is a ``URLError`` subclass, so ``_get_page`` already maps it onto
+    ``transport_error`` — an unreadable Version, never an empty one.
+    """
+    return no_redirect_read(request, timeout)
 
 
 class LiveRedmineVersionIssueSource:
@@ -121,6 +139,7 @@ class LiveRedmineVersionIssueSource:
         *,
         api_key: Optional[str],
         base_url: Optional[str],
+        project_id: Optional[str] = None,
         timeout: float = READ_TIMEOUT_SECONDS,
         page_limit: int = PAGE_LIMIT,
         max_pages: int = MAX_PAGES,
@@ -131,6 +150,12 @@ class LiveRedmineVersionIssueSource:
         # the explicit "no trusted destination" sentinel (fail-closed at read).
         self._api_key = (api_key or "").strip() or None
         self._base_url = normalize_base_url(base_url)
+        # A Redmine Version can be *shared* across projects, so a bare
+        # fixed_version_id read can return issues belonging to other projects.
+        # ``project_id`` (an identifier or numeric id) scopes the read to the one
+        # project the caller declared (#13687 j#76650). ``None`` keeps the
+        # pre-existing unscoped read for the snapshot/debug ``--live`` caller.
+        self._project_id = (project_id or "").strip() or None
         self._timeout = timeout
         self._page_limit = max(1, page_limit)
         self._max_pages = max(1, max_pages)
@@ -224,15 +249,18 @@ class LiveRedmineVersionIssueSource:
         travel as query-parameter values. Maps every failure to an explicit
         :class:`RedmineVersionReadUnavailable` reason.
         """
-        query = urllib.parse.urlencode(
-            {
-                "fixed_version_id": version_id,
-                "status_id": "*",
-                "limit": str(self._page_limit),
-                "offset": str(offset),
-                "sort": "id:asc",
-            }
-        )
+        params = {
+            "fixed_version_id": version_id,
+            "status_id": "*",
+            "limit": str(self._page_limit),
+            "offset": str(offset),
+            "sort": "id:asc",
+        }
+        if self._project_id is not None:
+            # Shared Versions are visible from several projects; scoping the read
+            # keeps another project's issues out of this project's bucket.
+            params["project_id"] = self._project_id
+        query = urllib.parse.urlencode(params)
         request = urllib.request.Request(
             f"{self._base_url}/issues.json?{query}",
             headers={"X-Redmine-API-Key": self._api_key or ""},
@@ -271,6 +299,7 @@ class LiveRedmineVersionIssueSource:
 
 def live_version_issue_source_from_env(
     *,
+    project_id: Optional[str] = None,
     environ: "object | None" = None,
     home: "object | None" = None,
     opener: Optional[Callable[[urllib.request.Request, float], object]] = None,
@@ -284,13 +313,16 @@ def live_version_issue_source_from_env(
     here: it surfaces as an explicit :class:`RedmineVersionReadUnavailable`
     (``provider_unavailable`` / ``credential_missing``) when
     ``read_version_issues`` is finally called, which is more informative than a
-    silent ``None``. ``environ`` / ``home`` / ``opener`` are injectable for
-    hermetic tests.
+    silent ``None``. ``project_id`` (optional) scopes the read to one project so a
+    shared Version cannot pull in another project's issues (#13687); omitted, the
+    read stays unscoped as before. ``environ`` / ``home`` / ``opener`` are
+    injectable for hermetic tests.
     """
     creds = resolve_redmine_credentials(home, environ=environ)
     return LiveRedmineVersionIssueSource(
         api_key=creds.api_key,
         base_url=creds.base_url,
+        project_id=project_id,
         opener=opener,
     )
 

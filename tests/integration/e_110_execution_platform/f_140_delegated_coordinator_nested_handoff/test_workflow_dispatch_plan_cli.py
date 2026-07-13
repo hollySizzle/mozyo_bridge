@@ -20,8 +20,10 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -29,6 +31,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     cli_workflow_dispatch_plan,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.live_fixed_version_bucket import (
+    LIVE_VERSION_NOT_OPEN,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_version_issue_source import (
+    RedmineVersionReadUnavailable,
 )
 
 _ISSUES = {
@@ -504,6 +512,170 @@ class ParsingTest(unittest.TestCase):
                     "noselector",
                 ]
             )
+
+
+class LiveRedmineModeTest(unittest.TestCase):
+    """`--live-redmine` (Redmine #13687 Increment 1): explicit opt-in, fail-closed.
+
+    The live *read* itself is unit-tested at the f_120 composition boundary against an
+    injected opener; here we pin the CLI contract on top of it: the flag is exclusive with
+    the snapshot input, a blocked read exits 2 with its reason on stderr and **no plan on
+    stdout** (so "could not look" is never rendered as "no work"), and the combinations the
+    live path cannot honour are refused explicitly rather than resolving to an empty bucket.
+    """
+
+    _READ = (
+        "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+        ".application.cli_workflow_dispatch_plan.read_live_fixed_version_bucket"
+    )
+
+    def _live_read(self):
+        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.live_fixed_version_bucket import (
+            LiveBucketRead,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.domain.fixed_version_lane_bucket_provider import (
+            RedmineFixedVersionLaneBucketProvider,
+        )
+
+        return LiveBucketRead(
+            provider=RedmineFixedVersionLaneBucketProvider(
+                issues_payload=_ISSUES,
+                versions_payload={
+                    "versions": [{"id": 292, "name": "枠", "status": "open"}]
+                },
+            ),
+            project_identifier="giken-3800-mozyo-bridge",
+            version_id="292",
+            version_name="枠",
+            issue_count=4,
+        )
+
+    def _run_live(self, argv, *, side_effect=None, return_value=None):
+        err = io.StringIO()
+        with mock.patch(
+            self._READ, side_effect=side_effect, return_value=return_value
+        ) as read, contextlib.redirect_stderr(err):
+            code, out = _run(argv)
+        return code, out, err.getvalue(), read
+
+    def test_live_read_plans_through_the_pure_planner(self):
+        code, out, _, read = self._run_live(
+            ["workflow", "dispatch-plan", "--bucket-id", "292", "--live-redmine", "--json"],
+            return_value=self._live_read(),
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["resolved"])
+        self.assertEqual(payload["bucket_id"], "292")
+        # The selector reaches the read; the repo defaults supply the project scope.
+        self.assertEqual(read.call_args.kwargs["bucket_id"], "292")
+        self.assertIsNone(read.call_args.kwargs["bucket_name"])
+
+    def test_explicit_repo_is_passed_to_the_live_read(self):
+        _, _, _, read = self._run_live(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-name",
+                "枠",
+                "--live-redmine",
+                "--repo",
+                "/some/repo",
+            ],
+            return_value=self._live_read(),
+        )
+        self.assertEqual(read.call_args.kwargs["repo_root"], Path("/some/repo"))
+        self.assertEqual(read.call_args.kwargs["bucket_name"], "枠")
+
+    def test_blocked_live_read_exits_2_with_its_reason_and_no_plan(self):
+        blocked = RedmineVersionReadUnavailable(
+            "version #292 status is 'closed', not 'open'",
+            reason=LIVE_VERSION_NOT_OPEN,
+        )
+        code, out, err, _ = self._run_live(
+            ["workflow", "dispatch-plan", "--bucket-id", "292", "--live-redmine", "--json"],
+            side_effect=blocked,
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")  # never a "0 candidates" plan on a read we could not do
+        self.assertIn(LIVE_VERSION_NOT_OPEN, err)
+
+    def test_custom_field_bucket_source_is_refused_live(self):
+        # A live issues read sends no include=, so custom-field values are not guaranteed
+        # present; resolving them live would look like an empty bucket ("no work").
+        code, out, err, read = self._run_live(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-id",
+                "bucket-a",
+                "--live-redmine",
+                "--bucket-source",
+                "custom-field",
+                "--custom-field-id",
+                "5",
+            ],
+            return_value=self._live_read(),
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn(cli_workflow_dispatch_plan.LIVE_UNSUPPORTED_BUCKET_SOURCE, err)
+        read.assert_not_called()  # refused before any network reach
+
+    def test_versions_json_snapshot_cannot_be_combined_with_live(self):
+        # A stale Version status is more dangerous than none: it can render a closed
+        # Version as open, which is exactly the gate the live read exists to enforce.
+        with tempfile.TemporaryDirectory() as tmp:
+            versions = _write(Path(tmp), "versions.json", {"versions": []})
+            code, out, err, read = self._run_live(
+                [
+                    "workflow",
+                    "dispatch-plan",
+                    "--bucket-id",
+                    "292",
+                    "--live-redmine",
+                    "--versions-json",
+                    versions,
+                ],
+                return_value=self._live_read(),
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn(cli_workflow_dispatch_plan.LIVE_SNAPSHOT_INPUT_CONFLICT, err)
+        read.assert_not_called()
+
+    def test_live_and_issues_json_are_mutually_exclusive(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(
+                [
+                    "workflow",
+                    "dispatch-plan",
+                    "--bucket-id",
+                    "292",
+                    "--issues-json",
+                    "x.json",
+                    "--live-redmine",
+                ]
+            )
+
+    def test_a_source_is_still_required(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["workflow", "dispatch-plan", "--bucket-id", "292"])
+
+    def test_snapshot_mode_never_reaches_the_live_read(self):
+        # The opt-in contract: without --live-redmine there is no network reach and no
+        # credential use, whatever else is passed.
+        with tempfile.TemporaryDirectory() as tmp:
+            issues = _write(Path(tmp), "issues.json", _ISSUES)
+            with mock.patch(self._READ) as read:
+                code, out = _run(
+                    ["workflow", "dispatch-plan", "--bucket-id", "292", "--issues-json", issues]
+                )
+        self.assertEqual(code, 0)
+        self.assertIn("resolved: true", out)
+        read.assert_not_called()
 
 
 if __name__ == "__main__":
