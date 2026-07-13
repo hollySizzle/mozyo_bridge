@@ -1464,6 +1464,17 @@ file_conventions:
       - logic-coordinator-sublane-development-flow
       - logic-ticketless-project-gateway-runtime-ux
 
+  - id: fc-agent-provider-profiles
+    name: packaged agent provider profile registry data source of truth
+    patterns:
+      - src/mozyo_bridge/e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profiles.yaml
+    severity: block
+    document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - spec-project-map
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: fc-delegated-coordinator-runtime-source
     name: delegated coordinator runtime and projection source
     patterns:
