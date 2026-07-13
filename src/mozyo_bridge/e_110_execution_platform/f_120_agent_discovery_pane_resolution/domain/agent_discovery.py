@@ -29,13 +29,25 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import pane_lines
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    AGENT_PROVIDER_PROFILES,
+    agent_discovery_aliases,
+    agent_provider_ids,
+)
 from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS
 
 
 AGENT_KIND_CLAUDE = "claude"
 AGENT_KIND_CODEX = "codex"
 AGENT_KIND_UNKNOWN = "unknown"
-AGENT_KINDS = frozenset({AGENT_KIND_CLAUDE, AGENT_KIND_CODEX, AGENT_KIND_UNKNOWN})
+# The known agent kinds are the registered provider ids (Redmine #13441) plus the
+# core-owned `unknown` sentinel, which is a *resolver outcome*, not a provider — a
+# profile can never register it (`FORBIDDEN_PROFILE_TOKENS` guards the authority
+# axes; `unknown` is simply never a provider id in the packaged data).
+_PROVIDER_IDS = agent_provider_ids()
+AGENT_KINDS = _PROVIDER_IDS | {AGENT_KIND_UNKNOWN}
+# `{window/pane alias -> provider id}` for name-based classification.
+_DISCOVERY_ALIASES = agent_discovery_aliases()
 
 # Role identity model (Redmine #11822). Agent role is not the window name nor a
 # single pane option — it is the *output of a resolver* over the pane's runtime
@@ -64,11 +76,16 @@ CONFIDENCE_NONE = "none"
 VIEW_KIND_COCKPIT_PANE = "cockpit_pane"
 VIEW_KIND_NORMAL_WINDOW = "normal_window"
 
-# Foreground process basenames that *weakly* hint a role. `node` / versioned
+# Foreground process basenames that *weakly* hint a role, derived from each
+# provider profile's declared `process_names` (Redmine #13441). `node` / versioned
 # native binaries are receiver-agnostic (both CLIs are node-based), so they are
 # deliberately NOT here — a weak hint must still name the role to be usable, and
 # automatic handoff never targets on a weak hint regardless.
-_PROCESS_ROLE_HINTS = {AGENT_KIND_CLAUDE: AGENT_KIND_CLAUDE, AGENT_KIND_CODEX: AGENT_KIND_CODEX}
+_PROCESS_ROLE_HINTS = {
+    process: profile.provider_id
+    for profile in AGENT_PROVIDER_PROFILES
+    for process in profile.process_names
+}
 
 
 @dataclass(frozen=True)
@@ -202,11 +219,13 @@ def infer_repo_root(cwd: str) -> str | None:
 
 
 def classify_agent_kind(window_name: str) -> str:
-    if window_name == AGENT_KIND_CLAUDE:
-        return AGENT_KIND_CLAUDE
-    if window_name == AGENT_KIND_CODEX:
-        return AGENT_KIND_CODEX
-    return AGENT_KIND_UNKNOWN
+    """The provider a window name names, or ``unknown`` (Redmine #13441).
+
+    Resolves through the profiles' declared discovery aliases, so a new
+    same-protocol provider is recognized by adding a profile entry rather than a
+    branch here. An unaliased name stays ``unknown`` exactly as before.
+    """
+    return _DISCOVERY_ALIASES.get(window_name, AGENT_KIND_UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -230,13 +249,14 @@ class RoleResolution:
 
 
 def _normalize_role(value: str | None) -> str:
-    """Map a raw role-ish string to a known agent kind, else ``unknown``."""
+    """Map a raw role-ish string to a registered provider id, else ``unknown``.
+
+    The pane option carries a *provider* token, so this checks the registered
+    provider vocabulary (Redmine #13441) rather than a hard-coded pair. An
+    unregistered token stays ``unknown``, so an unrecognized role never routes.
+    """
     text = (value or "").strip()
-    if text == AGENT_KIND_CLAUDE:
-        return AGENT_KIND_CLAUDE
-    if text == AGENT_KIND_CODEX:
-        return AGENT_KIND_CODEX
-    return AGENT_KIND_UNKNOWN
+    return text if text in _PROVIDER_IDS else AGENT_KIND_UNKNOWN
 
 
 def resolve_agent_role(

@@ -33,6 +33,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUBLANE_STATE_GATEWAY_ONLY,
 )
 
+from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
+
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
 
@@ -163,7 +165,7 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         coord = Path(tmp) / "coord"
         coord.mkdir(exist_ok=True)
         binpath = _fake_binary(tmp)
-        env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+        env = with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)})
         ops = HerdrSublaneActuatorOps(
             repo_root=coord,
             lane_label=lane_label,
@@ -303,7 +305,12 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 ops.append_lane_column(str(worktree))
         by_provider = {}
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
+            # argv[0] is the resolved absolute executable (#13441), not the label.
+            argv0 = argv[argv.index("--") + 1]
+            provider = next(
+                (p for p in ("claude", "codex") if argv0 == provider_bin_path(p)),
+                argv0,
+            )
             by_provider[provider] = argv
         claude = by_provider["claude"]
         idx = claude.index("--permission-mode")
@@ -502,7 +509,7 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 view = ops.read_lane(str(worktree))
         self.assertEqual(len(herdr.start_argvs), launches_before + 1)
         relaunch = herdr.start_argvs[-1]
-        self.assertEqual(relaunch[relaunch.index("--") + 1], "codex")
+        self.assertEqual(relaunch[relaunch.index("--") + 1], provider_bin_path("codex"))
         # The relaunch is pinned into the surviving worker's workspace (adopt pin),
         # so no second workspace (and no new base pane) is created.
         self.assertEqual(relaunch[relaunch.index("--workspace") + 1], "wL")
@@ -660,7 +667,7 @@ class HerdrLinkedWorktreeRoundTripTest(unittest.TestCase):
                 repo_root=main,
                 lane_label="issue_13331_x",
                 issue="13331",
-                env={HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)},
+                env=with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}),
                 runner=herdr.run,
             )
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
@@ -701,7 +708,7 @@ class HerdrLinkedWorktreeRoundTripTest(unittest.TestCase):
                 repo_root=main,
                 lane_label="issue_13331_x",
                 issue="13331",
-                env={HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)},
+                env=with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}),
                 runner=herdr.run,
             )
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
@@ -737,7 +744,7 @@ class HerdrUseCaseIntegrationTest(unittest.TestCase):
             repo_root=coord,
             lane_label="issue_13331_lane",
             issue="13331",
-            env={HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)},
+            env=with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}),
             runner=herdr.run,
         )
         request = SublaneCreateRequest(

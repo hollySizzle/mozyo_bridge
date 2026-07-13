@@ -28,18 +28,29 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-#: The closed provider + lane-class vocabulary of ``agent_launch.launch_argv`` (#13425).
-LAUNCH_ARGV_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    agent_provider_ids,
+    reserved_managed_flags,
+)
+
+#: The provider vocabulary of ``agent_launch.launch_argv``, derived from the agent
+#: provider profile registry (Redmine #13441) instead of a hard-coded pair: a new
+#: same-protocol provider becomes a valid config key by adding a profile entry, with no
+#: source branch here. The lane-class axis stays a code-owned closed set — it is mozyo's
+#: own launch-context taxonomy, not provider knowledge.
+LAUNCH_ARGV_PROVIDERS: frozenset[str] = agent_provider_ids()
 LAUNCH_ARGV_LANE_CLASSES: frozenset[str] = frozenset({"default", "sublane"})
 
 #: mozyo-owned managed launch flags a config ``launch_argv`` may NOT specify (Redmine
-#: #13425 design consultation answer j#73949 Q4). The managed Claude permission-mode
-#: posture (#13360) is mozyo policy applied at the launch chokepoint; a config token that
-#: re-specifies it fails closed rather than silently overriding the managed launch (config
-#: argv is otherwise rendered *after* the managed flag, so CLI last-wins would let it win).
-RESERVED_MANAGED_FLAGS: "dict[str, tuple[str, ...]]" = {
-    "claude": ("--permission-mode",),
-}
+#: #13425 design consultation answer j#73949 Q4), now derived from each provider profile's
+#: declared managed-flag spellings (#13441) rather than a hard-coded table. The managed
+#: permission-mode posture (#13360) is mozyo policy applied at the launch chokepoint; a
+#: config token that re-specifies it fails closed rather than silently overriding the
+#: managed launch (config argv is otherwise rendered *after* the managed flag, so CLI
+#: last-wins would let it win). A provider that renames its flag updates its profile —
+#: the reservation follows automatically, so the config guard can never drift behind the
+#: flag it is meant to protect.
+RESERVED_MANAGED_FLAGS: "dict[str, tuple[str, ...]]" = reserved_managed_flags()
 
 
 class AgentLaunchArgvError(ValueError):

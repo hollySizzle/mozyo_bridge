@@ -37,6 +37,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional, Protocol, runtime_checkable
 
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    agent_provider_ids,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
@@ -66,8 +69,13 @@ PROVIDER_CLAUDE: str = "claude"
 PROVIDER_CODEX: str = "codex"
 RECEIVER_COORDINATOR: str = "coordinator"
 
-#: The provider tokens a launched agent (and thus a mzb1 identity slot) may carry.
-AGENT_PROVIDERS: frozenset[str] = frozenset({PROVIDER_CLAUDE, PROVIDER_CODEX})
+#: The provider tokens a launched agent (and thus a mzb1 identity slot) may carry,
+#: derived from the agent provider profile registry (Redmine #13441) rather than a
+#: hard-coded pair, so a new same-protocol provider joins this vocabulary by adding a
+#: profile entry. This is *identity* vocabulary only: it says which provider tokens are
+#: recognized, never which providers get launched (default topology) nor which workflow
+#: role a provider may hold (that stays `provider_binding` authority, #12673 / #13583).
+AGENT_PROVIDERS: frozenset[str] = agent_provider_ids()
 
 # ---------------------------------------------------------------------------
 # Fail-closed reason vocabulary (core-owned, closed set).

@@ -16,6 +16,10 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     resolve_agent_role,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    agent_commands,
+    agent_process_names,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     pane_lines,
     resolve_pane_id,
@@ -26,11 +30,14 @@ from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import READ_MARK_PREFIX, normalize_path_unicode
 
 
-AGENT_PROCESSES = {"claude", "codex", "node"}
-AGENT_COMMANDS = {
-    "claude": "claude",
-    "codex": "codex",
-}
+# Provider vocabulary, derived from the agent provider profile registry (Redmine
+# #13441) instead of hard-coded here. `AGENT_COMMANDS` maps a provider label to its
+# command *basename*; the executable a launch actually execs is the verified absolute
+# realpath resolved at the launch chokepoint (`agent_provider_executable`), never this
+# basename. `node` stays a literal: it is a receiver-agnostic host runtime (both CLIs
+# are node-based), not a provider, so it belongs to process detection, not the registry.
+AGENT_PROCESSES = set(agent_process_names()) | {"node"}
+AGENT_COMMANDS = agent_commands()
 AGENT_LABELS = frozenset(AGENT_COMMANDS)
 # Pseudo-target label (Redmine #12015): resolves to the sender workspace's main
 # coordinator Codex (the default-lane Codex), so a sublane can call back the
