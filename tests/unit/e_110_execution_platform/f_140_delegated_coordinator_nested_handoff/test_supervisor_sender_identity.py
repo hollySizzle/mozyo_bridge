@@ -388,47 +388,121 @@ class ClaimReverificationTest(unittest.TestCase):
 
 
 class BackendNeutralResolverTest(unittest.TestCase):
-    """R4-F1: the production resolver matches stable (workspace/lane/role) against the LIVE inventory."""
+    """R5-F1: the production resolver delegates to resolve_route_neutral over live Herdr agent rows."""
 
-    def _resolver(self, workspace_id, rows):
+    def _resolver(self, workspace_id, rows, *, backend="herdr"):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
             BackendNeutralTargetResolver,
         )
 
-        return BackendNeutralTargetResolver(workspace_id=workspace_id, live_inventory=lambda: list(rows))
+        return BackendNeutralTargetResolver(workspace_id=workspace_id, inventory=lambda: (list(rows), backend))
 
-    def _neutral(self, workspace_id, role, locator, *, lane="default"):
-        # The ledger neutral row shape (workspace_id / lane_id / agent_role / id).
-        return {"workspace_id": workspace_id, "lane_id": lane, "agent_role": role, "id": locator}
+    def _herdr(self, workspace_id, role, locator, *, lane="default"):
+        # A live herdr `agent list` row: name = the mzb1 assigned name (identity source), pane_id.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        return {"name": encode_assigned_name(workspace_id, role, lane), "pane_id": locator}
 
     def test_resolves_this_workspace_live_role(self):
-        inv = [self._neutral("wsA", "codex", "%A"), self._neutral("wsB", "codex", "%B")]
+        inv = [self._herdr("wsA", "codex", "%A"), self._herdr("wsB", "codex", "%B")]
         res = self._resolver("wsA", inv).resolve(_row("wsA"))  # row target_receiver=codex
         self.assertEqual(len(res.targets), 1)
         self.assertEqual(res.targets[0].receiver, "codex")
         self.assertEqual(res.targets[0].locator, "%A")
         self.assertEqual(res.targets[0].issue, "13683")  # anchor carried from the row
+        self.assertEqual(res.targets[0].generation, "")  # generation from LIVE (none) -> blank
 
     def test_wrong_role_pane_is_not_resolved(self):
-        # R4-F1 repro: a live default-lane Claude is NEVER resolved for a coordinator(codex) row.
-        inv = [self._neutral("wsA", "claude", "%claudeA")]
+        # R4-F1: a live default-lane Claude is NEVER resolved for a coordinator(codex) row.
+        inv = [self._herdr("wsA", "claude", "%claudeA")]
         res = self._resolver("wsA", inv).resolve(_row("wsA", target_receiver="codex"))
         self.assertEqual(res.targets, ())  # no codex slot live -> fail-closed
 
+    def test_wrong_lane_name_is_not_resolved(self):
+        # R5-F1: a live row for a DIFFERENT lane (wrong assigned name / pane_name) is not matched —
+        # the delegation enforces the full stable key incl. pane_name, not just ws/role.
+        inv = [self._herdr("wsA", "codex", "%other", lane="otherlane")]
+        res = self._resolver("wsA", inv).resolve(_row("wsA", target_receiver="codex", target_lane="default"))
+        self.assertEqual(res.targets, ())
+
     def test_no_cross_workspace_resolution(self):
-        inv = [self._neutral("wsA", "codex", "%A"), self._neutral("wsB", "codex", "%B")]
+        inv = [self._herdr("wsA", "codex", "%A"), self._herdr("wsB", "codex", "%B")]
         res = self._resolver("wsA", inv).resolve(_row("wsA"))
         self.assertTrue(all(t.workspace_id == "wsA" for t in res.targets))
         self.assertNotIn("%B", {t.locator for t in res.targets})
 
+    def test_unsupported_backend_is_fail_closed(self):
+        # R5-F1: a tmux (unadapted) backend is an explicit Phase A fail-closed boundary.
+        inv = [self._herdr("wsA", "codex", "%A")]
+        res = self._resolver("wsA", inv, backend="tmux").resolve(_row("wsA"))
+        self.assertEqual(res.targets, ())
+
     def test_blank_expected_receiver_resolves_nothing(self):
-        inv = [self._neutral("wsA", "codex", "%A")]
+        inv = [self._herdr("wsA", "codex", "%A")]
         res = self._resolver("wsA", inv).resolve(_row("wsA", target_receiver=""))
         self.assertEqual(res.targets, ())
 
     def test_empty_inventory_is_fail_closed(self):
         res = self._resolver("wsA", []).resolve(_row("wsA"))
         self.assertEqual(res.targets, ())
+
+    def test_generation_from_live_not_row(self):
+        # R5-F2: the resolved target's generation comes from the LIVE inventory (Phase A: none ->
+        # blank), NEVER copied from the row — so a generation-correlated row fails closed downstream.
+        inv = [self._herdr("wsA", "codex", "%A")]
+        res = self._resolver("wsA", inv).resolve(_row("wsA", target_generation="g1"))
+        self.assertEqual(len(res.targets), 1)
+        self.assertEqual(res.targets[0].generation, "")  # NOT "g1"
+
+
+class TargetTupleBackfillTest(unittest.TestCase):
+    """R5-F2: a blank-tuple row (migration / early ingest) is atomically backfilled on re-ingest."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "wf.sqlite"
+
+    def _outbox_key(self):
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
+
+        key = CallbackOutboxKey(
+            source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
+            callback_route="coordinator", workspace_id="wsA",
+        )
+        return CallbackOutbox(path=self.store_path), key
+
+    def test_blank_tuple_row_backfilled_on_reingest(self):
+        from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+
+        outbox, key = self._outbox_key()
+        outbox.enqueue(key, initial_state=CALLBACK_PENDING, now=NOW)  # blank tuple (migration-shaped)
+        self.assertEqual(outbox.read()[0].target_receiver, "")
+        result = outbox.enqueue(
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex", now=NOW
+        )
+        self.assertFalse(result.inserted)  # no new row
+        rows = outbox.read()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].target_receiver, "codex")  # backfilled
+        self.assertEqual(rows[0].target_lane, "default")
+        self.assertEqual(rows[0].state, CALLBACK_PENDING)  # state never reset
+
+    def test_set_tuple_is_not_overwritten(self):
+        from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+
+        outbox, key = self._outbox_key()
+        outbox.enqueue(
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex", now=NOW
+        )
+        # A second ingest with a different tuple must NOT overwrite the set expectation.
+        outbox.enqueue(
+            key, initial_state=CALLBACK_PENDING, target_lane="other", target_receiver="claude", now=NOW
+        )
+        rows = outbox.read()
+        self.assertEqual(rows[0].target_receiver, "codex")
+        self.assertEqual(rows[0].target_lane, "default")
 
 
 class ClaimLostDuringResolverTest(unittest.TestCase):

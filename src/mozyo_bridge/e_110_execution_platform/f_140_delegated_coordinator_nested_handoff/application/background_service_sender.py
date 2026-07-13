@@ -57,12 +57,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_UNCERTAIN,
     send_outcome_for_delivery,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
-    PANE_KEY_ID,
-    PANE_KEY_LANE,
-    PANE_KEY_ROLE,
-    PANE_KEY_WORKSPACE,
-)
 
 
 def _utc_now_iso() -> str:
@@ -75,71 +69,90 @@ class TargetResolver(Protocol):
     def resolve(self, row: CallbackOutboxRow) -> TargetResolution: ...
 
 
+#: The backend-neutral live inventory the resolver re-matches against, as ``(rows, backend)`` — the
+#: raw backend inventory (Herdr ``agent list`` / tmux) + the backend token so the delegation
+#: normalizes and matches it through the one authority. ``Callable[[], (rows, backend)]``.
+BackendInventory = Callable[[], "tuple[Sequence[Mapping[str, object]], str]"]
+
+
 @dataclass
 class BackendNeutralTargetResolver:
-    """Resolve a row's target from the **backend-neutral live inventory** by stable fields (R4-F1).
+    """Resolve a row's target by delegating to the ledger's backend-neutral route authority (R5-F1).
 
-    The production :class:`TargetResolver`. Per the route-identity-ledger authority model, a live
-    target is the stable ``(workspace_id, lane_id, role)`` slot re-matched against the **live**
-    inventory (for Herdr, the canonical assigned name; the transient locator / cached
-    ``last_seen_pane_id`` is never the authority, only send-time evidence). For a claimed row it:
+    Per the route-identity-ledger Authority Model, a live target is the stable
+    ``(workspace_id, lane_id, role, pane_name)`` identity re-matched against the LIVE inventory
+    through :func:`...domain.backend_neutral_resolver.resolve_route_neutral` — which owns the
+    fail-closed outcome table (ambiguity fail-closed, stale-cache detection, blank-locator downgrade,
+    ``last_seen`` as evidence only). This resolver does NOT re-implement that match: it builds the
+    **expected** stable identity from the row's durable tuple (``target_receiver`` role +
+    ``target_lane``, with the canonical ``pane_name`` = ``encode_assigned_name``) and delegates.
 
-    - takes the row's durable expected target tuple (``target_receiver`` = the binding-resolved
-      provider role recorded at enqueue, ``target_lane``) — a blank expected receiver is
-      unresolvable and yields no target (fail-closed);
-    - filters the live inventory to this workspace and that **exact role** (so a ``coordinator``
-      route never resolves a different-role pane — e.g. a default-lane Claude — R4-F1) and, when the
-      row records a lane, that lane;
-    - emits a :class:`DeliveryTarget` per surviving live slot, carrying the ROW's own anchor
-      (issue / journal) + expected generation and the live ``id`` as the send-time ``locator``.
+    - a blank expected receiver is unresolvable -> no target (fail-closed);
+    - the Herdr backend delegates to the authority (which matches the full stable key incl. the
+      assigned-name ``pane_name``, so a wrong / missing label is never resolved — R5-F1);
+    - an **unsupported backend** (no Phase A live-inventory adaptation, e.g. tmux) is an explicit
+      durable fail-closed boundary — no target, rather than silently resolving on a partial key;
+    - the resolved target's ``generation`` is read from the **live** authority, NEVER copied from the
+      row (R5-F2): Phase A's live inventory carries no generation, so it is blank/unknown, and the
+      delivery authority then fails a generation-correlated (non-blank expected) row closed.
 
-    ``live_inventory`` is the injectable backend-neutral inventory seam: production adapts the live
-    Herdr / tmux inventory into the neutral row shape (``neutral_inventory``); tests inject fixed
-    neutral rows. An inventory read that raises degrades to an empty resolution (fail-closed).
+    ``inventory`` is the injectable ``(rows, backend)`` seam; tests inject fixed rows + a backend.
     """
 
     workspace_id: str
-    live_inventory: Callable[[], "Sequence[Mapping[str, object]]"]
+    inventory: BackendInventory
 
     def resolve(self, row: CallbackOutboxRow) -> TargetResolution:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
+            BACKEND_HERDR,
+            herdr_route_identity,
+            resolve_route_neutral,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
+            RESOLVE_OK,
+        )
+
         expected_receiver = str(getattr(row, "target_receiver", "") or "").strip()
         expected_lane = str(getattr(row, "target_lane", "") or "").strip()
         if not expected_receiver:
             return TargetResolution.of([])  # no binding-resolved expected role -> fail-closed
         try:
-            rows = list(self.live_inventory())
+            rows, backend = self.inventory()
         except Exception:  # noqa: BLE001 - an unreadable inventory is a fail-closed no-target
             return TargetResolution.of([])
-        targets: list[DeliveryTarget] = []
-        seen: set = set()
-        for entry in rows:
-            if not isinstance(entry, Mapping):
-                continue
-            if str(entry.get(PANE_KEY_WORKSPACE, "") or "") != self.workspace_id:
-                continue
-            role = str(entry.get(PANE_KEY_ROLE, "") or "")
-            if role != expected_receiver:
-                continue  # exact binding-resolved role match (R4-F1): never a wrong-role pane
-            lane = str(entry.get(PANE_KEY_LANE, "") or "")
-            if expected_lane and lane != expected_lane:
-                continue
-            locator = str(entry.get(PANE_KEY_ID, "") or "").strip()  # send-time evidence only
-            if not locator:
-                continue
-            key = (lane, role, locator)
-            if key in seen:
-                continue
-            seen.add(key)
-            targets.append(
-                DeliveryTarget(
-                    workspace_id=self.workspace_id, lane=lane, receiver=role,
-                    issue=str(getattr(row, "issue", "") or ""),
-                    journal=str(getattr(row, "journal", "") or ""),
-                    generation=str(getattr(row, "target_generation", "") or ""),
-                    locator=locator,
-                )
+        if str(backend or "").strip() != BACKEND_HERDR:
+            # Unsupported backend live-inventory adaptation is an explicit Phase A fail-closed
+            # boundary (the tmux live path is a Phase B dogfood surface) — never a partial-key match.
+            return TargetResolution.of([])
+        identity = herdr_route_identity(
+            workspace_id=self.workspace_id,
+            role=expected_receiver,
+            route_id=f"{self.workspace_id}:{expected_lane or 'default'}:{expected_receiver}",
+            lane_id=expected_lane,
+        )
+        try:
+            resolution = resolve_route_neutral(identity, list(rows), backend=backend)
+        except Exception:  # noqa: BLE001 - an authority error is a fail-closed no-target
+            return TargetResolution.of([])
+        if resolution.status != RESOLVE_OK:
+            return TargetResolution.of([])
+        locator = str(getattr(resolution, "resolved_pane_id", "") or "").strip()
+        if not locator:
+            return TargetResolution.of([])
+        return TargetResolution.of([
+            DeliveryTarget(
+                workspace_id=self.workspace_id,
+                lane=expected_lane,
+                receiver=expected_receiver,
+                issue=str(getattr(row, "issue", "") or ""),
+                journal=str(getattr(row, "journal", "") or ""),
+                # R5-F2: generation from LIVE evidence, never the row. Phase A live inventory carries
+                # none -> blank/unknown, so a generation-correlated row (non-blank expected) fails
+                # closed at the authority until #13684's live generation authority populates it.
+                generation="",
+                locator=locator,
             )
-        return TargetResolution.of(targets)
+        ])
 
 
 class DeliveryTransport(Protocol):

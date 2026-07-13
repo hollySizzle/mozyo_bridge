@@ -326,8 +326,8 @@ class CallbackOutbox:
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT state FROM callback_outbox WHERE source=? AND issue=? AND journal=? "
-                "AND normalized_gate=? AND callback_route=? AND workspace_id=?",
+                "SELECT state, target_receiver FROM callback_outbox WHERE source=? AND issue=? "
+                "AND journal=? AND normalized_gate=? AND callback_route=? AND workspace_id=?",
                 key.as_row(),
             ).fetchone()
             if existing is None:
@@ -366,6 +366,26 @@ class CallbackOutbox:
             else:
                 current = str(existing[0])
                 inserted = False
+                # R5-F2 backfill: a row created before the target tuple (schema migration / an
+                # earlier ingest that could not resolve it) gets its UNSET expectation atomically
+                # backfilled from this ingest — only when the persisted receiver is blank AND this
+                # ingest supplies one, and touching nothing else (state / attempts / claim / a
+                # terminal row are never reset). The ``target_receiver=''`` guard makes it a no-op
+                # once a tuple is set, so a set expectation is never overwritten.
+                if not str(existing[1] or "").strip() and str(target_receiver or "").strip():
+                    conn.execute(
+                        "UPDATE callback_outbox SET target_lane=?, target_receiver=?, "
+                        "target_generation=?, updated_at=? WHERE source=? AND issue=? AND journal=? "
+                        "AND normalized_gate=? AND callback_route=? AND workspace_id=? "
+                        "AND target_receiver=''",
+                        (
+                            str(target_lane or ""),
+                            str(target_receiver or ""),
+                            str(target_generation or ""),
+                            stamp,
+                            *key.as_row(),
+                        ),
+                    )
             if cursor_source is not None and cursor is not None:
                 conn.execute(
                     "INSERT INTO callback_cursor (source, cursor, updated_at) VALUES (?, ?, ?) "

@@ -475,17 +475,15 @@ def background_transport_env(workspace_id: str) -> dict:
     return env
 
 
-def workspace_neutral_inventory(ws: SupervisedWorkspace) -> list:
-    """Best-effort backend-neutral live inventory for this workspace (the live-inventory seam, R4-F1).
+def workspace_live_inventory(ws: SupervisedWorkspace) -> "tuple[list, str]":
+    """Best-effort ``(raw_inventory, backend)`` for this workspace (the live-inventory seam, R5-F1).
 
-    Per the route-identity-ledger authority model, the live target is a stable
-    ``(workspace_id, lane_id, role)`` slot re-matched against the LIVE inventory (for Herdr, the
-    canonical assigned name). This reads the workspace's backend live inventory (Herdr ``agent
-    list`` / tmux) and normalizes it into the neutral row shape via
-    :func:`...domain.backend_neutral_resolver.neutral_inventory`. Fail-open to an empty list on any
-    error: an empty inventory makes the resolver fail-closed (no confirmed target -> the row stays
-    retryable), never a mis-delivery. Live running agents are the Phase B dogfood surface (#13490 /
-    #13492); the resolver mechanism reads this seam, and tests inject fixed neutral rows.
+    Returns the workspace's **raw** backend inventory + its backend token so the resolver delegates
+    the stable-key match to the one backend-neutral route authority (``resolve_route_neutral``),
+    which normalizes and matches it. Herdr yields the live ``agent list`` rows + ``"herdr"``; an
+    unresolved / unsupported backend yields ``([], "")`` so the resolver fail-closes (never a
+    partial-key match on an unadapted inventory). Live running agents are the Phase B dogfood surface
+    (#13490 / #13492); tests inject fixed ``(rows, backend)``.
     """
     try:
         import os
@@ -493,19 +491,17 @@ def workspace_neutral_inventory(ws: SupervisedWorkspace) -> list:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
             list_herdr_agent_rows,
         )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
-            neutral_inventory,
-        )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
             herdr_backend_active,
         )
 
         if herdr_backend_active(str(Path(ws.canonical_path))):
-            return list(neutral_inventory(list_herdr_agent_rows(os.environ), backend="herdr"))
-        # tmux backend live-inventory adaptation is the Phase B dogfood surface; fail-closed empty.
-        return []
-    except Exception:  # noqa: BLE001 - inventory unavailable -> empty (resolver fail-closed)
-        return []
+            return list(list_herdr_agent_rows(os.environ)), "herdr"
+        # tmux / other backend live-inventory adaptation is the Phase B dogfood surface: the
+        # resolver's unsupported-backend branch fail-closes on the empty backend token.
+        return [], ""
+    except Exception:  # noqa: BLE001 - inventory unavailable -> fail-closed empty
+        return [], ""
 
 
 #: The coordinator's durable lane in the route model (the coordinator runs in the default lane).
@@ -533,13 +529,12 @@ def coordinator_target_tuple(binding: object, route: str) -> "tuple[str, str]":
 
 
 def default_target_resolver(ws: SupervisedWorkspace):
-    """Build the production backend-neutral route target resolver for a workspace (R4-F1).
+    """Build the production backend-neutral route target resolver for a workspace (R5-F1).
 
-    Re-resolves a claimed row's target by matching its durable expected tuple (binding-resolved
-    ``target_receiver`` role + ``target_lane``) against the workspace-scoped **backend-neutral live
-    inventory** (:func:`workspace_neutral_inventory`) on the stable ``(workspace, lane, role)``
-    fields — never the cached locator (which is send-time evidence only). 0 / >1 live targets fail
-    closed at the authority. The live running-agent surface is the Phase B dogfood (#13490 / #13492).
+    Delegates the stable-key match (``(workspace_id, lane_id, role, pane_name)``) to the ledger's
+    :func:`...domain.backend_neutral_resolver.resolve_route_neutral` authority over the workspace's
+    live ``(rows, backend)`` inventory (:func:`workspace_live_inventory`) — never a cached locator or
+    a partial hand-rolled filter. The live running-agent surface is the Phase B dogfood (#13490).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
         BackendNeutralTargetResolver,
@@ -547,7 +542,7 @@ def default_target_resolver(ws: SupervisedWorkspace):
 
     return BackendNeutralTargetResolver(
         workspace_id=ws.workspace_id,
-        live_inventory=lambda: workspace_neutral_inventory(ws),
+        inventory=lambda: workspace_live_inventory(ws),
     )
 
 
@@ -682,7 +677,7 @@ __all__ = (
     "default_redmine_source",
     "default_target_resolver",
     "default_background_transport",
-    "workspace_neutral_inventory",
+    "workspace_live_inventory",
     "coordinator_target_tuple",
     "background_transport_env",
     "default_binding",
