@@ -135,7 +135,11 @@ def _recommended_command(
         "handoff",
         "send",
         "--to",
-        "codex",
+        # The route lands at the binding-resolved gateway provider the decision was
+        # required to reach (Redmine #13569 R1-F2), not a literal `codex`, so a rebound
+        # gateway provider yields a correct replayable command. Default `codex`,
+        # byte-identical.
+        decision.required_role,
         "--target",
         decision.selected.pane_id,
         "--target-repo",

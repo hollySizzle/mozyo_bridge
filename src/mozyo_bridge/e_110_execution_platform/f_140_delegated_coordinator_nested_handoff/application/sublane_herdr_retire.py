@@ -148,6 +148,20 @@ def plan_herdr_retire_close(
     unit_lane = lane if ws and lane and lane != DEFAULT_LANE else ""
     close_targets: list[tuple[str, str]] = []
     foreign: list[str] = []
+    # Pair-atomic attestation (Redmine #13569 R1-F4): the retire must never partially
+    # close a lane whose live providers do not match the binding-expected pair. The
+    # mismatch signal is a *substitution* at the lane's own position (workspace + lane
+    # match): an expected ``managed_roles`` slot is MISSING while an unexpected (non-
+    # managed) slot is PRESENT — i.e. a wrong-provider agent stands where a bound provider
+    # should. When that holds, no slot is closed (zero-close); the matching half is never
+    # closed while the wrong-provider half stays live. Distinguished from the benign cases:
+    #   - an EXTRA non-managed slot alongside the full expected pair (both present) is not a
+    #     substitution — the pair closes, the extra is recorded foreign;
+    #   - partial liveness (an expected slot already gone, nothing unexpected in its place)
+    #     is not a substitution — the surviving expected slot(s) still close.
+    # For the built-in pair (live == expected) this is byte-identical.
+    present_managed: set[str] = set()
+    has_unexpected_at_position = False
     if not ws and not legacy_ws:
         return HerdrRetireClosePlan(workspace_id=ws, lane_id=lane)
     for row in rows:
@@ -164,21 +178,32 @@ def plan_herdr_retire_close(
             # other occupant is recorded (the workspace will not disappear while
             # they live) and never closed.
             if row_lane == DEFAULT_LANE and identity.role in managed:
+                present_managed.add(identity.role)
                 locator = _agent_locator(row)
                 if locator:
                     close_targets.append((identity.role, locator))
                 continue
+            if row_lane == DEFAULT_LANE:
+                # An unexpected provider AT the legacy lane's own position.
+                has_unexpected_at_position = True
             foreign.append(_norm(name))
             continue
         if ws and unit_lane and identity.workspace_id == ws and row_lane == unit_lane:
             if identity.role in managed:
+                present_managed.add(identity.role)
                 locator = _agent_locator(row)
                 if locator:
                     close_targets.append((identity.role, locator))
                 continue
-            # A managed-scheme agent inside the targeted lane unit that is not a
-            # gateway / worker slot: record it, never close it (guarded).
+            # An unexpected provider AT the targeted lane unit's own position.
+            has_unexpected_at_position = True
             foreign.append(_norm(name))
+    missing_expected = set(managed) - present_managed
+    if missing_expected and has_unexpected_at_position:
+        # Substitution detected: an expected provider is absent while an unexpected one is
+        # live at the lane's position. Fail the whole plan closed — never a partial close
+        # of a mis-identified lane (the unexpected slot is already recorded in ``foreign``).
+        close_targets = []
     return HerdrRetireClosePlan(
         # Echo the caller-visible unit: a legacy-only close reports its token.
         workspace_id=ws or legacy_ws,

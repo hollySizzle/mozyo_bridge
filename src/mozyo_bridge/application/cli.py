@@ -4,7 +4,12 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (  # noqa: E501
+        AgentProviderRuntimeSnapshot,
+    )
 
 from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
@@ -191,7 +196,23 @@ from mozyo_bridge.application.cli_core import (  # noqa: F401,E402
 )
 
 
-def build_parser(config: Optional[RepoLocalConfig] = None) -> argparse.ArgumentParser:
+def build_parser(
+    config: Optional[RepoLocalConfig] = None,
+    *,
+    snapshot: "Optional[AgentProviderRuntimeSnapshot]" = None,
+) -> argparse.ArgumentParser:
+    # Composition root (Redmine #13569 R1-F1): build ONE agent-provider runtime snapshot
+    # here and thread the SAME instance to every provider-vocabulary registrar, so the
+    # whole CLI surface agrees on one injected provider vocabulary rather than each
+    # registrar reaching an import-time global. ``snapshot=None`` uses the built-in
+    # snapshot (byte-identical); a test / future composition injects a synthetic registry's
+    # snapshot to drive the real parser composition without a global monkeypatch.
+    if snapshot is None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
+            BUILTIN_AGENT_PROVIDER_SNAPSHOT,
+        )
+
+        snapshot = BUILTIN_AGENT_PROVIDER_SNAPSHOT
     parser = argparse.ArgumentParser(
         prog="mozyo-bridge",
         description=(
@@ -265,7 +286,9 @@ def build_parser(config: Optional[RepoLocalConfig] = None) -> argparse.ArgumentP
     # ``mozyo-bridge`` help/subcommand tree. A supplied config may disable only
     # non-mandatory families; the registry forbids disabling a core /
     # authority-bearing family, failing closed in ``main`` with actionable text.
-    cli_modules.compose_parser(sub, config.cli if config is not None else None)
+    cli_modules.compose_parser(
+        sub, config.cli if config is not None else None, snapshot=snapshot
+    )
     return parser
 
 

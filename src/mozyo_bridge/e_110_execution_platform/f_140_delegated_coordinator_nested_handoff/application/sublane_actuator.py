@@ -223,6 +223,48 @@ def _resolve_sublane_ops(
     return LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=quiet_stdout)
 
 
+def _sublane_start_provider_preflight_blocked(repo_root) -> bool:
+    """Fail closed (True) when a lane's bound gateway/worker provider cannot be launched.
+
+    Redmine #13569 R1-F2. Resolves the coordinator (gateway) and implementer (worker)
+    providers from the repo-local ``RoleProviderBinding`` and checks each against the
+    built-in provider runtime snapshot's mechanical launchability (the same protocol +
+    interactive-TUI predicate the launch preflight enforces). Returns ``True`` — and
+    prints an actionable reason — when a role is unbound, or its provider is unknown or
+    not launchable, so ``cmd_sublane_start`` returns before any side effect. Returns
+    ``False`` (proceed) for the built-in binding, byte-identical.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_gateway_provider,
+        resolve_worker_provider,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
+        BUILTIN_AGENT_PROVIDER_SNAPSHOT,
+    )
+
+    root = str(repo_root)
+    try:
+        providers = (
+            ("gateway", resolve_gateway_provider(root)),
+            ("worker", resolve_worker_provider(root)),
+        )
+    except WorkflowProviderUnresolved as exc:
+        print(f"sublane start refused: {exc}; no lane was created.", file=sys.stderr)
+        return True
+    snapshot = BUILTIN_AGENT_PROVIDER_SNAPSHOT
+    for role, provider in providers:
+        if not snapshot.is_launchable(provider):
+            print(
+                f"sublane start refused: the {role} provider {provider!r} is not a "
+                f"launchable agent provider (unknown, or a non-interactive protocol / "
+                f"missing capability); no lane was created.",
+                file=sys.stderr,
+            )
+            return True
+    return False
+
+
 def cmd_sublane_start(args: argparse.Namespace) -> int:
     """``sublane create`` / ``start`` dispatcher.
 
@@ -248,6 +290,17 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         work_unit, decision_anchor = resolve_work_unit_request_fields(args, repo_root)
     except RepoLocalConfigError as exc:
         print(f"invalid repo-local config: {exc}", file=sys.stderr)
+        return 1
+
+    # Binding / launchability preflight (Redmine #13569 R1-F2): before ANY worktree or
+    # pane actuation, verify the providers the repo-local binding assigns to the lane's
+    # gateway (coordinator) and worker (implementer) roles are recognized AND mechanically
+    # launchable. An unbound role, an unknown provider, or a provider that is expressible
+    # but not launchable (a non-interactive protocol / missing capability) fails closed
+    # here — zero-start — rather than letting the default pair launch and then being unable
+    # to route to the intended provider. For the built-in binding (codex / claude, both
+    # launchable) this always passes, so the default path is byte-identical.
+    if _sublane_start_provider_preflight_blocked(repo_root):
         return 1
 
     request = SublaneCreateRequest(

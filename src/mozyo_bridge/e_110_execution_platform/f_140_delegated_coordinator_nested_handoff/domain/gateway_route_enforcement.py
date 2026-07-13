@@ -79,6 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
 # receiver (the ``codex`` gateway) is the governed route head.
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
     PROVIDER_CLAUDE,
+    PROVIDER_CODEX,
 )
 
 #: Implementation-shaped kinds whose delivery is route-governed (#12918 objective:
@@ -111,6 +112,12 @@ ROUTE_EXCEPTION: str = "gateway_route_exception"
 
 #: The single ``blocked_reason`` token a :data:`ROUTE_BLOCKED` decision carries.
 BLOCKED_DIRECT_WORKER_BYPASS: str = "coordinator_to_sublane_worker_bypass"
+#: A governed delivery addressed to a provider that is NEITHER the binding-resolved
+#: gateway nor the worker (Redmine #13569 R1-F3). With the receiver vocabulary opened to
+#: every registered provider (2A), "not the worker" no longer implies "the gateway", so a
+#: cross-boundary governed send to an arbitrary third provider must fail closed rather than
+#: be mistaken for the always-allowed gateway route head.
+BLOCKED_NON_GATEWAY_RECEIVER: str = "governed_route_non_gateway_receiver"
 
 #: The backward-compatible lane id a missing / empty ``@mozyo_lane_id`` resolves to
 #: (Redmine #11820, mirrored from ``agent_discovery._normalize_lane_display``). A
@@ -167,6 +174,13 @@ class GatewayRouteRequest:
     target_role: Optional[str] = None
     allow_direct_worker: bool = False
     worker_provider: Optional[str] = None
+    #: The runtime provider bound to the **coordinator (gateway) role** for this repo
+    #: (Redmine #13569 R1-F3). The governed route head (coordinator -> sublane gateway) is
+    #: the delivery whose receiver IS this provider; a governed delivery to any other
+    #: non-worker provider is not a legitimate gateway route and fails closed. The caller
+    #: resolves it from the repo-local :class:`RoleProviderBinding`; ``None`` (or empty)
+    #: falls back to :data:`PROVIDER_CODEX`, byte-identical to the pre-#13569 default.
+    gateway_provider: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +287,11 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     # implementer role's runtime provider, resolved by the caller from the binding.
     # Default (unset) -> claude, so the pre-#13174 behavior is byte-identical.
     worker_provider = _norm(request.worker_provider) or PROVIDER_CLAUDE
+    # The gateway route head is the coordinator (gateway) role's provider (Redmine #13569
+    # R1-F3). Default (unset) -> codex, byte-identical. Since 2A opened the receiver
+    # vocabulary to every registered provider, "not the worker" no longer implies "the
+    # gateway", so the governed head is checked against the EXACT gateway provider.
+    gateway_provider = _norm(request.gateway_provider) or PROVIDER_CODEX
 
     def _allowed(*, governed: bool, same_unit: Optional[bool]) -> GatewayRouteDecision:
         return GatewayRouteDecision(
@@ -289,13 +308,29 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     if kind not in GATEWAY_GOVERNED_KINDS:
         return _allowed(governed=False, same_unit=None)
 
-    # Governed kind. A delivery to a non-worker provider is the governed route head
-    # (coordinator -> sublane gateway, the gateway provider under this binding),
-    # always allowed.
-    if receiver != worker_provider:
+    # Governed kind. The route head is the delivery to the EXACT gateway provider
+    # (coordinator -> sublane gateway), always allowed.
+    if receiver == gateway_provider:
         return _allowed(governed=True, same_unit=None)
 
-    # Governed kind addressed to a Claude worker. When the sender's own lane Unit
+    # Not the gateway. The only other legitimate governed receiver is the worker
+    # provider (the terminal gateway -> worker hop). A governed delivery to a provider
+    # that is NEITHER the gateway nor the worker is not a legitimate route and fails
+    # closed (Redmine #13569 R1-F3) — a third provider must never be mistaken for the
+    # always-allowed gateway head now that the receiver vocabulary is open.
+    if receiver != worker_provider:
+        return GatewayRouteDecision(
+            verdict=ROUTE_BLOCKED,
+            governed=True,
+            kind=request.kind,
+            resolved_receiver=request.receiver,
+            blocked_reason=BLOCKED_NON_GATEWAY_RECEIVER,
+            suggested_safe_route=_suggested_safe_route(request),
+            same_unit=None,
+            exception_applied=False,
+        )
+
+    # Governed kind addressed to a worker. When the sender's own lane Unit
     # could not be resolved the gate cannot prove a cross-lane delivery and stays
     # out of the way (same posture as the cross-session gate skipping outside tmux).
     if not request.sender_identity_known:
@@ -372,6 +407,7 @@ __all__ = (
     "ROUTE_BLOCKED",
     "ROUTE_EXCEPTION",
     "BLOCKED_DIRECT_WORKER_BYPASS",
+    "BLOCKED_NON_GATEWAY_RECEIVER",
     "GatewayRouteRequest",
     "GatewayRouteDecision",
     "decide_gateway_route",

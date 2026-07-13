@@ -295,12 +295,15 @@ class WorkerProviderRebindTest(unittest.TestCase):
         )
 
     def test_rebound_worker_provider_blocks_that_receiver_cross_lane(self) -> None:
-        # implementer rebound to codex: a governed kind `--to codex` to a cross-lane
-        # pane is now the worker bypass and fails closed.
+        # A full role swap (worker=codex, gateway=claude): a governed kind `--to codex`
+        # to a cross-lane pane is now the worker bypass and fails closed. The gateway
+        # provider is passed explicitly (Redmine #13569 R1-F3): the gate keys the route
+        # head on the EXACT gateway provider, not "any non-worker".
         decision = _decide(
             kind="implementation_request",
             receiver="codex",
             worker_provider="codex",
+            gateway_provider="claude",
             sender_identity_known=True,
             sender_lane_id="lane-coordinator",
             target_lane_id="lane-sub-12642",
@@ -310,12 +313,13 @@ class WorkerProviderRebindTest(unittest.TestCase):
         self.assertEqual(BLOCKED_DIRECT_WORKER_BYPASS, decision.blocked_reason)
 
     def test_rebound_leaves_other_provider_as_gateway_head(self) -> None:
-        # With the worker bound to codex, `--to claude` is now the non-worker
-        # (gateway/coordinator) route head and is always allowed.
+        # With the swap (worker=codex, gateway=claude), `--to claude` IS the gateway
+        # route head and is always allowed — matched exactly, not by "not the worker".
         decision = _decide(
             kind="implementation_request",
             receiver="claude",
             worker_provider="codex",
+            gateway_provider="claude",
             sender_identity_known=True,
             sender_lane_id="lane-coordinator",
             target_lane_id="lane-sub-12642",
@@ -330,6 +334,7 @@ class WorkerProviderRebindTest(unittest.TestCase):
             kind="implementation_request",
             receiver="codex",
             worker_provider="codex",
+            gateway_provider="claude",
             sender_identity_known=True,
             sender_workspace_id="ws-a",
             sender_lane_id="lane-sub-12642",

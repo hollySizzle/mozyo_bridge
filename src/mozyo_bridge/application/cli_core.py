@@ -137,8 +137,16 @@ def register_keys(sub) -> None:
     keys.set_defaults(func=cmd_keys)
 
 
-def register_lifecycle(sub) -> None:
-    """Register the `init` / `doctor` / `sublane` lifecycle commands onto ``sub``."""
+def register_lifecycle(sub, *, snapshot=None) -> None:
+    """Register the `init` / `doctor` / `sublane` lifecycle commands onto ``sub``.
+
+    ``snapshot`` (Redmine #13569 R1-F1) supplies the ``init`` / ``herdr session-start``
+    ``--agent`` choice vocabulary from the composition root's single injected snapshot;
+    ``None`` uses the built-in provider ids (byte-identical).
+    """
+    agent_choices = (
+        sorted(snapshot.provider_ids) if snapshot is not None else sorted(agent_provider_ids())
+    )
     init = sub.add_parser(
         "init",
         help=(
@@ -152,7 +160,7 @@ def register_lifecycle(sub) -> None:
             "to the current pane when no target is given."
         ),
     )
-    init.add_argument("agent", choices=sorted(agent_provider_ids()))
+    init.add_argument("agent", choices=agent_choices)
     init.add_argument("target", nargs="?")
     init.add_argument(
         "--window-only",
@@ -760,7 +768,7 @@ def register_lifecycle(sub) -> None:
         "--agent",
         dest="agent",
         action="append",
-        choices=sorted(agent_provider_ids()),
+        choices=agent_choices,
         help="Provider agent to prepare (repeatable). Default: both claude and codex.",
     )
     herdr_session_start.add_argument(

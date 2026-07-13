@@ -31,6 +31,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
     WorkflowProviderUnresolved,
+    resolve_gateway_provider,
     resolve_worker_provider,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_route_enforcement import (
@@ -89,6 +90,7 @@ def enforce_gateway_route(
     binding, _warnings = load_workflow_binding()
     try:
         worker_provider = resolve_worker_provider(binding=binding)
+        gateway_provider = resolve_gateway_provider(binding=binding)
     except WorkflowProviderUnresolved as exc:
         die(str(exc))
         raise AssertionError("unreachable")
@@ -104,6 +106,7 @@ def enforce_gateway_route(
             target_role=preflight_target.role,
             allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
             worker_provider=worker_provider,
+            gateway_provider=gateway_provider,
         )
     )
     if decision.is_blocked:

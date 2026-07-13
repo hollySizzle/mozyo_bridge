@@ -138,6 +138,37 @@ class HerdrSublaneActuatorOps:
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
 
+    def gateway_provider(self) -> str:
+        """The coordinator (gateway) role's runtime provider from the binding (Redmine #13569).
+
+        Default ``codex`` (byte-identical); a rebound gateway provider moves the herdr
+        coordinator -> lane-gateway ``--to`` receiver with no source edit. Unbound ->
+        fail-closed zero-dispatch.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_gateway_provider,
+        )
+
+        return resolve_gateway_provider(str(self.repo_root))
+
+    def _launch_providers(self) -> tuple[str, str]:
+        """The (gateway, worker) provider slots this lane launches (Redmine #13569 R1-F2).
+
+        The sublane's runtime provider slots are injected from the repo-local binding —
+        the gateway (coordinator) provider then the worker (implementer) provider — so a
+        rebound binding launches ITS providers rather than the fixed ``(codex, claude)``
+        pair, and the coordinator -> gateway dispatch reaches a real pane. Default
+        ``(codex, claude)`` in launch order, byte-identical. This is the sublane's
+        provider-slot injection, NOT the fenced *default-lane* topology (which stays a
+        literal contract in ``herdr_launch_command`` / ``session_bootstrap``). An unbound
+        role raises :class:`WorkflowProviderUnresolved`, failing the launch closed.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_worker_provider,
+        )
+
+        return (self.gateway_provider(), resolve_worker_provider(str(self.repo_root)))
+
     def canonical_workspace_root(self) -> str:
         # #13392: the coordinator's workspace root — the lane runtime root of a non-git
         # (skip_no_git) lane, which has no worktree and runs in the workspace root itself.
@@ -201,7 +232,7 @@ class HerdrSublaneActuatorOps:
         operator-facing equivalent is ``herdr session-start`` for the two lane slots.
         """
         argv = ["herdr", "session-start", "--repo", worktree_path]
-        for provider in self.providers:
+        for provider in self._launch_providers():
             argv += ["--agent", provider]
         return argv
 
@@ -242,7 +273,7 @@ class HerdrSublaneActuatorOps:
         try:
             prepare_session(
                 repo_root=Path(worktree_path),
-                providers=list(self.providers),
+                providers=list(self._launch_providers()),
                 lane_id=self.lane_label,
                 env=self.env,
                 runner=self.runner,
@@ -493,7 +524,7 @@ class HerdrSublaneActuatorOps:
             "handoff",
             "send",
             "--to",
-            "codex",
+            self.gateway_provider(),
             "--source",
             "redmine",
             "--issue",

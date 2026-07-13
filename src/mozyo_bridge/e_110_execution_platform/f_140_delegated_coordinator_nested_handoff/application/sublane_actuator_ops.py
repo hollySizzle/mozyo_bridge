@@ -162,6 +162,22 @@ class LiveSublaneActuatorOps:
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
 
+    def gateway_provider(self) -> str:
+        """The runtime provider bound to the coordinator (gateway) role (Redmine #13569).
+
+        The coordinator -> lane-gateway dispatch and the gateway readiness probe key on
+        this, resolved from the repo-local ``RoleProviderBinding`` (default ``codex``,
+        byte-identical) so a rebound gateway provider moves the ``--to`` receiver and the
+        readiness check with no source edit. An unbound coordinator role raises
+        :class:`WorkflowProviderUnresolved`, which the actuation turns into a fail-closed
+        zero-dispatch.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_gateway_provider,
+        )
+
+        return resolve_gateway_provider(str(self.repo_root))
+
     def canonical_workspace_root(self) -> str:
         # #13392: the workspace root the actuation is driven from — the lane runtime root
         # of a non-git (skip_no_git) lane, which has no worktree and runs here.
@@ -254,8 +270,9 @@ class LiveSublaneActuatorOps:
         )
 
         try:
+            gateway_provider = self.gateway_provider()
             info = pane_info(gateway_pane)
-            if not is_receiver_agent_process(info.get("command", ""), "codex"):
+            if not is_receiver_agent_process(info.get("command", ""), gateway_provider):
                 return False
             rendered = capture_pane(gateway_pane, GATEWAY_READY_CAPTURE_LINES)
         except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the actuation.
@@ -276,7 +293,7 @@ class LiveSublaneActuatorOps:
             "handoff",
             "send",
             "--to",
-            "codex",
+            self.gateway_provider(),
             "--source",
             "redmine",
             "--issue",

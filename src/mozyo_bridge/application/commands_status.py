@@ -94,6 +94,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 if TYPE_CHECKING:  # avoid an import cycle / heavy import on the hot path
     import argparse
 
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (  # noqa: E501
+        AgentProviderRuntimeSnapshot,
+    )
+
     from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
         WorkspaceMembership,
     )
@@ -150,6 +154,7 @@ class ResolveSessionStatusUseCase:
         query: StatusQuery,
         *,
         expected_providers: "tuple[str, ...] | None" = None,
+        known_providers: "AgentProviderRuntimeSnapshot | None" = None,
     ) -> SessionStatusView:
         # `expected_providers` is the topology the session is expected to run (Redmine
         # #13569 known-vs-expected split); it defaults to the built-in launch pair and is
@@ -157,6 +162,11 @@ class ResolveSessionStatusUseCase:
         expected = (
             DEFAULT_EXPECTED_AGENTS if expected_providers is None else expected_providers
         )
+        # `known_providers` is the injected agent-provider snapshot used for RECOGNITION
+        # (Redmine #13569 R1-F1). ``None`` uses the built-in ``AGENT_LABELS``, byte-
+        # identical; the composition / a test injects a snapshot so a synthetic provider's
+        # window is recognized without an import-time global.
+        known = AGENT_LABELS if known_providers is None else known_providers.provider_ids
         session = query.session
         if not self._sessions.session_exists(session):
             return SessionStatusView(session=session, present=False)
@@ -164,7 +174,7 @@ class ResolveSessionStatusUseCase:
         windows = self._sessions.list_windows(session)
         # Recognition uses the KNOWN providers (the registry vocabulary): any observed
         # window whose name is a recognized provider is an agent window.
-        agent_windows = tuple(name for name in windows if name in AGENT_LABELS)
+        agent_windows = tuple(name for name in windows if name in known)
         if not agent_windows:
             return SessionStatusView(
                 session=session,

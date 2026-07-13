@@ -444,8 +444,14 @@ def configure_handoff_parser(
     )
 
 
-def register_message(sub) -> None:
-    """Register the `message` subcommand onto ``sub`` (pre-`keys` position)."""
+def register_message(
+    sub, *, snapshot: "AgentProviderRuntimeSnapshot | None" = None
+) -> None:
+    """Register the `message` subcommand onto ``sub`` (pre-`keys` position).
+
+    ``snapshot`` (Redmine #13569 R1-F1) supplies the ``--select-role`` receiver vocabulary
+    from the composition root's single injected snapshot; ``None`` uses the built-in set.
+    """
     message = sub.add_parser("message")
     # `target` is optional under `--select-role` semantic resolution (Redmine
     # #12663): an operator/ticketless message can name the Codex gateway by role
@@ -453,7 +459,7 @@ def register_message(sub) -> None:
     # `--select-role` must be given (validated in `cmd_message`).
     message.add_argument("target", nargs="?")
     message.add_argument("text")
-    add_message_select_args(message)
+    add_message_select_args(message, snapshot=snapshot)
     message.add_argument(
         "--no-submit",
         dest="submit",
@@ -509,8 +515,13 @@ def register_message(sub) -> None:
     message.set_defaults(func=cmd_message, submit=True)
 
 
-def register(sub) -> None:
-    """Register the notify-* / handoff / reply block onto ``sub`` (post-`keys`)."""
+def register(sub, *, snapshot: "AgentProviderRuntimeSnapshot | None" = None) -> None:
+    """Register the notify-* / handoff / reply block onto ``sub`` (post-`keys`).
+
+    ``snapshot`` (Redmine #13569 R1-F1) supplies the ``--to`` receiver vocabulary from the
+    composition root's single injected snapshot; ``None`` uses the built-in receivers,
+    byte-identical.
+    """
     for name_, func in [("notify-codex", cmd_notify_codex), ("notify-claude", cmd_notify_claude)]:
         notify = sub.add_parser(name_)
         add_notify_options(notify)
@@ -540,7 +551,7 @@ def register(sub) -> None:
     )
     handoff_sub = handoff.add_subparsers(dest="handoff_command", required=True)
     handoff_send = handoff_sub.add_parser("send", help="Send a handoff notification from sender to receiver")
-    configure_handoff_parser(handoff_send, kind_required=True)
+    configure_handoff_parser(handoff_send, kind_required=True, snapshot=snapshot)
     # Semantic target selection (Redmine #12663): resolve the pane from `--to` +
     # `--target-repo` (+ session/project) instead of a `%pane`; fail-closed on
     # 0/many and never weakens the `--target-repo`/`--target-project` gates.
@@ -551,7 +562,7 @@ def register(sub) -> None:
         "reply",
         help="Send a reply notification from sender to receiver (kind defaults to `reply`)",
     )
-    configure_handoff_parser(handoff_reply, kind_required=False)
+    configure_handoff_parser(handoff_reply, kind_required=False, snapshot=snapshot)
     handoff_reply.set_defaults(func=cmd_handoff_reply)
 
     handoff_ticketless = handoff_sub.add_parser(

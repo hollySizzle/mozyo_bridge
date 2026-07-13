@@ -1883,6 +1883,33 @@ f_140 layer, avoiding an f_120 → f_140 dependency inversion). `grandchild_stam
 `workflow_step_herdr`, the default topology, provider-specific Claude/Codex policy, and the
 public notify aliases are unchanged.
 
+**R1 corrections (Redmine #13569 j#77142 / j#77145).** The first 2B cut built the
+binding-parameterizable *seams* but did not wire them end to end. The corrections:
+
+- *Composition-root single injection* — `build_parser` now builds ONE snapshot and threads
+  it through `compose_parser` to every provider-vocabulary registrar (a registrar opts in by
+  declaring a `snapshot` keyword), so the whole CLI surface's `--agent` / `--to` /
+  `--select-role` choices come from one injected snapshot; `status`'s known-provider
+  recognition takes an injected `known_providers` snapshot. The acceptance drives the *real*
+  parser composition with an injected registry — no global monkeypatch.
+- *Gateway-via keys on the exact gateway provider* — with the receiver vocabulary opened
+  (2A), "not the worker" no longer implies "the gateway", so `decide_gateway_route` allows the
+  governed head only for `receiver == gateway_provider` and blocks a third provider
+  (`governed_route_non_gateway_receiver`); `gateway_route_gate` threads the binding-resolved
+  gateway provider.
+- *Sublane launch is binding-aware and fails closed* — `cmd_sublane_start` preflights the
+  bound gateway/worker providers for launchability (unbound / unknown / non-launchable →
+  zero-start before any actuation); the coordinator → gateway dispatch and readiness probe
+  key on the binding gateway provider; the herdr lane launches the binding's provider slots
+  (not the fixed pair); the adopt replayable command uses the decision's gateway provider.
+- *Retire is pair-atomic* — a provider *substitution* at the lane's position (an expected
+  managed role missing while an unexpected provider is present) fails the whole retire closed
+  (zero close targets), never a partial close; a benign extra slot or partial liveness still
+  closes the surviving expected pair.
+- *Live callers thread the binding* — `select_semantic_target` resolves the worker provider
+  from the sender's binding and passes it to `select_target`, so the cross-workspace
+  worker-direct refusal keys on the binding provider rather than the pure default.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

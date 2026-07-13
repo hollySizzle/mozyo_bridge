@@ -166,7 +166,25 @@ def select_semantic_target(
         project_scope=project,
         sender_repo_root=sender_repo_root,
     )
-    selection = select_target(pool, query, normalize=normalize_path_unicode)
+    # The cross-workspace worker-direct refusal keys on the binding-resolved implementer
+    # (worker) provider (Redmine #13569 R1-F5), so a rebound worker is still refused across
+    # a workspace boundary — the live path must thread the binding, never let the pure
+    # selector fall back to the literal `claude` default. Resolved from the sender's own
+    # repo-local binding (default `claude`, byte-identical); an unbound implementer fails
+    # closed with no send.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_worker_provider,
+    )
+
+    try:
+        worker_provider = resolve_worker_provider(sender_repo_root or expected_repo)
+    except WorkflowProviderUnresolved as exc:
+        die(f"semantic target selection failed ({exc}); no message was sent.")
+        raise AssertionError("unreachable")
+    selection = select_target(
+        pool, query, normalize=normalize_path_unicode, worker_provider=worker_provider
+    )
     if not selection.resolved:
         print(render_selection_diagnostics(selection), file=sys.stderr)
         die(

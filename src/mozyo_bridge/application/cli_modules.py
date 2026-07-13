@@ -335,7 +335,7 @@ def load_composition_config(
     return config
 
 
-def compose_parser(sub, config: Optional[CliCompositionConfig] = None) -> None:
+def compose_parser(sub, config: Optional[CliCompositionConfig] = None, *, snapshot=None) -> None:
     """Compose the top-level subparsers from the registry, in order.
 
     Walks :data:`BUILTIN_CLI_MODULE_REGISTRY` in registration order, resolving
@@ -346,9 +346,23 @@ def compose_parser(sub, config: Optional[CliCompositionConfig] = None) -> None:
     ``config`` may only select/deselect non-mandatory families; the registry
     rejects a config that tries to disable a mandatory (core / authority-bearing)
     family, so owner approval / review / close / send safety stay non-configurable.
+
+    ``snapshot`` (Redmine #13569 R1-F1) is the single agent-provider runtime snapshot the
+    composition root built. It is threaded to every registrar whose signature declares a
+    ``snapshot`` keyword — the provider-vocabulary registrars (``agents`` / ``handoff`` /
+    lifecycle ``init`` + ``herdr`` choices) — so their ``--agent`` / ``--to`` choices come
+    from the ONE injected snapshot rather than each reading an import-time global. A
+    registrar that does not take ``snapshot`` is called unchanged, so this is byte-identical
+    for every non-provider family.
     """
+    import inspect
+
     for name in BUILTIN_CLI_MODULE_REGISTRY.resolve_enabled(config):
-        _REGISTRARS[name](sub)
+        registrar = _REGISTRARS[name]
+        if snapshot is not None and "snapshot" in inspect.signature(registrar).parameters:
+            registrar(sub, snapshot=snapshot)
+        else:
+            registrar(sub)
 
 
 __all__ = (
