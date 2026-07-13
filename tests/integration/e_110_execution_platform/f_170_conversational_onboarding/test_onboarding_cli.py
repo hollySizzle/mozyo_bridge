@@ -7,6 +7,7 @@ apply / resume, with the trusted gate secret set in the environment.
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -142,10 +143,12 @@ class OnboardingCliBehaviourTests(unittest.TestCase):
 class OnboardingJsonArgDiscriminatorTests(unittest.TestCase):
     """``--plan`` / ``--intent`` JSON-vs-path discrimination (Redmine #13691).
 
-    An inline JSON document must never be handed to the filesystem: ``stat`` on
-    it raises ``ENAMETOOLONG`` on some interpreters / platforms and silently
-    reports "missing" on others, which made the ``apply`` security gate's error
-    semantics depend on the runtime rather than on the plan.
+    The argument is "an inline JSON string or a path to a JSON file", an
+    existing file taking precedence. An argument we cannot stat is not a file:
+    ``Path.exists()`` raises ``ENAMETOOLONG`` on a long inline plan under some
+    interpreters / platforms and silently reports "missing" under others, which
+    is what made the ``apply`` security gate's error semantics depend on the
+    runtime rather than on the plan.
     """
 
     def setUp(self) -> None:
@@ -155,11 +158,13 @@ class OnboardingJsonArgDiscriminatorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_inline_json_is_not_looked_up_on_the_filesystem(self) -> None:
+    def test_unstatable_inline_json_still_parses(self) -> None:
+        # Interpreter-independent form of the reported failure: whatever the
+        # filesystem raises about the argument, inline JSON reaches the gate.
         raw = json.dumps({"plan_id": "x" * 400, "steps": []})
-        with mock.patch.object(Path, "exists", autospec=True) as exists:
+        boom = OSError(errno.ENAMETOOLONG, "File name too long")
+        with mock.patch.object(Path, "exists", autospec=True, side_effect=boom):
             self.assertEqual(_load_json_arg(raw), {"plan_id": "x" * 400, "steps": []})
-        exists.assert_not_called()
 
     def test_unstatable_path_argument_fails_closed_as_json(self) -> None:
         # Not JSON and unusable as a path: the error must be the JSON error on
@@ -171,6 +176,20 @@ class OnboardingJsonArgDiscriminatorTests(unittest.TestCase):
         plan_file = self.tmp / "plan.json"
         plan_file.write_text(json.dumps(_INTENT), encoding="utf-8")
         self.assertEqual(_load_json_arg(str(plan_file)), _INTENT)
+
+    def test_json_prefix_file_path_input_remains_supported(self) -> None:
+        # A file path may itself start with `{` / `[`, so the discrimination
+        # cannot be made on the argument's leading character (R1-F1). Only a
+        # relative argument exercises this: an absolute one starts with `/`.
+        for name in ("{plan}.json", "[draft].json"):
+            with self.subTest(name=name):
+                (self.tmp / name).write_text(json.dumps({"from_file": name}), encoding="utf-8")
+                cwd = os.getcwd()
+                os.chdir(self.tmp)
+                try:
+                    self.assertEqual(_load_json_arg(name), {"from_file": name})
+                finally:
+                    os.chdir(cwd)
 
 
 class OnboardingCliLongInlinePlanTests(unittest.TestCase):
