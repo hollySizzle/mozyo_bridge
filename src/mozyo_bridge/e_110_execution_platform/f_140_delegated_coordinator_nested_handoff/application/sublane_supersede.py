@@ -616,6 +616,14 @@ class SublaneSupersedeUseCase:
         plan = _pin_matched_close_plan(
             stored_pins, rows, workspace_id=workspace_id, lane_id=original_lane
         )
+        if plan is None:
+            # R2-F1: the pin set is semantically inconsistent with the lane unit — fail
+            # closed (close nothing) rather than risk killing a foreign pane.
+            return ReleaseOutcome(
+                action_id=action_id,
+                process_release=rec.process_release,
+                detail="release pins inconsistent with lane unit; fail closed (no slots closed)",
+            )
         close = self.ops.execute_close(plan)
         target = RELEASE_RELEASED if not close.failed else RELEASE_PARTIAL
         try:
@@ -654,29 +662,57 @@ def _pin_matched_close_plan(
     *,
     workspace_id: str,
     lane_id: str,
-) -> HerdrRetireClosePlan:
-    """Close plan honoring the durable release pins (F1, R1 j#77247).
+) -> Optional[HerdrRetireClosePlan]:
+    """Close plan honoring the durable pins with full stable-identity re-resolution.
 
-    A pinned slot is a close target ONLY when a live row with its assigned name still
-    carries the exact locator the pin recorded. A slot whose live locator changed (its
-    pane was recycled into a new agent generation) or that is no longer live is dropped
-    from the plan — a stale release never kills a replacement pane.
+    R1 F1 (j#77247) + R2-F1 (j#77292): a pinned slot is a close target ONLY when BOTH
+
+    - the pin's assigned name **decodes to exactly this generation's unit and role**
+      ``(workspace_id, lane_id, pin.role)`` — the full ``ReleasePin`` stable identity, not
+      just a name string; and
+    - a live row with that same assigned name still carries the pin's **exact locator**
+      (the slot was not recycled into a new agent generation and is not gone).
+
+    A single semantically-inconsistent pin — one that decodes to a foreign unit / role, or
+    is undecodable — is a corrupt pin set: the WHOLE generation fails closed (returns
+    ``None`` so the caller closes nothing), rather than a partial set that might include a
+    foreign pane. The pins, re-resolved against the live inventory, are the sole authority
+    for what this stale action may close (``ReleasePin`` contract).
     """
-    live_by_name: dict[str, str] = {}
+    want_lane = _norm_lane(lane_id)
+
+    def _decodes_to_unit(name: str, role: str) -> bool:
+        decode = decode_assigned_name(name)
+        if not decode.ok or decode.identity is None:
+            return False
+        identity = decode.identity
+        return (
+            identity.workspace_id == workspace_id
+            and _norm_lane(identity.lane_id) == want_lane
+            and identity.role == role
+        )
+
+    live_locator: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, Mapping):
             continue
         name = _norm(row.get(AGENT_KEY_NAME))
         locator = _agent_locator(row)
         if name and locator:
-            live_by_name[name] = locator
-    targets = tuple(
-        (pin.role, pin.locator)
-        for pin in pins
-        if live_by_name.get(pin.assigned_name) == pin.locator
-    )
+            live_locator[name] = locator
+
+    targets: list[tuple[str, str]] = []
+    for pin in pins:
+        if pin.role not in _LANE_ROLES or not _decodes_to_unit(
+            pin.assigned_name, pin.role
+        ):
+            # A pin naming a foreign unit / role, or an undecodable one: the pin set is
+            # corrupt. Fail the whole generation closed rather than risk a foreign close.
+            return None
+        if live_locator.get(pin.assigned_name) == pin.locator:
+            targets.append((pin.role, pin.locator))
     return HerdrRetireClosePlan(
-        workspace_id=workspace_id, lane_id=lane_id, close_targets=targets
+        workspace_id=workspace_id, lane_id=lane_id, close_targets=tuple(targets)
     )
 
 

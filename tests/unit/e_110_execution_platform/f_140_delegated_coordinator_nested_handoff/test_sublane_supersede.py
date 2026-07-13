@@ -413,5 +413,66 @@ class SublaneSupersedeTest(unittest.TestCase):
             self.assertEqual(store.resolve_owner(WS, ISSUE).lane_id, ORIG)
 
 
+class PinMatchedClosePlanTest(unittest.TestCase):
+    """R2-F1 (j#77292): the pin matcher re-resolves the FULL stable identity."""
+
+    def _plan(self, pins, rows):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_supersede import (  # noqa: E501
+            _pin_matched_close_plan,
+        )
+
+        return _pin_matched_close_plan(pins, rows, workspace_id=WS, lane_id=ORIG)
+
+    def _pin(self, ws, role, lane, locator):
+        from mozyo_bridge.core.state.lane_lifecycle import ReleasePin
+
+        return ReleasePin(
+            role=role, assigned_name=encode_assigned_name(ws, role, lane), locator=locator
+        )
+
+    def test_valid_unit_pin_with_matching_locator_is_closed(self):
+        pin = self._pin(WS, "codex", ORIG, f"{WS}:p2")
+        rows = [_row("codex", ORIG, f"{WS}:p2")]
+        plan = self._plan([pin], rows)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.close_targets, (("codex", f"{WS}:p2"),))
+
+    def test_recycled_locator_is_not_closed(self):
+        pin = self._pin(WS, "codex", ORIG, f"{WS}:p2")
+        rows = [_row("codex", ORIG, f"{WS}:pNEW")]  # same name, new locator
+        plan = self._plan([pin], rows)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.close_targets, ())
+
+    def test_foreign_unit_pin_fails_whole_generation_closed(self):
+        # R2-F1: a pin naming a FOREIGN workspace/lane, even with a matching live locator,
+        # is a corrupt pin set -> the whole generation closes nothing (returns None).
+        foreign = self._pin("other-ws", "codex", "other-lane", "other-ws:p9")
+        rows = [{"name": foreign.assigned_name, "pane_id": "other-ws:p9"}]
+        self.assertIsNone(self._plan([foreign], rows))
+
+    def test_role_mismatched_pin_fails_closed(self):
+        # A pin whose declared role disagrees with its assigned-name decode is corrupt.
+        from mozyo_bridge.core.state.lane_lifecycle import ReleasePin
+
+        pin = ReleasePin(
+            role="claude",  # but the assigned name decodes to codex
+            assigned_name=encode_assigned_name(WS, "codex", ORIG),
+            locator=f"{WS}:p2",
+        )
+        rows = [_row("codex", ORIG, f"{WS}:p2")]
+        self.assertIsNone(self._plan([pin], rows))
+
+    def test_one_corrupt_pin_poisons_the_whole_set(self):
+        good = self._pin(WS, "codex", ORIG, f"{WS}:p2")
+        foreign = self._pin("other-ws", "claude", "other-lane", "other-ws:p9")
+        rows = [
+            _row("codex", ORIG, f"{WS}:p2"),
+            {"name": foreign.assigned_name, "pane_id": "other-ws:p9"},
+        ]
+        # Even though `good` would match, the corrupt `foreign` fails the whole plan.
+        self.assertIsNone(self._plan([good, foreign], rows))
+
+
 if __name__ == "__main__":
     unittest.main()

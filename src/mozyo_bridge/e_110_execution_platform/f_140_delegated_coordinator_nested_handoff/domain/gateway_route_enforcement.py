@@ -15,15 +15,23 @@ review/callback routing, and the coordinator callback. This module is the pure,
 machine-checkable gate that makes that bypass **fail closed** at the command
 surface instead of relying on the convention.
 
-What it governs (and, deliberately, what it does not):
+This module now carries **two independent gates** (Redmine #13681 R2-F4). Keep them
+distinct: the **gateway-bypass governance** below is kind-scoped, while the **lifecycle
+target invariant** (added by #13681, see :func:`decide_gateway_route` step 0) applies to
+*every* handoff kind. A statement that a kind is "left untouched" refers only to the
+bypass governance; a delivery to a lane the lifecycle authority marks non-active is
+still zero-sent regardless of kind.
 
-- Only **implementation-shaped work and review_result** are governed
-  (:data:`GATEWAY_GOVERNED_KINDS`). Every other handoff kind — ``design_consultation``,
-  ``review_request`` (the worker's *outbound* callback, not a coordinator->worker
-  delivery), ``reply``, ``implementation_done``, ``custom`` — is left untouched, so
-  read-only / design-consultation / summary uses of a main-lane Claude are never
-  blocked (acceptance: "preserve allowed main-lane Claude read-only / design
-  consultation / summary workflows").
+Gateway-bypass governance (what it governs, and deliberately what it does not):
+
+- Only **implementation-shaped work and review_result** are governed **by the bypass
+  gate** (:data:`GATEWAY_GOVERNED_KINDS`). Every other handoff kind —
+  ``design_consultation``, ``review_request`` (the worker's *outbound* callback, not a
+  coordinator->worker delivery), ``reply``, ``implementation_done``, ``custom`` — is left
+  untouched **by the bypass gate**, so read-only / design-consultation / summary uses of
+  a main-lane Claude are never blocked as a bypass (acceptance: "preserve allowed
+  main-lane Claude read-only / design consultation / summary workflows"). This carve-out
+  does **not** exempt them from the lifecycle target invariant below.
 - A governed kind addressed **to the Codex gateway** (``receiver == codex``) is the
   governed route itself and is always allowed — that is exactly
   ``coordinator -> sublane Codex gateway``.
@@ -333,8 +341,15 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
 
     Pure and total. See the module docstring for the policy; in short:
 
-    1. a non-governed kind -> :data:`ROUTE_ALLOWED`, ``governed=False`` (read-only /
-       design / summary / reply / implementation_done are never gated);
+    0. **lifecycle target invariant (Redmine #13681, all kinds)** — before any
+       kind-scoped gateway governance, a delivery to a lane the lifecycle authority marks
+       non-active (superseded / hibernated / retired), or whose authority is unreadable,
+       -> :data:`ROUTE_BLOCKED` regardless of ``kind``. This is a target-lane property,
+       not a gateway-bypass concern, so it is *not* limited to
+       :data:`GATEWAY_GOVERNED_KINDS`;
+    1. a non-governed kind to an active / owner-unbound lane -> :data:`ROUTE_ALLOWED`,
+       ``governed=False`` (read-only / design / summary / reply / implementation_done are
+       never gated *as a bypass*);
     2. a governed kind to the Codex gateway (``receiver == codex``) ->
        :data:`ROUTE_ALLOWED` (this *is* ``coordinator -> sublane Codex gateway``);
     3. a governed kind to a Claude worker when the sender lane Unit is unknown ->

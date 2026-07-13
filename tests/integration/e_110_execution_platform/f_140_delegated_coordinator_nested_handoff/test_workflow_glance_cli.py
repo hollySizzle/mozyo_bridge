@@ -275,6 +275,13 @@ class ActiveLanesStoreAdvisoryTest(unittest.TestCase):
 class LifecycleDiagnosticTest(unittest.TestCase):
     """R1 F4 (j#77247): a superseded lane's authority stays operator-visible in glance."""
 
+    def _hss(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as hss,
+        )
+
+        return hss
+
     def test_superseded_lane_appears_in_lifecycle_diagnostic(self):
         import os
         from unittest.mock import patch
@@ -304,6 +311,8 @@ class LifecycleDiagnosticTest(unittest.TestCase):
             )
             with patch.dict(
                 os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch.object(
+                self._hss(), "herdr_workspace_segment", return_value="wProj"
             ):
                 rc, out = _run(["workflow", "glance", "--json"])
         self.assertEqual(rc, 0)
@@ -316,6 +325,30 @@ class LifecycleDiagnosticTest(unittest.TestCase):
         # And it is NOT resurfaced into the active roster (capacity excludes it).
         active_issues = {r.get("issue_id") for r in payload.get("rows", [])}
         self.assertNotIn("13583", active_issues)
+
+    def test_snapshot_json_glance_does_not_create_state_store(self):
+        # R2-F2 (j#77292): a read-only --snapshot-json glance must not create state.sqlite
+        # just to fold the lifecycle diagnostic (the command's store-free contract).
+        import os
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.lane_lifecycle import lane_lifecycle_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            snap = home / "snap.json"
+            _write_snapshot(snap, [])
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                rc, _ = _run(
+                    ["workflow", "glance", "--snapshot-json", str(snap), "--json"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertFalse(
+                lane_lifecycle_path(home).exists(),
+                "read-only glance created the lifecycle state store",
+            )
 
 
 if __name__ == "__main__":

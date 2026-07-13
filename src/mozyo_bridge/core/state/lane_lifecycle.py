@@ -828,6 +828,43 @@ def load_lane_lifecycle(
         return None
 
 
+def load_lane_lifecycle_readonly(
+    *, home: Path | None = None
+) -> Optional[tuple[LaneLifecycleRecord, ...]]:
+    """Every lifecycle row via a **non-creating** read (Redmine #13681 R2-F2, j#77292).
+
+    Unlike :func:`load_lane_lifecycle` (which opens read-write and runs the schema
+    ensure, creating the container / table when absent), this never writes: an absent
+    state file, or an existing state file that does not yet carry the
+    ``lane_lifecycle_records`` table, yields ``()`` (no rows, nothing created). Only a
+    genuine read error yields ``None``. It is the read a read-only projection uses —
+    ``workflow glance --snapshot-json`` must not create ``state.sqlite`` just to fold a
+    diagnostic (the command's store-free / read-only contract).
+    """
+    path = lane_lifecycle_path(home)
+    if not path.exists():
+        return ()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError:
+        return None
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_TABLE,),
+        ).fetchone()
+        if not has_table:
+            return ()
+        rows = conn.execute(
+            f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY repo_workspace_id, lane_id"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
+    return tuple(_record(row) for row in rows)
+
+
 __all__ = (
     "DECISION_SOURCES",
     "DECISION_SOURCE_REDMINE",
@@ -843,6 +880,7 @@ __all__ = (
     "LaneLifecycleStore",
     "lane_lifecycle_path",
     "load_lane_lifecycle",
+    "load_lane_lifecycle_readonly",
     "resolve_lane_owner",
     # re-exported from lane_lifecycle_model so the component has one import surface
     "CAS_ACTION_MISMATCH",
