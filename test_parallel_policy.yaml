@@ -39,9 +39,11 @@
 #       - "unit.e_120_operations_cockpit.test_tmux_control_port"   # fixed port
 serial_modules: []
 
-# Default number of parallel shards when `--jobs` is not passed. Omit to default
-# to the host CPU count (the runner caps the effective count at the number of
-# parallel modules regardless).
+# Default number of concurrent shard workers when `--jobs` is not passed. Omit to
+# default to the host CPU count. Note this is the worker (concurrency) count, not
+# the shard count: the runner over-partitions modules into more shards than jobs
+# (default jobs*4, capped at the module count; override with `--shards`) so the
+# workers drain a finer queue.
 # default_jobs: 7
 
 # Default per-shard wall-clock timeout in seconds when `--shard-timeout` is not

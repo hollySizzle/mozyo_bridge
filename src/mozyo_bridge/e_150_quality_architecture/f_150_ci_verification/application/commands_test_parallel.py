@@ -432,6 +432,12 @@ def _run_shard(
         "mozyo_bridge",
         "tests",
         "_shard-worker",
+        # Pass the parent-resolved repo explicitly. resolve_repo_root gives an
+        # explicit --repo precedence over the (inherited, test-body-facing)
+        # MOZYO_REPO env, so a conflicting ambient MOZYO_REPO can never point the
+        # worker at the wrong tree (Redmine #13733 R2-F1).
+        "--repo",
+        str(repo_root),
         "--spec",
         str(spec_path),
         "--result",

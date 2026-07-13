@@ -128,11 +128,16 @@ singleton) を奪い合うとき。証拠は所有 Redmine issue に記録する
 ## deterministic plan と weight
 
 `plan_shards` は module を serial (policy match) と parallel に分け、parallel を
-`min(jobs, n_parallel_modules)` bin に LPT (longest-processing-time) で詰める。
-weight は duration manifest (`--durations`、`tests profile --format json` 形も可) が
-あれば実測秒、無ければ discovered test count。tie-break は module 名 → bin index で、
-plan は入力で完全に決定される (同一 suite + 同一 jobs + 同一 weight → 同一 plan)。
-これにより shard failure は出力される replay command で再現できる。
+LPT (longest-processing-time) で bin に詰める。bin 数 (= parallel shard 数) は
+`jobs` (=concurrent worker 数) と **切り離す**: `shard_count` 明示時はその値、無指定
+時は既定 `jobs * DEFAULT_SHARDS_PER_JOB` (=`jobs*4`)、いずれも parallel module 数で
+cap する (`--shards` で明示可)。この over-partition により `jobs` worker が finer な
+shard queue を drain し、load balance が改善し `--failfast` が queue 中 shard を止め
+られる (`### over-partition と --failfast`)。weight は duration manifest (`--durations`、
+`tests profile --format json` 形も可) があれば実測秒、無ければ discovered test count。
+tie-break は module 名 → bin index で、plan は入力で完全に決定される (同一 suite + 同一
+jobs + 同一 shard_count + 同一 weight → 同一 plan)。これにより shard failure は出力
+される replay command で再現できる。
 
 ## reliability invariant (本 runner が緩めないもの)
 

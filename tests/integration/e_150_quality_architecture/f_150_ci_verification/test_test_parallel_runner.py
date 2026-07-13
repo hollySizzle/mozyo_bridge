@@ -302,6 +302,25 @@ class IsolationTest(unittest.TestCase):
             self.assertEqual(Path(probe["cwd"]).resolve(), root.resolve())
 
 
+class RepoResolutionTest(unittest.TestCase):
+    def test_explicit_repo_beats_conflicting_mozyo_repo_env(self) -> None:
+        # The shard worker must target the parent's explicit --repo, not an
+        # inherited MOZYO_REPO pointing elsewhere (Redmine #13733 R2-F1). If the
+        # worker wrongly used MOZYO_REPO (a dir with no matching tests) it would
+        # discover/import nothing there and the run would go red.
+        with tempfile.TemporaryDirectory() as fix_tmp, tempfile.TemporaryDirectory() as other_tmp:
+            fixture = Path(fix_tmp)
+            _make_tree(fixture, {"test_ok": _PASS_MODULE.format(cls="Ok")})
+            other = Path(other_tmp)  # a valid but test-less repo root
+            (other / ".git").mkdir()
+            with mock.patch.dict(os.environ, {"MOZYO_REPO": str(other)}, clear=False):
+                code, payload = _run(fixture, jobs=1)
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["aggregate"]["total_ran_tests"], 2)
+            self.assertEqual(payload["aggregate"]["missing_test_ids"], [])
+
+
 class OutputCaptureTest(unittest.TestCase):
     def test_failing_shard_retains_stdout_stderr_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
