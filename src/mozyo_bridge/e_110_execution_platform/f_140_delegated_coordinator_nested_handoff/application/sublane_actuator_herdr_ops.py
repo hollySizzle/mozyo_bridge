@@ -57,7 +57,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
@@ -164,6 +164,12 @@ class HerdrSublaneActuatorOps:
     runtime_placement_fingerprint: RuntimePlacementFingerprint = field(
         default_factory=production_placement_fingerprint
     )
+    #: The action-time runtime fingerprint reader for the mutation front-door gate
+    #: (Redmine #13705 R1-F1). Returns a :func:`run_runtime_fingerprint`-shaped dict
+    #: (active-vs-repo-local-source drift). ``None`` builds the live reader from
+    #: ``repo_root``; tests inject a reader returning a drift fingerprint to prove the
+    #: front door goes zero-write on a source/installed skew.
+    runtime_fingerprint_reader: Optional[Callable[[], dict]] = None
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 
@@ -216,6 +222,50 @@ class HerdrSublaneActuatorOps:
                 f"default lane {DEFAULT_LANE!r}"
             )
         return True, "sender identity matches the coordinator binding and default lane"
+
+    def preflight_runtime_placement_gate(self) -> tuple[bool, str]:
+        """Action-time runtime fingerprint gate — the mutation front door (#13705 R1-F1).
+
+        Verifies BEFORE any worktree / lane side effect that the action-time runtime is
+        not a source/installed skew that would place the gateway/worker pair incorrectly.
+        Reads a :func:`run_runtime_fingerprint` result (active loaded package vs
+        repo-local source) and blocks ONLY when the active runtime is missing the
+        same-tab placement behavior the source ships — the exact skew that split the
+        #13441 lane (the pure :func:`evaluate_mutation_placement_gate` policy).
+
+        This is the achievable authority the R1 review asked for: the OFFICIAL mutating
+        front door goes zero-write on an installed/source fingerprint mismatch, detected
+        by a REAL active-vs-source probe (not a hard-coded capability). It cannot stop a
+        runtime that predates all fence code (no code we ship runs there); that residual
+        is closed by the #13524 reinstall fingerprint gate. A run with no repo-local
+        source to compare is unverifiable and allowed (again the reinstall gate covers it).
+        Any read failure fails closed (a fingerprint that cannot be established must not
+        greenlight a mutation).
+        """
+        from mozyo_bridge.application.doctor_runtime import (
+            evaluate_mutation_placement_gate,
+        )
+
+        reader = self.runtime_fingerprint_reader
+        if reader is None:
+            import argparse
+
+            from mozyo_bridge.application.doctor_runtime import run_runtime_fingerprint
+
+            def reader() -> dict:
+                return run_runtime_fingerprint(
+                    argparse.Namespace(repo=str(self.repo_root))
+                )
+
+        try:
+            fingerprint = reader()
+        except Exception as exc:  # noqa: BLE001 — an unresolvable fingerprint fails closed.
+            return False, (
+                f"the action-time runtime fingerprint could not be established ({exc}); "
+                "refuse to actuate a lane from a runtime of unverifiable provenance "
+                "(Redmine #13705)"
+            )
+        return evaluate_mutation_placement_gate(fingerprint)
 
     def create_worktree(
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
@@ -368,20 +418,22 @@ class HerdrSublaneActuatorOps:
         both slots share one ``(herdr_workspace, tab_id)`` container, so a heal that
         nonetheless split the pair is surfaced rather than reported healed.
         """
-        # Preflight fence — read-only, before any side effect. A down / unreadable
-        # inventory is not decisive here (the append step fails closed on its own);
-        # the fence still evaluates the runtime's provenance / capability.
-        existing_pair_colocated: Optional[bool] = None
+        # Preflight fence — read-only, BEFORE any side effect. An unreadable inventory
+        # is fail-closed (Redmine #13705 R1-F3): the pair invariant is unverifiable, so
+        # a mutating heal refuses rather than proceeding on an unknown topology (never
+        # `rows=()` → proceed).
         try:
             rows = self._live_rows()
-        except HerdrSessionStartError:
-            rows = ()
-        if rows:
-            _ws, _lane, existing = self._resolve_lane_slots(worktree_path, rows)
-            existing_pair_colocated = _pair_colocation(existing)
+        except HerdrSessionStartError as exc:
+            raise RuntimeError(
+                f"lane heal preflight fenced (inventory_unreadable): the live herdr "
+                f"inventory could not be read ({exc}); refuse to mutate an existing "
+                "lane without verifying its pair placement (Redmine #13705)"
+            ) from exc
+        _ws, _lane, existing = self._resolve_lane_slots(worktree_path, rows)
         verdict = evaluate_heal_runtime_fence(
             self.runtime_placement_fingerprint,
-            existing_pair_colocated=existing_pair_colocated,
+            existing_pair_colocated=_pair_colocation(existing),
         )
         if not verdict.ok:
             raise RuntimeError(
@@ -390,27 +442,31 @@ class HerdrSublaneActuatorOps:
 
         self.append_lane_column(worktree_path)
 
-        # Same-tab postcondition (Redmine #13705): the compatible heal must have kept
-        # (or restored) the gateway/worker pair in one container. A positive split
-        # detection fails closed; an unreadable inventory is not a positive detection
-        # (the `_execute_slot` landing guard already verified the launch landed in the
-        # requested tab), so it never fabricates a failure.
+        # Same-tab postcondition (Redmine #13705 R1-F3): the compatible heal must have
+        # restored the gateway/worker pair in ONE `(herdr_workspace, tab_id)` container.
+        # Unknown is NOT success — an unreadable post-heal inventory, a missing slot, or
+        # a split all fail closed. A legacy loose pair shares the KNOWN key `(wN, "")`
+        # (co-located), so it is never conflated with an unreadable / unknown placement.
         try:
             post_rows = self._live_rows()
-        except HerdrSessionStartError:
-            return
+        except HerdrSessionStartError as exc:
+            raise RuntimeError(
+                "lane heal postcondition failed (inventory_unreadable): the live herdr "
+                f"inventory could not be read after the relaunch ({exc}); the same-tab "
+                "pair placement is unverified — fail-closed (Redmine #13705)"
+            ) from exc
         _ws, _lane, healed = self._resolve_lane_slots(worktree_path, post_rows)
-        if _pair_colocation(healed) is False:
+        if _pair_colocation(healed) is not True:
             gateway = healed.get(GATEWAY_ROLE)
             worker = healed.get(WORKER_ROLE)
             raise RuntimeError(
                 "lane heal postcondition failed: the gateway "
                 f"{gateway[0] if gateway else '<none>'} and worker "
-                f"{worker[0] if worker else '<none>'} are not in one placement "
-                f"container after the relaunch (gateway placement "
-                f"{gateway[1] if gateway else None} != worker placement "
-                f"{worker[1] if worker else None}); the pair is split across tabs / "
-                "workspaces (Redmine #13705) — fail-closed"
+                f"{worker[0] if worker else '<none>'} are not confirmed in one "
+                f"placement container after the relaunch (gateway placement "
+                f"{gateway[1] if gateway else None}, worker placement "
+                f"{worker[1] if worker else None}); the pair is split or incomplete "
+                "(Redmine #13705) — fail-closed"
             )
 
     def _live_rows(self) -> Sequence[Mapping[str, object]]:

@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.application.doctor_runtime import (
+    PLACEMENT_PROBE_KEY,
     SOURCE_PROBE_MARKERS,
     SOURCE_PROBE_SCAN_EXCLUDE,
     STATUS_DRIFTED,
@@ -28,10 +29,12 @@ from mozyo_bridge.application.doctor_runtime import (
     STATUS_WARNING,
     RuntimeFingerprintReads,
     RuntimeFingerprintUseCase,
+    _probe_active_same_tab_pair,
     _source_feature_probes,
     build_runtime_next_action,
     classify_surface,
     evaluate_fingerprint,
+    evaluate_mutation_placement_gate,
     run_runtime_fingerprint,
 )
 
@@ -183,7 +186,11 @@ class SourceFeatureProbesTest(unittest.TestCase):
             )
             probes = _source_feature_probes(pkg)
             self.assertEqual(
-                {"standard_target_admission": False, "no_target_activation": False},
+                {
+                    "standard_target_admission": False,
+                    "no_target_activation": False,
+                    "same_tab_pair_placement": False,
+                },
                 probes,
             )
 
@@ -200,9 +207,18 @@ class SourceFeatureProbesTest(unittest.TestCase):
                 '    action="store_true",\n)\n',
                 encoding="utf-8",
             )
+            # Redmine #13411 / #13705: the same-tab placement resolver definition.
+            (pkg / "herdr_lane_topology.py").write_text(
+                "def _tab_target_for_lane(rows, ws, target, lane):\n    return ''\n",
+                encoding="utf-8",
+            )
             probes = _source_feature_probes(pkg)
             self.assertEqual(
-                {"standard_target_admission": True, "no_target_activation": True},
+                {
+                    "standard_target_admission": True,
+                    "no_target_activation": True,
+                    "same_tab_pair_placement": True,
+                },
                 probes,
             )
 
@@ -236,6 +252,48 @@ class SourceFeatureProbesTest(unittest.TestCase):
             )
             probes = _source_feature_probes(pkg)
             self.assertFalse(probes["standard_target_admission"])
+
+
+class MutationPlacementGateTest(unittest.TestCase):
+    """Redmine #13705 R1-F1: the pure front-door mutation gate over a fingerprint."""
+
+    def test_blocks_on_placement_probe_mismatch(self) -> None:
+        fp = {
+            "summary": "active surface is missing same_tab_pair_placement",
+            "probe_mismatch": [
+                {"probe": PLACEMENT_PROBE_KEY, "source": True, "active": False}
+            ],
+        }
+        ok, detail = evaluate_mutation_placement_gate(fp)
+        self.assertFalse(ok)
+        self.assertIn("placement drift", detail)
+
+    def test_allows_when_no_probe_mismatch(self) -> None:
+        ok, _ = evaluate_mutation_placement_gate({"probe_mismatch": []})
+        self.assertTrue(ok)
+
+    def test_allows_missing_probe_mismatch_key(self) -> None:
+        # `no-source` / `ok` verdicts have no `probe_mismatch` key at all.
+        ok, _ = evaluate_mutation_placement_gate({"ok": True, "status": "ok"})
+        self.assertTrue(ok)
+
+    def test_unrelated_probe_drift_does_not_block_placement_mutation(self) -> None:
+        # A #12597 admission probe drift alone is not a placement skew; the gate is
+        # scoped to the same-tab placement probe so it never over-blocks.
+        fp = {
+            "probe_mismatch": [
+                {"probe": "no_target_activation", "source": True, "active": False}
+            ]
+        }
+        ok, _ = evaluate_mutation_placement_gate(fp)
+        self.assertTrue(ok)
+
+    def test_active_placement_probe_true_for_loaded_package(self) -> None:
+        # The running package really carries `_tab_target_for_lane` (#13411).
+        self.assertTrue(_probe_active_same_tab_pair())
+
+    def test_placement_marker_is_registered_source_side(self) -> None:
+        self.assertIn(PLACEMENT_PROBE_KEY, SOURCE_PROBE_MARKERS)
 
 
 class BuildRuntimeNextActionTest(unittest.TestCase):

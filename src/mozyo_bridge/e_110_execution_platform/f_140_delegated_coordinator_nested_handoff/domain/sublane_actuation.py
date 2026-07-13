@@ -116,6 +116,18 @@ REASON_WORK_UNIT_BLOCKED = "work_unit_blocked"
 #: forces raw-input recovery). Fail closed BEFORE any worktree / launch side effect, with a
 #: replayable resume plan (re-attest the sender, then re-run create).
 REASON_SENDER_UNATTESTED = "sender_unattested"
+#: The existing lane's gateway/worker pair is split across tabs / workspaces
+#: (Redmine #13705): ``read_lane`` reports ``pair_split`` (both panes live but not
+#: co-located). A same-tab-contract lane admits only ``active`` for adopt / dispatch,
+#: so a split pair fails closed with zero append / dispatch — an actionable degraded
+#: state recovered by retire + recreate, never adopted or healed over.
+REASON_PAIR_SPLIT = "pair_split"
+#: The action-time runtime fingerprint gate refused before any mutation (Redmine
+#: #13705): the active runtime surface is missing placement behavior the repo-local
+#: source ships (a source/installed skew — the exact class that split the pair). The
+#: official mutating front door goes zero-write, so an incompatible / stale runtime
+#: cannot actuate a lane it would place incorrectly.
+REASON_RUNTIME_FINGERPRINT = "runtime_fingerprint"
 #: The #13290 dispatch admission gate refused: the caller-supplied fill decision
 #: resolved to a concrete stop and no explicit override was supplied. Defined in
 #: :mod:`...domain.sublane_dispatch_admission`; re-exported here so the actuator's
@@ -134,6 +146,8 @@ BLOCKED_REASONS = frozenset(
         REASON_HANDOFF_FAILED,
         REASON_WORK_UNIT_BLOCKED,
         REASON_SENDER_UNATTESTED,
+        REASON_PAIR_SPLIT,
+        REASON_RUNTIME_FINGERPRINT,
         REASON_FILL_STOP,
     }
 )
@@ -439,6 +453,8 @@ __all__ = (
     "REASON_LANE_MISMATCH",
     "REASON_HANDOFF_FAILED",
     "REASON_WORK_UNIT_BLOCKED",
+    "REASON_PAIR_SPLIT",
+    "REASON_RUNTIME_FINGERPRINT",
     "REASON_FILL_STOP",
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",

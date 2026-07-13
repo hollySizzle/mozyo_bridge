@@ -187,6 +187,38 @@ class _SplitOnHealHerdr(_StatefulHerdr):
         return super().run(argv, **kw)
 
 
+class _ListControlHerdr(_StatefulHerdr):
+    """A herdr whose ``agent list`` can be made to fail / drop a role on a given call.
+
+    ``fail_list_on`` is a set of 1-indexed ``agent list`` call numbers to answer with a
+    non-zero exit (so ``_live_rows`` raises ``HerdrSessionStartError`` — an unreadable
+    inventory). ``drop_role_on`` is ``(call_number, name_substring)``: on that list call
+    the inventory omits the matching role (simulating a slot vanishing between the
+    relaunch and the postcondition read). Redmine #13705 R1-F3.
+    """
+
+    def __init__(self, *, fail_list_on=(), drop_role_on=None, **kw):
+        super().__init__(**kw)
+        self._list_calls = 0
+        self._fail_list_on = set(fail_list_on)
+        self._drop_role_on = drop_role_on
+
+    def run(self, argv, **kw):
+        rest = list(argv[1:])
+        if rest == ["agent", "list"]:
+            self._list_calls += 1
+            if self._list_calls in self._fail_list_on:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="herdr inventory unavailable"
+                )
+            if self._drop_role_on and self._list_calls == self._drop_role_on[0]:
+                keep = [a for a in self.agents if self._drop_role_on[1] not in a["name"]]
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"agents": keep}), stderr=""
+                )
+        return super().run(argv, **kw)
+
+
 class HerdrSublaneOpsTest(unittest.TestCase):
     def _ops(self, tmp, herdr, *, lane_label="issue_13331_x", issue="13331"):
         home = Path(tmp) / "home"
@@ -625,6 +657,140 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                     ops.heal_lane_column(str(worktree))
         self.assertIn("postcondition", str(ctx.exception))
         self.assertIn("pair is split", str(ctx.exception))
+
+    def test_heal_preflight_inventory_unreadable_fails_closed_zero_side_effect(self) -> None:
+        # Redmine #13705 R1-F3: an unreadable inventory at preflight is fail-closed —
+        # the pair invariant is unverifiable, so a mutating heal refuses BEFORE any
+        # side effect (never proceeds on unknown topology).
+        herdr = _ListControlHerdr(fail_list_on={1})  # first `agent list` fails
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                launches_before = len(herdr.start_argvs)
+                with self.assertRaises(RuntimeError) as ctx:
+                    ops.heal_lane_column(str(worktree))
+        self.assertIn("inventory_unreadable", str(ctx.exception))
+        self.assertIn("preflight", str(ctx.exception))
+        self.assertEqual(len(herdr.start_argvs), launches_before)
+
+    def test_heal_postcondition_inventory_unreadable_fails_closed(self) -> None:
+        # Redmine #13705 R1-F3: an unreadable inventory AFTER the relaunch does not pass
+        # as success — the same-tab placement is unverified, so it fails closed.
+        # list calls: 1=preflight, 2=append(prepare_session), 3=postcondition.
+        herdr = _ListControlHerdr(fail_list_on={3})
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                # Reset the list counter so the heal's own 3 list calls are counted.
+                herdr._list_calls = 0
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                with self.assertRaises(RuntimeError) as ctx:
+                    ops.heal_lane_column(str(worktree))
+        self.assertIn("postcondition", str(ctx.exception))
+        self.assertIn("inventory_unreadable", str(ctx.exception))
+
+    def test_heal_postcondition_missing_slot_fails_closed(self) -> None:
+        # Redmine #13705 R1-F3: if the post-heal read-back cannot confirm BOTH slots
+        # co-located (a slot vanished), the heal fails closed rather than reporting
+        # success on an incomplete pair.
+        herdr = _ListControlHerdr(drop_role_on=(3, "_codex_"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr._list_calls = 0
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                with self.assertRaises(RuntimeError) as ctx:
+                    ops.heal_lane_column(str(worktree))
+        self.assertIn("postcondition", str(ctx.exception))
+        self.assertIn("split or incomplete", str(ctx.exception))
+
+    def test_front_door_fingerprint_gate_blocks_drifted_runtime_zero_side_effect(
+        self,
+    ) -> None:
+        # Redmine #13705 R1-F1: the OFFICIAL mutating front door (the use case) goes
+        # ZERO-WRITE when the action-time runtime is a source/installed skew missing the
+        # same-tab placement behavior the repo-local source ships. Driven through the
+        # REAL `evaluate_mutation_placement_gate` policy over an injected drift
+        # fingerprint (a `run_runtime_fingerprint`-shaped result), NOT a capability
+        # self-injection.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
+            SublaneActuateUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            ACTUATE_BLOCKED,
+            REASON_RUNTIME_FINGERPRINT,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            SublaneCreateRequest,
+        )
+
+        # A realistic fingerprint the drift-detection policy produces: the active runtime
+        # is missing the placement behavior the repo-local source ships.
+        drift_fingerprint = {
+            "ok": False,
+            "status": "drifted",
+            "summary": "active surface is missing gate-critical behavior (same_tab_pair_placement)",
+            "probe_mismatch": [
+                {"probe": "same_tab_pair_placement", "source": True, "active": False}
+            ],
+        }
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            coord = Path(tmp) / "coord"
+            coord.mkdir()
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            binpath = _fake_binary(tmp)
+            ops = HerdrSublaneActuatorOps(
+                repo_root=coord,
+                lane_label="issue_13705_x",
+                issue="13705",
+                env=with_provider_path(
+                    {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+                ),
+                runner=herdr.run,
+                runtime_fingerprint_reader=lambda: drift_fingerprint,
+            )
+            request = SublaneCreateRequest(
+                issue="13705",
+                lane_label="issue_13705_x",
+                branch="issue_13705_x",
+                worktree_path=str(worktree),
+                journal="77128",
+            )
+            use_case = SublaneActuateUseCase(ops, gateway_ready_probes=0)
+            # dispatch=False isolates the placement gate: a create/adopt-only run still
+            # APPENDS panes (the #13441-lane scenario), so it must be fenced. The gate
+            # runs at `execute` scope, before any worktree / append side effect.
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                outcome = use_case.run(
+                    request, execute=True, dispatch=False, target_repo=str(worktree)
+                )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_RUNTIME_FINGERPRINT, outcome.blocked_reasons)
+        # Zero side effect: the front door blocked before any herdr write.
+        self.assertEqual(herdr.start_argvs, [])
+        self.assertEqual(herdr.agents, [])
+
+    def test_front_door_fingerprint_gate_allows_matching_runtime(self) -> None:
+        # A non-drifted fingerprint (no placement probe mismatch) allows actuation.
+        ok_fingerprint = {"ok": True, "status": "ok", "probe_mismatch": []}
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            ops.runtime_fingerprint_reader = lambda: ok_fingerprint
+            gate_ok, _ = ops.preflight_runtime_placement_gate()
+        self.assertTrue(gate_ok)
 
     def test_read_lane_reports_pair_split_across_tabs(self) -> None:
         # Redmine #13705: `sublane list` / read-back must report a pair split across
