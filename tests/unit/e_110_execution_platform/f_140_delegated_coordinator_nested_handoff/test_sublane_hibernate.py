@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
     BLOCK_CALLBACK_DEBT,
     BLOCK_INTEGRATION_PENDING,
+    BLOCK_INVENTORY_UNREADABLE,
     BLOCK_NOT_PARKED,
     BLOCK_ORIGINAL_IDENTITY,
     BLOCK_OWNER_PENDING,
@@ -78,18 +79,19 @@ def _all_gates(**overrides) -> HibernateAssertions:
 
 
 class _FakeOps:
-    """Fake hibernate IO port: canned workspace / rows / close."""
+    """Fake hibernate IO port: canned workspace / inventory (rows + readability) / close."""
 
-    def __init__(self, *, rows, close_result=None):
+    def __init__(self, *, rows, close_result=None, readable=True):
         self._rows = list(rows)
+        self._readable = readable
         self._close_result = close_result
         self.close_calls: list = []
 
     def workspace_id(self) -> str:
         return WS
 
-    def live_rows(self):
-        return list(self._rows)
+    def read_inventory(self):
+        return list(self._rows), self._readable
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
@@ -309,6 +311,91 @@ class SublaneHibernateTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_HIBERNATED,
             )
+
+    def test_unreadable_inventory_blocks_before_cas(self) -> None:
+        # F1 (R1 j#77907): an unreadable live inventory must NOT be folded to "no live
+        # slots". Hibernate fails closed BEFORE the disposition CAS — zero mutation, no
+        # close, is_blocked — so a lane is never marked hibernated with panes we could not
+        # verify are gone.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            ops = _FakeOps(rows=[], readable=False)
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_INVENTORY_UNREADABLE, outcome.preflight.blocked_reasons)
+            self.assertIsNone(outcome.transition)  # CAS never attempted
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,  # never moved to hibernated
+            )
+
+    def test_already_hibernated_redrive_reevaluates_preservation_gate(self) -> None:
+        # F2 (R1 j#77907): a partial-release retry on an already-hibernated lane must
+        # re-check the CURRENT preservation gate. A lane that has since started working,
+        # gained a pending prompt, or owes a callback is NEVER closed by the stale retry —
+        # the re-drive blocks (zero close) rather than reporting a silent success.
+        for flag, reason in (
+            ("not_working", BLOCK_WORKING),
+            ("no_pending_prompt", BLOCK_PENDING_PROMPT),
+            ("callbacks_drained", BLOCK_CALLBACK_DEBT),
+        ):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                store = self._store(tmp)
+                self._declare(store)
+                partial = HerdrRetireCloseResult(
+                    workspace_id=WS,
+                    lane_id=LANE,
+                    closed=(("claude", f"{WS}:p3"),),
+                    failed=(("codex", f"{WS}:p2", "close_failed"),),
+                )
+                first = SublaneHibernateUseCase(
+                    ops=self._live_ops(close_result=partial), store=store
+                ).run(_request(), execute=True)
+                self.assertEqual(first.release.process_release, RELEASE_PARTIAL)
+
+                retry_ops = self._live_ops()  # a plain close would succeed if attempted
+                retry = SublaneHibernateUseCase(ops=retry_ops, store=store).run(
+                    _request(assertions=_all_gates(**{flag: False})), execute=True
+                )
+                self.assertTrue(retry.already_hibernated)
+                self.assertTrue(retry.is_blocked)
+                self.assertTrue(retry.redrive_blocked)
+                self.assertIn(reason, retry.preflight.blocked_reasons)
+                self.assertIsNone(retry.release)
+                self.assertEqual(retry_ops.close_calls, [])
+                # Still hibernated, still partial (never falsely advanced to released).
+                rec = store.get(LaneLifecycleKey(WS, LANE))
+                self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+                self.assertEqual(rec.process_release, RELEASE_PARTIAL)
+
+    def test_already_hibernated_redrive_blocked_on_unreadable_inventory(self) -> None:
+        # F1 + F2: re-driving a partial release when the inventory is unreadable must block
+        # (never close blindly on a snapshot we could not read).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS,
+                lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=self._live_ops(close_result=partial), store=store
+            ).run(_request(), execute=True)
+            retry_ops = _FakeOps(rows=[], readable=False)
+            retry = SublaneHibernateUseCase(ops=retry_ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(retry.already_hibernated)
+            self.assertTrue(retry.is_blocked)
+            self.assertIn(BLOCK_INVENTORY_UNREADABLE, retry.preflight.blocked_reasons)
+            self.assertIsNone(retry.release)
+            self.assertEqual(retry_ops.close_calls, [])
 
     def test_crash_after_commit_before_release_resumes(self) -> None:
         # A crash between the disposition CAS and the release: the store is hibernated but

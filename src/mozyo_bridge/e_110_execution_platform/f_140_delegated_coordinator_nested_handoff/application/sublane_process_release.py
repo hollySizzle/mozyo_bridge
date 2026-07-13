@@ -301,6 +301,7 @@ def drive_process_release(
     lane_id: str,
     workspace_id: str,
     action_id: str,
+    rows: Optional[Sequence[Mapping[str, object]]] = None,
 ) -> ReleaseOutcome:
     """Open (or idempotently resume) a release generation and close the lane's slots.
 
@@ -312,6 +313,12 @@ def drive_process_release(
     ``action_id`` is the caller's generation id (``supersede:<lane>`` / ``hibernate:<lane>``)
     for a *fresh* generation; when a generation is already open the stored action id is
     resumed instead, never a second one opened.
+
+    ``rows`` lets a caller pass a live inventory snapshot it has already read (and whose
+    readability it has already vetted, Redmine #13682 R1-F1): an empty ``rows`` then means
+    a *confirmed*-empty inventory ("the processes are already gone"), never an *unreadable*
+    one folded to empty. When ``rows`` is ``None`` the driver reads it via ``ops.live_rows``
+    (the supersede path, whose fail-open to ``()`` is its documented boundary).
 
     Only a lane that has already left ``active`` is released here — a lane still holding
     its work is never a release target (the caller's disposition CAS must land first).
@@ -332,7 +339,7 @@ def drive_process_release(
             detail="lane is still active; no release",
         )
 
-    rows = ops.live_rows()
+    rows = ops.live_rows() if rows is None else rows
     if rec.process_release == RELEASE_NOT_REQUESTED:
         pins = release_pins(rows, workspace_id, lane_id)
         if not pins:

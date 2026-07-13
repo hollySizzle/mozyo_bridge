@@ -82,6 +82,7 @@ BLOCK_INTEGRATION_PENDING = "integration_pending"
 BLOCK_PENDING_PROMPT = "pending_composer_input"
 BLOCK_WORKING = "work_in_flight"
 BLOCK_UNRECORDED_BOUNDARY = "dirty_worktree_without_boundary_journal"
+BLOCK_INVENTORY_UNREADABLE = "inventory_unreadable"
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,23 @@ class HibernateAssertions:
         """A clean worktree, or a recorded boundary journal for a dirty one."""
         return self.worktree_clean or self.boundary_recorded
 
+    @property
+    def preservation_satisfied(self) -> bool:
+        """Every work-preservation gate holds (identity aside).
+
+        The gate both the initial hibernate and the already-hibernated release re-drive
+        share (R1-F2): a lane whose processes are (re-)released must be explicitly parked,
+        owe no coordinator obligation, be idle (no work in flight / no pending composer),
+        and have its dirty diff captured. A partial-release retry re-checks this against the
+        lane's *current* state — a lane that has since started working is never closed.
+        """
+        return (
+            self.explicitly_parked
+            and self.no_outstanding_obligation
+            and self.lane_idle
+            and self.boundary_ok
+        )
+
 
 # ---------------------------------------------------------------------------
 # Pure preflight decision.
@@ -152,6 +170,7 @@ class HibernatePreflight:
     no_outstanding_obligation: bool
     lane_idle: bool
     boundary_ok: bool
+    inventory_readable: bool = True
     assertions: HibernateAssertions = field(default_factory=HibernateAssertions)
 
     @property
@@ -162,6 +181,7 @@ class HibernatePreflight:
             and self.no_outstanding_obligation
             and self.lane_idle
             and self.boundary_ok
+            and self.inventory_readable
         )
 
     @property
@@ -186,6 +206,8 @@ class HibernatePreflight:
             reasons.append(BLOCK_WORKING)
         if not self.boundary_ok:
             reasons.append(BLOCK_UNRECORDED_BOUNDARY)
+        if not self.inventory_readable:
+            reasons.append(BLOCK_INVENTORY_UNREADABLE)
         return tuple(reasons)
 
     def as_payload(self) -> dict[str, Any]:
@@ -196,6 +218,7 @@ class HibernatePreflight:
             "no_outstanding_obligation": self.no_outstanding_obligation,
             "lane_idle": self.lane_idle,
             "boundary_ok": self.boundary_ok,
+            "inventory_readable": self.inventory_readable,
             "blocked_reasons": list(self.blocked_reasons),
         }
 
@@ -209,6 +232,7 @@ class HibernateOutcome:
     issue: str
     lane: str
     already_hibernated: bool = False
+    redrive_blocked: bool = False
     transition: Optional[CasOutcome] = None
     release: Optional[ReleaseOutcome] = None
     detail: str = ""
@@ -216,7 +240,10 @@ class HibernateOutcome:
     @property
     def is_blocked(self) -> bool:
         if self.already_hibernated:
-            return False
+            # A re-drive on an already-hibernated lane still fails closed when its
+            # current preservation gate is unmet or the inventory is unreadable (R1-F2):
+            # never a silent zero-close reported as success.
+            return self.redrive_blocked
         if not self.preflight.may_hibernate:
             return True
         # A commit that was attempted but not applied (a lost CAS race) is a block.
@@ -230,6 +257,7 @@ class HibernateOutcome:
             "issue": self.issue,
             "lane": self.lane,
             "already_hibernated": self.already_hibernated,
+            "redrive_blocked": self.redrive_blocked,
             "is_blocked": self.is_blocked,
             "preflight": self.preflight.as_payload(),
             "transition": (
@@ -254,7 +282,7 @@ class SublaneHibernateOps(Protocol):
 
     def workspace_id(self) -> str: ...
 
-    def live_rows(self) -> Sequence[Mapping[str, object]]: ...
+    def read_inventory(self) -> tuple[Sequence[Mapping[str, object]], bool]: ...
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult: ...
 
@@ -278,15 +306,22 @@ class LiveSublaneHibernateOps:
         except (OSError, ValueError):
             return ""
 
-    def live_rows(self) -> Sequence[Mapping[str, object]]:
+    def read_inventory(self) -> tuple[Sequence[Mapping[str, object]], bool]:
+        """``(rows, readable)`` — an **unreadable** inventory is not folded to empty (R1-F1).
+
+        A live-inventory read that could not run (``list_herdr_agent_rows`` raised) returns
+        ``((), False)`` — the caller must fail closed rather than mistake "could not verify
+        the panes" for "the panes are gone". A successful read (even genuinely empty)
+        returns ``(rows, True)``.
+        """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
             list_herdr_agent_rows,
         )
 
         try:
-            return list_herdr_agent_rows(self.env)
-        except Exception:  # noqa: BLE001 — inventory unavailable -> no live slots (fail closed)
-            return ()
+            return list(list_herdr_agent_rows(self.env)), True
+        except Exception:  # noqa: BLE001 — inventory unreadable -> fail closed (NOT empty)
+            return (), False
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult:
         return execute_herdr_retire_close(
@@ -369,34 +404,53 @@ class SublaneHibernateUseCase:
                 detail="lifecycle store unreadable; fail closed",
             )
 
+        # Read the live inventory ONCE, keeping readability explicit (R1-F1). An
+        # unreadable inventory is never folded to "empty"; the same snapshot is reused for
+        # the release close so nothing is re-read between the gate and the actuation.
+        rows, inventory_readable = self.ops.read_inventory()
+
         # Idempotent resume: the lane is already hibernated. Skip the commit (its CAS
         # guard would refuse anyway) and re-drive the release, which is itself idempotent
-        # (a pane close is, unlike a send) — a partial close from a prior run finishes.
+        # (a pane close is, unlike a send). But the re-drive re-checks the lane's CURRENT
+        # preservation gate and the inventory readability (R1-F2): a partial close from a
+        # prior run finishes only while the lane is still parked / idle / boundary-recorded;
+        # a lane that has since started working, gained a pending prompt, or owes a callback
+        # is NEVER closed by a stale retry, and an unreadable inventory blocks the re-drive.
         already_hibernated = (
             rec is not None
             and rec.lane_disposition == DISPOSITION_HIBERNATED
             and rec.issue_id == issue
         )
         if already_hibernated:
+            redrive_ok = (
+                inventory_readable and request.assertions.preservation_satisfied
+            )
             release = None
-            if execute:
-                release = self._drive_release(key, lane, workspace_id)
+            if execute and redrive_ok:
+                release = self._drive_release(key, lane, workspace_id, rows)
             preflight = HibernatePreflight(
-                original_identity_known=True,
-                explicitly_parked=True,
-                no_outstanding_obligation=True,
-                lane_idle=True,
-                boundary_ok=True,
+                original_identity_known=True,  # the hibernated lane is known
+                explicitly_parked=request.assertions.explicitly_parked,
+                no_outstanding_obligation=request.assertions.no_outstanding_obligation,
+                lane_idle=request.assertions.lane_idle,
+                boundary_ok=request.assertions.boundary_ok,
+                inventory_readable=inventory_readable,
                 assertions=request.assertions,
             )
             return HibernateOutcome(
-                executed=execute,
+                executed=execute and redrive_ok,
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
                 already_hibernated=True,
+                redrive_blocked=execute and not redrive_ok,
                 release=release,
-                detail="lane already hibernated; resumed release",
+                detail=(
+                    "lane already hibernated; release re-drive blocked (preservation gate "
+                    "unmet or inventory unreadable)"
+                    if execute and not redrive_ok
+                    else "lane already hibernated; resumed release"
+                ),
             )
 
         original_identity_known = (
@@ -410,6 +464,7 @@ class SublaneHibernateUseCase:
             no_outstanding_obligation=request.assertions.no_outstanding_obligation,
             lane_idle=request.assertions.lane_idle,
             boundary_ok=request.assertions.boundary_ok,
+            inventory_readable=inventory_readable,
             assertions=request.assertions,
         )
         if not preflight.may_hibernate or not execute:
@@ -426,7 +481,9 @@ class SublaneHibernateUseCase:
             )
 
         # Commit point: CAS active -> hibernated, guarded on the lane's exact state +
-        # revision and the durable decision anchor. Nothing is closed until this lands.
+        # revision and the durable decision anchor. Nothing is closed until this lands, and
+        # may_hibernate already required a readable inventory — so the CAS is never reached
+        # on an unverifiable one (zero-mutation on unreadable, R1-F1).
         assert rec is not None  # guaranteed by original_identity_known
         transition = self.store.transition_disposition(
             key,
@@ -445,7 +502,7 @@ class SublaneHibernateUseCase:
                 detail=f"hibernate commit refused ({transition.reason})",
             )
 
-        release = self._drive_release(key, lane, workspace_id)
+        release = self._drive_release(key, lane, workspace_id, rows)
         return HibernateOutcome(
             executed=True,
             preflight=preflight,
@@ -457,13 +514,19 @@ class SublaneHibernateUseCase:
         )
 
     def _drive_release(
-        self, key: LaneLifecycleKey, lane: str, workspace_id: str
+        self,
+        key: LaneLifecycleKey,
+        lane: str,
+        workspace_id: str,
+        rows: Sequence[Mapping[str, object]],
     ) -> ReleaseOutcome:
         """Open (or resume) the release generation and close the lane's managed slots.
 
         Delegates to the shared tombstone-free driver: it never removes a worktree,
         deletes a branch, or writes a metadata tombstone, and a partial close leaves the
-        generation open and re-drivable (Redmine #13682).
+        generation open and re-drivable (Redmine #13682). ``rows`` is the readability-vetted
+        inventory snapshot the caller already read (R1-F1), so an empty ``rows`` means a
+        *confirmed*-empty inventory, never an unreadable one.
         """
         return drive_process_release(
             store=self.store,
@@ -472,6 +535,7 @@ class SublaneHibernateUseCase:
             lane_id=lane,
             workspace_id=workspace_id,
             action_id=f"hibernate:{key.lane_id}",
+            rows=rows,
         )
 
 
