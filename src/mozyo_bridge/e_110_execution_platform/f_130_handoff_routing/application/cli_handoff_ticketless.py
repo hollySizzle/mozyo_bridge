@@ -197,3 +197,11 @@ def configure_ticketless_callback_parser(parser_: argparse.ArgumentParser) -> No
             "#12700 workflow contract refs / #12706 transition role payload tokens."
         ),
     )
+    parser_.add_argument(
+        "--forward-action-id", dest="forward_action_id", default="",
+        help=(
+            "Echo the opaque forward generation id (Redmine #13583) the consultation / work-intake "
+            "payload carried, so a positively-delivered callback completes the exact forward "
+            "generation. Omit for a plain (non-forward) ticketless callback."
+        ),
+    )

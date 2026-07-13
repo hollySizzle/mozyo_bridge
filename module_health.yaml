@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3525
+    lines: 3541
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1037,6 +1037,13 @@ allowlist:
       `f_130_handoff_routing/application/role_profile_field_resolution.py` helper (the
       workspace-default read itself is `core.state.workspace_defaults.resolve_default_project`),
       so only the one guarded call site + its import remain here.
+      Raised 3525 -> 3541 for the #13583 R1-F1 forward generation correlation: the two ticketless
+      payload constructions in `orchestrate_handoff` thread the additive `forward_action_id` (herdr
+      forward only; the field + round-trip live in the `f_130_handoff_routing/domain/ticketless_*`
+      value objects, not here), and `cmd_handoff_ticketless_callback` calls the best-effort
+      completion hook after a delivered callback (the hook itself is
+      `herdr_workflow_step.complete_forward_generation_on_callback`, not here — only the guarded
+      call site remains).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

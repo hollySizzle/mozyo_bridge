@@ -1,24 +1,34 @@
-"""Home-scoped atomic idempotency fence for herdr coordinator one-step forwards (Redmine #13583).
+"""Home-scoped route+generation lifecycle store for herdr coordinator forwards (Redmine #13583).
 
-Increment 3 (Design Answer j#76417, safety-contract point 4): a single ``workflow step`` on a
-resolved coordinator lane may perform **exactly one** ticketless forward send — the
-department-root → project-gateway consultation, or the project-gateway → child work-intake — fenced
-so a repeat / crash / concurrent caller can never produce a duplicate forward.
+Increment 3 correction (Design Answer j#76528, R1-F1): a herdr coordinator one-step forward — the
+department-root → project-gateway consultation, or the project-gateway → child work-intake — must be
+**at-most-once per logical generation**, where a generation spans from the send until the receiver's
+ticketless callback is positively returned. A repeat while a generation is reserved / delivered /
+uncertain is a duplicate zero-send; only after the generation is ``completed`` (by the correlated
+callback) may the next ``workflow step`` mint a new generation and send once.
 
-This is a **dedicated** fence, carved off from the anchored-worker
-:class:`~mozyo_bridge.core.state.dispatch_outbox_fence.DispatchOutboxFence` exactly the way the
-callback outbox was (a separate bounded context, the same reserve-before-send pattern): a herdr
-forward is **ticketless**, so its identity must not be disguised as a Redmine
-``(issue, journal)`` anchor (safety-contract point 3). The UNIQUE key is the forward's own
-identity — ``(workspace_id, from_lane_id, from_role, to_role, project_scope,
-target_assigned_name)`` — never a synthetic Redmine anchor.
+This store is the **authority** for that lifecycle. It is keyed on the **stable route identity**
+``(workspace_id, from_lane_id, from_role, to_role, project_scope)`` — the target's live assigned
+name is an action-time attestation and is deliberately NOT part of the key, so a target rename can
+never advance a generation (j#76528 point 1). Each route holds **exactly one** active generation
+row carrying an opaque ``forward_action_id`` and its ``state``:
 
-The mechanics mirror the dispatch fence exactly (the guarantee is identical): a home-scoped SQLite
-store with a ``BEGIN IMMEDIATE`` reserve-before-send, a DB-external ``store_nonce`` sidecar that
-fails a **deleted / replaced** store closed (so a lost store can never re-send a delivered
-forward), initial-only :meth:`bootstrap`, and operator-gated :meth:`recover`. States are the closed
-``reserved / delivered / uncertain / cancelled`` set; a re-entry on a still-``reserved`` row (crash
-window) is surfaced ``uncertain`` for operator reconcile, never auto-retried.
+- :meth:`reserve` mints a fresh ``forward_action_id`` and writes a :data:`FORWARD_RESERVED` row for
+  a fresh / ``completed`` route (the caller won the single send); a still-``reserved`` re-entry
+  (crash window) transitions to :data:`FORWARD_UNCERTAIN` (never auto-retried); a
+  ``reserved`` / ``delivered`` / ``uncertain`` generation is never-send (the active generation);
+- :meth:`mark_delivered` / :meth:`mark_uncertain` record the send outcome, guarded by the exact
+  ``forward_action_id`` so a stale writer never clobbers a newer generation;
+- :meth:`complete` CAS-transitions the exact ``delivered`` generation to :data:`FORWARD_COMPLETED`
+  — the correlated-callback completion hook. A stale / mismatched / already-advanced id no-ops, so a
+  duplicate of an old callback can never close a newer active generation (j#76528 point 4 / 5).
+
+Store identity mirrors the sibling fences: a DB-external ``store_nonce`` sidecar fails a deleted /
+replaced store **closed** (a lost store can never re-send a delivered forward). :meth:`bootstrap` is
+initial-only and :meth:`recover` is operator-gated — the **execution path never auto-creates the
+store** (R1-F2): a missing / corrupt / replaced / total-loss store is a do-not-send condition, not a
+silent re-create. The anchored-worker ``DispatchOutboxFence`` / ``callback_outbox`` are neither
+reused nor disguised (this is ticketless — no Redmine ``(issue, journal)`` anchor).
 """
 
 from __future__ import annotations
@@ -34,32 +44,35 @@ from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 FORWARD_OUTBOX_FENCE_FILENAME = "forward-outbox-fence.sqlite"
 FORWARD_OUTBOX_FENCE_SIDECAR_SUFFIX = ".anchor"
-FORWARD_OUTBOX_FENCE_SCHEMA_VERSION = 1
+#: Schema v2: route+generation lifecycle (v1 was the target-keyed fence, Redmine #13583 R1-F1).
+FORWARD_OUTBOX_FENCE_SCHEMA_VERSION = 2
 
-# The closed fence-state vocabulary (mirrors the dispatch fence; identical guarantee).
-FORWARD_RESERVED = "reserved"  # write-locked before the send; the send's fate is not yet known
-FORWARD_DELIVERED = "delivered"  # the forward send was positively confirmed
+# The closed generation-state vocabulary (Design Answer j#76528).
+FORWARD_RESERVED = "reserved"  # minted + write-locked before the send; the send's fate is unknown
+FORWARD_DELIVERED = "delivered"  # the forward send was positively confirmed; awaiting the callback
 FORWARD_UNCERTAIN = "uncertain"  # the send outcome is unknown (crash / timeout) -> operator reconcile
-FORWARD_CANCELLED = "cancelled"  # a durable supersede was confirmed *before* the send
-FORWARD_ABSENT = "absent"  # sentinel: no row existed for the key (not persisted)
+FORWARD_COMPLETED = "completed"  # the correlated callback returned -> the next step may re-mint
+FORWARD_ABSENT = "absent"  # sentinel: no row existed for the route (not persisted)
 
 FORWARD_STATES = frozenset(
-    {FORWARD_RESERVED, FORWARD_DELIVERED, FORWARD_UNCERTAIN, FORWARD_CANCELLED}
+    {FORWARD_RESERVED, FORWARD_DELIVERED, FORWARD_UNCERTAIN, FORWARD_COMPLETED}
 )
+#: The states that hold the active generation (a repeat is a duplicate zero-send).
+_ACTIVE_STATES = frozenset({FORWARD_RESERVED, FORWARD_DELIVERED, FORWARD_UNCERTAIN})
 
 _TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS forward_outbox (
-    workspace_id         TEXT NOT NULL,
-    from_lane_id         TEXT NOT NULL,
-    from_role            TEXT NOT NULL,
-    to_role              TEXT NOT NULL,
-    project_scope        TEXT NOT NULL,
-    target_assigned_name TEXT NOT NULL,
-    state                TEXT NOT NULL,
-    detail               TEXT NOT NULL DEFAULT '',
-    reserved_at          TEXT NOT NULL,
-    updated_at           TEXT NOT NULL,
-    UNIQUE(workspace_id, from_lane_id, from_role, to_role, project_scope, target_assigned_name)
+CREATE TABLE IF NOT EXISTS forward_generation (
+    workspace_id       TEXT NOT NULL,
+    from_lane_id       TEXT NOT NULL,
+    from_role          TEXT NOT NULL,
+    to_role            TEXT NOT NULL,
+    project_scope      TEXT NOT NULL,
+    forward_action_id  TEXT NOT NULL,
+    state              TEXT NOT NULL,
+    detail             TEXT NOT NULL DEFAULT '',
+    reserved_at        TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    UNIQUE(workspace_id, from_lane_id, from_role, to_role, project_scope)
 )
 """
 
@@ -74,11 +87,7 @@ _STORE_NONCE_KEY = "store_nonce"
 
 
 class ForwardOutboxFenceError(RuntimeError):
-    """The forward outbox fence DB could not be opened at the expected schema (fail-closed).
-
-    The caller treats it as "do not send": the idempotency authority is unavailable, so a send
-    could duplicate a forward.
-    """
+    """The forward store could not be opened at the expected schema (fail-closed = do-not-send)."""
 
 
 def _utc_now() -> str:
@@ -91,15 +100,17 @@ def forward_outbox_fence_path(home: Optional[Path] = None) -> Path:
     return (home or mozyo_bridge_home()) / FORWARD_OUTBOX_FENCE_FILENAME
 
 
-@dataclass(frozen=True)
-class ForwardFenceKey:
-    """The UNIQUE forward-fence key: the forward's own (anchor-free) identity.
+def mint_forward_action_id() -> str:
+    """Mint an opaque, unguessable forward action id (never a role / approval / anchor authority)."""
+    return "fwd_" + secrets.token_hex(16)
 
-    ``from_lane_id`` / ``from_role`` are the sender lane + its resolved workflow role; ``to_role``
-    is the forward target role; ``project_scope`` is the gateway's declared scope for a child-intake
-    (``""`` for the grandparent consultation); ``target_assigned_name`` is the resolved live
-    target's canonical mzb1 assigned name. No Redmine ``issue`` / ``journal`` — a forward is
-    ticketless (safety-contract point 3).
+
+@dataclass(frozen=True)
+class ForwardRouteKey:
+    """The UNIQUE route identity a forward generation series is keyed on (target-name-free).
+
+    The target's live assigned name is an **action-time attestation**, not part of this key
+    (j#76528 point 1) — so a target rename can never advance a generation.
     """
 
     workspace_id: str
@@ -107,16 +118,14 @@ class ForwardFenceKey:
     from_role: str
     to_role: str
     project_scope: str
-    target_assigned_name: str
 
-    def as_row(self) -> tuple[str, str, str, str, str, str]:
+    def as_row(self) -> tuple[str, str, str, str, str]:
         return (
             self.workspace_id,
             self.from_lane_id,
             self.from_role,
             self.to_role,
             self.project_scope,
-            self.target_assigned_name,
         )
 
 
@@ -124,19 +133,33 @@ class ForwardFenceKey:
 class ReserveResult:
     """The outcome of a :meth:`ForwardOutboxFence.reserve` attempt.
 
-    ``won`` is True only when this call wrote a fresh :data:`FORWARD_RESERVED` row — the single
-    caller cleared to perform the one forward send.
+    ``won`` is True only when this call minted + wrote a fresh :data:`FORWARD_RESERVED` generation
+    (the single caller cleared to send). ``action_id`` is the minted id on ``won`` (``""`` else).
+    ``prior_state`` is the route's state before this call.
     """
 
     won: bool
+    action_id: str
     prior_state: str
     current_state: str
     needs_reconcile: bool = False
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class ActiveGeneration:
+    """The route's current generation (id + state), or absent."""
+
+    action_id: str
+    state: str
+
+    @property
+    def absent(self) -> bool:
+        return self.state == FORWARD_ABSENT
+
+
 class ForwardOutboxFence:
-    """Read/write access to the home-scoped forward outbox fence DB (mirrors the dispatch fence)."""
+    """Read/write access to the home-scoped forward route+generation lifecycle store."""
 
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else forward_outbox_fence_path(home)
@@ -181,15 +204,15 @@ class ForwardOutboxFence:
             conn.close()
         self.sidecar_path.write_text(nonce, encoding="utf-8")
 
-    # -- bootstrap / recover -----------------------------------------------
+    # -- bootstrap / recover (operator-only; the execution path never auto-creates, R1-F2) --
 
     def bootstrap(self) -> None:
-        """Initial-only creation of the fence store + its DB-external identity (mirrors dispatch F1).
+        """Initial-only creation of the store + its DB-external identity (operator action).
 
-        A reserve never auto-creates a missing store (auto-creation would resurrect a deleted /
-        replaced store and let an already ``delivered`` forward re-send). Both absent -> mint a
-        nonce + create; co-existing at the same nonce -> idempotent no-op; any single-sided /
-        mismatched state -> fail closed (use :meth:`recover`).
+        The **only** initial-creation path. A reserve never auto-creates a missing store (that would
+        resurrect a deleted / replaced store and let an already-``delivered`` forward re-send — R1-F2
+        / R1-F1). Both absent -> mint + create; co-existing at the same nonce -> idempotent no-op; any
+        single-sided / mismatched state -> fail closed (use :meth:`recover`).
         """
         sidecar_nonce = self._read_sidecar_nonce()
         db_exists = self.path.exists()
@@ -199,13 +222,13 @@ class ForwardOutboxFence:
         if self.is_bootstrapped():
             return
         raise ForwardOutboxFenceError(
-            f"forward outbox fence {self.path} is in an inconsistent state (only one of the DB / "
-            f"sidecar exists, or their nonces differ): a store loss or replacement. Refusing to "
-            f"silently re-create. Use recover() for a deliberate, operator-gated loss recovery."
+            f"forward store {self.path} is in an inconsistent state (only one of the DB / sidecar "
+            f"exists, or their nonces differ): a store loss or replacement. Refusing to silently "
+            f"re-create. Use recover() for a deliberate, operator-gated loss recovery."
         )
 
     def recover(self) -> None:
-        """Deliberate operator loss-recovery: mint a NEW nonce and a fresh DB (mirrors dispatch F1)."""
+        """Deliberate operator loss-recovery: mint a NEW nonce and a fresh DB."""
         self._create_fresh(secrets.token_hex(16))
 
     def is_bootstrapped(self) -> bool:
@@ -233,13 +256,13 @@ class ForwardOutboxFence:
         sidecar_nonce = self._read_sidecar_nonce()
         if sidecar_nonce is None:
             raise ForwardOutboxFenceError(
-                f"forward outbox fence {self.path} has no identity sidecar (never bootstrapped / "
-                f"lost); fail closed rather than risk a duplicate send"
+                f"forward store {self.path} has no identity sidecar (never bootstrapped / lost); "
+                f"fail closed rather than risk a duplicate send"
             )
         if not self.path.exists():
             raise ForwardOutboxFenceError(
-                f"forward outbox fence {self.path} DB is missing while its sidecar remains (store "
-                f"loss); fail closed rather than auto-create and risk a duplicate send"
+                f"forward store {self.path} DB is missing while its sidecar remains (store loss); "
+                f"fail closed rather than auto-create and risk a duplicate send"
             )
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
@@ -247,20 +270,19 @@ class ForwardOutboxFence:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if version != FORWARD_OUTBOX_FENCE_SCHEMA_VERSION:
                 raise ForwardOutboxFenceError(
-                    f"forward outbox fence {self.path} is not a bootstrapped fence at version "
+                    f"forward store {self.path} is not a bootstrapped store at version "
                     f"{FORWARD_OUTBOX_FENCE_SCHEMA_VERSION} (found {version}: empty / replaced / "
-                    f"foreign store); fail closed rather than risk a duplicate send"
+                    f"foreign / v1 store); fail closed rather than risk a duplicate send"
                 )
             if self._db_nonce(conn) != sidecar_nonce:
                 raise ForwardOutboxFenceError(
-                    f"forward outbox fence {self.path} nonce does not match its sidecar (replaced "
-                    f"/ foreign store); fail closed rather than risk a duplicate send"
+                    f"forward store {self.path} nonce does not match its sidecar (replaced / "
+                    f"foreign store); fail closed rather than risk a duplicate send"
                 )
         except sqlite3.DatabaseError as exc:
             conn.close()
             raise ForwardOutboxFenceError(
-                f"forward outbox fence {self.path} is unreadable ({type(exc).__name__}); fail "
-                f"closed rather than risk a duplicate send"
+                f"forward store {self.path} is unreadable ({type(exc).__name__}); fail closed"
             ) from exc
         except ForwardOutboxFenceError:
             conn.close()
@@ -269,75 +291,76 @@ class ForwardOutboxFence:
 
     # -- reserve -----------------------------------------------------------
 
-    def reserve(self, key: ForwardFenceKey, *, now: Optional[str] = None) -> ReserveResult:
-        """Atomically reserve the key for a single forward send, or report never-send (fail-closed).
+    def reserve(self, route: ForwardRouteKey, *, now: Optional[str] = None) -> ReserveResult:
+        """Mint + reserve a fresh generation for the route, or report never-send (fail-closed).
 
-        Fresh key -> writes a :data:`FORWARD_RESERVED` row, ``won=True``. Existing key ->
-        ``won=False`` with the prior state; a still-:data:`FORWARD_RESERVED` row (crash window) is
-        transitioned to :data:`FORWARD_UNCERTAIN` and flagged ``needs_reconcile`` (never
-        auto-retried). Raises :class:`ForwardOutboxFenceError` (do-not-send) on a corrupt store.
+        Fresh route or a :data:`FORWARD_COMPLETED` prior generation -> mint a new
+        ``forward_action_id``, write / replace a :data:`FORWARD_RESERVED` row, ``won=True``. A
+        still-:data:`FORWARD_RESERVED` re-entry (crash window) transitions to
+        :data:`FORWARD_UNCERTAIN`, ``won=False``, ``needs_reconcile``. A
+        :data:`FORWARD_DELIVERED` / :data:`FORWARD_UNCERTAIN` generation is the active generation ->
+        ``won=False`` (never-send). Raises :class:`ForwardOutboxFenceError` (do-not-send) on a
+        corrupt / uninitialized store.
         """
         stamp = now or _utc_now()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT state FROM forward_outbox WHERE workspace_id=? AND from_lane_id=? AND "
-                "from_role=? AND to_role=? AND project_scope=? AND target_assigned_name=?",
-                key.as_row(),
+                "SELECT forward_action_id, state FROM forward_generation WHERE workspace_id=? AND "
+                "from_lane_id=? AND from_role=? AND to_role=? AND project_scope=?",
+                route.as_row(),
             ).fetchone()
             if row is None:
-                try:
-                    conn.execute(
-                        "INSERT INTO forward_outbox (workspace_id, from_lane_id, from_role, "
-                        "to_role, project_scope, target_assigned_name, state, detail, reserved_at, "
-                        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (*key.as_row(), FORWARD_RESERVED, "", stamp, stamp),
-                    )
-                except sqlite3.IntegrityError:
-                    conn.execute("ROLLBACK")
-                    return ReserveResult(
-                        won=False,
-                        prior_state=FORWARD_RESERVED,
-                        current_state=FORWARD_RESERVED,
-                        needs_reconcile=False,
-                        detail="lost a concurrent reserve race; the other caller sends",
-                    )
+                action_id = mint_forward_action_id()
+                conn.execute(
+                    "INSERT INTO forward_generation (workspace_id, from_lane_id, from_role, "
+                    "to_role, project_scope, forward_action_id, state, detail, reserved_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*route.as_row(), action_id, FORWARD_RESERVED, "", stamp, stamp),
+                )
                 conn.execute("COMMIT")
                 return ReserveResult(
-                    won=True,
-                    prior_state=FORWARD_ABSENT,
-                    current_state=FORWARD_RESERVED,
-                    detail="reserved a fresh key for the single forward send",
+                    won=True, action_id=action_id, prior_state=FORWARD_ABSENT,
+                    current_state=FORWARD_RESERVED, detail="minted the first generation for this route",
                 )
-            prior = str(row[0])
+            prior_action, prior = str(row[0]), str(row[1])
+            if prior == FORWARD_COMPLETED:
+                action_id = mint_forward_action_id()
+                conn.execute(
+                    "UPDATE forward_generation SET forward_action_id=?, state=?, detail=?, "
+                    "reserved_at=?, updated_at=? WHERE workspace_id=? AND from_lane_id=? AND "
+                    "from_role=? AND to_role=? AND project_scope=?",
+                    (action_id, FORWARD_RESERVED, "", stamp, stamp, *route.as_row()),
+                )
+                conn.execute("COMMIT")
+                return ReserveResult(
+                    won=True, action_id=action_id, prior_state=FORWARD_COMPLETED,
+                    current_state=FORWARD_RESERVED, detail="minted a new generation after completion",
+                )
             if prior == FORWARD_RESERVED:
                 conn.execute(
-                    "UPDATE forward_outbox SET state=?, detail=?, updated_at=? WHERE "
+                    "UPDATE forward_generation SET state=?, detail=?, updated_at=? WHERE "
                     "workspace_id=? AND from_lane_id=? AND from_role=? AND to_role=? AND "
-                    "project_scope=? AND target_assigned_name=?",
+                    "project_scope=?",
                     (
                         FORWARD_UNCERTAIN,
-                        "re-entered a reserved key (crash window); prior send outcome unknown",
+                        "re-entered a reserved generation (crash window); prior send outcome unknown",
                         stamp,
-                        *key.as_row(),
+                        *route.as_row(),
                     ),
                 )
                 conn.execute("COMMIT")
                 return ReserveResult(
-                    won=False,
-                    prior_state=FORWARD_RESERVED,
-                    current_state=FORWARD_UNCERTAIN,
-                    needs_reconcile=True,
+                    won=False, action_id="", prior_state=FORWARD_RESERVED,
+                    current_state=FORWARD_UNCERTAIN, needs_reconcile=True,
                     detail="prior reserve unresolved; marked uncertain for operator reconcile",
                 )
             conn.execute("ROLLBACK")
             return ReserveResult(
-                won=False,
-                prior_state=prior,
-                current_state=prior,
+                won=False, action_id=prior_action, prior_state=prior, current_state=prior,
                 needs_reconcile=(prior == FORWARD_UNCERTAIN),
-                detail=f"key already {prior}; never-send",
+                detail=f"generation already {prior}; never-send until it completes",
             )
         except ForwardOutboxFenceError:
             raise
@@ -347,23 +370,28 @@ class ForwardOutboxFence:
             except sqlite3.DatabaseError:
                 pass
             raise ForwardOutboxFenceError(
-                f"forward outbox fence reserve failed ({type(exc).__name__}); fail closed"
+                f"forward store reserve failed ({type(exc).__name__}); fail closed"
             ) from exc
         finally:
             conn.close()
 
-    # -- outcome writes ----------------------------------------------------
+    # -- outcome / completion writes ---------------------------------------
 
-    def _set_state(self, key: ForwardFenceKey, state: str, detail: str, *, now: Optional[str]) -> bool:
+    def _guarded_set(
+        self, route: ForwardRouteKey, action_id: str, from_states, to_state: str, detail: str,
+        *, now: Optional[str],
+    ) -> bool:
+        """CAS the route's generation to ``to_state`` only when its id + state match (stale-safe)."""
         stamp = now or _utc_now()
+        placeholders = ",".join("?" for _ in from_states)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
-                "UPDATE forward_outbox SET state=?, detail=?, updated_at=? WHERE workspace_id=? "
+                "UPDATE forward_generation SET state=?, detail=?, updated_at=? WHERE workspace_id=? "
                 "AND from_lane_id=? AND from_role=? AND to_role=? AND project_scope=? AND "
-                "target_assigned_name=?",
-                (state, detail, stamp, *key.as_row()),
+                f"forward_action_id=? AND state IN ({placeholders})",
+                (to_state, detail, stamp, *route.as_row(), action_id, *from_states),
             )
             conn.execute("COMMIT")
             return cur.rowcount > 0
@@ -373,39 +401,118 @@ class ForwardOutboxFence:
             except sqlite3.DatabaseError:
                 pass
             raise ForwardOutboxFenceError(
-                f"forward outbox fence update failed ({type(exc).__name__}); fail closed"
+                f"forward store update failed ({type(exc).__name__}); fail closed"
             ) from exc
         finally:
             conn.close()
 
-    def mark_delivered(self, key: ForwardFenceKey, *, detail: str = "", now: Optional[str] = None) -> bool:
-        """Record the reserved key's forward send as positively delivered."""
-        return self._set_state(key, FORWARD_DELIVERED, detail or "forward delivered", now=now)
+    def mark_delivered(self, route: ForwardRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None) -> bool:
+        """Record the reserved generation's send as delivered (guarded by the exact action id)."""
+        return self._guarded_set(
+            route, action_id, (FORWARD_RESERVED,), FORWARD_DELIVERED,
+            detail or "forward delivered; awaiting correlated callback", now=now,
+        )
 
-    def mark_uncertain(self, key: ForwardFenceKey, *, detail: str = "", now: Optional[str] = None) -> bool:
-        """Record the reserved key's forward outcome as unknown (crash / timeout) -> reconcile."""
-        return self._set_state(key, FORWARD_UNCERTAIN, detail or "forward outcome uncertain", now=now)
+    def mark_uncertain(self, route: ForwardRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None) -> bool:
+        """Record the reserved generation's send outcome as unknown (crash / timeout) -> reconcile."""
+        return self._guarded_set(
+            route, action_id, (FORWARD_RESERVED,), FORWARD_UNCERTAIN,
+            detail or "forward outcome uncertain", now=now,
+        )
 
-    def mark_cancelled(self, key: ForwardFenceKey, *, detail: str = "", now: Optional[str] = None) -> bool:
-        """Record the reserved key as cancelled (a durable supersede confirmed before the send)."""
-        return self._set_state(key, FORWARD_CANCELLED, detail or "cancelled before send", now=now)
+    def complete(self, route: ForwardRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None) -> bool:
+        """CAS the EXACT delivered generation to completed — the correlated-callback hook (j#76528).
+
+        Advances **only** when the route's current generation is :data:`FORWARD_DELIVERED` AND its
+        ``forward_action_id`` equals ``action_id``. A stale / mismatched / already-completed /
+        reserved id no-ops (returns False), so a duplicate of an old callback can never close a newer
+        active generation. Never advances from ``uncertain`` (that needs an explicit reconcile).
+        """
+        return self._guarded_set(
+            route, action_id, (FORWARD_DELIVERED,), FORWARD_COMPLETED,
+            detail or "correlated callback positively delivered; generation completed", now=now,
+        )
+
+    def complete_by_correlation(
+        self,
+        action_id: str,
+        *,
+        workspace_id: str,
+        from_role: str,
+        detail: str = "",
+        now: Optional[str] = None,
+    ) -> bool:
+        """Complete a delivered generation by the callback's echoed id + reverse route (j#76528 §4).
+
+        The correlated-callback completion hook: a callback returning to the forward's caller echoes
+        the opaque ``forward_action_id`` and carries the caller's ``read_contract`` — which is the
+        forward's ``from_role`` (the role the callback returns *to*). This CAS-advances the EXACT
+        :data:`FORWARD_DELIVERED` generation whose ``forward_action_id`` **and**
+        ``(workspace_id, from_role)`` match. The opaque, globally-unique ``action_id`` already pins
+        the exact generation (so ``to_role`` / ``from_lane_id`` / ``project_scope`` are not required
+        in the match); the ``from_role`` is the route cross-check that rejects a callback echoing a
+        valid id on a **drifted** contract. A mismatched id / route, or a non-delivered /
+        already-advanced generation, no-ops (returns False) — a stale / duplicate callback can never
+        close a newer active generation. Returns ``False`` (never raises) on a fail-closed store: a
+        missing completion is safe (the generation stays delivered until a real correlated callback
+        arrives).
+        """
+        aid = (action_id or "").strip()
+        if not aid:
+            return False
+        try:
+            conn = self._connect()
+        except ForwardOutboxFenceError:
+            return False
+        stamp = now or _utc_now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE forward_generation SET state=?, detail=?, updated_at=? WHERE workspace_id=? "
+                "AND from_role=? AND forward_action_id=? AND state=?",
+                (
+                    FORWARD_COMPLETED,
+                    detail or "correlated callback positively delivered; generation completed",
+                    stamp,
+                    (workspace_id or "").strip(),
+                    (from_role or "").strip(),
+                    aid,
+                    FORWARD_DELIVERED,
+                ),
+            )
+            conn.execute("COMMIT")
+            return cur.rowcount > 0
+        except sqlite3.DatabaseError:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            return False
+        finally:
+            conn.close()
 
     # -- reads -------------------------------------------------------------
 
-    def state_of(self, key: ForwardFenceKey) -> str:
-        """The current fence state for the key, or :data:`FORWARD_ABSENT` (fail-soft diagnostic)."""
+    def active(self, route: ForwardRouteKey) -> ActiveGeneration:
+        """The route's current generation (id + state), or absent (fail-soft diagnostic)."""
         if not self.is_bootstrapped():
-            return FORWARD_ABSENT
+            return ActiveGeneration(action_id="", state=FORWARD_ABSENT)
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT state FROM forward_outbox WHERE workspace_id=? AND from_lane_id=? AND "
-                "from_role=? AND to_role=? AND project_scope=? AND target_assigned_name=?",
-                key.as_row(),
+                "SELECT forward_action_id, state FROM forward_generation WHERE workspace_id=? AND "
+                "from_lane_id=? AND from_role=? AND to_role=? AND project_scope=?",
+                route.as_row(),
             ).fetchone()
-            return str(row[0]) if row is not None else FORWARD_ABSENT
+            if row is None:
+                return ActiveGeneration(action_id="", state=FORWARD_ABSENT)
+            return ActiveGeneration(action_id=str(row[0]), state=str(row[1]))
         finally:
             conn.close()
+
+    def is_active(self, route: ForwardRouteKey) -> bool:
+        """True when the route currently holds a reserved / delivered / uncertain generation."""
+        return self.active(route).state in _ACTIVE_STATES
 
 
 __all__ = (
@@ -415,12 +522,14 @@ __all__ = (
     "FORWARD_RESERVED",
     "FORWARD_DELIVERED",
     "FORWARD_UNCERTAIN",
-    "FORWARD_CANCELLED",
+    "FORWARD_COMPLETED",
     "FORWARD_ABSENT",
     "FORWARD_STATES",
     "ForwardOutboxFenceError",
     "forward_outbox_fence_path",
-    "ForwardFenceKey",
+    "mint_forward_action_id",
+    "ForwardRouteKey",
     "ReserveResult",
+    "ActiveGeneration",
     "ForwardOutboxFence",
 )

@@ -623,24 +623,17 @@ def execute_herdr_forward_leg(args: argparse.Namespace, outcome):
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_forward_send import (
         ForwardExecutionResult,
-        ForwardSendOutcome,
         OrchestrateHandoffForwardSendPort,
-        SEND_FAILED,
         execute_herdr_forward,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
         ZERO_SEND,
+        plan_forward_route,
     )
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
         ROLE_PROJECT_GATEWAY,
     )
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
-        HERDR_PROVIDER_CODEX,
-    )
-    from mozyo_bridge.core.state.forward_outbox_fence import (
-        ForwardOutboxFence,
-        ForwardOutboxFenceError,
-    )
+    from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence
 
     def _blocked(reason: str, detail: str) -> "ForwardExecutionResult":
         return ForwardExecutionResult(
@@ -667,6 +660,20 @@ def execute_herdr_forward_leg(args: argparse.Namespace, outcome):
             "the durable workflow-role authority no longer resolves this lane to a coordinator role",
         )
 
+    # R1-F3: resolve the TARGET role's provider from the action-time provider_binding (not a
+    # hard-coded codex), and use the same provider for target resolution AND the semantic receiver.
+    # unknown / unbound / unsupported provider fails closed to a zero-send.
+    plan = plan_forward_route(role_authority.role, role_authority.project_scope)
+    if plan is None:
+        return _blocked("herdr_forward_no_route", f"role {role_authority.role!r} has no forward")
+    target_provider = _forward_target_provider(args, repo_root, plan.to_role)
+    if not target_provider:
+        return _blocked(
+            "herdr_forward_provider_unresolved",
+            f"the provider_binding resolves no provider for the forward target role {plan.to_role!r}; "
+            "bind it (or fix the config) before forwarding",
+        )
+
     parsed = load_parsed_role_bindings(repo_root)
     gateway_lane_ids = frozenset(
         b.lane_id for b in parsed.bindings if b.role == ROLE_PROJECT_GATEWAY
@@ -676,26 +683,68 @@ def execute_herdr_forward_leg(args: argparse.Namespace, outcome):
     except Exception:  # noqa: BLE001 - an unreadable inventory yields no target -> fail closed
         rows = []
 
+    # R1-F2: the execution path NEVER bootstraps the store — an un-bootstrapped / lost store is a
+    # do-not-send condition (execute_herdr_forward returns fence-unavailable). Init/recovery is the
+    # explicit operator `workflow forward-fence --bootstrap` / `--recover`.
     fence = ForwardOutboxFence()
-    try:
-        if not fence.is_bootstrapped():
-            fence.bootstrap()
-    except ForwardOutboxFenceError as exc:
-        return _blocked("herdr_forward_fence_unavailable", f"fence bootstrap failed: {exc}")
 
     return execute_herdr_forward(
         role_authority,
         args=args,
         workspace_id=sender.workspace_id,
         sender_lane_id=sender.lane_id,
-        target_provider=HERDR_PROVIDER_CODEX,
+        target_provider=target_provider,
         gateway_lane_ids=gateway_lane_ids,
         rows=rows,
         decode=decode_assigned_name,
         locator_of=_agent_locator,
         fence=fence,
-        send_port=OrchestrateHandoffForwardSendPort(repo_root=str(repo_root)),
+        send_port=OrchestrateHandoffForwardSendPort(
+            repo_root=str(repo_root), receiver_provider=target_provider
+        ),
     )
+
+
+def _forward_target_provider(args, repo_root, to_role: str) -> str:
+    """The action-time provider_binding provider for a forward target role, or "" (Redmine #13583 R1-F3).
+
+    Maps the forward's target role to a ``RoleProviderBinding`` role and resolves the provider from
+    the current ``provider_binding`` (so a rebind is honored, and an unbound role fails closed):
+
+    - ``project_gateway`` -> the ``project_gateway`` binding role;
+    - ``delegated_coordinator`` (the child sublane gateway) -> the generic ``coordinator`` binding
+      role (both default to codex; a child coordinator is a coordinator-provider lane).
+
+    A broken provider config, an unmapped role, or an unbound binding yields ``""`` (the leg then
+    fails closed to a zero-send rather than target a guessed provider).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+        load_workflow_binding,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+        ROLE_COORDINATOR,
+        ROLE_PROJECT_GATEWAY as BINDING_PROJECT_GATEWAY,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        ROLE_PROJECT_GATEWAY,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
+        ROLE_DELEGATED_COORDINATOR,
+    )
+
+    binding_role = {
+        ROLE_PROJECT_GATEWAY: BINDING_PROJECT_GATEWAY,
+        ROLE_DELEGATED_COORDINATOR: ROLE_COORDINATOR,
+    }.get(to_role)
+    if binding_role is None:
+        return ""
+    try:
+        binding, _warnings = load_workflow_binding(repo_root)
+    except Exception:  # noqa: BLE001 - a broken provider config fails closed (never a default)
+        return ""
+    if binding is None:
+        return ""
+    return binding.provider_for(binding_role) or ""
 
 
 def _same_lane_agent_rows(*, env):
@@ -707,4 +756,49 @@ def _same_lane_agent_rows(*, env):
     return list_herdr_agent_rows(env)
 
 
-__all__ = ("resolve_herdr_step_outcome", "execute_herdr_forward_leg")
+def complete_forward_generation_on_callback(args, *, delivered: bool) -> bool:
+    """The correlated-callback completion hook: complete a forward generation on positive delivery.
+
+    Fired by the ticketless callback send path (Redmine #13583 R1-F1, Design Answer j#76528 §4).
+    When a ticketless callback that **echoes** a ``forward_action_id`` is **positively delivered**
+    (``delivered``), this CAS-completes the exact delivered forward generation whose opaque action id
+    + reverse route (the callback's ``read_contract`` is the forward's ``from_role``) match, so the
+    caller's next ``workflow step`` may mint a new generation. It is **fail-soft**: a non-forward
+    callback (no id), a failed delivery, an unresolved herdr workspace, or an un-bootstrapped store
+    is a no-op (``False``) — never an error and never a spurious completion. A stale / duplicate /
+    drifted callback simply does not match (the store no-ops), so it can never close a newer
+    generation. Returns ``True`` only when a real delivered generation was completed.
+    """
+    if not delivered:
+        return False
+    action_id = (getattr(args, "forward_action_id", "") or "").strip()
+    read_contract = (getattr(args, "read_contract", "") or "").strip()  # the forward's from_role
+    if not action_id or not read_contract:
+        return False
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+        resolve_sender_identity,
+    )
+    from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence
+
+    try:
+        repo_root = repo_root_from_args(args)
+        anchor_ws = _anchor_workspace_id(repo_root)
+        sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+        if not sender_res.ok or sender_res.identity is None:
+            return False  # not an attested herdr sender -> nothing to complete (fail-soft)
+        fence = ForwardOutboxFence()
+        if not fence.is_bootstrapped():
+            return False  # no forward store -> the generation (if any) stays delivered, safely
+        return fence.complete_by_correlation(
+            action_id, workspace_id=sender_res.identity.workspace_id, from_role=read_contract
+        )
+    except Exception:  # noqa: BLE001 - the completion is best-effort; it never breaks the callback
+        return False
+
+
+__all__ = (
+    "resolve_herdr_step_outcome",
+    "execute_herdr_forward_leg",
+    "complete_forward_generation_on_callback",
+)

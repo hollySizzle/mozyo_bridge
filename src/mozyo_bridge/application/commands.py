@@ -1766,6 +1766,9 @@ def orchestrate_handoff(
                 callback_to_role=getattr(args, "callback_to_role", None),
                 callback_methods=getattr(args, "callback_methods", None),
                 read_contract=getattr(args, "read_contract", None),
+                # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
+                # so the child's returning callback echoes it to complete the exact generation.
+                forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessWorkIntakeError as exc:
             _emit_outcome(
@@ -1802,6 +1805,9 @@ def orchestrate_handoff(
                 callback_to_role=getattr(args, "callback_to_role", None),
                 callback_methods=getattr(args, "callback_methods", None),
                 read_contract=getattr(args, "read_contract", None),
+                # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
+                # so the gateway's returning callback echoes it to complete the exact generation.
+                forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessConsultationError as exc:
             _emit_outcome(
@@ -1838,6 +1844,9 @@ def orchestrate_handoff(
                 next_action_owner=getattr(args, "workflow_next_owner", None),
                 callback_reason=getattr(args, "callback_reason", None),
                 read_contract=getattr(args, "read_contract", None),
+                # Redmine #13583 R1-F1: echo the forward generation id the consultation/work-intake
+                # carried, so a positively-delivered callback completes the exact forward generation.
+                forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessCallbackError as exc:
             _emit_outcome(
@@ -3341,15 +3350,22 @@ def cmd_handoff_reply(args: argparse.Namespace) -> int:
 
 
 def cmd_handoff_ticketless_callback(args: argparse.Namespace) -> int:
-    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``."""
+    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``.
+
+    Redmine #13583 R1-F1: on a positively-delivered callback that echoes a ``forward_action_id``,
+    complete the correlated forward generation (best-effort; never alters the callback's own rc).
+    """
     from mozyo_bridge.application.handoff_command import (
         HandoffCommandUseCase,
         LiveHandoffCommandOps,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (
+        complete_forward_generation_on_callback,
+    )
 
-    return HandoffCommandUseCase(
-        LiveHandoffCommandOps()
-    ).run_ticketless_callback(args)
+    rc = HandoffCommandUseCase(LiveHandoffCommandOps()).run_ticketless_callback(args)
+    complete_forward_generation_on_callback(args, delivered=(rc == 0))
+    return rc
 
 
 def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:

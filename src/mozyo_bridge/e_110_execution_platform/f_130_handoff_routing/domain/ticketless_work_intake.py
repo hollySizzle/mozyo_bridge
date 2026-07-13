@@ -202,6 +202,9 @@ class TicketlessWorkIntake:
     callback_to_role: str
     callback_methods: tuple[str, ...]
     read_contract: str
+    #: Opaque forward generation correlation id (Redmine #13583 R1-F1); ``""`` for a non-forward
+    #: (tmux) work-intake, set by a herdr project-gateway forward so the returning callback echoes it.
+    forward_action_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -226,6 +229,11 @@ class TicketlessWorkIntake:
                 self.read_contract, READ_CONTRACT_TOKENS, field="read_contract"
             ),
         )
+        object.__setattr__(
+            self,
+            "forward_action_id",
+            str(self.forward_action_id).strip() if self.forward_action_id is not None else "",
+        )
 
     @property
     def worker_dispatch_requires_anchor(self) -> bool:
@@ -249,7 +257,7 @@ class TicketlessWorkIntake:
 
     def to_structured_dict(self) -> dict[str, object]:
         """Structured, free-text-free fields for the handoff work-intake payload."""
-        return {
+        payload: dict[str, object] = {
             "work_shape": self.work_shape,
             "callback_to_role": self.callback_to_role,
             "callback_methods": list(self.callback_methods),
@@ -259,6 +267,9 @@ class TicketlessWorkIntake:
             "parent_must_not_answer_domain": PARENT_MUST_NOT_ANSWER_DOMAIN,
             "child_owns_anchor_decision": CHILD_OWNS_ANCHOR_DECISION,
         }
+        if self.forward_action_id:
+            payload["forward_action_id"] = self.forward_action_id
+        return payload
 
     def marker_fields(self) -> list[tuple[str, str]]:
         """Marker key/value pairs for the ticketless forward work-intake marker.
@@ -346,6 +357,7 @@ def ticketless_work_intake_from_payload(
         callback_to_role=callback_to_role,  # type: ignore[arg-type]
         callback_methods=callback_methods,  # type: ignore[arg-type]
         read_contract=read_contract,  # type: ignore[arg-type]
+        forward_action_id=payload.get("forward_action_id", ""),  # type: ignore[arg-type]
     )
 
 
