@@ -269,10 +269,11 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
         CliFamily(
             name="tests",
             summary=(
-                "test verification helpers family (Redmine #12752 / #12754): "
-                "module-to-test impact resolver (`tests resolve`) and test "
-                "runtime profiling against the slow-test budget (`tests profile`) "
-                "for local/CI reuse. Read-only; no routing, approval, or close "
+                "test verification helpers family (Redmine #12752 / #12754 / "
+                "#13733): module-to-test impact resolver (`tests resolve`), test "
+                "runtime profiling against the slow-test budget (`tests profile`), "
+                "and the isolated-shard parallel runner (`tests parallel`) for "
+                "local/CI reuse. Read-only; no routing, approval, or close "
                 "authority."
             ),
         ),
