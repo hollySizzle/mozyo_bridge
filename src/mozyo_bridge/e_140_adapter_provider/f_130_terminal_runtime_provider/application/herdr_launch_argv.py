@@ -128,7 +128,7 @@ def build_agent_start_argv(
     lane: str,
     target_workspace: str,
     target_tab: str,
-    split_tab: bool,
+    split: str,
     binary: str,
     attest_launcher: str,
     store_home: str,
@@ -160,10 +160,18 @@ def build_agent_start_argv(
     the launcher's home pins writer and reader to one store. It is always injected
     (harmless when it equals the wrapper's default home).
 
-    Lane=tab placement (Redmine #13411): a non-default lane's ``--tab`` (and
-    ``--split right`` for the second slot) is inserted right after ``--workspace``;
-    the default lane passes no ``target_tab`` and stays byte-for-byte the pre-#13411
-    shape.
+    Lane=tab placement (Redmine #13411) + config-driven split (Redmine #13646): a
+    non-default lane's ``--tab`` is inserted right after ``--workspace``, and ``--split
+    <dir>`` is appended for a slot that splits beside an occupant. ``split`` is the
+    resolved direction the caller already decided (``""`` = emit no ``--split``): the
+    session-start composition root resolves it from the lane class + ``lane_placement``
+    config, so this pure builder never reads config and only renders the two placement
+    flags. A ``sublane`` slot that historically split gets ``split="right"`` (byte-for-byte
+    the pre-#13646 literal) unless configured otherwise; the ``default`` lane passes
+    ``split=""`` unless it is explicitly configured, and passes no ``target_tab`` either,
+    so its unconfigured shape stays byte-for-byte the pre-#13411 command. ``--split`` is
+    rendered independently of ``--tab`` (herdr 0.7.1 accepts them as independent optional
+    flags, live ``--help`` j#76559), which is what lets the tab-less default pair split.
     """
     provider_cmd = _provider_command(
         provider,
@@ -220,12 +228,14 @@ def build_agent_start_argv(
         "--",
         *run_cmd,
     ]
+    placement_flags: list[str] = []
     if target_tab:
+        placement_flags += ["--tab", target_tab]
+    if split:
+        placement_flags += ["--split", split]
+    if placement_flags:
         insert_at = launch_argv.index("--workspace") + 2
-        tab_flags = ["--tab", target_tab]
-        if split_tab:
-            tab_flags.extend(["--split", "right"])
-        launch_argv[insert_at:insert_at] = tab_flags
+        launch_argv[insert_at:insert_at] = placement_flags
     return launch_argv
 
 

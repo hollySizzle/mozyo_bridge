@@ -44,6 +44,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     VERDICT_PRESENT,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+    LanePlacementConfig,
+)
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
@@ -2484,6 +2487,370 @@ class ResolveAttestLauncherTest(unittest.TestCase):
             # A PATH with no mozyo-bridge resolves to "".
             with tempfile.TemporaryDirectory() as empty:
                 self.assertEqual(resolve_attest_launcher({"PATH": empty}), "")
+
+
+class LanePlacementLaunchTest(unittest.TestCase):
+    """Config-driven pane-pair placement (Redmine #13646, Design Answer j#76564).
+
+    ``lane_placement.{default,sublane}.{split,order}`` decides the herdr split
+    direction and which provider occupies the container first. Unset is byte-for-byte
+    the pre-#13646 launch; a configured lane class changes only its own fields. The
+    config is a FUTURE launch policy: it never moves an already-live pane.
+    """
+
+    @staticmethod
+    def _placement(**classes):
+        """A `LanePlacementConfig` from a `{lane_class: {split, order}}` mapping."""
+        return LanePlacementConfig.from_record(classes)
+
+    def _prepare(self, tmp, *, herdr, providers, lane, lane_placement=None, rows=None):
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            if rows is not None:
+                herdr.existing_rows = rows(ws)
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env={HERDR_ENV: str(binpath)},
+                runner=herdr.run,
+                lane_placement=lane_placement,
+            )
+        return result, ws
+
+    # --- unset: byte-invariant (Design Answer Q3) --------------------------------
+
+    def test_unset_default_pair_emits_no_split_flag(self) -> None:
+        # An unset `lane_placement` leaves the coordinator pair delegating to the herdr
+        # server default: no `--tab`, no `--split`, requested provider order preserved.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane=""
+            )
+        for argv in herdr.start_argvs:
+            self.assertNotIn("--tab", argv)
+            self.assertNotIn("--split", argv)
+        self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
+
+    def test_unset_sublane_keeps_legacy_split_right(self) -> None:
+        # An unset `lane_placement` keeps the pre-#13646 literal: 1st slot occupies the
+        # tab, 2nd splits `right`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1")
+        first, second = herdr.start_argvs
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    def test_empty_class_object_is_a_noop(self) -> None:
+        # A present-but-empty lane-class object configures neither field, so both
+        # inherit the legacy discipline (an empty `{}` never changes the launch).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={}),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    # --- configured fresh pairs ---------------------------------------------------
+
+    def test_configured_default_pair_splits_down_without_a_tab(self) -> None:
+        # The primary close condition: `lane_placement.default.split: down` makes the
+        # tab-less coordinator pair split vertically — the 1st slot occupies (no flag),
+        # the 2nd carries `--split down`. `--split` is emitted independently of `--tab`
+        # (herdr 0.7.1 accepts them as independent optional flags).
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="",
+                lane_placement=self._placement(default={"split": "down"}),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--tab", first)
+        self.assertNotIn("--split", first)
+        self.assertNotIn("--tab", second)
+        self.assertEqual(second[second.index("--split") + 1], "down")
+        # The flag sits right after `--workspace <id>`, before the `-- provider` tail.
+        at = second.index("--workspace")
+        self.assertEqual(second[at : at + 4], ["--workspace", "wZ", "--split", "down"])
+
+    def test_configured_sublane_split_down_overrides_legacy_right(self) -> None:
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+            )
+        second = herdr.start_argvs[1]
+        self.assertEqual(second[second.index("--tab") + 1], "wZ:t1")
+        self.assertEqual(second[second.index("--split") + 1], "down")
+
+    def test_configured_order_reorders_the_launch_sequence(self) -> None:
+        # `order: [claude, codex]` makes claude the OCCUPANT (launched first, no split)
+        # and codex the splitter — the inverse of the requested `[codex, claude]`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, ws = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["claude", "codex"]}
+                ),
+            )
+        first, second = herdr.start_argvs
+        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
+        self.assertEqual(second[second.index("--split") + 1], "right")
+        self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
+
+    def test_order_alone_leaves_the_legacy_split_direction(self) -> None:
+        # A partial object (order only) reorders but keeps the legacy `right`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
+            )
+        second = herdr.start_argvs[1]
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    def test_other_lane_class_is_untouched(self) -> None:
+        # Configuring `default` never changes the `sublane` launch (and vice versa).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    default={"split": "down", "order": ["claude", "codex"]}
+                ),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    # --- single-provider / heal ----------------------------------------------------
+
+    def test_single_provider_request_gains_no_implicit_peer(self) -> None:
+        # `order` names both providers, but a single-provider request stays single: the
+        # order never launches an unrequested peer (Design Answer Q2).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "down", "order": ["codex", "claude"]}
+                ),
+            )
+        self.assertEqual(len(herdr.start_argvs), 1)
+        self.assertEqual([s.provider for s in result.slots], ["claude"])
+        # It is the tab's first occupant, so it does not split.
+        self.assertNotIn("--split", herdr.start_argvs[0])
+
+    def test_tabbed_heal_uses_the_configured_split_direction(self) -> None:
+        # A heal beside a live tabbed sibling splits in the CONFIGURED direction.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        self.assertEqual(herdr.tab_creates, [])
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--tab") + 1], "w5:t3")
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+
+    def test_default_lane_heal_splits_beside_the_live_sibling(self) -> None:
+        # The default-lane analogue: a live coordinator slot occupies the project
+        # workspace, so the healing launch splits beside it in the configured direction
+        # (no tab involved).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="",
+                lane_placement=self._placement(default={"split": "down"}),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", ""),
+                        "pane_id": "w5:pC",
+                    }
+                ],
+            )
+        argv = herdr.start_argvs[0]
+        self.assertNotIn("--tab", argv)
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+
+    def test_heal_of_configured_primary_reports_order_deferred(self) -> None:
+        # The configured primary (`order[0]` = codex) died while claude stayed live.
+        # herdr `agent start` has no pane-target flag, so codex can only be placed as a
+        # split beside the live claude — the physical order cannot be satisfied without
+        # moving a live pane (forbidden). The slot detail says so rather than silently
+        # claiming the order was applied; no swap/bounce is issued.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["codex", "claude"]}
+                ),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "claude", "lane-1"),
+                        "pane_id": "w5:pL",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        codex_slot = next(s for s in result.slots if s.provider == "codex")
+        self.assertEqual(codex_slot.outcome, SLOT_LAUNCHED)
+        self.assertIn("order_deferred_until_full_relaunch", codex_slot.detail)
+        # It still launches, in the configured direction, and moves nothing.
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--split") + 1], "right")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_heal_of_non_primary_does_not_report_order_deferred(self) -> None:
+        # The configured primary (codex) is the live occupant, so healing the SECOND
+        # provider satisfies the order exactly — no deferral marker.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["codex", "claude"]}
+                ),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        claude_slot = next(s for s in result.slots if s.provider == "claude")
+        self.assertNotIn("order_deferred_until_full_relaunch", claude_slot.detail)
+
+    def test_fresh_configured_pair_reports_no_order_deferral(self) -> None:
+        # A full fresh relaunch realizes the configured order physically, so neither
+        # slot carries the deferral marker.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["codex", "claude"]}
+                ),
+            )
+        for slot in result.slots:
+            self.assertNotIn("order_deferred_until_full_relaunch", slot.detail)
+
+    # --- no live mutation ----------------------------------------------------------
+
+    def test_config_read_never_moves_a_live_pair(self) -> None:
+        # Reading a `lane_placement` that disagrees with the live layout adopts the live
+        # slots and issues ZERO placement mutations (no pane close / swap / move): the
+        # config is a future-launch policy, never a live-layout authority.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "codex", "lane-1"),
+                            "pane_id": "w5:pC",
+                            "tab_id": "w5:t3",
+                        },
+                        {
+                            "name": encode_assigned_name(ws, "claude", "lane-1"),
+                            "pane_id": "w5:pL",
+                            "tab_id": "w5:t3",
+                        },
+                    ]
+                )
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                    lane_placement=self._placement(
+                        sublane={"split": "down", "order": ["claude", "codex"]}
+                    ),
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w5:pC"
+                    ),
+                )
+        # Nothing launched, nothing created, nothing closed — the live pair is untouched.
+        self.assertEqual(herdr.start_argvs, [])
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertEqual({s.outcome for s in result.slots} - {SLOT_ADOPTED}, {SLOT_UNATTESTED})
 
 
 if __name__ == "__main__":  # pragma: no cover

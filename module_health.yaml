@@ -1257,25 +1257,6 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1075
-    reason: >-
-      Herdr session-start composition root (classification / placement / reclaim).
-      It sat at 1072 after Bug #13595 (dry-run purity). Bug #13637 (adopted-agent
-      identity triplet) added the adopt-time startup self-attestation gate (read
-      each live name-match's generation-bound record, surface `unattested` when
-      absent/stale/missing/conflict) and its store import, but ALSO carried out the
-      previously-scheduled reduction: the launch-argv assembly (provider command,
-      the #13637 self-attestation wrapper, and the #13411 tab flags) was extracted
-      to the cohesive sibling `herdr_launch_argv.build_agent_start_argv` — netting a
-      drop to 1065. The #13637 review (j#76492 Finding 1) then required threading the
-      resolved store home to the wrapper (`--env MOZYO_BRIDGE_HOME`) and pinning the
-      adopt reader to it, +10 correctness-required lines to 1075 — still a net +3 over
-      the pre-#13637 1072 despite adding the whole self-attestation feature. A further
-      reduction could extract the empty-base-pane / tab reclaim helpers if this grows.
-    owner_issue: "#13637"
-    resolution_version: "v0.10.10 (Version #241)"
-    expires: "2027-11-30"
 
 # herdr_session_start.py was allowlisted at 1027 lines (owner_issue #13425, split
 # deferred pending #13392). Redmine #13411 (lane=tab subdivision) resolved the
@@ -1285,5 +1266,16 @@ allowlist:
 # (~446 lines: placement decisions + payload parsers + the workspace-segment
 # resolver), dropping herdr_session_start to ~970 lines — back under the 1000
 # threshold even after the j#74433 / j#74434 review-fix guards. The allowlist entry
-# was removed then; it is re-added above after the #13613/#13614 integration
-# (#13518 restack) pushed the file to 1013.
+# was removed then; it was re-added after the #13613/#13614 integration (#13518
+# restack) pushed the file to 1013, and grew to a 1075 baseline through #13637.
+#
+# Redmine #13646 (config-driven `lane_placement`) removed that entry AGAIN by carrying
+# out the reduction the #13637 entry itself pre-declared ("a further reduction could
+# extract the empty-base-pane / tab reclaim helpers if this grows"): the fail-closed
+# herdr command runner, the `agent list` read, and the workspace/tab create + root-pane
+# reclaim helpers moved to the cohesive sibling
+# `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_pane_lifecycle.py`
+# (~186 lines), and the new placement decisions (split direction, container occupancy,
+# launch order, per-slot placement) went to the pure `herdr_lane_topology.py`. Net:
+# herdr_session_start is 997 lines — under the threshold WITH the whole #13646 feature
+# added, so it carries no allowlist entry.
