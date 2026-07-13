@@ -86,14 +86,20 @@ single-Python full + artifact/install smoke で足りる。
 
 `publish.yml` は production publish を **publish workflow 自身で機械確認**する:
 
-- `verify` job (matrix 3.10–3.13): exact release/tag SHA を checkout し、`HEAD ==
-  release SHA` と `tag ↔ 2-file version mirror` の一致を検査してから full
-  `unittest discover` + health gate を supported Python 全環境で回す。tag↔version
-  mirror 一致が「artifact が tag に対応する」ことを機械保証し、policy 文書の手動
-  前提を置き換える。
-- `build` job: 同 exact SHA で wheel+sdist を build し、built artifact の
-  fresh-install smoke (`mozyo-bridge` / `mozyo` entry point) を回して artifact を
-  upload する。`verify` 成功後のみ。
+- `verify` job (matrix 3.10–3.13): **immutable な `github.sha`** (release-event の
+  tagged commit、trigger 時に固定) を checkout し、`HEAD == github.sha` を
+  fail-closed 照合。tag は **`v` prefix 必須** (release-flow.md `## Tag and Release`
+  の canonical rule) で、非 `v` tag は fail-closed。`tag ↔ 2-file version mirror` の
+  一致を検査してから full `unittest discover` + health gate を supported Python 全
+  環境で回す。tag↔version mirror 一致が「artifact が tag に対応する」ことを機械保証
+  し、policy 文書の手動前提を置き換える。
+- `build` job: **同 immutable `github.sha`** を checkout し、build job 自身でも
+  `HEAD == github.sha` を fail-closed 再照合してから wheel+sdist を build し、built
+  artifact の fresh-install smoke (`mozyo-bridge` / `mozyo` entry point) を回して
+  artifact を upload する。`verify` 成功後のみ。**artifact authority は mutable な
+  tag 名でなく immutable SHA に固定**し、`verify` 完了後に tag が force-move されても
+  未検証 commit が publish へ渡らない (Redmine #13734 j#77258 F1 TOCTOU 対策。
+  `testpypi.yml` build job の exact-`source_sha` 照合と同じ doctrine)。
 - `publish` job: `id-token: write` + `environment: pypi` を持つ**唯一の** job。
   verified artifact を download して upload するだけで、checkout/build/verify surface に
   OIDC credential が触れない (#13601 の OIDC 境界を production にも適用)。
