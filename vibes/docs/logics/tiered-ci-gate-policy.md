@@ -1,0 +1,144 @@
+# Tiered CI Gate Policy
+
+Redmine #13734 (parent US #13732 `ローカル並列全件テストと段階的CIゲートで検証待ちを短縮する`,
+Version `モジュール分割・テスト影響範囲整備枠`)。全 branch push で Python
+3.10–3.13 の full matrix を反復していた CI を、**risk tier 別の gate** へ再編する
+設計正本。`.github/workflows/test.yml` / `testpypi.yml` / `publish.yml` の trigger
+routing と pre-publish 機械 gate を束ねる。
+
+CI 内の test authority は引き続き `unittest discover` / `mozyo-bridge tests profile`
+(authoritative serial runner)。本 issue は #13733 の local 並列 runner の未確定
+interface には依存しない (`## 非目標`)。
+
+## 出発点 (verified baseline, #13732)
+
+- `test.yml` は既に **parallel** に 3.10–3.13 を回す。最適化対象は *並列化不足* では
+  なく、**全 branch push での発火頻度**と **4-environment 重複 build** である
+  (#13734 j#77169 invariant #1)。
+- `publish.yml` は `release: published` で単一 Python の build+publish のみ。full
+  matrix / artifact / fresh-install の機械 gate が無く、production の健全性が policy
+  文書の手動前提に依存していた。
+- `testpypi.yml` は #13601 の exact-SHA data gate (SHA / version mirror / lineage /
+  prior Test success / uniqueness) を持つが、**publish 直前に suite を自ら回す機械
+  gate** が無かった。
+
+## Tier 構成
+
+| tier | trigger | runner | gate 内容 |
+| --- | --- | --- | --- |
+| quick | `pull_request` / issue-branch `push` / manual `quick` dispatch | single Python 3.12 | health + docs + **affected** tests (fail-closed → whole suite) |
+| integration | `push` to `main` / `int_*` / `integration_*` | clean Linux single Python 3.12 | health + docs + **full** `unittest discover` + wheel/sdist build + fresh-install smoke、**exact SHA に 1 回** |
+| testpypi | `workflow_dispatch` (exact candidate) / `workflow_run` (main Test success) | single Python 3.11 | #13601 data gate 群 + **inline clean single-Python full + artifact/install smoke** (両 event) |
+| nightly | `schedule` (07:00 JST) | 3.10–3.13 matrix | full `unittest discover` + wheel build |
+| production | `release: published` | 3.10–3.13 matrix (verify) + single (build) | exact release/tag SHA の **full matrix** + tag↔version mirror + wheel/sdist + **fresh-install smoke**、OIDC publish は別 job |
+
+### issue-branch push を full matrix から外す (invariant #2)
+
+`test.yml` の routing:
+
+- `pull_request` → `quick` のみ。
+- issue-branch `push` (= `main` でも `int_*` / `integration_*` でもない ref への push)
+  → `quick` のみ。**issue-branch push は full Python matrix を auto 発火しない**。
+- integration `push` (`main` / `int_*` / `integration_*`) → `integration` batch のみ。
+- `schedule` → `full-matrix` (nightly)。
+- `workflow_dispatch` → `lane` input で `full` (既定) / `quick` を選ぶ。明示 full が
+  唯一の on-demand full matrix 経路。
+
+quick lane の affected 解決は #12752 の pure resolver を local と共有する。base は PR
+なら merge target、push/manual quick なら `origin/main`。issue branch を `origin/main`
+に対して diff すると integration base の差分も含めて **over-select** することがあるが、
+これは安全側 (single Python で多めに回す)。base が解決不能なら resolver が fail-closed で
+whole suite (single Python) を推奨する (silent な空集合 = fail-open を出さない)。
+
+### integration batch (invariant #2)
+
+integration ref への push で **exact integration SHA に 1 回** だけ、clean Linux
+single-Python full + health/docs + wheel/sdist build + fresh-install smoke を回す。
+これが自動 TestPyPI dev path (`testpypi.yml` の `workflow_run`) が key にする `main` の
+`Test` success でもある。full matrix (4 環境) は integration tier では回さず、nightly /
+production tier に寄せる。
+
+### nightly (invariant #4)
+
+`schedule` は 3.10–3.13 full matrix を維持する。日次で supported Python 全環境の
+全件保証を担保する安全 lane。
+
+## TestPyPI pre-publish 機械 gate (invariant #3)
+
+`testpypi.yml` の build job は、**manual / auto 両 event** で publish 直前に inline で
+clean single-Python full + health/docs + artifact/install smoke を回す。prior な
+`Test` run を *信頼するだけ* にせず、**exact checked-out SHA で suite を自ら実行**する
+ことで、manual dispatch の gate 抜け (green だが partial な上流 signal が publish へ
+到達する経路) を塞ぐ。
+
+保存する #13601 の性質:
+
+- workflow 定義 / event ref は `main` 固定。artifact authority は exact `source_sha`。
+- build job は `id-token` を持たず、OIDC (`id-token: write` + `environment: testpypi`)
+  は publish job のみ。inline full/smoke を追加しても OIDC surface は build に触れない。
+- exact SHA / version mirror / source_ref lineage / candidate `test.yml` == trusted
+  main / 同 SHA `Test` success / version uniqueness の data gate 群は温存する。
+
+4-version matrix は TestPyPI tier では **不要** (#13732 owner direction)。clean
+single-Python full + artifact/install smoke で足りる。
+
+## Production 機械 gate (invariant #4)
+
+`publish.yml` は production publish を **publish workflow 自身で機械確認**する:
+
+- `verify` job (matrix 3.10–3.13): exact release/tag SHA を checkout し、`HEAD ==
+  release SHA` と `tag ↔ 2-file version mirror` の一致を検査してから full
+  `unittest discover` + health gate を supported Python 全環境で回す。tag↔version
+  mirror 一致が「artifact が tag に対応する」ことを機械保証し、policy 文書の手動
+  前提を置き換える。
+- `build` job: 同 exact SHA で wheel+sdist を build し、built artifact の
+  fresh-install smoke (`mozyo-bridge` / `mozyo` entry point) を回して artifact を
+  upload する。`verify` 成功後のみ。
+- `publish` job: `id-token: write` + `environment: pypi` を持つ**唯一の** job。
+  verified artifact を download して upload するだけで、checkout/build/verify surface に
+  OIDC credential が触れない (#13601 の OIDC 境界を production にも適用)。
+
+trigger は `release: published` のまま。tag push だけでは発火しない。
+
+## Concurrency / provenance (invariant #5)
+
+- `test.yml`: `test-<workflow>-<event>-<ref>` group。PR 更新と issue-branch push は
+  `cancel-in-progress` で superseded run を止める。integration (`main` / `int_*` /
+  `integration_*`) / nightly / manual dispatch は **cancel しない** (各 integration
+  SHA / scheduled sweep / on-demand run が固有の verdict を保つ。自動 TestPyPI dev
+  path が COMPLETED main `Test` run の head_sha を key にするため、main run を
+  cancel すると gate が落ちる)。
+- `testpypi.yml`: `expected_version` (manual) / triggering `head_sha` (dev) 別に
+  serialize、`cancel-in-progress: false`。
+- `publish.yml`: `publish-pypi-<tag>` で release tag 別 serialize、
+  `cancel-in-progress: false` (production publish は決して cancel しない)。
+- run summary provenance: quick / integration / production の各 lane は
+  `$GITHUB_STEP_SUMMARY` に event / ref / exact SHA / Python / gate 内容を出す。
+  TestPyPI は #13601 由来の dev/exact summary を維持する。
+
+## 現行 green 証跡の非無効化 (Acceptance)
+
+本変更は変更 commit 以降に適用し、現行の active issue branch の CI 証跡を遡って
+無効化しない。tier routing は event/ref で分岐するのみで、既存 SHA の過去 run を
+再評価しない。
+
+## 非目標
+
+- test runner の差し替え (CI authority は `unittest discover` / `tests profile` の
+  まま。#13733 の local 並列 runner interface には依存しない)。
+- production publish / GitHub Release / tag / version bump の実行 (本 issue は gate
+  設計のみ。publish 自体は行わない)。
+- slow-test budget enforcement の CI default 有効化 (#12754 のまま opt-in)。
+- 外部 environment 設定 (required reviewer / deployment branch policy) の変更。
+
+## 関連
+
+- `vibes/docs/logics/ci-quick-full-lane-policy.md` — quick/full lane split (#12753)
+  の原設計。本 doc の quick / full 語彙と affected resolver 共有はここを継承する。
+- `vibes/docs/logics/release-flow.md` — release / TestPyPI / production の運用手順と
+  guardrail。`## Production Release Gate` はここを正本とし、本 doc は publish workflow が
+  その gate を機械化する形を定義する。
+- `vibes/docs/logics/release-helper-contract.md` — version mirror set の正本。
+  `test.yml` / `testpypi.yml` / `publish.yml` の inline mirror check はこれと lockstep。
+- `vibes/docs/logics/test-runtime-profiling-policy.md` — `tests profile` の runtime
+  summary と suite verdict 正本性。

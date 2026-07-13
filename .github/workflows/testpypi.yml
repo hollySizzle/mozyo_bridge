@@ -21,6 +21,17 @@ name: Publish to TestPyPI
 #     merely downloads the built artifact and uploads it — holds `id-token:
 #     write` + `environment: testpypi`, so Trusted Publishing credentials are
 #     never exposed to the checkout/build/verify steps.
+#
+# Tiered pre-publish gate (Redmine #13734):
+#   - BOTH events (manual exact-candidate AND automatic main-CI dev) run an
+#     inline clean single-Python FULL suite + health/docs gate + fresh-install
+#     smoke inside the trusted build job BEFORE the artifact is uploaded. The
+#     mechanical gate does not merely TRUST a prior `Test` run — it runs the
+#     whole suite at the exact checked-out SHA here, closing the manual-dispatch
+#     bypass where a green-but-partial upstream signal could reach publish. The
+#     4-version matrix is intentionally NOT duplicated here (that stays the
+#     nightly/production tier); TestPyPI requires only the clean single-Python
+#     full + artifact/install smoke.
 
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch'
@@ -285,6 +296,26 @@ jobs:
         with:
           python-version: "3.11"
 
+      # --- Tiered pre-publish clean-runner gate (Redmine #13734) ---
+      # Runs for BOTH events at the exact checked-out candidate SHA, BEFORE any
+      # dev-version rewrite and BEFORE upload. This is the mechanical gate that
+      # closes the manual-dispatch bypass: the whole suite + health/docs run
+      # here rather than only trusting a prior signal.
+      - name: Install package (pre-publish gate)
+        run: python -m pip install .
+
+      - name: Module-health gate (pre-publish)
+        run: mozyo-bridge health check
+
+      - name: Docs catalog validate (pre-publish)
+        run: mozyo-bridge docs validate --repo .
+
+      - name: Run full suite (clean single-Python, pre-publish)
+        # SAME discovery as `python -m unittest discover -s tests`; the suite
+        # verdict drives the exit code. Single Python by design (the 4-version
+        # matrix stays the nightly/production tier, Redmine #13734).
+        run: mozyo-bridge tests profile --slowest 20
+
       - name: Install build tools
         run: python -m pip install build
 
@@ -335,6 +366,25 @@ jobs:
 
       - name: Build package
         run: python -m build
+
+      - name: Fresh-install smoke (built artifact, pre-publish)
+        # Install the just-built wheel into an ISOLATED venv and exercise both
+        # console entry points before the artifact can be uploaded/published.
+        # Proves the exact artifact that will land on TestPyPI imports and
+        # exposes `mozyo-bridge` / `mozyo` (Redmine #13734 artifact/install
+        # smoke). Runs for both events.
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/testpypi-smoke-venv
+          /tmp/testpypi-smoke-venv/bin/python -m pip install --upgrade pip
+          WHEEL="$(ls dist/*.whl | head -n1)"
+          if [ -z "$WHEEL" ]; then
+            echo "::error::no wheel built for install smoke"; exit 1
+          fi
+          /tmp/testpypi-smoke-venv/bin/python -m pip install "$WHEEL"
+          /tmp/testpypi-smoke-venv/bin/mozyo-bridge --version
+          /tmp/testpypi-smoke-venv/bin/mozyo-bridge --help > /dev/null
+          /tmp/testpypi-smoke-venv/bin/mozyo --help > /dev/null
 
       - name: Upload built distributions
         uses: actions/upload-artifact@v4

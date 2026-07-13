@@ -15,9 +15,17 @@ Version `モジュール分割・テスト影響範囲整備枠`)。CI を「通
 | full lane が落ちた場合の扱いを Redmine workflow / release gate と矛盾なく定義する | 下記「full lane failure handling」 |
 | local command と CI command が同じ resolver を使う | quick lane は `mozyo-bridge tests resolve --base <merge target>` を使い、local の `tests resolve` と同じ pure resolver を共有する |
 
+> **更新 (Redmine #13734)**: 下記の「`push` → full のみ」という trigger routing は
+> tiered CI gate へ再編済み。issue-branch push は `quick` に縮小し full Python matrix を
+> auto 発火させない。integration push は single-Python full の integration batch、nightly
+> のみ 3.10–3.13 full matrix を保つ。現行の routing / gate 正本は
+> `vibes/docs/logics/tiered-ci-gate-policy.md`。本 doc は quick/full lane の語彙と
+> affected resolver 共有 (#12753) の原設計として引き続き有効。
+
 ## レーン構成
 
-トリガ別にどちらのレーンが走るかを `if` で分ける:
+トリガ別にどちらのレーンが走るかを `if` で分ける (#12753 当時。現行の tier 別 routing は
+`tiered-ci-gate-policy.md`):
 
 - `pull_request` → `quick` のみ。
 - `push` (branch への merge を含む) / `schedule` (nightly) / `workflow_dispatch`
