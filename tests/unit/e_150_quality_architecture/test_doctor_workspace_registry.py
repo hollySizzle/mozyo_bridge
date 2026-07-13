@@ -34,7 +34,7 @@ from mozyo_bridge.workspace_registry import (
 )
 
 TARGET = Path("/repo")
-HOME = Path("/home/.mozyo_bridge")
+HOME = Path("/workspace/agent/.mozyo_bridge")
 
 
 @dataclass
@@ -126,7 +126,7 @@ class _FakeWorkspaceRegistryReads:
 def _health(status: str, **extra: Any) -> dict[str, Any]:
     base = {
         "status": status,
-        "path": "/home/.mozyo_bridge/registry.sqlite",
+        "path": "/workspace/agent/.mozyo_bridge/registry.sqlite",
         "schema_version": 1,
         "expected_schema_version": 1,
     }

@@ -47,7 +47,7 @@ def _view(
     agent_records: list[dict[str, Any]] | None = None,
     gap_check_error: str | None = None,
     counts: dict[str, Any] | None = None,
-    store_path: str = "/home/.mozyo-bridge/otel-events.sqlite",
+    store_path: str = "/workspace/agent/.mozyo-bridge/otel-events.sqlite",
     store_exists: bool = True,
 ) -> dict[str, Any]:
     view: dict[str, Any] = {

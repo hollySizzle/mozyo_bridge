@@ -53,6 +53,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
 )
+from tests.support.private_path_fixtures import macos_home_path
 
 # A spread of component values that exercise the codec: identifier-safe, the
 # delimiter, other punctuation, spaces, non-ASCII, digits, mixed case.
@@ -365,7 +366,7 @@ class LaneWorkspaceTokenTest(unittest.TestCase):
 
     def test_does_not_leak_the_path(self) -> None:
         # Only a hash — never the (private) absolute path — is emitted.
-        path = "/Users/someone/secret/mozyo_bridge_issue_101"
+        path = macos_home_path("someone", "secret", "mozyo_bridge_issue_101")
         token = derive_lane_workspace_token(path)
         self.assertNotIn("someone", token)
         self.assertNotIn("secret", token)

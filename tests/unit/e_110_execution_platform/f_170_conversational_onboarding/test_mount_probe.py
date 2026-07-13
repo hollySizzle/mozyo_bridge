@@ -13,6 +13,10 @@ from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.domai
     MOUNT_NETWORK,
     MOUNT_UNAVAILABLE,
 )
+from tests.support.private_path_fixtures import macos_home_path
+
+# The APFS Data volume carries the user home, so the probed path is home-shaped.
+_DATA_VOLUME_HOME = "/System/Volumes/Data" + macos_home_path("x", "proj")
 
 _MAC_MOUNT = (
     "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
@@ -41,7 +45,7 @@ def _linux_parsed():
 class MacMountParseTests(unittest.TestCase):
     def test_local_apfs_data_volume(self) -> None:
         entry = mp._longest_mount_prefix(
-            Path("/System/Volumes/Data/Users/x/proj"), _mac_parsed()
+            Path(_DATA_VOLUME_HOME), _mac_parsed()
         )
         self.assertIsNotNone(entry)
         facts = mp._classify_fstype(*entry)

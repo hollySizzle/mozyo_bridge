@@ -88,8 +88,14 @@ def _issue(issue_id: int, *, closed: bool = False, parent: int | None = None) ->
     return entry
 
 
+# An explicit non-secret placeholder: Source Tree Hygiene strict-fails on a
+# credential-shaped literal in a tracked file, and the `fake-` marker is what the
+# scanner classifies as a placeholder rather than a leaked key.
+_FAKE_API_KEY = "fake-api-key"
+
+
 def _source(opener, **kwargs) -> LiveRedmineVersionIssueSource:
-    params = dict(api_key="k", base_url="https://redmine.example", opener=opener)
+    params = dict(api_key=_FAKE_API_KEY, base_url="https://redmine.example", opener=opener)
     params.update(kwargs)
     return LiveRedmineVersionIssueSource(**params)
 
