@@ -372,7 +372,8 @@ class ReleaseCheckTreeTest(unittest.TestCase):
                 "password" + "_length = 16",
                 "password" + "less = \"" + "ab" + "c123\"",
                 "access" + "_tokenizer = \"" + "ab" + "c123\"",
-                "API" + "_KEY_ENV = \"" + "REDMINE" + "_API_KEY\"",  # env-name def
+                # Allowlisted env-var name definition (exempt).
+                "API" + "_KEY_ENV = \"" + "MOZYO_REDMINE" + "_API_KEY\"",
             )
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -386,25 +387,29 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             output = out.getvalue()
             self.assertEqual(release_mod.EXIT_BLOCKER, rc)
             self.assertIn(real_secret, output)
-            # The glued-substring / env-name-definition lines are not reported.
+            # The glued-substring / allowlisted env-name lines are not reported.
             self.assertNotIn("password_length", output)
             self.assertNotIn("passwordless", output)
             self.assertNotIn("access_tokenizer", output)
-            self.assertNotIn("REDMINE_API_KEY", output)
+            self.assertNotIn("MOZYO_REDMINE_API_KEY", output)
 
     def test_r2_tree_artifact_parity(self) -> None:
-        # Redmine #13716 R2: the first-stage grep and the shared second-stage
+        # Redmine #13716 R2/R3: the first-stage grep and the shared second-stage
         # classifier use the same segment-bounded grammar, so a line's tree and
-        # artifact verdicts always agree. R2-F1: a `*_ENV` key exempts only an
-        # UPPER_SNAKE value that itself names a credential env var; an opaque
-        # uppercase secret under a `*_ENV` key still blocks. R2-F2: a glued
-        # provider prefix (`mygithub_token`) is a candidate in neither scan.
+        # artifact verdicts always agree. R3-F1: a `*_ENV` key exempts only a
+        # value in the known env-name allowlist; any other literal (`REAL_..._123`)
+        # under a `*_ENV` key still blocks. R2-F2: a glued provider prefix
+        # (`mygithub_token`) is a candidate in neither scan.
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         env_key = "API" + "_KEY_ENV"
+        # The allowlisted production env-var name (kept safe); split so this test
+        # source carries no contiguous credential-shaped assignment.
+        known_env_name = "MOZYO_REDMINE" + "_API_KEY"
+        self.assertIn(known_env_name, release_mod._KNOWN_CREDENTIAL_ENV_NAMES)
         cases = (
-            (env_key + " = \"" + "REAL" + "_SECRET_123\"", True),   # secret under *_ENV
-            (env_key + " = \"" + "REDMINE" + "_API_KEY\"", False),  # credential env-name
+            (env_key + " = \"" + "REAL" + "_API_KEY_123\"", True),  # secret under *_ENV
+            (env_key + " = \"" + known_env_name + "\"", False),     # allowlisted env-name
             ("mygithub" + "_token = \"" + "ab" + "c123\"", False),  # glued provider prefix
         )
         personal_pattern = re.compile("|".join(release_mod._PERSONAL_PATH_PATTERNS))
@@ -628,9 +633,8 @@ class SecretValueClassifierTest(unittest.TestCase):
                 release_mod._secret_assignment_is_real(line),
                 msg=f"expected real credential to block: {line!r}",
             )
-        # `*_ENV` key bound to an UPPER_SNAKE env-var *name* is a reference.
+        # `*_ENV` key bound to an allowlisted env-var name is a reference.
         env_name_defs = (
-            "API" + "_KEY_ENV = \"" + "REDMINE" + "_API_KEY\"",
             "API" + "_KEY_ENV = \"" + "MOZYO_REDMINE" + "_API_KEY\"",
         )
         for line in env_name_defs:
@@ -660,31 +664,35 @@ class SecretValueClassifierTest(unittest.TestCase):
                 msg=f"expected non-credential identifier to be safe: {line!r}",
             )
 
-    def test_13716_r2f1_env_name_exemption_needs_credential_keyword(self) -> None:
-        # Redmine #13716 R2-F1: a `*_ENV` key exempts its value only when the
-        # value is the UPPER_SNAKE *name* of a credential env var — i.e. it both
-        # is UPPER_SNAKE AND carries a credential keyword. An opaque uppercase
-        # secret under a `*_ENV` key (shape but no keyword) still blocks.
+    def test_13716_r3f1_env_name_exemption_is_allowlist_not_shape(self) -> None:
+        # Redmine #13716 R3-F1: the `*_ENV` exemption is an explicit allowlist of
+        # known env-var names, NOT a value-shape rule. Only an allowlisted name is
+        # safe; any other literal under a `*_ENV` key — even one that is
+        # UPPER_SNAKE and carries a credential keyword (`REAL_API_KEY_123`) —
+        # still blocks, because shape cannot separate an env-name from a secret.
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         env_key = "API" + "_KEY_ENV"
         blocks = (
-            env_key + " = \"" + "REAL" + "_SECRET_123\"",     # UPPER_SNAKE, no keyword
-            env_key + " = \"" + "UPPER" + "_SNAKE_SECRET\"",  # `SECRET` != client_secret
+            env_key + " = \"" + "REAL" + "_API_KEY_123\"",   # UPPER_SNAKE + keyword, not listed
+            env_key + " = \"" + "UPPER" + "_SNAKE_SECRET\"",  # UPPER_SNAKE, not listed
+            env_key + " = \"" + "REDMINE" + "_API_KEY\"",     # env-name shape, not listed
         )
         for line in blocks:
             self.assertTrue(
                 release_mod._secret_assignment_is_real(line),
-                msg=f"expected opaque secret under *_ENV to block: {line!r}",
+                msg=f"expected non-allowlisted literal under *_ENV to block: {line!r}",
             )
+        # Only the allowlisted production env-var name is safe.
+        known = "MOZYO_REDMINE" + "_API_KEY"
+        self.assertIn(known, release_mod._KNOWN_CREDENTIAL_ENV_NAMES)
         env_names = (
-            env_key + " = \"" + "REDMINE" + "_API_KEY\"",         # carries api_key
-            env_key + " = \"" + "MOZYO_REDMINE" + "_API_KEY\"",   # production shape
+            env_key + " = \"" + known + "\"",
         )
         for line in env_names:
             self.assertFalse(
                 release_mod._secret_assignment_is_real(line),
-                msg=f"expected credential env-var name to be safe: {line!r}",
+                msg=f"expected allowlisted env-var name to be safe: {line!r}",
             )
 
     def test_12693_field_name_false_positives_are_safe(self) -> None:
