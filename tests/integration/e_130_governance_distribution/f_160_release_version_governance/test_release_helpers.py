@@ -392,6 +392,46 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertNotIn("access_tokenizer", output)
             self.assertNotIn("REDMINE_API_KEY", output)
 
+    def test_r2_tree_artifact_parity(self) -> None:
+        # Redmine #13716 R2: the first-stage grep and the shared second-stage
+        # classifier use the same segment-bounded grammar, so a line's tree and
+        # artifact verdicts always agree. R2-F1: a `*_ENV` key exempts only an
+        # UPPER_SNAKE value that itself names a credential env var; an opaque
+        # uppercase secret under a `*_ENV` key still blocks. R2-F2: a glued
+        # provider prefix (`mygithub_token`) is a candidate in neither scan.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        env_key = "API" + "_KEY_ENV"
+        cases = (
+            (env_key + " = \"" + "REAL" + "_SECRET_123\"", True),   # secret under *_ENV
+            (env_key + " = \"" + "REDMINE" + "_API_KEY\"", False),  # credential env-name
+            ("mygithub" + "_token = \"" + "ab" + "c123\"", False),  # glued provider prefix
+        )
+        personal_pattern = re.compile("|".join(release_mod._PERSONAL_PATH_PATTERNS))
+        for line, expect_block in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._init_repo(root)
+                self._commit_file(root, "f.py", line + "\n")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = release_mod.cmd_release_check_tree(
+                        argparse.Namespace(repo=str(root))
+                    )
+                tree_block = rc == release_mod.EXIT_BLOCKER
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "f.py").write_text(line + "\n", encoding="utf-8")
+                artifact_block = bool(
+                    release_mod._grep_artifact_tree(root, personal_pattern)
+                )
+            self.assertEqual(
+                tree_block, artifact_block,
+                msg=f"tree/artifact parity broken for {line!r}",
+            )
+            self.assertEqual(
+                expect_block, tree_block, msg=f"unexpected verdict for {line!r}"
+            )
+
 
 class SecretValueClassifierTest(unittest.TestCase):
     """Redmine #12175: pin the second-stage credential-value classifier that
@@ -618,6 +658,33 @@ class SecretValueClassifierTest(unittest.TestCase):
             self.assertFalse(
                 release_mod._secret_assignment_is_real(line),
                 msg=f"expected non-credential identifier to be safe: {line!r}",
+            )
+
+    def test_13716_r2f1_env_name_exemption_needs_credential_keyword(self) -> None:
+        # Redmine #13716 R2-F1: a `*_ENV` key exempts its value only when the
+        # value is the UPPER_SNAKE *name* of a credential env var — i.e. it both
+        # is UPPER_SNAKE AND carries a credential keyword. An opaque uppercase
+        # secret under a `*_ENV` key (shape but no keyword) still blocks.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        env_key = "API" + "_KEY_ENV"
+        blocks = (
+            env_key + " = \"" + "REAL" + "_SECRET_123\"",     # UPPER_SNAKE, no keyword
+            env_key + " = \"" + "UPPER" + "_SNAKE_SECRET\"",  # `SECRET` != client_secret
+        )
+        for line in blocks:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected opaque secret under *_ENV to block: {line!r}",
+            )
+        env_names = (
+            env_key + " = \"" + "REDMINE" + "_API_KEY\"",         # carries api_key
+            env_key + " = \"" + "MOZYO_REDMINE" + "_API_KEY\"",   # production shape
+        )
+        for line in env_names:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected credential env-var name to be safe: {line!r}",
             )
 
     def test_12693_field_name_false_positives_are_safe(self) -> None:
