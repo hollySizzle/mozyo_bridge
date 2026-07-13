@@ -158,11 +158,17 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             ["workflow", "callbacks", "--emit-gate", "--issue", "13683",
              "--gate", "review_request", "--json"]
         )
-        # Force the credential-gated transport to a recording fake so the gate RECORDS.
+        # Force the credential-gated transport to a recording fake so the gate RECORDS; stub the
+        # activation to a no-op so this test observes the enqueue deterministically (the activation
+        # itself is covered by the full-chain test).
         with mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
             "redmine_note_transport.redmine_delivery_transport_from_env",
             return_value=_RecordingTransport(),
+        ), mock.patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.cli_workflow_callbacks._activate_supervisor_process",
+            lambda: None,
         ):
             rc = args.func(args)
         self.assertEqual(rc, 0)  # gate recorded
@@ -170,9 +176,11 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         pending = SupervisorWakeStore(home=self.home).pending()
         self.assertEqual([h.as_tuple() for h in pending], [("wsA", "13683")])
 
-    def test_gate_emit_to_wake_to_supervisor_delivery_full_chain(self) -> None:
-        # The full R2-F2 path: gate emit -> durable wake -> lease-owner supervisor consumes the wake
-        # (local_wake) -> durable event appended + callback outbox delivered.
+    def test_gate_emit_activates_supervisor_to_delivery_full_chain(self) -> None:
+        # The full R3-F1 path: gate emit -> durable wake + ACTIVATION -> the activated supervisor
+        # consumes the wake -> durable event appended + callback outbox delivered through the REAL
+        # background_service authority. The test never calls run_once itself — the gate commit's
+        # activation seam drives it.
         from mozyo_bridge.application.cli import build_parser
         from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
         from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore, supervisor_lease_path
@@ -200,21 +208,6 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             SUPERVISION_LOCAL_WAKE,
         )
 
-        # 1) gate emit enqueues the wake (workspace "wsA" from MOZYO_WORKSPACE_ID env).
-        parser = build_parser()
-        args = parser.parse_args(
-            ["workflow", "callbacks", "--emit-gate", "--issue", "13683",
-             "--gate", "review_request", "--json"]
-        )
-        with mock.patch(
-            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
-            "redmine_note_transport.redmine_delivery_transport_from_env",
-            return_value=_RecordingTransport(),
-        ):
-            self.assertEqual(args.func(args), 0)
-
-        # 2) the lease-owner supervisor consumes the wake and delivers through the REAL
-        #    background_service authority (lease + outbox claim gated) to the exact resolved target.
         store_path = workflow_runtime_store_path(self.home)
         store = WorkflowRuntimeStore(path=store_path)
         outbox = CallbackOutbox(path=store_path)
@@ -244,34 +237,47 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             transports[ws.workspace_id] = t
             return BackgroundServiceCallbackSender(
                 workspace_id=ws.workspace_id, holder="superX", lease_store=lease_store,
-                target_resolver=_FakeResolver(ws.workspace_id), transport=t,
+                target_resolver=_FakeResolver(ws.workspace_id), transport=t, outbox=outbox,
                 now_fn=lambda: "2026-07-13T00:00:00+00:00",
             )
 
-        supervisor = WorkspaceCallbackSupervisor(
-            holder="superX",
-            lease_store=lease_store,
-            store=store,
-            outbox=outbox,
-            workspaces_fn=lambda: [SupervisedWorkspace("wsA", str(self.home / "repoA"))],
-            roster_fn=lambda ws: (("13683",), ""),
-            redmine_source_fn=lambda ws: MappingRedmineJournalSource(payload=_payload("13683")),
-            sender_fn=sender_fn,
-            wake_store=SupervisorWakeStore(path=supervisor_wake_path(self.home)),
-            clock=lambda: "2026-07-13T00:00:00+00:00",
-        )
-        report = supervisor.run_once(mode=SUPERVISION_LOCAL_WAKE)
+        def _activate():
+            # The activation seam (production spawns a detached run-once): here it runs an in-process
+            # supervisor over the same home, consuming the just-enqueued wake and delivering.
+            WorkspaceCallbackSupervisor(
+                holder="superX", lease_store=lease_store, store=store, outbox=outbox,
+                workspaces_fn=lambda: [SupervisedWorkspace("wsA", str(self.home / "repoA"))],
+                roster_fn=lambda ws: (("13683",), ""),
+                redmine_source_fn=lambda ws: MappingRedmineJournalSource(payload=_payload("13683")),
+                sender_fn=sender_fn,
+                wake_store=SupervisorWakeStore(path=supervisor_wake_path(self.home)),
+                clock=lambda: "2026-07-13T00:00:00+00:00",
+            ).run_once(mode=SUPERVISION_LOCAL_WAKE)
 
-        w = report.workspaces[0]
-        self.assertEqual(w.supervised_issues, ("13683",))  # driven by the wake
-        self.assertGreaterEqual(w.events_supplied, 1)  # durable event supplied for glance/resume
-        # The background_service authority delivered once to the exact re-resolved target.
-        self.assertEqual(len(transports["wsA"].calls), 1)
+        parser = build_parser()
+        args = parser.parse_args(
+            ["workflow", "callbacks", "--emit-gate", "--issue", "13683",
+             "--gate", "review_request", "--json"]
+        )
+        # gate emit -> records the gate -> enqueues the wake -> ACTIVATES the supervisor (the seam
+        # is patched to run in-process; the test does not call run_once).
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            return_value=_RecordingTransport(),
+        ), mock.patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.cli_workflow_callbacks._activate_supervisor_process",
+            _activate,
+        ):
+            self.assertEqual(args.func(args), 0)
+
+        # The gate commit's activation drove the whole chain to delivery.
+        self.assertEqual(len(transports.get("wsA", _CapturingTransport()).calls), 1)
         self.assertEqual(transports["wsA"].calls[0][1].locator, "%coord")
         self.assertEqual(len(outbox.read(states=[CALLBACK_DELIVERED])), 1)
         self.assertEqual([e.issue for e in store.read_events()], ["13683"])
-        # The wake was consumed by the owner.
-        self.assertEqual(SupervisorWakeStore(home=self.home).pending(), ())
+        self.assertEqual(SupervisorWakeStore(home=self.home).pending(), ())  # wake consumed
 
 
 if __name__ == "__main__":

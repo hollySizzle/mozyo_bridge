@@ -719,6 +719,59 @@ class CallbackOutbox:
         finally:
             conn.close()
 
+    def verify_claim(
+        self,
+        key: CallbackOutboxKey,
+        claim_token: str,
+        *,
+        now: Optional[str] = None,
+        stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
+    ) -> bool:
+        """Confirm ``claim_token`` still owns the row AND its claim lease has not expired (read-only).
+
+        Redmine #13683 review R3-F4: a background-service authority must re-verify its outbox claim
+        against the durable store immediately before delivery — a non-empty ``claim_token`` on an
+        in-memory row is not proof it is still the current owner. This reads the persisted
+        ``claim_token`` + ``claimed_at`` for the key and returns True only when (a) the token matches
+        the persisted one (still ours — not recovered + re-claimed elsewhere) AND (b) ``claimed_at``
+        is within the lease window (not a stale claim eligible for recovery). A blank token, a
+        missing row, or an unreadable / never-migrated store returns False (fail-closed).
+        """
+        token = str(claim_token or "").strip()
+        if not token:
+            return False
+        self._ensure_migrated_if_exists()
+        conn = self._connect_ro()
+        if conn is None:
+            return False
+        try:
+            if not self._table_present(conn):
+                return False
+            row = conn.execute(
+                "SELECT claim_token, claimed_at FROM callback_outbox WHERE source=? AND issue=? "
+                "AND journal=? AND normalized_gate=? AND callback_route=? AND workspace_id=?",
+                key.as_row(),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return False
+        persisted_token = str(row[0] or "")
+        claimed_at = str(row[1] or "")
+        if persisted_token != token:
+            return False  # recovered + re-claimed elsewhere (de-owned)
+        # The lease is live iff claimed_at is at/after the stale cutoff (both ISO-8601 UTC-second, so
+        # a lexicographic compare is chronological). A blank claimed_at is treated as stale.
+        if not claimed_at:
+            return False
+        base = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        cutoff = (base - timedelta(seconds=int(stale_seconds))).astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return claimed_at > cutoff
+
     def read_cursor(self, source: str) -> Optional[str]:
         """Return the persisted cursor token for ``source``, or ``None`` if unset."""
         conn = self._connect_ro()

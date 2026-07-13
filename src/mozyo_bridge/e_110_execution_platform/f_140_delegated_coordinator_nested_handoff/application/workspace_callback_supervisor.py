@@ -470,27 +470,54 @@ def background_transport_env(workspace_id: str) -> dict:
     return env
 
 
-def default_target_resolver(ws: SupervisedWorkspace):
+def workspace_live_locators(ws: SupervisedWorkspace) -> "set[str]":
+    """Best-effort live agent locators (pane ids) in this workspace (the live-inventory seam).
+
+    The workspace-scoped live inventory the route resolver cross-checks the route ledger against
+    (design answer j#77216 boundary 4). Reads the live agent discovery, filtered to this workspace's
+    canonical path, and returns the live pane ids. Fail-open to an empty set on any discovery error:
+    an empty live set makes the resolver fail-closed (no confirmed target -> the row stays retryable),
+    never a mis-delivery. Live running agents are the Phase B dogfood surface (#13490 / #13492); the
+    resolver mechanism reads this seam, and the isolated 2-workspace E2E injects a fixed live set.
+    """
+    try:
+        from mozyo_bridge.application.commands import _agents_target_candidates
+        import argparse as _argparse
+
+        root = Path(ws.canonical_path).expanduser()
+        locators: set[str] = set()
+        for cand in _agents_target_candidates(_argparse.Namespace(agent=None, session=None)):
+            repo_root = getattr(cand, "repo_root", "") or getattr(cand, "workspace", "")
+            try:
+                same = Path(str(repo_root)).expanduser().resolve() == root.resolve()
+            except OSError:
+                same = False
+            pane = str(getattr(cand, "pane_id", "") or "").strip()
+            if same and pane:
+                locators.add(pane)
+        return locators
+    except Exception:  # noqa: BLE001 - discovery unavailable -> empty live set (resolver fail-closed)
+        return set()
+
+
+def default_target_resolver(ws: SupervisedWorkspace, *, store):
     """Build the production route target resolver for a workspace (design answer j#77216 boundary 4).
 
-    Re-resolves a claimed row's route against the durable route ledger, cross-checked with the live
-    inventory. The **live-inventory** cross-check (which coordinator pane is live in this workspace)
-    is the Phase B dogfood seam (#13490 / #13492); until it lands this resolver is **fail-closed** —
-    it yields no confirmed live target, so a background delivery fails closed (the row stays
-    retryable) rather than mis-delivering on an unconfirmed route. The delivery MECHANISM
-    (authority + resolution + fail-closed + transport) is exercised through this seam in the isolated
-    2-workspace E2E; production live resolution is wired in Phase B.
+    Re-resolves a claimed row's route against the durable route ledger (``store``), cross-checked
+    with the workspace-scoped live inventory (:func:`workspace_live_locators`). A ledger entry whose
+    pane is not live is dropped, so delivery only ever targets a confirmed-live route — and 0 / >1
+    live targets fail closed at the authority. The live running-agent surface is the Phase B dogfood
+    (#13490 / #13492); the resolver itself reads the real ledger + inventory seam.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
-        TargetResolution,
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+        RouteLedgerTargetResolver,
     )
 
-    class _FailClosedResolver:
-        def resolve(self, row) -> "TargetResolution":  # noqa: F821 - forward ref in annotation
-            # Fail-closed until the Phase B live-inventory wire: no confirmed live target.
-            return TargetResolution.of([])
-
-    return _FailClosedResolver()
+    return RouteLedgerTargetResolver(
+        workspace_id=ws.workspace_id,
+        store=store,
+        live_locators=lambda: workspace_live_locators(ws),
+    )
 
 
 def default_background_transport(ws: SupervisedWorkspace):
@@ -580,24 +607,28 @@ def build_supervisor(
 
     resolved_store_path = store_path or workflow_runtime_store_path(home)
     lease_store = SupervisorLeaseStore(path=supervisor_lease_path(home))
+    store = WorkflowRuntimeStore(path=resolved_store_path)
+    outbox = CallbackOutbox(path=resolved_store_path)
 
     def _sender_fn(ws: SupervisedWorkspace):
         # Model A' (design answer j#77216): the supervisor delivers as a background_service
-        # authority — lease + claim gated, target re-resolved, transport origin separated from an
-        # agent send — NOT via an agent handoff sender identity.
+        # authority — lease + claim gated (claim re-verified against the outbox, R3-F4), target
+        # re-resolved from the route ledger + live inventory (R3-F2) and bound to the row anchor
+        # (R3-F3), transport origin separated from an agent send — NOT an agent handoff identity.
         return BackgroundServiceCallbackSender(
             workspace_id=ws.workspace_id,
             holder=holder,
             lease_store=lease_store,
-            target_resolver=default_target_resolver(ws),
+            target_resolver=default_target_resolver(ws, store=store),
             transport=default_background_transport(ws),
+            outbox=outbox,
         )
 
     return WorkspaceCallbackSupervisor(
         holder=holder,
         lease_store=lease_store,
-        store=WorkflowRuntimeStore(path=resolved_store_path),
-        outbox=CallbackOutbox(path=resolved_store_path),
+        store=store,
+        outbox=outbox,
         workspaces_fn=lambda: default_workspaces(home=home),
         roster_fn=default_roster,
         redmine_source_fn=default_redmine_source,
@@ -620,6 +651,7 @@ __all__ = (
     "default_redmine_source",
     "default_target_resolver",
     "default_background_transport",
+    "workspace_live_locators",
     "background_transport_env",
     "default_binding",
     "build_supervisor",

@@ -104,7 +104,11 @@ class CanonicalGateRecordE2ETest(unittest.TestCase):
 
         transport = _CapturingTransport()
         store = str(Path(self._tmp.name) / "wf.sqlite")
-        with patch.object(cli, "_outbox_from_args", lambda args: self.outbox), patch(
+        # #13683 R3-F1: a recorded gate now ACTIVATES a bounded supervisor pass. Stub the activation
+        # so this #13520 e2e does not spawn a real detached supervisor subprocess.
+        with patch.object(cli, "_activate_supervisor_process", lambda: None), patch.object(
+            cli, "_outbox_from_args", lambda args: self.outbox
+        ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
             "redmine_note_transport.redmine_delivery_transport_from_env",
             lambda: transport,

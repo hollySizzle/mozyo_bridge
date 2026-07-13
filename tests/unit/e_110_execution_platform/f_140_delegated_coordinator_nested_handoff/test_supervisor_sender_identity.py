@@ -32,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
     AUTH_AMBIGUOUS_TARGET,
+    AUTH_ANCHOR_MISMATCH,
     AUTH_FOREIGN_WORKSPACE,
     AUTH_GENERATION_MISMATCH,
     AUTH_NO_CLAIM,
@@ -94,7 +95,8 @@ class _RecordingTransport:
 class AuthorizeMatrixTest(unittest.TestCase):
     def _authorize(self, **over):
         base = dict(
-            expected_workspace="wsA", row_workspace="wsA", has_lease=True, has_claim=True,
+            expected_workspace="wsA", row_workspace="wsA", row_issue="13683", row_journal="77065",
+            has_lease=True, has_claim=True,
             resolution=TargetResolution.of([_target("wsA")]), expected_generation="",
         )
         base.update(over)
@@ -137,6 +139,21 @@ class AuthorizeMatrixTest(unittest.TestCase):
     def test_generation_absent_is_no_constraint(self):
         d = self._authorize(resolution=TargetResolution.of([_target("wsA", generation="")]), expected_generation="")
         self.assertTrue(d.authorized)
+
+    def test_unknown_target_generation_when_expected_is_zero_send(self):
+        # R3-F3 repro: expected g1, resolved target has NO generation -> strict fail-closed.
+        d = self._authorize(
+            resolution=TargetResolution.of([_target("wsA", generation="")]), expected_generation="g1"
+        )
+        self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
+
+    def test_wrong_anchor_target_is_zero_send(self):
+        # R3-F3 repro: a resolved target for a DIFFERENT issue/journal than the row is not delivered.
+        wrong = DeliveryTarget(
+            workspace_id="wsA", lane="other", receiver="claude", issue="99999", journal="1", locator="%x"
+        )
+        d = self._authorize(resolution=TargetResolution.of([wrong]))
+        self.assertEqual(d.reason, AUTH_ANCHOR_MISMATCH)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +296,108 @@ class TwoWorkspaceExactRouteTest(unittest.TestCase):
         result = self.sA(_row("wsB"))
         self.assertEqual(result.outcome, SEND_NOT_SENT)
         self.assertEqual(self.tA.calls, [])
+
+
+class ClaimReverificationTest(unittest.TestCase):
+    """R3-F4: the sender re-verifies the outbox claim (ownership + lease) against the store."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+
+    def _outbox_with_claimed_row(self):
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
+        from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+
+        outbox = CallbackOutbox(path=self.store_path)
+        key = CallbackOutboxKey(
+            source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
+            callback_route="coordinator", workspace_id="wsA",
+        )
+        outbox.enqueue(key, initial_state=CALLBACK_PENDING, now=NOW)
+        claimed = outbox.claim_pending(now=NOW, workspace_id="wsA")
+        return outbox, claimed[0]
+
+    def _sender(self, outbox, *, now=NOW, transport=None):
+        self.transport = transport or _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        return BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
+            target_resolver=_FakeResolver([_target("wsA")]), transport=self.transport,
+            outbox=outbox, now_fn=lambda: now,
+        )
+
+    def test_valid_claim_delivers(self):
+        outbox, row = self._outbox_with_claimed_row()
+        result = self._sender(outbox, now=NOW)(row)
+        self.assertEqual(result.outcome, SEND_DELIVERED)
+        self.assertEqual(len(self.transport.calls), 1)
+
+    def test_expired_claim_is_zero_send(self):
+        outbox, row = self._outbox_with_claimed_row()  # claimed_at = NOW; supervisor lease ttl 600
+        # now is past the CLAIM lease (300s -> stale after 00:05:00) but before the SUPERVISOR lease
+        # expiry (600s -> 00:10:00), so the lease is live and the claim staleness is what fails.
+        result = self._sender(outbox, now="2026-07-13T00:06:00+00:00")(row)
+        self.assertEqual(result.outcome, SEND_NOT_SENT)
+        self.assertEqual(result.persist_reason, AUTH_NO_CLAIM)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_de_owned_claim_is_zero_send(self):
+        outbox, row = self._outbox_with_claimed_row()
+        # A concurrent processor recovered + re-claimed the row: the persisted token no longer
+        # matches this sender's row token -> zero-send.
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
+
+        stale = CallbackOutboxRow(**{**row.as_payload(), "claim_token": "someoneelse"})
+        result = self._sender(outbox, now=NOW)(stale)
+        self.assertEqual(result.persist_reason, AUTH_NO_CLAIM)
+        self.assertEqual(self.transport.calls, [])
+
+
+class RouteLedgerResolverTest(unittest.TestCase):
+    """R3-F2: the production resolver reads the route ledger + live inventory (no fake seam)."""
+
+    def setUp(self):
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+
+        self.dir = Path(tempfile.mkdtemp())
+        self.store = WorkflowRuntimeStore(path=self.dir / "workflow-runtime.sqlite")
+        # Two workspaces' coordinator route identities in the durable ledger.
+        self.store.put_route_identities([
+            {"route_id": "rA", "issue": "13683", "workspace_id": "wsA", "lane_id": "default",
+             "role": "codex", "pane_name": "coordA", "last_seen_pane_id": "%A"},
+            {"route_id": "rB", "issue": "13684", "workspace_id": "wsB", "lane_id": "default",
+             "role": "codex", "pane_name": "coordB", "last_seen_pane_id": "%B"},
+        ])
+
+    def _resolver(self, workspace_id, live):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+            RouteLedgerTargetResolver,
+        )
+
+        return RouteLedgerTargetResolver(
+            workspace_id=workspace_id, store=self.store, live_locators=lambda: set(live)
+        )
+
+    def test_resolves_this_workspace_live_coordinator(self):
+        res = self._resolver("wsA", {"%A", "%B"}).resolve(_row("wsA"))
+        self.assertEqual(len(res.targets), 1)
+        self.assertEqual(res.targets[0].workspace_id, "wsA")
+        self.assertEqual(res.targets[0].locator, "%A")
+        # Anchor carried from the row (so the sender's anchor-binding passes for a real target).
+        self.assertEqual(res.targets[0].issue, "13683")
+
+    def test_no_cross_workspace_resolution(self):
+        # wsA's resolver never resolves wsB's route even though the ledger holds it.
+        res = self._resolver("wsA", {"%A", "%B"}).resolve(_row("wsA"))
+        self.assertTrue(all(t.workspace_id == "wsA" for t in res.targets))
+        self.assertNotIn("%B", {t.locator for t in res.targets})
+
+    def test_dead_pane_is_dropped(self):
+        # The ledger holds wsA's route but its pane is not live -> no target (fail-closed).
+        res = self._resolver("wsA", set()).resolve(_row("wsA"))
+        self.assertEqual(res.targets, ())
 
 
 class BackgroundTransportEnvTest(unittest.TestCase):

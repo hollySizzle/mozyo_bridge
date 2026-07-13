@@ -46,7 +46,8 @@ AUTH_NO_CLAIM = "no_outbox_claim"  # the row carries no durable outbox claim tok
 AUTH_FOREIGN_WORKSPACE = "foreign_workspace"  # the row / resolved target is a different workspace
 AUTH_NO_TARGET = "no_target_resolved"  # the route re-resolution found no live target
 AUTH_AMBIGUOUS_TARGET = "ambiguous_target"  # the route re-resolution found more than one target
-AUTH_GENERATION_MISMATCH = "generation_mismatch"  # the resolved target's generation moved on
+AUTH_ANCHOR_MISMATCH = "anchor_mismatch"  # the resolved target's issue/journal != the row's anchor
+AUTH_GENERATION_MISMATCH = "generation_mismatch"  # the resolved target's generation is unknown/stale
 
 #: The fail-closed reasons — every one is a deterministic zero-send (nothing was delivered).
 FAIL_CLOSED_REASONS = frozenset(
@@ -56,6 +57,7 @@ FAIL_CLOSED_REASONS = frozenset(
         AUTH_FOREIGN_WORKSPACE,
         AUTH_NO_TARGET,
         AUTH_AMBIGUOUS_TARGET,
+        AUTH_ANCHOR_MISMATCH,
         AUTH_GENERATION_MISMATCH,
     }
 )
@@ -118,6 +120,8 @@ def authorize_background_delivery(
     *,
     expected_workspace: str,
     row_workspace: str,
+    row_issue: str = "",
+    row_journal: str = "",
     has_lease: bool,
     has_claim: bool,
     resolution: TargetResolution,
@@ -133,8 +137,14 @@ def authorize_background_delivery(
     4. the route re-resolution must yield **exactly one** live target in this workspace — 0
        (:data:`AUTH_NO_TARGET`), >1 (:data:`AUTH_AMBIGUOUS_TARGET`), or a foreign-workspace target
        (:data:`AUTH_FOREIGN_WORKSPACE`) all fail closed;
-    5. when both the expectation and the resolved target carry a generation, they must match
-       (:data:`AUTH_GENERATION_MISMATCH` otherwise) — a no-op when neither carries one.
+    5. the resolved target's **source anchor** (issue + journal) must exact-match the row's durable
+       anchor (:data:`AUTH_ANCHOR_MISMATCH` otherwise) — a re-resolution that drifted to a different
+       issue / journal is never delivered (review R3-F3: the delivery is bound to the row's anchor,
+       not a resolver-supplied one);
+    6. generation is **strict**: when the row expects a generation, the resolved target must carry
+       exactly that generation (:data:`AUTH_GENERATION_MISMATCH` otherwise — an unknown / empty /
+       stale target generation fails closed). No expectation = no constraint (forward hook for
+       #13684's correlated generation).
 
     Only when every check passes is the delivery :data:`AUTH_OK` with the single resolved target.
     """
@@ -153,9 +163,17 @@ def authorize_background_delivery(
     target = targets[0]
     if str(target.workspace_id or "").strip() != expected:
         return BackgroundDeliveryDecision(False, AUTH_FOREIGN_WORKSPACE)
+    # Bind the delivery to the ROW's durable anchor — a re-resolution that returns a different
+    # issue / journal is not this row's callback and is never delivered (R3-F3).
+    if (
+        str(target.issue or "").strip() != str(row_issue or "").strip()
+        or str(target.journal or "").strip() != str(row_journal or "").strip()
+    ):
+        return BackgroundDeliveryDecision(False, AUTH_ANCHOR_MISMATCH)
     want_gen = str(expected_generation or "").strip()
-    got_gen = str(target.generation or "").strip()
-    if want_gen and got_gen and want_gen != got_gen:
+    if want_gen and want_gen != str(target.generation or "").strip():
+        # Strict: an expected generation must match exactly — an unknown / empty / stale target
+        # generation fails closed (R3-F3), never authorized.
         return BackgroundDeliveryDecision(False, AUTH_GENERATION_MISMATCH)
     return BackgroundDeliveryDecision(True, AUTH_OK, target)
 
@@ -168,6 +186,7 @@ __all__ = (
     "AUTH_FOREIGN_WORKSPACE",
     "AUTH_NO_TARGET",
     "AUTH_AMBIGUOUS_TARGET",
+    "AUTH_ANCHOR_MISMATCH",
     "AUTH_GENERATION_MISMATCH",
     "FAIL_CLOSED_REASONS",
     "DeliveryTarget",
