@@ -28,8 +28,11 @@ classical tests へ落とす契約、実機に残す最小確認、過去の fai
 
 現在の repo-local 実行順序は #12499 の roadmap anchor と
 `delegated-coordinator-real-machine-acceptance.md` の `Current Roadmap Gates` を読む。
-#12546 autonomous parent smoke は、#12590 source/test layout full expansion、#12608
-queue-enter default rail dogfood、scenario / oracle rerun/audit の後に実行する。
+layout gate は closed #12622「Source/Test layout を Redmine 番号付き Epic/Feature 階層へ
+全面再移行する」を履歴根拠とし、superseded #12590 を current hard gate として扱わない。
+#12546 autonomous parent smoke は、現行 predecessor chain
+#13582 + #13583 + #13595 → #13581 → #12709 の後に実行し、その後に #12461 retirement /
+cleanup verification が続く。
 
 ## #12474 / #12484 / #12485 で分かった failure mode
 
@@ -125,8 +128,9 @@ Redmine MCP 実体に依存せず、receiver に渡す issue surface を fixture
 
 classical tests を通した後、実機 smoke は次だけを見る。
 
-- #12590 / #12608 / scenario-oracle rerun が pre-smoke gate として満たされており、その記録が
-  Redmine #12499 / #12546 から追跡できる。
+- 現行 predecessor chain（#13582 + #13583 + #13595 → #13581 → #12709）が pre-smoke gate
+  として満たされており、その記録が Redmine #12499 / #12546 から追跡できる。layout gate は
+  closed #12622 を履歴根拠とし、superseded #12590 を current gate として扱わない。
 - fresh panes / worktrees が stale evidence なしで用意される。
 - `delegated-coordinator-real-machine-acceptance.md` が定義する test model
   (`autonomous_parent`, `bounded_read`, `context_rich`) が Start Gate で明示されている。
@@ -152,7 +156,8 @@ product evidence として認めるもの:
 - grandparent が Redmine smoke issue / prior journal / expected route を読まず、routing
   metadata だけで project gateway を分類または fail-closed する。
 - parent project gateway が明示 role と workflow contract を受け取り、domain/design 判断を
-  自身でも grandparent でも吸収せず、Redmine anchor 境界を作って child coordinator へ橋渡しする。
+  自身でも grandparent でも吸収せず、child coordinator へ ticketless no-anchor work-intake
+  として橋渡しする（Redmine anchor の作成・選択は child coordinator が所有する）。
 - child / grandchild へ進む場合、Redmine anchor、callback target、no-dispatch reason が
   durable record で replay できる。
 - callback / hands-off が pane 上の自然文ではなく、standard transport または durable anchor
