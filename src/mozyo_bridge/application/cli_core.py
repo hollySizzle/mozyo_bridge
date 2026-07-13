@@ -59,6 +59,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_supersede import (
     cmd_sublane_supersede,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (
+    cmd_sublane_hibernate,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (
+    cmd_sublane_resume,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -811,6 +817,109 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     add_repo_option(sublane_supersede)
     _add_lifecycle_json(sublane_supersede)
     sublane_supersede.set_defaults(func=cmd_sublane_supersede)
+
+    sublane_hibernate = sublane_sub.add_parser(
+        "hibernate",
+        help=(
+            "Redmine #13682: release an OPEN lane's managed gateway/worker processes "
+            "while preserving its worktree / branch / unpublished commits / lane metadata "
+            "/ durable callback route (tombstone-free — never closes the issue, removes a "
+            "worktree, or deletes a branch). Fail-closed preflight (lane actively owns the "
+            "issue; issue explicitly parked; no callback/review/owner/integration due; no "
+            "pending composer; no work in flight; a dirty worktree needs a boundary "
+            "journal). Not an idle-timeout kill. Default is preflight only; --execute "
+            "performs the hibernate. Exits non-zero when blocked. Resume with "
+            "`sublane resume`."
+        ),
+    )
+    sublane_hibernate.add_argument(
+        "--issue", required=True, help="Redmine issue id the lane owns (stays open)"
+    )
+    sublane_hibernate.add_argument(
+        "--lane",
+        required=True,
+        help="Lane label to hibernate (e.g. issue_<id>_<slug>)",
+    )
+    sublane_hibernate.add_argument(
+        "--journal",
+        required=True,
+        help="Redmine journal id that authorizes the hibernate (durable anchor)",
+    )
+    # Durable-record invariants the operator asserts from the Redmine record (each
+    # defaults to unsatisfied so an omitted flag fails closed).
+    for _opt, _dest, _help in (
+        ("--explicitly-parked", "explicitly_parked",
+         "The issue is open and explicitly parked/blocked (not merely idle)."),
+        ("--callbacks-drained", "callbacks_drained",
+         "The lane owes no outstanding coordinator callback."),
+        ("--no-review-pending", "no_review_pending",
+         "The lane has no review awaiting a result."),
+        ("--no-owner-approval-pending", "no_owner_approval_pending",
+         "The lane has no owner close approval pending."),
+        ("--no-integration-pending", "no_integration_pending",
+         "The lane has no integration disposition pending."),
+        ("--no-pending-prompt", "no_pending_prompt",
+         "The lane has no composer input pending."),
+        ("--not-working", "not_working", "The lane has no work in flight."),
+        ("--worktree-clean", "worktree_clean",
+         "The lane's worktree has no uncommitted diff (no boundary journal needed)."),
+        ("--boundary-recorded", "boundary_recorded",
+         "A boundary journal capturing the dirty worktree's diff / resume next-action "
+         "is recorded (required when the worktree is not clean)."),
+    ):
+        sublane_hibernate.add_argument(
+            _opt, dest=_dest, action="store_true", help=_help
+        )
+    sublane_hibernate.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Perform the hibernate: CAS the disposition (active->hibernated) and release "
+            "the lane's managed processes. Without it this is preflight only (no mutation)."
+        ),
+    )
+    add_repo_option(sublane_hibernate)
+    _add_lifecycle_json(sublane_hibernate)
+    sublane_hibernate.set_defaults(func=cmd_sublane_hibernate)
+
+    sublane_resume = sublane_sub.add_parser(
+        "resume",
+        help=(
+            "Redmine #13682: bring a hibernated lane back to active once a FRESH managed "
+            "pair has been relaunched on its preserved worktree (via `sublane start`). "
+            "Verify + flip only — closes nothing, launches nothing, touches no worktree / "
+            "branch / issue / commit. Fail-closed preflight (lane hibernated and owns the "
+            "issue; release generation settled; issue not re-owned; the relaunched pair is "
+            "both-slots live AND generation-matched attested, #13637). Default is preflight "
+            "only; --execute performs the flip. Exits non-zero when blocked."
+        ),
+    )
+    sublane_resume.add_argument(
+        "--issue", required=True, help="Redmine issue id the hibernated lane owns"
+    )
+    sublane_resume.add_argument(
+        "--lane",
+        required=True,
+        help="Hibernated lane label to resume (e.g. issue_<id>_<slug>)",
+    )
+    sublane_resume.add_argument(
+        "--journal",
+        required=True,
+        help="Redmine journal id that authorizes the resume (durable anchor)",
+    )
+    sublane_resume.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Perform the resume: CAS the disposition (hibernated->active) after verifying "
+            "the fresh attested pair. Without it this is preflight only (no mutation)."
+        ),
+    )
+    add_repo_option(sublane_resume)
+    _add_lifecycle_json(sublane_resume)
+    sublane_resume.set_defaults(func=cmd_sublane_resume)
 
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
     # is the opt-in write side: it mints durable herdr assigned names for the
