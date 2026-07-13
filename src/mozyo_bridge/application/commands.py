@@ -1623,7 +1623,7 @@ def _maybe_restore_previous_active(
 # terminal-path publisher live in `f_130_.../application/delivery_outcome_gate.py`; re-exported.
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E402,E501
     delivery_was_positive,
-    publish_delivery_outcome as _publish_delivery_outcome,
+    make_publishing_emitter as _make_publishing_emitter,
 )
 
 
@@ -1673,6 +1673,8 @@ def orchestrate_handoff(
     # (and the tmux gates below) must not run; the target is resolved herdr-natively.
     # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
     # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
+    # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
+    _emit = _make_publishing_emitter(args, _emit_outcome)
     herdr_send = herdr_effective_backend_selected(args)
     if not herdr_send:
         require_tmux()
@@ -1706,7 +1708,7 @@ def orchestrate_handoff(
         # stricter than strict `standard`: `--force` cannot be used to bypass
         # non-agent target checks under this rail. The rail only makes sense
         # for Claude/Codex agent panes whose prompt queue accepts Enter.
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -1728,7 +1730,7 @@ def orchestrate_handoff(
         )
 
     if kind not in KIND_LABELS:
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -1779,7 +1781,7 @@ def orchestrate_handoff(
                 forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessWorkIntakeError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -1818,7 +1820,7 @@ def orchestrate_handoff(
                 forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessConsultationError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -1857,7 +1859,7 @@ def orchestrate_handoff(
                 forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessCallbackError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -1889,7 +1891,7 @@ def orchestrate_handoff(
                 journal=getattr(args, "journal", None),
             )
         except AnchorError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_anchor",
@@ -1918,7 +1920,7 @@ def orchestrate_handoff(
         try:
             target_info = resolve_herdr_send_target(args, receiver=receiver)
         except HerdrSendEntryError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_unavailable",
@@ -1940,7 +1942,7 @@ def orchestrate_handoff(
         try:
             target_info = pane_info(target_arg)
         except SystemExit:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_unavailable",
@@ -2043,7 +2045,7 @@ def orchestrate_handoff(
     elif getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
         raw_target = getattr(args, "target", None)
         if not is_explicit_pane_target(raw_target):
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2079,7 +2081,7 @@ def orchestrate_handoff(
 
         auto_root = _resolve_workspace_root(auto_cwd)
         if not auto_root:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_repo_mismatch",
@@ -2143,7 +2145,7 @@ def orchestrate_handoff(
     if main_lane_guard_blocked(
         args, receiver=receiver, kind=kind, preflight_target=preflight_target
     ):
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="main_lane_implementation_blocked",
@@ -2195,7 +2197,7 @@ def orchestrate_handoff(
         # under a `to=codex` marker.
         observed_window = preflight_target.window_name or "<unknown>"
         observed_role = preflight_target.pane_option_role or "<none>"
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -2269,7 +2271,7 @@ def orchestrate_handoff(
                 both_sessions_known and explicit_target and has_target_repo
             )
             if not cross_session_admitted:
-                _emit_outcome(
+                _emit(
                     make_outcome(
                         status="blocked",
                         reason="invalid_args",
@@ -2330,7 +2332,7 @@ def orchestrate_handoff(
         and sender_session_xw != target_session_xw
         and receiver == "claude"
     ):
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="cross_session_claude",
@@ -2418,7 +2420,7 @@ def orchestrate_handoff(
         target=target,
         record_format=record_format,
         record_command=record_command,
-        emit=_emit_outcome,
+        emit=_emit,
         sender_lane_unit=herdr_sender_lane_unit,
     )
 
@@ -2442,7 +2444,7 @@ def orchestrate_handoff(
         if observed_repo is None or normalize_path_unicode(
             observed_repo
         ) != normalize_path_unicode(expected_resolved):
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_repo_mismatch",
@@ -2504,7 +2506,7 @@ def orchestrate_handoff(
         # the sole identity gate. `--target-repo` has already been validated above
         # when present.
         if not expected_target_repo:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2571,7 +2573,7 @@ def orchestrate_handoff(
             observed_path = None
 
         if observed_scope != expected_project:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_project_mismatch",
@@ -2649,7 +2651,7 @@ def orchestrate_handoff(
                 target=target,
                 anchor=anchor,
             )
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2712,7 +2714,7 @@ def orchestrate_handoff(
         pane_command = target_info.get("command") or ""
         if not is_receiver_agent_process(pane_command, receiver):
             observed_command = Path(pane_command).name or "<none>"
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_not_agent",
@@ -2738,7 +2740,7 @@ def orchestrate_handoff(
         try:
             ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
         except SystemExit:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_not_agent",
@@ -2800,7 +2802,7 @@ def orchestrate_handoff(
                 role_profile_arg, profile_fields
             )
         except RoleProfileError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2835,7 +2837,7 @@ def orchestrate_handoff(
         try:
             transition_role_boundary = resolve_transition_role(transition_role_arg)
         except TransitionRoleError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2869,7 +2871,7 @@ def orchestrate_handoff(
         try:
             workflow_contract_bundle = resolve_workflow_contract(workflow_contract_arg)
         except WorkflowContractError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2906,7 +2908,7 @@ def orchestrate_handoff(
             ticketless_work_intake=ticketless_work_intake_payload,
         )
     except AnchorError as exc:
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -2998,7 +3000,7 @@ def orchestrate_handoff(
             ticketless_work_intake=ticketless_work_intake_payload,
             turn_start_outcome=turn_start_telemetry,
         )
-        _emit_outcome(
+        _emit(
             outcome,
             record_format=record_format,
             command=record_command,
@@ -3049,8 +3051,7 @@ def orchestrate_handoff(
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
         )
-        _publish_delivery_outcome(args, outcome)
-        _emit_outcome(
+        _emit(
             outcome,
             record_format=record_format,
             command=record_command,
@@ -3089,7 +3090,7 @@ def orchestrate_handoff(
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
         )
-        _emit_outcome(
+        _emit(
             outcome,
             record_format=record_format,
             command=record_command,
@@ -3196,7 +3197,7 @@ def orchestrate_handoff(
                 ticketless_consultation=ticketless_consultation_payload,
                 ticketless_work_intake=ticketless_work_intake_payload,
             )
-            _emit_outcome(
+            _emit(
                 outcome,
                 record_format=record_format,
                 command=record_command,
@@ -3277,7 +3278,6 @@ def orchestrate_handoff(
         # snapshot (`None` for tmux / non-queue-enter). Never influences the wire.
         queue_enter_turn_start_observation=queue_enter_observation,
     )
-    _publish_delivery_outcome(args, outcome)
     # Durable retry telemetry (policy + attempted count + interval) is recorded
     # in the delivery record / narrative only when the Enter-only retry actually
     # engaged. It is wording-layer only: it never reaches the wire enums or the
@@ -3301,7 +3301,7 @@ def orchestrate_handoff(
         target_activation,
         restore_previous_active=admission_policy.restore_previous_active,
     )
-    _emit_outcome(
+    _emit(
         outcome,
         record_format=record_format,
         command=record_command,
