@@ -31,6 +31,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SUBLANE_STATE_ACTIVE,
     SUBLANE_STATE_GATEWAY_ONLY,
+    SUBLANE_STATE_PAIR_SPLIT,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
+    RuntimePlacementFingerprint,
 )
 
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
@@ -156,6 +160,31 @@ def _fake_binary(tmp: str) -> Path:
     binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return binpath
+
+
+class _SplitOnHealHerdr(_StatefulHerdr):
+    """A herdr that *reports* the requested tab but actually lands the pane elsewhere.
+
+    Models a spec-drift / lying runtime (Redmine #13705): when ``split_next_start`` is
+    set, the next ``agent start`` echoes the requested ``--tab`` in its ``agent_started``
+    payload (so the launch landing guard passes) but records the live row in a DIFFERENT
+    tab, so ``agent list`` later shows a split pair. The same-tab postcondition must
+    catch it even though the launch guard did not.
+    """
+
+    def __init__(self, *, created_workspace="wL"):
+        super().__init__(created_workspace=created_workspace)
+        self.split_next_start = False
+
+    def run(self, argv, **kw):
+        rest = list(argv[1:])
+        if rest[:2] == ["agent", "start"] and self.split_next_start and "--tab" in rest:
+            self.split_next_start = False
+            result = super().run(argv, **kw)
+            # The live row we just appended is split into a different tab.
+            self.agents[-1]["tab_id"] = self.agents[-1]["tab_id"] + "_split"
+            return result
+        return super().run(argv, **kw)
 
 
 class HerdrSublaneOpsTest(unittest.TestCase):
@@ -517,6 +546,104 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
         self.assertTrue(view.gateway_pane.startswith("wL:"))
         self.assertTrue(view.worker_pane.startswith("wL:"))
+
+    def test_heal_from_incompatible_runtime_fails_closed_zero_side_effect(self) -> None:
+        # Redmine #13705: the measured incident — a lane built under the #13411 same-tab
+        # contract healed by an older installed runtime that lacks it. The mutating heal
+        # fences BEFORE any pane side effect: no new `agent start`, and a fail-closed
+        # RuntimeError naming the runtime skew.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            # Simulate the older installed runtime that lacks the same-tab contract.
+            ops.runtime_placement_fingerprint = RuntimePlacementFingerprint(
+                version="0.10.0", capabilities=frozenset()
+            )
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                launches_before = len(herdr.start_argvs)
+                # The gateway vanishes; a heal would relaunch it — but the runtime is
+                # incompatible with the lane's placement contract.
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                with self.assertRaises(RuntimeError) as ctx:
+                    ops.heal_lane_column(str(worktree))
+        self.assertIn("runtime_lacks_placement_contract", str(ctx.exception))
+        # Zero side effect: no new agent start ran after the fence blocked.
+        self.assertEqual(len(herdr.start_argvs), launches_before)
+
+    def test_heal_from_unknown_provenance_runtime_fails_closed(self) -> None:
+        # Redmine #13705: a runtime with no resolvable build version cannot attest its
+        # placement provenance -> fail closed with zero side effect.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            ops.runtime_placement_fingerprint = RuntimePlacementFingerprint(
+                version="", capabilities=frozenset()
+            )
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                launches_before = len(herdr.start_argvs)
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                with self.assertRaises(RuntimeError) as ctx:
+                    ops.heal_lane_column(str(worktree))
+        self.assertIn("provenance_unknown", str(ctx.exception))
+        self.assertEqual(len(herdr.start_argvs), launches_before)
+
+    def test_compatible_heal_passes_same_tab_postcondition(self) -> None:
+        # Redmine #13705: a compatible heal rejoins the surviving slot's tab, so the
+        # postcondition confirms both slots share one (workspace, tab) container.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                ops.heal_lane_column(str(worktree))  # no raise
+                view = ops.read_lane(str(worktree))
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+
+    def test_heal_that_splits_the_pair_fails_the_postcondition(self) -> None:
+        # Redmine #13705 postcondition: even when the launch landing guard is satisfied
+        # (the runtime reports the requested tab), a relaunch that actually split the
+        # pair across tabs is caught on read-back and fails closed.
+        herdr = _SplitOnHealHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                herdr.split_next_start = True
+                with self.assertRaises(RuntimeError) as ctx:
+                    ops.heal_lane_column(str(worktree))
+        self.assertIn("postcondition", str(ctx.exception))
+        self.assertIn("pair is split", str(ctx.exception))
+
+    def test_read_lane_reports_pair_split_across_tabs(self) -> None:
+        # Redmine #13705: `sublane list` / read-back must report a pair split across
+        # tabs as `pair_split`, never `active`.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                # Move the gateway into a different tab of the same workspace.
+                for agent in herdr.agents:
+                    if "_codex_" in agent["name"]:
+                        agent["tab_id"] = agent.get("tab_id", "wL:t1") + "_moved"
+                view = ops.read_lane(str(worktree))
+        self.assertIsNotNone(view)
+        self.assertTrue(view.gateway_pane and view.worker_pane)
+        self.assertEqual(view.state, SUBLANE_STATE_PAIR_SPLIT)
 
     def test_append_failure_raises_runtime_error(self) -> None:
         herdr = _StatefulHerdr()

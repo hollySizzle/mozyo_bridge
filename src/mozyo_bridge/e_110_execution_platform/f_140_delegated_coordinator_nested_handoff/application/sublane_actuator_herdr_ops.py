@@ -75,6 +75,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
     _lane_state,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
+    RuntimePlacementFingerprint,
+    evaluate_heal_runtime_fence,
+    production_placement_fingerprint,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+    _tab_id_of_row,
+    _workspace_prefix,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _list_rows,
 )
@@ -107,6 +116,22 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 HERDR_LANE_PROVIDERS: tuple[str, ...] = (GATEWAY_ROLE, WORKER_ROLE)
 
 
+def _pair_colocation(slots: Mapping[str, tuple[str, str]]) -> Optional[bool]:
+    """Whether a live gateway/worker pair shares one placement container (#13705).
+
+    ``slots`` maps role -> ``(locator, placement_key)``. ``True`` when both slots are
+    live and share one ``(herdr_workspace, tab_id)`` key (an operable same-tab pair),
+    ``False`` when both are live but the keys differ (a ``pair_split``), and ``None``
+    when fewer than two slots are live (the ordinary single-provider heal — not
+    applicable, so the fence never blocks on it).
+    """
+    gateway = slots.get(GATEWAY_ROLE)
+    worker = slots.get(WORKER_ROLE)
+    if gateway is None or worker is None:
+        return None
+    return gateway[1] == worker[1]
+
+
 @dataclass
 class HerdrSublaneActuatorOps:
     """Live herdr adapter composing the shared-project-workspace primitives for a lane.
@@ -132,6 +157,13 @@ class HerdrSublaneActuatorOps:
     providers: tuple[str, ...] = HERDR_LANE_PROVIDERS
     quiet_stdout: bool = False
     timeout: float = COMMAND_TIMEOUT_SECONDS
+    #: The running build's placement provenance (Redmine #13705). The default is
+    #: THIS runtime's real fingerprint (``__version__`` + advertised placement
+    #: contracts); tests inject an older / incompatible one to exercise the
+    #: mutating-heal runtime fence. Only the heal path reads it.
+    runtime_placement_fingerprint: RuntimePlacementFingerprint = field(
+        default_factory=production_placement_fingerprint
+    )
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 
@@ -324,8 +356,62 @@ class HerdrSublaneActuatorOps:
         stays fail-closed. Exposed as an *optional* port capability (the use case
         discovers it via ``getattr``): the tmux adapter deliberately does not provide it
         — a repeated tmux ``cockpit append`` would append a duplicate column, not adopt.
+
+        Runtime / placement-contract fence (Redmine #13705). BEFORE any pane side
+        effect the heal proves the running runtime can honour the lane's same-tab
+        pair placement contract: an incompatible / unknown-provenance runtime (a
+        source/installed skew — the measured incident healed a #13411 lane from an
+        older 0.10.0 runtime lacking the contract, splitting the pair across tabs)
+        fails closed here with zero ``workspace`` / ``tab`` / ``agent`` write. An
+        already-split live pair is likewise refused (a heal cannot repair a live
+        split). After a compatible relaunch a same-tab **postcondition** verifies
+        both slots share one ``(herdr_workspace, tab_id)`` container, so a heal that
+        nonetheless split the pair is surfaced rather than reported healed.
         """
+        # Preflight fence — read-only, before any side effect. A down / unreadable
+        # inventory is not decisive here (the append step fails closed on its own);
+        # the fence still evaluates the runtime's provenance / capability.
+        existing_pair_colocated: Optional[bool] = None
+        try:
+            rows = self._live_rows()
+        except HerdrSessionStartError:
+            rows = ()
+        if rows:
+            _ws, _lane, existing = self._resolve_lane_slots(worktree_path, rows)
+            existing_pair_colocated = _pair_colocation(existing)
+        verdict = evaluate_heal_runtime_fence(
+            self.runtime_placement_fingerprint,
+            existing_pair_colocated=existing_pair_colocated,
+        )
+        if not verdict.ok:
+            raise RuntimeError(
+                f"lane heal fenced ({verdict.reason}): {verdict.detail}"
+            )
+
         self.append_lane_column(worktree_path)
+
+        # Same-tab postcondition (Redmine #13705): the compatible heal must have kept
+        # (or restored) the gateway/worker pair in one container. A positive split
+        # detection fails closed; an unreadable inventory is not a positive detection
+        # (the `_execute_slot` landing guard already verified the launch landed in the
+        # requested tab), so it never fabricates a failure.
+        try:
+            post_rows = self._live_rows()
+        except HerdrSessionStartError:
+            return
+        _ws, _lane, healed = self._resolve_lane_slots(worktree_path, post_rows)
+        if _pair_colocation(healed) is False:
+            gateway = healed.get(GATEWAY_ROLE)
+            worker = healed.get(WORKER_ROLE)
+            raise RuntimeError(
+                "lane heal postcondition failed: the gateway "
+                f"{gateway[0] if gateway else '<none>'} and worker "
+                f"{worker[0] if worker else '<none>'} are not in one placement "
+                f"container after the relaunch (gateway placement "
+                f"{gateway[1] if gateway else None} != worker placement "
+                f"{worker[1] if worker else None}); the pair is split across tabs / "
+                "workspaces (Redmine #13705) — fail-closed"
+            )
 
     def _live_rows(self) -> Sequence[Mapping[str, object]]:
         binary = _resolve_binary_or_die(self.env)
@@ -341,17 +427,21 @@ class HerdrSublaneActuatorOps:
         workspace_id: str,
         lane_id: str,
         rows: Sequence[Mapping[str, object]],
-    ) -> dict[str, str]:
-        """Map ``{role: locator}`` for the lane unit's managed slots.
+    ) -> dict[str, tuple[str, str]]:
+        """Map ``{role: (locator, placement_key)}`` for the lane unit's managed slots.
 
         Decodes each ``agent list`` row's ``mzb1`` name (#13247); a row is a managed lane
         slot iff it decodes to ``(workspace_id, lane_id, role)``. Undecodable / foreign
         rows are skipped. A row that decodes to a managed slot but carries no live locator is
         skipped (a blank target is never a resolved pane), so the use case reads it as a
         missing pane and fails closed rather than adopting a locator-less lane.
+
+        ``placement_key`` is the slot's ``(herdr_workspace, tab_id)`` container
+        (Redmine #13705): two slots sharing one key are an operable same-tab pair; a
+        differing key is the ``pair_split`` a runtime skew produced.
         """
         want_lane = _norm_lane(lane_id)
-        slots: dict[str, str] = {}
+        slots: dict[str, tuple[str, str]] = {}
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
@@ -370,8 +460,40 @@ class HerdrSublaneActuatorOps:
                 continue
             # First live locator wins; a duplicate managed name is a session-start
             # fail-closed condition, not this read's to resolve.
-            slots.setdefault(identity.role, locator)
+            if identity.role not in slots:
+                slots[identity.role] = (
+                    locator,
+                    (_workspace_prefix(locator), _tab_id_of_row(row)),
+                )
         return slots
+
+    def _resolve_lane_slots(
+        self, worktree_path: str, rows: Sequence[Mapping[str, object]]
+    ) -> tuple[str, str, dict[str, tuple[str, str]]]:
+        """``(workspace_id, lane_id, {role: (locator, placement_key)})`` for the lane.
+
+        The shared resolution both :meth:`read_lane` and the #13705 heal fence use:
+        the shared project-workspace unit ``(project ws, lane_label)`` first, then the
+        legacy ``wt_<hash>`` default-lane compatibility unit. ``("", "", {})`` when the
+        worktree resolves no segment (the caller treats that as an absent lane).
+        """
+        try:
+            resolved = Path(worktree_path).expanduser().resolve()
+            workspace_id = herdr_workspace_segment(resolved)
+        except (OSError, ValueError):
+            return "", "", {}
+        lane_id = _norm_lane(self.lane_label)
+        slots: dict[str, tuple[str, str]] = {}
+        if workspace_id:
+            slots = self._lane_slots(workspace_id, lane_id, rows)
+        if not slots:
+            # Legacy compatibility (pre-#13377): the lane's agents live in their own
+            # `wt_<hash>` workspace under the default lane.
+            legacy_ws = derive_lane_workspace_token(str(resolved))
+            legacy_slots = self._lane_slots(legacy_ws, DEFAULT_LANE, rows)
+            if legacy_slots:
+                workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, legacy_slots
+        return workspace_id, lane_id, slots
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         """Resolve the lane from the live herdr inventory for this worktree (fail-safe).
@@ -385,12 +507,10 @@ class HerdrSublaneActuatorOps:
         Returns ``None`` when no segment resolves or neither managed slot is live (a
         fresh worktree before :meth:`append_lane_column`) — the use case then treats the
         lane as absent and creates it.
+
+        A live pair whose two slots do NOT share one ``(herdr_workspace, tab_id)``
+        container reads as ``pair_split`` (Redmine #13705), not ``active``.
         """
-        try:
-            resolved = Path(worktree_path).expanduser().resolve()
-            workspace_id = herdr_workspace_segment(resolved)
-        except (OSError, ValueError):
-            return None
         try:
             rows = self._live_rows()
         except HerdrSessionStartError:
@@ -399,17 +519,7 @@ class HerdrSublaneActuatorOps:
             # rather than fabricating a partial view — a genuinely down herdr also fails
             # closed on the append step, so this never adopts a lane it cannot see.
             return None
-        lane_id = _norm_lane(self.lane_label)
-        slots: dict[str, str] = {}
-        if workspace_id:
-            slots = self._lane_slots(workspace_id, lane_id, rows)
-        if not slots:
-            # Legacy compatibility (pre-#13377): the lane's agents live in their own
-            # `wt_<hash>` workspace under the default lane.
-            legacy_ws = derive_lane_workspace_token(str(resolved))
-            legacy_slots = self._lane_slots(legacy_ws, DEFAULT_LANE, rows)
-            if legacy_slots:
-                workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, legacy_slots
+        workspace_id, lane_id, slots = self._resolve_lane_slots(worktree_path, rows)
         gateway = slots.get(GATEWAY_ROLE)
         worker = slots.get(WORKER_ROLE)
         if not gateway and not worker:
@@ -421,9 +531,14 @@ class HerdrSublaneActuatorOps:
             issue=self.issue or None,
             branch=None,
             repo_root=str(worktree_path),
-            gateway_pane=gateway,
-            worker_pane=worker,
-            state=_lane_state(gateway, worker),
+            gateway_pane=gateway[0] if gateway else None,
+            worker_pane=worker[0] if worker else None,
+            state=_lane_state(
+                gateway[0] if gateway else None,
+                worker[0] if worker else None,
+                gateway_placement=gateway[1] if gateway else None,
+                worker_placement=worker[1] if worker else None,
+            ),
         )
 
     def probe_gateway_ready(self, gateway_pane: str) -> bool:

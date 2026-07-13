@@ -437,6 +437,45 @@ v1 に含めない**: launch 経路の語彙は現状 lane_class (`default` / `s
 には lane-role 語彙の launch 時解決が別途必要。schema は lane class key を追加するだけで拡張でき
 (closed set に新 class を足す)、既存 class の意味論は変わらないため、この拡張点は塞がっていない。
 
+## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
+
+§5 の同一 tab pair placement / heal contract は、**それを実装した runtime が heal を
+実行する**ことを前提にする。実測 incident (#13705): #13411 contract を持つ source
+(`c4a999e`) で作った lane を、同 contract を欠く古い installed runtime (pipx 0.10.0) で
+heal したため、replacement gateway が surviving worker と別 tab に着地し、`sublane list`
+は依然 `active` を返した。直接原因は runtime/source skew だが、製品欠陥は mutating
+actuation が **pane 生成前に実行 runtime の placement-contract capability / build
+provenance を照合しない**ことにある。
+
+- **runtime fence (fail-closed, side-effect 前)**: mutating heal は pane 生成前に
+  純 fence `sublane_runtime_fence.evaluate_heal_runtime_fence` を評価する。runtime は自身の
+  `RuntimePlacementFingerprint` (build `__version__` + advertise する placement capability
+  集合) を自己申告し、fence は `same_tab_pair_v13411` を advertise しない runtime を
+  `runtime_lacks_placement_contract`、build version が解決できない runtime を
+  `provenance_unknown` として **workspace/tab/agent write 0** で拒否する。fingerprint は
+  actuator に inject 可能で、production default は本 build の実 fingerprint
+  (`production_placement_fingerprint`)。
+- **pair invariant preflight**: heal 実行前に live pair が既に別 tab/workspace に分裂して
+  いれば (`existing_pair_colocated is False`) `pair_already_split` で fail-closed する
+  (live split は heal で in-place 修復できない — herdr は live pane の same-tab re-split を
+  拒否する)。single-provider heal (live slot 1 個) は非該当で block しない。
+- **same-tab postcondition**: compatible heal の後、両 slot が単一の
+  `(herdr_workspace, tab_id)` container を共有することを read-back で確認し、分裂を検出したら
+  fail-closed する (launch landing guard を通過した spec-drift/lying runtime も捕捉する)。
+- **`pair_split` degraded projection**: `sublane list` / readiness / doctor 相当の
+  projection (`project_herdr_sublanes` / `herdr_lane_view_for_worktree` / actuator
+  `read_lane`) は各 slot の `(herdr_workspace, tab_id)` を比較し、live pair が単一 container を
+  共有しなければ `active` ではなく domain state `pair_split` (`SUBLANE_STATE_PAIR_SPLIT`) を
+  返す。placement key を渡さない caller (tmux projection) は byte-invariant に `active` を保つ
+  (tmux の window 分裂は従来どおり `STALE_HINT_WINDOW_SPLIT` advisory)。
+- **#13524 reinstall gate との関係**: fence の provenance/capability 判定は
+  `doctor runtime` の silent-drift fingerprint と相補的である。local reinstall/dogfood は
+  source/installed fingerprint 一致を確認してから再開する (#13524 close condition)。
+
+fence は何も修復せず、live process env を読まない (herdr は不可)。blocked heal からの復旧は
+owner 判断 (runtime を `doctor runtime` で検証し、source と一致する互換 runtime で heal /
+recreate する) である。
+
 ## 6. Close-evidence contract (pure-herdr round trip)
 
 close 判定には次の durable evidence を要求する:

@@ -34,14 +34,69 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUBLANE_STATE_ACTIVE,
     SUBLANE_STATE_DETACHED,
     SUBLANE_STATE_GATEWAY_ONLY,
+    SUBLANE_STATE_PAIR_SPLIT,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
 
 
-def _row(ws, role, lane, locator):
-    return {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
+def _row(ws, role, lane, locator, tab_id=None):
+    row = {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
+    if tab_id is not None:
+        row["tab_id"] = tab_id
+    return row
+
+
+class PairSplitProjectionTest(unittest.TestCase):
+    """Redmine #13705: a gateway/worker pair not in one container reads `pair_split`."""
+
+    def _views(self, rows):
+        return project_herdr_sublanes(
+            rows, exclude_workspace_id="", resolve_repo_root=lambda ws: None
+        )
+
+    def test_pair_in_different_tabs_is_pair_split(self) -> None:
+        # The measured incident: a heal placed the replacement gateway in a DIFFERENT
+        # tab of the same herdr workspace from the surviving worker.
+        rows = [
+            _row("wsMain", "codex", "issue_13441_x", "w19:p22", tab_id="w19:t5"),
+            _row("wsMain", "claude", "issue_13441_x", "w19:pG", tab_id="w19:t6"),
+        ]
+        views = self._views(rows)
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].state, SUBLANE_STATE_PAIR_SPLIT)
+        self.assertTrue(views[0].gateway_pane and views[0].worker_pane)
+
+    def test_pair_in_same_tab_is_active(self) -> None:
+        rows = [
+            _row("wsMain", "codex", "issue_1_x", "w19:p2", tab_id="w19:t5"),
+            _row("wsMain", "claude", "issue_1_x", "w19:p3", tab_id="w19:t5"),
+        ]
+        self.assertEqual(self._views(rows)[0].state, SUBLANE_STATE_ACTIVE)
+
+    def test_loose_legacy_pair_no_tab_is_active_byte_invariant(self) -> None:
+        # A pre-#13411 loose pair (no tab_id) in one herdr workspace stays active.
+        rows = [
+            _row("wsMain", "codex", "issue_1_x", "w19:p2"),
+            _row("wsMain", "claude", "issue_1_x", "w19:p3"),
+        ]
+        self.assertEqual(self._views(rows)[0].state, SUBLANE_STATE_ACTIVE)
+
+    def test_pair_in_different_workspaces_is_pair_split(self) -> None:
+        # The #13380 workspace axis: gateway and worker in different herdr workspaces.
+        rows = [
+            _row("wsMain", "codex", "issue_1_x", "w19:p2", tab_id="w19:t5"),
+            _row("wsMain", "claude", "issue_1_x", "w20:p3", tab_id="w20:t5"),
+        ]
+        self.assertEqual(self._views(rows)[0].state, SUBLANE_STATE_PAIR_SPLIT)
+
+    def test_one_slot_tabbed_one_loose_is_pair_split(self) -> None:
+        rows = [
+            _row("wsMain", "codex", "issue_1_x", "w19:p2", tab_id="w19:t5"),
+            _row("wsMain", "claude", "issue_1_x", "w19:p3"),
+        ]
+        self.assertEqual(self._views(rows)[0].state, SUBLANE_STATE_PAIR_SPLIT)
 
 
 class ProjectHerdrSublanesTest(unittest.TestCase):
