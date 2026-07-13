@@ -901,45 +901,50 @@ class PackagedResourceShipsInTheWheelTest(unittest.TestCase):
     silently drop it (review R1-F4).
     """
 
-    def _package_data(self):
-        import tomllib
+    # The resource path RELATIVE TO THE PACKAGE ROOT — exactly the form a `package-data`
+    # entry takes. A literal, deliberately NOT derived from the reader module's
+    # ``__file__``: on the installed-package lane that module lives in site-packages, so
+    # a repo-relative derivation raises. And no ``tomllib`` (3.11+, while the matrix also
+    # runs 3.10) — a guard against a portability bug must not itself be unportable.
+    RESOURCE_REL = (
+        "e_140_adapter_provider/f_160_provider_registry/domain/"
+        "agent_provider_profiles.yaml"
+    )
 
-        pyproject = REPO_ROOT / "pyproject.toml"
-        with pyproject.open("rb") as handle:
-            data = tomllib.load(handle)
-        return data["tool"]["setuptools"]["package-data"]["mozyo_bridge"]
+    def _source_checkout(self):
+        """The repo checkout, or ``None`` when running against an installed package."""
+        return REPO_ROOT if (REPO_ROOT / "pyproject.toml").is_file() else None
 
     def test_profile_yaml_is_declared_as_package_data(self) -> None:
+        repo = self._source_checkout()
+        if repo is None:
+            self.skipTest("installed-package lane: no pyproject.toml to inspect")
+        text = (repo / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn(
+            self.RESOURCE_REL,
+            text,
+            f"{self.RESOURCE_REL} is not declared in [tool.setuptools.package-data]; "
+            f"an installed wheel would ship no agent provider profiles, the registry "
+            f"would fail to load, and every launch would fail closed",
+        )
+
+    def test_declared_path_is_the_file_the_reader_loads(self) -> None:
+        # A path typo would satisfy the check above and still ship nothing.
         from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
             AGENT_PROVIDER_PROFILE_RESOURCE,
         )
 
-        entries = self._package_data()
-        matching = [e for e in entries if e.endswith(AGENT_PROVIDER_PROFILE_RESOURCE)]
-        self.assertTrue(
-            matching,
-            f"{AGENT_PROVIDER_PROFILE_RESOURCE} is not declared in "
-            f"[tool.setuptools.package-data]; an installed wheel would ship no agent "
-            f"provider profiles and every launch would fail closed",
-        )
+        self.assertTrue(self.RESOURCE_REL.endswith(AGENT_PROVIDER_PROFILE_RESOURCE))
+        repo = self._source_checkout()
+        if repo is None:
+            self.skipTest("installed-package lane: no source tree to inspect")
+        self.assertTrue((repo / "src" / "mozyo_bridge" / self.RESOURCE_REL).is_file())
 
-    def test_declared_path_matches_the_module_that_reads_it(self) -> None:
-        # A path typo would pass the test above and still ship nothing.
-        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain import (
-            agent_provider_profile,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
-            AGENT_PROVIDER_PROFILE_RESOURCE,
-        )
-
-        reader_dir = Path(agent_provider_profile.__file__).resolve().parent
-        src_root = REPO_ROOT / "src" / "mozyo_bridge"
-        expected = str(
-            (reader_dir / AGENT_PROVIDER_PROFILE_RESOURCE).relative_to(src_root)
-        )
-        self.assertIn(expected, self._package_data())
-        # ...and the file is actually there for that path.
-        self.assertTrue((src_root / expected).is_file())
+    def test_the_reader_resolves_the_resource_package_anchored(self) -> None:
+        # Portable in BOTH lanes: `importlib.resources` resolves the artifact from the
+        # package itself, which is the property that must actually hold inside a wheel.
+        config = load_agent_provider_config()
+        self.assertTrue(config.profiles)
 
 
 class R1F4HostIndependenceTest(unittest.TestCase):
