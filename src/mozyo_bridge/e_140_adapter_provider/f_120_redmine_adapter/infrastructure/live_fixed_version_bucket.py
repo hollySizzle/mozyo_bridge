@@ -1,15 +1,23 @@
 """Live, project-scoped fixed-version lane-bucket read (Redmine #13687 Increment 1).
 
-Composes the two read-only f_120 live sources —
-:class:`LiveRedmineProjectVersionSource` (Version metadata) and
+Composes the three read-only f_120 live sources — :class:`LiveRedmineProjectSource` (the
+project's numeric id), :class:`LiveRedmineProjectVersionSource` (Version metadata) and
 :class:`LiveRedmineVersionIssueSource` (the Version's issues) — into the input the pure
 :class:`RedmineFixedVersionLaneBucketProvider` already consumes, so ``workflow
 dispatch-plan --live-redmine`` plans against a real Redmine without re-implementing the
 bucket / leaf rule. The pure provider is used **unchanged**: its snapshot semantics stay
 byte-identical, and every live-only strictness lives here.
 
-Read-only by construction: two ``GET``s and no write, no actuation, no handoff. This is
+Read-only by construction: three ``GET``s and no write, no actuation, no handoff. This is
 Increment 1's whole surface (j#76650); selection and dispatch are Increment 3.
+
+Why the project is read twice over (R1-F1 j#76747): the two endpoints do not take the same
+kind of project reference. The Versions path segment accepts an identifier, but the Issues
+list filter is documented as taking a **numeric id, not an identifier**
+(https://www.redmine.org/projects/redmine/wiki/Rest_Issues). Sending the identifier there
+would leave the project isolation resting on undocumented server behaviour, so the numeric
+id is resolved from the Projects endpoint — which does accept the identifier — and only
+that id scopes the issues read.
 
 Why this layer is stricter than the pure provider (j#76646 Finding 2 / j#76650)
 ------------------------------------------------------------------------------
@@ -24,6 +32,9 @@ a zero-candidate plan:
 - the declared host does not match the trusted credential base URL -> ``project_host_mismatch``
   (raised **before any network call**, so a hostile checkout can never draw the key to
   its own host);
+- the project's numeric id cannot be established, or the server resolves the identifier to
+  a different project -> ``project_unresolved`` (the issues read is never scoped to a
+  project nobody asked for, and never to a guessed id);
 - the requested Version is not among the ones the project can see -> ``version_not_found``
   (this is also how a cross-project Version id is caught);
 - a Version *name* matches several ids -> ``version_ambiguous`` (never guessed);
@@ -49,6 +60,9 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
     resolve_redmine_credentials,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_project_source import (
+    LiveRedmineProjectSource,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_project_version_source import (
     LiveRedmineProjectVersionSource,
@@ -89,12 +103,14 @@ class LiveBucketRead:
 
     ``provider`` is the pure #12919 provider loaded with exactly the live-read payloads,
     so the caller resolves the bucket through the same code path a snapshot run uses.
-    ``project_identifier`` / ``version_id`` / ``version_name`` describe what was actually
+    ``project_identifier`` (the declared slug) / ``project_id`` (the numeric id the issues
+    read was actually scoped to) / ``version_id`` / ``version_name`` describe what was
     read, for the coordinator's durable dispatch record.
     """
 
     provider: RedmineFixedVersionLaneBucketProvider
     project_identifier: str
+    project_id: int
     version_id: str
     version_name: Optional[str]
     issue_count: int
@@ -217,6 +233,15 @@ def read_live_fixed_version_bucket(
             reason=LIVE_VERSION_NOT_FOUND,
         )
 
+    # The issues filter takes a NUMERIC project id, not an identifier (official Issues REST
+    # contract; R1-F1 j#76747). Resolve it from the documented Projects endpoint, which does
+    # accept the identifier. Deliberately not taken from the Version's embedded `project`:
+    # a *shared* Version's project is its owner, which need not be the project being scoped.
+    project_id = LiveRedmineProjectSource(
+        api_key=api_key, base_url=trusted_base, opener=opener
+    ).read_project_id(identifier)
+
+    # The Versions path segment does accept the identifier, so it stays as declared.
     version_source = LiveRedmineProjectVersionSource(
         api_key=api_key, base_url=trusted_base, opener=opener
     )
@@ -235,7 +260,7 @@ def read_live_fixed_version_bucket(
     issue_source = LiveRedmineVersionIssueSource(
         api_key=api_key,
         base_url=trusted_base,
-        project_id=identifier,
+        project_id=str(project_id),
         opener=opener,
     )
     issues = list(issue_source.read_version_issues(version_id))
@@ -250,6 +275,7 @@ def read_live_fixed_version_bucket(
     return LiveBucketRead(
         provider=provider,
         project_identifier=identifier,
+        project_id=project_id,
         version_id=version_id,
         version_name=_text(entry.get("name")),
         issue_count=len(issues),

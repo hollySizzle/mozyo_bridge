@@ -545,6 +545,7 @@ class LiveRedmineModeTest(unittest.TestCase):
                 },
             ),
             project_identifier="giken-3800-mozyo-bridge",
+            project_id=38,
             version_id="292",
             version_name="枠",
             issue_count=4,
