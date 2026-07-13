@@ -291,6 +291,15 @@ Table naming:
     unique は、同じ issue 番号を正当に持つ別 project と衝突する。
   - `released` は command outcome / desired state であり **live absence の正本ではない**。process
     presence は従来どおり live inventory (`observed_liveness`) を読む。
+  - **owner binding と decision anchor は別 field である** (schema v2、#13689 R2-F1)。`issue_id` は
+    「この lane がどの issue を所有しているか」(unbound lane では **空**)、`decision_source` /
+    `decision_issue_id` / `decision_journal` は「現在の state をどの durable record が決めたか」で
+    **常に完全**である。Redmine の journal は issue 経由 (`/issues/<id>.json`) でしか addressing
+    できないため、issue を欠く anchor は何も指さず、`operator_current_state` の復旧 (explicit
+    re-declare) が成立しない。両者を 1 field に畳むと、unbound lane が再読不能な anchor を持てて
+    しまう。`DecisionPointer` は source 語彙と **positive decimal な issue/journal id** を要求する。
+    v1 row の anchor は issue を欠くため `decision` が `None` (再読不能) として **可視化**され、
+    推測で back-fill しない。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
 
 Ownership rules:
