@@ -159,9 +159,9 @@ def _secret_value_is_real(value: str) -> bool:
     that carry common credential punctuation such as ``.``, ``/``, ``+`` and
     padding ``=`` (dotted JWTs, slash/base64 secrets, provider-style keys). See
     the focused tests for the exact accept / reject cases pinned by Redmine
-    #12175 (j#60460, j#60466).
+    #12175 (j#60460, j#60466) and #13695 (call-terminated literals).
     """
-    raw = value.strip().rstrip(",;")
+    raw = value.strip().rstrip(",;)]}")
     quoted = False
     if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
         inner = raw[1:-1]
