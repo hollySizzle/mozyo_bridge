@@ -80,6 +80,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DecisionPointer,
     DecisionPointerError,
     ReleasePinError,
+    recovery_refusal,
     rehydrate_allowed,
     validate_release_pins,
     CAS_ACTION_MISMATCH,
@@ -124,7 +125,11 @@ from mozyo_bridge.core.state.state_store import (
 
 #: The state_schema_components identity of this native component.
 LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
-LANE_LIFECYCLE_SCHEMA_VERSION = 1
+#: v2 (Redmine #13689 R2-F1): splits the durable decision anchor's issue
+#: (``decision_issue_id``) from the lane's owner binding (``issue_id``). A Redmine
+#: journal is only addressable through its issue, so an anchor without one names
+#: nothing — and an unbound lane legitimately has no binding.
+LANE_LIFECYCLE_SCHEMA_VERSION = 2
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -143,6 +148,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     release_action_id TEXT NOT NULL DEFAULT '',
     release_pins TEXT NOT NULL DEFAULT '',
     decision_source TEXT NOT NULL DEFAULT '',
+    decision_issue_id TEXT NOT NULL DEFAULT '',
     decision_journal TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -164,7 +170,7 @@ WHERE lane_disposition = '{DISPOSITION_ACTIVE}' AND issue_id <> ''
 _COLUMNS = (
     "repo_workspace_id, lane_id, issue_id, lane_disposition, process_release, "
     "revision, release_action_id, release_pins, decision_source, "
-    "decision_journal, created_at, updated_at"
+    "decision_issue_id, decision_journal, created_at, updated_at"
 )
 
 
@@ -213,6 +219,18 @@ class LaneLifecycleStore:
         try:
             with conn:
                 conn.execute(_TABLE_SQL)
+                # v1 -> v2 (R2-F1): additive, mirroring the sibling native component's
+                # ``lane_metadata`` v2 migration. A v1 row's anchor kept only the
+                # journal, so its ``decision_issue_id`` lands empty — that row is a
+                # known-incomplete anchor, not a silently-repaired one.
+                columns = {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")
+                }
+                if "decision_issue_id" not in columns:
+                    conn.execute(
+                        f"ALTER TABLE {_TABLE} "
+                        "ADD COLUMN decision_issue_id TEXT NOT NULL DEFAULT ''"
+                    )
                 conn.execute(_OWNER_INDEX_SQL)
                 conn.execute(
                     "INSERT INTO state_schema_components "
@@ -321,14 +339,16 @@ class LaneLifecycleStore:
         key: LaneLifecycleKey,
         *,
         decision: DecisionPointer,
+        issue_id: str = "",
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Declare a fresh lane ``active`` / ``not_requested`` at revision 1.
 
-        The lane's issue comes from ``decision`` — the durable record that decided
-        it owns that issue (R1-F5); there is no way to declare an owner without
-        naming the decision. An issueless lane declares with an empty
-        ``decision.issue_id``.
+        ``issue_id`` is the lane's **owner binding** and may be empty — an unbound
+        lane owns no issue (Design Answer D2). ``decision`` is the **durable anchor**
+        of the record that declared it and is always complete, unbound or not
+        (R2-F1). When the lane *is* bound, the two must name the same issue: a
+        decision filed on an unrelated ticket does not authorize this ownership.
 
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the
@@ -337,7 +357,12 @@ class LaneLifecycleStore:
         this workspace: the storage index, not a later check, is what makes double
         ownership impossible.
         """
-        issue = decision.issue_id
+        issue = norm(issue_id)
+        if not decision.authorizes_binding(issue):
+            raise DecisionPointerError(
+                f"decision is anchored to issue {decision.issue_id!r} but the lane "
+                f"is being bound to {issue!r}"
+            )
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -356,7 +381,7 @@ class LaneLifecycleStore:
             try:
                 conn.execute(
                     f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         key.repo_workspace_id,
                         key.lane_id,
@@ -367,6 +392,7 @@ class LaneLifecycleStore:
                         "",
                         "",
                         decision.source,
+                        decision.issue_id,
                         decision.journal_id,
                         stamp,
                         stamp,
@@ -421,8 +447,9 @@ class LaneLifecycleStore:
             if refusal is not None:
                 conn.execute("ROLLBACK")
                 return refusal
-            if not decision.binds_issue(current.issue_id):
-                # The decision authorizes a different issue than this lane holds.
+            if not decision.authorizes_binding(current.issue_id):
+                # A bound lane may only be decided by a record filed on its own issue;
+                # an unbound lane accepts any complete anchor (R2-F1).
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
@@ -464,7 +491,8 @@ class LaneLifecycleStore:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
                     "release_action_id = ?, release_pins = ?, revision = ?, "
-                    "decision_source = ?, decision_journal = ?, updated_at = ? "
+                    "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
+                    "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
                     (
                         target,
@@ -473,6 +501,7 @@ class LaneLifecycleStore:
                         pins,
                         revision,
                         decision.source,
+                        decision.issue_id,
                         decision.journal_id,
                         stamp,
                         key.repo_workspace_id,
@@ -565,7 +594,7 @@ class LaneLifecycleStore:
                     revision=current.revision,
                 )
             incoming = _locked_row(conn, recovery)
-            refusal = _recovery_refusal(
+            refusal = recovery_refusal(
                 incoming,
                 issue=issue,
                 expected_disposition=recovery_expected_disposition,
@@ -590,12 +619,14 @@ class LaneLifecycleStore:
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, revision = ?, "
-                    "decision_source = ?, decision_journal = ?, updated_at = ? "
+                    "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
+                    "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
                     (
                         DISPOSITION_SUPERSEDED,
                         current.revision + 1,
                         decision.source,
+                        decision.issue_id,
                         decision.journal_id,
                         stamp,
                         superseded.repo_workspace_id,
@@ -607,7 +638,7 @@ class LaneLifecycleStore:
                     revision = 1
                     conn.execute(
                         f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             recovery.repo_workspace_id,
                             recovery.lane_id,
@@ -618,6 +649,7 @@ class LaneLifecycleStore:
                             "",
                             "",
                             decision.source,
+                            decision.issue_id,
                             decision.journal_id,
                             stamp,
                             stamp,
@@ -628,7 +660,8 @@ class LaneLifecycleStore:
                     conn.execute(
                         f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
                         "process_release = ?, release_action_id = ?, release_pins = ?, "
-                        "revision = ?, decision_source = ?, decision_journal = ?, "
+                        "revision = ?, decision_source = ?, decision_issue_id = ?, "
+                        "decision_journal = ?, "
                         "updated_at = ? WHERE repo_workspace_id = ? AND lane_id = ? "
                         "AND revision = ?",
                         (
@@ -639,6 +672,7 @@ class LaneLifecycleStore:
                             "",
                             revision,
                             decision.source,
+                            decision.issue_id,
                             decision.journal_id,
                             stamp,
                             recovery.repo_workspace_id,
@@ -830,9 +864,10 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         release_action_id=str(row[6] or ""),
         release_pins=str(row[7] or ""),
         decision_source=str(row[8] or ""),
-        decision_journal=str(row[9] or ""),
-        created_at=str(row[10]),
-        updated_at=str(row[11]),
+        decision_issue_id=str(row[9] or ""),
+        decision_journal=str(row[10] or ""),
+        created_at=str(row[11]),
+        updated_at=str(row[12]),
     )
 
 
@@ -846,49 +881,6 @@ def _locked_row(
     ).fetchone()
     return _record(row) if row is not None else None
 
-
-
-def _recovery_refusal(
-    incoming: Optional[LaneLifecycleRecord],
-    *,
-    issue: str,
-    expected_disposition: Optional[str],
-    expected_revision: Optional[int],
-) -> Optional[CasOutcome]:
-    """Guard the recovery side of a supersession (``None`` when it may be activated).
-
-    Everything the *old* lane's guard does, the recovery lane needs too (R1-F2) — it
-    is just as much a CAS target. Beyond the expected state + revision it also has to
-    keep two invariants the old lane cannot: it must not already own a **different**
-    issue (R1-F1), and it must not have a release generation in flight (R1-F3).
-    """
-    if incoming is None:
-        if expected_disposition is not None or expected_revision is not None:
-            # The caller expected an existing recovery lane; there is none.
-            return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
-        return None
-    if expected_disposition is None or expected_revision is None:
-        # An existing recovery lane may only be moved under an explicit expectation.
-        return CasOutcome(
-            applied=False, reason=CAS_UNEXPECTED_STATE, revision=incoming.revision
-        )
-    refusal = guard(incoming, expected_disposition, expected_revision)
-    if refusal is not None:
-        return refusal
-    if incoming.issue_id and incoming.issue_id != issue:
-        # Promoting it would leave `incoming.issue_id` with no owner at all.
-        return CasOutcome(
-            applied=False, reason=CAS_OWNER_CONFLICT, revision=incoming.revision
-        )
-    if incoming.lane_disposition not in (DISPOSITION_ACTIVE, DISPOSITION_HIBERNATED):
-        return CasOutcome(
-            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
-        )
-    if not rehydrate_allowed(incoming.process_release):
-        return CasOutcome(
-            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
-        )
-    return None
 
 
 def _active_owner(

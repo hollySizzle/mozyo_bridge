@@ -291,6 +291,15 @@ class DecisionPointerError(ValueError):
     """A durable decision pointer is missing / malformed (R1-F5); fail closed."""
 
 
+def _positive_decimal(value: str, *, field: str) -> str:
+    """A Redmine id: a positive decimal. Anything else cannot address a record."""
+    if not value.isdigit() or int(value) <= 0:
+        raise DecisionPointerError(
+            f"a redmine {field} must be a positive decimal id, got {value!r}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class DecisionPointer:
     """The durable record that authorizes one lifecycle write.
@@ -305,6 +314,18 @@ class DecisionPointer:
     stored decision actually names the record that made it. Inheriting the previous
     write's pointer would leave a rehydrate decision pointing at the hibernate
     journal — an anchor that documents the wrong thing.
+
+    **The anchor is always complete, even for a lane that owns no issue (R2-F1).** A
+    Redmine journal is only addressable *through its issue* — the adapter reaches it
+    as ``/issues/<id>.json``, and there is no journal-addressable endpoint — so a
+    pointer without an issue id names nothing and cannot be re-read at recovery time.
+    Both ids are therefore required and must be positive decimals.
+
+    This is deliberately **not** the lane's owner binding. Whether a lane *owns* an
+    issue (:attr:`LaneLifecycleRecord.issue_id`, legitimately empty for an unbound
+    lane, Design Answer D2) and *which record decided* its current state (this
+    pointer, never empty, D1) are different facts. Folding them into one field is
+    what let an unbound lane store an unreadable anchor.
     """
 
     source: str
@@ -320,19 +341,31 @@ class DecisionPointer:
                 f"unknown decision source {self.source!r}; "
                 f"expected one of {sorted(DECISION_SOURCES)}"
             )
-        if not self.journal_id:
-            raise DecisionPointerError(
-                "a durable decision pointer requires the journal id that recorded it"
-            )
+        _positive_decimal(self.issue_id, field="issue id")
+        _positive_decimal(self.journal_id, field="journal id")
 
-    def binds_issue(self, issue_id: str) -> bool:
-        """Does this pointer authorize a decision about ``issue_id``?"""
-        return self.issue_id == norm(issue_id)
+    def authorizes_binding(self, binding_issue_id: str) -> bool:
+        """May this decision act on a lane bound to ``binding_issue_id``?
+
+        An **unbound** lane (empty binding) may be decided by any valid anchor — the
+        decision is about the lane, not about an ownership it does not hold. A lane
+        that *does* own an issue may only be decided by a record filed on that same
+        issue, so a decision cannot be anchored to an unrelated ticket.
+        """
+        binding = norm(binding_issue_id)
+        return not binding or binding == self.issue_id
 
 
 @dataclass(frozen=True)
 class LaneLifecycleRecord:
-    """One lane unit's durable desired lifecycle."""
+    """One lane unit's durable desired lifecycle.
+
+    ``issue_id`` is the lane's **owner binding** — which issue this lane owns, empty
+    when it owns none. ``decision_*`` is the **durable anchor** of the record that put
+    the lane in its current state, and is always complete. The two are separate
+    (R2-F1): an unbound lane still has a decision, and that decision must stay
+    re-readable.
+    """
 
     repo_workspace_id: str
     lane_id: str
@@ -343,6 +376,7 @@ class LaneLifecycleRecord:
     release_action_id: str = ""
     release_pins: str = ""
     decision_source: str = ""
+    decision_issue_id: str = ""
     decision_journal: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -355,6 +389,24 @@ class LaneLifecycleRecord:
     def pins(self) -> tuple[ReleasePin, ...]:
         return decode_release_pins(self.release_pins)
 
+    @property
+    def decision(self) -> Optional[DecisionPointer]:
+        """The stored anchor, or ``None`` when this row has no re-readable one.
+
+        ``None`` is the honest answer for a v1 row written before the anchor carried
+        its issue (R2-F1): that row cannot be re-read from Redmine, and a caller must
+        see that rather than a pointer that looks usable. The gap is surfaced, never
+        back-filled with a guessed issue.
+        """
+        try:
+            return DecisionPointer(
+                source=self.decision_source,
+                issue_id=self.decision_issue_id,
+                journal_id=self.decision_journal,
+            )
+        except DecisionPointerError:
+            return None
+
     def as_payload(self) -> dict[str, object]:
         return {
             "repo_workspace_id": self.repo_workspace_id,
@@ -366,6 +418,7 @@ class LaneLifecycleRecord:
             "release_action_id": self.release_action_id,
             "release_pins": [p.as_payload() for p in self.pins],
             "decision_source": self.decision_source,
+            "decision_issue_id": self.decision_issue_id,
             "decision_journal": self.decision_journal,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -416,7 +469,51 @@ def guard(
     return None
 
 
+def recovery_refusal(
+    incoming: Optional[LaneLifecycleRecord],
+    *,
+    issue: str,
+    expected_disposition: Optional[str],
+    expected_revision: Optional[int],
+) -> Optional[CasOutcome]:
+    """Guard the recovery side of a supersession (``None`` when it may be activated).
+
+    Everything the *old* lane's guard does, the recovery lane needs too (R1-F2) — it
+    is just as much a CAS target. Beyond the expected state + revision it also has to
+    keep two invariants the old lane cannot: it must not already own a **different**
+    issue (R1-F1), and it must not have a release generation in flight (R1-F3).
+    """
+    if incoming is None:
+        if expected_disposition is not None or expected_revision is not None:
+            # The caller expected an existing recovery lane; there is none.
+            return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+        return None
+    if expected_disposition is None or expected_revision is None:
+        # An existing recovery lane may only be moved under an explicit expectation.
+        return CasOutcome(
+            applied=False, reason=CAS_UNEXPECTED_STATE, revision=incoming.revision
+        )
+    refusal = guard(incoming, expected_disposition, expected_revision)
+    if refusal is not None:
+        return refusal
+    if incoming.issue_id and incoming.issue_id != issue:
+        # Promoting it would leave `incoming.issue_id` with no owner at all.
+        return CasOutcome(
+            applied=False, reason=CAS_OWNER_CONFLICT, revision=incoming.revision
+        )
+    if incoming.lane_disposition not in (DISPOSITION_ACTIVE, DISPOSITION_HIBERNATED):
+        return CasOutcome(
+            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
+        )
+    if not rehydrate_allowed(incoming.process_release):
+        return CasOutcome(
+            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
+        )
+    return None
+
+
 __all__ = (
+    "recovery_refusal",
     "DECISION_SOURCES",
     "DECISION_SOURCE_REDMINE",
     "DecisionPointer",
