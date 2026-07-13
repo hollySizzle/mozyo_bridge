@@ -10,10 +10,12 @@ non-active, so the W4 roster join excludes it from active capacity).
 
 from __future__ import annotations
 
+import argparse
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -45,7 +47,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_WORKING,
     HibernateAssertions,
     HibernateRequest,
+    LiveSublaneHibernateOps,
     SublaneHibernateUseCase,
+    cmd_sublane_hibernate,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -342,6 +346,9 @@ class SublaneHibernateTest(unittest.TestCase):
             ("not_working", BLOCK_WORKING),
             ("no_pending_prompt", BLOCK_PENDING_PROMPT),
             ("callbacks_drained", BLOCK_CALLBACK_DEBT),
+            # R1 j#77907 named a dirty-worktree / boundary-unrecorded partial retry: turning
+            # off worktree_clean (boundary_recorded stays False) makes boundary_ok False.
+            ("worktree_clean", BLOCK_UNRECORDED_BOUNDARY),
         ):
             with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
                 store = self._store(tmp)
@@ -472,6 +479,105 @@ class SublaneHibernateTest(unittest.TestCase):
                 DISPOSITION_ACTIVE,
             )
             self.assertEqual(ops.close_calls, [])
+
+
+_PROJECTION = (
+    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+    ".application.sublane_herdr_projection.list_herdr_agent_rows"
+)
+_WORKSPACE_SEGMENT = (
+    "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application"
+    ".herdr_session_start.herdr_workspace_segment"
+)
+_HIBERNATE_MOD = (
+    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+    ".application.sublane_hibernate"
+)
+
+
+class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
+    """R2 (j#77925): pin the REAL adapter's inventory exception -> unreadable conversion.
+
+    The prior regression injected a ``readable=False`` fake, which bypassed the live
+    adapter's own ``try/except`` and the CLI's non-zero exit. These exercise that boundary
+    directly, so a re-introduced fail-open (exception folded to a "successful empty") is
+    caught by a committed test, not just a one-off probe.
+    """
+
+    def test_read_inventory_success_is_readable(self) -> None:
+        ops = LiveSublaneHibernateOps(repo_root=Path("."))
+        with mock.patch(
+            _PROJECTION, return_value=[{"name": "x", "pane_id": "w:p1"}]
+        ):
+            rows, readable = ops.read_inventory()
+        self.assertTrue(readable)
+        self.assertEqual(len(list(rows)), 1)
+
+    def test_read_inventory_exception_is_unreadable_not_empty(self) -> None:
+        ops = LiveSublaneHibernateOps(repo_root=Path("."))
+        with mock.patch(_PROJECTION, side_effect=RuntimeError("herdr inventory down")):
+            rows, readable = ops.read_inventory()
+        # The exception must surface as UNREADABLE, never a "successful empty".
+        self.assertFalse(readable)
+        self.assertEqual(tuple(rows), ())
+
+    def test_live_adapter_exception_blocks_hibernate_without_mutation(self) -> None:
+        # adapter -> use-case: a real inventory read failure blocks BEFORE the CAS, keeps
+        # the lane active, and closes nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            with mock.patch(_WORKSPACE_SEGMENT, return_value=WS), mock.patch(
+                _PROJECTION, side_effect=RuntimeError("herdr inventory down")
+            ):
+                outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                    _request(), execute=True
+                )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_INVENTORY_UNREADABLE, outcome.preflight.blocked_reasons
+            )
+            self.assertIsNone(outcome.transition)  # CAS never attempted
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_cmd_returns_nonzero_when_inventory_unreadable(self) -> None:
+        # CLI exit: a blocked (unreadable-inventory) hibernate must exit non-zero.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            args = argparse.Namespace(
+                repo=None,
+                issue=ISSUE,
+                lane=LANE,
+                journal=JOURNAL,
+                explicitly_parked=True,
+                callbacks_drained=True,
+                no_review_pending=True,
+                no_owner_approval_pending=True,
+                no_integration_pending=True,
+                no_pending_prompt=True,
+                not_working=True,
+                worktree_clean=True,
+                boundary_recorded=False,
+                execute=True,
+                json=False,
+            )
+            fake_ops = _FakeOps(rows=[], readable=False)
+            with mock.patch(
+                f"{_HIBERNATE_MOD}.LiveSublaneHibernateOps", return_value=fake_ops
+            ), mock.patch(
+                f"{_HIBERNATE_MOD}.LaneLifecycleStore", return_value=store
+            ):
+                rc = cmd_sublane_hibernate(args)
+            self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":
