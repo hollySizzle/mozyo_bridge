@@ -34,6 +34,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RedmineJournalSource,
     markers_from_source,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+    OwningLaneBinding,
+    ReviewReturnPlan,
+    encode_review_return_payload,
+    plan_review_returns,
+)
 
 #: The default callback route for a handoff-worthy gate: the coordinator (a sublane callback
 #: goes to the coordinator lane, per the workflow doctrine).
@@ -76,6 +82,53 @@ def discover_candidates(
             )
         )
     return candidates
+
+
+def discover_review_returns(
+    source: RedmineJournalSource,
+    issue: str,
+    owner: OwningLaneBinding,
+    *,
+    workspace_id: str = "",
+) -> tuple[list[CallbackCandidate], list[ReviewReturnPlan]]:
+    """Discover correlated review_result return candidates for an issue (Redmine #13684).
+
+    Reads the issue's structured gate markers and asks the pure
+    :func:`...domain.review_return_route.plan_review_returns` policy which review_result (if any) is
+    returnable to its durable owning-lane Codex gateway, given ``owner`` (the #13681/#13689 owning-lane
+    binding + generation + gateway receiver the caller already resolved). Only a :data:`RETURN_OK` plan
+    becomes a :class:`CallbackCandidate` — carrying the ``review_return:<lane>`` route (a distinct
+    idempotency key from the coordinator callback) and the durable expected target tuple
+    (lane / gateway receiver / owning-lane generation) the background_service delivery authority binds
+    the re-resolved live target + independently-read live generation to.
+
+    Returns ``(candidates, plans)``: the candidates to enqueue, plus every plan (incl. refusals) so the
+    caller can record why nothing was returned (observability). A read failure propagates to the caller
+    (handled fail-closed per candidate downstream); an issue with no returnable review_result yields no
+    candidate — never a guess.
+    """
+    markers = markers_from_source(source, issue)
+    plans = list(plan_review_returns(markers, issue, owner))
+    candidates: list[CallbackCandidate] = []
+    for plan in plans:
+        if not plan.emit:
+            continue
+        candidates.append(
+            CallbackCandidate(
+                issue=str(issue).strip(),
+                journal=str(plan.review_journal).strip(),
+                callback_route=plan.callback_route,
+                notification_kind="review_result",
+                # The correlated review_request (action identity) the row is bound to, persisted on
+                # the outbox row so the send authority can re-verify the round at action time (R1-F2).
+                payload=encode_review_return_payload(plan.review_request_journal),
+                workspace_id=str(workspace_id or "").strip(),
+                target_lane=plan.target_lane,
+                target_receiver=plan.target_receiver,
+                target_generation=plan.target_generation,
+            )
+        )
+    return candidates, plans
 
 
 def run_once(
@@ -139,4 +192,10 @@ def watch(
     return results
 
 
-__all__ = ("DEFAULT_CALLBACK_ROUTE", "discover_candidates", "run_once", "watch")
+__all__ = (
+    "DEFAULT_CALLBACK_ROUTE",
+    "discover_candidates",
+    "discover_review_returns",
+    "run_once",
+    "watch",
+)

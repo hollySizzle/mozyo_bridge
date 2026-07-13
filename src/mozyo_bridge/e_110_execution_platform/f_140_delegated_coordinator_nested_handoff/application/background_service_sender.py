@@ -63,6 +63,13 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+#: The action-time round-fence refusal (Redmine #13684 review R1-F1): a reserved review_result return
+#: was found stale at the send edge (a newer review_request / result / correction superseded its
+#: round). A deterministic zero-send — the transport is never invoked and the row bounded-retries then
+#: dead-letters (operator-visible), never a blind delivery of a stale review outcome.
+ROUND_STALE = "review_round_stale"
+
+
 class TargetResolver(Protocol):
     """Re-resolves a claimed row's route to live targets (route ledger + live inventory)."""
 
@@ -92,15 +99,23 @@ class BackendNeutralTargetResolver:
       assigned-name ``pane_name``, so a wrong / missing label is never resolved — R5-F1);
     - an **unsupported backend** (no Phase A live-inventory adaptation, e.g. tmux) is an explicit
       durable fail-closed boundary — no target, rather than silently resolving on a partial key;
-    - the resolved target's ``generation`` is read from the **live** authority, NEVER copied from the
-      row (R5-F2): Phase A's live inventory carries no generation, so it is blank/unknown, and the
-      delivery authority then fails a generation-correlated (non-blank expected) row closed.
+    - the resolved target's ``generation`` is read from an independent **live** authority
+      (``live_generation_fn``), NEVER copied from the row (R5-F2 / #13684 correction 1): the delivery
+      authority then requires the row's *expected* generation and this *live* generation to both be
+      non-blank and match. Without a ``live_generation_fn`` (Phase A / a coordinator route) the live
+      generation is blank, so a generation-correlated (non-blank expected) row still fails closed —
+      #13684 injects the owning-lane generation reader only for the correlated review_result return
+      route (:data:`...domain.review_return_route.REVIEW_RETURN_ROUTE_PREFIX`), which is what enables
+      that route's delivery while leaving every other route's Phase A fail-closed-disabled state intact.
 
     ``inventory`` is the injectable ``(rows, backend)`` seam; tests inject fixed rows + a backend.
+    ``live_generation_fn`` is the injectable independent live-generation authority (default: none ->
+    blank -> unchanged Phase A behaviour).
     """
 
     workspace_id: str
     inventory: BackendInventory
+    live_generation_fn: Optional[Callable[[CallbackOutboxRow], str]] = None
 
     def resolve(self, row: CallbackOutboxRow) -> TargetResolution:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
@@ -139,6 +154,17 @@ class BackendNeutralTargetResolver:
         locator = str(getattr(resolution, "resolved_pane_id", "") or "").strip()
         if not locator:
             return TargetResolution.of([])
+        # R5-F2 / #13684 correction 1: the generation is read from the INDEPENDENT live authority
+        # (``live_generation_fn``), never copied from the row. For the correlated review_result return
+        # route this is the owning-lane's live revision (which mismatches a supersession-bumped or
+        # owner-changed expectation -> zero-send); without an injected authority it stays blank, so a
+        # generation-correlated row still fails closed at :func:`authorize_background_delivery`.
+        live_generation = ""
+        if self.live_generation_fn is not None:
+            try:
+                live_generation = str(self.live_generation_fn(row) or "").strip()
+            except Exception:  # noqa: BLE001 - an unreadable generation authority is a blank -> fail-closed
+                live_generation = ""
         return TargetResolution.of([
             DeliveryTarget(
                 workspace_id=self.workspace_id,
@@ -146,10 +172,7 @@ class BackendNeutralTargetResolver:
                 receiver=expected_receiver,
                 issue=str(getattr(row, "issue", "") or ""),
                 journal=str(getattr(row, "journal", "") or ""),
-                # R5-F2: generation from LIVE evidence, never the row. Phase A live inventory carries
-                # none -> blank/unknown, so a generation-correlated row (non-blank expected) fails
-                # closed at the authority until #13684's live generation authority populates it.
-                generation="",
+                generation=live_generation,
                 locator=locator,
             )
         ])
@@ -180,6 +203,12 @@ class BackgroundServiceCallbackSender:
     outbox: Optional[CallbackOutbox] = None
     now_fn: Callable[[], str] = _utc_now_iso
     claim_stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS
+    #: #13684 review R1-F1 — the action-time round fence. For a correlated review_result return row it
+    #: re-reads the issue's live structured markers at the send edge and returns True only when the
+    #: reserved result is STILL the current review round (no newer request / result / correction). A
+    #: stale row returns False -> a deterministic zero-send (never a blind delivery of a stale result).
+    #: ``None`` (default) applies no fence — a non-return row / a pure-mechanism test is unaffected.
+    round_fence_fn: Optional[Callable[[CallbackOutboxRow], bool]] = None
 
     def __call__(self, row: CallbackOutboxRow) -> CallbackSendResult:
         # Boundary 2 (claim): the durable outbox claim must still be OURS and unexpired at send time
@@ -221,6 +250,15 @@ class BackgroundServiceCallbackSender:
             return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_LEASE)
         if not self._holds_claim(row):
             return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_CLAIM)
+        # R1-F1 action-time round fence: for a correlated review_result return, re-verify at the send
+        # edge that the reserved result is STILL the current review round (a newer review_request /
+        # result landing after reserve makes it stale). A stale round is a deterministic zero-send —
+        # the transport is NEVER invoked, and the row stays retryable then bounded-dead-letters
+        # (operator-visible), never a blind delivery of a stale review outcome.
+        if not self._round_is_current(row):
+            return CallbackSendResult(
+                SEND_NOT_SENT, persist_ok=False, persist_reason=ROUND_STALE
+            )
         try:
             result = self.transport.deliver(row, decision.target)
         except Exception:  # noqa: BLE001 - a transport blow-up mid-send is uncertain (no blind retry)
@@ -229,6 +267,20 @@ class BackgroundServiceCallbackSender:
         return CallbackSendResult(
             outcome, persist_ok=result.persist_ok, persist_reason=result.persist_reason
         )
+
+    def _round_is_current(self, row: CallbackOutboxRow) -> bool:
+        """True iff the row's reserved review round is still current at the send edge (R1-F1).
+
+        No fence wired, or a non-review-return row -> True (unaffected). With a fence, delegate to it;
+        a fence that raises is fail-closed (a round we cannot re-verify is treated as stale so a
+        possibly-superseded result is never delivered).
+        """
+        if self.round_fence_fn is None:
+            return True
+        try:
+            return bool(self.round_fence_fn(row))
+        except Exception:  # noqa: BLE001 - an unverifiable round is fail-closed stale (no blind send)
+            return False
 
     def _holds_claim(self, row: CallbackOutboxRow) -> bool:
         """True iff this row's outbox claim is still OURS and unexpired at send time (R3-F4).
@@ -263,6 +315,7 @@ class BackgroundServiceCallbackSender:
 
 
 __all__ = (
+    "ROUND_STALE",
     "TargetResolver",
     "BackendNeutralTargetResolver",
     "DeliveryTransport",
