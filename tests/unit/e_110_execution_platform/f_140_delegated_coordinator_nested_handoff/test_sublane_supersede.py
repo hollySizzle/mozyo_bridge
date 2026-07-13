@@ -280,6 +280,80 @@ class SublaneSupersedeTest(unittest.TestCase):
             # Same action generation across the resume (never opened a second one).
             self.assertEqual(resume.release.action_id, action_first)
 
+    def test_crash_after_commit_before_release_resumes(self) -> None:
+        # A crash between the supersede commit and the release: the store has the
+        # handover but process_release is still not_requested. A re-run detects the
+        # handover, opens the generation, closes the slots -> released.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            # Simulate only the commit landing (the actuator died before _drive_release).
+            store.supersede_and_activate(
+                superseded=LaneLifecycleKey(WS, ORIG),
+                expected_revision=1,
+                recovery=LaneLifecycleKey(WS, REC),
+                decision=_decision(),
+            )
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, ORIG)).process_release, "not_requested"
+            )
+            ops = self._both_lanes_live_ops()
+            outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.already_handed_over)
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            self.assertEqual(len(ops.close_calls), 1)
+
+    def test_partial_pair_releases_the_single_live_slot(self) -> None:
+        # The original already lost its gateway; only the worker is live. The release
+        # closes the one slot and records released (every pinned slot closed).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            rows = [
+                _row("claude", ORIG, f"{WS}:p3"),  # only the worker of the original
+                _row("codex", REC, f"{WS}:p10"),
+                _row("claude", REC, f"{WS}:p11"),
+            ]
+            attest = {
+                encode_assigned_name(WS, "codex", REC): _attest("codex", REC, f"{WS}:p10"),
+                encode_assigned_name(WS, "claude", REC): _attest("claude", REC, f"{WS}:p11"),
+            }
+            ops = _FakeOps(rows=rows, attestations=attest)
+            outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.supersede.applied)
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            self.assertEqual({loc for _, loc in outcome.release.closed}, {f"{WS}:p3"})
+
+    def test_original_with_dead_processes_supersedes_with_no_release(self) -> None:
+        # The original's slots are already gone. Ownership still hands over; there is
+        # nothing to release (a superseded lane draws zero capacity regardless).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            rows = [
+                _row("codex", REC, f"{WS}:p10"),
+                _row("claude", REC, f"{WS}:p11"),
+            ]
+            attest = {
+                encode_assigned_name(WS, "codex", REC): _attest("codex", REC, f"{WS}:p10"),
+                encode_assigned_name(WS, "claude", REC): _attest("claude", REC, f"{WS}:p11"),
+            }
+            ops = _FakeOps(rows=rows, attestations=attest)
+            outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.supersede.applied)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, ORIG)).lane_disposition,
+                DISPOSITION_SUPERSEDED,
+            )
+            self.assertEqual(outcome.release.process_release, "not_requested")
+            self.assertEqual(ops.close_calls, [])
+
     def test_incomplete_identity_fails_closed_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
