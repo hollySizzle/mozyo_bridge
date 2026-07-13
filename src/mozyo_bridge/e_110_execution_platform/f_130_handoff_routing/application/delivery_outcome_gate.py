@@ -54,10 +54,30 @@ def delivery_was_positive(args: argparse.Namespace) -> bool:
     )
 
 
+def make_publishing_emitter(args: argparse.Namespace, emit):
+    """Wrap ``emit`` so every emitted outcome is published first (Redmine #13583 R3-F1).
+
+    ``orchestrate_handoff`` has many terminal paths (blocked / invalid-args / pending / the
+    tmux+queue-enter final / the **herdr event-driven turn-start rail**). Publishing at hand-picked
+    ``return`` sites is fragile: the event rail emitted its outcome and returned ``0`` on a ``sent``
+    projection while never publishing, so on the normal herdr route ``delivery_was_positive`` was
+    always ``False`` and a correlated forward generation could never complete (a fail-safe stuck
+    lifecycle). Routing every emit through this wrapper makes publication a property of *emitting*,
+    so a newly added terminal path cannot silently miss it.
+    """
+
+    def _emit(outcome, **emit_kwargs):
+        publish_delivery_outcome(args, outcome)
+        emit(outcome, **emit_kwargs)
+
+    return _emit
+
+
 __all__ = (
     "POSITIVE_STATUS",
     "POSITIVE_REASON",
     "DELIVERY_OUTCOME_ATTR",
     "publish_delivery_outcome",
     "delivery_was_positive",
+    "make_publishing_emitter",
 )

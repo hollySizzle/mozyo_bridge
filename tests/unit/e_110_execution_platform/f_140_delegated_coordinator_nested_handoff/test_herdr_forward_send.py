@@ -536,5 +536,80 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
             )
 
 
+class QEnterCallbackTransportBoundaryTest(unittest.TestCase):
+    """R3-F1 item 4: the OTHER callback entry — q-enter `consultation_callback` — must gate the
+    completion on the transport's structured positive delivery too, not on rc.
+
+    (The R2 correction only regressed the `handoff ticketless-callback` entry; j#76628 overclaimed
+    "both entries". This pins q-enter itself: rc 0 in all three transport results, completion only
+    on `sent`/`ok`.)
+    """
+
+    def _mk_outcome(self, status, reason):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            make_outcome,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_anchors import (
+            TicketlessAnchor,
+        )
+        return make_outcome(
+            status=status, reason=reason, receiver="codex", target="%1",
+            anchor=TicketlessAnchor(
+                classification="consultation_result", dispatch_decision="no_dispatch"
+            ),
+            mode="queue-enter", kind="design_consultation", notification_marker="m",
+        )
+
+    def _drive_q_enter(self, status, reason):
+        import argparse as _ap
+        import contextlib as _ctx
+        import io as _io
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (
+            cli_handoff_q_enter as qe,
+        )
+
+        captured = {}
+
+        def _fake_orchestrate(a, **kw):
+            a.delivery_outcome = self._mk_outcome(status, reason)
+            return 0  # rc 0 in ALL cases -- the rc must NOT be the gate
+
+        def _fake_complete(a, *, delivered):
+            captured["delivered"] = delivered
+            return delivered
+
+        args = _ap.Namespace(
+            intent="consultation_callback", to="codex", source=None, issue=None, journal=None,
+            task_id=None, comment_id=None, anchor_url=None, kind=None,
+            classification="consultation_result", dispatch_decision="no_dispatch",
+            workflow_next_owner="caller", callback_reason="no_dispatch_decided",
+            read_contract="grandparent_coordinator", forward_action_id="fwd_x",
+            record_format="json",
+        )
+        with patch.object(qe, "orchestrate_handoff", side_effect=_fake_orchestrate), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.herdr_workflow_step.complete_forward_generation_on_callback",
+            side_effect=_fake_complete,
+        ), _ctx.redirect_stdout(_io.StringIO()):
+            rc = qe.cmd_handoff_q_enter(args)
+        return rc, captured.get("delivered")
+
+    def test_q_enter_sent_ok_completes(self):
+        rc, delivered = self._drive_q_enter("sent", "ok")
+        self.assertEqual(rc, 0)
+        self.assertTrue(delivered)
+
+    def test_q_enter_marker_unobserved_queue_enter_does_not_complete(self):
+        rc, delivered = self._drive_q_enter("sent", "queue_enter")
+        self.assertEqual(rc, 0)  # rc 0 -- but NOT delivered
+        self.assertFalse(delivered)
+
+    def test_q_enter_pending_input_does_not_complete(self):
+        rc, delivered = self._drive_q_enter("pending_input", "ok")
+        self.assertEqual(rc, 0)  # rc 0, reason "ok" -- the STATUS disqualifies it
+        self.assertFalse(delivered)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

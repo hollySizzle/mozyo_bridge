@@ -879,5 +879,110 @@ class ExplicitPaneTargetRoutesTmuxTest(unittest.TestCase):
                     resolve_handoff_transport_runtime(self._args(repo, None))
 
 
+class HerdrEventRailForwardCompletionTest(unittest.TestCase):
+    """The herdr event-driven rail must publish its terminal outcome (Redmine #13583 R3-F1).
+
+    The event rail builds an outcome, emits it, and returns 0 on a `sent` projection. Before the
+    R3-F1 fix it never published that outcome, so `delivery_was_positive(args)` was False on the
+    NORMAL herdr route and a correlated forward generation could never complete — the caller could
+    never forward again (fail-safe stuck). These drive a REAL `handoff ticketless-callback` over the
+    event rail against a live forward store: the generation completes on an actual `sent`, and does
+    NOT complete when the rail fails to confirm a turn start.
+    """
+
+    def _drive(self, *, wait_results, read_contract="grandparent_coordinator"):
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.core.state.forward_outbox_fence import (
+            ForwardOutboxFence,
+            ForwardRouteKey,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            (repo / ".mozyo-bridge").mkdir()
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+            )
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+
+            # A live forward store holding a DELIVERED generation awaiting its correlated callback.
+            fence = ForwardOutboxFence(home=home)
+            fence.bootstrap()
+            route = ForwardRouteKey(ws, "default", read_contract, "project_gateway", "")
+            minted = fence.reserve(route).action_id
+            fence.mark_delivered(route, minted)
+
+            herdr = _FakeHerdr(
+                [
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "wS:pS"},
+                    {"name": encode_assigned_name(ws, "claude", "lane-1"), "pane_id": "wT:pT"},
+                ],
+                get_states=["idle"],
+                wait_results=wait_results,
+            )
+            herdr_bin = repo / "fake-herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(herdr_bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+            argv = [
+                "handoff", "ticketless-callback", "--to", "claude", "--target", "wT:pT",
+                "--target-repo", str(repo),
+                "--classification", "consultation_result",
+                "--dispatch-decision", "no_dispatch",
+                "--workflow-next-owner", "caller",
+                "--callback-reason", "no_dispatch_decided",
+                "--read-contract", read_contract,
+                "--forward-action-id", minted,
+                "--mode", "standard", "--landing-timeout", "0.05", "--submit-delay", "0",
+            ]
+            args = build_parser().parse_args(argv)
+            args.repo = str(repo)
+
+            env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+            env["MOZYO_HERDR_BINARY"] = str(herdr_bin)
+            env["MOZYO_REPO"] = str(repo)
+            env["MOZYO_BRIDGE_HOME"] = str(home)
+            env["MOZYO_WORKSPACE_ID"] = ws
+            env["MOZYO_AGENT_ROLE"] = "codex"
+            env["MOZYO_LANE_ID"] = "lane-1"
+
+            with patch("subprocess.run", herdr.run), patch(
+                "subprocess.Popen", herdr.popen
+            ), patch("mozyo_bridge.application.commands.time.sleep"), patch.dict(
+                os.environ, env, clear=True
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                try:
+                    args.func(args)
+                except BaseException:  # noqa: BLE001 - a non-sent rail dies; that IS the negative
+                    pass
+                published = getattr(args, "delivery_outcome", None)
+                state = fence.active(route).state
+            return published, state, minted
+
+    def test_event_rail_sent_publishes_outcome_and_completes_generation(self):
+        from mozyo_bridge.core.state.forward_outbox_fence import FORWARD_COMPLETED
+
+        published, state, _minted = self._drive(wait_results=[(0, "")])
+        # 1) the event rail PUBLISHES its terminal outcome (the R3-F1 gap).
+        self.assertIsNotNone(published, "the event rail must publish its terminal outcome")
+        self.assertEqual(published.status, "sent")
+        self.assertEqual(published.reason, "ok")
+        # 2) so the correlated generation actually completes on a real herdr delivery.
+        self.assertEqual(state, FORWARD_COMPLETED)
+
+    def test_event_rail_non_sent_does_not_complete_generation(self):
+        from mozyo_bridge.core.state.forward_outbox_fence import FORWARD_DELIVERED
+
+        # The rail never confirms a turn start -> non-`sent` projection -> zero completion.
+        _published, state, _minted = self._drive(wait_results=[(1, "")])
+        self.assertEqual(state, FORWARD_DELIVERED)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
