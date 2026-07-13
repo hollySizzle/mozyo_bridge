@@ -44,6 +44,36 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.shared.errors import die
 
 
+def _resolve_target_disposition(preflight_target: Any) -> Optional[str]:
+    """The target lane's lifecycle disposition, or ``None`` (byte-invariant; #13681 W3).
+
+    Fail-closed to ``None`` on every uncertainty — a target with no resolvable
+    ``(workspace_id, lane_id)`` unit, an unreadable store, or a lane with no lifecycle
+    row (owner-unbound). ``None`` and ``active`` both leave the gate byte-identical to
+    its pre-#13681 behaviour; only a resolved non-active disposition zero-sends. The
+    lookup keys on the SAME ``(project workspace segment, lane_label)`` unit the create
+    (W1) and supersede (W2) writes use — the mzb1 decode that populates
+    ``preflight_target`` yields exactly that project workspace segment and lane label.
+    """
+    workspace = getattr(preflight_target, "workspace_id", None)
+    lane = getattr(preflight_target, "lane_id", None)
+    if not workspace or not lane:
+        return None
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            LaneLifecycleError,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        record = LaneLifecycleStore().get(
+            LaneLifecycleKey(str(workspace), str(lane))
+        )
+    except (LaneLifecycleError, OSError, ValueError):
+        return None
+    return record.lane_disposition if record is not None else None
+
+
 def enforce_gateway_route(
     args: argparse.Namespace,
     *,
@@ -99,6 +129,10 @@ def enforce_gateway_route(
             target_role=preflight_target.role,
             allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
             worker_provider=worker_provider,
+            # Redmine #13681 W3: zero-send a governed delivery to a lane the lifecycle
+            # authority marks non-active (superseded / hibernated / retired). Resolved
+            # fail-closed to None (byte-invariant) when no disposition is knowable.
+            target_lane_disposition=_resolve_target_disposition(preflight_target),
         )
     )
     if decision.is_blocked:

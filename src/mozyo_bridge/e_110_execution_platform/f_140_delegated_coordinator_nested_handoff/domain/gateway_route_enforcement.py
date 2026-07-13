@@ -73,6 +73,18 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     KIND_LABELS,
 )
 
+# Lane disposition vocabulary (Redmine #13681 W3): a governed delivery to a lane the
+# lifecycle component says is no longer the active owner — superseded / hibernated /
+# retired — zero-sends. Imported from the pure core model (no SQLite) so this domain
+# leaf and the store cannot drift on the disposition tokens. core is an inner layer;
+# a domain module depending on it introduces no cycle.
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
+    DISPOSITION_RETIRED,
+    DISPOSITION_SUPERSEDED,
+)
+
 # Provider / receiver tokens. ``claude`` is the worker surface a governed kind may
 # only reach via its same-lane gateway; reused from the role/provider binding so
 # this module and the binding cannot drift on the literal. Any non-``claude``
@@ -109,8 +121,27 @@ ROUTE_BLOCKED: str = "gateway_route_blocked"
 #: exception was supplied. Allowed, but recorded distinctly from the normal route.
 ROUTE_EXCEPTION: str = "gateway_route_exception"
 
-#: The single ``blocked_reason`` token a :data:`ROUTE_BLOCKED` decision carries.
+#: The ``blocked_reason`` token a :data:`ROUTE_BLOCKED` cross-lane-worker decision carries.
 BLOCKED_DIRECT_WORKER_BYPASS: str = "coordinator_to_sublane_worker_bypass"
+
+#: ``blocked_reason`` tokens for a governed delivery to a lane whose lifecycle
+#: disposition is no longer active (Redmine #13681 W3). A superseded lane has handed
+#: its issue to a recovery successor and is never a send target again; a hibernated
+#: lane's processes are (being) released; a retired lane is terminal. Each is a
+#: distinct, durable-record-safe zero-send diagnostic.
+BLOCKED_LANE_SUPERSEDED: str = "lane_superseded"
+BLOCKED_LANE_HIBERNATED: str = "lane_hibernated"
+BLOCKED_LANE_RETIRED: str = "lane_retired"
+
+#: The non-active dispositions that zero-send a governed delivery, mapped to their
+#: block reason. ``active`` (and an unresolved / owner-unbound lane, disposition
+#: ``None``) is absent, so the gate stays byte-invariant when no lifecycle authority
+#: is resolvable.
+_BLOCKABLE_DISPOSITIONS: dict[str, str] = {
+    DISPOSITION_SUPERSEDED: BLOCKED_LANE_SUPERSEDED,
+    DISPOSITION_HIBERNATED: BLOCKED_LANE_HIBERNATED,
+    DISPOSITION_RETIRED: BLOCKED_LANE_RETIRED,
+}
 
 #: The backward-compatible lane id a missing / empty ``@mozyo_lane_id`` resolves to
 #: (Redmine #11820, mirrored from ``agent_discovery._normalize_lane_display``). A
@@ -167,6 +198,12 @@ class GatewayRouteRequest:
     target_role: Optional[str] = None
     allow_direct_worker: bool = False
     worker_provider: Optional[str] = None
+    #: The target lane's lifecycle disposition (Redmine #13681 W3), when the caller
+    #: could resolve it from the lifecycle authority. ``None`` — an unresolved / absent
+    #: / owner-unbound lane, or a caller that does not resolve it — keeps the gate
+    #: byte-invariant (no disposition block). Only a non-active resolved disposition
+    #: zero-sends a governed delivery.
+    target_lane_disposition: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +287,24 @@ def _suggested_safe_route(request: GatewayRouteRequest) -> str:
     )
 
 
+def _suggested_disposition_route(
+    request: GatewayRouteRequest, disposition: str
+) -> str:
+    """Public-safe pointer for a delivery blocked by a non-active target disposition.
+
+    Names the target lane and its disposition and points at the durable owner, so the
+    caller re-routes to the lane that actually owns the issue now (never a pane id).
+    """
+    target_lane = _norm(request.target_lane_id) or "<target_lane>"
+    kind = _norm(request.kind) or "<kind>"
+    return (
+        f"lane {target_lane!r} is {disposition} and no longer owns its issue; the "
+        f"{kind} was not delivered. Resolve the issue's current active owner "
+        "(`mozyo-bridge sublane list`) and route the work there — the durable Redmine "
+        "record names the recovery successor."
+    )
+
+
 def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     """Decide whether a handoff delivery satisfies the governed gateway route.
 
@@ -288,6 +343,28 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
 
     if kind not in GATEWAY_GOVERNED_KINDS:
         return _allowed(governed=False, same_unit=None)
+
+    # Redmine #13681 W3: a governed delivery to a lane the lifecycle authority says is
+    # no longer the active owner (superseded / hibernated / retired) zero-sends — for
+    # ANY receiver, since neither the dead lane's gateway nor its worker should take new
+    # work. This block precedes the gateway / worker-lane logic: a superseded lane is not
+    # a valid target regardless of which slot the send addresses. An unresolved /
+    # owner-unbound lane (disposition ``None`` / ``active``) is not blocked here, so the
+    # gate is byte-invariant wherever no lifecycle authority is resolvable.
+    disposition = _norm(request.target_lane_disposition)
+    if disposition and disposition != DISPOSITION_ACTIVE:
+        block_reason = _BLOCKABLE_DISPOSITIONS.get(disposition)
+        if block_reason is not None:
+            return GatewayRouteDecision(
+                verdict=ROUTE_BLOCKED,
+                governed=True,
+                kind=request.kind,
+                resolved_receiver=request.receiver,
+                blocked_reason=block_reason,
+                suggested_safe_route=_suggested_disposition_route(request, disposition),
+                same_unit=None,
+                exception_applied=False,
+            )
 
     # Governed kind. A delivery to a non-worker provider is the governed route head
     # (coordinator -> sublane gateway, the gateway provider under this binding),
@@ -339,6 +416,17 @@ def render_block_die_message(decision: GatewayRouteDecision, lane_id: object) ->
     and the explicit durable exception.
     """
     lane = _norm(lane_id) or "<unknown>"
+    # Redmine #13681 W3: a non-active-disposition block is a different failure from the
+    # cross-lane worker bypass — it is not releasable by `--allow-direct-worker` (the
+    # lane is dead, not merely mis-routed), so it names the disposition and the owner
+    # instead of the gateway route.
+    if decision.blocked_reason in _BLOCKABLE_DISPOSITIONS.values():
+        return (
+            f"gateway route enforcement (Redmine #13681): a {_norm(decision.kind)!r} "
+            f"was addressed to lane {lane!r}, which the lifecycle authority marks "
+            f"{decision.blocked_reason!r} — it no longer owns its issue and takes no "
+            f"new work. {decision.suggested_safe_route}"
+        )
     return (
         f"gateway route enforcement (Redmine #12918): a {_norm(decision.kind)!r} "
         f"addressed directly to the Claude worker in lane {lane!r} bypasses that "
@@ -372,6 +460,9 @@ __all__ = (
     "ROUTE_BLOCKED",
     "ROUTE_EXCEPTION",
     "BLOCKED_DIRECT_WORKER_BYPASS",
+    "BLOCKED_LANE_SUPERSEDED",
+    "BLOCKED_LANE_HIBERNATED",
+    "BLOCKED_LANE_RETIRED",
     "GatewayRouteRequest",
     "GatewayRouteDecision",
     "decide_gateway_route",

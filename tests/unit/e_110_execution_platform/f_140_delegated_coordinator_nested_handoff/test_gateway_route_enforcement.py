@@ -341,5 +341,96 @@ class WorkerProviderRebindTest(unittest.TestCase):
         self.assertTrue(decision.same_unit)
 
 
+class LaneDispositionBlockTest(unittest.TestCase):
+    """Redmine #13681 W3: a governed send to a non-active-disposition lane zero-sends."""
+
+    def _to_lane(self, *, receiver: str, disposition, kind="implementation_request"):
+        # A same-lane send that would normally be ALLOWED — so a block can only come
+        # from the disposition gate, not the bypass gate.
+        return _decide(
+            kind=kind,
+            receiver=receiver,
+            sender_identity_known=True,
+            sender_workspace_id="ws-a",
+            sender_lane_id="lane-sub",
+            target_workspace_id="ws-a",
+            target_lane_id="lane-sub",
+            target_role=receiver,
+            target_lane_disposition=disposition,
+        )
+
+    def test_superseded_lane_blocks_worker_send(self) -> None:
+        decision = self._to_lane(receiver="claude", disposition="superseded")
+        self.assertEqual(ROUTE_BLOCKED, decision.verdict)
+        self.assertEqual("lane_superseded", decision.blocked_reason)
+        self.assertFalse(decision.exception_applied)
+
+    def test_superseded_lane_blocks_gateway_send_too(self) -> None:
+        # Not just the worker: a superseded lane's gateway takes no new work either.
+        decision = self._to_lane(receiver="codex", disposition="superseded")
+        self.assertEqual(ROUTE_BLOCKED, decision.verdict)
+        self.assertEqual("lane_superseded", decision.blocked_reason)
+
+    def test_hibernated_and_retired_block_with_distinct_reasons(self) -> None:
+        self.assertEqual(
+            "lane_hibernated",
+            self._to_lane(receiver="codex", disposition="hibernated").blocked_reason,
+        )
+        self.assertEqual(
+            "lane_retired",
+            self._to_lane(receiver="codex", disposition="retired").blocked_reason,
+        )
+
+    def test_active_disposition_does_not_block(self) -> None:
+        decision = self._to_lane(receiver="codex", disposition="active")
+        self.assertEqual(ROUTE_ALLOWED, decision.verdict)
+
+    def test_none_disposition_is_byte_invariant(self) -> None:
+        # An unresolved / owner-unbound lane (None) leaves the gate exactly as before.
+        allowed = self._to_lane(receiver="codex", disposition=None)
+        self.assertEqual(ROUTE_ALLOWED, allowed.verdict)
+        # And the pre-existing cross-lane worker bypass still fires when disposition
+        # is unknown (the disposition gate did not swallow it).
+        bypass = _decide(
+            kind="implementation_request",
+            receiver="claude",
+            sender_identity_known=True,
+            sender_workspace_id="ws-a",
+            sender_lane_id="lane-coordinator",
+            target_workspace_id="ws-a",
+            target_lane_id="lane-sub",
+            target_role="claude",
+            target_lane_disposition=None,
+        )
+        self.assertEqual(ROUTE_BLOCKED, bypass.verdict)
+        self.assertEqual(BLOCKED_DIRECT_WORKER_BYPASS, bypass.blocked_reason)
+
+    def test_non_governed_kind_never_disposition_blocked(self) -> None:
+        # A non-governed kind (e.g. reply) to a superseded lane is still allowed — the
+        # disposition gate only governs implementation_request / review_result.
+        decision = self._to_lane(
+            receiver="claude", disposition="superseded", kind="reply"
+        )
+        self.assertEqual(ROUTE_ALLOWED, decision.verdict)
+        self.assertFalse(decision.governed)
+
+    def test_disposition_block_not_releasable_by_allow_direct_worker(self) -> None:
+        # --allow-direct-worker releases a bypass, but NOT a dead-lane block.
+        decision = _decide(
+            kind="implementation_request",
+            receiver="claude",
+            sender_identity_known=True,
+            sender_workspace_id="ws-a",
+            sender_lane_id="lane-sub",
+            target_workspace_id="ws-a",
+            target_lane_id="lane-sub",
+            target_role="claude",
+            target_lane_disposition="superseded",
+            allow_direct_worker=True,
+        )
+        self.assertEqual(ROUTE_BLOCKED, decision.verdict)
+        self.assertEqual("lane_superseded", decision.blocked_reason)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
