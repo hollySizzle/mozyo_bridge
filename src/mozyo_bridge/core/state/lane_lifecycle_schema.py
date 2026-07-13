@@ -105,16 +105,21 @@ _VERSION_MALFORMED = -1
 def _recorded_version(conn: sqlite3.Connection) -> Optional[int]:
     """This component's recorded ``state_schema_components`` version, or ``None``.
 
-    ``None`` means the component has never registered — a fresh install, which this
-    build may create. A *present* version is the store's own statement of the shape
-    its rows are in, and only this build's recognized versions may be written under.
+    Three outcomes, kept distinct (R5-F1):
 
-    A present-but-malformed value — a REAL ``2.5``, TEXT, BLOB, anything that is not
-    an exact integer — returns :data:`_VERSION_MALFORMED`, never a coerced number
-    (R4-F1). ``int(2.5)`` would silently truncate a ``2.5`` REAL to ``2`` and let it
-    pass the recognized-version check, re-stamping an unknown schema this build does
-    not understand. Both the SQLite storage class (``typeof``) and the returned
-    Python type must say integer; only then is the row a version we may act on.
+    - ``None`` — the component row is **absent**. Only this is a fresh install this
+      build may create.
+    - :data:`_VERSION_MALFORMED` — the row is **present but unusable**: a ``NULL``
+      version, a REAL ``2.5``, TEXT, BLOB, or a version-query failure after the
+      container was already initialized. A *present* row is the store's own
+      statement about its rows; a broken one is not "never registered", it is an
+      unknown state, and re-stamping it to v2 would let this build write authority
+      rows it does not understand.
+
+    A present-but-malformed value is never a coerced number (R4-F1): ``int(2.5)``
+    would truncate a ``2.5`` REAL to ``2`` and pass the recognized-version check.
+    Both the SQLite storage class (``typeof``) and the returned Python type must say
+    integer, and the value must not be ``NULL``.
     """
     try:
         row = conn.execute(
@@ -123,14 +128,21 @@ def _recorded_version(conn: sqlite3.Connection) -> Optional[int]:
             (LANE_LIFECYCLE_COMPONENT,),
         ).fetchone()
     except sqlite3.DatabaseError:
-        return None
-    if row is None or row[1] is None:
-        return None
+        # The container guard has already created `state_schema_components`; a query
+        # failing *now* is a broken store, not a fresh one. Fail closed.
+        return _VERSION_MALFORMED
+    if row is None:
+        return None  # genuinely never registered — a fresh install
     storage_class, value = row
-    # `typeof` is SQLite's own view (a non-integer REAL keeps class `real`); the
-    # Python-side `isinstance` guards against a driver ever handing back a float that
-    # `typeof` reported as integer. `bool` is an `int` subclass and is not a version.
-    if storage_class != "integer" or not isinstance(value, int) or isinstance(value, bool):
+    # A present row whose version is NULL / a non-integer REAL / TEXT / BLOB is a
+    # malformed record, distinct from an absent row. `bool` is an `int` subclass and
+    # is not a version.
+    if (
+        value is None
+        or storage_class != "integer"
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+    ):
         return _VERSION_MALFORMED
     return value
 
