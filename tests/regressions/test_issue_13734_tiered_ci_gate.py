@@ -405,6 +405,35 @@ class PublishProductionGateTest(unittest.TestCase):
         self.assertIn("mozyo-bridge --version", blob)
         self.assertIn("mozyo --help", blob)
 
+    def _checkout_ref(self, job):
+        for s in self.jobs[job]["steps"]:
+            if "checkout" in str(s.get("uses", "")):
+                return str((s.get("with") or {}).get("ref", ""))
+        raise AssertionError(f"{job} has no checkout step")
+
+    def test_verify_and_build_pin_immutable_sha_not_tag(self) -> None:
+        # F1 (j#77258): the artifact authority must be the IMMUTABLE release-event
+        # SHA, not the mutable tag name — otherwise a tag force-moved between
+        # verify and build could ship an unverified commit (TOCTOU).
+        for job in ("verify", "build"):
+            ref = self._checkout_ref(job)
+            self.assertIn("github.sha", ref, msg=f"{job} must checkout github.sha")
+            self.assertNotIn(
+                "tag_name", ref,
+                msg=f"{job} must NOT checkout the mutable tag name",
+            )
+
+    def test_build_reasserts_exact_sha_before_building(self) -> None:
+        # The build (artifact-authority) job itself must re-verify HEAD ==
+        # release SHA, not merely inherit `verify`'s check.
+        order = [str(s.get("name", "")) for s in self.jobs["build"]["steps"]]
+        verify_i = next(
+            (i for i, n in enumerate(order) if "exact release SHA" in n), None
+        )
+        build_i = next((i for i, n in enumerate(order) if n == "Build package"), None)
+        self.assertIsNotNone(verify_i, msg="build must re-assert exact release SHA")
+        self.assertLess(verify_i, build_i, msg="SHA check must precede build")
+
     def test_only_publish_job_holds_oidc(self) -> None:
         for job in ("verify", "build"):
             self.assertNotEqual(
@@ -472,9 +501,17 @@ class PublishTagVersionMirrorBehaviorTest(unittest.TestCase):
         self.assertEqual(0, r.returncode, msg=r.stdout)
         self.assertIn("version mirror == tag version", r.stdout)
 
-    def test_tag_without_v_prefix_passes(self) -> None:
+    def test_tag_without_v_prefix_fails_closed(self) -> None:
+        # F2 (j#77258): release-flow.md ## Tag and Release requires the `v`
+        # prefix; a non-`v` tag must be REFUSED, not published.
         r = self._run("0.11.0", "0.11.0", "0.11.0")
-        self.assertEqual(0, r.returncode, msg=r.stdout)
+        self.assertEqual(1, r.returncode, msg=r.stdout)
+        self.assertIn("must be v-prefixed", r.stdout)
+
+    def test_bare_v_tag_fails_closed(self) -> None:
+        # A lone `v` has no version to strip; must not slip through as empty.
+        r = self._run("v", "0.11.0", "0.11.0")
+        self.assertEqual(1, r.returncode, msg=r.stdout)
 
     def test_tag_mismatch_fails_closed(self) -> None:
         r = self._run("v0.12.0", "0.11.0", "0.11.0")
@@ -506,6 +543,58 @@ class PublishTagVersionMirrorBehaviorTest(unittest.TestCase):
         )
         self.assertEqual(1, r.returncode, msg=r.stdout)
         self.assertIn("no version literal found", r.stdout)
+
+
+class PublishBuildExactShaBehaviorTest(unittest.TestCase):
+    """Execute the real BUILD-job exact-SHA gate body against fixtures (F1)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        steps = _load(_PUBLISH_YML)["jobs"]["build"]["steps"]
+        cls.body = next(
+            s["run"] for s in steps
+            if "build checkout is the exact release SHA" in str(s.get("name", ""))
+        )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.bindir = Path(self._tmp.name) / "bin"
+        self.bindir.mkdir()
+        git = self.bindir / "git"
+        git.write_text(_FAKE_GIT, encoding="utf-8")
+        git.chmod(git.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    def _run(self, head: str, release_sha: str) -> subprocess.CompletedProcess:
+        script = Path(self._tmp.name) / "gate.sh"
+        script.write_text(self.body, encoding="utf-8")
+        return subprocess.run(
+            ["bash", str(script)],
+            env={
+                **os.environ,
+                "PATH": f"{self.bindir}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_HEAD": head,
+                "RELEASE_SHA": release_sha,
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+    def test_matching_head_passes(self) -> None:
+        sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        r = self._run(sha, sha)
+        self.assertEqual(0, r.returncode, msg=r.stdout)
+        self.assertIn("build HEAD == release SHA", r.stdout)
+
+    def test_moved_tag_head_fails_closed(self) -> None:
+        # Simulates a tag force-moved after `verify`: build HEAD != release SHA.
+        r = self._run(
+            "0000000000000000000000000000000000000000",
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
+        self.assertEqual(1, r.returncode, msg=r.stdout)
+        self.assertIn("refusing to build an unverified commit", r.stdout)
 
 
 if __name__ == "__main__":

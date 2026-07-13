@@ -5,10 +5,14 @@ name: Publish to PyPI
 # Production publish is mechanically gated inside the publish workflow itself,
 # NOT by a policy-doc manual assumption:
 #   - `verify` runs the supported Python 3.10-3.13 FULL suite at the exact
-#     release/tag SHA, plus the module-health gate and a tag<->version-mirror
-#     equality check (ties the artifact to the tag mechanically).
-#   - `build` builds wheel+sdist at the same exact SHA and runs a fresh-install
-#     smoke on the built artifact.
+#     release SHA, plus the module-health gate, a `v`-prefixed-tag requirement,
+#     and a tag<->version-mirror equality check (ties the artifact to the tag
+#     mechanically).
+#   - `build` builds wheel+sdist at the SAME immutable SHA and runs a
+#     fresh-install smoke on the built artifact. Both `verify` and `build`
+#     check out `github.sha` (the immutable release-event commit) and re-assert
+#     `HEAD == github.sha`, so a tag force-moved mid-run cannot ship an
+#     unverified commit (Redmine #13734 j#77258 F1).
 #   - `publish` is the ONLY job carrying `id-token: write` + `environment: pypi`;
 #     it merely downloads the verified artifact and uploads it, so Trusted
 #     Publishing credentials never touch the checkout/build/verify surface
@@ -47,8 +51,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # Build/test the exact commit the release tag points to.
-          ref: ${{ github.event.release.tag_name }}
+          # Pin to the IMMUTABLE release-event commit SHA, not the mutable tag
+          # name. `github.sha` is fixed at trigger time to the commit the tag
+          # pointed to; a later force-move of the tag cannot redirect this
+          # checkout (Redmine #13734 j#77258 F1). fetch-depth 0 for completeness.
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Verify checkout is the exact release SHA
@@ -67,14 +74,22 @@ jobs:
           TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          # Strip a leading `v` from the tag and require BOTH mirror files to
-          # carry exactly that version. Ties the published artifact to the tag
-          # mechanically (replaces the policy-doc manual assumption). Mirror set
-          # kept in lockstep with vibes/docs/logics/release-helper-contract.md.
+          # Require a `v`-prefixed release tag (release-flow.md ## Tag and
+          # Release: release tags are annotated `vX.Y.Z`), then require BOTH
+          # mirror files to carry exactly the stripped version. Ties the
+          # published artifact to the canonical tag mechanically. A non-`v` tag
+          # fails CLOSED (Redmine #13734 j#77258 F2) — GitHub Release creation
+          # triggers production publish even outside the helper, so the workflow
+          # must reject non-canonical tags itself. Mirror set kept in lockstep
+          # with vibes/docs/logics/release-helper-contract.md.
           python3 - <<'PY'
           import os, re, sys
           tag = os.environ["TAG_NAME"]
-          expected = tag[1:] if tag.startswith("v") else tag
+          if not tag.startswith("v") or len(tag) < 2:
+              print(f"::error::release tag {tag!r} must be v-prefixed (vX.Y.Z); "
+                    "release policy requires the `v` prefix (release-flow.md ## Tag and Release)")
+              sys.exit(1)
+          expected = tag[1:]
           mirror = {
               "pyproject.toml": r'(?m)^version\s*=\s*"([^"]+)"',
               "src/mozyo_bridge/__init__.py": r'(?m)^__version__\s*=\s*"([^"]+)"',
@@ -122,7 +137,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          # Artifact authority: build the IMMUTABLE release-event SHA, not the
+          # mutable tag name. Without this, a tag force-moved between `verify`
+          # and `build` could ship a wheel/sdist from a commit that never passed
+          # the full matrix verify (Redmine #13734 j#77258 F1 TOCTOU).
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify build checkout is the exact release SHA
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Re-assert on the artifact-authority job itself (not only `verify`):
+          # the commit being packaged MUST be the one the full matrix verified.
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::build HEAD $HEAD_SHA != release SHA $RELEASE_SHA; refusing to build an unverified commit"; exit 1
+          fi
+          echo "build HEAD == release SHA ($RELEASE_SHA)"
 
       - name: Set up Python
         uses: actions/setup-python@v6
