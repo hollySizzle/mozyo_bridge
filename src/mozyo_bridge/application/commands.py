@@ -271,21 +271,20 @@ def load_tmux_conf_for(args: argparse.Namespace) -> bool:
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
-    Thin wrapper: the discovery orchestration was extracted to
-    :class:`mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`,
-    which depends on the injected
-    :class:`mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
-    instead of the four naked external reads (live discovery / canonical session /
-    git checkout probe / project scope) — the OOP-first read-discovery tranche
-    (Redmine #12749 / #12638 / #12785). This wrapper keeps the public name so the
-    ``agents targets`` / attention handlers and the delegated-coordinator /
-    project-gateway callers that ``from ...commands import _agents_target_candidates``
-    (and the tests that patch ``commands._agents_target_candidates``) are unchanged.
-    Behavior-preserving.
+    Thin wrapper over :class:`~mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`
+    (over the injected :class:`~mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
+    — the #12749 / #12638 / #12785 OOP-first read tranche); keeps the public name so the
+    ``agents targets`` / attention handlers and the delegated-coordinator / project-gateway
+    callers (and tests) that import ``commands._agents_target_candidates`` are unchanged. The
+    composition-injected ``args.snapshot`` (Redmine #13569 R2-F1) is threaded into the discovery
+    adapter and the use-case validation so the runtime read uses the SAME provider vocabulary
+    the CLI choices came from; ``None`` uses the built-in providers.
     """
-    return ResolveAgentTargetsUseCase(LiveAgentDiscovery()).resolve(
+    _s = getattr(args, "snapshot", None)
+    return ResolveAgentTargetsUseCase(LiveAgentDiscovery(snapshot=_s)).resolve(
         agent_filter=getattr(args, "agent", None),
         session_filter=getattr(args, "session", None),
+        snapshot=_s,
     )
 
 

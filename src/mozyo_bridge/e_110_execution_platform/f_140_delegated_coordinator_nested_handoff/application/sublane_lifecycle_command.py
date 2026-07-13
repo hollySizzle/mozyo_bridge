@@ -825,6 +825,16 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         )
     except WorkflowProviderUnresolved:
         return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
+    # Launchability gate (Redmine #13569 R2-F4b): a managed provider that is unknown or not
+    # mechanically launchable is not a lane this retire can trust to identify — a binding to a
+    # non-existent provider must never close a guessed pane. Fail closed to zero-actuation
+    # before planning. Built-in codex/claude are always launchable, so this is byte-identical.
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
+        BUILTIN_AGENT_PROVIDER_SNAPSHOT,
+    )
+
+    if not all(BUILTIN_AGENT_PROVIDER_SNAPSHOT.is_launchable(p) for p in managed_roles):
+        return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
     plan = plan_herdr_retire_close(
         rows,
         workspace_id=workspace_id,

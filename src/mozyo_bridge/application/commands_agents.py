@@ -62,7 +62,6 @@ from mozyo_bridge.application.tmux_option_port import (
     TmuxOptionWriterPort,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-    AGENT_KINDS,
     build_target_candidates,
     discover_agents,
     filter_agents,
@@ -98,9 +97,16 @@ class ResolveAgentTargetsUseCase:
     def __init__(self, discovery: AgentDiscoveryPort) -> None:
         self._discovery = discovery
 
-    def resolve(self, *, agent_filter, session_filter) -> list:
-        if agent_filter is not None and agent_filter not in AGENT_KINDS:
-            die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+    def resolve(self, *, agent_filter, session_filter, snapshot=None) -> list:
+        # Validate against the injected snapshot's vocabulary (Redmine #13569 R2-F1), so a
+        # synthetic provider the composition injected is accepted here; `None` uses built-in.
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (  # noqa: E501
+            agent_kinds,
+        )
+
+        known = agent_kinds(snapshot)
+        if agent_filter is not None and agent_filter not in known:
+            die(f"--agent must be one of {sorted(known)}; got {agent_filter!r}")
 
         canonical_cache: dict[str, object] = {}
 
@@ -347,16 +353,25 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     working. Single tmux server assumed; a multi-server deployment would
     key on ``(socket, pane_id)``.
     """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+        agent_kinds,
+        fold_agents_by_pane,
+    )
 
     require_tmux()
+    # The runtime handler validates and classifies against the SAME snapshot the parser
+    # composition injected (Redmine #13569 R2-F1), threaded through `args.snapshot`, so a
+    # synthetic provider accepted by `--agent` is also recognized here — not re-rejected
+    # against a fixed built-in set. `None` uses the built-in providers, byte-identical.
+    snapshot = getattr(args, "snapshot", None)
+    known = agent_kinds(snapshot)
     agent_filter = getattr(args, "agent", None)
-    if agent_filter is not None and agent_filter not in AGENT_KINDS:
-        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+    if agent_filter is not None and agent_filter not in known:
+        die(f"--agent must be one of {sorted(known)}; got {agent_filter!r}")
     session_filter = getattr(args, "session", None)
     records = filter_agents(
         fold_agents_by_pane(
-            discover_agents(),
+            discover_agents(snapshot=snapshot),
             resolve_canonical=lambda root: resolve_canonical_session(root).name,
         ),
         session=session_filter,

@@ -79,7 +79,7 @@ def register(sub, *, snapshot: AgentProviderRuntimeSnapshot | None = None) -> No
         dest="as_json",
         help="Emit structured JSON output instead of the tab-separated table.",
     )
-    agents_list.set_defaults(func=cmd_agents_list)
+    agents_list.set_defaults(func=cmd_agents_list, snapshot=snapshot)
 
     agents_targets = agents_sub.add_parser(
         "targets",
@@ -113,7 +113,7 @@ def register(sub, *, snapshot: AgentProviderRuntimeSnapshot | None = None) -> No
         dest="as_json",
         help="Emit structured JSON candidates instead of the compact table.",
     )
-    agents_targets.set_defaults(func=cmd_agents_targets)
+    agents_targets.set_defaults(func=cmd_agents_targets, snapshot=snapshot)
 
     agents_attention = agents_sub.add_parser(
         "attention-project",
@@ -153,4 +153,4 @@ def register(sub, *, snapshot: AgentProviderRuntimeSnapshot | None = None) -> No
         dest="as_json",
         help="Emit the derived attention records and set-option plan as JSON.",
     )
-    agents_attention.set_defaults(func=cmd_agents_attention_project)
+    agents_attention.set_defaults(func=cmd_agents_attention_project, snapshot=snapshot)

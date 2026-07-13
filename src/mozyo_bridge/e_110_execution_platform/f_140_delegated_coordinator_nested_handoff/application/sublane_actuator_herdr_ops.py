@@ -372,6 +372,7 @@ class HerdrSublaneActuatorOps:
         workspace_id: str,
         lane_id: str,
         rows: Sequence[Mapping[str, object]],
+        managed: "tuple[str, ...] | None" = None,
     ) -> dict[str, str]:
         """Map ``{role: locator}`` for the lane unit's managed slots.
 
@@ -380,7 +381,14 @@ class HerdrSublaneActuatorOps:
         rows are skipped. A row that decodes to a managed slot but carries no live locator is
         skipped (a blank target is never a resolved pane), so the use case reads it as a
         missing pane and fails closed rather than adopting a locator-less lane.
+
+        ``managed`` is the (gateway, worker) provider pair the lane is expected to run
+        (Redmine #13569 R2-F2). It must match the pair :meth:`_launch_providers` launched,
+        so a lane whose binding rebound its providers is READ BACK by its own providers
+        rather than being judged "no lane" against a fixed ``codex/claude``. ``None`` uses
+        the built-in pair, byte-identical.
         """
+        managed_pair = managed if managed is not None else (GATEWAY_ROLE, WORKER_ROLE)
         want_lane = _norm_lane(lane_id)
         slots: dict[str, str] = {}
         for row in rows:
@@ -394,7 +402,7 @@ class HerdrSublaneActuatorOps:
                 continue
             if _norm_lane(identity.lane_id) != want_lane:
                 continue
-            if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
+            if identity.role not in managed_pair:
                 continue
             locator = _agent_locator(row)
             if not locator:
@@ -430,19 +438,32 @@ class HerdrSublaneActuatorOps:
             # rather than fabricating a partial view — a genuinely down herdr also fails
             # closed on the append step, so this never adopts a lane it cannot see.
             return None
+        # The read-back recognizes the SAME provider pair the launch created (Redmine
+        # #13569 R2-F2), resolved from the binding — a rebound lane is read back by its own
+        # providers, not judged "no lane" against a fixed pair. Fail-safe to None if the
+        # binding cannot resolve (mirrors the inventory-unavailable path).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            WorkflowProviderUnresolved,
+        )
+
+        try:
+            gateway_provider, worker_provider = self._launch_providers()
+        except WorkflowProviderUnresolved:
+            return None
+        managed_pair = (gateway_provider, worker_provider)
         lane_id = _norm_lane(self.lane_label)
         slots: dict[str, str] = {}
         if workspace_id:
-            slots = self._lane_slots(workspace_id, lane_id, rows)
+            slots = self._lane_slots(workspace_id, lane_id, rows, managed_pair)
         if not slots:
             # Legacy compatibility (pre-#13377): the lane's agents live in their own
             # `wt_<hash>` workspace under the default lane.
             legacy_ws = derive_lane_workspace_token(str(resolved))
-            legacy_slots = self._lane_slots(legacy_ws, DEFAULT_LANE, rows)
+            legacy_slots = self._lane_slots(legacy_ws, DEFAULT_LANE, rows, managed_pair)
             if legacy_slots:
                 workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, legacy_slots
-        gateway = slots.get(GATEWAY_ROLE)
-        worker = slots.get(WORKER_ROLE)
+        gateway = slots.get(gateway_provider)
+        worker = slots.get(worker_provider)
         if not gateway and not worker:
             return None
         return SublaneLaneView(

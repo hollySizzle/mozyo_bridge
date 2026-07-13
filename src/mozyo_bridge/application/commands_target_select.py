@@ -178,7 +178,13 @@ def select_semantic_target(
     )
 
     try:
-        worker_provider = resolve_worker_provider(sender_repo_root or expected_repo)
+        # The cross-workspace worker-direct refusal keys on whether the CANDIDATE (which
+        # lives in the TARGET workspace) is that workspace's worker, so the worker provider
+        # is resolved from the TARGET repo's binding (`expected_repo`), not the sender's
+        # (Redmine #13569 R2-F5b). A worker rebound in the target workspace is then correctly
+        # refused for a cross-workspace direct route. `expected_repo` is non-None here (the
+        # None case died above). Default `claude`, byte-identical for the built-in binding.
+        worker_provider = resolve_worker_provider(expected_repo)
     except WorkflowProviderUnresolved as exc:
         die(f"semantic target selection failed ({exc}); no message was sent.")
         raise AssertionError("unreachable")

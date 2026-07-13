@@ -1907,8 +1907,38 @@ binding-parameterizable *seams* but did not wire them end to end. The correction
   (zero close targets), never a partial close; a benign extra slot or partial liveness still
   closes the surviving expected pair.
 - *Live callers thread the binding* — `select_semantic_target` resolves the worker provider
-  from the sender's binding and passes it to `select_target`, so the cross-workspace
-  worker-direct refusal keys on the binding provider rather than the pure default.
+  and passes it to `select_target`, so the cross-workspace worker-direct refusal keys on the
+  binding provider rather than the pure default.
+
+**R2 corrections (Redmine #13569 j#77190 / j#77200).** R1 wired the seams to the parser
+choices and leaf helpers, but not through to the runtime handlers, the herdr read-back, or
+the *target* repo's binding. The R2 corrections make the composition end-to-end and
+target-repo-authoritative:
+
+- *Snapshot reaches the runtime discovery, not only the parser* — the composition
+  `set_defaults(snapshot=…)` on the `agents` subparsers so the handler receives it via
+  `args.snapshot`; `commands_agents` / `ResolveAgentTargetsUseCase` / `LiveAgentDiscovery`
+  thread it into `discover_agents` (which classifies each pane by the injected vocabulary).
+  `agent_discovery` / `pane_resolver` no longer freeze an import-time vocabulary or import the
+  `e_140` registry at module level — the built-in fallback is read lazily through the new
+  `agent_provider_vocab` leaf (a lazy, cached, function-local registry read), and `AGENT_KINDS`
+  / `AGENT_LABELS` are PEP-562 lazy module attributes.
+- *Herdr read-back / projection recognize the launched pair* — `HerdrSublaneActuatorOps`'s
+  `_lane_slots` / `read_lane` and `project_herdr_sublanes` roster the binding-resolved
+  (gateway, worker) pair (the same pair `_launch_providers` launches), so a rebound lane is
+  read back by its own providers instead of being judged "no lane" against a fixed pair.
+- *Target-repo authority* — the gateway gate resolves the binding from `preflight_target.repo_root`
+  (the receiver's workspace), the semantic target selector resolves the worker provider from the
+  target `expected_repo`, and the launch preflight uses the composition-injected snapshot — so a
+  provider rebound in the TARGET workspace is the exact authority, and a cross-workspace third
+  provider cannot slip through on the sender's (default) binding.
+- *Retire is launchability-gated and per-unit* — the retire command boundary refuses to close
+  a lane whose bound provider is unknown / unlaunchable (zero-actuation), and the substitution
+  attestation is computed within the shared unit and the legacy twin SEPARATELY, so a provider
+  present in one unit can never mask a substitution in the other.
+- *No silent planner default reduction* — `delegation_route_planner.RouteRequest`'s gateway /
+  worker providers are required (keyword-only, no literal default), so a route plan can never
+  silently reduce to the built-in pair when a caller omits the binding.
 
 ## Follow-up Split
 

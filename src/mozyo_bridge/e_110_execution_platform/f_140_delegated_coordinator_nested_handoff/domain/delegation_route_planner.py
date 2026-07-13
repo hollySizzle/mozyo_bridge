@@ -247,13 +247,13 @@ class RouteRequest:
     #: Optional capability the route is for (echoed into the decision record).
     capability: Optional[str] = None
     #: The runtime providers the gateway / worker route heads target (Redmine #13569
-    #: Increment 2B). Defaults are the built-in binding (gateway ``codex`` / worker
-    #: ``claude``), byte-identical; the caller passes the values resolved from the
-    #: repo-local ``RoleProviderBinding`` so a rebound worker/gateway provider follows
-    #: without a literal edit, while the "gateway-via, worker-never-cross-boundary-direct"
-    #: invariant keys on the resolved worker provider rather than the literal ``claude``.
-    gateway_provider: str = "codex"
-    worker_provider: str = "claude"
+    #: Increment 2B / R2-F3). REQUIRED (keyword-only, no literal default): the caller must
+    #: resolve them from the repo-local ``RoleProviderBinding`` and thread them, so a route
+    #: plan can never silently reduce to the built-in ``codex`` / ``claude`` pair when a
+    #: caller omits the binding. The "gateway-via, worker-never-cross-boundary-direct"
+    #: invariant keys on the resolved worker provider, never a literal.
+    gateway_provider: str = field(kw_only=True)
+    worker_provider: str = field(kw_only=True)
     # --- role-profile template fields (all optional; unresolved -> reported) ---
     parent_project: str = ""
     parent_issue: str = ""
@@ -728,7 +728,7 @@ def _handoff_step(
     route_target: str,
     role_profile: RoleProfileResolution,
     realization: str,
-    worker_provider: str = "claude",
+    worker_provider: str,
 ) -> PlannedStep:
     """Build a handoff step, failing closed on a forbidden cross-boundary worker send.
 

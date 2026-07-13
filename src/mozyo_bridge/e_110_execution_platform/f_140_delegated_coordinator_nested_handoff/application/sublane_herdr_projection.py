@@ -203,6 +203,32 @@ class _LaneEntry:
     repo_scoped: bool
 
 
+def _managed_pair_for(
+    workspace_id: str,
+    resolve_repo_root: "Callable[[str], Optional[str]]",
+) -> tuple[str, str]:
+    """The (gateway, worker) provider pair a unit's lane is expected to run (Redmine #13569).
+
+    Resolves the unit's repo root (via the injected ``resolve_repo_root``) and reads the
+    repo-local ``RoleProviderBinding`` for that repo, so a lane whose binding rebound its
+    gateway / worker providers is projected by ITS providers. Any failure (unresolved repo,
+    broken / unbound binding) falls back to the built-in ``(GATEWAY_ROLE, WORKER_ROLE)`` pair
+    — the projection is a read-model and must never raise; the built-in pair is byte-identical.
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_gateway_provider,
+            resolve_worker_provider,
+        )
+
+        repo_root = resolve_repo_root(workspace_id) if resolve_repo_root else None
+        if not repo_root:
+            return (GATEWAY_ROLE, WORKER_ROLE)
+        return (resolve_gateway_provider(repo_root), resolve_worker_provider(repo_root))
+    except Exception:  # noqa: BLE001 — a read-model projection never raises.
+        return (GATEWAY_ROLE, WORKER_ROLE)
+
+
 def project_herdr_sublanes(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -294,8 +320,11 @@ def project_herdr_sublanes(
         if not decode.ok or decode.identity is None:
             continue
         identity = decode.identity
-        if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
-            continue
+        # Collect any decoded managed-scheme slot; the gateway/worker pair is picked
+        # per-unit below using that unit's binding-resolved providers (Redmine #13569
+        # R2-F2), so a lane whose binding rebound its providers is still projected rather
+        # than filtered out against a fixed ``codex/claude`` pair. A default-lane coordinator
+        # pair is still excluded below.
         ws = identity.workspace_id
         lane = _norm_lane(identity.lane_id)
         if not ws:
@@ -317,8 +346,9 @@ def project_herdr_sublanes(
     entries: list[_LaneEntry] = []
     for unit in order:
         ws, lane = unit
-        gateway = slots[unit].get(GATEWAY_ROLE)
-        worker = slots[unit].get(WORKER_ROLE)
+        gateway_provider, worker_provider = _managed_pair_for(ws, resolve_repo_root)
+        gateway = slots[unit].get(gateway_provider)
+        worker = slots[unit].get(worker_provider)
         legacy_unit = lane == DEFAULT_LANE
         if legacy_unit:
             record = resolve_lane_record(ws) if resolve_lane_record is not None else None

@@ -79,15 +79,18 @@ def enforce_gateway_route(
         sender_ws, sender_lane = sender_lane_unit
     else:
         sender_ws, sender_lane = current_pane_lane_unit()
-    # Role-based worker discrimination (Redmine #13174): resolve the implementer
-    # (worker) role's runtime provider from the repo-local binding (#12673/#13157;
-    # default -> claude, byte-identical) so the authority decision keys on the role,
-    # not the literal `claude` receiver token. A broken config fails closed through the
-    # loader's RepoLocalConfigError; an unbound worker role fails closed here rather than
-    # silently defaulting to a literal (Redmine #13569 j#76969 correction 4) — without a
-    # resolvable worker provider the cross-lane discrimination cannot be made, so the send
-    # is blocked before any text is typed.
-    binding, _warnings = load_workflow_binding()
+    # Role-based worker discrimination (Redmine #13174): resolve the implementer (worker)
+    # and coordinator (gateway) providers from the binding so the authority decision keys on
+    # the role, not the literal receiver token. The receiver lives in the TARGET workspace,
+    # so the authority is the TARGET repo's binding (Redmine #13569 R2-F3b) — resolved from
+    # ``preflight_target.repo_root`` — not the sender's cwd binding: a gateway rebound in the
+    # target workspace must be the exact allowed head, and a cross-workspace send to a third
+    # provider must not slip through on the sender's (default) binding. ``None`` (same-repo /
+    # no target root) resolves the local binding, byte-identical. A broken config fails closed
+    # through the loader; an unbound role fails closed here rather than silently defaulting
+    # (j#76969 correction 4) — without resolvable providers the discrimination cannot be made.
+    target_repo_root = getattr(preflight_target, "repo_root", None)
+    binding, _warnings = load_workflow_binding(target_repo_root)
     try:
         worker_provider = resolve_worker_provider(binding=binding)
         gateway_provider = resolve_gateway_provider(binding=binding)

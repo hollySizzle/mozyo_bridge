@@ -106,6 +106,8 @@ def _request(**overrides) -> RouteRequest:
         upstream_coordinator="upstream_coordinator",
         gateway_callback_target="grandchild_gateway",
         lane="lane-neutral",
+        gateway_provider="codex",
+        worker_provider="claude",
     )
     base.update(overrides)
     return RouteRequest(**base)

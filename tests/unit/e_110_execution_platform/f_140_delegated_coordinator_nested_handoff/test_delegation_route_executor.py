@@ -308,6 +308,8 @@ def _grandchild_plan(grandchild_required=True, output_mode=None, status=STATUS_R
         upstream_coordinator="coord",
         gateway_callback_target="gw-cb",
         parent_callback_target="p-cb",
+        gateway_provider="codex",
+        worker_provider="claude",
     )
     if output_mode is not None:
         kwargs["output_mode"] = output_mode

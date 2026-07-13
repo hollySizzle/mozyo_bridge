@@ -19,11 +19,6 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     AgentProviderRuntimeSnapshot,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE
-from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
-    agent_commands,
-    agent_process_names,
-    agent_process_owners,
-)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     pane_lines,
     resolve_pane_id,
@@ -34,21 +29,31 @@ from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import READ_MARK_PREFIX, normalize_path_unicode
 
 
-# Provider vocabulary, derived from the agent provider profile registry (Redmine
-# #13441) instead of hard-coded here. `AGENT_COMMANDS` maps a provider label to its
-# command *basename*; the executable a launch actually execs is the verified absolute
-# realpath resolved at the launch chokepoint (`agent_provider_executable`), never this
-# basename. `node` stays a literal: it is a receiver-agnostic host runtime (both CLIs
-# are node-based), not a provider, so it belongs to process detection, not the registry.
-AGENT_PROCESSES = set(agent_process_names()) | {"node"}
-AGENT_COMMANDS = agent_commands()
-AGENT_LABELS = frozenset(AGENT_COMMANDS)
-# `{process basename -> provider id}` for the strong per-receiver identity check
-# (`is_receiver_agent_process`). Registry-derived so a provider whose process
-# basename differs from its id resolves correctly; `node` is deliberately absent
-# (it is receiver-agnostic, handled by the weak branch). An injected snapshot
-# (Redmine #13569 Increment 2A) overrides this default per call.
-_PROCESS_OWNERS = agent_process_owners()
+# Provider vocabulary is read LAZILY through `agent_provider_vocab`, never frozen at import
+# and never a module-level `e_110 domain -> e_140 registry` edge (Redmine #13569 R2-F1 — both
+# forbidden by j#76969). `AGENT_COMMANDS` maps a provider label to its command *basename*
+# (the executable a launch execs is the verified absolute realpath resolved at the launch
+# chokepoint, never this basename). `node` stays a receiver-agnostic host runtime (both CLIs
+# are node-based) — process detection, not the registry (handled by the vocab accessor).
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_vocab import (  # noqa: E402
+    builtin_agent_commands as _builtin_agent_commands,
+    builtin_agent_processes as _builtin_agent_processes,
+    builtin_process_owners as _builtin_process_owners,
+)
+
+
+def __getattr__(name: str):
+    """Lazy module attributes (PEP 562, Redmine #13569 R2-F1): ``AGENT_COMMANDS`` /
+    ``AGENT_LABELS`` / ``AGENT_PROCESSES`` are the built-in vocabulary computed on first
+    access rather than frozen at import — existing importers get the same values, with no
+    import-time freeze and no module-level ``e_140`` import."""
+    if name == "AGENT_COMMANDS":
+        return _builtin_agent_commands()
+    if name == "AGENT_LABELS":
+        return frozenset(_builtin_agent_commands())
+    if name == "AGENT_PROCESSES":
+        return _builtin_agent_processes()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 # Pseudo-target label (Redmine #12015): resolves to the sender workspace's main
 # coordinator Codex (the default-lane Codex), so a sublane can call back the
 # coordinator without hand-picking its `%pane`. Not an `AGENT_LABELS` member —
@@ -405,7 +410,7 @@ def same_lane_receiver_duplicates(
     Codex gateway pane (role=codex) is not mistaken for a duplicate Claude
     receiver.
     """
-    if receiver not in AGENT_LABELS:
+    if receiver not in _builtin_agent_commands():
         return []
     target_id = target.get("id")
     target_identity = _pane_lane_identity(target)
@@ -803,7 +808,7 @@ def resolve_target(
             )
         )
         raise AssertionError("unreachable")
-    labels = AGENT_LABELS if snapshot is None else snapshot.provider_ids
+    labels = frozenset(_builtin_agent_commands()) if snapshot is None else snapshot.provider_ids
     if target not in labels:
         die(
             f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
@@ -841,7 +846,7 @@ def is_agent_process(
     command: str, *, snapshot: AgentProviderRuntimeSnapshot | None = None
 ) -> bool:
     name = Path(command or "").name
-    known = AGENT_PROCESSES if snapshot is None else None
+    known = _builtin_agent_processes() if snapshot is None else None
     is_known = name in known if known is not None else snapshot.is_agent_process(name)
     return is_known or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
 
@@ -888,7 +893,7 @@ def is_receiver_agent_process(
     # detectable (a `codex` process for receiver=`claude` still returns False). For
     # the built-in providers the process basename equals the provider id, so this is
     # byte-identical to the previous literal check.
-    owners = _PROCESS_OWNERS if snapshot is None else snapshot.process_owners()
+    owners = _builtin_process_owners() if snapshot is None else snapshot.process_owners()
     if owners.get(name) == receiver:
         return True
     # Weak identity branch: `node` literal and versioned native binary
