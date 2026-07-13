@@ -75,6 +75,13 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle_model import (
+    DECISION_SOURCE_REDMINE,
+    DECISION_SOURCES,
+    DecisionPointer,
+    DecisionPointerError,
+    ReleasePinError,
+    rehydrate_allowed,
+    validate_release_pins,
     CAS_ACTION_MISMATCH,
     CAS_ALREADY_DECLARED,
     CAS_APPLIED,
@@ -313,12 +320,15 @@ class LaneLifecycleStore:
         self,
         key: LaneLifecycleKey,
         *,
-        issue_id: str = "",
-        decision_source: str = "",
-        decision_journal: str = "",
+        decision: DecisionPointer,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Declare a fresh lane ``active`` / ``not_requested`` at revision 1.
+
+        The lane's issue comes from ``decision`` — the durable record that decided
+        it owns that issue (R1-F5); there is no way to declare an owner without
+        naming the decision. An issueless lane declares with an empty
+        ``decision.issue_id``.
 
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the
@@ -327,7 +337,7 @@ class LaneLifecycleStore:
         this workspace: the storage index, not a later check, is what makes double
         ownership impossible.
         """
-        issue = norm(issue_id)
+        issue = decision.issue_id
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -356,8 +366,8 @@ class LaneLifecycleStore:
                         1,
                         "",
                         "",
-                        norm(decision_source),
-                        norm(decision_journal),
+                        decision.source,
+                        decision.journal_id,
                         stamp,
                         stamp,
                     ),
@@ -383,15 +393,19 @@ class LaneLifecycleStore:
         expected_disposition: str,
         expected_revision: int,
         target: str,
-        decision_source: str = "",
-        decision_journal: str = "",
+        decision: DecisionPointer,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """CAS the lane's disposition, guarded on its exact state + revision.
 
-        Rehydrating (``hibernated -> active``) also resets the release generation:
-        the released processes are gone for good, so the next hibernate opens a
-        *fresh* generation rather than inheriting the last one's terminal state.
+        ``decision`` is required and replaces the stored pointer (R1-F5): the row must
+        always name the durable record that put it in its *current* state, never an
+        inherited one from an earlier write.
+
+        Rehydrating (``hibernated -> active``) clears the release generation, but only
+        a *finished* one — :func:`rehydrate_allowed` refuses while a generation is in
+        flight (R1-F3), so a lane whose panes an actuator is still closing cannot slip
+        back into the active roster.
         """
         if target not in DISPOSITIONS:
             raise ValueError(f"unknown lane disposition {target!r}")
@@ -407,6 +421,14 @@ class LaneLifecycleStore:
             if refusal is not None:
                 conn.execute("ROLLBACK")
                 return refusal
+            if not decision.binds_issue(current.issue_id):
+                # The decision authorizes a different issue than this lane holds.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_UNEXPECTED_STATE,
+                    revision=current.revision,
+                )
             if not disposition_transition_allowed(current.lane_disposition, target):
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -415,6 +437,13 @@ class LaneLifecycleStore:
                     revision=current.revision,
                 )
             rehydrating = target == DISPOSITION_ACTIVE
+            if rehydrating and not rehydrate_allowed(current.process_release):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
             if rehydrating and current.issue_id:
                 # While this lane slept, another lane may have taken its issue. Coming
                 # back as a second active owner is exactly the state the owner index
@@ -443,8 +472,8 @@ class LaneLifecycleStore:
                         action,
                         pins,
                         revision,
-                        norm(decision_source) or current.decision_source,
-                        norm(decision_journal) or current.decision_journal,
+                        decision.source,
+                        decision.journal_id,
                         stamp,
                         key.repo_workspace_id,
                         key.lane_id,
@@ -474,25 +503,48 @@ class LaneLifecycleStore:
         superseded: LaneLifecycleKey,
         expected_revision: int,
         recovery: LaneLifecycleKey,
-        issue_id: str,
-        decision_source: str = "",
-        decision_journal: str = "",
+        decision: DecisionPointer,
+        recovery_expected_disposition: Optional[str] = None,
+        recovery_expected_revision: Optional[int] = None,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Hand an issue's ownership to a recovery lane in **one** transaction.
 
-        The old owner goes ``active -> superseded`` and the recovery lane becomes
-        the active owner atomically. There is no instant at which the issue has two
-        active owners (the partial unique index would reject it) nor zero (a reader
-        between two separate writes would have failed closed on ``absent``).
+        The old owner goes ``active -> superseded`` and the recovery lane becomes the
+        active owner atomically. There is no instant at which the issue has two active
+        owners (the partial unique index would reject it) nor zero (a reader between
+        two separate writes would have failed closed on ``absent``).
+
+        The issue whose ownership moves is ``decision.issue_id`` — the durable record
+        that decided the handover (R1-F5). Both lanes must live in the **same
+        workspace** (R1-F1): ownership is a workspace-scoped fact, so moving it across
+        workspaces is not a handover but two unrelated writes, and the owner index
+        would not even see the conflict.
+
+        The recovery lane is CAS-guarded on its own expected state + revision when it
+        already exists (R1-F2). Without that, a caller holding only the *old* lane's
+        revision could overwrite whatever the recovery lane happens to be doing —
+        including wiping an in-flight release generation. Pass
+        ``recovery_expected_disposition`` / ``recovery_expected_revision`` for an
+        existing recovery lane, and neither for a fresh one.
+
+        A recovery lane already bound to a *different* issue is refused
+        (:data:`CAS_OWNER_CONFLICT`, R1-F1): promoting it would silently strip that
+        issue of its owner. Only an unbound lane, or one already bound to this issue,
+        may be activated.
 
         ``revision`` in the outcome is the *recovery* lane's.
         """
-        issue = norm(issue_id)
+        issue = decision.issue_id
         if not issue:
             raise ValueError("supersession requires the issue whose ownership moves")
         if superseded == recovery:
             raise ValueError("a lane cannot supersede itself")
+        if superseded.repo_workspace_id != recovery.repo_workspace_id:
+            raise ValueError(
+                "supersession is workspace-scoped: "
+                f"{superseded.repo_workspace_id!r} != {recovery.repo_workspace_id!r}"
+            )
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -513,6 +565,15 @@ class LaneLifecycleStore:
                     revision=current.revision,
                 )
             incoming = _locked_row(conn, recovery)
+            refusal = _recovery_refusal(
+                incoming,
+                issue=issue,
+                expected_disposition=recovery_expected_disposition,
+                expected_revision=recovery_expected_revision,
+            )
+            if refusal is not None:
+                conn.execute("ROLLBACK")
+                return refusal
             holder = _active_owner(conn, superseded.repo_workspace_id, issue)
             if holder is not None and holder not in (
                 superseded.lane_id,
@@ -534,8 +595,8 @@ class LaneLifecycleStore:
                     (
                         DISPOSITION_SUPERSEDED,
                         current.revision + 1,
-                        norm(decision_source) or current.decision_source,
-                        norm(decision_journal) or current.decision_journal,
+                        decision.source,
+                        decision.journal_id,
                         stamp,
                         superseded.repo_workspace_id,
                         superseded.lane_id,
@@ -556,23 +617,13 @@ class LaneLifecycleStore:
                             revision,
                             "",
                             "",
-                            norm(decision_source),
-                            norm(decision_journal),
+                            decision.source,
+                            decision.journal_id,
                             stamp,
                             stamp,
                         ),
                     )
                 else:
-                    if incoming.lane_disposition not in (
-                        DISPOSITION_ACTIVE,
-                        DISPOSITION_HIBERNATED,
-                    ):
-                        conn.execute("ROLLBACK")
-                        return CasOutcome(
-                            applied=False,
-                            reason=CAS_FORBIDDEN_TRANSITION,
-                            revision=incoming.revision,
-                        )
                     revision = incoming.revision + 1
                     conn.execute(
                         f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
@@ -587,8 +638,8 @@ class LaneLifecycleStore:
                             "",
                             "",
                             revision,
-                            norm(decision_source) or incoming.decision_source,
-                            norm(decision_journal) or incoming.decision_journal,
+                            decision.source,
+                            decision.journal_id,
                             stamp,
                             recovery.repo_workspace_id,
                             recovery.lane_id,
@@ -631,9 +682,9 @@ class LaneLifecycleStore:
         action = norm(action_id)
         if not action:
             raise ValueError("a release generation requires a non-empty action id")
-        pinned = tuple(pins)
-        if not pinned:
-            raise ValueError("a release generation requires at least one pinned slot")
+        # Every pin must name a slot the actuator can actually re-resolve, and no slot
+        # may appear twice (R1-F4); an unusable pin is refused, never stored.
+        pinned = validate_release_pins(tuple(pins))
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -797,6 +848,49 @@ def _locked_row(
 
 
 
+def _recovery_refusal(
+    incoming: Optional[LaneLifecycleRecord],
+    *,
+    issue: str,
+    expected_disposition: Optional[str],
+    expected_revision: Optional[int],
+) -> Optional[CasOutcome]:
+    """Guard the recovery side of a supersession (``None`` when it may be activated).
+
+    Everything the *old* lane's guard does, the recovery lane needs too (R1-F2) — it
+    is just as much a CAS target. Beyond the expected state + revision it also has to
+    keep two invariants the old lane cannot: it must not already own a **different**
+    issue (R1-F1), and it must not have a release generation in flight (R1-F3).
+    """
+    if incoming is None:
+        if expected_disposition is not None or expected_revision is not None:
+            # The caller expected an existing recovery lane; there is none.
+            return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+        return None
+    if expected_disposition is None or expected_revision is None:
+        # An existing recovery lane may only be moved under an explicit expectation.
+        return CasOutcome(
+            applied=False, reason=CAS_UNEXPECTED_STATE, revision=incoming.revision
+        )
+    refusal = guard(incoming, expected_disposition, expected_revision)
+    if refusal is not None:
+        return refusal
+    if incoming.issue_id and incoming.issue_id != issue:
+        # Promoting it would leave `incoming.issue_id` with no owner at all.
+        return CasOutcome(
+            applied=False, reason=CAS_OWNER_CONFLICT, revision=incoming.revision
+        )
+    if incoming.lane_disposition not in (DISPOSITION_ACTIVE, DISPOSITION_HIBERNATED):
+        return CasOutcome(
+            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
+        )
+    if not rehydrate_allowed(incoming.process_release):
+        return CasOutcome(
+            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
+        )
+    return None
+
+
 def _active_owner(
     conn: sqlite3.Connection, repo_workspace_id: str, issue_id: str
 ) -> Optional[str]:
@@ -852,6 +946,13 @@ def load_lane_lifecycle(
 
 
 __all__ = (
+    "DECISION_SOURCES",
+    "DECISION_SOURCE_REDMINE",
+    "DecisionPointer",
+    "DecisionPointerError",
+    "ReleasePinError",
+    "rehydrate_allowed",
+    "validate_release_pins",
     "LANE_LIFECYCLE_COMPONENT",
     "LANE_LIFECYCLE_RECOVERY_POLICY",
     "LANE_LIFECYCLE_SCHEMA_VERSION",
