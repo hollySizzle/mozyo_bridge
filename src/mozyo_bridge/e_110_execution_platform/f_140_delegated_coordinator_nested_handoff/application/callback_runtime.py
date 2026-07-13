@@ -37,6 +37,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     OwningLaneBinding,
     ReviewReturnPlan,
+    encode_review_return_payload,
     plan_review_returns,
 )
 
@@ -118,6 +119,9 @@ def discover_review_returns(
                 journal=str(plan.review_journal).strip(),
                 callback_route=plan.callback_route,
                 notification_kind="review_result",
+                # The correlated review_request (action identity) the row is bound to, persisted on
+                # the outbox row so the send authority can re-verify the round at action time (R1-F2).
+                payload=encode_review_return_payload(plan.review_request_journal),
                 workspace_id=str(workspace_id or "").strip(),
                 target_lane=plan.target_lane,
                 target_receiver=plan.target_receiver,

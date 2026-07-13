@@ -121,6 +121,11 @@ class IssueSupervisionOutcome:
     pending: int = 0
     dead_letter: int = 0
     error: str = ""
+    #: The fixed-vocabulary review_result-return refusal reasons for this issue (#13684 review R1-F3):
+    #: why a correlated return was NOT reserved (missing / ambiguous owner, self-route, stale, blank
+    #: generation, uncorrelated). Secret-safe reason tokens only (no pane id / path / credential), so
+    #: an operator sees a fail-closed zero-send is a deliberate refusal, not a silent drop.
+    review_return_refusals: tuple[str, ...] = ()
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -131,6 +136,7 @@ class IssueSupervisionOutcome:
             "pending": self.pending,
             "dead_letter": self.dead_letter,
             "error": self.error,
+            "review_return_refusals": list(self.review_return_refusals),
         }
 
 

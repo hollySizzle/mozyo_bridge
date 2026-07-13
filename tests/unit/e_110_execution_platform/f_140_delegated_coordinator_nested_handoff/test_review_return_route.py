@@ -27,17 +27,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RETURN_BLANK_GENERATION,
     RETURN_NO_GATEWAY,
     RETURN_NO_OWNER,
+    RETURN_NO_REVIEW_REQUEST,
     RETURN_NOT_LATEST,
     RETURN_NOT_REVIEW_RESULT,
     RETURN_OK,
     RETURN_SELF_ROUTE,
     REVIEW_RETURN_ROUTE_PREFIX,
     OwningLaneBinding,
+    correlated_review_request_journal,
+    decode_review_return_payload,
+    encode_review_return_payload,
     is_review_return_route,
     latest_review_result_journal,
     plan_review_return,
     plan_review_returns,
     review_return_callback_route,
+    review_return_is_current,
 )
 
 ISSUE = "13684"
@@ -55,6 +60,11 @@ def _owner(**kw) -> OwningLaneBinding:
     base = dict(status=OWNER_RESOLVED, lane_id="issue_13684", generation="3", gateway_receiver="codex")
     base.update(kw)
     return OwningLaneBinding(**base)
+
+
+#: A valid review round on ISSUE: a review_request (j10) then the review_result (j20) it answers, so
+#: a plan for j20 passes the round-correlation fence and the test isolates the dimension it varies.
+_ROUND = [_review_request("10"), _review_result("20")]
 
 
 class ReviewReturnRouteTest(unittest.TestCase):
@@ -78,6 +88,20 @@ class ReviewReturnRouteTest(unittest.TestCase):
         self.assertEqual(plan.target_receiver, "codex")
         self.assertEqual(plan.target_generation, "3")
         self.assertEqual(plan.review_journal, "20")
+        # R1-F2: the return correlates to the review_request it answers (action identity).
+        self.assertEqual(plan.review_request_journal, "10")
+
+    def test_review_result_without_a_review_request_is_refused(self) -> None:
+        # R1-F2: an uncorrelated review outcome (no preceding review_request) is never returned.
+        plan = plan_review_return([_review_result("20")], ISSUE, "20", _owner())
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_NO_REVIEW_REQUEST)
+
+    def test_correlated_review_request_is_the_latest_before_the_result(self) -> None:
+        markers = [_review_request("5"), _review_request("10"), _review_result("20"), _review_request("30")]
+        # The request the result answers is the newest request BEFORE the result (10, not 30).
+        self.assertEqual(correlated_review_request_journal(markers, ISSUE, "20"), "10")
+        self.assertEqual(correlated_review_request_journal([_review_result("20")], ISSUE, "20"), "")
 
     def test_latest_review_result_journal_picks_the_newest(self) -> None:
         markers = [_review_result("20"), _review_result("35"), _review_result("9")]
@@ -85,12 +109,31 @@ class ReviewReturnRouteTest(unittest.TestCase):
         self.assertEqual(latest_review_result_journal([], ISSUE), "")
 
     def test_stale_result_shadowed_by_newer_result_is_refused(self) -> None:
-        markers = [_review_result("20"), _review_result("35")]
+        markers = [_review_request("10"), _review_result("20"), _review_result("35")]
         plan = plan_review_return(markers, ISSUE, "20", _owner())
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_NOT_LATEST)
         # ...and the newest result IS returnable.
         self.assertTrue(plan_review_return(markers, ISSUE, "35", _owner()).emit)
+
+    def test_review_return_is_current_action_time_fence(self) -> None:
+        markers = [_review_request("10"), _review_result("20")]
+        # Reserved round is still current.
+        self.assertTrue(review_return_is_current(markers, ISSUE, "20", "10"))
+        # A newer review_request landed after reserve -> the round restarted -> stale.
+        self.assertFalse(review_return_is_current(markers + [_review_request("30")], ISSUE, "20", "10"))
+        # A newer review_result landed -> stale.
+        self.assertFalse(review_return_is_current(markers + [_review_result("40")], ISSUE, "20", "10"))
+        # The recorded correlation drifted from the current one -> stale.
+        self.assertFalse(review_return_is_current(markers, ISSUE, "20", "7"))
+        # An uncorrelated result (no request) is not current.
+        self.assertFalse(review_return_is_current([_review_result("20")], ISSUE, "20", ""))
+
+    def test_payload_round_trips_the_correlation(self) -> None:
+        self.assertEqual(decode_review_return_payload(encode_review_return_payload("10")), "10")
+        self.assertEqual(encode_review_return_payload(""), "")
+        self.assertEqual(decode_review_return_payload(""), "")
+        self.assertEqual(decode_review_return_payload("not json"), "")
 
     def test_newer_review_request_restarts_the_round_and_refuses_old_result(self) -> None:
         # A review round restarted after the result (j30 review_request > j20 review_result).
@@ -115,29 +158,27 @@ class ReviewReturnRouteTest(unittest.TestCase):
         )
 
     def test_absent_owner_is_refused(self) -> None:
-        plan = plan_review_return([_review_result("20")], ISSUE, "20", OwningLaneBinding(status=OWNER_ABSENT))
+        plan = plan_review_return(_ROUND, ISSUE, "20", OwningLaneBinding(status=OWNER_ABSENT))
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_NO_OWNER)
 
     def test_ambiguous_owner_is_refused(self) -> None:
-        plan = plan_review_return(
-            [_review_result("20")], ISSUE, "20", OwningLaneBinding(status=OWNER_AMBIGUOUS)
-        )
+        plan = plan_review_return(_ROUND, ISSUE, "20", OwningLaneBinding(status=OWNER_AMBIGUOUS))
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_AMBIGUOUS_OWNER)
 
     def test_self_route_to_coordinator_lane_is_refused(self) -> None:
-        plan = plan_review_return([_review_result("20")], ISSUE, "20", _owner(lane_id=COORDINATOR_LANE))
+        plan = plan_review_return(_ROUND, ISSUE, "20", _owner(lane_id=COORDINATOR_LANE))
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_SELF_ROUTE)
 
     def test_blank_gateway_receiver_is_refused(self) -> None:
-        plan = plan_review_return([_review_result("20")], ISSUE, "20", _owner(gateway_receiver=""))
+        plan = plan_review_return(_ROUND, ISSUE, "20", _owner(gateway_receiver=""))
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_NO_GATEWAY)
 
     def test_blank_owning_generation_is_refused(self) -> None:
-        plan = plan_review_return([_review_result("20")], ISSUE, "20", _owner(generation=""))
+        plan = plan_review_return(_ROUND, ISSUE, "20", _owner(generation=""))
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_BLANK_GENERATION)
 

@@ -112,6 +112,11 @@ ISSUE_PASS_ERROR = "issue_pass_error"
 #: issue's source reads), so the outbox delivery was skipped — zero-send (Redmine #13683 R2-F1).
 ISSUE_LEASE_LOST = "lease_lost_before_send"
 
+#: A review-return refusal token (#13684 review R1-F3): resolving the owning-lane binding raised, so
+#: no correlated return was reserved. Surfaced in the issue outcome so the zero-send is
+#: operator-visible (secret-safe; carries no pane id / path / credential).
+REVIEW_RETURN_OWNER_READ_ERROR = "owner_binding_read_error"
+
 #: The launch-time lane-identity env a background supervisor must NOT inherit (Redmine #13683
 #: R2-F3). A supervisor is not a lane agent, so carrying another lane's role / lane / workspace id
 #: into a target workspace's send would misroute on a foreign identity (or, in a login service,
@@ -322,6 +327,7 @@ class WorkspaceCallbackSupervisor:
         events_supplied = 0
         error = ""
         candidates = ()
+        review_return_refusals: tuple[str, ...] = ()
         try:
             if source is not None:
                 events_supplied = self._supply_events(issue, source, binding)
@@ -344,12 +350,18 @@ class WorkspaceCallbackSupervisor:
                 if self._owner_binding_fn is not None:
                     try:
                         owner = self._owner_binding_fn(workspace_id, issue, binding)
-                        return_candidates, _plans = discover_review_returns(
+                        return_candidates, plans = discover_review_returns(
                             source, issue, owner, workspace_id=workspace_id
                         )
                         candidates = candidates + tuple(return_candidates)
+                        # R1-F3: surface WHY a return was refused (secret-safe reason tokens) so a
+                        # fail-closed zero-send is operator-visible in the supervisor report, not a
+                        # silent drop.
+                        review_return_refusals = tuple(
+                            p.reason for p in plans if not p.emit
+                        )
                     except Exception:  # noqa: BLE001 - an owner-read failure never aborts the issue pass
-                        pass
+                        review_return_refusals = (REVIEW_RETURN_OWNER_READ_ERROR,)
             else:
                 error = ISSUE_SOURCE_UNREADABLE
         except Exception:  # noqa: BLE001 - a source read failure degrades this issue, never the sweep
@@ -366,7 +378,8 @@ class WorkspaceCallbackSupervisor:
             workspace_id, self._holder, now=self._clock(), ttl_seconds=self._ttl
         ):
             return IssueSupervisionOutcome(
-                issue=issue, events_supplied=events_supplied, error=ISSUE_LEASE_LOST
+                issue=issue, events_supplied=events_supplied, error=ISSUE_LEASE_LOST,
+                review_return_refusals=review_return_refusals,
             )
 
         try:
@@ -376,7 +389,8 @@ class WorkspaceCallbackSupervisor:
             report = run_once(processor, sender, candidates=candidates)
         except Exception:  # noqa: BLE001 - a store / send failure is recorded, not fatal to the sweep
             return IssueSupervisionOutcome(
-                issue=issue, events_supplied=events_supplied, error=error or ISSUE_PASS_ERROR
+                issue=issue, events_supplied=events_supplied, error=error or ISSUE_PASS_ERROR,
+                review_return_refusals=review_return_refusals,
             )
 
         deliver = report.get("deliver") or {}
@@ -389,6 +403,7 @@ class WorkspaceCallbackSupervisor:
             pending=len(sweep.get("pending") or []),
             dead_letter=len(sweep.get("dead_letter") or []),
             error=error,
+            review_return_refusals=review_return_refusals,
         )
 
     def _supply_events(self, issue: str, source: RedmineJournalSource, binding: object) -> int:
@@ -646,6 +661,51 @@ def owning_lane_generation_reader(
     return _read
 
 
+def review_round_send_fence(
+    source_fn: Callable[[], Optional[RedmineJournalSource]]
+) -> "Callable[[CallbackOutboxRow], bool]":
+    """The action-time review-round fence for a review_result return row (#13684 review R1-F1).
+
+    At the send edge the sender calls this to re-verify a correlated ``review_return`` row is STILL
+    the current review round: it re-reads the issue's live structured markers through ``source_fn``
+    (the ticket-provider boundary — Redmine is the authority, never a notification kind), decodes the
+    row's correlated ``review_request_journal`` from its payload, and delegates to the pure
+    :func:`...review_return_route.review_return_is_current`. A newer review_request / review_result /
+    correction landing after the row was reserved makes it stale -> False -> the sender zero-sends. A
+    non-return row is not fenced (True); an unreadable source is fail-closed (False) — a round we
+    cannot re-verify is never delivered.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        markers_from_source,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+        decode_review_return_payload,
+        review_return_is_current,
+    )
+
+    def _fence(row: CallbackOutboxRow) -> bool:
+        if not is_review_return_route(str(getattr(row, "callback_route", "") or "")):
+            return True
+        issue = str(getattr(row, "issue", "") or "").strip()
+        review_journal = str(getattr(row, "journal", "") or "").strip()
+        if not issue or not review_journal:
+            return False
+        try:
+            source = source_fn()
+        except Exception:  # noqa: BLE001 - an unresolvable source is a fail-closed stale round
+            return False
+        if source is None:
+            return False
+        try:
+            markers = markers_from_source(source, issue)
+        except Exception:  # noqa: BLE001 - an unreadable source is a fail-closed stale round
+            return False
+        request_journal = decode_review_return_payload(str(getattr(row, "payload", "") or ""))
+        return review_return_is_current(markers, issue, review_journal, request_journal)
+
+    return _fence
+
+
 def default_lifecycle_store(*, home: Optional[Path] = None):
     """Build the home-scoped lane lifecycle store (the #13681/#13689 owning-lane binding authority)."""
     from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
@@ -789,6 +849,8 @@ def build_supervisor(
             target_resolver=default_target_resolver(ws, lifecycle_store=lifecycle_store),
             transport=default_background_transport(ws),
             outbox=outbox,
+            # R1-F1: re-verify the review round at the send edge against the live Redmine markers.
+            round_fence_fn=review_round_send_fence(lambda: default_redmine_source(ws)),
         )
 
     def _owner_binding_fn(workspace_id: str, issue: str, binding: object) -> OwningLaneBinding:
@@ -819,6 +881,8 @@ __all__ = (
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",
     "ISSUE_LEASE_LOST",
+    "REVIEW_RETURN_OWNER_READ_ERROR",
+    "review_round_send_fence",
     "default_workspaces",
     "default_roster",
     "default_redmine_source",

@@ -59,6 +59,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     default_workspaces,
     owning_lane_binding,
     owning_lane_generation_reader,
+    review_round_send_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MappingRedmineJournalSource,
@@ -88,6 +89,12 @@ def _review_request_note():
 
 def _review_result_note(conclusion="approved"):
     return render_workflow_event_marker("review_result", conclusion=conclusion)
+
+
+def _round_source(*extra):
+    """A source with a valid review round (review_request j10 → review_result j20) + optional extras."""
+    entries = [("10", _review_request_note()), ("20", _review_result_note()), *extra]
+    return MappingRedmineJournalSource(payload=_journals(*entries))
 
 
 class _CapturingTransport:
@@ -136,27 +143,34 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         rows = [{"name": encode_assigned_name(WS, "codex", lane), "pane_id": f"%{lane}"} for lane in lanes]
         return lambda: (rows, "herdr")
 
-    def _sender(self, transport, *, inventory_lanes=(LANE,)):
+    def _sender(self, transport, *, inventory_lanes=(LANE,), fence_source=None):
         resolver = BackendNeutralTargetResolver(
             workspace_id=WS,
             inventory=self._inventory(*inventory_lanes),
             live_generation_fn=owning_lane_generation_reader(WS, lifecycle_store=self.life),
         )
+        # Wire the REAL action-time round fence (R1-F1) against a live source so the send edge
+        # re-verifies the review round; ``fence_source`` may differ from the discovery source to
+        # simulate a newer review_request landing between reserve and send.
+        fence = review_round_send_fence(lambda: fence_source) if fence_source is not None else None
         return BackgroundServiceCallbackSender(
             workspace_id=WS, holder="superX", lease_store=self.lease,
             target_resolver=resolver, transport=transport, outbox=self.outbox,
-            now_fn=lambda: NOW,
+            now_fn=lambda: NOW, round_fence_fn=fence,
         )
 
     def _owner(self):
         return owning_lane_binding(WS, ISSUE, RoleProviderBinding.default(), lifecycle_store=self.life)
 
-    def _run(self, source, transport, *, inventory_lanes=(LANE,), candidates=None):
+    def _run(self, source, transport, *, inventory_lanes=(LANE,), candidates=None, fence_source=None):
         proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
         if candidates is None:
             candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
-        return run_once(proc, self._sender(transport, inventory_lanes=inventory_lanes),
-                        candidates=candidates, now=NOW)
+        sender = self._sender(
+            transport, inventory_lanes=inventory_lanes,
+            fence_source=fence_source if fence_source is not None else source,
+        )
+        return run_once(proc, sender, candidates=candidates, now=NOW)
 
     # -- scenarios --------------------------------------------------------
 
@@ -182,7 +196,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
 
     def test_duplicate_review_result_journal_delivers_once(self) -> None:
         self._declare_owner()
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         t1 = _CapturingTransport()
         self._run(source, t1)
         # A second sweep re-discovers the same review_result — idempotent enqueue, nothing new to send.
@@ -192,12 +206,10 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         self.assertEqual(t2.calls, [])
         self.assertEqual(len(self.outbox.read(states=[CALLBACK_DELIVERED])), 1)
 
-    def test_latest_review_fence_refuses_a_stale_result(self) -> None:
+    def test_latest_review_fence_refuses_a_stale_result_at_discovery(self) -> None:
         self._declare_owner()
-        # A newer review_request (j30) restarted the round after the review_result (j20).
-        source = MappingRedmineJournalSource(
-            payload=_journals(("20", _review_result_note()), ("30", _review_request_note()))
-        )
+        # Round j10→j20, then a newer review_request (j30) restarted the round after the result.
+        source = _round_source(("30", _review_request_note()))
         candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
         self.assertEqual(candidates, [])
         transport = _CapturingTransport()
@@ -205,10 +217,38 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])
         self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
 
+    def test_action_time_fence_zero_sends_when_a_newer_request_lands_after_reserve(self) -> None:
+        # R1-F1 race regression: the return row is reserved while the round is current, then a NEWER
+        # review_request lands before the send edge. The action-time round fence (re-reading the live
+        # markers at send time) must zero-send the now-stale row — discovery-time correctness alone is
+        # not enough.
+        self._declare_owner()
+        discovery_source = _round_source()  # j10 req, j20 result — current at reserve
+        candidates, _ = discover_review_returns(discovery_source, ISSUE, self._owner(), workspace_id=WS)
+        self.assertEqual(len(candidates), 1)
+        proc = CallbackOutboxProcessor(self.outbox, discovery_source, workspace_id=WS)
+        proc.ingest(candidates, now=NOW)  # reserve the return row while the round is current
+        # A newer review_request (j30) restarts the round AFTER reserve.
+        send_source = _round_source(("30", _review_request_note()))
+        transport = _CapturingTransport()
+        run_once(proc, self._sender(transport, fence_source=send_source), now=NOW)
+        self.assertEqual(transport.calls, [])  # action-time fence zero-sends the stale round
+        self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
+        # Without the action-time fence the same row WOULD have delivered — prove the fence is load-bearing.
+        self.setUp()  # fresh stores
+        self._declare_owner()
+        candidates2, _ = discover_review_returns(_round_source(), ISSUE, self._owner(), workspace_id=WS)
+        proc2 = CallbackOutboxProcessor(self.outbox, _round_source(), workspace_id=WS)
+        proc2.ingest(candidates2, now=NOW)
+        t2 = _CapturingTransport()
+        # fence_source omitted -> no round fence; the stale round is not caught (regression witness).
+        run_once(proc2, self._sender(t2), now=NOW)
+        self.assertEqual(len(t2.calls), 1)
+
     def test_supersession_zero_sends_the_stale_lane_row(self) -> None:
         # An L1 return row was reserved while L1 owned the issue.
         self._declare_owner(lane=LANE)
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
         proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
         proc.ingest(candidates, now=NOW)  # enqueue the L1 return row, do not deliver yet
@@ -227,7 +267,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # The owner is the recovery lane by the time the review_result is discovered.
         self._declare_owner(lane=LANE)
         self._supersede()  # owner is now RECOVERY_LANE
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].callback_route, f"review_return:{RECOVERY_LANE}")
@@ -239,14 +279,14 @@ class ReviewReturnScenarioTest(unittest.TestCase):
 
     def test_self_route_owned_by_coordinator_lane_emits_nothing(self) -> None:
         self._declare_owner(lane="default")  # the coordinator's own lane owns the issue
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
         self.assertEqual(candidates, [])
         self.assertTrue(any(p.reason == "self_route" for p in plans))
 
     def test_missing_owner_emits_nothing(self) -> None:
         # No lifecycle owner row for the issue -> fail-closed, no return.
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
         self.assertEqual(candidates, [])
 
@@ -254,7 +294,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # The owning lane resolves, but its Codex gateway pane is not in the live inventory (down /
         # not launched) -> no live target -> deterministic zero-send, row stays retryable.
         self._declare_owner()
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         transport = _CapturingTransport()
         # inventory_lanes empty -> the resolver finds no live gateway for LANE.
         self._run(source, transport, inventory_lanes=())
@@ -264,7 +304,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
 
     def test_uncertain_send_is_not_blind_retried(self) -> None:
         self._declare_owner()
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         # A post-injection ambiguous outcome (turn-start unconfirmed) -> uncertain, never auto-retried.
         transport = _CapturingTransport(result=HandoffDeliveryResult("blocked", "turn_start_unconfirmed"))
         self._run(source, transport)
@@ -285,7 +325,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
             decision=DecisionPointer("redmine", ISSUE, "100"), issue_id=ISSUE, now=NOW,
         )
         self.lease.acquire(wsid, "superF", now=NOW, ttl_seconds=600)
-        source = MappingRedmineJournalSource(payload=_journals(("20", _review_result_note())))
+        source = _round_source()
         transport = _CapturingTransport()
         inv = lambda: ([{"name": encode_assigned_name(wsid, "codex", LANE), "pane_id": "%gw"}], "herdr")
 

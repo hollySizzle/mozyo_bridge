@@ -63,6 +63,13 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+#: The action-time round-fence refusal (Redmine #13684 review R1-F1): a reserved review_result return
+#: was found stale at the send edge (a newer review_request / result / correction superseded its
+#: round). A deterministic zero-send — the transport is never invoked and the row bounded-retries then
+#: dead-letters (operator-visible), never a blind delivery of a stale review outcome.
+ROUND_STALE = "review_round_stale"
+
+
 class TargetResolver(Protocol):
     """Re-resolves a claimed row's route to live targets (route ledger + live inventory)."""
 
@@ -196,6 +203,12 @@ class BackgroundServiceCallbackSender:
     outbox: Optional[CallbackOutbox] = None
     now_fn: Callable[[], str] = _utc_now_iso
     claim_stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS
+    #: #13684 review R1-F1 — the action-time round fence. For a correlated review_result return row it
+    #: re-reads the issue's live structured markers at the send edge and returns True only when the
+    #: reserved result is STILL the current review round (no newer request / result / correction). A
+    #: stale row returns False -> a deterministic zero-send (never a blind delivery of a stale result).
+    #: ``None`` (default) applies no fence — a non-return row / a pure-mechanism test is unaffected.
+    round_fence_fn: Optional[Callable[[CallbackOutboxRow], bool]] = None
 
     def __call__(self, row: CallbackOutboxRow) -> CallbackSendResult:
         # Boundary 2 (claim): the durable outbox claim must still be OURS and unexpired at send time
@@ -237,6 +250,15 @@ class BackgroundServiceCallbackSender:
             return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_LEASE)
         if not self._holds_claim(row):
             return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_CLAIM)
+        # R1-F1 action-time round fence: for a correlated review_result return, re-verify at the send
+        # edge that the reserved result is STILL the current review round (a newer review_request /
+        # result landing after reserve makes it stale). A stale round is a deterministic zero-send —
+        # the transport is NEVER invoked, and the row stays retryable then bounded-dead-letters
+        # (operator-visible), never a blind delivery of a stale review outcome.
+        if not self._round_is_current(row):
+            return CallbackSendResult(
+                SEND_NOT_SENT, persist_ok=False, persist_reason=ROUND_STALE
+            )
         try:
             result = self.transport.deliver(row, decision.target)
         except Exception:  # noqa: BLE001 - a transport blow-up mid-send is uncertain (no blind retry)
@@ -245,6 +267,20 @@ class BackgroundServiceCallbackSender:
         return CallbackSendResult(
             outcome, persist_ok=result.persist_ok, persist_reason=result.persist_reason
         )
+
+    def _round_is_current(self, row: CallbackOutboxRow) -> bool:
+        """True iff the row's reserved review round is still current at the send edge (R1-F1).
+
+        No fence wired, or a non-review-return row -> True (unaffected). With a fence, delegate to it;
+        a fence that raises is fail-closed (a round we cannot re-verify is treated as stale so a
+        possibly-superseded result is never delivered).
+        """
+        if self.round_fence_fn is None:
+            return True
+        try:
+            return bool(self.round_fence_fn(row))
+        except Exception:  # noqa: BLE001 - an unverifiable round is fail-closed stale (no blind send)
+            return False
 
     def _holds_claim(self, row: CallbackOutboxRow) -> bool:
         """True iff this row's outbox claim is still OURS and unexpired at send time (R3-F4).
@@ -279,6 +315,7 @@ class BackgroundServiceCallbackSender:
 
 
 __all__ = (
+    "ROUND_STALE",
     "TargetResolver",
     "BackendNeutralTargetResolver",
     "DeliveryTransport",

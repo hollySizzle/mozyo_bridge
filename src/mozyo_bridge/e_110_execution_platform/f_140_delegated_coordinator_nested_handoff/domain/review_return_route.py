@@ -45,6 +45,7 @@ Redmine journal, and firing the delivery, are the application layer's job.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -80,8 +81,13 @@ RETURN_NO_GATEWAY = "no_gateway_receiver"  # the lane gateway provider did not r
 RETURN_NOT_LATEST = "not_latest_review"  # a newer review_result / review_request superseded this one
 RETURN_NOT_REVIEW_RESULT = "not_review_result"  # the anchored journal carries no review outcome
 RETURN_BLANK_GENERATION = "blank_owning_generation"  # the owning lane carries no generation stamp
+#: The review_result is not correlated to any preceding review_request (no review round it answers) —
+#: an uncorrelated review outcome is never returned (#13684 review R1-F2 / j#77892 correction 3: the
+#: result must bind to its review_request / action identity).
+RETURN_NO_REVIEW_REQUEST = "no_correlated_review_request"
 
-#: The refusal reasons — every one is a fail-closed no-return (never a guessed / self / stale send).
+#: The refusal reasons — every one is a fail-closed no-return (never a guessed / self / stale /
+#: uncorrelated send).
 RETURN_REFUSAL_REASONS = frozenset(
     {
         RETURN_NO_OWNER,
@@ -91,6 +97,7 @@ RETURN_REFUSAL_REASONS = frozenset(
         RETURN_NOT_LATEST,
         RETURN_NOT_REVIEW_RESULT,
         RETURN_BLANK_GENERATION,
+        RETURN_NO_REVIEW_REQUEST,
     }
 )
 
@@ -164,6 +171,10 @@ class ReviewReturnPlan:
     target_receiver: str = ""
     target_generation: str = ""
     review_journal: str = ""
+    #: The correlated review_request journal this result answers (#13684 review R1-F2): the action
+    #: identity the return is bound to, so the send authority can re-verify the round at action time
+    #: and refuse a result whose round was superseded by a newer request.
+    review_request_journal: str = ""
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -174,7 +185,43 @@ class ReviewReturnPlan:
             "target_receiver": self.target_receiver,
             "target_generation": self.target_generation,
             "review_journal": self.review_journal,
+            "review_request_journal": self.review_request_journal,
         }
+
+
+#: The outbox-row payload key carrying the correlated review_request journal (action identity). Kept
+#: in the row ``payload`` (not a new column) so the existing outbox idempotency key is untouched
+#: (#13684 review R1-F2 / j#77892 correction 4: action/generation are payload authority, no new ledger).
+_PAYLOAD_REVIEW_REQUEST_JOURNAL = "review_request_journal"
+
+
+def encode_review_return_payload(review_request_journal: str) -> str:
+    """Encode the review-return correlation into a compact JSON outbox payload (pure).
+
+    Carries the correlated ``review_request_journal`` (the action identity the return is bound to) so
+    the send authority can re-verify the review round at action time. Returns ``""`` for a blank
+    request journal (nothing to carry).
+    """
+    j = str(review_request_journal or "").strip()
+    return json.dumps({_PAYLOAD_REVIEW_REQUEST_JOURNAL: j}, sort_keys=True) if j else ""
+
+
+def decode_review_return_payload(payload: str) -> str:
+    """Read the correlated ``review_request_journal`` from an outbox-row payload, or ``""`` (pure).
+
+    Fail-safe: a blank / non-JSON / unexpected-shape payload yields ``""`` (the send authority then
+    treats the round correlation as unrecorded and re-derives it from the live markers).
+    """
+    raw = str(payload or "").strip()
+    if not raw:
+        return ""
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get(_PAYLOAD_REVIEW_REQUEST_JOURNAL, "") or "").strip()
 
 
 def _as_int(journal: object) -> Optional[int]:
@@ -236,6 +283,73 @@ def _has_newer_review_request(markers: Iterable[JournalMarker], issue: str, jour
     return False
 
 
+def correlated_review_request_journal(
+    markers: Iterable[JournalMarker], issue: str, review_journal: str
+) -> str:
+    """The review_request journal a review_result answers, or ``""`` (pure; #13684 review R1-F2).
+
+    The review round a ``review_result`` (on ``review_journal``) belongs to is the LATEST
+    ``review_request`` on the issue with a journal id strictly **before** the result (the request the
+    result answers). Redmine ids are monotonic, so this is the greatest request id ``< review_journal``.
+    Returns ``""`` when the result has no preceding review_request — an uncorrelated review outcome
+    (never part of a real review round), which the plan refuses (:data:`RETURN_NO_REVIEW_REQUEST`).
+    """
+    issue_s = str(issue).strip()
+    review_int = _as_int(review_journal)
+    if review_int is None:
+        return ""
+    best_id: Optional[int] = None
+    best_journal = ""
+    for mk in markers:
+        if str(mk.issue).strip() != issue_s or str(mk.gate).strip() != GATE_REVIEW_REQUEST:
+            continue
+        rid = _as_int(mk.journal)
+        if rid is None or rid >= review_int:
+            continue
+        if best_id is None or rid > best_id:
+            best_id = rid
+            best_journal = str(mk.journal).strip()
+    return best_journal
+
+
+def review_return_is_current(
+    markers: Iterable[JournalMarker],
+    issue: str,
+    review_journal: str,
+    review_request_journal: str = "",
+) -> bool:
+    """Whether a reserved review_result return is STILL the current round at action time (pure).
+
+    #13684 review R1-F1: the latest-review fence must be re-verified at the reserve / irreversible
+    send edge, not only at discovery — a newer review_request / review_result landing after the row
+    was reserved makes the reserved result stale. Re-reading the issue's structured markers, the
+    return is current iff:
+
+    1. ``review_journal`` is still the LATEST review_result on the issue (no newer review outcome);
+    2. no ``review_request`` is newer than it (the round did not restart);
+    3. it still correlates to a preceding review_request, and — when a ``review_request_journal`` was
+       recorded at reserve — that correlation has not drifted (the round the row was bound to is the
+       one still in effect).
+
+    Any failure is a stale row -> the caller zero-sends. The re-fetched Redmine structured gate is the
+    authority (never a notification kind).
+    """
+    review_int = _as_int(review_journal)
+    if review_int is None:
+        return False
+    if str(review_journal).strip() != latest_review_result_journal(markers, issue):
+        return False
+    if _has_newer_review_request(markers, issue, review_int):
+        return False
+    current_request = correlated_review_request_journal(markers, issue, review_journal)
+    if not current_request:
+        return False
+    recorded = str(review_request_journal or "").strip()
+    if recorded and recorded != current_request:
+        return False
+    return True
+
+
 def plan_review_return(
     markers: Iterable[JournalMarker],
     issue: str,
@@ -252,6 +366,10 @@ def plan_review_return(
     2. it must be the LATEST review_result on the issue AND no ``review_request`` may be newer than it
        (:data:`RETURN_NOT_LATEST` otherwise — a stale outcome is never returned; the re-fetched
        structured markers are the authority, never a notification kind);
+    2b. it must correlate to a preceding ``review_request`` — the review round it answers
+       (:data:`RETURN_NO_REVIEW_REQUEST` otherwise; #13684 review R1-F2 / j#77892 correction 3: an
+       uncorrelated review outcome is never returned, and the correlated request journal is carried on
+       the plan so the send authority can re-verify the round at action time);
     3. the issue must have exactly one active owning lane from the durable binding
        (:data:`RETURN_NO_OWNER` / :data:`RETURN_AMBIGUOUS_OWNER` otherwise — never "the newest lane" or
        a pane guess);
@@ -288,6 +406,13 @@ def plan_review_return(
     if _has_newer_review_request(markers, issue, review_int):
         return _refuse(RETURN_NOT_LATEST, review_journal_s)
 
+    # 2b. round correlation: the result must answer a preceding review_request (R1-F2). An
+    # uncorrelated review outcome (no request before it) is never returned; the correlated request
+    # journal is carried so the send authority can re-verify the round at action time.
+    request_journal = correlated_review_request_journal(markers, issue, review_journal_s)
+    if not request_journal:
+        return _refuse(RETURN_NO_REVIEW_REQUEST, review_journal_s)
+
     # 3. owning-lane binding is the target authority (never a pane / issue-id guess).
     if owner.status == OWNER_AMBIGUOUS:
         return _refuse(RETURN_AMBIGUOUS_OWNER, review_journal_s)
@@ -315,6 +440,7 @@ def plan_review_return(
         target_receiver=receiver,
         target_generation=generation,
         review_journal=review_journal_s,
+        review_request_journal=request_journal,
     )
 
 
@@ -355,6 +481,7 @@ __all__ = (
     "RETURN_NOT_LATEST",
     "RETURN_NOT_REVIEW_RESULT",
     "RETURN_BLANK_GENERATION",
+    "RETURN_NO_REVIEW_REQUEST",
     "RETURN_REFUSAL_REASONS",
     "OWNER_RESOLVED",
     "OWNER_ABSENT",
@@ -365,6 +492,10 @@ __all__ = (
     "review_return_callback_route",
     "is_review_return_route",
     "latest_review_result_journal",
+    "correlated_review_request_journal",
+    "review_return_is_current",
+    "encode_review_return_payload",
+    "decode_review_return_payload",
     "plan_review_return",
     "plan_review_returns",
 )
