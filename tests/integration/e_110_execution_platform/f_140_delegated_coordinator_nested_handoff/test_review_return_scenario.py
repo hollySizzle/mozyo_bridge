@@ -44,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BackgroundServiceCallbackSender,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
+    CallbackCandidate,
     CallbackOutboxProcessor,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
@@ -67,6 +68,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
     RoleProviderBinding,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+    review_return_callback_route,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
@@ -312,9 +316,46 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         self.assertTrue(self.outbox.read(states=[CALLBACK_UNCERTAIN]))
         self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
 
+    def test_action_time_fence_zero_sends_when_a_newer_correction_lands_after_reserve(self) -> None:
+        # R1-re-review F1 race regression: the return row is reserved while current, then a NEWER
+        # implementation_done (correction) lands before the send edge. The action-time round fence
+        # must zero-send the now-stale row (the finding is already being addressed).
+        self._declare_owner()
+        candidates, _ = discover_review_returns(_round_source(), ISSUE, self._owner(), workspace_id=WS)
+        self.assertEqual(len(candidates), 1)
+        proc = CallbackOutboxProcessor(self.outbox, _round_source(), workspace_id=WS)
+        proc.ingest(candidates, now=NOW)
+        # A newer implementation_done correction (j30) lands AFTER reserve.
+        send_source = _round_source(("30", render_workflow_event_marker("implementation_done")))
+        transport = _CapturingTransport()
+        run_once(proc, self._sender(transport, fence_source=send_source), now=NOW)
+        self.assertEqual(transport.calls, [])  # correction fence zero-sends
+        self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
+
+    def test_blank_correlation_payload_row_is_fail_closed_at_send(self) -> None:
+        # R1-re-review F2: a review_return row with NO durable recorded correlation (a pre-R1 / lost /
+        # corrupt payload) fails closed at the send edge — the correlation is never re-derived from the
+        # live markers as a wildcard substitute.
+        self._declare_owner()
+        # Hand-build a review_return candidate with a BLANK payload (no correlated review_request).
+        route = review_return_callback_route(LANE)
+        blank_candidate = CallbackCandidate(
+            issue=ISSUE, journal="20", callback_route=route, notification_kind="review_result",
+            payload="", workspace_id=WS, target_lane=LANE, target_receiver="codex", target_generation="1",
+        )
+        source = _round_source()  # the live round IS valid (j10 req / j20 result) — only the row payload is blank
+        proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
+        proc.ingest([blank_candidate], now=NOW)
+        transport = _CapturingTransport()
+        run_once(proc, self._sender(transport, fence_source=source), now=NOW)
+        self.assertEqual(transport.calls, [])  # fail-closed: no durable action identity -> zero-send
+        self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
+
     def test_full_supervisor_fan_out_delivers_the_return(self) -> None:
-        # The strongest production-composition proof: the REAL WorkspaceCallbackSupervisor fan-out
-        # with owner_binding_fn wired delivers the correlated return through the whole path.
+        # The strongest production-composition proof (R1-re-review F3): the REAL
+        # WorkspaceCallbackSupervisor fan-out — owner_binding_fn AND the action-time round fence wired —
+        # runs source journal -> supervisor -> outbox reserve/claim -> sender (lease/claim/generation/
+        # round fence) -> transport, delivering the correlated return to the exact gateway.
         repo = self.home / "repoReview"
         repo.mkdir()
         rec = register_workspace(repo, home=self.home).record
@@ -337,6 +378,8 @@ class ReviewReturnScenarioTest(unittest.TestCase):
             return BackgroundServiceCallbackSender(
                 workspace_id=ws.workspace_id, holder="superF", lease_store=self.lease,
                 target_resolver=resolver, transport=transport, outbox=self.outbox, now_fn=lambda: NOW,
+                # R1-re-review F3: the production supervisor wires the action-time round fence.
+                round_fence_fn=review_round_send_fence(lambda: source),
             )
 
         supervisor = WorkspaceCallbackSupervisor(
@@ -354,7 +397,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # The correlated return was delivered to the owning gateway through the full fan-out.
         self.assertEqual([t[1].lane for t in transport.calls], [LANE])
         delivered = self.outbox.read(states=[CALLBACK_DELIVERED])
-        self.assertIn("review_return:issue_13684", {d.callback_route for d in delivered})
+        self.assertIn(review_return_callback_route(LANE), {d.callback_route for d in delivered})
 
 
 if __name__ == "__main__":

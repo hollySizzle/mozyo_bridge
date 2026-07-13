@@ -53,6 +53,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     JournalMarker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    GATE_IMPLEMENTATION_DONE,
     GATE_REVIEW,
     GATE_REVIEW_REQUEST,
 )
@@ -267,20 +268,41 @@ def latest_review_result_journal(markers: Iterable[JournalMarker], issue: str) -
     return best_journal
 
 
+def _has_newer_marker(
+    markers: Iterable[JournalMarker], issue: str, gate: str, journal_int: int
+) -> bool:
+    """Whether a marker of ``gate`` on ``issue`` is newer than ``journal_int`` (pure)."""
+    issue_s = str(issue).strip()
+    gate_s = str(gate).strip()
+    for mk in markers:
+        if str(mk.issue).strip() != issue_s or str(mk.gate).strip() != gate_s:
+            continue
+        rid = _as_int(mk.journal)
+        if rid is not None and rid > journal_int:
+            return True
+    return False
+
+
 def _has_newer_review_request(markers: Iterable[JournalMarker], issue: str, journal_int: int) -> bool:
     """Whether a ``review_request`` marker on ``issue`` is newer than ``journal_int`` (pure).
 
     A newer review request means the review round restarted, so an older review_result is stale and
     must not be returned (correction 3: a newer review_request supersedes an old result).
     """
-    issue_s = str(issue).strip()
-    for mk in markers:
-        if str(mk.issue).strip() != issue_s or str(mk.gate).strip() != GATE_REVIEW_REQUEST:
-            continue
-        rid = _as_int(mk.journal)
-        if rid is not None and rid > journal_int:
-            return True
-    return False
+    return _has_newer_marker(markers, issue, GATE_REVIEW_REQUEST, journal_int)
+
+
+def _has_newer_correction(markers: Iterable[JournalMarker], issue: str, journal_int: int) -> bool:
+    """Whether an ``implementation_done`` (correction) marker on ``issue`` is newer than the result (pure).
+
+    #13684 review R1-re-review F1: a worker responds to a ``review_result`` (changes_requested) by
+    recording a correction (``implementation_done``) and then a fresh ``review_request``. A correction
+    newer than the result means the finding is already being addressed, so returning the old result
+    would deliver a stale "please correct" — correction 3's "newer finding / correction" arm. The
+    correction is the ``implementation_done`` gate (mapped from that marker kind), read from the
+    re-fetched structured markers, never a notification kind.
+    """
+    return _has_newer_marker(markers, issue, GATE_IMPLEMENTATION_DONE, journal_int)
 
 
 def correlated_review_request_journal(
@@ -326,13 +348,16 @@ def review_return_is_current(
     return is current iff:
 
     1. ``review_journal`` is still the LATEST review_result on the issue (no newer review outcome);
-    2. no ``review_request`` is newer than it (the round did not restart);
-    3. it still correlates to a preceding review_request, and — when a ``review_request_journal`` was
-       recorded at reserve — that correlation has not drifted (the round the row was bound to is the
-       one still in effect).
+    2. no ``review_request`` is newer than it (the round did not restart) AND no ``implementation_done``
+       correction is newer than it (the finding is not already being addressed) — the "newer finding /
+       correction" arm of correction 3 (R1-re-review F1);
+    3. it still correlates to a preceding review_request, and the row's recorded correlation is
+       **non-blank and equal** to that current one (R1-re-review F2): a review_return row without a
+       durable recorded action identity fails closed here — a blank / lost / drifted correlation is
+       never re-derived from the live markers as a substitute (the payload is the authority).
 
-    Any failure is a stale row -> the caller zero-sends. The re-fetched Redmine structured gate is the
-    authority (never a notification kind).
+    Any failure is a stale / uncorrelated row -> the caller zero-sends. The re-fetched Redmine
+    structured gate is the authority (never a notification kind).
     """
     review_int = _as_int(review_journal)
     if review_int is None:
@@ -341,11 +366,15 @@ def review_return_is_current(
         return False
     if _has_newer_review_request(markers, issue, review_int):
         return False
+    if _has_newer_correction(markers, issue, review_int):
+        return False
     current_request = correlated_review_request_journal(markers, issue, review_journal)
     if not current_request:
         return False
+    # R1-re-review F2: the recorded correlation must be present AND match — a blank recorded
+    # correlation is fail-closed, never a wildcard re-derived from the live markers.
     recorded = str(review_request_journal or "").strip()
-    if recorded and recorded != current_request:
+    if not recorded or recorded != current_request:
         return False
     return True
 
@@ -400,10 +429,14 @@ def plan_review_return(
     if not on_this_journal:
         return _refuse(RETURN_NOT_REVIEW_RESULT, review_journal_s)
 
-    # 2. latest-review fence: this must be the newest review_result and unshadowed by a newer request.
+    # 2. latest-review fence: this must be the newest review_result and unshadowed by a newer request
+    # OR a newer implementation_done correction (R1-re-review F1 — the finding is already being
+    # addressed, so the old result is stale).
     if review_journal_s != latest:
         return _refuse(RETURN_NOT_LATEST, review_journal_s)
     if _has_newer_review_request(markers, issue, review_int):
+        return _refuse(RETURN_NOT_LATEST, review_journal_s)
+    if _has_newer_correction(markers, issue, review_int):
         return _refuse(RETURN_NOT_LATEST, review_journal_s)
 
     # 2b. round correlation: the result must answer a preceding review_request (R1-F2). An

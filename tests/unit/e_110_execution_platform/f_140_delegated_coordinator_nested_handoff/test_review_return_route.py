@@ -56,6 +56,10 @@ def _review_request(journal: str, *, issue: str = ISSUE):
     return build_marker(issue, journal, "review_request")
 
 
+def _impl_done(journal: str, *, issue: str = ISSUE):
+    return build_marker(issue, journal, "implementation_done")
+
+
 def _owner(**kw) -> OwningLaneBinding:
     base = dict(status=OWNER_RESOLVED, lane_id="issue_13684", generation="3", gateway_receiver="codex")
     base.update(kw)
@@ -124,10 +128,24 @@ class ReviewReturnRouteTest(unittest.TestCase):
         self.assertFalse(review_return_is_current(markers + [_review_request("30")], ISSUE, "20", "10"))
         # A newer review_result landed -> stale.
         self.assertFalse(review_return_is_current(markers + [_review_result("40")], ISSUE, "20", "10"))
+        # R1-re-review F1: a newer implementation_done correction landed -> stale.
+        self.assertFalse(review_return_is_current(markers + [_impl_done("30")], ISSUE, "20", "10"))
         # The recorded correlation drifted from the current one -> stale.
         self.assertFalse(review_return_is_current(markers, ISSUE, "20", "7"))
+        # R1-re-review F2: a blank recorded correlation is fail-closed (never a wildcard), even with a
+        # valid live review round present.
+        self.assertFalse(review_return_is_current(markers, ISSUE, "20", ""))
         # An uncorrelated result (no request) is not current.
         self.assertFalse(review_return_is_current([_review_result("20")], ISSUE, "20", ""))
+
+    def test_newer_implementation_done_correction_refuses_at_discovery(self) -> None:
+        # R1-re-review F1: a correction (implementation_done j30) after the result stales the return.
+        markers = [_review_request("10"), _review_result("20"), _impl_done("30")]
+        plan = plan_review_return(markers, ISSUE, "20", _owner())
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_NOT_LATEST)
+        # An OLDER implementation_done (before the result) does not shadow it.
+        self.assertTrue(plan_review_return([_impl_done("5"), _review_request("10"), _review_result("20")], ISSUE, "20", _owner()).emit)
 
     def test_payload_round_trips_the_correlation(self) -> None:
         self.assertEqual(decode_review_return_payload(encode_review_return_payload("10")), "10")
