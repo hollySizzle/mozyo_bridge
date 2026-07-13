@@ -214,7 +214,14 @@ class _Herdr:
         if rest[:2] == ["herdr", "agent-attest"]:
             self.attest_probes.append(list(argv))
             if self.attest_capable:
-                return subprocess.CompletedProcess(argv, 0, stdout="usage: ...", stderr="")
+                # Capable => exit 0 AND the wrapper-contract marker in the help output
+                # (Redmine #13748 R1: exit 0 alone is not proof of capability).
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout="usage: mozyo-bridge herdr agent-attest [-h] --assigned-name ...",
+                    stderr="",
+                )
             return subprocess.CompletedProcess(
                 argv, 2, stdout="", stderr="invalid choice: 'agent-attest'"
             )
@@ -412,7 +419,13 @@ class SessionStartTest(unittest.TestCase):
         self.assertNotIn("MOZYO_BRIDGE_HOME", "".join(start))
         self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
 
-    # --- Launcher command-capability preflight (Redmine #13748) ---------------
+    # --- Launcher command-capability preflight: feature behavior (Redmine #13748) ---
+    # The DEFECT regression pins (incapable launcher must fail closed with zero
+    # actuation, via PATH fallback and explicit override, including the R1 success-exit
+    # false positive) live in `tests/regressions/test_issue_13748_launcher_capability_preflight.py`
+    # per `tests-placement-discovery-policy.md` (fixed-defect pin -> tests/regressions).
+    # The tests below are new-feature behavior / byte-invariance guarantees, which the
+    # same policy keeps out of regressions.
 
     def _assert_zero_herdr_actuation(self, herdr) -> None:
         """No workspace / tab / agent / pane write happened (fail-closed boundary)."""
@@ -420,53 +433,6 @@ class SessionStartTest(unittest.TestCase):
         self.assertEqual(herdr.tab_creates, [])
         self.assertEqual(herdr.start_argvs, [])
         self.assertEqual(herdr.pane_closes, [])
-
-    def test_incapable_launcher_via_path_fails_closed_before_side_effects(self) -> None:
-        # Redmine #13748 (acceptance 1/2/3): a launcher resolved from the trusted PATH
-        # (`_fake_launcher_env` puts `mozyo-bridge` on it) is a real executable but its
-        # CLI lacks `herdr agent-attest` — the installed-launcher-lags-unreleased-source
-        # skew (measured: installed 0.10.0 answers exit 2 while source succeeds). The
-        # capability preflight must detect it BEFORE any side effect and fail closed, not
-        # launch a pair of panes that die ~0.4s later.
-        herdr = _Herdr(attest_capable=False)
-        with tempfile.TemporaryDirectory() as tmp:
-            launcher_env, launcher = self._fake_launcher_env(tmp)
-            with self.assertRaises(HerdrSessionStartError) as ctx:
-                self._prepare(
-                    tmp, providers=["claude", "codex"], herdr=herdr, extra_env=launcher_env
-                )
-        # The launcher WAS probed (not merely stat-checked for executability).
-        self.assertTrue(herdr.attest_probes)
-        self.assertEqual(herdr.attest_probes[0][1:4], ["herdr", "agent-attest", "--help"])
-        # Zero herdr actuation: no partial / immediately-vanishing lane (acceptance 2).
-        self._assert_zero_herdr_actuation(herdr)
-        # Error names the launcher path, the required command, and the recovery actions
-        # (acceptance 5). It is raised, never written to a durable store.
-        msg = str(ctx.exception)
-        self.assertIn(launcher, msg)
-        self.assertIn("herdr agent-attest", msg)
-        self.assertIn("MOZYO_BRIDGE_LAUNCHER", msg)
-
-    def test_incapable_launcher_via_explicit_override_fails_closed(self) -> None:
-        # Redmine #13748 acceptance 4: the explicit `MOZYO_BRIDGE_LAUNCHER` override path
-        # is verified too, not only the PATH fallback. Point the override at a real
-        # absolute executable whose CLI lacks the wrapper subcommand.
-        herdr = _Herdr(attest_capable=False)
-        with tempfile.TemporaryDirectory() as tmp:
-            _, launcher = self._fake_launcher_env(tmp)
-            with self.assertRaises(HerdrSessionStartError) as ctx:
-                # Default launch env (provider stubs on PATH so provider preflight passes);
-                # the override — not PATH — is what resolves the launcher here.
-                self._prepare(
-                    tmp,
-                    providers=["claude"],
-                    herdr=herdr,
-                    extra_env={"MOZYO_BRIDGE_LAUNCHER": launcher},
-                )
-        self.assertTrue(herdr.attest_probes)
-        self.assertEqual(herdr.attest_probes[0][0], launcher)
-        self._assert_zero_herdr_actuation(herdr)
-        self.assertIn("herdr agent-attest", str(ctx.exception))
 
     def test_capable_launcher_is_probed_then_launches(self) -> None:
         # Redmine #13748: "単なる実行可能ファイル確認だけでcompatibleと見なさない" — a capable

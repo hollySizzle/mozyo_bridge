@@ -41,6 +41,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _parse_workspace_created,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    ATTEST_CAPABILITY_MARKER,
     MOZYO_BRIDGE_LAUNCHER_ENV,
     build_attest_capability_probe_argv,
 )
@@ -98,12 +99,19 @@ def preflight_attest_launcher_capability(
     ``--help``, which dispatches and short-circuits before any actuation (no attestation
     write, no provider exec, no pane). It is invoked HERE — before the caller's first
     ``workspace`` / ``tab`` / ``agent`` write — so an executable-but-incapable launcher
-    aborts the run with zero side effect. Any non-zero exit, or a mechanical failure to
-    even run the probe, fails closed: without a positive capability signal the wrapped
-    launch is unsafe. The error names the launcher path, the required command, and the
-    two recovery actions (release/install a capable ``mozyo-bridge``, or pin an explicit
-    absolute :data:`MOZYO_BRIDGE_LAUNCHER_ENV`); it is raised, never written to a durable
-    store, so no personal path is persisted.
+    aborts the run with zero side effect.
+
+    A positive verdict requires BOTH an exit code of 0 AND
+    :data:`ATTEST_CAPABILITY_MARKER` in the probe output (review R1). The exit code alone
+    is not proof: a success-exit non-launcher (e.g. ``/usr/bin/true``) ignores the args and
+    exits 0 without the subcommand, then the real launch — which runs the SAME launcher as
+    the wrapper's ``argv[0]`` — would still exit before ``exec``ing the provider, the exact
+    vanishing lane this closes. So an exit-0 without the marker fails closed just like a
+    non-zero exit; a mechanical failure to even run the probe fails closed too. The error
+    names the launcher path, the required command, and the two recovery actions
+    (release/install a capable ``mozyo-bridge``, or pin an explicit absolute
+    :data:`MOZYO_BRIDGE_LAUNCHER_ENV`); it is raised, never written to a durable store, so
+    no personal path is persisted.
 
     Only an executable-but-incapable launcher reaches here. An unresolvable launcher is
     already ``""`` (wrapping disabled — the byte-invariant #13637 fallback), and the
@@ -133,6 +141,23 @@ def preflight_attest_launcher_capability(
             f"provider starts, leaving a partial / immediately-vanishing lane. Recovery: "
             f"install or release a mozyo-bridge whose CLI has `herdr agent-attest`, or set "
             f"{MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
+        )
+    # Exit 0 is necessary but NOT sufficient (review R1): a success-exit non-launcher
+    # (e.g. `/usr/bin/true`) ignores the args and exits 0 without the subcommand, then the
+    # real launch — running the SAME launcher as the wrapper's argv[0] — exits before the
+    # provider. Require the marker the wrapper actually passes to appear in the probe
+    # output, the positive signal that this launcher carries the `agent-attest` contract.
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if ATTEST_CAPABILITY_MARKER not in output:
+        raise HerdrSessionStartError(
+            f"selected managed-launch launcher {launcher!r} exited 0 for the "
+            f"`herdr agent-attest` probe but did not emit the expected wrapper contract "
+            f"marker {ATTEST_CAPABILITY_MARKER!r}; a bare success exit does not prove the "
+            f"subcommand (e.g. a non-mozyo executable that ignores its arguments), and its "
+            f"wrapper would exit before the provider starts, leaving a partial / "
+            f"immediately-vanishing lane. Recovery: install or release a mozyo-bridge whose "
+            f"CLI has `herdr agent-attest`, or set {MOZYO_BRIDGE_LAUNCHER_ENV} to an "
+            f"absolute launcher that has it."
         )
 
 

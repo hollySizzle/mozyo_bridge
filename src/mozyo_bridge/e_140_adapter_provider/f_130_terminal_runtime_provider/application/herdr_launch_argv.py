@@ -59,6 +59,18 @@ MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
 #: a false parity check.
 ATTEST_WRAPPER_SUBCOMMAND: tuple[str, ...] = ("herdr", "agent-attest")
 
+#: The stable marker the launcher's ``herdr agent-attest --help`` output MUST contain
+#: for the capability probe to trust it (Redmine #13748 review R1). A bare exit-0 is
+#: insufficient: a success-exit non-launcher (e.g. ``/usr/bin/true``) ignores the
+#: probe args and exits 0 *without* the subcommand, so the real launch — which runs
+#: the SAME launcher as ``argv[0]`` of the wrapper — would still exit before ``exec``ing
+#: the provider, reproducing the vanishing lane #13748 closes. This marker is the first
+#: flag the wrapper actually passes (:func:`build_agent_start_argv`), so its presence in
+#: the help proves the launcher carries THIS ``agent-attest`` contract rather than merely
+#: returning 0. Kept as the shared literal the wrapper renders so probe and wrapper stay
+#: in lockstep.
+ATTEST_CAPABILITY_MARKER = "--assigned-name"
+
 
 def _is_absolute_executable(candidate: str) -> bool:
     """True iff ``candidate`` is an absolute path to an existing executable file.
@@ -112,10 +124,15 @@ def build_attest_capability_probe_argv(launcher: str) -> list[str]:
     ``herdr agent-attest --help`` with argparse ``invalid choice`` / exit 2 while the source
     tree succeeds). ``--help`` is the actuation-free discriminant: argparse dispatches the
     subcommand and short-circuits on the help action BEFORE the wrapper's required
-    ``--assigned-name`` / provider exec, so a present subcommand exits 0 and an absent one
-    exits 2 — without recording an attestation, spawning a provider, or touching a pane. The
-    subcommand tokens are shared with the real wrapper (:data:`ATTEST_WRAPPER_SUBCOMMAND`) so
-    the probe can never verify a path the launch would not take.
+    ``--assigned-name`` / provider exec — without recording an attestation, spawning a
+    provider, or touching a pane.
+
+    The caller does NOT trust the exit code alone (review R1): a success-exit non-launcher
+    (e.g. ``/usr/bin/true``) ignores these args and exits 0 without the subcommand, so it
+    must additionally require :data:`ATTEST_CAPABILITY_MARKER` in the probe output — the
+    positive signal that the launcher really carries this contract. The subcommand tokens
+    are shared with the real wrapper (:data:`ATTEST_WRAPPER_SUBCOMMAND`) so the probe can
+    never verify a path the launch would not take.
     """
     return [launcher, *ATTEST_WRAPPER_SUBCOMMAND, "--help"]
 
@@ -246,7 +263,7 @@ def build_agent_start_argv(
         run_cmd = [
             attest_launcher,
             *ATTEST_WRAPPER_SUBCOMMAND,
-            "--assigned-name",
+            ATTEST_CAPABILITY_MARKER,
             assigned_name,
             "--workspace-id",
             workspace_id,
@@ -301,6 +318,7 @@ def build_agent_start_argv(
 
 
 __all__ = (
+    "ATTEST_CAPABILITY_MARKER",
     "ATTEST_WRAPPER_SUBCOMMAND",
     "MOZYO_BRIDGE_LAUNCHER_ENV",
     "build_agent_start_argv",
