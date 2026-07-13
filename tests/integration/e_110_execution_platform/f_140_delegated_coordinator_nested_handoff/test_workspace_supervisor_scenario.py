@@ -11,10 +11,12 @@ workspaces), with injected roster / Redmine source / sender so the scenario is h
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -120,6 +122,53 @@ class WorkspaceSupervisorScenarioTest(unittest.TestCase):
         self.assertEqual(report_b.workspaces_supervised, 0)
         self.assertEqual(report_b.workspaces_skipped, 2)
         self.assertEqual(self.sender.calls, [])  # zero duplicate delivery
+
+
+class _RecordingTransport:
+    """A fake Redmine note transport that records the gate note (so --emit-gate reports recorded)."""
+
+    def post_issue_note(self, issue_id: str, notes: str) -> str:
+        return f"https://redmine.example/issues/{issue_id}#note-1"
+
+
+class SupervisorWakeProducerE2ETest(unittest.TestCase):
+    """R1-F2 end-to-end: the canonical gate writer emits a local wake the supervisor consumes."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp())
+        self._env = {}
+        for key in ("MOZYO_BRIDGE_HOME", "MOZYO_WORKSPACE_ID"):
+            self._env[key] = os.environ.get(key)
+        os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
+        os.environ["MOZYO_WORKSPACE_ID"] = "wsA"
+
+    def tearDown(self) -> None:
+        for key, val in self._env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
+    def test_emit_gate_enqueues_wake_that_supervisor_consumes(self) -> None:
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.core.state.supervisor_wake import SupervisorWakeStore
+
+        parser = build_parser()
+        args = parser.parse_args(
+            ["workflow", "callbacks", "--emit-gate", "--issue", "13683",
+             "--gate", "review_request", "--json"]
+        )
+        # Force the credential-gated transport to a recording fake so the gate RECORDS.
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            return_value=_RecordingTransport(),
+        ):
+            rc = args.func(args)
+        self.assertEqual(rc, 0)  # gate recorded
+        # The gate commit emitted a durable local wake for (wsA, 13683).
+        pending = SupervisorWakeStore(home=self.home).pending()
+        self.assertEqual([h.as_tuple() for h in pending], [("wsA", "13683")])
 
 
 if __name__ == "__main__":

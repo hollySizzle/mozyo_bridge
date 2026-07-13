@@ -122,6 +122,27 @@ def _require_partition_workspace_id(args: argparse.Namespace) -> str:
     )
 
 
+def _best_effort_emit_supervisor_wake(args: argparse.Namespace, issue: str) -> None:
+    """Enqueue a supervisor local wake for (workspace, issue) after a recorded gate (#13683 R1-F2).
+
+    The workspace is the attested id this surface owns (:func:`_resolve_workspace_id`); a blank id
+    (un-partitioned legacy bucket) or a blank issue is a no-op. Wholly best-effort: any wake-store
+    failure is swallowed — the gate is already recorded on Redmine (the durable authority), and the
+    supervisor's bounded reconciliation recovers a lost wake. This is the PRIMARY supervisor trigger
+    (a mozyo-originated gate commit), with reconciliation as the loss-recovery supplement.
+    """
+    ws = _resolve_workspace_id(args)
+    iss = str(issue or "").strip()
+    if not ws or not iss:
+        return
+    try:
+        from mozyo_bridge.core.state.supervisor_wake import SupervisorWakeStore
+
+        SupervisorWakeStore().enqueue(ws, iss)
+    except Exception:  # noqa: BLE001 - a wake emit never fails an already-recorded gate
+        pass
+
+
 def _watch_sender_attested(args: argparse.Namespace) -> bool:
     """Whether the launch-time coordinator sender identity is attested for a managed watcher.
 
@@ -483,6 +504,13 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         if receipt.location:
             lines.append(f"location: {receipt.location}")
         _emit(payload, as_json=as_json, text_lines=lines)
+        # #13683 review R1-F2: the canonical gate writer is the PRIMARY supervisor trigger — after a
+        # gate is RECORDED, emit a best-effort local wake for (workspace, issue) so the workspace
+        # callback supervisor re-reads that issue without waiting for the reconciliation interval.
+        # Best-effort: a wake-store failure never fails the (already-recorded) gate; a lost wake is
+        # recovered by the supervisor's bounded reconciliation.
+        if receipt.recorded:
+            _best_effort_emit_supervisor_wake(args, issue)
         # #13520 review R2-F1: fail-closed at the PROCESS gate too — a not-recorded gate (opt-in
         # unset / transport failure) must NOT exit 0, so a caller that reads only the return code
         # can never treat an un-written gate as recorded. The structured receipt still prints above.

@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
 from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore
+from mozyo_bridge.core.state.supervisor_wake import SupervisorWakeStore
 from mozyo_bridge.core.state.workflow_runtime_store import (
     CALLBACK_DELIVERED,
     WorkflowRuntimeStore,
@@ -43,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MappingRedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    SKIP_LEASE_LOST,
     SKIP_LEASE_REFUSED,
     SKIP_ROSTER_UNREADABLE,
     SUPERVISION_BOUNDED_RECONCILIATION,
@@ -199,6 +201,143 @@ class WorkspaceCallbackSupervisorTest(unittest.TestCase):
                 workspaces_fn=lambda: [self.ws], roster_fn=lambda ws: ((ISSUE,), ""),
                 redmine_source_fn=lambda ws: self.source, sender_fn=lambda ws: self.sender,
             )
+
+
+class SupervisorLeaseFenceTest(unittest.TestCase):
+    """R1-F1: a stale holder whose lease is taken over mid-sweep stops before the next issue."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.store = WorkflowRuntimeStore(path=self.store_path)
+        self.outbox = CallbackOutbox(path=self.store_path)
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+        self.source = MappingRedmineJournalSource(payload=_review_request_payload())
+        self.ws = SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "repoA"))
+
+    def test_old_holder_stops_delivering_after_ttl_crossing_takeover(self) -> None:
+        # A second-issue source so both issues carry a deliverable gate.
+        source2 = MappingRedmineJournalSource(payload=_review_request_payload(issue="13684", journal="77066"))
+
+        def source_fn(ws):
+            # One combined source that answers both issues (payload keyed by requested issue).
+            class _Multi:
+                def read_entries(_self, issue_id):
+                    p = self.source if str(issue_id) == "13683" else source2
+                    return p.read_entries(issue_id)
+            return _Multi()
+
+        lease_store = self.lease_store
+
+        class _TakeoverSender:
+            """Delivers issue-0, then a SECOND supervisor takes the (now-expired) lease over."""
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def __call__(self, row):
+                self.calls.append(row)
+                if len(self.calls) == 1:
+                    # now is past superX's expiry (00:00:00 + ttl 100 = 00:01:40) -> takeover.
+                    lease_store.acquire("wsA", "superB", now="2026-07-13T00:30:00+00:00", ttl_seconds=600)
+                return SEND_DELIVERED
+
+        sender = _TakeoverSender()
+        # Fresh clock per read: acquire (issue-0 fence) then the issue-1 renew (past takeover time).
+        clocks = iter(["2026-07-13T00:00:00+00:00", "2026-07-13T01:00:00+00:00"])
+        sup = WorkspaceCallbackSupervisor(
+            holder="superX",
+            lease_store=self.lease_store,
+            store=self.store,
+            outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws],
+            roster_fn=lambda ws: (("13683", "13684"), ""),
+            redmine_source_fn=source_fn,
+            sender_fn=lambda ws: sender,
+            clock=lambda: next(clocks),
+            lease_ttl_seconds=100,
+        )
+        report = sup.run_once()
+        w = report.workspaces[0]
+        # The renew fence tripped: only issue-0 was delivered; issue-1's side-effects never ran.
+        self.assertEqual(len(sender.calls), 1)
+        self.assertEqual(w.skipped_reason, SKIP_LEASE_LOST)
+        self.assertEqual(len(w.issues), 1)  # only the first issue's outcome recorded
+        # The new holder owns the lease; superX's holder-conditional release was a no-op.
+        self.assertEqual(self.lease_store.holder_of("wsA").holder, "superB")
+
+    def test_slow_multi_issue_sweep_renews_and_keeps_ownership(self) -> None:
+        # No takeover: a live owner's renew succeeds across issues, so all issues are supervised.
+        source2 = MappingRedmineJournalSource(payload=_review_request_payload(issue="13684", journal="77066"))
+
+        def source_fn(ws):
+            class _Multi:
+                def read_entries(_self, issue_id):
+                    return (self.source if str(issue_id) == "13683" else source2).read_entries(issue_id)
+            return _Multi()
+
+        calls = []
+        clocks = iter([f"2026-07-13T00:00:{i:02d}+00:00" for i in range(0, 60, 5)])
+        sup = WorkspaceCallbackSupervisor(
+            holder="superX", lease_store=self.lease_store, store=self.store, outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws], roster_fn=lambda ws: (("13683", "13684"), ""),
+            redmine_source_fn=source_fn, sender_fn=lambda ws: (lambda row: calls.append(row) or SEND_DELIVERED),
+            clock=lambda: next(clocks), lease_ttl_seconds=100,
+        )
+        report = sup.run_once()
+        w = report.workspaces[0]
+        self.assertEqual(w.skipped_reason, "")
+        self.assertEqual(len(w.issues), 2)  # both issues supervised (renew kept ownership)
+        self.assertEqual(len(calls), 2)
+
+
+class SupervisorWakeConsumeTest(unittest.TestCase):
+    """R1-F2: the supervisor drains the durable wake queue and consumes it as local_wake."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.store = WorkflowRuntimeStore(path=self.store_path)
+        self.outbox = CallbackOutbox(path=self.store_path)
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+        self.wake_store = SupervisorWakeStore(path=self.dir / "wake.sqlite")
+        self.source = MappingRedmineJournalSource(payload=_review_request_payload())
+        self.sender = _RecordingSender()
+        self.ws = SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "repoA"))
+
+    def _supervisor(self):
+        return WorkspaceCallbackSupervisor(
+            holder="superX", lease_store=self.lease_store, store=self.store, outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws], roster_fn=lambda ws: (("13683", "13684"), ""),
+            redmine_source_fn=lambda ws: self.source, sender_fn=lambda ws: self.sender,
+            wake_store=self.wake_store, clock=lambda: "2026-07-13T00:00:00+00:00",
+        )
+
+    def test_drained_wake_drives_local_wake_and_consumes_queue(self) -> None:
+        # A gate-emit-produced wake for one active issue.
+        self.wake_store.enqueue("wsA", "13683")
+        report = self._supervisor().run_once(mode=SUPERVISION_LOCAL_WAKE)
+        w = report.workspaces[0]
+        self.assertEqual(w.supervised_issues, ("13683",))  # only the wake-named issue
+        # The wake queue was consumed (drained), not left pending.
+        self.assertEqual(self.wake_store.pending(), ())
+
+    def test_bounded_reconciliation_also_drains_wake_but_covers_full_roster(self) -> None:
+        self.wake_store.enqueue("wsA", "13683")
+        report = self._supervisor().run_once(mode=SUPERVISION_BOUNDED_RECONCILIATION)
+        w = report.workspaces[0]
+        self.assertEqual(set(w.supervised_issues), {"13683", "13684"})  # loss recovery = full roster
+        self.assertEqual(self.wake_store.pending(), ())  # still consumed
+
+    def test_absent_wake_store_is_fine(self) -> None:
+        sup = WorkspaceCallbackSupervisor(
+            holder="superX", lease_store=self.lease_store, store=self.store, outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws], roster_fn=lambda ws: (("13683",), ""),
+            redmine_source_fn=lambda ws: self.source, sender_fn=lambda ws: self.sender,
+            wake_store=None, clock=lambda: "2026-07-13T00:00:00+00:00",
+        )
+        report = sup.run_once(mode=SUPERVISION_BOUNDED_RECONCILIATION)
+        self.assertEqual(report.workspaces[0].supervised_issues, ("13683",))
 
 
 if __name__ == "__main__":

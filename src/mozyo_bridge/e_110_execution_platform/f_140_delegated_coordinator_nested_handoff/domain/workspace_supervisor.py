@@ -52,6 +52,9 @@ DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 300
 SKIP_LEASE_REFUSED = "lease_held_by_other"  # a live duplicate supervisor owns this workspace
 SKIP_ROSTER_UNREADABLE = "active_lane_roster_unreadable"  # the roster read failed (fail-closed)
 SKIP_NO_ACTIVE_ISSUES = "no_active_issues_to_supervise"  # roster read OK but nothing to do
+#: The renew fence tripped mid-sweep: this workspace's lease was lost (taken over after expiry),
+#: so the supervisor stopped before the next issue's side-effects (Redmine #13683 review R1-F1).
+SKIP_LEASE_LOST = "lease_lost_midsweep"
 
 #: Phase A refuses to mutate the host / login service (install / restart / uninstall). The actual
 #: activation is Phase B, gated on installed parity (#13524 / #13526). j#77065 boundary.
@@ -274,6 +277,7 @@ __all__ = (
     "SKIP_LEASE_REFUSED",
     "SKIP_ROSTER_UNREADABLE",
     "SKIP_NO_ACTIVE_ISSUES",
+    "SKIP_LEASE_LOST",
     "PHASE_A_SERVICE_MUTATION_REASON",
     "IssueSelection",
     "select_supervised_issues",

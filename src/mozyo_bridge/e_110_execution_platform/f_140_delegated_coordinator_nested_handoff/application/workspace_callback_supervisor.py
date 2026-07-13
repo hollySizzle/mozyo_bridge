@@ -55,6 +55,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    SKIP_LEASE_LOST,
     SKIP_LEASE_REFUSED,
     SKIP_NO_ACTIVE_ISSUES,
     SKIP_ROSTER_UNREADABLE,
@@ -117,6 +118,7 @@ class WorkspaceCallbackSupervisor:
         redmine_source_fn: Callable[[SupervisedWorkspace], Optional[RedmineJournalSource]],
         sender_fn: Callable[[SupervisedWorkspace], Callable[[CallbackOutboxRow], str]],
         binding_fn: Optional[Callable[[SupervisedWorkspace], object]] = None,
+        wake_store: object = None,
         clock: Callable[[], str] = _utc_now_iso,
         lease_ttl_seconds: int = SUPERVISOR_LEASE_TTL_SECONDS,
         release_after: bool = True,
@@ -137,6 +139,7 @@ class WorkspaceCallbackSupervisor:
         self._redmine_source_fn = redmine_source_fn
         self._sender_fn = sender_fn
         self._binding_fn = binding_fn
+        self._wake_store = wake_store
         self._clock = clock
         self._ttl = int(lease_ttl_seconds)
         self._release_after = bool(release_after)
@@ -157,26 +160,50 @@ class WorkspaceCallbackSupervisor:
         roster, selects the issues for the ``mode`` (whole roster for ``bounded_reconciliation``;
         only wake-named roster issues for ``local_wake``), and per issue supplies durable events +
         drains the callback outbox partition. Returns a redaction-safe :class:`SupervisorReport`.
+
+        Local-wake primacy (R1-F2): the durable wake queue is drained first and its
+        ``(workspace_id, issue)`` wakes are merged with any explicit ``wake_hints`` — so a
+        mozyo-originated gate commit that enqueued a wake drives this pass. Bounded reconciliation
+        (the whole-roster mode) is the loss recovery: a dropped wake is still caught because the
+        roster is re-read regardless.
         """
-        now = self._clock()
-        wake_by_ws = _group_wake_hints(wake_hints)
+        drained = self._drain_wake_store()
+        merged_hints = tuple(drained) + tuple(wake_hints)
+        wake_by_ws = _group_wake_hints(merged_hints)
         outcomes: list[WorkspaceSupervisionOutcome] = []
         for ws in self._workspaces_fn():
             outcomes.append(
                 self._supervise_workspace(
-                    ws, mode=mode, wake_issues=wake_by_ws.get(ws.workspace_id, ()), now=now
+                    ws, mode=mode, wake_issues=wake_by_ws.get(ws.workspace_id, ())
                 )
             )
         return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
 
+    def _drain_wake_store(self) -> tuple[tuple[str, str], ...]:
+        """Consume the durable local-wake queue into ``(workspace_id, issue)`` hints (fail-open).
+
+        A wake-store read failure is swallowed (returns ``()``) — a lost wake is recovered by the
+        bounded reconciliation pass, so the wake queue never breaks the sweep (R1-F2).
+        """
+        if self._wake_store is None:
+            return ()
+        try:
+            return tuple(h.as_tuple() for h in self._wake_store.drain())
+        except Exception:  # noqa: BLE001 - a wake read never breaks the sweep (reconciliation recovers)
+            return ()
+
     # -- per-workspace -----------------------------------------------------
 
     def _supervise_workspace(
-        self, ws: SupervisedWorkspace, *, mode: str, wake_issues: Sequence[str], now: str
+        self, ws: SupervisedWorkspace, *, mode: str, wake_issues: Sequence[str]
     ) -> WorkspaceSupervisionOutcome:
         wsid = str(ws.workspace_id or "").strip()
+        # A FRESH clock per workspace (R1-F1): a single sweep-start clock would make a later
+        # workspace's lease deadline stale (born-expired) after a slow earlier workspace, and its
+        # takeover check compare against sweep-start time. Reading the clock at each acquire keeps
+        # the lease deadline and the takeover comparison anchored to real time.
         lease = self._lease_store.acquire(
-            wsid, self._holder, now=now, ttl_seconds=self._ttl
+            wsid, self._holder, now=self._clock(), ttl_seconds=self._ttl
         )
         if not lease.acquired:
             # A live duplicate supervisor owns this workspace — skip it, deliver nothing.
@@ -209,17 +236,31 @@ class WorkspaceCallbackSupervisor:
             source = self._redmine_source_fn(ws)
             sender = self._sender_fn(ws)
             binding = self._binding_fn(ws) if self._binding_fn is not None else None
-            issue_outcomes = tuple(
-                self._supervise_issue(wsid, issue, source, sender, binding)
-                for issue in selection.supervised
-            )
+            issue_outcomes: list[IssueSupervisionOutcome] = []
+            lease_lost = False
+            for index, issue in enumerate(selection.supervised):
+                # Issue-boundary renew fence (R1-F1): before each issue's side-effects (after the
+                # first, which the acquire above already fenced) re-establish lease ownership with a
+                # FRESH clock. renew() is holder-conditional: it returns False iff another supervisor
+                # took the lease over after expiry — stop before the next issue so a stale holder
+                # never delivers past a takeover. A live owner's renew also extends the deadline, so
+                # a slow multi-issue sweep does not spuriously expire its own lease.
+                if index > 0 and not self._lease_store.renew(
+                    wsid, self._holder, now=self._clock(), ttl_seconds=self._ttl
+                ):
+                    lease_lost = True
+                    break
+                issue_outcomes.append(
+                    self._supervise_issue(wsid, issue, source, sender, binding)
+                )
             return WorkspaceSupervisionOutcome(
                 workspace_id=wsid,
                 lease_acquired=True,
                 lease_reason=lease.reason,
                 supervised_issues=selection.supervised,
                 ignored_wake_issues=selection.ignored_wake,
-                issues=issue_outcomes,
+                issues=tuple(issue_outcomes),
+                skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
             )
         finally:
             # A bounded run-once releases each workspace at the end of its sweep so the next
@@ -373,8 +414,48 @@ def default_redmine_source(ws: SupervisedWorkspace) -> Optional[RedmineJournalSo
         return None
 
 
+def workspace_send_runner(
+    canonical_path: str, workspace_id: str
+) -> Callable[[list], "tuple[int, str]"]:
+    """A subprocess runner that runs the handoff in the target workspace's root + identity (R1-F3).
+
+    A background supervisor fans out over many workspaces from ONE process, so it cannot rely on
+    ambient cwd/env to route a send. This runner pins the ``mozyo-bridge handoff send`` subprocess
+    to the target workspace's **canonical execution root** (``cwd``) and stamps its **workspace
+    identity** (``MOZYO_WORKSPACE_ID``) into the child env, so ``--target coordinator`` /
+    workspace-scoped resolution binds to the row's workspace, not the supervisor process's cwd. A
+    bad / missing cwd raises inside the runner and the send port catches it fail-safe (uncertain, no
+    delivery), so a stale workspace path never crashes the sweep.
+    """
+    import os
+    import subprocess
+
+    def _run(argv: list) -> "tuple[int, str]":
+        env = {**os.environ, "MOZYO_WORKSPACE_ID": str(workspace_id or "")}
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; sanctioned handoff CLI
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(canonical_path) or None,
+            env=env,
+        )
+        return proc.returncode, proc.stdout
+
+    return _run
+
+
 def default_sender(ws: SupervisedWorkspace) -> Callable[[CallbackOutboxRow], str]:
-    """Build the real one-send callback sender, pinned to this workspace's attested id."""
+    """Build the real one-send callback sender as an attested per-workspace system actor (R1-F3).
+
+    Pins delivery to the target workspace three ways: (1) ``attested_workspace_id`` refuses a row
+    whose workspace does not match (fail-closed backstop — a foreign / unattested row is a
+    zero-send ``blocked``); (2) ``target_repo=ws.canonical_path`` passes the workspace's execution
+    root as the explicit ``--target-repo`` identity gate instead of ambient ``auto``; (3) the runner
+    executes in that root with the workspace-identity env. So a background multi-workspace supervisor
+    delivers each row to its own workspace's exact target, never on the sender process's ambient
+    cwd/env.
+    """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
         HandoffCallbackSendPort,
     )
@@ -383,7 +464,11 @@ def default_sender(ws: SupervisedWorkspace) -> Callable[[CallbackOutboxRow], str
     )
 
     return HandoffCallbackSender(
-        HandoffCallbackSendPort(attested_workspace_id=ws.workspace_id)
+        HandoffCallbackSendPort(
+            attested_workspace_id=ws.workspace_id,
+            target_repo=ws.canonical_path,
+            runner=workspace_send_runner(ws.canonical_path, ws.workspace_id),
+        )
     )
 
 
@@ -416,6 +501,7 @@ def build_supervisor(
     not by a per-workspace DB.
     """
     from mozyo_bridge.core.state.supervisor_lease import supervisor_lease_path
+    from mozyo_bridge.core.state.supervisor_wake import SupervisorWakeStore, supervisor_wake_path
     from mozyo_bridge.core.state.workflow_runtime_store import workflow_runtime_store_path
 
     resolved_store_path = store_path or workflow_runtime_store_path(home)
@@ -429,6 +515,7 @@ def build_supervisor(
         redmine_source_fn=default_redmine_source,
         sender_fn=default_sender,
         binding_fn=default_binding,
+        wake_store=SupervisorWakeStore(path=supervisor_wake_path(home)),
         release_after=release_after,
         lease_ttl_seconds=lease_ttl_seconds,
     )
@@ -444,5 +531,6 @@ __all__ = (
     "default_redmine_source",
     "default_sender",
     "default_binding",
+    "workspace_send_runner",
     "build_supervisor",
 )

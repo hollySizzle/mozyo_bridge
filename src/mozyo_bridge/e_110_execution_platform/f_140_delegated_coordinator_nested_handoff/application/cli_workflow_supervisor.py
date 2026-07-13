@@ -93,7 +93,10 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
 
     holder = (getattr(args, "holder", None) or "").strip() or _default_holder()
     wake_hints = tuple(getattr(args, "wake", None) or ())
-    mode = SUPERVISION_LOCAL_WAKE if wake_hints else SUPERVISION_BOUNDED_RECONCILIATION
+    # local_wake mode is selected explicitly (--local-wake, the wake-driven consume path that
+    # drains the durable wake queue) or implicitly when explicit --wake hints are supplied.
+    local_wake = bool(getattr(args, "local_wake", False)) or bool(wake_hints)
+    mode = SUPERVISION_LOCAL_WAKE if local_wake else SUPERVISION_BOUNDED_RECONCILIATION
     supervisor = build_supervisor(
         holder=holder, home=_home_from_args(args), store_path=_store_path_from_args(args)
     )
@@ -323,8 +326,15 @@ def register_supervisor(workflow_sub) -> None:
         help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
     )
     p.add_argument(
+        "--local-wake", dest="local_wake", action="store_true",
+        help="Wake-driven consume: drain the durable local-wake queue (gate-emit produced) and "
+             "supervise only those active-lane issues (local_wake mode). Loss is recovered by a "
+             "plain --run-once (bounded reconciliation).",
+    )
+    p.add_argument(
         "--wake", action="append", type=_parse_wake_hint, metavar="WORKSPACE_ID:ISSUE",
-        help="A local wake hint (repeatable): supervise only these active-lane issues (local_wake mode).",
+        help="An explicit local wake hint (repeatable): supervise these active-lane issues "
+             "(implies local_wake mode; merged with the drained wake queue).",
     )
     p.add_argument(
         "--holder", default=None,
