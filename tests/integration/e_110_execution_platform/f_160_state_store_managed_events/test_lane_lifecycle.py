@@ -1080,14 +1080,16 @@ class R2RegressionTest(unittest.TestCase):
 
 
 class R3RegressionTest(unittest.TestCase):
-    """R3 (j#76810): a guard that never met its own boundary conditions.
+    """R3 (j#76810) + R4 (j#76879): a guard that never met its own boundary conditions.
 
-    F1 -- the container guard was mistaken for a component guard, so a *newer*
+    R3-F1 -- the container guard was mistaken for a component guard, so a *newer*
     component schema was silently re-stamped as v2 and its authority rows became
     writable by a build that does not know their semantics.
-    F2 -- ``str.isdigit()`` is not an ASCII-decimal test, so Unicode digits were
+    R3-F2 -- ``str.isdigit()`` is not an ASCII-decimal test, so Unicode digits were
     stored as anchors Redmine can never resolve, and ``int()`` leaked a raw
     ``ValueError`` out of an error contract that promises ``DecisionPointerError``.
+    R4-F1 -- the same version guard trusted ``int()`` to read the recorded version, so
+    a REAL ``2.5`` truncated to ``2`` and passed the recognized-version check.
     """
 
     def setUp(self) -> None:
@@ -1205,6 +1207,113 @@ class R3RegressionTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(version, 2)
+
+    # -- R4-F1: a present-but-malformed version is not coerced to a known one --
+
+    def _corrupt_v2_version(self, sql_literal: str) -> Path:
+        """A v2 store whose component version was overwritten with a raw SQL value."""
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(self.key, decision=_decision(), issue_id=ISSUE)
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = "
+                + sql_literal
+                + " WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.execute(
+                "ALTER TABLE lane_lifecycle_records "
+                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'future'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_f1_real_2_5_is_not_truncated_to_2(self) -> None:
+        # int(2.5) == 2 would pass the {1, 2} check and re-stamp an unknown schema.
+        path = self._corrupt_v2_version("2.5")
+        before = path.read_bytes()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(path.read_bytes(), before)
+        conn = sqlite3.connect(path)
+        try:
+            storage_class, value = conn.execute(
+                "SELECT typeof(schema_version), schema_version "
+                "FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()
+            columns = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(lane_lifecycle_records)")
+            ]
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM lane_lifecycle_records"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(storage_class, "real")  # not re-stamped to integer 2
+        self.assertEqual(value, 2.5)
+        self.assertIn("future_guard", columns)
+        self.assertEqual(rows, 1)
+
+    def test_f1_malformed_versions_fail_closed(self) -> None:
+        # Every present-but-non-integer shape is unknown, not a coerced number.
+        for literal in ("2.5", "1.9", "'abc'", "x'02'"):
+            with self.subTest(literal=literal):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    key = LaneLifecycleKey(WS, LANE_A)
+                    store = LaneLifecycleStore(home=home)
+                    store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+                    path = lane_lifecycle_path(home)
+                    conn = sqlite3.connect(path)
+                    try:
+                        conn.execute(
+                            "UPDATE state_schema_components SET schema_version = "
+                            + literal
+                            + " WHERE component = ?",
+                            (LANE_LIFECYCLE_COMPONENT,),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    with self.assertRaises(LaneLifecycleError):
+                        LaneLifecycleStore(home=home).ensure_schema()
+
+    def test_f1_malformed_version_readers_fail_closed(self) -> None:
+        self._corrupt_v2_version("2.5")
+        self.assertEqual(
+            resolve_lane_owner(WS, ISSUE, home=self.home).status, OWNER_UNKNOWN
+        )
+        self.assertIsNone(load_lane_lifecycle(home=self.home))
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).transition_disposition(
+                self.key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=1,
+                target=DISPOSITION_HIBERNATED,
+                decision=_decision(journal="76887"),
+            )
+
+    def test_f1_integer_stored_as_real_2_0_is_still_accepted(self) -> None:
+        # SQLite folds a lossless REAL 2.0 to integer 2; that is a real v2, not
+        # malformed -- the guard must not become so strict it rejects a valid store.
+        path = self._corrupt_v2_version("2.0")
+        conn = sqlite3.connect(path)
+        try:
+            storage_class = conn.execute(
+                "SELECT typeof(schema_version) FROM state_schema_components "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(storage_class, "integer")  # SQLite already folded it
+        LaneLifecycleStore(home=self.home).ensure_schema()  # no raise
 
     # -- R3-F2: the id validator has a closed error contract ------------------
 
