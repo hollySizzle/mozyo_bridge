@@ -91,38 +91,28 @@ def cmd_onboarding_inspect(args: argparse.Namespace) -> int:
     return 0 if not inspection.preflight.is_hard_block else 1
 
 
-def _is_inline_json(raw: str) -> bool:
-    """A JSON document argument, discriminated without touching the filesystem.
+def _existing_file_arg(raw: str) -> Path | None:
+    """``raw`` as an existing input file, or ``None`` if it is not one.
 
-    ``plan`` / ``intent`` documents are JSON objects, so a leading ``{`` (or
-    ``[`` for a non-object document we still want to parse and then fail closed
-    on) settles the discrimination on the argument's own text.
-    """
-    return raw.lstrip().startswith(("{", "["))
-
-
-def _path_exists(candidate: Path) -> bool:
-    """Existence check that cannot turn an unusable path into a raised error.
-
-    ``Path.exists()`` propagates ``ENAMETOOLONG`` (and friends) on some
-    interpreters / platforms and swallows it on others; a path we cannot even
-    stat is simply not an input file here (Redmine #13691).
+    An argument we cannot even stat is not an input file. ``Path.exists()``
+    propagates ``ENAMETOOLONG`` (and friends) on some interpreters / platforms
+    and swallows it on others — a long inline plan document is exactly such an
+    unusable path — so normalising the error to "not a file" is what keeps the
+    security gate's semantics from depending on the runtime (Redmine #13691).
     """
     try:
-        return candidate.exists()
+        candidate = Path(raw).expanduser()
+        return candidate if candidate.exists() else None
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _load_json_arg(raw: str) -> object:
-    # Accept an inline JSON string or a path to a JSON file. Inline JSON is
-    # never looked up on the filesystem, so a long plan document reaches the
-    # security gate instead of decaying into an OS-dependent parse error.
-    if _is_inline_json(raw):
-        return json.loads(raw)
-    candidate = Path(raw).expanduser()
-    if _path_exists(candidate):
-        return json.loads(candidate.read_text(encoding="utf-8"))
+    # Accept an inline JSON string or a path to a JSON file, in that established
+    # precedence: an existing file wins, anything else is parsed as inline JSON.
+    candidate = _existing_file_arg(raw)
+    if candidate is not None:
+        raw = candidate.read_text(encoding="utf-8")
     return json.loads(raw)
 
 
