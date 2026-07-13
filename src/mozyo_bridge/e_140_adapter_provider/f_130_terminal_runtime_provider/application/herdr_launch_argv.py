@@ -51,6 +51,26 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 #: unresolvable / non-absolute value disables wrapping (byte-invariant fallback).
 MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
 
+#: The wrapper subcommand every managed launch execs the provider THROUGH (Redmine
+#: #13637): ``<launcher> herdr agent-attest ...``. Named once so the wrapper argv
+#: (:func:`build_agent_start_argv`) and the capability probe
+#: (:func:`build_attest_capability_probe_argv`, Redmine #13748) stay in lockstep — a
+#: probe that verified a different subcommand than the wrapper actually runs would be
+#: a false parity check.
+ATTEST_WRAPPER_SUBCOMMAND: tuple[str, ...] = ("herdr", "agent-attest")
+
+#: The stable marker the launcher's ``herdr agent-attest --help`` output MUST contain
+#: for the capability probe to trust it (Redmine #13748 review R1). A bare exit-0 is
+#: insufficient: a success-exit non-launcher (e.g. ``/usr/bin/true``) ignores the
+#: probe args and exits 0 *without* the subcommand, so the real launch — which runs
+#: the SAME launcher as ``argv[0]`` of the wrapper — would still exit before ``exec``ing
+#: the provider, reproducing the vanishing lane #13748 closes. This marker is the first
+#: flag the wrapper actually passes (:func:`build_agent_start_argv`), so its presence in
+#: the help proves the launcher carries THIS ``agent-attest`` contract rather than merely
+#: returning 0. Kept as the shared literal the wrapper renders so probe and wrapper stay
+#: in lockstep.
+ATTEST_CAPABILITY_MARKER = "--assigned-name"
+
 
 def _is_absolute_executable(candidate: str) -> bool:
     """True iff ``candidate`` is an absolute path to an existing executable file.
@@ -93,6 +113,28 @@ def resolve_attest_launcher(env: Mapping[str, str]) -> str:
         return ""
     found = shutil.which("mozyo-bridge", path=path)
     return found if found and _is_absolute_executable(found) else ""
+
+
+def build_attest_capability_probe_argv(launcher: str) -> list[str]:
+    """The argv that probes whether ``launcher`` can run the wrapper subcommand (pure).
+
+    Redmine #13748: :func:`resolve_attest_launcher` proves the launcher is an *executable*
+    but not that its CLI still carries ``herdr agent-attest`` — an installed launcher can
+    lag unreleased source (measured: installed ``mozyo-bridge 0.10.0`` answers
+    ``herdr agent-attest --help`` with argparse ``invalid choice`` / exit 2 while the source
+    tree succeeds). ``--help`` is the actuation-free discriminant: argparse dispatches the
+    subcommand and short-circuits on the help action BEFORE the wrapper's required
+    ``--assigned-name`` / provider exec — without recording an attestation, spawning a
+    provider, or touching a pane.
+
+    The caller does NOT trust the exit code alone (review R1): a success-exit non-launcher
+    (e.g. ``/usr/bin/true``) ignores these args and exits 0 without the subcommand, so it
+    must additionally require :data:`ATTEST_CAPABILITY_MARKER` in the probe output — the
+    positive signal that the launcher really carries this contract. The subcommand tokens
+    are shared with the real wrapper (:data:`ATTEST_WRAPPER_SUBCOMMAND`) so the probe can
+    never verify a path the launch would not take.
+    """
+    return [launcher, *ATTEST_WRAPPER_SUBCOMMAND, "--help"]
 
 
 def _provider_command(
@@ -220,9 +262,8 @@ def build_agent_start_argv(
     if attest_launcher:
         run_cmd = [
             attest_launcher,
-            "herdr",
-            "agent-attest",
-            "--assigned-name",
+            *ATTEST_WRAPPER_SUBCOMMAND,
+            ATTEST_CAPABILITY_MARKER,
             assigned_name,
             "--workspace-id",
             workspace_id,
@@ -277,7 +318,10 @@ def build_agent_start_argv(
 
 
 __all__ = (
+    "ATTEST_CAPABILITY_MARKER",
+    "ATTEST_WRAPPER_SUBCOMMAND",
     "MOZYO_BRIDGE_LAUNCHER_ENV",
     "build_agent_start_argv",
+    "build_attest_capability_probe_argv",
     "resolve_attest_launcher",
 )

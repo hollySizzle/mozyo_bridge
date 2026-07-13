@@ -278,6 +278,21 @@ flow:
    `exec` する (self-check before exec)。mozyo-bridge launcher が trusted env (絶対 PATH / 明示
    override) で解決できない場合は wrap せず直接 provider を起動する byte-invariant fallback を採り
    (dead pane を作らない)、record 不在は adopt / doctor 側で fail-closed に縮退する。
+   **launcher command-capability preflight (Redmine #13748)**: launcher が解決されて wrap する場合、
+   実 launch (workspace / tab / agent いずれの side effect) より前に、その launcher の CLI が
+   `herdr agent-attest` wrapper subcommand を実際に実行できるかを actuation-free に probe
+   (`herdr agent-attest --help`) する。単なる実行可能ファイル確認では compatible とみなさない。
+   **exit 0 単独でも不十分** (review R1): 引数を無視して 0 終了するだけの non-launcher
+   (`/usr/bin/true` 等) も通過してしまい、実 launch は同 launcher を wrapper argv[0] にするため
+   provider を exec せず即死する。よって capable 判定は **exit 0 かつ probe 出力に marker
+   `--assigned-name`** (wrapper が実際に渡す flag、real の `agent-attest --help` に出現) を含むことを
+   要求する。installed launcher が未リリース source に遅れて subcommand を欠く場合
+   (installed 0.10.0 は argparse exit 2、source tree は成功) 各 wrapped pane は provider 起動前に
+   即死し、`sublane create` は一度返した live locator を失う。probe が capability を確認できない場合は
+   workspace/tab/agent を作らず fail-closed し、error に launcher path・必要 command・復旧 action
+   (release/install または明示 `MOZYO_BRIDGE_LAUNCHER` override) を示す (credential / 個人 path は
+   durable log へ残さない)。unwrapped fallback (`attest_launcher == ""`) と adopt-only / dry-run は
+   wrapper を走らせないため probe せず byte-invariant のままとする。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。
    ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
    `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /
