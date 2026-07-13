@@ -88,10 +88,15 @@ def _issue(issue_id: int, *, closed: bool = False, parent: int | None = None) ->
     return entry
 
 
-# An explicit non-secret placeholder: Source Tree Hygiene strict-fails on a
+# Explicit non-secret placeholders: Source Tree Hygiene strict-fails on a
 # credential-shaped literal in a tracked file, and the `fake-` marker is what the
 # scanner classifies as a placeholder rather than a leaked key.
+#
+# The canary is deliberately DISTINCT from the default key: the redaction test
+# overrides the key with it, so asserting the canary is absent from the failure
+# reason proves the *caller-supplied* key never reaches the message.
 _FAKE_API_KEY = "fake-api-key"
+_REDACTION_CANARY_KEY = "fake-api-key-redaction-canary"
 
 
 def _source(opener, **kwargs) -> LiveRedmineVersionIssueSource:
@@ -300,10 +305,10 @@ class FailClosedTest(unittest.TestCase):
 class FailClosedReasonRedactionTest(unittest.TestCase):
     def test_reasons_never_carry_the_api_key(self) -> None:
         err = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
-        source = _source(_RecordingOpener([err]), api_key="super-secret-key")
+        source = _source(_RecordingOpener([err]), api_key=_REDACTION_CANARY_KEY)
         with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
             source.read_version_issues("248")
-        self.assertNotIn("super-secret-key", str(ctx.exception))
+        self.assertNotIn(_REDACTION_CANARY_KEY, str(ctx.exception))
 
 
 class BuilderTest(unittest.TestCase):
