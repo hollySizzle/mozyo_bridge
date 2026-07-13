@@ -331,6 +331,33 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: blocker", output)
             self.assertIn(secret_key, output)
 
+    def test_underscore_and_dict_env_key_literals_still_block(self) -> None:
+        # Redmine #13716: the first-stage grep anchored the credential keyword
+        # on a bare word boundary, so a leading-underscore identifier
+        # (`_API_KEY = ...`) and an ENV-name dict key (`API_KEY_ENV: ...`) never
+        # surfaced as candidates and a real literal in either shape returned
+        # clean. Both must now block. Key/separator are split so this test
+        # source never carries a contiguous matchable assignment token.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "sk" + "-live-abc123def456"
+        underscore_line = "_API" + "_KEY = \"" + token + "\""
+        dict_env_line = "environ = {" + "API" + "_KEY_ENV: \"" + token + "\"}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(
+                root, "leaky.py", underscore_line + "\n" + dict_env_line + "\n"
+            )
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("result: blocker", output)
+            # Both leaked shapes are reported.
+            self.assertEqual(2, output.count(token))
+
 
 class SecretValueClassifierTest(unittest.TestCase):
     """Redmine #12175: pin the second-stage credential-value classifier that
@@ -470,6 +497,42 @@ class SecretValueClassifierTest(unittest.TestCase):
             self.assertTrue(
                 release_mod._secret_assignment_is_real(line),
                 msg=f"expected unsafe line: {line!r}",
+            )
+
+    def test_13716_underscore_and_dict_env_key_shapes(self) -> None:
+        # Redmine #13716: the credential keyword must be caught inside a wider
+        # identifier — a leading underscore / name prefix, and a trailing ENV
+        # segment used as a dict key — while the value classifier still rejects
+        # the widened key when its value is a reference / keyword / placeholder.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "ab" + "c123"
+        # Real literals in the newly covered identifier shapes must be flagged.
+        real_lines = (
+            "_API" + "_KEY = \"" + token + "\"",          # leading underscore
+            "OPENAI" + "_API_KEY = " + token,             # name prefix
+            "_GITHUB" + "_TOKEN = '" + token + "'",       # provider, leading _
+            "environ = {" + "API" + "_KEY_ENV: \"" + token + "\"}",  # dict ENV key
+            "GITHUB" + "_TOKEN_ENV = \"" + token + "\"",  # provider, trailing seg
+        )
+        for line in real_lines:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected real credential literal: {line!r}",
+            )
+
+        # The widened key with a non-literal value stays safe: an env read, a
+        # bare identifier reference, a type annotation, or a None default.
+        safe_lines = (
+            "_API" + "_KEY = os.environ.get(" + "API" + "_KEY_ENV)",
+            "_api" + "_key: str | None = None",
+            "environ = {" + "API" + "_KEY_ENV: " + "API_KEY" + "}",
+            "environ = {" + "API" + "_KEY_ENV: None}",
+        )
+        for line in safe_lines:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected safe widened-key line: {line!r}",
             )
 
     def test_12693_field_name_false_positives_are_safe(self) -> None:

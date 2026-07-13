@@ -52,7 +52,7 @@ _PROJECT = "giken-3800-mozyo-bridge"
 #: never the identifier (R1-F1 j#76747).
 _PROJECT_ID = 38
 _HOME = Path("/nonexistent-home-for-test")
-_ENV = {BASE_URL_ENV: _HOST, API_KEY_ENV: "k"}
+_ENV = {BASE_URL_ENV: _HOST, API_KEY_ENV: "fake-api-key"}
 _UNSET = object()
 
 
@@ -383,11 +383,11 @@ class BlockedReadTest(unittest.TestCase):
             read_live_fixed_version_bucket(
                 repo_root=self.repo.declare(),
                 bucket_id="292",
-                environ={BASE_URL_ENV: _HOST, API_KEY_ENV: "super-secret-key"},
+                environ={BASE_URL_ENV: _HOST, API_KEY_ENV: "fake-super-secret-key"},
                 home=_HOME,
                 opener=opener,
             )
-        self.assertNotIn("super-secret-key", str(ctx.exception))
+        self.assertNotIn("fake-super-secret-key", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -42,7 +42,10 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
     RedmineVersionReadUnavailable,
 )
 
-_API_KEY = "super-secret-key"
+# Redaction canary: an explicit `fake-` sentinel so the strengthened release
+# tree scanner (Redmine #13716) classifies it as a placeholder, not a leak,
+# while it still exercises the "must not appear in error output" assertions.
+_API_KEY = "fake-super-secret-key"
 
 
 class _RecordingParent:
