@@ -1383,6 +1383,18 @@ documents:
       - rule-project-agent-workflow
       - skill-workflow-reference
 
+  - id: logic-tiered-ci-gate-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/tiered-ci-gate-policy.md
+    purpose: "全 branch push で Python 3.10-3.13 full matrix を反復していた CI を risk tier 別 gate へ再編する設計正本 (Redmine #13734 / 親 US #13732)。issue-branch push を quick/affected 単一 Python に縮小し full matrix を auto 発火させない routing、integration push (main/int_*/integration_*) の exact-SHA clean single-Python full + wheel/sdist + fresh-install smoke を 1 回、TestPyPI build job の manual/auto 両 event inline clean-full + artifact/install smoke による pre-publish gate 抜け封鎖 (#13601 OIDC 境界と data gate 温存)、nightly の 3.10-3.13 full matrix 維持、production publish workflow の exact release/tag SHA full matrix + tag<->version mirror + fresh-install の機械強制と OIDC publish job 分離、concurrency cancel/serialize と run summary provenance、現行 green 証跡の非無効化を定義する。CI authority は unittest discover / tests profile のままで #13733 local 並列 runner に依存しない。"
+    audit_role: tiered_ci_gate_policy_logic
+    related_document_refs:
+      - logic-test-runtime-profiling-policy
+      - logic-module-health-gate
+      - logic-release-flow
+      - logic-release-helper-contract
+
 file_conventions:
   - id: fc-agent-routers
     name: agent entrypoint routers
