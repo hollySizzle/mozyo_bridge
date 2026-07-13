@@ -24,6 +24,7 @@ from typing import Optional
 
 from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
 from mozyo_bridge.core.state.state_store import (
+    STATE_CONTAINER_VERSION,
     StateStoreError,
     connect_state_container_rw,
     state_store_path,
@@ -169,19 +170,31 @@ def readonly_component_status(conn: sqlite3.Connection) -> str:
     :func:`ensure_lane_lifecycle_schema`: it never writes (no DDL, no metadata upsert),
     and returns one of
 
-    - :data:`READONLY_COMPONENT_ABSENT` — a fresh store: neither the component metadata
-      row nor the table exists. The caller reads no rows without creating anything.
-    - :data:`READONLY_COMPONENT_RECOGNIZED` — the recorded component ``schema_version`` is
-      one this build understands (:data:`_RECOGNIZED_SCHEMA_VERSIONS`) AND the table is
-      present. The caller may read the authority rows.
-    - :data:`READONLY_COMPONENT_UNSUPPORTED` — an unknown / newer / malformed component
+    - :data:`READONLY_COMPONENT_ABSENT` — a **recognized container** whose lifecycle
+      component is completely absent (neither its metadata row nor its table exists). The
+      caller reads no rows without creating anything.
+    - :data:`READONLY_COMPONENT_RECOGNIZED` — a recognized container AND a recorded
+      component ``schema_version`` this build understands
+      (:data:`_RECOGNIZED_SCHEMA_VERSIONS`) AND the table is present. The caller may read.
+    - :data:`READONLY_COMPONENT_UNSUPPORTED` — a **newer / unknown container**
+      ``PRAGMA user_version`` (R4-F1, j#77322), an unknown / newer / malformed component
       version, a metadata row without its table (a partial / migrating store), a table
-      without its metadata / a missing components registry, or a query failure. The caller
-      fails closed, exactly as the guarded write path raises ``LaneLifecycleError`` on a
-      newer container *or component* schema (``managed-state-model.md``
-      ``### backup / downgrade / partial migration``): an older build never reads
-      authority rows whose newer semantics it does not agree to.
+      without its metadata / a missing components registry, or a query failure.
+
+    The container ``PRAGMA user_version`` is checked FIRST and must equal the exact
+    :data:`STATE_CONTAINER_VERSION` — mirroring the write-side ``connect_state_container_rw``
+    — so a store written by a newer build fails closed here too. An older build never reads
+    authority rows whose newer container *or component* semantics it does not agree to
+    (``managed-state-model.md`` ``### backup / downgrade / partial migration``).
     """
+    try:
+        container_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return READONLY_COMPONENT_UNSUPPORTED
+    if container_version != STATE_CONTAINER_VERSION:
+        # A newer / unknown container schema — fail closed exactly like the write-side
+        # container guard's exact-version enforcement (never read a downgraded store).
+        return READONLY_COMPONENT_UNSUPPORTED
     try:
         has_meta = _table_present(conn, "state_schema_components")
         has_table = _table_present(conn, _TABLE)

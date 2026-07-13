@@ -1569,6 +1569,27 @@ class ReadonlyLoaderGuardTest(unittest.TestCase):
         self.assertIsNone(load_lane_lifecycle(home=self.home))  # guarded path
         self.assertIsNone(load_lane_lifecycle_readonly(home=self.home))  # readonly path
 
+    def test_unsupported_container_version_fails_closed_without_mutation(self) -> None:
+        # R4-F1 (j#77322): a newer / unknown container PRAGMA user_version fails closed
+        # even when the component + table + rows are all valid v2 — and the read never
+        # mutates the DB byte state (no re-init).
+        self._seed_row()
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA user_version = 999")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(load_lane_lifecycle(home=self.home))  # guarded path
+        self.assertIsNone(load_lane_lifecycle_readonly(home=self.home))  # readonly path
+        # The readonly read left the container version untouched (no downgrade re-init).
+        conn = sqlite3.connect(path)
+        try:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 999)
+        finally:
+            conn.close()
+
     def test_table_present_without_metadata_fails_closed(self) -> None:
         # A partial store (lifecycle table exists, but its component metadata row is gone)
         # is unsupported, not a fresh empty read.
