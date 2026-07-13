@@ -1079,6 +1079,200 @@ class R2RegressionTest(unittest.TestCase):
         self.assertIsNone(record.decision)
 
 
+class R3RegressionTest(unittest.TestCase):
+    """R3 (j#76810): a guard that never met its own boundary conditions.
+
+    F1 -- the container guard was mistaken for a component guard, so a *newer*
+    component schema was silently re-stamped as v2 and its authority rows became
+    writable by a build that does not know their semantics.
+    F2 -- ``str.isdigit()`` is not an ASCII-decimal test, so Unicode digits were
+    stored as anchors Redmine can never resolve, and ``int()`` leaked a raw
+    ``ValueError`` out of an error contract that promises ``DecisionPointerError``.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.key = LaneLifecycleKey(WS, LANE_A)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _v3_store(self) -> Path:
+        """A store an imagined future build upgraded past us."""
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(self.key, decision=_decision(), issue_id=ISSUE)
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 3 "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.execute(
+                "ALTER TABLE lane_lifecycle_records "
+                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'v3'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    # -- R3-F1: a newer component schema is never downgraded ------------------
+
+    def test_f1_newer_component_schema_fails_closed(self) -> None:
+        self._v3_store()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+
+    def test_f1_refusal_leaves_the_store_byte_equivalent(self) -> None:
+        path = self._v3_store()
+        before = path.read_bytes()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_f1_version_and_future_columns_survive(self) -> None:
+        path = self._v3_store()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        conn = sqlite3.connect(path)
+        try:
+            version = conn.execute(
+                "SELECT schema_version FROM state_schema_components "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+            columns = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(lane_lifecycle_records)")
+            ]
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM lane_lifecycle_records"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(version, 3)  # not re-stamped down to 2
+        self.assertIn("future_guard", columns)
+        self.assertEqual(rows, 1)
+
+    def test_f1_no_write_reaches_a_newer_component(self) -> None:
+        # The point of the refusal: rows here are lifecycle AUTHORITY. A build that
+        # does not know v3's semantics must not be able to move them.
+        self._v3_store()
+        store = LaneLifecycleStore(home=self.home)
+        with self.assertRaises(LaneLifecycleError):
+            store.transition_disposition(
+                self.key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=1,
+                target=DISPOSITION_HIBERNATED,
+                decision=_decision(journal="76816"),
+            )
+
+    def test_f1_readers_fail_closed_never_assume_active(self) -> None:
+        self._v3_store()
+        # `absent` would read as "no owner, go ahead"; unsupported must be `unknown`.
+        self.assertEqual(
+            resolve_lane_owner(WS, ISSUE, home=self.home).status, OWNER_UNKNOWN
+        )
+        self.assertIsNone(load_lane_lifecycle(home=self.home))
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).records()
+
+    def test_f1_a_known_v1_still_migrates(self) -> None:
+        # Fail-closed on *newer* must not break the supported v1 -> v2 path.
+        store = LaneLifecycleStore(home=self.home)
+        store.ensure_schema()
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 1 "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        conn = sqlite3.connect(path)
+        try:
+            version = conn.execute(
+                "SELECT schema_version FROM state_schema_components "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(version, 2)
+
+    # -- R3-F2: the id validator has a closed error contract ------------------
+
+    def test_f2_unicode_digits_are_rejected(self) -> None:
+        # Every one of these is `str.isdigit() == True` -- and none is a Redmine id.
+        for value in ("²", "１２", "١٢"):
+            with self.subTest(value=value):
+                self.assertTrue(value.isdigit())  # the trap, pinned
+                with self.assertRaises(DecisionPointerError):
+                    DecisionPointer(
+                        source="redmine", issue_id=value, journal_id="76741"
+                    )
+                with self.assertRaises(DecisionPointerError):
+                    DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=value)
+
+    def test_f2_oversize_input_raises_the_declared_error(self) -> None:
+        # CPython raises a raw ValueError converting a huge string with int(); the
+        # contract says every rejection is a DecisionPointerError.
+        huge = "1" * 5000
+        with self.assertRaises(DecisionPointerError):
+            DecisionPointer(source="redmine", issue_id=huge, journal_id="76741")
+        with self.assertRaises(DecisionPointerError):
+            DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=huge)
+
+    def test_f2_zero_and_empty_are_rejected(self) -> None:
+        for value in ("", "0", "00", " ", "-1", "1.0", "1e3", "12a"):
+            with self.subTest(value=value):
+                with self.assertRaises(DecisionPointerError):
+                    DecisionPointer(
+                        source="redmine", issue_id=value, journal_id="76741"
+                    )
+
+    def test_f2_a_corrupt_anchor_reads_as_none_not_a_raw_error(self) -> None:
+        # The docstring on `.decision` promises None for an unreadable anchor. Before
+        # the fix a Unicode-digit anchor made simply *reading* the row raise.
+        store = LaneLifecycleStore(home=self.home)
+        store.ensure_schema()
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            conn.execute(
+                "INSERT INTO lane_lifecycle_records (repo_workspace_id, lane_id, "
+                "issue_id, lane_disposition, process_release, revision, "
+                "release_action_id, release_pins, decision_source, "
+                "decision_issue_id, decision_journal, created_at, updated_at) "
+                "VALUES (?, ?, '', ?, ?, 1, '', '', 'redmine', ?, '76741', ?, ?)",
+                (
+                    WS,
+                    LANE_B,
+                    DISPOSITION_ACTIVE,
+                    RELEASE_NOT_REQUESTED,
+                    "²",
+                    "2026-07-13T00:00:00+00:00",
+                    "2026-07-13T00:00:00+00:00",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        record = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE_B))
+        self.assertEqual(record.decision_issue_id, "²")
+        self.assertIsNone(record.decision)
+
+    def test_f2_valid_ids_still_pass(self) -> None:
+        pointer = DecisionPointer(source="redmine", issue_id="13689", journal_id="1")
+        self.assertEqual(pointer.issue_id, "13689")
+        self.assertEqual(pointer.journal_id, "1")
+
+
 class FailClosedReadTest(unittest.TestCase):
     """An unusable store must never read as "active" / "no conflict"."""
 
