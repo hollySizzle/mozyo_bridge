@@ -347,6 +347,62 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertEqual(record.source_backend, "herdr")
         self.assertEqual(record.status, "active")
 
+    def test_append_declares_lane_owner_binding(self) -> None:
+        # Redmine #13681 W1: with a `--journal` anchor the create command boundary
+        # declares the lane's owner binding in the lifecycle component, keyed on the
+        # live `(project workspace, lane_label)` unit — separate from (and CAS'd,
+        # unlike) the display-metadata upsert. The lane resolves as the single active
+        # owner of its issue, and the decision anchor is re-readable.
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DISPOSITION_ACTIVE,
+            OWNER_RESOLVED,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            ops.journal = "76630"
+            root = str(ops.repo_root)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(root)
+                project_ws = read_anchor(ops.repo_root)["workspace_id"]
+                store = LaneLifecycleStore(home=home)
+                record = store.get(LaneLifecycleKey(project_ws, "issue_13331_x"))
+                owner = store.resolve_owner(project_ws, "13331")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.lane_disposition, DISPOSITION_ACTIVE)
+        self.assertEqual(record.issue_id, "13331")
+        self.assertEqual(record.decision_source, "redmine")
+        self.assertEqual(record.decision_issue_id, "13331")
+        self.assertEqual(record.decision_journal, "76630")
+        self.assertEqual(owner.status, OWNER_RESOLVED)
+        self.assertEqual(owner.lane_id, "issue_13331_x")
+
+    def test_append_without_journal_leaves_lane_owner_unbound(self) -> None:
+        # Redmine #13681 W1: a create with no `--journal` anchor is owner-unbound — no
+        # lifecycle row is written, so the issue has no resolvable owner. The gap is
+        # honest (fail-closed at the roster / send gate), never a guessed owner.
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            OWNER_ABSENT,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)  # no journal supplied
+            root = str(ops.repo_root)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(root)
+                project_ws = read_anchor(ops.repo_root)["workspace_id"]
+                store = LaneLifecycleStore(home=home)
+                record = store.get(LaneLifecycleKey(project_ws, "issue_13331_x"))
+                owner = store.resolve_owner(project_ws, "13331")
+        self.assertIsNone(record)
+        self.assertEqual(owner.status, OWNER_ABSENT)
+
     def test_non_git_lane_launches_as_project_lane_unit_not_default(self) -> None:
         # Redmine #13392 (required test 2): a non-git lane's runtime root IS the workspace
         # root (the use case collapses skip_no_git to repo_root). Its slots must stand up

@@ -127,6 +127,10 @@ class HerdrSublaneActuatorOps:
     lane_label: str
     issue: str
     branch: str = ""
+    #: The durable-record journal that authorizes this lane's owner binding (Redmine
+    #: #13681 W1). It travels the same ``--journal`` anchor the dispatch leg uses; a
+    #: create with no journal is owner-unbound and writes no lifecycle row.
+    journal: str = ""
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
     providers: tuple[str, ...] = HERDR_LANE_PROVIDERS
@@ -305,6 +309,61 @@ class HerdrSublaneActuatorOps:
             worktree_path=str(worktree_path),
             lane_id=self.lane_label or "",
         )
+        # Redmine #13681 W1: declare the lane's owner binding in the lifecycle
+        # component, adjacent to (and keyed differently from) the display-metadata
+        # upsert. Best-effort, exactly like the metadata write — but the two axes are
+        # separate: metadata is a display join that *revives a tombstone*, while the
+        # lifecycle row is CAS'd owner authority the roster (W4) and send gate (W3)
+        # fail-closed against. The live lane unit `(project workspace, lane_label)` is
+        # the same unit those projections join on.
+        self._declare_lane_lifecycle(repo_workspace_id)
+
+    def _declare_lane_lifecycle(self, repo_workspace_id: str) -> None:
+        """Declare this lane's owner binding (best-effort, never raises; Redmine #13681 W1).
+
+        A declare needs both the lane unit identity `(repo_workspace_id, lane_label)`
+        and the durable decision anchor `(--journal)`. A create with no journal — or an
+        unresolved workspace segment / lane label — is **owner-unbound**: no lifecycle
+        row is written, and the lane reads as owner-unbound at the roster and send gate.
+        That is a fail-closed gap surfaced honestly downstream, never a guessed owner.
+
+        The write is best-effort like the metadata upsert: a store error never breaks the
+        actuation. A re-run (self-heal, #13378) re-declares and is refused idempotently
+        (`already_declared`); a create for an issue another lane still actively owns is
+        refused (`owner_conflict`) and the recovery lane stays unbound until an explicit
+        `sublane supersede` hands ownership over (W2) — both are correct, not errors.
+        """
+        journal = _norm(self.journal)
+        issue = _norm(self.issue)
+        lane = _norm(self.lane_label)
+        workspace = _norm(repo_workspace_id)
+        if not (journal and issue and lane and workspace):
+            return
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DecisionPointer,
+            DecisionPointerError,
+            LaneLifecycleError,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        try:
+            key = LaneLifecycleKey(workspace, lane)
+            decision = DecisionPointer(
+                source="redmine", issue_id=issue, journal_id=journal
+            )
+        except (DecisionPointerError, ValueError):
+            # A non-decimal issue / journal cannot anchor a re-readable decision — skip
+            # rather than write an owner row no recovery could ever resolve.
+            return
+        try:
+            LaneLifecycleStore().declare_active(key, decision=decision, issue_id=issue)
+        except (LaneLifecycleError, DecisionPointerError, OSError) as exc:
+            print(
+                f"warning: lane lifecycle declare skipped ({type(exc).__name__}); "
+                "lane reads as owner-unbound",
+                file=sys.stderr,
+            )
 
     def heal_lane_column(self, worktree_path: str) -> None:
         """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).
