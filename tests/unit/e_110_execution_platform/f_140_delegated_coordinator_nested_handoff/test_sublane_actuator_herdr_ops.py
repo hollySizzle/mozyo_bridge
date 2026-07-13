@@ -782,6 +782,85 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertEqual(herdr.start_argvs, [])
         self.assertEqual(herdr.agents, [])
 
+    def test_front_door_gate_blocks_via_real_fingerprint_composition_zero_write(
+        self,
+    ) -> None:
+        # Redmine #13705 R2-F1: prove the front door goes ZERO-WRITE through the REAL
+        # `run_runtime_fingerprint` composition — active probe + source scan +
+        # `evaluate_fingerprint` — NOT a precomputed fingerprint dict. The mixed-runtime
+        # skew is simulated by the single fact that a stale runtime lacks the #13411
+        # placement behavior: the active placement probe is patched to False while the
+        # repo-local source really ships the `def _tab_target_for_lane` marker, so the
+        # real drift-detection produces the placement `probe_mismatch` that blocks the
+        # mutation. No `runtime_fingerprint_reader` is injected.
+        from mozyo_bridge import __version__ as REAL_VERSION
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
+            SublaneActuateUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            ACTUATE_BLOCKED,
+            REASON_RUNTIME_FINGERPRINT,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            SublaneCreateRequest,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            # A real repo-local source tree that SHIPS the #13411 placement marker,
+            # with a version equal to the active runtime's (the silent-drift class).
+            src_pkg = Path(tmp) / "repo" / "src" / "mozyo_bridge"
+            src_pkg.mkdir(parents=True)
+            (src_pkg / "__init__.py").write_text(
+                f'__version__ = "{REAL_VERSION}"\n', encoding="utf-8"
+            )
+            (src_pkg / "herdr_lane_topology.py").write_text(
+                "def _tab_target_for_lane(rows, ws, target, lane):\n    return ''\n",
+                encoding="utf-8",
+            )
+            repo_root = Path(tmp) / "repo"
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            binpath = _fake_binary(tmp)
+            ops = HerdrSublaneActuatorOps(
+                repo_root=repo_root,
+                lane_label="issue_13705_x",
+                issue="13705",
+                env=with_provider_path(
+                    {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+                ),
+                runner=herdr.run,
+                # No runtime_fingerprint_reader -> the REAL run_runtime_fingerprint runs.
+            )
+            request = SublaneCreateRequest(
+                issue="13705",
+                lane_label="issue_13705_x",
+                branch="issue_13705_x",
+                worktree_path=str(worktree),
+                journal="77188",
+            )
+            use_case = SublaneActuateUseCase(ops, gateway_ready_probes=0)
+            # Patch ONLY the active placement probe to False — the one fact a stale
+            # runtime lacking #13411 would report. Source scan / evaluate_fingerprint /
+            # the gate policy all run for real.
+            with patch(
+                "mozyo_bridge.application.doctor_runtime._probe_active_same_tab_pair",
+                return_value=False,
+            ):
+                with patch.dict(
+                    os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+                ):
+                    outcome = use_case.run(
+                        request, execute=True, dispatch=False, target_repo=str(worktree)
+                    )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_RUNTIME_FINGERPRINT, outcome.blocked_reasons)
+        # Zero side effect: the real-composition drift detection blocked before any write.
+        self.assertEqual(herdr.start_argvs, [])
+        self.assertEqual(herdr.agents, [])
+
     def test_front_door_fingerprint_gate_allows_matching_runtime(self) -> None:
         # A non-drifted fingerprint (no placement probe mismatch) allows actuation.
         ok_fingerprint = {"ok": True, "status": "ok", "probe_mismatch": []}
