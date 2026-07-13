@@ -1,0 +1,126 @@
+"""Workspace callback supervisor end-to-end scenario (Redmine #13683 Phase A).
+
+Exercises the real cross-workspace fan-out over a **real** home workspace registry (two registered
+workspaces), with injected roster / Redmine source / sender so the scenario is hermetic:
+
+- one supervised sweep enumerates the registry and, per workspace, supplies durable events (so
+  `workflow glance` stops reporting `unknown`) and drains that workspace's callback partition;
+- a concurrent duplicate daemon (a second holder while the first still holds its leases) is fenced
+  across the WHOLE registry — every workspace is skipped, zero delivery.
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
+from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore, supervisor_lease_path
+from mozyo_bridge.core.state.workflow_runtime_store import (
+    CALLBACK_DELIVERED,
+    WorkflowRuntimeStore,
+    workflow_runtime_store_path,
+)
+from mozyo_bridge.core.state.workspace_registry import register_workspace
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
+    SupervisedWorkspace,
+    WorkspaceCallbackSupervisor,
+    default_workspaces,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+    SEND_DELIVERED,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MappingRedmineJournalSource,
+)
+
+
+def _payload(issue: str) -> dict:
+    return {
+        "issue": {"id": issue},
+        "journals": [
+            {"id": f"j{issue}", "notes": f"[mozyo:workflow-event:gate=review_request:conclusion=pending]"}
+        ],
+    }
+
+
+class _RecordingSender:
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def __call__(self, row) -> str:
+        self.calls.append(row)
+        return SEND_DELIVERED
+
+
+class WorkspaceSupervisorScenarioTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp())
+        # Two real registered workspaces under the temp home.
+        self.repo_a = self.home / "repoA"
+        self.repo_b = self.home / "repoB"
+        self.repo_a.mkdir()
+        self.repo_b.mkdir()
+        rec_a = register_workspace(self.repo_a, home=self.home).record
+        rec_b = register_workspace(self.repo_b, home=self.home).record
+        # Map each real workspace_id to a distinct active issue for the injected roster.
+        self.issue_by_ws = {rec_a.workspace_id: "13683", rec_b.workspace_id: "13684"}
+        self.store_path = workflow_runtime_store_path(self.home)
+        self.store = WorkflowRuntimeStore(path=self.store_path)
+        self.outbox = CallbackOutbox(path=self.store_path)
+        self.sender = _RecordingSender()
+
+    def _supervisor(self, *, holder, release_after=True):
+        def roster_fn(ws: SupervisedWorkspace):
+            issue = self.issue_by_ws.get(ws.workspace_id)
+            return ((issue,) if issue else ()), ""
+
+        def source_fn(ws: SupervisedWorkspace):
+            issue = self.issue_by_ws.get(ws.workspace_id)
+            return MappingRedmineJournalSource(payload=_payload(issue)) if issue else None
+
+        return WorkspaceCallbackSupervisor(
+            holder=holder,
+            lease_store=SupervisorLeaseStore(path=supervisor_lease_path(self.home)),
+            store=self.store,
+            outbox=self.outbox,
+            workspaces_fn=lambda: default_workspaces(home=self.home),
+            roster_fn=roster_fn,
+            redmine_source_fn=source_fn,
+            sender_fn=lambda ws: self.sender,
+            release_after=release_after,
+            clock=lambda: "2026-07-13T00:00:00+00:00",
+        )
+
+    def test_sweep_supplies_events_and_drains_all_registered_workspaces(self) -> None:
+        report = self._supervisor(holder="superX").run_once()
+        self.assertEqual(len(report.workspaces), 2)
+        self.assertEqual(report.workspaces_supervised, 2)
+        self.assertGreaterEqual(report.events_supplied, 2)  # one gate per workspace's issue
+        self.assertEqual(report.delivered, 2)
+        # Both issues' events are persisted for glance/resume.
+        persisted = {e.issue for e in self.store.read_events()}
+        self.assertEqual(persisted, {"13683", "13684"})
+        # Both callbacks delivered, each partitioned to its own workspace.
+        delivered = self.outbox.read(states=[CALLBACK_DELIVERED])
+        self.assertEqual(len(delivered), 2)
+        self.assertEqual({d.workspace_id for d in delivered}, set(self.issue_by_ws))
+
+    def test_concurrent_duplicate_daemon_is_fenced_across_whole_registry(self) -> None:
+        # Supervisor A holds all leases (release_after=False, still running).
+        self._supervisor(holder="superA", release_after=False).run_once()
+        self.sender.calls.clear()
+        # Supervisor B (different holder) runs while A holds the leases -> every workspace skipped.
+        report_b = self._supervisor(holder="superB").run_once()
+        self.assertEqual(report_b.workspaces_supervised, 0)
+        self.assertEqual(report_b.workspaces_skipped, 2)
+        self.assertEqual(self.sender.calls, [])  # zero duplicate delivery
+
+
+if __name__ == "__main__":
+    unittest.main()

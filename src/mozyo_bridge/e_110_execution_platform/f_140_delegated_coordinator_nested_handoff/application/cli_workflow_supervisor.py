@@ -1,0 +1,343 @@
+"""CLI surface for `workflow supervisor` — workspace callback supervisor (Redmine #13683 Phase A).
+
+`mozyo-bridge workflow supervisor` is the mozyo **semantic facade** over the workspace callback
+supervisor composition root (:mod:`...application.workspace_callback_supervisor`). It is the
+user-scoped owner that enumerates the whole workspace registry and, per leased workspace, supplies
+durable workflow events (so `workflow glance` / `workflow resume` stop reporting `unknown`) and
+drains that workspace's callback-outbox partition — without an agent ever touching a raw Herdr /
+tmux primitive.
+
+Actions (mutually exclusive):
+
+- ``--run-once`` — one **bounded supervised sweep** across the registry: for each workspace it can
+  lease, supply events + deliver the callback outbox once (a refused lease -> the workspace is
+  skipped, zero delivery — the duplicate-supervisor fence). Actuates. ``--wake WORKSPACE:ISSUE``
+  (repeatable) switches to ``local_wake`` mode (supervise only the wake-named active-lane issues).
+- ``--status`` — read-only: the registry workspaces, current supervisor leases, and the
+  home-scoped runtime-store event count + callback-outbox backlog. Mutates nothing.
+- ``--service-status`` / ``--install`` / ``--restart`` / ``--uninstall`` — the **service lifecycle
+  command contract**. ``--service-status`` prints the resolved (secret-free) service definition and
+  reports that the host service is not activated. The three mutating verbs are **fail-closed in
+  Phase A**: they print the resolved plan + refusal reason and exit non-zero WITHOUT touching the
+  host / login service — the real activation is Phase B (installed parity #13524 / #13526).
+
+A source / store error is a ``SystemExit`` with a redacted message (never a credential / URL /
+pane id / absolute path).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json as _json
+import os
+import socket
+from pathlib import Path
+from typing import Optional
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+    PHASE_A_SERVICE_MUTATION_REASON,
+    SUPERVISION_BOUNDED_RECONCILIATION,
+    SUPERVISION_LOCAL_WAKE,
+    build_service_definition,
+)
+
+
+def _home_from_args(args: argparse.Namespace) -> Optional[Path]:
+    """Resolve the ``--home`` override (test/debug), or ``None`` for the default mozyo home."""
+    raw = (getattr(args, "home", None) or "").strip()
+    return Path(raw) if raw else None
+
+
+def _store_path_from_args(args: argparse.Namespace) -> Optional[Path]:
+    raw = (getattr(args, "store_path", None) or "").strip()
+    return Path(raw) if raw else None
+
+
+def _default_holder() -> str:
+    """A stable-per-process supervisor lease holder id (host + pid).
+
+    Each supervisor process is a distinct lease holder, so a concurrent duplicate is fenced; a
+    later invocation (a new pid) re-acquires cleanly after the prior process released its leases.
+    """
+    try:
+        host = socket.gethostname() or "host"
+    except OSError:
+        host = "host"
+    return f"{host}:{os.getpid()}"
+
+
+def _parse_wake_hint(spec: str) -> tuple[str, str]:
+    """Parse a ``WORKSPACE_ID:ISSUE`` wake hint (structured; no prose)."""
+    raw = (spec or "").strip()
+    ws, sep, issue = raw.partition(":")
+    if not sep or not ws.strip() or not issue.strip():
+        raise argparse.ArgumentTypeError(
+            f"--wake expects WORKSPACE_ID:ISSUE (e.g. a1b2c3:13683), got {spec!r}"
+        )
+    return ws.strip(), issue.strip()
+
+
+def _emit(payload: dict, *, as_json: bool, text_lines) -> None:
+    if as_json:
+        print(_json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        for line in text_lines:
+            print(line)
+
+
+def _cmd_run_once(args: argparse.Namespace) -> int:
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
+        build_supervisor,
+    )
+
+    holder = (getattr(args, "holder", None) or "").strip() or _default_holder()
+    wake_hints = tuple(getattr(args, "wake", None) or ())
+    mode = SUPERVISION_LOCAL_WAKE if wake_hints else SUPERVISION_BOUNDED_RECONCILIATION
+    supervisor = build_supervisor(
+        holder=holder, home=_home_from_args(args), store_path=_store_path_from_args(args)
+    )
+    report = supervisor.run_once(mode=mode, wake_hints=wake_hints)
+    payload = report.as_payload()
+    lines = [
+        "action: run-once",
+        f"mode: {report.mode}",
+        f"workspaces_total: {len(report.workspaces)}",
+        f"workspaces_supervised: {report.workspaces_supervised}",
+        f"workspaces_skipped: {report.workspaces_skipped}",
+        f"events_supplied: {report.events_supplied}",
+        f"delivered: {report.delivered}",
+    ]
+    for w in report.workspaces:
+        if w.lease_acquired:
+            lines.append(
+                f"  ws {w.workspace_id}: supervised {len(w.supervised_issues)} issue(s), "
+                f"events={w.events_supplied} delivered={w.delivered}"
+                + (f" [{w.skipped_reason}]" if w.skipped_reason else "")
+            )
+        else:
+            lines.append(f"  ws {w.workspace_id}: skipped ({w.skipped_reason})")
+    _emit(payload, as_json=bool(getattr(args, "as_json", False)), text_lines=lines)
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
+    from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore, supervisor_lease_path
+    from mozyo_bridge.core.state.workflow_runtime_store import (
+        CALLBACK_DEAD_LETTER,
+        CALLBACK_PENDING,
+        CALLBACK_UNCERTAIN,
+        WorkflowRuntimeStore,
+        WorkflowRuntimeStoreError,
+        workflow_runtime_store_path,
+    )
+    from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseError
+    from mozyo_bridge.core.state.workspace_registry import list_workspaces
+
+    home = _home_from_args(args)
+    store_path = _store_path_from_args(args) or workflow_runtime_store_path(home)
+    try:
+        workspaces = list_workspaces(home=home)
+        leases = SupervisorLeaseStore(path=supervisor_lease_path(home)).leases()
+        store = WorkflowRuntimeStore(path=store_path)
+        outbox = CallbackOutbox(path=store_path)
+        event_count = len(store.read_events())
+        pending = len(outbox.read(states=[CALLBACK_PENDING]))
+        uncertain = len(outbox.read(states=[CALLBACK_UNCERTAIN]))
+        dead_letter = len(outbox.read(states=[CALLBACK_DEAD_LETTER]))
+    except (WorkflowRuntimeStoreError, SupervisorLeaseError) as exc:
+        raise SystemExit(f"workflow supervisor status: store unavailable ({exc})") from exc
+
+    lease_holders = {lease.workspace_id: lease for lease in leases}
+    payload = {
+        "action": "status",
+        "workspaces_total": len(workspaces),
+        "leases_held": len(leases),
+        "runtime_events": event_count,
+        "callback_pending": pending,
+        "callback_uncertain": uncertain,
+        "callback_dead_letter": dead_letter,
+        "workspaces": [
+            {
+                "workspace_id": rec.workspace_id,
+                "project_name": rec.project_name,
+                "lease_held": rec.workspace_id in lease_holders,
+                "lease_holder": (
+                    lease_holders[rec.workspace_id].holder
+                    if rec.workspace_id in lease_holders
+                    else ""
+                ),
+                "lease_expires_at": (
+                    lease_holders[rec.workspace_id].expires_at
+                    if rec.workspace_id in lease_holders
+                    else ""
+                ),
+            }
+            for rec in workspaces
+        ],
+    }
+    lines = [
+        "action: status",
+        f"workspaces_total: {len(workspaces)}",
+        f"leases_held: {len(leases)}",
+        f"runtime_events: {event_count}",
+        f"callback_pending: {pending}",
+        f"callback_uncertain: {uncertain}",
+        f"callback_dead_letter: {dead_letter}",
+    ]
+    for rec in workspaces:
+        lease = lease_holders.get(rec.workspace_id)
+        held = f"leased by {lease.holder} until {lease.expires_at}" if lease else "unleased"
+        lines.append(f"  ws {rec.workspace_id} ({rec.project_name}): {held}")
+    _emit(payload, as_json=bool(getattr(args, "as_json", False)), text_lines=lines)
+    return 0
+
+
+def _service_definition(args: argparse.Namespace):
+    interval = int(
+        getattr(args, "reconciliation_interval", None)
+        or DEFAULT_RECONCILIATION_INTERVAL_SECONDS
+    )
+    return build_service_definition(reconciliation_interval_seconds=interval)
+
+
+def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
+    """The service lifecycle command contract (Phase A: report; host mutation is Phase B).
+
+    ``--service-status`` reports the resolved definition + that the host service is not activated
+    (exit 0). ``--install`` / ``--restart`` / ``--uninstall`` are fail-closed in Phase A: they
+    print the plan + the :data:`PHASE_A_SERVICE_MUTATION_REASON` refusal and exit non-zero WITHOUT
+    touching the host / login service — the real activation is Phase B (#13524 / #13526 parity).
+    """
+    as_json = bool(getattr(args, "as_json", False))
+    definition = _service_definition(args)
+    if verb == "service-status":
+        payload = {
+            "action": "service-status",
+            "installed": False,
+            "phase": "A",
+            "note": "host service activation is Phase B (#13524 / #13526 installed parity)",
+            "definition": definition.as_payload(),
+        }
+        lines = [
+            "action: service-status",
+            "installed: False",
+            "phase: A (host service activation deferred to Phase B: #13524 / #13526)",
+            f"service_label: {definition.label}",
+            f"command: {' '.join(definition.command)}",
+            f"reconciliation_interval_seconds: {definition.reconciliation_interval_seconds}",
+            f"run_at_login: {definition.run_at_login}",
+        ]
+        _emit(payload, as_json=as_json, text_lines=lines)
+        return 0
+
+    # install / restart / uninstall: fail-closed, no host mutation in Phase A.
+    payload = {
+        "action": verb,
+        "performed": False,
+        "reason": PHASE_A_SERVICE_MUTATION_REASON,
+        "note": (
+            "Phase A does not mutate the host / login service; run this after Phase B installed "
+            "parity (#13524 / #13526). No launchd/login service was changed."
+        ),
+        "definition": definition.as_payload(),
+    }
+    lines = [
+        f"action: {verb}",
+        "performed: False",
+        f"reason: {PHASE_A_SERVICE_MUTATION_REASON}",
+        "note: Phase A does not mutate the host/login service; activation is Phase B "
+        "(#13524 / #13526). No launchd/login service was changed.",
+        f"service_label: {definition.label}",
+        f"command: {' '.join(definition.command)}",
+    ]
+    _emit(payload, as_json=as_json, text_lines=lines)
+    return 1
+
+
+def cmd_workflow_supervisor(args: argparse.Namespace) -> int:
+    """Run one `workflow supervisor` action (run-once / status / service lifecycle contract)."""
+    if getattr(args, "run_once", False):
+        return _cmd_run_once(args)
+    if getattr(args, "status", False):
+        return _cmd_status(args)
+    if getattr(args, "service_status", False):
+        return _cmd_service(args, verb="service-status")
+    if getattr(args, "install", False):
+        return _cmd_service(args, verb="install")
+    if getattr(args, "restart", False):
+        return _cmd_service(args, verb="restart")
+    if getattr(args, "uninstall", False):
+        return _cmd_service(args, verb="uninstall")
+    raise SystemExit(
+        "workflow supervisor requires an action: --run-once | --status | --service-status | "
+        "--install | --restart | --uninstall"
+    )
+
+
+def register_supervisor(workflow_sub) -> None:
+    """Register ``workflow supervisor`` onto the ``workflow`` subparser (Redmine #13683 Phase A)."""
+    p = workflow_sub.add_parser(
+        "supervisor",
+        description=(
+            "Workspace callback supervisor (Redmine #13683 Phase A). The user-scoped owner that "
+            "enumerates the whole workspace registry and, per workspace it can lease, supplies "
+            "durable workflow events (so `workflow glance` / `workflow resume` stop reporting "
+            "`unknown`) and drains that workspace's callback-outbox partition. `--run-once` runs "
+            "one bounded supervised sweep (a refused lease skips the workspace: the "
+            "duplicate-supervisor fence); `--wake WORKSPACE:ISSUE` switches to local_wake mode. "
+            "`--status` is a read-only registry / lease / backlog view. The service lifecycle "
+            "contract (`--service-status` / `--install` / `--restart` / `--uninstall`) reports the "
+            "secret-free service definition; the three mutating verbs are fail-closed in Phase A "
+            "(host activation is Phase B, #13524 / #13526)."
+        ),
+        help=(
+            "Workspace callback supervisor: run-once / status / service lifecycle contract. "
+            "Supplies durable glance/resume state + drains callbacks per leased workspace."
+        ),
+    )
+    action = p.add_mutually_exclusive_group(required=True)
+    action.add_argument(
+        "--run-once", dest="run_once", action="store_true",
+        help="One bounded supervised sweep across the registry (supply events + deliver callbacks).",
+    )
+    action.add_argument(
+        "--status", action="store_true",
+        help="Read-only: registry workspaces, supervisor leases, runtime-event + callback backlog.",
+    )
+    action.add_argument(
+        "--service-status", dest="service_status", action="store_true",
+        help="Report the resolved (secret-free) service definition and host-activation status.",
+    )
+    action.add_argument(
+        "--install", action="store_true",
+        help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
+    )
+    action.add_argument(
+        "--restart", action="store_true",
+        help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
+    )
+    action.add_argument(
+        "--uninstall", action="store_true",
+        help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
+    )
+    p.add_argument(
+        "--wake", action="append", type=_parse_wake_hint, metavar="WORKSPACE_ID:ISSUE",
+        help="A local wake hint (repeatable): supervise only these active-lane issues (local_wake mode).",
+    )
+    p.add_argument(
+        "--holder", default=None,
+        help="Override the supervisor lease holder id (default: host:pid). One holder per supervisor process.",
+    )
+    p.add_argument(
+        "--reconciliation-interval", dest="reconciliation_interval", type=int, default=None,
+        help="Bounded reconciliation interval seconds for the service definition (default: portable default).",
+    )
+    p.add_argument("--json", action="store_true", dest="as_json", help="Emit a structured JSON result.")
+    p.add_argument("--home", default=None, help=argparse.SUPPRESS)  # test/debug: override mozyo home
+    p.add_argument("--store-path", dest="store_path", default=None, help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_workflow_supervisor)
+
+
+__all__ = ("cmd_workflow_supervisor", "register_supervisor")
