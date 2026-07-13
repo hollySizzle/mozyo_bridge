@@ -92,15 +92,23 @@ class BackendNeutralTargetResolver:
       assigned-name ``pane_name``, so a wrong / missing label is never resolved — R5-F1);
     - an **unsupported backend** (no Phase A live-inventory adaptation, e.g. tmux) is an explicit
       durable fail-closed boundary — no target, rather than silently resolving on a partial key;
-    - the resolved target's ``generation`` is read from the **live** authority, NEVER copied from the
-      row (R5-F2): Phase A's live inventory carries no generation, so it is blank/unknown, and the
-      delivery authority then fails a generation-correlated (non-blank expected) row closed.
+    - the resolved target's ``generation`` is read from an independent **live** authority
+      (``live_generation_fn``), NEVER copied from the row (R5-F2 / #13684 correction 1): the delivery
+      authority then requires the row's *expected* generation and this *live* generation to both be
+      non-blank and match. Without a ``live_generation_fn`` (Phase A / a coordinator route) the live
+      generation is blank, so a generation-correlated (non-blank expected) row still fails closed —
+      #13684 injects the owning-lane generation reader only for the correlated review_result return
+      route (:data:`...domain.review_return_route.REVIEW_RETURN_ROUTE_PREFIX`), which is what enables
+      that route's delivery while leaving every other route's Phase A fail-closed-disabled state intact.
 
     ``inventory`` is the injectable ``(rows, backend)`` seam; tests inject fixed rows + a backend.
+    ``live_generation_fn`` is the injectable independent live-generation authority (default: none ->
+    blank -> unchanged Phase A behaviour).
     """
 
     workspace_id: str
     inventory: BackendInventory
+    live_generation_fn: Optional[Callable[[CallbackOutboxRow], str]] = None
 
     def resolve(self, row: CallbackOutboxRow) -> TargetResolution:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
@@ -139,6 +147,17 @@ class BackendNeutralTargetResolver:
         locator = str(getattr(resolution, "resolved_pane_id", "") or "").strip()
         if not locator:
             return TargetResolution.of([])
+        # R5-F2 / #13684 correction 1: the generation is read from the INDEPENDENT live authority
+        # (``live_generation_fn``), never copied from the row. For the correlated review_result return
+        # route this is the owning-lane's live revision (which mismatches a supersession-bumped or
+        # owner-changed expectation -> zero-send); without an injected authority it stays blank, so a
+        # generation-correlated row still fails closed at :func:`authorize_background_delivery`.
+        live_generation = ""
+        if self.live_generation_fn is not None:
+            try:
+                live_generation = str(self.live_generation_fn(row) or "").strip()
+            except Exception:  # noqa: BLE001 - an unreadable generation authority is a blank -> fail-closed
+                live_generation = ""
         return TargetResolution.of([
             DeliveryTarget(
                 workspace_id=self.workspace_id,
@@ -146,10 +165,7 @@ class BackendNeutralTargetResolver:
                 receiver=expected_receiver,
                 issue=str(getattr(row, "issue", "") or ""),
                 journal=str(getattr(row, "journal", "") or ""),
-                # R5-F2: generation from LIVE evidence, never the row. Phase A live inventory carries
-                # none -> blank/unknown, so a generation-correlated row (non-blank expected) fails
-                # closed at the authority until #13684's live generation authority populates it.
-                generation="",
+                generation=live_generation,
                 locator=locator,
             )
         ])
