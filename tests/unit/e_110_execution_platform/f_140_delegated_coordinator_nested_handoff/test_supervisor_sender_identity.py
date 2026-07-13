@@ -56,7 +56,7 @@ NOW = "2026-07-13T00:00:00+00:00"
 
 def _row(
     workspace_id: str, *, claim_token: str = "tok", target_receiver: str = "codex",
-    target_lane: str = "default", target_generation: str = "",
+    target_lane: str = "default", target_generation: str = "g1",
 ) -> CallbackOutboxRow:
     return CallbackOutboxRow(
         source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
@@ -68,7 +68,7 @@ def _row(
 
 
 def _target(
-    workspace_id: str, *, generation: str = "", locator: str = "%1", receiver: str = "codex",
+    workspace_id: str, *, generation: str = "g1", locator: str = "%1", receiver: str = "codex",
     lane: str = "default",
 ) -> DeliveryTarget:
     return DeliveryTarget(
@@ -104,7 +104,7 @@ class AuthorizeMatrixTest(unittest.TestCase):
     def _authorize(self, **over):
         base = dict(
             expected_workspace="wsA", row_workspace="wsA", row_issue="13683", row_journal="77065",
-            row_lane="default", row_receiver="codex", row_generation="",
+            row_lane="default", row_receiver="codex", row_generation="g1",
             has_lease=True, has_claim=True,
             resolution=TargetResolution.of([_target("wsA")]),
         )
@@ -145,9 +145,19 @@ class AuthorizeMatrixTest(unittest.TestCase):
         )
         self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
 
-    def test_generation_absent_is_no_constraint(self):
+    def test_blank_generation_on_both_sides_is_zero_send(self):
+        # R6-F1: a blank expected AND blank live generation must fail closed (the Phase A production
+        # default) — delivery is disabled until #13684 supplies the correlated generation authority,
+        # never a silent uncorrelated send.
         d = self._authorize(resolution=TargetResolution.of([_target("wsA", generation="")]), row_generation="")
-        self.assertTrue(d.authorized)
+        self.assertFalse(d.authorized)
+        self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
+
+    def test_blank_expected_generation_with_live_generation_is_zero_send(self):
+        # R6-F1: even when the live target carries a generation, a blank expected generation on the
+        # row cannot be correlated -> fail closed.
+        d = self._authorize(resolution=TargetResolution.of([_target("wsA", generation="g1")]), row_generation="")
+        self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
 
     def test_unknown_target_generation_when_expected_is_zero_send(self):
         # R4-F2 repro: expected g1, resolved target has NO generation -> strict fail-closed.
@@ -347,12 +357,15 @@ class ClaimReverificationTest(unittest.TestCase):
             callback_route="coordinator", workspace_id="wsA",
         )
         outbox.enqueue(
-            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex", now=NOW
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex",
+            target_generation="g1", now=NOW,
         )
         claimed = outbox.claim_pending(now=NOW, workspace_id="wsA")
         return outbox, claimed[0]
 
     def _sender(self, outbox, *, now=NOW, transport=None):
+        # The fake resolver stands in for a connected live generation authority (#13684): it returns a
+        # target carrying generation "g1" so the correlated row can deliver — the mechanism proof.
         self.transport = transport or _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
         return BackgroundServiceCallbackSender(
             workspace_id="wsA", holder="superX", lease_store=self.lease_store,
@@ -522,8 +535,11 @@ class ClaimLostDuringResolverTest(unittest.TestCase):
             source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
             callback_route="coordinator", workspace_id="wsA",
         )
+        # A correlated generation so authorize passes the generation fence and the pre-transport
+        # LEASE re-verify is what catches the lost lease (this test targets the R4-F3 fence, not R6-F1).
         outbox.enqueue(
-            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex", now=NOW
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex",
+            target_generation="g1", now=NOW,
         )
         return outbox, outbox.claim_pending(now=NOW, workspace_id="wsA")[0]
 
@@ -580,6 +596,80 @@ class BackgroundTransportEnvTest(unittest.TestCase):
             result = sender(_row("wsA"))
         self.assertEqual(result.outcome, SEND_NOT_SENT)
         self.assertEqual(transport.calls, [])
+
+
+class ProductionSenderGenerationFenceTest(unittest.TestCase):
+    """R6-F1: the PRODUCTION path (real BackendNeutralTargetResolver over live Herdr rows) fails
+    closed when generation is blank/unknown — blank row + blank live -> transport 0, never sent.
+
+    This is the production-composition regression the review requires: no injected fake resolver, a
+    valid lease + a real durable claim, a canonical Herdr assigned name live — yet delivery is
+    disabled because Phase A has no live generation authority (that is #13684)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+
+    def _real_resolver(self, rows, *, backend="herdr"):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+            BackendNeutralTargetResolver,
+        )
+
+        return BackendNeutralTargetResolver(workspace_id="wsA", inventory=lambda: (list(rows), backend))
+
+    def _herdr(self, role, locator, *, lane="default"):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        return {"name": encode_assigned_name("wsA", role, lane), "pane_id": locator}
+
+    def _claimed_row(self, *, target_generation=""):
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
+        from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+
+        outbox = CallbackOutbox(path=self.store_path)
+        key = CallbackOutboxKey(
+            source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
+            callback_route="coordinator", workspace_id="wsA",
+        )
+        outbox.enqueue(
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex",
+            target_generation=target_generation, now=NOW,
+        )
+        return outbox, outbox.claim_pending(now=NOW, workspace_id="wsA")[0]
+
+    def test_blank_generation_production_path_is_transport_zero(self):
+        # A live coordinator(codex) slot IS resolvable, lease + claim are valid — the ONLY thing that
+        # fails closed is the blank live generation (Phase A has no #13684 authority).
+        outbox, row = self._claimed_row(target_generation="")
+        transport = _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        sender = BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
+            target_resolver=self._real_resolver([self._herdr("codex", "%A")]),
+            transport=transport, outbox=outbox, now_fn=lambda: NOW,
+        )
+        result = sender(row)
+        self.assertEqual(transport.calls, [])  # nothing delivered
+        self.assertEqual(result.outcome, SEND_NOT_SENT)
+        self.assertEqual(result.persist_reason, AUTH_GENERATION_MISMATCH)
+
+    def test_correlated_row_still_transport_zero_when_live_generation_blank(self):
+        # Even a generation-correlated row (target_generation="g1") fails closed on the production path,
+        # because the REAL resolver derives generation from LIVE inventory (blank in Phase A), never
+        # from the row -> the fence is a genuine cross-authority comparison, not a self-comparison.
+        outbox, row = self._claimed_row(target_generation="g1")
+        transport = _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        sender = BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
+            target_resolver=self._real_resolver([self._herdr("codex", "%A")]),
+            transport=transport, outbox=outbox, now_fn=lambda: NOW,
+        )
+        result = sender(row)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(result.persist_reason, AUTH_GENERATION_MISMATCH)
 
 
 if __name__ == "__main__":

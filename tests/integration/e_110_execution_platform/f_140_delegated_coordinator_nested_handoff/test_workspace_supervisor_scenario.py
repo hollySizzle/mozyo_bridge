@@ -222,11 +222,14 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
                 self._wsid = wsid
 
             def resolve(self, row):
-                # A live coordinator (codex) target matching the row's durable expected tuple.
+                # A live coordinator (codex) target matching the row's durable expected tuple. The
+                # generation comes from the LIVE authority — Phase A has none (#13684 unconnected), so
+                # it is blank, NEVER copied from the row. That blank live generation is what fences
+                # delivery closed below (R6-F1).
                 return TargetResolution.of([
                     DeliveryTarget(workspace_id=self._wsid, lane="default", receiver="codex",
                                    issue=str(row.issue), journal=str(row.journal),
-                                   generation=str(row.target_generation), locator="%coord")
+                                   generation="", locator="%coord")
                 ])
 
         class _CapturingTransport:
@@ -278,10 +281,14 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         ):
             self.assertEqual(args.func(args), 0)
 
-        # The gate commit's activation drove the whole chain to delivery.
-        self.assertEqual(len(transports.get("wsA", _CapturingTransport()).calls), 1)
-        self.assertEqual(transports["wsA"].calls[0][1].locator, "%coord")
-        self.assertEqual(len(outbox.read(states=[CALLBACK_DELIVERED])), 1)
+        # The gate commit's activation drove the whole chain: durable wake -> activation -> event
+        # supply. Delivery itself is fail-closed in Phase A because there is no live generation
+        # authority (#13684 unconnected): the background_service transport is NEVER called and no row
+        # reaches DELIVERED — a deterministic zero-send, not a silent uncorrelated push (R6-F1).
+        self.assertEqual(transports.get("wsA", _CapturingTransport()).calls, [])  # generation-disabled
+        self.assertEqual(len(outbox.read(states=[CALLBACK_DELIVERED])), 0)
+        # The durable-event supply (the supervisor's primary function — 15/15 unknown resolution) is
+        # unaffected by the delivery fence, and the wake is still consumed.
         self.assertEqual([e.issue for e in store.read_events()], ["13683"])
         self.assertEqual(SupervisorWakeStore(home=self.home).pending(), ())  # wake consumed
 

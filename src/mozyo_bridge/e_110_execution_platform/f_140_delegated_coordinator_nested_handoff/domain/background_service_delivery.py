@@ -150,10 +150,13 @@ def authorize_background_delivery(
        expected ``receiver`` (an unknown expected target cannot be verified -> fail closed), and the
        resolved receiver / lane must equal the recorded ones — a live resolution that picked a wrong
        role / lane is never delivered;
-    7. generation is **strict**: when the row expects a generation, the resolved target must carry
-       exactly that generation (:data:`AUTH_GENERATION_MISMATCH` otherwise — an unknown / empty /
-       stale target generation fails closed). No expectation = no constraint (the seam #13684's
-       correlated generation populates).
+    7. generation is a **mandatory correlated authority** (review R6-F1, per j#77216 boundary 4 /
+       j#77398 R5-F2): a deliverable row REQUIRES a non-blank expected generation AND a non-blank
+       live (resolved) generation from the independent correlated authority AND their exact match.
+       A blank / unknown / stale generation on **either** side fails closed
+       (:data:`AUTH_GENERATION_MISMATCH`). Because Phase A carries no live generation authority
+       (that is #13684's correlated review-result routing), background_service DELIVERY is
+       fail-closed-disabled until #13684 connects it — the durable-event supply is unaffected.
 
     Only when every check passes is the delivery :data:`AUTH_OK` with the single resolved target.
     """
@@ -189,9 +192,12 @@ def authorize_background_delivery(
     if want_lane and str(target.lane or "").strip() != want_lane:
         return BackgroundDeliveryDecision(False, AUTH_TARGET_MISMATCH)
     want_gen = str(row_generation or "").strip()
-    if want_gen and want_gen != str(target.generation or "").strip():
-        # Strict: an expected generation must match exactly — an unknown / empty / stale target
-        # generation fails closed (R3-F3 / R4-F2), never authorized.
+    got_gen = str(target.generation or "").strip()
+    if not want_gen or not got_gen or want_gen != got_gen:
+        # Mandatory correlated authority (R6-F1): a deliverable row needs a non-blank expected
+        # generation AND a non-blank live generation AND their exact match. A blank / unknown / stale
+        # generation on EITHER side fails closed — delivery is disabled until #13684 supplies the
+        # live generation authority (never a silent uncorrelated send).
         return BackgroundDeliveryDecision(False, AUTH_GENERATION_MISMATCH)
     return BackgroundDeliveryDecision(True, AUTH_OK, target)
 
