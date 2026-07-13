@@ -350,5 +350,191 @@ class ForwardTargetProviderTest(unittest.TestCase):
             self.assertEqual(hws._forward_target_provider(_ap.Namespace(repo=None), ".", "project_gateway"), "")
 
 
+class ReceiverVisibleRoundtripTest(unittest.TestCase):
+    """R2-F1: the forward generation id must reach the RECEIVER on the real delivery path.
+
+    The no-anchor ticketless rail has no Redmine anchor and no `--persist-delivery`, so the
+    structured dict is sender-side only — `build_notification_body` types `pointer_clause()` into
+    the receiver's pane/agent. The id must ride that body (and the durable record), or the receiver
+    can never echo it and the generation would never complete. This pins the full
+    forward -> receiver-reads-body -> echo -> callback completes roundtrip on ONE id.
+    """
+
+    def _consultation(self, action_id):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
+            CALLBACK_METHODS,
+            CONSULTATION_PROJECT_DOMAIN,
+            TicketlessConsultation,
+        )
+        return TicketlessConsultation(
+            CONSULTATION_PROJECT_DOMAIN, "grandparent_coordinator", list(CALLBACK_METHODS),
+            "project_gateway", forward_action_id=action_id,
+        )
+
+    def _body(self, payload):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            build_notification_body,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_anchors import (
+            TicketlessConsultationAnchor,
+        )
+        anchor = TicketlessConsultationAnchor(
+            consultation_kind=payload.consultation_kind, callback_to_role=payload.callback_to_role
+        )
+        return build_notification_body(
+            anchor, "design_consultation", None, "codex", ticketless_consultation=payload
+        )
+
+    def test_consultation_body_carries_the_action_id(self):
+        c = self._consultation("fwd_abc123")
+        self.assertIn("fwd_abc123", c.pointer_clause())
+        self.assertNotIn("\n", c.pointer_clause())  # the body is a single send-keys line
+        self.assertIn("fwd_abc123", self._body(c))  # what the receiver actually reads
+        self.assertTrue(any("fwd_abc123" in l for l in c.record_lines()))
+
+    def test_work_intake_body_carries_the_action_id(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
+            CALLBACK_METHODS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
+            WORK_SHAPE_DOMAIN_DESIGN,
+            TicketlessWorkIntake,
+        )
+        w = TicketlessWorkIntake(
+            WORK_SHAPE_DOMAIN_DESIGN, "project_gateway", list(CALLBACK_METHODS),
+            "delegated_coordinator", forward_action_id="fwd_child9",
+        )
+        self.assertIn("fwd_child9", w.pointer_clause())
+        self.assertNotIn("\n", w.pointer_clause())
+        self.assertTrue(any("fwd_child9" in l for l in w.record_lines()))
+
+    def test_non_forward_payload_body_is_byte_invariant(self):
+        c = self._consultation("")
+        self.assertNotIn("forward_action_id", c.pointer_clause())
+        self.assertFalse(any("Forward action id" in l for l in c.record_lines()))
+
+    def test_end_to_end_id_roundtrip_completes_the_generation(self):
+        import os
+        import re
+        import argparse as _ap
+        from unittest.mock import patch
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            herdr_workflow_step as hws,
+        )
+        home = Path(tempfile.mkdtemp())
+        os.environ["MOZYO_BRIDGE_HOME"] = str(home)
+        self.addCleanup(lambda: os.environ.pop("MOZYO_BRIDGE_HOME", None))
+        fence = ForwardOutboxFence(home=home)
+        fence.bootstrap()
+        route = ForwardRouteKey(WS, "default", "grandparent_coordinator", "project_gateway", "")
+        minted = fence.reserve(route).action_id
+        fence.mark_delivered(route, minted)
+
+        # 1) the forward body the RECEIVER reads carries the minted id.
+        body = self._body(self._consultation(minted))
+        found = re.search(r"forward_action_id (fwd_[0-9a-f]+)", body)
+        self.assertIsNotNone(found, "the receiver must be able to read the id off the body")
+        echoed = found.group(1)
+        self.assertEqual(echoed, minted)
+
+        # 2) the receiver echoes exactly that id on its callback -> the generation completes.
+        args = _ap.Namespace(
+            forward_action_id=echoed, read_contract="grandparent_coordinator", repo=None
+        )
+        with patch.object(hws, "_anchor_workspace_id", return_value=WS), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain."
+            "herdr_target_resolution.resolve_sender_identity",
+            return_value=_FakeSenderRes(WS),
+        ):
+            self.assertTrue(hws.complete_forward_generation_on_callback(args, delivered=True))
+        # 3) completed -> the caller may forward again.
+        self.assertTrue(fence.reserve(route).won)
+
+
+class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
+    """R2-F2: completion is gated on the transport's structured POSITIVE delivery, not the CLI rc.
+
+    `orchestrate_handoff` returns rc 0 for a `pending_input` (body typed, Enter never pressed) and
+    for a marker-unobserved `queue_enter` (landing unconfirmed). Neither handed the message to the
+    receiver, so neither may complete a forward generation.
+    """
+
+    def _mk_outcome(self, status, reason):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            make_outcome,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_anchors import (
+            TicketlessConsultationAnchor,
+        )
+        return make_outcome(
+            status=status, reason=reason, receiver="codex", target="%1",
+            anchor=TicketlessConsultationAnchor(
+                consultation_kind="project_domain_consultation",
+                callback_to_role="grandparent_coordinator",
+            ),
+            mode="queue-enter", kind="design_consultation", notification_marker="m",
+        )
+
+    def _positive(self, status, reason):
+        import argparse as _ap
+        from mozyo_bridge.application.commands import delivery_was_positive
+        args = _ap.Namespace()
+        args.delivery_outcome = self._mk_outcome(status, reason)
+        return delivery_was_positive(args)
+
+    def test_observed_sent_is_positive(self):
+        self.assertTrue(self._positive("sent", "ok"))
+
+    def test_marker_unobserved_queue_enter_is_not_positive(self):
+        self.assertFalse(self._positive("sent", "queue_enter"))
+
+    def test_pending_input_is_not_positive(self):
+        # pending_input carries reason="ok" -> the status MUST be checked too.
+        self.assertFalse(self._positive("pending_input", "ok"))
+
+    def test_absent_outcome_fails_closed(self):
+        import argparse as _ap
+        from mozyo_bridge.application.commands import delivery_was_positive
+        self.assertFalse(delivery_was_positive(_ap.Namespace()))
+
+    def test_callback_entry_completes_only_on_positive_delivery(self):
+        """The `handoff ticketless-callback` entry gates the completion on the real outcome."""
+        import argparse as _ap
+        from unittest.mock import patch
+        from mozyo_bridge.application import commands as cmds
+
+        for status, reason, expect in (
+            ("sent", "ok", True),
+            ("sent", "queue_enter", False),
+            ("pending_input", "ok", False),
+        ):
+            captured = {}
+
+            def _fake_run(a, _s=status, _r=reason):
+                a.delivery_outcome = self._mk_outcome(_s, _r)
+                return 0  # rc 0 in ALL three cases -- the rc must NOT be the gate
+
+            def _fake_complete(a, *, delivered):
+                captured["delivered"] = delivered
+                return delivered
+
+            with patch(
+                "mozyo_bridge.application.handoff_command.HandoffCommandUseCase."
+                "run_ticketless_callback",
+                side_effect=lambda a: _fake_run(a),
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+                "application.herdr_workflow_step.complete_forward_generation_on_callback",
+                side_effect=_fake_complete,
+            ):
+                rc = cmds.cmd_handoff_ticketless_callback(
+                    _ap.Namespace(forward_action_id="fwd_x", read_contract="grandparent_coordinator")
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                captured.get("delivered"), expect, f"{status}/{reason} -> expected {expect}"
+            )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

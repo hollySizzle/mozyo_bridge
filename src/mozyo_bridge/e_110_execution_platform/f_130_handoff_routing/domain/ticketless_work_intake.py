@@ -296,6 +296,17 @@ class TicketlessWorkIntake:
         worker-dispatch anchor rule.
         """
         methods = " or ".join(self.callback_methods)
+        # Redmine #13583 R2-F1: the forward generation id MUST ride this receiver-visible one-line
+        # body (the structured dict is sender-side and unreadable to the child on the no-anchor
+        # rail), else the child could never echo it and the gateway's generation would never
+        # complete. Single line by construction (no newlines).
+        correlation = (
+            f"; forward_action_id {self.forward_action_id} — echo it verbatim on your callback "
+            f"(`--forward-action-id {self.forward_action_id}`) so the parent's forward generation "
+            "completes and it may hand off again"
+            if self.forward_action_id
+            else ""
+        )
         return (
             f"ticketless work-intake: shape {self.work_shape}; you (the "
             f"{self.read_contract}) own the Redmine anchor create/select/blocked "
@@ -305,6 +316,7 @@ class TicketlessWorkIntake:
             "requires a Redmine anchor (mint one and use `handoff send --source "
             "redmine`); the structured work-intake fields are the durable delivery "
             "record (no Redmine anchor was fabricated)"
+            + correlation
         )
 
     def record_lines(self) -> list[str]:
@@ -315,7 +327,7 @@ class TicketlessWorkIntake:
         without re-reading the pane.
         """
         methods = ", ".join(f"`{m}`" for m in self.callback_methods)
-        return [
+        lines = [
             f"- Ticketless work-intake: shape `{self.work_shape}`",
             f"  - Anchor decision owner: `{ANCHOR_DECISION_OWNER}` "
             "(the child owns create/select/blocked; the parent does not mint one)",
@@ -328,6 +340,13 @@ class TicketlessWorkIntake:
             f"`{str(WORKER_DISPATCH_REQUIRES_ANCHOR).lower()}` "
             "(this no-anchor forward rail does not relax the worker-dispatch gate)",
         ]
+        if self.forward_action_id:
+            lines.append(
+                f"  - Forward action id: `{self.forward_action_id}` "
+                f"(echo verbatim: `--forward-action-id {self.forward_action_id}` on your callback, "
+                "so the parent's forward generation completes)"
+            )
+        return lines
 
 
 def ticketless_work_intake_from_payload(

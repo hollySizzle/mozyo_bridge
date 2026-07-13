@@ -1494,6 +1494,7 @@ file_conventions:
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
       - src/mozyo_bridge/core/state/forward_outbox_fence.py
       - .mozyo-bridge/workflow-role-bindings.json
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
