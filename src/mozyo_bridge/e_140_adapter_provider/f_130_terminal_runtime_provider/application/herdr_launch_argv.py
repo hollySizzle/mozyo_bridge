@@ -44,12 +44,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
     ResolvedProviderLaunch,
 )
-from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
-    provider_has_capability,
-)
-from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
-    AgentCapability,
-)
 
 #: Optional launch-env override naming the absolute mozyo-bridge launcher used to
 #: wrap the provider in the #13637 startup self-attestation self-check. When unset
@@ -102,7 +96,6 @@ def resolve_attest_launcher(env: Mapping[str, str]) -> str:
 
 
 def _provider_command(
-    provider: str,
     *,
     workspace_id: str,
     lane: str,
@@ -117,9 +110,13 @@ def _provider_command(
     ``codex`` branch and a new same-protocol provider needs no edit here.
 
     ``resolved`` is produced by ``preflight_launch_providers`` BEFORE the caller creates
-    a workspace, a tab, or any agent (review R1-F1). This builder therefore performs no
-    environment lookup of its own: it cannot fail, so it cannot fail *after* a sibling
-    provider has already been started and left a partial lane behind.
+    a workspace, a tab, or any agent (review R1-F1). This builder therefore performs
+    **no** profile / registry / environment lookup of its own — argv[0], the managed
+    tokens, AND the tool-shell capability all come off ``resolved`` — so it cannot fail,
+    and so it cannot fail *after* a sibling provider has already been started and left a
+    partial lane behind. Reading the capability live (via a global ``provider_has_capability``)
+    was the R2-F1 registry split: it RAISED for a provider present only in an injected
+    registry, and re-read a possibly-since-changed global inside the "pure" builder.
 
     argv[0] is the **verified absolute realpath** (Design Answer j#76725 Q1), not the bare
     provider name: leaving argv[0] bare would let the exec-time ``PATH`` decide which
@@ -130,7 +127,7 @@ def _provider_command(
     managed tokens here every herdr lane worker boots prompt-gated and stalls on its first
     gated command. Config-driven launch tokens (Redmine #13425) are appended AFTER the
     managed tokens (answer j#73949 Q4 render order) so the managed posture keeps its
-    position. A provider declaring ``tool_shell_env_overrides`` applies its own tool-shell
+    position. A provider that pinned ``tool_shell_env_overrides`` applies its own tool-shell
     env policy, so the attested identity is re-expressed as ``-c`` overrides appended last
     (Codex, #13614) — repo-local extras can never replace the attested tuple.
     """
@@ -138,7 +135,7 @@ def _provider_command(
     cmd.extend(resolved.managed_argv)
     if launch_argv_extra:
         cmd.extend(launch_argv_extra)
-    if provider_has_capability(provider, AgentCapability.TOOL_SHELL_ENV_OVERRIDES):
+    if resolved.tool_shell_env_overrides:
         cmd.extend(
             CodexShellIdentity(workspace_id=workspace_id, lane_id=lane).launch_argv()
         )
@@ -215,7 +212,6 @@ def build_agent_start_argv(
     byte-invariant, and a live pane is never focused / moved / swapped.
     """
     provider_cmd = _provider_command(
-        provider,
         workspace_id=workspace_id,
         lane=lane,
         resolved=resolved,

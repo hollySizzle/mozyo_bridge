@@ -215,53 +215,92 @@ class SyntheticProviderTest(unittest.TestCase):
 
 
 class SyntheticProviderLaunchArgvTest(unittest.TestCase):
-    """End-to-end: a data-only provider renders a full launch argv, no source branch."""
+    """End-to-end: a data-only provider renders a full launch argv, no source branch.
 
-    def test_synthetic_provider_renders_its_own_managed_flag_in_launch_argv(self) -> None:
+    Crucially, this passes ONLY the injected registry — no global monkeypatch — so it
+    exercises the real seam an added provider travels through. The pre-R2-F1 version
+    patched BOTH `profile_module.AGENT_PROVIDER_PROFILES` and the executable module's
+    global, which hid a registry split: the preflight resolved the executable from the
+    injected registry but the managed policy / capability re-read the global, so a
+    provider present only in an injected registry got an empty managed argv and then made
+    the "pure" builder raise `unknown agent provider` (review R2-F1).
+    """
+
+    def _launch(self, record, *, permission_mode_default="auto"):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (
             herdr_launch_argv,
         )
-        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application import (
-            agent_provider_executable,
-        )
 
         registry = AgentProviderProfileConfig.from_record(
-            _config_record({"mistral-cli": _synthetic_record()})
+            _config_record({record["_id"]: {k: v for k, v in record.items() if k != "_id"}})
         ).to_registry()
-
+        provider_id = record["_id"]
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp) / "bin"
-            expected_argv0 = _install_binary(bindir, "mistral-cli")
-            # Swap the built-in registry for one that knows only the synthetic provider:
-            # if any launch code still branched on `claude` / `codex`, this would fail.
-            with patch.object(profile_module, "AGENT_PROVIDER_PROFILES", registry), patch.object(
-                agent_provider_executable, "AGENT_PROVIDER_PROFILES", registry
-            ):
-                resolved = preflight_launch_providers(
-                    ["mistral-cli"],
-                    {"PATH": str(bindir)},
-                    permission_mode_default="auto",
-                )["mistral-cli"]
-                argv = herdr_launch_argv.build_agent_start_argv(
-                    assigned_name="mzb1_ws_mistral-cli_lane",
-                    provider="mistral-cli",
-                    repo_root=Path(tmp),
-                    workspace_id="ws",
-                    lane="lane-1",
-                    target_workspace="wsname",
-                    target_tab="",
-                    split="",
-                    focus=False,
-                    binary="/usr/bin/herdr",
-                    attest_launcher="",
-                    store_home=str(Path(tmp) / "home"),
-                    resolved=resolved,
-                    launch_argv_extra=[],
-                )
+            expected_argv0 = _install_binary(bindir, record["executable"]["command"])
+            # NO global patch — only the injected registry is threaded, exactly as an
+            # added provider would flow through a single registry snapshot.
+            resolved = preflight_launch_providers(
+                [provider_id],
+                {"PATH": str(bindir)},
+                permission_mode_default=permission_mode_default,
+                registry=registry,
+            )[provider_id]
+            argv = herdr_launch_argv.build_agent_start_argv(
+                assigned_name=f"mzb1_ws_{provider_id}_lane",
+                provider=provider_id,
+                repo_root=Path(tmp),
+                workspace_id="ws",
+                lane="lane-1",
+                target_workspace="wsname",
+                target_tab="",
+                split="",
+                focus=False,
+                binary="/usr/bin/herdr",
+                attest_launcher="",
+                store_home=str(Path(tmp) / "home"),
+                resolved=resolved,
+                launch_argv_extra=[],
+            )
+        return resolved, expected_argv0, argv[argv.index("--") + 1 :]
 
-        run_cmd = argv[argv.index("--") + 1 :]
-        # argv[0] = the resolved absolute executable; then ITS OWN flag spelling.
+    def test_injected_only_registry_renders_managed_flag_and_builder_succeeds(self) -> None:
+        record = dict(_synthetic_record(), _id="mistral-cli")
+        resolved, expected_argv0, run_cmd = self._launch(record)
+        # The managed argv is resolved from the SAME injected registry (not empty), and
+        # the builder does not raise `unknown agent provider`.
+        self.assertEqual(("--approval", "auto"), resolved.managed_argv)
         self.assertEqual([expected_argv0, "--approval", "auto"], run_cmd)
+
+    def test_injected_only_tool_shell_capability_is_pinned_and_rendered(self) -> None:
+        # A provider that declares tool_shell_env_overrides ONLY in the injected registry
+        # must have that capability pinned on `resolved` (not re-read from the global),
+        # so the builder renders the `-c` overrides without a global lookup.
+        record = _synthetic_record(
+            capabilities=[
+                "interactive_tui",
+                "managed_permission_mode",
+                "tool_shell_env_overrides",
+            ]
+        )
+        record["_id"] = "mistral-cli"
+        resolved, expected_argv0, run_cmd = self._launch(record)
+        self.assertTrue(resolved.tool_shell_env_overrides)
+        self.assertEqual(expected_argv0, run_cmd[0])
+        self.assertEqual(["--approval", "auto"], run_cmd[1:3])
+        self.assertTrue(
+            any("shell_environment_policy" in token for token in run_cmd),
+            run_cmd,
+        )
+
+    def test_injected_provider_without_tool_shell_renders_no_c_overrides(self) -> None:
+        record = _synthetic_record(
+            capabilities=["interactive_tui", "managed_permission_mode"]
+        )
+        record["_id"] = "mistral-cli"
+        resolved, _, run_cmd = self._launch(record)
+        self.assertFalse(resolved.tool_shell_env_overrides)
+        self.assertNotIn("-c", run_cmd)
 
 
 class ArgvZeroCompatibilityTest(unittest.TestCase):
@@ -945,6 +984,136 @@ class PackagedResourceShipsInTheWheelTest(unittest.TestCase):
         # package itself, which is the property that must actually hold inside a wheel.
         config = load_agent_provider_config()
         self.assertTrue(config.profiles)
+
+
+class R2F1SingleRegistrySnapshotTest(unittest.TestCase):
+    """R2-F1: preflight resolves executable, managed policy, AND capability from ONE
+    registry snapshot, and the builder re-reads nothing.
+
+    The first R1-F1 cut threaded the injected registry into executable resolution only;
+    `permission_mode_argv` and the builder's capability check re-read the global. So a
+    provider present only in an injected registry got an empty managed argv and made the
+    builder raise. These pin the whole `ResolvedProviderLaunch` to the injected snapshot.
+    """
+
+    def _injected_registry(self, **caps):
+        capabilities = caps.get(
+            "capabilities",
+            ["interactive_tui", "managed_permission_mode"],
+        )
+        return AgentProviderProfileConfig.from_record(
+            _config_record(
+                {
+                    "mistral-cli": {
+                        "protocol": "interactive_cli_tui",
+                        "executable": {
+                            "command": "mistral-cli",
+                            "env_override": "MOZYO_AGENT_MISTRAL_BINARY",
+                        },
+                        "discovery_aliases": ["mistral-cli"],
+                        "process_names": ["mistral-cli"],
+                        "capabilities": capabilities,
+                        "managed_flags": {"permission_mode": "--approval"},
+                    }
+                }
+            )
+        ).to_registry()
+
+    def test_managed_argv_resolves_from_the_injected_registry(self) -> None:
+        registry = self._injected_registry()
+        with tempfile.TemporaryDirectory() as tmp:
+            _install_binary(Path(tmp) / "bin", "mistral-cli")
+            resolved = preflight_launch_providers(
+                ["mistral-cli"],
+                {"PATH": str(Path(tmp) / "bin")},
+                permission_mode_default="auto",
+                registry=registry,
+            )["mistral-cli"]
+        # Was `()` before R2-F1 because permission_mode_argv re-read the global.
+        self.assertEqual(("--approval", "auto"), resolved.managed_argv)
+
+    def test_the_provider_is_absent_from_the_global_registry(self) -> None:
+        # Guards the test's own premise: if `mistral-cli` were ever a built-in, the split
+        # would be invisible again. It must NOT be in the global set.
+        self.assertNotIn("mistral-cli", agent_provider_ids())
+
+    def test_capability_is_pinned_not_re_read(self) -> None:
+        registry = self._injected_registry(
+            capabilities=[
+                "interactive_tui",
+                "managed_permission_mode",
+                "tool_shell_env_overrides",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _install_binary(Path(tmp) / "bin", "mistral-cli")
+            resolved = preflight_launch_providers(
+                ["mistral-cli"],
+                {"PATH": str(Path(tmp) / "bin")},
+                registry=registry,
+            )["mistral-cli"]
+        self.assertTrue(resolved.tool_shell_env_overrides)
+
+    def test_permission_mode_argv_honors_an_injected_registry(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+            permission_mode_argv,
+        )
+
+        registry = self._injected_registry()
+        # Global does not know mistral-cli -> () ; injected registry does -> tokens.
+        self.assertEqual((), permission_mode_argv("mistral-cli", policy_default="auto", env={}))
+        self.assertEqual(
+            ("--approval", "auto"),
+            permission_mode_argv(
+                "mistral-cli", policy_default="auto", env={}, registry=registry
+            ),
+        )
+
+
+class R2F1PreflightIdentityGuardTest(unittest.TestCase):
+    """R2-F1 must-fix 4: a launch plan with no matching resolved fails BEFORE side effects."""
+
+    def test_launch_with_unresolved_provider_creates_nothing(self) -> None:
+        import stat as _stat
+
+        from tests.support.herdr_fake import FakeHerdr
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+            HerdrSessionStartError,
+            prepare_session,
+        )
+
+        # A provider that is not registered at all -> preflight raises, zero side effects.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            herdr_bin = Path(tmp) / "herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(herdr_bin.stat().st_mode | _stat.S_IEXEC)
+            bindir = Path(tmp) / "bin"
+            _install_binary(bindir, "claude")
+            herdr = FakeHerdr()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo)
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["ghost-provider"],
+                        lane_id="lane-1",
+                        env={"MOZYO_HERDR_BINARY": str(herdr_bin), "PATH": str(bindir)},
+                        runner=herdr.run,
+                    )
+            calls = [" ".join(c[:3]) for c in herdr.calls]
+        self.assertEqual(
+            [],
+            [
+                c
+                for c in calls
+                if any(v in c for v in ("workspace create", "tab create", "agent start"))
+            ],
+        )
 
 
 class R1F4HostIndependenceTest(unittest.TestCase):
