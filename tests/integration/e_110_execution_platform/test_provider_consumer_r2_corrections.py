@@ -114,8 +114,11 @@ class F2HerdrReadBackRecognizesReboundPair(unittest.TestCase):
             {AGENT_KEY_NAME: "mzb1_projws_mistralcli_lane1", "pane_id": "wZ:p3"},
         ]
         # The rebound pair is recognized when the managed pair is the binding's providers…
+        # (after the #13705 integration the slot VALUE is (locator, placement_key); the
+        # locator component still resolves to the rebound pair — invariant unchanged).
+        resolved = ops._lane_slots("projws", "lane1", rows, ("grokgw", "mistralcli"))
         self.assertEqual(
-            ops._lane_slots("projws", "lane1", rows, ("grokgw", "mistralcli")),
+            {role: value[0] for role, value in resolved.items()},
             {"grokgw": "wZ:p2", "mistralcli": "wZ:p3"},
         )
         # …and invisible against the fixed built-in pair (the R2-F2 launched-but-invisible bug).

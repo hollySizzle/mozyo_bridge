@@ -76,8 +76,19 @@ def _version(version_id: int, name: str, status: str = "open") -> dict:
     return {"id": version_id, "name": name, "status": status}
 
 
+# Explicit non-secret placeholders: Source Tree Hygiene strict-fails on a
+# credential-shaped literal in a tracked file, and the `fake-` marker is what the
+# scanner classifies as a placeholder rather than a leaked key.
+#
+# The canary is deliberately DISTINCT from the default key: the redaction test
+# overrides the key with it, so asserting the canary is absent from the failure
+# reason proves the *caller-supplied* key never reaches the message.
+_FAKE_API_KEY = "fake-api-key"
+_REDACTION_CANARY_KEY = "fake-api-key-redaction-canary"
+
+
 def _source(opener, **kwargs) -> LiveRedmineProjectVersionSource:
-    params = dict(api_key="k", base_url="https://redmine.example", opener=opener)
+    params = dict(api_key=_FAKE_API_KEY, base_url="https://redmine.example", opener=opener)
     params.update(kwargs)
     return LiveRedmineProjectVersionSource(**params)
 
@@ -98,7 +109,7 @@ class ProjectVersionReadTest(unittest.TestCase):
         )
         self.assertEqual(opener.requests[0].get_method(), "GET")
         self.assertEqual(
-            opener.requests[0].get_header("X-redmine-api-key"), "k"
+            opener.requests[0].get_header("X-redmine-api-key"), _FAKE_API_KEY
         )
 
     def test_identifier_is_percent_encoded_and_cannot_traverse(self) -> None:
@@ -212,17 +223,17 @@ class FailClosedTest(unittest.TestCase):
     def test_reasons_never_carry_the_api_key(self) -> None:
         err = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
         opener = _RecordingOpener([err])
-        source = _source(opener, api_key="super-secret-key")
+        source = _source(opener, api_key=_REDACTION_CANARY_KEY)
         with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
             source.read_project_versions("p")
-        self.assertNotIn("super-secret-key", str(ctx.exception))
+        self.assertNotIn(_REDACTION_CANARY_KEY, str(ctx.exception))
 
 
 class BuilderTest(unittest.TestCase):
     def test_resolves_credentials_from_the_injected_environment(self) -> None:
         opener = _RecordingOpener([{"versions": [_version(292, "枠")], "total_count": 1}])
         source = live_project_version_source_from_env(
-            environ={BASE_URL_ENV: "https://redmine.example", API_KEY_ENV: "k"},
+            environ={BASE_URL_ENV: "https://redmine.example", API_KEY_ENV: "fake-api-key"},
             home=Path("/nonexistent-home-for-test"),
             opener=opener,
         )

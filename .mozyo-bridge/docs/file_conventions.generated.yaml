@@ -216,6 +216,19 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: local parallel test runner (isolated process shards) source
+  patterns:
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_parallel.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_parallel.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_parallel.py
+  - test_parallel_policy.yaml
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/local-parallel-test-runner-policy.md と @vibes/docs/logics/tests-placement-discovery-policy.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: static typing staged adoption gate (mypy config and first typed island)
   patterns:
   - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_impact.py

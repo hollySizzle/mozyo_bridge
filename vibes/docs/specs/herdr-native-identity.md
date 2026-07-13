@@ -437,6 +437,69 @@ v1 に含めない**: launch 経路の語彙は現状 lane_class (`default` / `s
 には lane-role 語彙の launch 時解決が別途必要。schema は lane class key を追加するだけで拡張でき
 (closed set に新 class を足す)、既存 class の意味論は変わらないため、この拡張点は塞がっていない。
 
+## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
+
+§5 の同一 tab pair placement / heal contract は、**それを実装した runtime が heal を
+実行する**ことを前提にする。実測 incident (#13705): #13411 contract を持つ source
+(`c4a999e`) で作った lane を、同 contract を欠く古い installed runtime (pipx 0.10.0) で
+heal したため、replacement gateway が surviving worker と別 tab に着地し、`sublane list`
+は依然 `active` を返した。直接原因は runtime/source skew だが、製品欠陥は mutating
+actuation が **pane 生成前に実行 runtime の placement-contract capability / build
+provenance を照合しない**ことにある。
+
+- **front-door fingerprint gate (R1-F1、mutation 前 zero-write)**: mutating
+  `sublane start/heal --execute` の official 入口 (`SublaneActuateUseCase`、全 side-effect
+  前) が **action-time runtime fingerprint** を照合する。`doctor runtime` の
+  active-vs-repo-local-source drift 判定 (`evaluate_fingerprint`) に **placement probe**
+  `same_tab_pair_placement` (source marker `def _tab_target_for_lane` + active `hasattr`
+  probe) を加え、active runtime が source の同 placement behavior を欠く drift
+  (`probe_mismatch`) を `evaluate_mutation_placement_gate` が検出したら
+  worktree/tab/agent write 0 で fail-closed する。これは capability 自己申告でなく **実
+  active-vs-source probe** による skew 検出であり、issue Scope の「runtime/build
+  fingerprint」選択肢を満たす。`preflight_runtime_placement_gate` は optional/herdr-only
+  port method で、fingerprint reader は test に inject 可能。
+- **residual の設計上明示 (authority boundary 不在)**: fence code を一切持たない古い client
+  (事故の installed 0.10.0) は、本 runtime が出す code では止められない — herdr backend は
+  mozyo client を拒否する authority を持たず、lane lock/lease を古い client は読まない。
+  従って本 fence は **forward gate** である: 修正 runtime が installed になった後、stale
+  install が newer source に対して mutating すれば front-door gate が zero-write で拒否する
+  (skew の現実的再発形)。事故そのものの residual は **#13524 reinstall fingerprint gate**
+  (source/installed fingerprint 一致を確認してから dogfood 再開、Close condition #5) で閉じる。
+  per-lane に required contract を stamp する案は採らない: front-door fingerprint gate が同
+  skew class を token 比較より一般に (any placement-behavior drift) 検出するため冗長。
+- **heal capability fence + pair invariant preflight/postcondition**: heal 個別 path も
+  defense-in-depth を保つ。`heal_lane_column` は pane 生成前に純 fence
+  `sublane_runtime_fence.evaluate_heal_runtime_fence` を評価 (`runtime_lacks_placement_contract`
+  / `provenance_unknown` / 既分裂 live pair `pair_already_split` を write 0 で拒否)。
+  **R1-F3 fail-closed**: preflight の inventory read 不能は side-effect 前 block、compatible
+  heal 後の same-tab postcondition は inventory 不能・slot 欠落・非 co-located をいずれも
+  fail-closed (unknown は success にしない)。legacy loose pair は既知 key `(wN, "")` の
+  co-located として扱い unknown と混同しない。
+- **`pair_split` degraded projection + admission (R1-F2)**: projection
+  (`project_herdr_sublanes` / `herdr_lane_view_for_worktree` / actuator `read_lane`) は各
+  slot の `(herdr_workspace, tab_id)` を比較し、live pair が単一 container を共有しなければ
+  `active` でなく domain state `pair_split` (`SUBLANE_STATE_PAIR_SPLIT`) を返す。さらに
+  use case は `pair_split` lane を adopt/dispatch せず append/dispatch 0 で fail-closed する
+  (`sublane_actuator_gates.pair_split_admission`、adopt/append/heal read-back の全 site)。
+  既存 split lane の復旧は owner 判断の retire + recreate であり heal-over しない。placement
+  key を渡さない caller (tmux projection) は byte-invariant に `active` を保つ (tmux の
+  window 分裂は従来どおり `STALE_HINT_WINDOW_SPLIT` advisory)。
+
+fence は何も修復せず、live process env を読まない (herdr は不可)。blocked からの復旧は
+owner 判断 (runtime を `doctor runtime` で検証し source と一致する互換 runtime で heal /
+recreate、split lane は retire + recreate) である。
+
+> **acceptance (coordinator ratified、Redmine #13705 j#77203 = Close condition #1 の durable
+> amendment)。** 上記 forward-gate + reinstall-gate による residual の扱いは、coordinator
+> acceptance authority (owner delegation、production release 以外) により承認され、issue
+> #13705 の Close condition #1 は次へ改訂された: *incompatible/provenance 不明 runtime による
+> heal/start は、本 fence を carry する runtime の official mutating front door において
+> workspace/tab/agent side effect 0 で fail-closed する。fence code を持たない旧世代 client は
+> 本 issue scope では技術的に停止不能であり、その残余は #13524 の installed/source fingerprint
+> 一致・local reinstall gate が green になるまで dogfood/release 候補へ進めないことで閉じる。*
+> fence-less client 自体を backend/server authority で拒否する強保証が将来必要なら別 ticket
+> (本 issue へ scope 膨張させない)。
+
 ## 6. Close-evidence contract (pure-herdr round trip)
 
 close 判定には次の durable evidence を要求する:

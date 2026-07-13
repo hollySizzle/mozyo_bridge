@@ -56,7 +56,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973"):
+def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973", state="active"):
     return SublaneLaneView(
         workspace_id="ws",
         lane_id="l1",
@@ -66,8 +66,17 @@ def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973"):
         repo_root=repo_root,
         gateway_pane=gateway,
         worker_pane=worker,
-        state="active",
+        state=state,
     )
+
+
+def _split_lane(**kw):
+    """A lane whose gateway/worker pair is split across tabs (Redmine #13705)."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+        SUBLANE_STATE_PAIR_SPLIT,
+    )
+
+    return _lane(state=SUBLANE_STATE_PAIR_SPLIT, **kw)
 
 
 class FakeActuatorOps:
@@ -762,6 +771,44 @@ class DispatchSelfHealTests(unittest.TestCase):
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
         self.assertNotIn("heal_lane_column", ops._names())
+
+    def test_healed_pair_split_lane_blocks_before_retry(self):
+        # Redmine #13705 R1-F2: a healed lane whose pair is split across tabs is not
+        # operable — the dispatch retry must not fire, fail closed on pair_split.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            REASON_PAIR_SPLIT,
+        )
+
+        ops = self._healable(
+            lanes=[None, _lane(), _lane(gateway=None), _split_lane(gateway="%130")],
+            dispatch_rcs=(1,),
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_PAIR_SPLIT, outcome.blocked_reasons)
+        # Healed once, but the retry dispatch never fired to the split lane.
+        self.assertEqual(ops._names().count("heal_lane_column"), 1)
+        self.assertEqual(ops._names().count("dispatch"), 1)
+
+
+class PairSplitAdmissionTests(unittest.TestCase):
+    """Redmine #13705 R1-F2: a `pair_split` lane is not adopted / dispatched."""
+
+    def test_existing_pair_split_lane_is_not_adopted_or_dispatched(self):
+        # Pre-fix regression: an already-split #13441-type lane (both panes present but
+        # in different tabs) was adopted as a healthy pair and dispatched. It must now
+        # fail closed with zero append / dispatch.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            REASON_PAIR_SPLIT,
+        )
+
+        ops = FakeActuatorOps(git=True, lanes=[_split_lane()], dispatch_rc=0)
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_PAIR_SPLIT, outcome.blocked_reasons)
+        names = ops._names()
+        self.assertNotIn("append_lane_column", names)
+        self.assertNotIn("dispatch", names)
 
 
 class RenderTests(unittest.TestCase):

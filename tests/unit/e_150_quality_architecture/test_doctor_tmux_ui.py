@@ -30,7 +30,7 @@ def _host_wiring(
     *,
     state: str = "installed",
     drift_reason: str | None = None,
-    tmux_conf: str = "/home/op/.tmux.conf",
+    tmux_conf: str = "/workspace/agent/.tmux.conf",
     tmux_conf_exists: bool = True,
     current_source_path: str | None = "/checkout/.mozyo-bridge/tmux/agent-ui.conf",
     expected_snippet: str = "/checkout/.mozyo-bridge/tmux/agent-ui.conf",
@@ -286,7 +286,7 @@ class LiveTmuxUiArtifactReadsTest(unittest.TestCase):
         captured: dict[str, Any] = {}
         target = Path("/checkout/repo")
         snippet = target / doctor.TMUX_UI_RELATIVE_PATH
-        host_conf = Path("/home/op/.tmux.conf")
+        host_conf = Path("/workspace/agent/.tmux.conf")
         wiring = _host_wiring(
             state=tmux_ui.STATE_DRIFT,
             drift_reason="elsewhere",
@@ -352,7 +352,7 @@ class LiveTmuxUiArtifactReadsTest(unittest.TestCase):
         original_host_conf = tmux_ui.default_host_tmux_conf
         original_compute = tmux_ui.compute_status
         doctor._scaffold_manifest_files = lambda _target: {"AGENTS.md", "CLAUDE.md"}
-        tmux_ui.default_host_tmux_conf = lambda: Path("/home/op/.tmux.conf")
+        tmux_ui.default_host_tmux_conf = lambda: Path("/workspace/agent/.tmux.conf")
         tmux_ui.compute_status = lambda _root, _conf: wiring
         try:
             view = LiveTmuxUiArtifactReads(target).describe()
