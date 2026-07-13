@@ -1,9 +1,10 @@
-"""Attested per-workspace supervisor sender tests (Redmine #13683 Phase A, R1-F3).
+"""Background-service delivery authority tests (Redmine #13683 design answer j#77216, Model A').
 
-A background supervisor fans out over many workspaces from one process, so its callback sender must
-route each row to the row's own workspace — its canonical execution root (cwd + explicit
---target-repo) and workspace identity (env) — never on the sender process's ambient cwd/env. A
-foreign / unattested row is a zero-send.
+The R3 evidence for the ``background_service`` delivery authority: every fail-closed path is a
+zero-send (no lease / no claim / foreign workspace / no or ambiguous target / generation mismatch /
+lease expired), an authorized delivery goes through the transport seam to the exact re-resolved
+target, a genuine uncertain outcome does not blind-retry, and the delivery env is scrubbed of agent
+identity + stamped as a separated origin.
 """
 
 from __future__ import annotations
@@ -18,177 +19,293 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
-from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
-    HandoffCallbackSendPort,
+from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore
+from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_INFLIGHT
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+    BackgroundServiceCallbackSender,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
+    HandoffDeliveryResult,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
+    background_transport_env,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
+    AUTH_AMBIGUOUS_TARGET,
+    AUTH_FOREIGN_WORKSPACE,
+    AUTH_GENERATION_MISMATCH,
+    AUTH_NO_CLAIM,
+    AUTH_NO_LEASE,
+    AUTH_NO_TARGET,
+    AUTH_OK,
+    BACKGROUND_SERVICE_ORIGIN,
+    DeliveryTarget,
+    TargetResolution,
+    authorize_background_delivery,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
     SEND_DELIVERED,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
-    SupervisedWorkspace,
-    default_sender,
-    workspace_send_runner,
+    SEND_NOT_SENT,
+    SEND_UNCERTAIN,
 )
 
+NOW = "2026-07-13T00:00:00+00:00"
 
-def _row(workspace_id: str) -> CallbackOutboxRow:
+
+def _row(workspace_id: str, *, claim_token: str = "tok") -> CallbackOutboxRow:
     return CallbackOutboxRow(
         source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
-        callback_route="coordinator", state=CALLBACK_PENDING, attempts=0, max_attempts=3,
-        send_attempted=False, notification_kind="review_request", notification_summary="",
-        gate_mismatch=False, detail="", payload="", claim_token="tok", workspace_id=workspace_id,
+        callback_route="coordinator", state=CALLBACK_INFLIGHT, attempts=0, max_attempts=3,
+        send_attempted=True, notification_kind="review_request", notification_summary="",
+        gate_mismatch=False, detail="", payload="", claim_token=claim_token, workspace_id=workspace_id,
     )
 
 
-_DELIVERED_STDOUT = '{"status": "delivered", "reason": "ok"}'
+def _target(workspace_id: str, *, generation: str = "", locator: str = "%1") -> DeliveryTarget:
+    return DeliveryTarget(
+        workspace_id=workspace_id, lane="default", receiver="codex", issue="13683",
+        journal="77065", generation=generation, locator=locator,
+    )
 
 
-class SendPortTargetRepoTest(unittest.TestCase):
-    def test_explicit_target_repo_replaces_ambient_auto(self) -> None:
-        captured = {}
+class _FakeResolver:
+    def __init__(self, targets):
+        self._targets = tuple(targets)
 
-        def runner(argv):
-            captured["argv"] = argv
-            return 0, _DELIVERED_STDOUT
+    def resolve(self, row):
+        return TargetResolution.of(self._targets)
 
-        port = HandoffCallbackSendPort(
-            attested_workspace_id="wsA", target_repo="/canonical/repoA", runner=runner
+
+class _RecordingTransport:
+    def __init__(self, result: HandoffDeliveryResult):
+        self._result = result
+        self.calls = []
+
+    def deliver(self, row, target):
+        self.calls.append((row, target))
+        return self._result
+
+
+# ---------------------------------------------------------------------------
+# Pure authorization matrix.
+# ---------------------------------------------------------------------------
+
+
+class AuthorizeMatrixTest(unittest.TestCase):
+    def _authorize(self, **over):
+        base = dict(
+            expected_workspace="wsA", row_workspace="wsA", has_lease=True, has_claim=True,
+            resolution=TargetResolution.of([_target("wsA")]), expected_generation="",
         )
-        result = port(_row("wsA"))
-        self.assertEqual(result.status, "delivered")
-        argv = captured["argv"]
-        i = argv.index("--target-repo")
-        self.assertEqual(argv[i + 1], "/canonical/repoA")  # explicit path, NOT "auto"
-        self.assertNotIn("auto", argv[i + 1])
+        base.update(over)
+        return authorize_background_delivery(**base)
 
-    def test_default_target_repo_is_auto_backcompat(self) -> None:
-        captured = {}
-        port = HandoffCallbackSendPort(
-            attested_workspace_id="wsA", runner=lambda argv: (captured.setdefault("argv", argv), (0, _DELIVERED_STDOUT))[1]
+    def test_authorized_happy_path(self):
+        d = self._authorize()
+        self.assertTrue(d.authorized)
+        self.assertEqual(d.reason, AUTH_OK)
+        self.assertEqual(d.target.workspace_id, "wsA")
+
+    def test_foreign_row_workspace(self):
+        d = self._authorize(row_workspace="wsB")
+        self.assertFalse(d.authorized)
+        self.assertEqual(d.reason, AUTH_FOREIGN_WORKSPACE)
+
+    def test_no_lease(self):
+        self.assertEqual(self._authorize(has_lease=False).reason, AUTH_NO_LEASE)
+
+    def test_no_claim(self):
+        self.assertEqual(self._authorize(has_claim=False).reason, AUTH_NO_CLAIM)
+
+    def test_no_target(self):
+        self.assertEqual(self._authorize(resolution=TargetResolution.of([])).reason, AUTH_NO_TARGET)
+
+    def test_ambiguous_target(self):
+        d = self._authorize(resolution=TargetResolution.of([_target("wsA"), _target("wsA", locator="%2")]))
+        self.assertEqual(d.reason, AUTH_AMBIGUOUS_TARGET)
+
+    def test_resolved_target_foreign_workspace(self):
+        d = self._authorize(resolution=TargetResolution.of([_target("wsB")]))
+        self.assertEqual(d.reason, AUTH_FOREIGN_WORKSPACE)
+
+    def test_generation_mismatch(self):
+        d = self._authorize(
+            resolution=TargetResolution.of([_target("wsA", generation="g2")]), expected_generation="g1"
         )
-        port(_row("wsA"))
-        argv = captured["argv"]
-        self.assertEqual(argv[argv.index("--target-repo") + 1], "auto")  # unchanged default
+        self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
 
-    def test_foreign_row_is_zero_send(self) -> None:
-        calls = []
-        port = HandoffCallbackSendPort(
-            attested_workspace_id="wsA", target_repo="/canonical/repoA",
-            runner=lambda argv: calls.append(argv) or (0, _DELIVERED_STDOUT),
+    def test_generation_absent_is_no_constraint(self):
+        d = self._authorize(resolution=TargetResolution.of([_target("wsA", generation="")]), expected_generation="")
+        self.assertTrue(d.authorized)
+
+
+# ---------------------------------------------------------------------------
+# Sender: lease + claim authority, resolution, transport, outcome mapping.
+# ---------------------------------------------------------------------------
+
+
+class BackgroundServiceSenderTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+
+    def _sender(self, *, workspace_id="wsA", holder="superX", resolver=None, transport=None, now=NOW):
+        self.transport = transport or _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        return BackgroundServiceCallbackSender(
+            workspace_id=workspace_id, holder=holder, lease_store=self.lease_store,
+            target_resolver=resolver or _FakeResolver([_target(workspace_id)]),
+            transport=self.transport, now_fn=lambda: now,
         )
-        result = port(_row("wsB"))  # foreign workspace
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.reason, "workspace_mismatch")
-        self.assertEqual(calls, [])  # runner never invoked -> zero send
+
+    def test_authorized_delivery_calls_transport_delivered(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        sender = self._sender()
+        result = sender(_row("wsA"))
+        self.assertEqual(result.outcome, SEND_DELIVERED)
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertEqual(self.transport.calls[0][1].workspace_id, "wsA")
+
+    def test_no_lease_is_zero_send_not_sent(self):
+        # no lease acquired at all
+        sender = self._sender()
+        result = sender(_row("wsA"))
+        self.assertEqual(result.outcome, SEND_NOT_SENT)  # retryable, NOT uncertain
+        self.assertEqual(result.persist_reason, AUTH_NO_LEASE)
+        self.assertEqual(self.transport.calls, [])  # transport never invoked
+
+    def test_expired_lease_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=100)  # expires 00:01:40
+        sender = self._sender(now="2026-07-13T01:00:00+00:00")  # past expiry
+        result = sender(_row("wsA"))
+        self.assertEqual(result.outcome, SEND_NOT_SENT)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_lease_held_by_other_holder_is_zero_send(self):
+        self.lease_store.acquire("wsA", "otherHolder", now=NOW, ttl_seconds=600)
+        sender = self._sender(holder="superX")
+        result = sender(_row("wsA"))
+        self.assertEqual(result.persist_reason, AUTH_NO_LEASE)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_no_claim_token_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        sender = self._sender()
+        result = sender(_row("wsA", claim_token=""))  # unclaimed row
+        self.assertEqual(result.persist_reason, AUTH_NO_CLAIM)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_foreign_row_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        sender = self._sender()
+        result = sender(_row("wsB"))  # foreign workspace row
+        self.assertEqual(result.persist_reason, AUTH_FOREIGN_WORKSPACE)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_no_target_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        sender = self._sender(resolver=_FakeResolver([]))
+        result = sender(_row("wsA"))
+        self.assertEqual(result.persist_reason, AUTH_NO_TARGET)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_ambiguous_target_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        sender = self._sender(resolver=_FakeResolver([_target("wsA"), _target("wsA", locator="%2")]))
+        result = sender(_row("wsA"))
+        self.assertEqual(result.persist_reason, AUTH_AMBIGUOUS_TARGET)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_unresolvable_route_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+
+        class _Raises:
+            def resolve(self, row):
+                raise RuntimeError("route ledger unreadable")
+
+        sender = self._sender(resolver=_Raises())
+        result = sender(_row("wsA"))
+        self.assertEqual(result.persist_reason, AUTH_NO_TARGET)  # fail-closed -> no target
+        self.assertEqual(self.transport.calls, [])
+
+    def test_transport_uncertain_does_not_retry(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        sender = self._sender(transport=_RecordingTransport(HandoffDeliveryResult("blocked", "turn_start_unconfirmed")))
+        result = sender(_row("wsA"))
+        self.assertEqual(result.outcome, SEND_UNCERTAIN)  # no blind retry (boundary 5)
+
+    def test_transport_exception_is_uncertain(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+
+        class _BoomTransport:
+            calls = []
+
+            def deliver(self, row, target):
+                raise RuntimeError("subprocess exploded")
+
+        sender = BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
+            target_resolver=_FakeResolver([_target("wsA")]), transport=_BoomTransport(), now_fn=lambda: NOW,
+        )
+        self.assertEqual(sender(_row("wsA")).outcome, SEND_UNCERTAIN)
 
 
-class DefaultSenderIdentityTest(unittest.TestCase):
-    """The production default_sender pins cwd + identity env + explicit target-repo per workspace."""
+class TwoWorkspaceExactRouteTest(unittest.TestCase):
+    """R3 evidence: 2 workspaces each deliver to their own exact target; cross-ws is zero-send."""
 
-    def test_two_workspaces_each_route_to_their_own_execution_root(self) -> None:
-        recorded = []
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        self.lease_store.acquire("wsB", "superX", now=NOW, ttl_seconds=600)
+        self.tA = _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        self.tB = _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        self.sA = BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
+            target_resolver=_FakeResolver([_target("wsA", locator="%A")]), transport=self.tA, now_fn=lambda: NOW,
+        )
+        self.sB = BackgroundServiceCallbackSender(
+            workspace_id="wsB", holder="superX", lease_store=self.lease_store,
+            target_resolver=_FakeResolver([_target("wsB", locator="%B")]), transport=self.tB, now_fn=lambda: NOW,
+        )
 
-        class _Proc:
-            returncode = 0
-            stdout = _DELIVERED_STDOUT
+    def test_each_workspace_delivers_to_its_own_target(self):
+        self.assertEqual(self.sA(_row("wsA")).outcome, SEND_DELIVERED)
+        self.assertEqual(self.sB(_row("wsB")).outcome, SEND_DELIVERED)
+        self.assertEqual(self.tA.calls[0][1].locator, "%A")
+        self.assertEqual(self.tB.calls[0][1].locator, "%B")
 
-        def fake_run(argv, **kwargs):
-            recorded.append((argv, kwargs.get("cwd"), dict(kwargs.get("env") or {})))
-            return _Proc()
+    def test_cross_workspace_row_is_zero_send(self):
+        # wsA's authority handed a wsB row -> foreign -> zero-send, neither transport fires.
+        result = self.sA(_row("wsB"))
+        self.assertEqual(result.outcome, SEND_NOT_SENT)
+        self.assertEqual(self.tA.calls, [])
 
-        ws_a = SupervisedWorkspace(workspace_id="wsA", canonical_path="/canonical/repoA")
-        ws_b = SupervisedWorkspace(workspace_id="wsB", canonical_path="/canonical/repoB")
 
-        with mock.patch("subprocess.run", fake_run):
-            default_sender(ws_a)(_row("wsA"))
-            default_sender(ws_b)(_row("wsB"))
+class BackgroundTransportEnvTest(unittest.TestCase):
+    def test_env_scrubs_agent_identity_and_stamps_origin(self):
+        polluted = {"MOZYO_AGENT_ROLE": "codex", "MOZYO_LANE_ID": "foreign", "MOZYO_WORKSPACE_ID": "wsZ", "PATH": "/bin"}
+        with mock.patch.dict("os.environ", polluted, clear=True):
+            env = background_transport_env("wsA")
+        self.assertNotIn("MOZYO_AGENT_ROLE", env)
+        self.assertNotIn("MOZYO_LANE_ID", env)
+        self.assertEqual(env["MOZYO_WORKSPACE_ID"], "wsA")
+        self.assertEqual(env["MOZYO_DELIVERY_ORIGIN"], BACKGROUND_SERVICE_ORIGIN)
+        self.assertEqual(env["PATH"], "/bin")  # unrelated env preserved
 
-        self.assertEqual(len(recorded), 2)
-        (argv_a, cwd_a, env_a), (argv_b, cwd_b, env_b) = recorded
-        # Each send runs in its OWN workspace root, with that workspace's identity env + target-repo.
-        self.assertEqual(cwd_a, "/canonical/repoA")
-        self.assertEqual(env_a.get("MOZYO_WORKSPACE_ID"), "wsA")
-        self.assertEqual(argv_a[argv_a.index("--target-repo") + 1], "/canonical/repoA")
-        self.assertEqual(cwd_b, "/canonical/repoB")
-        self.assertEqual(env_b.get("MOZYO_WORKSPACE_ID"), "wsB")
-        self.assertEqual(argv_b[argv_b.index("--target-repo") + 1], "/canonical/repoB")
-
-    def test_default_sender_refuses_foreign_row_without_running_subprocess(self) -> None:
-        calls = []
-        with mock.patch("subprocess.run", lambda *a, **k: calls.append(1)):
-            sender = default_sender(SupervisedWorkspace(workspace_id="wsA", canonical_path="/canonical/repoA"))
-            result = sender(_row("wsB"))  # foreign
-        # The sender returns a CallbackSendResult; a refused foreign row never delivers (zero send).
-        self.assertNotEqual(result.outcome, SEND_DELIVERED)
-        self.assertEqual(calls, [])
-
-    def test_runner_sets_cwd_and_identity_env(self) -> None:
-        seen = {}
-
-        class _Proc:
-            returncode = 0
-            stdout = "ok"
-
-        def fake_run(argv, **kwargs):
-            seen.update(cwd=kwargs.get("cwd"), env=dict(kwargs.get("env") or {}))
-            return _Proc()
-
-        with mock.patch("subprocess.run", fake_run):
-            runner = workspace_send_runner("/canonical/repoA", "wsA")
-            rc, out = runner(["mozyo-bridge", "handoff", "send"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(seen["cwd"], "/canonical/repoA")
-        self.assertEqual(seen["env"].get("MOZYO_WORKSPACE_ID"), "wsA")
-
-    def test_runner_scrubs_inherited_lane_identity(self) -> None:
-        # R2-F3: a supervisor launched in a lane's env must NOT carry that lane's role/lane/ws into
-        # a target workspace's send — those are scrubbed, only the target workspace id is set.
-        seen = {}
-
-        class _Proc:
-            returncode = 0
-            stdout = "ok"
-
-        def fake_run(argv, **kwargs):
-            seen["env"] = dict(kwargs.get("env") or {})
-            return _Proc()
-
-        polluted = {
-            "MOZYO_AGENT_ROLE": "codex",  # a foreign lane's identity
-            "MOZYO_LANE_ID": "foreign-lane",
-            "MOZYO_WORKSPACE_ID": "foreignWs",
-            "PATH": "/usr/bin",  # a benign var survives
-        }
-        with mock.patch.dict("os.environ", polluted, clear=True), mock.patch("subprocess.run", fake_run):
-            workspace_send_runner("/canonical/repoA", "wsA")(["mozyo-bridge", "handoff", "send"])
-        env = seen["env"]
-        self.assertNotIn("MOZYO_AGENT_ROLE", env)  # scrubbed (no foreign role carryover)
-        self.assertNotIn("MOZYO_LANE_ID", env)  # scrubbed
-        self.assertEqual(env.get("MOZYO_WORKSPACE_ID"), "wsA")  # only the target ws id, deterministic
-        self.assertEqual(env.get("PATH"), "/usr/bin")  # unrelated env preserved
-
-    def test_two_workspaces_do_not_cross_contaminate_identity(self) -> None:
-        envs = []
-
-        class _Proc:
-            returncode = 0
-            stdout = _DELIVERED_STDOUT
-
-        def fake_run(argv, **kwargs):
-            envs.append(dict(kwargs.get("env") or {}))
-            return _Proc()
-
-        polluted = {"MOZYO_AGENT_ROLE": "claude", "MOZYO_LANE_ID": "some-lane", "MOZYO_WORKSPACE_ID": "wsZ"}
-        with mock.patch.dict("os.environ", polluted, clear=True), mock.patch("subprocess.run", fake_run):
-            default_sender(SupervisedWorkspace("wsA", "/canonical/repoA"))(_row("wsA"))
-            default_sender(SupervisedWorkspace("wsB", "/canonical/repoB"))(_row("wsB"))
-        self.assertEqual(envs[0].get("MOZYO_WORKSPACE_ID"), "wsA")
-        self.assertEqual(envs[1].get("MOZYO_WORKSPACE_ID"), "wsB")
-        # No ambient/foreign lane identity carried into either send.
-        for env in envs:
-            self.assertNotIn("MOZYO_AGENT_ROLE", env)
-            self.assertNotIn("MOZYO_LANE_ID", env)
+    def test_ambient_pollution_does_not_grant_authority(self):
+        # Even with a polluted agent env, without a lease the delivery is zero-send: the authority is
+        # lease + claim, NOT the env identity.
+        d = Path(tempfile.mkdtemp())
+        lease_store = SupervisorLeaseStore(path=d / "lease.sqlite")  # no lease acquired
+        transport = _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        sender = BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=lease_store,
+            target_resolver=_FakeResolver([_target("wsA")]), transport=transport, now_fn=lambda: NOW,
+        )
+        with mock.patch.dict("os.environ", {"MOZYO_AGENT_ROLE": "codex", "MOZYO_WORKSPACE_ID": "wsA"}, clear=True):
+            result = sender(_row("wsA"))
+        self.assertEqual(result.outcome, SEND_NOT_SENT)
+        self.assertEqual(transport.calls, [])
 
 
 if __name__ == "__main__":

@@ -449,66 +449,98 @@ def default_redmine_source(ws: SupervisedWorkspace) -> Optional[RedmineJournalSo
         return None
 
 
-def workspace_send_runner(
-    canonical_path: str, workspace_id: str
-) -> Callable[[list], "tuple[int, str]"]:
-    """A subprocess runner that runs the handoff in the target workspace's root + identity (R1-F3).
+def background_transport_env(workspace_id: str) -> dict:
+    """The deterministic env for a background-service delivery subprocess (design answer j#77216).
 
-    A background supervisor fans out over many workspaces from ONE process, so it cannot rely on
-    ambient cwd/env to route a send. This runner pins the ``mozyo-bridge handoff send`` subprocess
-    to the target workspace's **canonical execution root** (``cwd``) and stamps its **workspace
-    identity** (``MOZYO_WORKSPACE_ID``) into the child env, so ``--target coordinator`` /
-    workspace-scoped resolution binds to the row's workspace, not the supervisor process's cwd. A
-    bad / missing cwd raises inside the runner and the send port catches it fail-safe (uncertain, no
-    delivery), so a stale workspace path never crashes the sweep.
+    Model A' delivers as a ``background_service`` origin, NOT an agent: the inherited lane identity
+    (``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID`` / ``MOZYO_WORKSPACE_ID``) is scrubbed so no foreign
+    lane identity carries over (boundary 1), the target workspace id is pinned, and the delivery
+    origin is stamped ``MOZYO_DELIVERY_ORIGIN=background_service`` so the transport is separated from
+    an agent send (boundary 5). The lease + claim authority (not this env) gates the delivery.
     """
     import os
+
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
+        BACKGROUND_SERVICE_ORIGIN,
+    )
+
+    env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_LANE_IDENTITY_ENV}
+    env["MOZYO_WORKSPACE_ID"] = str(workspace_id or "")
+    env["MOZYO_DELIVERY_ORIGIN"] = BACKGROUND_SERVICE_ORIGIN
+    return env
+
+
+def default_target_resolver(ws: SupervisedWorkspace):
+    """Build the production route target resolver for a workspace (design answer j#77216 boundary 4).
+
+    Re-resolves a claimed row's route against the durable route ledger, cross-checked with the live
+    inventory. The **live-inventory** cross-check (which coordinator pane is live in this workspace)
+    is the Phase B dogfood seam (#13490 / #13492); until it lands this resolver is **fail-closed** —
+    it yields no confirmed live target, so a background delivery fails closed (the row stays
+    retryable) rather than mis-delivering on an unconfirmed route. The delivery MECHANISM
+    (authority + resolution + fail-closed + transport) is exercised through this seam in the isolated
+    2-workspace E2E; production live resolution is wired in Phase B.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
+        TargetResolution,
+    )
+
+    class _FailClosedResolver:
+        def resolve(self, row) -> "TargetResolution":  # noqa: F821 - forward ref in annotation
+            # Fail-closed until the Phase B live-inventory wire: no confirmed live target.
+            return TargetResolution.of([])
+
+    return _FailClosedResolver()
+
+
+def default_background_transport(ws: SupervisedWorkspace):
+    """Build the production background-service delivery transport for a workspace (boundary 5).
+
+    Shares the handoff rail's outcome vocabulary but under a **separated origin class**: it fires
+    ``mozyo-bridge handoff send`` to the **re-resolved explicit target** (never a role label) from
+    the target workspace's canonical root, with the scrubbed background-service env
+    (:func:`background_transport_env`). Delivery safety is the lease + claim authority (verified by
+    the sender before this transport is ever called) + the outbox one-send fence, not this env. The
+    subprocess runner is injectable (tests inject a fake; the live wire is the Phase B dogfood).
+    """
     import subprocess
 
-    def _run(argv: list) -> "tuple[int, str]":
-        # R2-F3: build a DETERMINISTIC env — scrub the inherited lane identity (a supervisor is not
-        # the launching lane's agent) and pin only this workspace's id. A herdr send that needs a
-        # lane-sender role/lane now fails closed rather than misrouting on the ambient identity.
-        env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_LANE_IDENTITY_ENV}
-        env["MOZYO_WORKSPACE_ID"] = str(workspace_id or "")
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; sanctioned handoff CLI
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=str(canonical_path) or None,
-            env=env,
-        )
-        return proc.returncode, proc.stdout
-
-    return _run
-
-
-def default_sender(ws: SupervisedWorkspace) -> Callable[[CallbackOutboxRow], str]:
-    """Build the real one-send callback sender as an attested per-workspace system actor (R1-F3).
-
-    Pins delivery to the target workspace three ways: (1) ``attested_workspace_id`` refuses a row
-    whose workspace does not match (fail-closed backstop — a foreign / unattested row is a
-    zero-send ``blocked``); (2) ``target_repo=ws.canonical_path`` passes the workspace's execution
-    root as the explicit ``--target-repo`` identity gate instead of ambient ``auto``; (3) the runner
-    executes in that root with the workspace-identity env. So a background multi-workspace supervisor
-    delivers each row to its own workspace's exact target, never on the sender process's ambient
-    cwd/env.
-    """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
-        HandoffCallbackSendPort,
+        _parse_outcome,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
-        HandoffCallbackSender,
+        HandoffDeliveryResult,
     )
 
-    return HandoffCallbackSender(
-        HandoffCallbackSendPort(
-            attested_workspace_id=ws.workspace_id,
-            target_repo=ws.canonical_path,
-            runner=workspace_send_runner(ws.canonical_path, ws.workspace_id),
-        )
-    )
+    canonical = str(ws.canonical_path)
+    env = background_transport_env(ws.workspace_id)
+
+    class _HandoffBackgroundTransport:
+        def deliver(self, row, target) -> "HandoffDeliveryResult":  # noqa: F821
+            argv = [
+                "mozyo-bridge", "handoff", "send",
+                "--to", str(target.receiver or "codex"),
+                "--target", str(target.locator),  # the re-resolved explicit locator, never a label
+                "--target-repo", canonical,
+                "--source", "redmine",
+                "--issue", str(target.issue),
+                "--journal", str(target.journal),
+                "--kind", "reply",
+                "--mode", "standard",
+                "--record-format", "json",
+            ]
+            try:
+                proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; sanctioned handoff CLI
+                    argv, capture_output=True, text=True, check=False, cwd=canonical or None, env=env
+                )
+            except Exception:  # noqa: BLE001 - a runner blow-up is fail-safe uncertain
+                return HandoffDeliveryResult("blocked", "inject_failed")
+            parsed = _parse_outcome(proc.stdout or "")
+            if parsed is not None:
+                return HandoffDeliveryResult(parsed[0], parsed[1])
+            return HandoffDeliveryResult("blocked", "turn_start_unconfirmed")
+
+    return _HandoffBackgroundTransport()
 
 
 def default_binding(ws: SupervisedWorkspace) -> object:
@@ -542,17 +574,34 @@ def build_supervisor(
     from mozyo_bridge.core.state.supervisor_lease import supervisor_lease_path
     from mozyo_bridge.core.state.supervisor_wake import SupervisorWakeStore, supervisor_wake_path
     from mozyo_bridge.core.state.workflow_runtime_store import workflow_runtime_store_path
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+        BackgroundServiceCallbackSender,
+    )
 
     resolved_store_path = store_path or workflow_runtime_store_path(home)
+    lease_store = SupervisorLeaseStore(path=supervisor_lease_path(home))
+
+    def _sender_fn(ws: SupervisedWorkspace):
+        # Model A' (design answer j#77216): the supervisor delivers as a background_service
+        # authority — lease + claim gated, target re-resolved, transport origin separated from an
+        # agent send — NOT via an agent handoff sender identity.
+        return BackgroundServiceCallbackSender(
+            workspace_id=ws.workspace_id,
+            holder=holder,
+            lease_store=lease_store,
+            target_resolver=default_target_resolver(ws),
+            transport=default_background_transport(ws),
+        )
+
     return WorkspaceCallbackSupervisor(
         holder=holder,
-        lease_store=SupervisorLeaseStore(path=supervisor_lease_path(home)),
+        lease_store=lease_store,
         store=WorkflowRuntimeStore(path=resolved_store_path),
         outbox=CallbackOutbox(path=resolved_store_path),
         workspaces_fn=lambda: default_workspaces(home=home),
         roster_fn=default_roster,
         redmine_source_fn=default_redmine_source,
-        sender_fn=default_sender,
+        sender_fn=_sender_fn,
         binding_fn=default_binding,
         wake_store=SupervisorWakeStore(path=supervisor_wake_path(home)),
         release_after=release_after,
@@ -569,8 +618,9 @@ __all__ = (
     "default_workspaces",
     "default_roster",
     "default_redmine_source",
-    "default_sender",
+    "default_target_resolver",
+    "default_background_transport",
+    "background_transport_env",
     "default_binding",
-    "workspace_send_runner",
     "build_supervisor",
 )

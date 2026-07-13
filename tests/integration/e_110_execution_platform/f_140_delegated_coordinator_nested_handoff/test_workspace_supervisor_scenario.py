@@ -182,9 +182,19 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             WorkflowRuntimeStore,
             workflow_runtime_store_path,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+            BackgroundServiceCallbackSender,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
+            HandoffDeliveryResult,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
             SupervisedWorkspace,
             WorkspaceCallbackSupervisor,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
+            DeliveryTarget,
+            TargetResolution,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
             SUPERVISION_LOCAL_WAKE,
@@ -203,20 +213,50 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         ):
             self.assertEqual(args.func(args), 0)
 
-        # 2) the lease-owner supervisor consumes the wake and delivers.
+        # 2) the lease-owner supervisor consumes the wake and delivers through the REAL
+        #    background_service authority (lease + outbox claim gated) to the exact resolved target.
         store_path = workflow_runtime_store_path(self.home)
         store = WorkflowRuntimeStore(path=store_path)
         outbox = CallbackOutbox(path=store_path)
-        calls = []
+        lease_store = SupervisorLeaseStore(path=supervisor_lease_path(self.home))
+        transports = {}
+
+        class _FakeResolver:
+            def __init__(self, wsid):
+                self._wsid = wsid
+
+            def resolve(self, row):
+                return TargetResolution.of([
+                    DeliveryTarget(workspace_id=self._wsid, lane="default", receiver="codex",
+                                   issue=str(row.issue), journal=str(row.journal), locator="%coord")
+                ])
+
+        class _CapturingTransport:
+            def __init__(self):
+                self.calls = []
+
+            def deliver(self, row, target):
+                self.calls.append((row, target))
+                return HandoffDeliveryResult("sent", "ok")
+
+        def sender_fn(ws):
+            t = _CapturingTransport()
+            transports[ws.workspace_id] = t
+            return BackgroundServiceCallbackSender(
+                workspace_id=ws.workspace_id, holder="superX", lease_store=lease_store,
+                target_resolver=_FakeResolver(ws.workspace_id), transport=t,
+                now_fn=lambda: "2026-07-13T00:00:00+00:00",
+            )
+
         supervisor = WorkspaceCallbackSupervisor(
             holder="superX",
-            lease_store=SupervisorLeaseStore(path=supervisor_lease_path(self.home)),
+            lease_store=lease_store,
             store=store,
             outbox=outbox,
             workspaces_fn=lambda: [SupervisedWorkspace("wsA", str(self.home / "repoA"))],
             roster_fn=lambda ws: (("13683",), ""),
             redmine_source_fn=lambda ws: MappingRedmineJournalSource(payload=_payload("13683")),
-            sender_fn=lambda ws: (lambda row: calls.append(row) or SEND_DELIVERED),
+            sender_fn=sender_fn,
             wake_store=SupervisorWakeStore(path=supervisor_wake_path(self.home)),
             clock=lambda: "2026-07-13T00:00:00+00:00",
         )
@@ -225,7 +265,9 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         w = report.workspaces[0]
         self.assertEqual(w.supervised_issues, ("13683",))  # driven by the wake
         self.assertGreaterEqual(w.events_supplied, 1)  # durable event supplied for glance/resume
-        self.assertEqual(len(calls), 1)  # callback delivered once
+        # The background_service authority delivered once to the exact re-resolved target.
+        self.assertEqual(len(transports["wsA"].calls), 1)
+        self.assertEqual(transports["wsA"].calls[0][1].locator, "%coord")
         self.assertEqual(len(outbox.read(states=[CALLBACK_DELIVERED])), 1)
         self.assertEqual([e.issue for e in store.read_events()], ["13683"])
         # The wake was consumed by the owner.

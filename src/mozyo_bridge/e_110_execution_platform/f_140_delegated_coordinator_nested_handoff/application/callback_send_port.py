@@ -116,14 +116,6 @@ class HandoffCallbackSendPort:
 
     runner: CallbackSendRunner = _default_runner
     mozyo_bridge_bin: str = "mozyo-bridge"
-    #: The ``--target-repo`` identity gate value (Redmine #13683 review R1-F3). Default ``"auto"``
-    #: preserves the single-workspace behavior (resolve the repo from the explicit target pane's
-    #: cwd). A **background** multi-workspace supervisor cannot rely on ambient cwd/env — it fans
-    #: out over many workspaces from one process — so it passes the target workspace's canonical
-    #: execution root here (an explicit path), pinning the receiver repo to the row's workspace
-    #: instead of the sender process's ambient cwd. Combined with a runner that runs in that
-    #: workspace's cwd + identity env, this makes the delivery workspace-attested, not ambient.
-    target_repo: str = "auto"
     #: The workspace this sender is attested for (#13520 review R2-F5 / #13518 review R3-F3). When
     #: attested (non-blank), the sender routes a row ONLY when the row's workspace id EXACTLY
     #: matches — a foreign row OR a row with no workspace id is refused (fail-closed), rather than
@@ -152,7 +144,7 @@ class HandoffCallbackSendPort:
             "--journal", row.journal,
             "--kind", "reply",
             "--mode", "standard",
-            "--target-repo", str(self.target_repo or "auto"),
+            "--target-repo", "auto",
             "--record-format", "json",
             # Emit a best-effort, credential-gated Redmine delivery RECEIPT through the sanctioned
             # handoff delivery-record path (#13520 review F6). This is a human-visible notification
