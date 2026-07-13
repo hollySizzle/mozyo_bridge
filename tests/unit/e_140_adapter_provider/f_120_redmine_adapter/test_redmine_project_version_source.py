@@ -233,7 +233,7 @@ class BuilderTest(unittest.TestCase):
     def test_resolves_credentials_from_the_injected_environment(self) -> None:
         opener = _RecordingOpener([{"versions": [_version(292, "枠")], "total_count": 1}])
         source = live_project_version_source_from_env(
-            environ={BASE_URL_ENV: "https://redmine.example", API_KEY_ENV: "k"},
+            environ={BASE_URL_ENV: "https://redmine.example", API_KEY_ENV: "fake-api-key"},
             home=Path("/nonexistent-home-for-test"),
             opener=opener,
         )

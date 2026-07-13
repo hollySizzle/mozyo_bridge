@@ -71,35 +71,31 @@ _SECRET_VALUE_PATTERNS = (
     r"(?i:\b(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|KEY)\b\s*[:=]\s*[^<\s#][^\s#]*)",
 )
 _TREE_SECRET_VALUE_PATTERNS = (
-    r"(^|[^[:alnum:]_])(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
-    r"(^|[^[:alnum:]_])(ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|KEY)[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
+    r"(^|[^[:alnum:]_])[A-Za-z0-9_]*(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
+    r"(^|[^[:alnum:]_])[A-Za-z0-9_]*(ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|KEY)[A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
 )
 
-# The grep patterns above intentionally cast a wide net so they can run as a
-# single POSIX-ERE pass under `git grep` / artifact scanning. That net also
-# catches code that merely *names* a credential identifier — environment
-# lookups, type annotations, keyword/identifier references, and explicit
-# non-secret test sentinels — none of which are leaked credential values.
-# `_secret_assignment_is_real` is the second-stage classifier that decides
-# whether a candidate `key [:=] value` is an actual credential-shaped literal.
-# Both `release check tree` and the artifact scan post-filter grep candidates
-# through it so the gate fails on real leaks without blocking on safe code.
+# The grep patterns above intentionally cast a wide net for a single POSIX-ERE
+# `git grep` / artifact pass; that net also catches code that merely *names* a
+# credential (env lookups, annotations, references, test sentinels), so
+# `_secret_assignment_is_real` below is the second-stage classifier that judges
+# whether a candidate `key [:=] value` is a real literal (both `release check
+# tree` and the artifact scan post-filter through it). The keyword is wrapped in
+# `[A-Za-z0-9_]*` runs (here and in the grep) so a leading underscore (`_API_KEY`)
+# or trailing `_ENV` dict key (`API_KEY_ENV:`) is still surfaced (Redmine #13716).
 _SECRET_KEY_ALTERNATION = (
     r"(?:[A-Za-z0-9_]*(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Za-z0-9_]*"
     r"(?:TOKEN|SECRET|PASSWORD|KEY))"
     r"|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)"
 )
 _SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:" + _SECRET_KEY_ALTERNATION + r")\s*[:=]\s*(?P<value>[^\s#]+)",
+    r"(?<![A-Za-z0-9_])[A-Za-z0-9_]*(?:" + _SECRET_KEY_ALTERNATION + r")[A-Za-z0-9_]*\s*[:=]\s*(?P<value>[^\s#]+)",
     re.IGNORECASE,
 )
-# Characters that mark the captured value as code structure — a call, an
-# index/slice, a dict/set, a union/generic, a redirect — rather than an opaque
-# literal credential. `.` and `/` are deliberately NOT here: real credential
-# tokens legitimately contain them (dotted JWTs, slash/base64 secrets,
-# provider-style `sk.live.…` keys), so rejecting on them suppressed real leaks
-# (Redmine #12175 j#60466). Dotted *code references* (e.g. `os.environ`) are
-# instead rejected by `_is_attribute_path_reference`.
+# Code-structure chars (call, index, dict/set, union, redirect) mark an
+# expression, not a literal. `.` / `/` are excluded so real token shapes (dotted
+# JWTs, slash/base64, `sk.live.…` keys) survive (Redmine #12175 j#60466); dotted
+# code references (`os.environ`) instead go to `_is_attribute_path_reference`.
 _SECRET_EXPRESSION_CHARS = frozenset("()[]{}|<>\\ \t")
 # Python / JSON / shell literals that are never a credential value.
 _SECRET_VALUE_KEYWORDS = frozenset(
@@ -153,7 +149,7 @@ def _secret_value_is_real(value: str) -> bool:
     Rejects code structure / expressions, keyword literals, explicit non-secret
     placeholders, and bare identifier / constant / type / attribute references:
     an ``os.environ`` read, a ``None`` default, a ``str`` annotation, an
-    uppercase constant reference, or an explicit non-credential test sentinel.
+    uppercase / ``UPPER_SNAKE`` env-var-name reference, or a test sentinel.
     Accepts an opaque literal value — the non-placeholder right-hand side of an
     ``api_key`` / ``*_API_KEY`` assignment — INCLUDING token-shaped literals
     that carry common credential punctuation such as ``.``, ``/``, ``+`` and
@@ -184,6 +180,10 @@ def _secret_value_is_real(value: str) -> bool:
     if lowered in _SECRET_VALUE_KEYWORDS:
         return False
     if any(marker in lowered for marker in _SECRET_PLACEHOLDER_MARKERS):
+        return False
+    # UPPER_SNAKE (quoted/not) is an env-var name / constant ref, not the secret;
+    # the required `_` keeps opaque uppercase tokens real (Redmine #13716).
+    if re.fullmatch(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+", inner):
         return False
     # Unquoted name references are not values. A quoted value, or an unquoted
     # one carrying digits (abc123) / token punctuation, is a literal.

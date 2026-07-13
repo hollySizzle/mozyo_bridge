@@ -317,7 +317,7 @@ class BuilderTest(unittest.TestCase):
         source = live_version_issue_source_from_env(
             environ={
                 BASE_URL_ENV: "https://redmine.example",
-                API_KEY_ENV: "k",
+                API_KEY_ENV: "fake-api-key",
             },
             home=Path("/nonexistent-home-for-test"),
             opener=opener,
