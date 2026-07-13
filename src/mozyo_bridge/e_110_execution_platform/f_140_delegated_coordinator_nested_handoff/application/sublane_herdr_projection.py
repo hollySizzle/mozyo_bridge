@@ -47,6 +47,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _lane_state,
     parse_issue_from_lane_label,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+    _tab_id_of_row,
+    _workspace_prefix,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _list_rows,
 )
@@ -191,6 +195,10 @@ class _LaneEntry:
     lane_id: str
     gateway: Optional[str]
     worker: Optional[str]
+    #: Each live slot's placement-container key ``(herdr_workspace, tab_id)`` — the
+    #: pair-split discriminant (Redmine #13705). ``None`` for an absent slot.
+    gateway_placement: Optional[tuple]
+    worker_placement: Optional[tuple]
     lane_label: str
     issue: Optional[str]
     branch: Optional[str]
@@ -277,6 +285,10 @@ def project_herdr_sublanes(
             if rec_ws and rec_lane:
                 records_by_unit.setdefault((rec_ws, rec_lane), record)
     slots: dict[tuple[str, str], dict[str, str]] = {}
+    #: role -> placement-container key ``(herdr_workspace, tab_id)`` per lane unit,
+    #: captured alongside the locator so a pair split across tabs / workspaces reads
+    #: as ``pair_split`` instead of ``active`` (Redmine #13705).
+    placements: dict[tuple[str, str], dict[str, tuple]] = {}
     order: list[tuple[str, str]] = []
     exclude = _norm(exclude_workspace_id)
     repo_scope = _norm(repo_workspace_id)
@@ -311,8 +323,17 @@ def project_herdr_sublanes(
         unit = (ws, lane)
         if unit not in slots:
             slots[unit] = {}
+            placements[unit] = {}
             order.append(unit)
-        slots[unit].setdefault(identity.role, locator)
+        if identity.role not in slots[unit]:
+            slots[unit][identity.role] = locator
+            # The placement key pairs the herdr terminal workspace (locator prefix,
+            # the #13380 axis) with the tab (#13411 axis); an equal key for both
+            # slots proves one operable pair.
+            placements[unit][identity.role] = (
+                _workspace_prefix(locator),
+                _tab_id_of_row(row),
+            )
 
     entries: list[_LaneEntry] = []
     for unit in order:
@@ -354,6 +375,8 @@ def project_herdr_sublanes(
                 lane_id=lane,
                 gateway=gateway,
                 worker=worker,
+                gateway_placement=placements[unit].get(GATEWAY_ROLE),
+                worker_placement=placements[unit].get(WORKER_ROLE),
                 lane_label=lane_label,
                 issue=issue or None,
                 branch=branch,
@@ -398,6 +421,8 @@ def project_herdr_sublanes(
                     lane_id=unit_lane,
                     gateway=None,
                     worker=None,
+                    gateway_placement=None,
+                    worker_placement=None,
                     lane_label=lane_label,
                     issue=issue or None,
                     branch=getattr(record, "branch", "") or None,
@@ -453,7 +478,12 @@ def project_herdr_sublanes(
                 repo_root=entry.repo_root,
                 gateway_pane=entry.gateway,
                 worker_pane=entry.worker,
-                state=_lane_state(entry.gateway, entry.worker),
+                state=_lane_state(
+                    entry.gateway,
+                    entry.worker,
+                    gateway_placement=entry.gateway_placement,
+                    worker_placement=entry.worker_placement,
+                ),
                 stale_hints=tuple(hints),
             )
         )
@@ -553,6 +583,8 @@ def herdr_lane_view_for_worktree(
     except HerdrSessionStartError:
         return None
 
+    slot_placements: dict[str, tuple] = {}
+
     def _unit_slots(want_ws: str, want_lane: str) -> dict[str, str]:
         unit_slots: dict[str, str] = {}
         for row in rows:
@@ -569,8 +601,13 @@ def herdr_lane_view_for_worktree(
             if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
                 continue
             locator = _agent_locator(row)
-            if locator:
-                unit_slots.setdefault(identity.role, locator)
+            if locator and identity.role not in unit_slots:
+                unit_slots[identity.role] = locator
+                # Placement key for the pair-split verdict (Redmine #13705).
+                slot_placements[identity.role] = (
+                    _workspace_prefix(locator),
+                    _tab_id_of_row(row),
+                )
         return unit_slots
 
     # Shared project workspace model (#13377): the lane unit is (project workspace,
@@ -616,7 +653,12 @@ def herdr_lane_view_for_worktree(
         repo_root=str(worktree_path),
         gateway_pane=gateway,
         worker_pane=worker,
-        state=_lane_state(gateway, worker),
+        state=_lane_state(
+            gateway,
+            worker,
+            gateway_placement=slot_placements.get(GATEWAY_ROLE),
+            worker_placement=slot_placements.get(WORKER_ROLE),
+        ),
         stale_hints=hints,
     )
 

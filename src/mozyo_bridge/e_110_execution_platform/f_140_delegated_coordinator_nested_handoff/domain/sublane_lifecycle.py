@@ -194,6 +194,9 @@ SUBLANE_STATE_GATEWAY_ONLY = "gateway_only"
 SUBLANE_STATE_WORKER_ONLY = "worker_only"
 #: Neither a gateway nor a worker pane is live (only other/unknown-role panes).
 SUBLANE_STATE_DETACHED = "detached"
+#: Both panes are live but not in one placement container — a runtime skew split
+#: the pair across herdr tabs / workspaces (Redmine #13705; herdr projection only).
+SUBLANE_STATE_PAIR_SPLIT = "pair_split"
 
 SUBLANE_STATES = frozenset(
     {
@@ -201,6 +204,7 @@ SUBLANE_STATES = frozenset(
         SUBLANE_STATE_GATEWAY_ONLY,
         SUBLANE_STATE_WORKER_ONLY,
         SUBLANE_STATE_DETACHED,
+        SUBLANE_STATE_PAIR_SPLIT,
     }
 )
 
@@ -355,8 +359,20 @@ def _is_non_sublane_lane(lane_id: str, lane_label: str, lane_kind: str) -> bool:
     return False
 
 
-def _lane_state(gateway_pane: Optional[str], worker_pane: Optional[str]) -> str:
+def _lane_state(
+    gateway_pane: Optional[str],
+    worker_pane: Optional[str],
+    *,
+    gateway_placement: Optional[object] = None,
+    worker_placement: Optional[object] = None,
+) -> str:
+    """The coarse lane state; optional ``(herdr_workspace, tab_id)`` placement keys
+    make a live pair not sharing one container read ``pair_split`` (Redmine #13705).
+    Placement-unaware callers pass ``None`` and keep the pre-#13705 verdict."""
     if gateway_pane and worker_pane:
+        placed = gateway_placement is not None and worker_placement is not None
+        if placed and gateway_placement != worker_placement:
+            return SUBLANE_STATE_PAIR_SPLIT
         return SUBLANE_STATE_ACTIVE
     if gateway_pane:
         return SUBLANE_STATE_GATEWAY_ONLY
@@ -959,6 +975,7 @@ __all__ = (
     "SUBLANE_STATE_GATEWAY_ONLY",
     "SUBLANE_STATE_WORKER_ONLY",
     "SUBLANE_STATE_DETACHED",
+    "SUBLANE_STATE_PAIR_SPLIT",
     "SUBLANE_STATES",
     "STALE_HINT_GATEWAY_PANE_MISSING",
     "STALE_HINT_WORKER_PANE_MISSING",
