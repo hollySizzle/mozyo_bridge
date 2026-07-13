@@ -70,9 +70,20 @@ class _RecordingOpener:
         return [r.full_url for r in self.requests]
 
 
+# Explicit non-secret placeholders: Source Tree Hygiene strict-fails on a
+# credential-shaped literal in a tracked file, and the `fake-` marker is what the
+# scanner classifies as a placeholder rather than a leaked key.
+#
+# The canary is deliberately DISTINCT from the default key: the redaction test
+# overrides the key with it, so asserting the canary is absent from the failure
+# reason proves the *caller-supplied* key never reaches the message.
+_FAKE_API_KEY = "fake-api-key"
+_REDACTION_CANARY_KEY = "fake-api-key-redaction-canary"
+
+
 def _source(page, **kwargs) -> tuple[LiveRedmineProjectSource, _RecordingOpener]:
     opener = _RecordingOpener(page)
-    params = dict(api_key="k", base_url="https://redmine.example", opener=opener)
+    params = dict(api_key=_FAKE_API_KEY, base_url="https://redmine.example", opener=opener)
     params.update(kwargs)
     return LiveRedmineProjectSource(**params), opener
 
@@ -169,10 +180,10 @@ class FailClosedTest(unittest.TestCase):
 
     def test_reasons_never_carry_the_api_key(self) -> None:
         err = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))
-        source, _ = _source(err, api_key="super-secret-key")
+        source, _ = _source(err, api_key=_REDACTION_CANARY_KEY)
         with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
             source.read_project_id(_PROJECT)
-        self.assertNotIn("super-secret-key", str(ctx.exception))
+        self.assertNotIn(_REDACTION_CANARY_KEY, str(ctx.exception))
 
 
 class BuilderTest(unittest.TestCase):
