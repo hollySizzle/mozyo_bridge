@@ -25,9 +25,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "src"))
-_TESTS_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+_TESTS_ROOT = Path(__file__).resolve().parents[3]
 if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
@@ -889,6 +889,57 @@ class R1F3IdentityVocabularyTest(unittest.TestCase):
         )
 
         self.assertEqual({"claude": "claude", "codex": "codex"}, agent_process_owners())
+
+
+class PackagedResourceShipsInTheWheelTest(unittest.TestCase):
+    """The profile artifact must travel with the package, not just the repo.
+
+    ``agent_provider_profile.py`` reads the YAML at import. Inside the repo it resolves
+    from the source tree, so a missing ``package-data`` entry is invisible here — but an
+    installed wheel would have no profiles, the registry would fail to load, and EVERY
+    launch would fail closed. This pins the declaration so the packaging can never
+    silently drop it (review R1-F4).
+    """
+
+    def _package_data(self):
+        import tomllib
+
+        pyproject = REPO_ROOT / "pyproject.toml"
+        with pyproject.open("rb") as handle:
+            data = tomllib.load(handle)
+        return data["tool"]["setuptools"]["package-data"]["mozyo_bridge"]
+
+    def test_profile_yaml_is_declared_as_package_data(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
+            AGENT_PROVIDER_PROFILE_RESOURCE,
+        )
+
+        entries = self._package_data()
+        matching = [e for e in entries if e.endswith(AGENT_PROVIDER_PROFILE_RESOURCE)]
+        self.assertTrue(
+            matching,
+            f"{AGENT_PROVIDER_PROFILE_RESOURCE} is not declared in "
+            f"[tool.setuptools.package-data]; an installed wheel would ship no agent "
+            f"provider profiles and every launch would fail closed",
+        )
+
+    def test_declared_path_matches_the_module_that_reads_it(self) -> None:
+        # A path typo would pass the test above and still ship nothing.
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain import (
+            agent_provider_profile,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
+            AGENT_PROVIDER_PROFILE_RESOURCE,
+        )
+
+        reader_dir = Path(agent_provider_profile.__file__).resolve().parent
+        src_root = REPO_ROOT / "src" / "mozyo_bridge"
+        expected = str(
+            (reader_dir / AGENT_PROVIDER_PROFILE_RESOURCE).relative_to(src_root)
+        )
+        self.assertIn(expected, self._package_data())
+        # ...and the file is actually there for that path.
+        self.assertTrue((src_root / expected).is_file())
 
 
 class R1F4HostIndependenceTest(unittest.TestCase):
