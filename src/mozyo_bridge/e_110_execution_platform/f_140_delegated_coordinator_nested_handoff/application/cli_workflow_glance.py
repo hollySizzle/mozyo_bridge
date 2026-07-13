@@ -51,6 +51,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MappingGlanceSnapshotSource,
     active_lane_snapshots,
     enumerate_active_lanes,
+    enumerate_lifecycle_diagnostic,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
     fold_glance_rows,
@@ -197,17 +198,37 @@ def cmd_workflow_glance(args: argparse.Namespace) -> int:
     and always returns 0 — the output is a projection, not a delivery.
     """
     rows, degraded, notes = _collect(args)
+    # Redmine #13681 W4 / R1 F4 (j#77247): the lifecycle diagnostic roster is folded into
+    # the SAME operator-facing view. A superseded / hibernated / retired lane is excluded
+    # from the active-capacity roster above (it no longer owns its issue), but its
+    # authority difference stays visible here — together with its process-release progress
+    # — so a released lane reads as `superseded/released` on a real surface rather than
+    # vanishing (issue acceptance: distinguish original/recovery authority; j#76630).
+    diagnostic, diag_error = enumerate_lifecycle_diagnostic(Path.cwd())
+    if diag_error:
+        degraded = True
+        notes = tuple(notes) + (diag_error,)
     if getattr(args, "as_json", False):
-        print(
-            _json.dumps(
-                glance_payload(rows, degraded=degraded, notes=notes),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        payload = glance_payload(rows, degraded=degraded, notes=notes)
+        payload["lifecycle_diagnostic"] = [
+            {
+                "issue": issue,
+                "lane": lane,
+                "lane_disposition": disposition,
+                "process_release": release,
+            }
+            for issue, lane, disposition, release in diagnostic
+        ]
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(render_glance_table(rows))
+        if diagnostic:
+            print("")
+            print("lifecycle diagnostic (non-active lanes, excluded from capacity):")
+            for issue, lane, disposition, release in diagnostic:
+                print(
+                    f"  - #{issue or '-'} {lane or '-'}: {disposition} / {release}"
+                )
         if degraded:
             print("")
             print("degraded: some lane sources were unavailable/unrecognized:")
