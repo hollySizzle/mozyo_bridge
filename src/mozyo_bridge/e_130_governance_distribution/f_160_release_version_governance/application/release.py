@@ -55,8 +55,8 @@ EXIT_TIMEOUT = 124
 
 
 # Personal home / secret-shape patterns shared between source-tree and artifact
-# checks. Keep this narrower than a raw `token|secret|password` word scan:
-# release docs / scanner code discuss those terms; fail on leaks, not guidance.
+# checks — narrower than a raw `token|secret|password` word scan so the gate
+# fails on leaks, not on release docs / scanner code discussing those terms.
 _PERSONAL_PATH_PATTERNS = (
     r"/Users/[A-Za-z0-9._-]+/",
     r"/home/[A-Za-z0-9._-]+/",
@@ -75,14 +75,11 @@ _TREE_SECRET_VALUE_PATTERNS = (
 )
 
 # The grep patterns above cast a wide net for a single POSIX-ERE `git grep` /
-# artifact pass; it also catches code that merely *names* a credential, so
-# `_secret_assignment_is_real` below is the second-stage classifier both
-# `release check tree` and the artifact scan post-filter through. The keyword
-# sits in a *segment-bounded* identifier — an underscore-delimited prefix
-# `(?:[A-Za-z0-9]*_)*` plus only the known `_ENV` suffix — so `_API_KEY` /
-# `OPENAI_API_KEY` / `API_KEY_ENV:` surface without matching a glued substring
-# like `passwordless` (Redmine #13716 R1-F2). Grep and classifier share this
-# grammar exactly so a line's tree and artifact verdicts always agree (R2-F2).
+# artifact pass; `_secret_assignment_is_real` is the second-stage classifier both
+# scans post-filter through. The keyword sits in a *segment-bounded* identifier
+# (prefix `(?:[A-Za-z0-9]*_)*` + only the `_ENV` suffix), so `_API_KEY` /
+# `API_KEY_ENV:` match but a glued substring like `passwordless` does not; grep
+# and classifier share this grammar so tree/artifact verdicts agree (R1-F2/R2-F2).
 _SECRET_KEY_ALTERNATION = (
     # No leading `[A-Za-z0-9_]*` here: the outer prefix owns it (grep parity, R2-F2).
     r"(?:(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Za-z0-9_]*"
@@ -123,6 +120,13 @@ _SECRET_PLACEHOLDER_MARKERS = (
     "fake",
     "xxxx",
 )
+# Credential-bearing env-var NAMES this project reads. A `*_ENV` constant bound
+# to one of these names *where* a secret is read from, not the secret — the only
+# value-side exemption. Shape can't separate an env-var name from a secret (both
+# can be UPPER_SNAKE with a keyword), so this is an explicit allowlist, not a
+# pattern; a new credential env var is flagged until added here (Redmine #13716
+# R3-F1).
+_KNOWN_CREDENTIAL_ENV_NAMES = frozenset({"MOZYO_REDMINE_API_KEY"})
 
 
 def _is_attribute_path_reference(inner: str) -> bool:
@@ -147,11 +151,11 @@ def _secret_value_is_real(value: str) -> bool:
     Rejects code structure / expressions, keyword literals, placeholders, and
     bare identifier / constant / type / attribute references (an ``os.environ``
     read, ``None``, a ``str`` annotation, an uppercase constant, a test
-    sentinel). An env-var *name* under a ``*_ENV`` key is exempted in
-    ``_secret_assignment_is_real`` where the key context is available. Accepts an
-    opaque literal — the non-placeholder RHS of an ``api_key`` / ``*_API_KEY``
-    assignment — INCLUDING token-shaped literals with credential punctuation
-    (``.`` ``/`` ``+`` / padding ``=``: JWTs, base64); see #12175 / #13695 tests.
+    sentinel). Known env-var names under a ``*_ENV`` key are exempted in
+    ``_secret_assignment_is_real``. Accepts an opaque literal — the non-placeholder
+    RHS of an ``api_key`` / ``*_API_KEY`` assignment — INCLUDING token-shaped
+    literals with credential punctuation (``.`` ``/`` ``+`` / padding ``=``: JWTs,
+    base64); see #12175 / #13695 tests.
     """
     raw = value.strip().rstrip(",;)]}")
     quoted = False
@@ -166,8 +170,7 @@ def _secret_value_is_real(value: str) -> bool:
     # Punctuation-only values (stray quotes/separators) are never a leaked secret.
     if not any(ch.isalnum() for ch in inner):
         return False
-    # Code-structure chars (calls, indexing, unions, redirects) mark an
-    # expression, not a literal; `.` / `/` are excluded so real tokens survive.
+    # Code-structure chars mark an expression; `.` / `/` excluded so tokens survive.
     if any(ch in _SECRET_EXPRESSION_CHARS for ch in raw):
         return False
     lowered = inner.lower()
@@ -175,11 +178,9 @@ def _secret_value_is_real(value: str) -> bool:
         return False
     if any(marker in lowered for marker in _SECRET_PLACEHOLDER_MARKERS):
         return False
-    # Unquoted name references are not values (a quoted value, or an unquoted one
-    # carrying digits / token punctuation, is a literal).
+    # Unquoted name references aren't values (quoted / digit-bearing = literal).
     if not quoted:
-        # Digit-free bare identifier = a name reference (constant / type / env
-        # var / same-name keyword pass-through; Redmine #12693).
+        # Digit-free bare identifier = name reference (constant/type/env; #12693).
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner) and not any(
             ch.isdigit() for ch in inner
         ):
@@ -190,18 +191,17 @@ def _secret_value_is_real(value: str) -> bool:
 
 
 def _secret_assignment_is_real(content: str) -> bool:
-    """True if any `key [:=] value` in `content` is a real literal. A ``*_ENV``
-    key whose value is the UPPER_SNAKE *name* of a credential env var (UPPER_SNAKE
-    AND carrying a credential keyword) is a reference, exempted with key context;
-    an opaque uppercase secret under a ``*_ENV`` key still blocks (#13716 R2-F1)."""
+    """True if any `key [:=] value` in `content` is a real literal. The only
+    value-side exemption: a ``*_ENV`` key whose value is in the known env-name
+    allowlist (`_KNOWN_CREDENTIAL_ENV_NAMES`). Membership — not shape — is the
+    safe authority, so any other literal under a ``*_ENV`` key blocks (#13716)."""
     for match in _SECRET_ASSIGNMENT_RE.finditer(content):
         if not _secret_value_is_real(match.group("value")):
             continue
         inner = match.group("value").strip().rstrip(",;)]}").strip("\"'")
         if (
             match.group("key").upper().endswith("_ENV")
-            and re.fullmatch(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+", inner)
-            and re.search(_SECRET_KEY_ALTERNATION, inner, re.IGNORECASE)
+            and inner in _KNOWN_CREDENTIAL_ENV_NAMES
         ):
             continue
         return True
