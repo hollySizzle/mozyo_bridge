@@ -405,14 +405,40 @@ class LaneDispositionBlockTest(unittest.TestCase):
         self.assertEqual(ROUTE_BLOCKED, bypass.verdict)
         self.assertEqual(BLOCKED_DIRECT_WORKER_BYPASS, bypass.blocked_reason)
 
-    def test_non_governed_kind_never_disposition_blocked(self) -> None:
-        # A non-governed kind (e.g. reply) to a superseded lane is still allowed — the
-        # disposition gate only governs implementation_request / review_result.
-        decision = self._to_lane(
-            receiver="claude", disposition="superseded", kind="reply"
+    def test_all_kinds_to_superseded_lane_zero_send(self) -> None:
+        # R1 F2 (j#77247): the disposition gate is a target-lane invariant — EVERY
+        # handoff kind to a superseded lane zero-sends, not just the two governed kinds.
+        for kind in sorted(KIND_LABELS):
+            decision = self._to_lane(
+                receiver="claude", disposition="superseded", kind=kind
+            )
+            self.assertEqual(
+                ROUTE_BLOCKED, decision.verdict, f"{kind} should zero-send"
+            )
+            self.assertEqual("lane_superseded", decision.blocked_reason)
+
+    def test_unreadable_lifecycle_authority_fails_closed(self) -> None:
+        # R1 F3 (j#77247): an unreadable authority for a resolved target lane zero-sends
+        # (never assumed active), for any kind — even when no disposition is known.
+        decision = _decide(
+            kind="reply",
+            receiver="codex",
+            sender_identity_known=True,
+            sender_workspace_id="ws-a",
+            sender_lane_id="lane-sub",
+            target_workspace_id="ws-a",
+            target_lane_id="lane-sub",
+            target_role="codex",
+            target_lane_disposition=None,
+            target_lane_lifecycle_unreadable=True,
         )
+        self.assertEqual(ROUTE_BLOCKED, decision.verdict)
+        self.assertEqual("lane_lifecycle_unreadable", decision.blocked_reason)
+
+    def test_owner_unbound_lane_still_byte_invariant(self) -> None:
+        # (None, not-unreadable) = owner-unbound / no row = compat allow (byte-invariant).
+        decision = self._to_lane(receiver="claude", disposition=None, kind="reply")
         self.assertEqual(ROUTE_ALLOWED, decision.verdict)
-        self.assertFalse(decision.governed)
 
     def test_disposition_block_not_releasable_by_allow_direct_worker(self) -> None:
         # --allow-direct-worker releases a bypass, but NOT a dead-lane block.

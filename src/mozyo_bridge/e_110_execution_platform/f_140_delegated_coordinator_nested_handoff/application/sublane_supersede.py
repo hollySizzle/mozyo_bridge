@@ -62,7 +62,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HerdrRetireClosePlan,
     HerdrRetireCloseResult,
     execute_herdr_retire_close,
-    plan_herdr_retire_close,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     GATEWAY_ROLE,
@@ -599,8 +598,23 @@ class SublaneSupersedeUseCase:
                 detail="release generation already released",
             )
 
-        plan = plan_herdr_retire_close(
-            rows, workspace_id=workspace_id, lane_id=original_lane
+        # F1 (R1 j#77247): close only the slots this generation durably pinned, and
+        # only when their live locator STILL matches the pinned locator. A live unit scan
+        # (`plan_herdr_retire_close`) would close whatever managed slot happens to occupy
+        # the lane unit now — killing a pane recycled into a NEW agent generation between
+        # a partial close and its resume. The pins, not a live scan, are the authority for
+        # what this stale action may close (lane_lifecycle_model.py ReleasePin contract).
+        # Corrupt pins fail closed (never degrade to fewer targets, leaving slots alive).
+        try:
+            stored_pins = rec.pins
+        except ReleasePinError:
+            return ReleaseOutcome(
+                action_id=action_id,
+                process_release=rec.process_release,
+                detail="release pins unreadable; fail closed (no slots closed)",
+            )
+        plan = _pin_matched_close_plan(
+            stored_pins, rows, workspace_id=workspace_id, lane_id=original_lane
         )
         close = self.ops.execute_close(plan)
         target = RELEASE_RELEASED if not close.failed else RELEASE_PARTIAL
@@ -632,6 +646,38 @@ class SublaneSupersedeUseCase:
                 else f"release outcome refused ({recorded.reason})"
             ),
         )
+
+
+def _pin_matched_close_plan(
+    pins: Sequence[ReleasePin],
+    rows: Sequence[Mapping[str, object]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+) -> HerdrRetireClosePlan:
+    """Close plan honoring the durable release pins (F1, R1 j#77247).
+
+    A pinned slot is a close target ONLY when a live row with its assigned name still
+    carries the exact locator the pin recorded. A slot whose live locator changed (its
+    pane was recycled into a new agent generation) or that is no longer live is dropped
+    from the plan — a stale release never kills a replacement pane.
+    """
+    live_by_name: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        name = _norm(row.get(AGENT_KEY_NAME))
+        locator = _agent_locator(row)
+        if name and locator:
+            live_by_name[name] = locator
+    targets = tuple(
+        (pin.role, pin.locator)
+        for pin in pins
+        if live_by_name.get(pin.assigned_name) == pin.locator
+    )
+    return HerdrRetireClosePlan(
+        workspace_id=workspace_id, lane_id=lane_id, close_targets=targets
+    )
 
 
 def _release_pins(

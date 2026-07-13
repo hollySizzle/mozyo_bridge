@@ -80,12 +80,35 @@ class DispositionGateWiringTest(unittest.TestCase):
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 self.assertEqual(
                     _resolve_target_disposition(_Target(WS, LANE)),
-                    DISPOSITION_SUPERSEDED,
+                    (DISPOSITION_SUPERSEDED, False),
                 )
-                # Owner-unbound / absent lane -> None (byte-invariant).
-                self.assertIsNone(_resolve_target_disposition(_Target(WS, "other")))
-                # Missing unit fields -> None, never a raised key error.
-                self.assertIsNone(_resolve_target_disposition(_Target("", LANE)))
+                # Owner-unbound / absent lane -> (None, False) (byte-invariant compat).
+                self.assertEqual(
+                    _resolve_target_disposition(_Target(WS, "other")), (None, False)
+                )
+                # Missing unit fields -> (None, False), never a raised key error.
+                self.assertEqual(
+                    _resolve_target_disposition(_Target("", LANE)), (None, False)
+                )
+
+    def test_resolve_disposition_unreadable_store_fails_closed(self) -> None:
+        # R1 F3 (j#77247): a store read failure resolves to (None, True) — distinct from
+        # an absent row — so the send gate fails closed instead of assuming active.
+        from mozyo_bridge.core.state import lane_lifecycle as ll
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._seed(home, DISPOSITION_SUPERSEDED)
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch.object(
+                ll.LaneLifecycleStore,
+                "get",
+                side_effect=ll.LaneLifecycleError("boom"),
+            ):
+                self.assertEqual(
+                    _resolve_target_disposition(_Target(WS, LANE)), (None, True)
+                )
 
     def _enforce(self, home: Path, target: _Target):
         emitted = []
@@ -128,6 +151,21 @@ class DispositionGateWiringTest(unittest.TestCase):
             home = Path(tmp)  # no lifecycle row seeded
             emitted = self._enforce(home, _Target(WS, "never_declared"))
             self.assertEqual(emitted, [])
+
+    def test_unreadable_store_send_fails_closed_and_dies(self) -> None:
+        # R1 F3 (j#77247): a read failure at send time blocks + dies (never assumed
+        # active), even for a governed gateway send.
+        from mozyo_bridge.core.state import lane_lifecycle as ll
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._seed(home, DISPOSITION_ACTIVE)
+            with patch.object(
+                ll.LaneLifecycleStore,
+                "get",
+                side_effect=ll.LaneLifecycleError("boom"),
+            ), self.assertRaises(_Die):
+                self._enforce(home, _Target(WS, LANE))
 
 
 if __name__ == "__main__":

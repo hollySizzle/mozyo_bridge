@@ -354,6 +354,52 @@ class SublaneSupersedeTest(unittest.TestCase):
             self.assertEqual(outcome.release.process_release, "not_requested")
             self.assertEqual(ops.close_calls, [])
 
+    def test_resume_never_closes_a_recycled_replacement_pane(self) -> None:
+        # R1 F1 (j#77247): a partial release stays open pinned to the ORIGINAL locators.
+        # If the slots are recycled into new agent generations (same assigned name, NEW
+        # locator) before the resume, the resume must close NOTHING — a stale release
+        # never kills a replacement pane.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS,
+                lane_id=ORIG,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            first = SublaneSupersedeUseCase(
+                ops=self._both_lanes_live_ops(close_result=partial), store=store
+            ).run(_request(), execute=True)
+            self.assertEqual(first.release.process_release, RELEASE_PARTIAL)
+
+            # The original's slots are recycled: same assigned names, NEW locators.
+            recycled = [
+                _row("codex", ORIG, f"{WS}:pNEWc"),
+                _row("claude", ORIG, f"{WS}:pNEWw"),
+                _row("codex", REC, f"{WS}:p10"),
+                _row("claude", REC, f"{WS}:p11"),
+            ]
+            attest = {
+                encode_assigned_name(WS, "codex", REC): _attest("codex", REC, f"{WS}:p10"),
+                encode_assigned_name(WS, "claude", REC): _attest("claude", REC, f"{WS}:p11"),
+            }
+            ops2 = _FakeOps(rows=recycled, attestations=attest)
+            resume = SublaneSupersedeUseCase(ops=ops2, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(resume.already_handed_over)
+            # Nothing was closed: the pinned locators no longer match the live ones.
+            all_targets = [
+                t for call in ops2.close_calls for t in call.close_targets
+            ]
+            self.assertEqual(all_targets, [])
+            closed_locators = {
+                loc for call in ops2.close_calls for _, loc in call.close_targets
+            }
+            self.assertNotIn(f"{WS}:pNEWc", closed_locators)
+            self.assertNotIn(f"{WS}:pNEWw", closed_locators)
+
     def test_incomplete_identity_fails_closed_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)

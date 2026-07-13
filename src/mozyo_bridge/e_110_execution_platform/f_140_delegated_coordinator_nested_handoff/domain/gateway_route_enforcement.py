@@ -133,6 +133,11 @@ BLOCKED_LANE_SUPERSEDED: str = "lane_superseded"
 BLOCKED_LANE_HIBERNATED: str = "lane_hibernated"
 BLOCKED_LANE_RETIRED: str = "lane_retired"
 
+#: The lifecycle authority for a resolved target lane could not be read at action time
+#: (R1 F3, j#77247). Fail-closed zero-send: an unreadable authority may be masking a
+#: superseded lane, so the send is refused rather than assumed active.
+BLOCKED_LANE_LIFECYCLE_UNREADABLE: str = "lane_lifecycle_unreadable"
+
 #: The non-active dispositions that zero-send a governed delivery, mapped to their
 #: block reason. ``active`` (and an unresolved / owner-unbound lane, disposition
 #: ``None``) is absent, so the gate stays byte-invariant when no lifecycle authority
@@ -199,11 +204,17 @@ class GatewayRouteRequest:
     allow_direct_worker: bool = False
     worker_provider: Optional[str] = None
     #: The target lane's lifecycle disposition (Redmine #13681 W3), when the caller
-    #: could resolve it from the lifecycle authority. ``None`` — an unresolved / absent
-    #: / owner-unbound lane, or a caller that does not resolve it — keeps the gate
+    #: resolved a lifecycle row for it. ``None`` — an owner-unbound lane (no row), a
+    #: target with no lane unit, or a caller that does not resolve it — keeps the gate
     #: byte-invariant (no disposition block). Only a non-active resolved disposition
-    #: zero-sends a governed delivery.
+    #: zero-sends. Distinct from :attr:`target_lane_lifecycle_unreadable`: ``None`` here
+    #: means "no authority to act on" (compat-allowed), not "authority unreadable".
     target_lane_disposition: Optional[str] = None
+    #: The lifecycle store could not be read at action time for a resolved target lane
+    #: (R1 F3, j#77247). Fail-closed: an unreadable authority is never assumed active —
+    #: it zero-sends, because it may be masking a superseded lane (#13689 contract). The
+    #: caller sets this ONLY on a genuine read failure, never for an absent row.
+    target_lane_lifecycle_unreadable: bool = False
 
 
 @dataclass(frozen=True)
@@ -305,6 +316,18 @@ def _suggested_disposition_route(
     )
 
 
+def _suggested_unreadable_route(request: GatewayRouteRequest) -> str:
+    """Public-safe pointer for a delivery blocked by an unreadable lifecycle authority."""
+    target_lane = _norm(request.target_lane_id) or "<target_lane>"
+    kind = _norm(request.kind) or "<kind>"
+    return (
+        f"the lifecycle authority for lane {target_lane!r} could not be read; the "
+        f"{kind} was not delivered (fail-closed — an unreadable authority may be masking "
+        "a superseded lane). Restore the lifecycle store, confirm the lane's current "
+        "owner (`mozyo-bridge sublane list`), and retry."
+    )
+
+
 def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     """Decide whether a handoff delivery satisfies the governed gateway route.
 
@@ -328,6 +351,7 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     # implementer role's runtime provider, resolved by the caller from the binding.
     # Default (unset) -> claude, so the pre-#13174 behavior is byte-identical.
     worker_provider = _norm(request.worker_provider) or PROVIDER_CLAUDE
+    kind_governed = kind in GATEWAY_GOVERNED_KINDS
 
     def _allowed(*, governed: bool, same_unit: Optional[bool]) -> GatewayRouteDecision:
         return GatewayRouteDecision(
@@ -341,23 +365,39 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
             exception_applied=False,
         )
 
-    if kind not in GATEWAY_GOVERNED_KINDS:
-        return _allowed(governed=False, same_unit=None)
-
-    # Redmine #13681 W3: a governed delivery to a lane the lifecycle authority says is
-    # no longer the active owner (superseded / hibernated / retired) zero-sends — for
-    # ANY receiver, since neither the dead lane's gateway nor its worker should take new
-    # work. This block precedes the gateway / worker-lane logic: a superseded lane is not
-    # a valid target regardless of which slot the send addresses. An unresolved /
-    # owner-unbound lane (disposition ``None`` / ``active``) is not blocked here, so the
-    # gate is byte-invariant wherever no lifecycle authority is resolvable.
+    # Redmine #13681 W3 + R1 F2/F3 (j#77247): the lifecycle disposition of the target
+    # lane is a **target-lane invariant** checked for EVERY handoff kind, before the
+    # gateway/worker-kind governance below. A lane the lifecycle authority does not
+    # affirm as its active owner must receive NO new handoff of any kind:
+    #
+    # - a resolved non-active disposition (superseded / hibernated / retired) zero-sends
+    #   (F2 — scoping this to governed kinds let a stale reply / callback re-address a
+    #   dead lane, contradicting the issue acceptance / j#76630 / j#77170);
+    # - an authority that could not be READ at action time zero-sends (F3 — assuming
+    #   active for an unreadable store re-authorized a send into a possibly-superseded
+    #   lane, contradicting the #13689 fail-closed contract).
+    #
+    # An owner-unbound lane (no lifecycle row: disposition ``None`` and not unreadable)
+    # stays allowed — a deliberate compatibility carve-out until legacy lanes are
+    # migrated (#13685), never an inference that unknown == active.
+    if request.target_lane_lifecycle_unreadable:
+        return GatewayRouteDecision(
+            verdict=ROUTE_BLOCKED,
+            governed=kind_governed,
+            kind=request.kind,
+            resolved_receiver=request.receiver,
+            blocked_reason=BLOCKED_LANE_LIFECYCLE_UNREADABLE,
+            suggested_safe_route=_suggested_unreadable_route(request),
+            same_unit=None,
+            exception_applied=False,
+        )
     disposition = _norm(request.target_lane_disposition)
     if disposition and disposition != DISPOSITION_ACTIVE:
         block_reason = _BLOCKABLE_DISPOSITIONS.get(disposition)
         if block_reason is not None:
             return GatewayRouteDecision(
                 verdict=ROUTE_BLOCKED,
-                governed=True,
+                governed=kind_governed,
                 kind=request.kind,
                 resolved_receiver=request.receiver,
                 blocked_reason=block_reason,
@@ -365,6 +405,9 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
                 same_unit=None,
                 exception_applied=False,
             )
+
+    if not kind_governed:
+        return _allowed(governed=False, same_unit=None)
 
     # Governed kind. A delivery to a non-worker provider is the governed route head
     # (coordinator -> sublane gateway, the gateway provider under this binding),
@@ -420,6 +463,13 @@ def render_block_die_message(decision: GatewayRouteDecision, lane_id: object) ->
     # cross-lane worker bypass — it is not releasable by `--allow-direct-worker` (the
     # lane is dead, not merely mis-routed), so it names the disposition and the owner
     # instead of the gateway route.
+    if decision.blocked_reason == BLOCKED_LANE_LIFECYCLE_UNREADABLE:
+        return (
+            f"gateway route enforcement (Redmine #13681): a {_norm(decision.kind)!r} "
+            f"was addressed to lane {lane!r}, but its lifecycle authority could not be "
+            f"read — fail-closed rather than risk a send into a superseded lane. "
+            f"{decision.suggested_safe_route}"
+        )
     if decision.blocked_reason in _BLOCKABLE_DISPOSITIONS.values():
         return (
             f"gateway route enforcement (Redmine #13681): a {_norm(decision.kind)!r} "
@@ -463,6 +513,7 @@ __all__ = (
     "BLOCKED_LANE_SUPERSEDED",
     "BLOCKED_LANE_HIBERNATED",
     "BLOCKED_LANE_RETIRED",
+    "BLOCKED_LANE_LIFECYCLE_UNREADABLE",
     "GatewayRouteRequest",
     "GatewayRouteDecision",
     "decide_gateway_route",

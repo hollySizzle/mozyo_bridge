@@ -272,5 +272,51 @@ class ActiveLanesStoreAdvisoryTest(unittest.TestCase):
         self.assertEqual(rows["13425"]["delivery_anomaly"], "none")
 
 
+class LifecycleDiagnosticTest(unittest.TestCase):
+    """R1 F4 (j#77247): a superseded lane's authority stays operator-visible in glance."""
+
+    def test_superseded_lane_appears_in_lifecycle_diagnostic(self):
+        import os
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DISPOSITION_ACTIVE,
+            DISPOSITION_SUPERSEDED,
+            DecisionPointer,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = LaneLifecycleStore(home=home)
+            key = LaneLifecycleKey("wProj", "issue_13583_x")
+            dec = DecisionPointer(
+                source="redmine", issue_id="13583", journal_id="76630"
+            )
+            store.declare_active(key, decision=dec, issue_id="13583")
+            store.transition_disposition(
+                key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=1,
+                target=DISPOSITION_SUPERSEDED,
+                decision=dec,
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                rc, out = _run(["workflow", "glance", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        diag = payload.get("lifecycle_diagnostic", [])
+        entry = next((d for d in diag if d["lane"] == "issue_13583_x"), None)
+        self.assertIsNotNone(entry, f"superseded lane missing from diagnostic: {diag}")
+        self.assertEqual(entry["lane_disposition"], "superseded")
+        self.assertEqual(entry["issue"], "13583")
+        # And it is NOT resurfaced into the active roster (capacity excludes it).
+        active_issues = {r.get("issue_id") for r in payload.get("rows", [])}
+        self.assertNotIn("13583", active_issues)
+
+
 if __name__ == "__main__":
     unittest.main()
