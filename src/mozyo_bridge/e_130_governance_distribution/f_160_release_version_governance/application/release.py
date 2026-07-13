@@ -78,12 +78,14 @@ _TREE_SECRET_VALUE_PATTERNS = (
 # artifact pass; it also catches code that merely *names* a credential, so
 # `_secret_assignment_is_real` below is the second-stage classifier both
 # `release check tree` and the artifact scan post-filter through. The keyword
-# sits in a *segment-bounded* identifier — underscore-delimited prefix
-# `(?:[A-Za-z0-9]*_)*` (`_API_KEY`, `OPENAI_API_KEY`) plus only the known `_ENV`
-# suffix (`API_KEY_ENV:`) — so those shapes surface without matching a glued
-# substring like `passwordless` / `access_tokenizer` (Redmine #13716 R1-F2).
+# sits in a *segment-bounded* identifier — an underscore-delimited prefix
+# `(?:[A-Za-z0-9]*_)*` plus only the known `_ENV` suffix — so `_API_KEY` /
+# `OPENAI_API_KEY` / `API_KEY_ENV:` surface without matching a glued substring
+# like `passwordless` (Redmine #13716 R1-F2). Grep and classifier share this
+# grammar exactly so a line's tree and artifact verdicts always agree (R2-F2).
 _SECRET_KEY_ALTERNATION = (
-    r"(?:[A-Za-z0-9_]*(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Za-z0-9_]*"
+    # No leading `[A-Za-z0-9_]*` here: the outer prefix owns it (grep parity, R2-F2).
+    r"(?:(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Za-z0-9_]*"
     r"(?:TOKEN|SECRET|PASSWORD|KEY))"
     r"|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)"
 )
@@ -91,17 +93,15 @@ _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?P<key>(?:[A-Za-z0-9]*_)*(?:" + _SECRET_KEY_ALTERNATION + r")(?:_ENV)?)\s*[:=]\s*(?P<value>[^\s#]+)",
     re.IGNORECASE,
 )
-# Code-structure chars (call, index, dict/set, union, redirect) mark an
-# expression, not a literal. `.` / `/` are excluded so real token shapes (dotted
-# JWTs, slash/base64, `sk.live.…` keys) survive (Redmine #12175 j#60466); dotted
-# code references (`os.environ`) instead go to `_is_attribute_path_reference`.
+# Code-structure chars (call, index, dict, union, redirect) mark an expression;
+# `.` / `/` survive so real token shapes do (JWTs, base64, `sk.live.…`; #12175
+# j#60466), while dotted code refs go to `_is_attribute_path_reference`.
 _SECRET_EXPRESSION_CHARS = frozenset("()[]{}|<>\\ \t")
 # Python / JSON / shell literals that are never a credential value.
 _SECRET_VALUE_KEYWORDS = frozenset(
     {"none", "true", "false", "null", "nil", "undefined", "..."}
 )
-# Case-insensitive substrings marking an explicit non-secret placeholder /
-# sentinel value (e.g. the `test-key-not-a-real-credential` test dummy).
+# Case-insensitive substrings marking an explicit non-secret placeholder / sentinel.
 _SECRET_PLACEHOLDER_MARKERS = (
     "example",
     "placeholder",
@@ -151,8 +151,7 @@ def _secret_value_is_real(value: str) -> bool:
     ``_secret_assignment_is_real`` where the key context is available. Accepts an
     opaque literal — the non-placeholder RHS of an ``api_key`` / ``*_API_KEY``
     assignment — INCLUDING token-shaped literals with credential punctuation
-    (``.`` ``/`` ``+`` / padding ``=``: JWTs, base64, provider keys); see the
-    focused Redmine #12175 / #13695 tests.
+    (``.`` ``/`` ``+`` / padding ``=``: JWTs, base64); see #12175 / #13695 tests.
     """
     raw = value.strip().rstrip(",;)]}")
     quoted = False
@@ -176,32 +175,33 @@ def _secret_value_is_real(value: str) -> bool:
         return False
     if any(marker in lowered for marker in _SECRET_PLACEHOLDER_MARKERS):
         return False
-    # Unquoted name references are not values. A quoted value, or an unquoted
-    # one carrying digits (abc123) / token punctuation, is a literal.
+    # Unquoted name references are not values (a quoted value, or an unquoted one
+    # carrying digits / token punctuation, is a literal).
     if not quoted:
-        # A digit-free bare identifier is a name reference (constant, type,
-        # env/file var, same-name keyword pass-through); see Redmine #12693.
+        # Digit-free bare identifier = a name reference (constant / type / env
+        # var / same-name keyword pass-through; Redmine #12693).
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner) and not any(
             ch.isdigit() for ch in inner
         ):
             return False
-        # Dotted attribute references (os.environ, config.API_KEY).
-        if _is_attribute_path_reference(inner):
+        if _is_attribute_path_reference(inner):  # os.environ, config.API_KEY
             return False
     return True
 
 
 def _secret_assignment_is_real(content: str) -> bool:
     """True if any `key [:=] value` in `content` is a real literal. A ``*_ENV``
-    key bound to an ``UPPER_SNAKE`` value is an env-var *name* constant, exempted
-    here with key context; a non-env-name value in a ``*_ENV`` key still blocks
-    (Redmine #13716)."""
+    key whose value is the UPPER_SNAKE *name* of a credential env var (UPPER_SNAKE
+    AND carrying a credential keyword) is a reference, exempted with key context;
+    an opaque uppercase secret under a ``*_ENV`` key still blocks (#13716 R2-F1)."""
     for match in _SECRET_ASSIGNMENT_RE.finditer(content):
         if not _secret_value_is_real(match.group("value")):
             continue
         inner = match.group("value").strip().rstrip(",;)]}").strip("\"'")
-        if match.group("key").upper().endswith("_ENV") and re.fullmatch(
-            r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+", inner
+        if (
+            match.group("key").upper().endswith("_ENV")
+            and re.fullmatch(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+", inner)
+            and re.search(_SECRET_KEY_ALTERNATION, inner, re.IGNORECASE)
         ):
             continue
         return True
