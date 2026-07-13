@@ -1090,6 +1090,8 @@ class R3RegressionTest(unittest.TestCase):
     ``ValueError`` out of an error contract that promises ``DecisionPointerError``.
     R4-F1 -- the same version guard trusted ``int()`` to read the recorded version, so
     a REAL ``2.5`` truncated to ``2`` and passed the recognized-version check.
+    R5-F1 -- and it collapsed a present-but-NULL row (and a failed version query) into
+    "never registered", re-stamping an unknown store as fresh.
     """
 
     def setUp(self) -> None:
@@ -1298,6 +1300,111 @@ class R3RegressionTest(unittest.TestCase):
                 target=DISPOSITION_HIBERNATED,
                 decision=_decision(journal="76887"),
             )
+
+    # -- R5-F1: a present NULL row is not "never registered" -----------------
+
+    def _null_version_store(self) -> Path:
+        """A v2 store whose component row exists but records a NULL version.
+
+        Rebuilds ``state_schema_components`` with a nullable ``schema_version`` (an
+        imagined future shape) so the NULL can be stored, then keeps the lane's
+        authority row and a future column.
+        """
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(self.key, decision=_decision(), issue_id=ISSUE)
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE state_schema_components RENAME TO _old")
+            conn.execute(
+                "CREATE TABLE state_schema_components ("
+                "component TEXT PRIMARY KEY, schema_version INTEGER, owner TEXT, "
+                "recovery_policy TEXT, migrated_from TEXT, updated_at TEXT)"
+            )
+            conn.execute("INSERT INTO state_schema_components SELECT * FROM _old")
+            conn.execute("DROP TABLE _old")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = NULL "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.execute(
+                "ALTER TABLE lane_lifecycle_records "
+                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'future'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_f1_present_null_version_fails_closed(self) -> None:
+        # A present row with a NULL version is unknown, not "never registered".
+        path = self._null_version_store()
+        before = path.read_bytes()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(path.read_bytes(), before)
+        conn = sqlite3.connect(path)
+        try:
+            storage_class, value = conn.execute(
+                "SELECT typeof(schema_version), schema_version "
+                "FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()
+            columns = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(lane_lifecycle_records)")
+            ]
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM lane_lifecycle_records"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(storage_class, "null")  # not re-stamped to integer 2
+        self.assertIsNone(value)
+        self.assertIn("future_guard", columns)
+        self.assertEqual(rows, 1)
+
+    def test_f1_present_null_version_readers_fail_closed(self) -> None:
+        self._null_version_store()
+        self.assertEqual(
+            resolve_lane_owner(WS, ISSUE, home=self.home).status, OWNER_UNKNOWN
+        )
+        self.assertIsNone(load_lane_lifecycle(home=self.home))
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).transition_disposition(
+                self.key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=1,
+                target=DISPOSITION_HIBERNATED,
+                decision=_decision(journal="76901"),
+            )
+
+    def test_f1_version_query_failure_is_not_treated_as_fresh(self) -> None:
+        # A query failing after the container was initialized is a broken store, not
+        # a fresh one -- it must not fall through to the create/register path.
+        from mozyo_bridge.core.state import lane_lifecycle_schema as schema
+
+        class _BoomConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.DatabaseError("boom")
+
+        self.assertEqual(schema._recorded_version(_BoomConn()), schema._VERSION_MALFORMED)
+        self.assertNotIn(schema._VERSION_MALFORMED, schema._RECOGNIZED_SCHEMA_VERSIONS)
+
+    def test_f1_absent_row_is_still_a_fresh_create(self) -> None:
+        # The one case that IS fresh: no component row at all.
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            version = conn.execute(
+                "SELECT schema_version FROM state_schema_components "
+                "WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(version, 2)
 
     def test_f1_integer_stored_as_real_2_0_is_still_accepted(self) -> None:
         # SQLite folds a lossless REAL 2.0 to integer 2; that is a real v2, not
