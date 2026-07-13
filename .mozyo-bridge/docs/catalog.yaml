@@ -1371,6 +1371,18 @@ documents:
       - logic-module-health-gate
       - spec-project-map
 
+  - id: logic-local-parallel-test-runner-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/local-parallel-test-runner-policy.md
+    purpose: "local isolated-process parallel test runner (Redmine #13733) の設計正本。`mozyo-bridge tests parallel` が serial `unittest discover` と同一 test 集合/verdict を isolated process shard で並列実行する契約、deterministic shard plan (duration/test-count weight の LPT)、fail-closed aggregate (failure/timeout/crash/import-error/parity-mismatch は green にしない)、shard ごとの HOME/TMPDIR/MOZYO isolation と live-session env pin 除去、明示 serial bucket 機構 (`test_parallel_policy.yaml`) とその既定が空である evidence-based 根拠、速度値を hard gate にしない不変条件を定義する。"
+    audit_role: local_parallel_test_runner_policy_logic
+    related_document_refs:
+      - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
+      - logic-module-health-gate
+      - spec-project-map
+
   - id: logic-pre-commit-focused-verification
     type: logic
     status: active
@@ -1617,6 +1629,19 @@ file_conventions:
     severity: block
     document_refs:
       - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
+      - spec-project-map
+
+  - id: fc-test-parallel-runner-source
+    name: local parallel test runner (isolated process shards) source
+    patterns:
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_parallel.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_parallel.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_parallel.py
+      - test_parallel_policy.yaml
+    severity: block
+    document_refs:
+      - logic-local-parallel-test-runner-policy
       - logic-tests-placement-discovery-policy
       - spec-project-map
 

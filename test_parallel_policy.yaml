@@ -1,0 +1,51 @@
+# Local parallel test-runner policy (Redmine #13733).
+#
+# Read by `mozyo-bridge tests parallel`. This is the single, repo-root location
+# for the runner's serial bucket and its default parallelism knobs. See
+# vibes/docs/logics/local-parallel-test-runner-policy.md for the full contract.
+#
+# A missing file resolves to the empty default (the runner works before this
+# policy is authored). A malformed file fails closed, so a broken policy never
+# silently drops the serial bucket or the timeout guard.
+
+# Serial-bucket module patterns. Any discovered module (dotted name as unittest
+# discovery reports it, e.g. `unit.e_120_operations_cockpit.test_x`) matching one
+# of these fnmatch globs is pulled out of the parallel plan and run in a single
+# serial shard that never runs concurrently with the parallel shards.
+#
+# WHY THIS IS EMPTY BY DEFAULT (this is a deliberate, evidence-based decision, not
+# an oversight):
+#   The discovered `tests/` suite is hermetic by policy
+#   (vibes/docs/logics/tests-placement-discovery-policy.md): unit / integration /
+#   scenarios / regressions tests touch no real tmux / network / owner / Redmine
+#   and no real host-global singleton. Work that touches those lives in `smoke/**`,
+#   which is OUTSIDE the `tests/` discovery root and is never run by this runner.
+#   Each shard additionally gets its own HOME / TMPDIR / MOZYO_BRIDGE_HOME (the
+#   fresh HOME kept functional via PYTHONUSERBASE + a git identity), and has the
+#   live cockpit-session env pins stripped (TMUX / TMUX_PANE / MOZYO_WORKSPACE_ID /
+#   MOZYO_LANE_ID / MOZYO_AGENT_ROLE), so tests that mutate cwd (os.chdir), HOME,
+#   or the home-scoped state store are isolated ACROSS PROCESSES. There is
+#   therefore no discovered module that is unsafe to run in its own process shard,
+#   so the serial bucket is empty; this is confirmed by dogfooding the full suite
+#   in parallel (same test set and green/red verdict as the serial run).
+#
+# WHEN TO ADD AN ENTRY:
+#   Add a pattern here only with evidence that a module is unsafe even under
+#   per-process isolation — i.e. it contends on a resource that isolated
+#   HOME/TMPDIR/MOZYO state and stripped session pins do NOT separate (a fixed
+#   TCP port, a fixed on-disk path outside HOME/TMPDIR, a real OS-level singleton).
+#   Record the evidence in the owning Redmine issue. Example:
+#     serial_modules:
+#       - "unit.e_120_operations_cockpit.test_tmux_control_port"   # fixed port
+serial_modules: []
+
+# Default number of concurrent shard workers when `--jobs` is not passed. Omit to
+# default to the host CPU count. Note this is the worker (concurrency) count, not
+# the shard count: the runner over-partitions modules into more shards than jobs
+# (default jobs*4, capped at the module count; override with `--shards`) so the
+# workers drain a finer queue.
+# default_jobs: 7
+
+# Default per-shard wall-clock timeout in seconds when `--shard-timeout` is not
+# passed. Omit for no timeout. A timed-out shard is fail-closed (never green).
+# shard_timeout_seconds: 600
