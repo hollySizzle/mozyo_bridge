@@ -270,6 +270,27 @@ Table naming:
   させない。`state_schema_components` へは `migrated_from` NULL で自己登録する (native component の
   登録形)。native component のみが載る `state.sqlite` は「partial migration」ではない (doctor は
   native-only を ok と分類し、legacy import の未実行は operator の選択として案内する)。
+- `lane_lifecycle_records` — 2 つ目の **native component** の table (#13689、Design Answer j#76741)。
+  component 名は **`lane_lifecycle`**、owner module は `core/state/lane_lifecycle.py`。lane unit
+  `(repo_workspace_id, lane_id)` の **desired lifecycle** — `lane_disposition`
+  (`active|superseded|hibernated|retired`) と `process_release`
+  (`not_requested|requested|partial|released`) — を持つ。recovery policy は `operator_current_state`
+  (coordinator の supersede / hibernate 判断は event から再構成できず、復旧は Redmine durable pointer
+  からの explicit re-declare)。`migrated_from` NULL で自己登録する。
+  - **`lane_metadata` とは別 component である**。`lane_metadata` は display join であり、その `upsert`
+    は tombstone を意図的に revive し、CAS を持たない。lifecycle authority をそこへ載せると
+    out-of-order な write が supersede / hibernate を黙って上書きする。両者の drift は **診断対象**で
+    あり、片方から他方を暗黙修復しない。
+  - 読み手は `lane_metadata` と異なり **fail-closed** する: 不読 / 不在は `unknown` であって `active`
+    ではない (推定 active は superseded lane への send を再認可してしまう)。
+  - write は CAS (`BEGIN IMMEDIATE` + expected state + exact revision + exact release action id)。
+    container guard の接続は default-isolation なので、`acquire_generation_lease` と同型に自前の
+    autocommit 接続で `BEGIN IMMEDIATE` を駆動する。
+  - active owner は partial unique index `(repo_workspace_id, issue_id) WHERE
+    lane_disposition='active' AND issue_id <> ''` で **workspace scope** に固定する。home-global な
+    unique は、同じ issue 番号を正当に持つ別 project と衝突する。
+  - `released` は command outcome / desired state であり **live absence の正本ではない**。process
+    presence は従来どおり live inventory (`observed_liveness`) を読む。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
 
 Ownership rules:

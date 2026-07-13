@@ -1,0 +1,895 @@
+"""Lane lifecycle — disposition + process-release CAS component (Redmine #13689).
+
+The durable **desired lifecycle** of a sublane unit, kept apart from the three
+things it is routinely confused with (design consultation j#76734, coordinator
+Design Answer j#76741):
+
+- **route identity** (:mod:`...domain.route_identity_ledger`) is *where to send*.
+  A lane's lifecycle must never become a routing key, so no field of this
+  component enters :class:`RouteIdentity`.
+- **lane metadata** (:mod:`mozyo_bridge.core.state.lane_metadata`) is the
+  token→label *display join*, explicitly "never routing authority". Its
+  ``upsert`` deliberately **revives a tombstone** (a re-created lane is active
+  again), and it carries no CAS — so an out-of-order write would silently undo a
+  supersede / hibernate. Lifecycle authority cannot live there; the two stay
+  separate and their drift is a *diagnostic*, never an implicit repair.
+- **process presence** is a live-inventory fact. :data:`RELEASE_RELEASED` is the
+  recorded outcome of a release *command*, **not** proof that the slots are gone:
+  a reader that needs liveness re-reads the live herdr inventory (Design Answer
+  D3; ``managed-state-model.md`` ``### 正本境界`` keeps ``observed_liveness`` on
+  the runtime).
+
+State kind (``vibes/docs/logics/managed-state-model.md``
+``### state kind ownership / recovery matrix``): ``desired_current_state``, a
+**native component** of the consolidated home-scoped ``state.sqlite`` — it shares
+the container guard (:func:`~...state_store.connect_state_container_rw`) and
+self-registers in ``state_schema_components`` with no ``migrated_from`` (there is
+no legacy file), exactly like the sibling native :mod:`...lane_metadata`.
+
+Recovery policy ``operator_current_state``: a coordinator's supersede / hibernate
+*decision* cannot be rebuilt from events, so loss requires an explicit re-declare
+from the Redmine durable pointer. Unlike ``lane_metadata`` (which fails **open**
+to a raw token so a display degrades rather than aborts), every reader here fails
+**closed**: an absent / unreadable store yields :data:`OWNER_UNKNOWN`, never an
+inferred ``active`` (Design Answer D1). Guessing ``active`` would re-authorize a
+send into a superseded lane — the exact failure this component exists to prevent.
+
+Owner exact-one (Design Answer D2, correcting the consultation's proposal): the
+partial unique index is scoped to the **workspace**
+(``(repo_workspace_id, issue_id)`` where the row is ``active`` and the issue is
+non-empty). A home-global ``UNIQUE(issue_id)`` would collide across unrelated
+projects that legitimately share an issue number. The index gives *at most one*
+active owner; :meth:`LaneLifecycleStore.resolve_owner` supplies the *exactly one*
+half by failing closed on zero / many / stale rows.
+
+Redmine boundary: the row stores a durable **pointer** (source kind + issue id +
+journal id) to the coordinator decision that set it. Journal bodies, issue status,
+and approvals are ``workflow_truth`` and are never copied into the DB
+(``managed-state-model.md``: "Redmine durable record で復旧。runtime DB へ複製しない").
+
+Concurrency: writes are CAS. Every transition takes ``BEGIN IMMEDIATE`` and
+matches an **exact expected state + revision** (and, for a release, the exact
+action generation) — the discipline of
+:meth:`...forward_outbox_fence.ForwardOutboxFence._guarded_set`. A stale,
+duplicate, or out-of-order caller updates nothing and is told why
+(:class:`CasOutcome`), rather than clobbering a newer decision.
+
+Note the container guard returns a *default-isolation* connection, which cannot
+drive ``BEGIN IMMEDIATE``; like
+:meth:`...workflow_runtime_store.WorkflowRuntimeStore.acquire_generation_lease`,
+this component uses the guard only to create / validate the container, then opens
+its own autocommit connection for the CAS itself.
+
+This module is the **store** half of the component: schema, registration, and the
+guarded writes. The closed vocabularies, the transition matrix, and the typed
+records are the pure
+:mod:`mozyo_bridge.core.state.lane_lifecycle_model`, re-exported here so callers
+have a single import surface.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional, Sequence
+
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    CAS_ACTION_MISMATCH,
+    CAS_ALREADY_DECLARED,
+    CAS_APPLIED,
+    CAS_FORBIDDEN_TRANSITION,
+    CAS_NOT_FOUND,
+    CAS_OWNER_CONFLICT,
+    CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
+    DISPOSITION_RETIRED,
+    DISPOSITION_SUPERSEDED,
+    DISPOSITIONS,
+    OWNER_ABSENT,
+    OWNER_AMBIGUOUS,
+    OWNER_RESOLVED,
+    OWNER_UNKNOWN,
+    RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
+    RELEASE_RELEASED,
+    RELEASE_REQUESTED,
+    RELEASE_STATES,
+    CasOutcome,
+    LaneLifecycleKey,
+    LaneLifecycleRecord,
+    OwnerResolution,
+    ReleasePin,
+    decode_release_pins,
+    disposition_transition_allowed,
+    encode_release_pins,
+    guard,
+    norm,
+    release_transition_allowed,
+)
+from mozyo_bridge.core.state.state_store import (
+    StateStoreError,
+    connect_state_container_rw,
+    state_store_path,
+)
+
+#: The state_schema_components identity of this native component.
+LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
+LANE_LIFECYCLE_SCHEMA_VERSION = 1
+#: A coordinator decision that cannot be rebuilt from events; loss requires an
+#: explicit re-declare from the Redmine durable pointer.
+LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
+
+_TABLE = "lane_lifecycle_records"
+_OWNER_INDEX = "idx_lane_lifecycle_active_owner"
+
+_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {_TABLE} (
+    repo_workspace_id TEXT NOT NULL,
+    lane_id TEXT NOT NULL,
+    issue_id TEXT NOT NULL DEFAULT '',
+    lane_disposition TEXT NOT NULL,
+    process_release TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    release_action_id TEXT NOT NULL DEFAULT '',
+    release_pins TEXT NOT NULL DEFAULT '',
+    decision_source TEXT NOT NULL DEFAULT '',
+    decision_journal TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (repo_workspace_id, lane_id)
+)
+"""
+
+#: At most one ACTIVE owner per (workspace, issue) — enforced by the storage
+#: engine, so "original + recovery both own the issue" is unrepresentable rather
+#: than merely detected afterwards. Scoped to the workspace (Design Answer D2): a
+#: home-global unique would collide across unrelated projects. Rows with an empty
+#: issue (a lane not bound to an issue yet) are exempt.
+_OWNER_INDEX_SQL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS {_OWNER_INDEX}
+ON {_TABLE} (repo_workspace_id, issue_id)
+WHERE lane_disposition = '{DISPOSITION_ACTIVE}' AND issue_id <> ''
+"""
+
+_COLUMNS = (
+    "repo_workspace_id, lane_id, issue_id, lane_disposition, process_release, "
+    "revision, release_action_id, release_pins, decision_source, "
+    "decision_journal, created_at, updated_at"
+)
+
+
+class LaneLifecycleError(RuntimeError):
+    """The lifecycle store is unusable (unreadable / unsupported); fail closed."""
+
+
+def lane_lifecycle_path(home: Path | None = None) -> Path:
+    """The consolidated single state DB this component lives in (state.sqlite)."""
+    return state_store_path(home)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# -- store -------------------------------------------------------------------
+
+
+class LaneLifecycleStore:
+    """CAS store for lane disposition + process release (native ``state.sqlite``)."""
+
+    def __init__(self, *, home: Path | None = None, path: Path | None = None) -> None:
+        self.path = path if path is not None else lane_lifecycle_path(home)
+
+    # -- schema / connections ------------------------------------------------
+
+    def ensure_schema(self) -> None:
+        """Create / validate the container, this component's table + owner index.
+
+        Uses the shared container guard (``PRAGMA user_version`` +
+        ``state_schema_components``), then registers this component with no
+        ``migrated_from`` — the native-component registration form.
+        """
+        try:
+            conn = connect_state_container_rw(self.path)
+        except StateStoreError as exc:
+            raise LaneLifecycleError(str(exc)) from exc
+        except sqlite3.DatabaseError as exc:
+            # An unreadable / non-SQLite file: fail closed rather than surface a raw
+            # driver error into a caller that would read it as "no lifecycle state".
+            raise LaneLifecycleError(
+                f"lane lifecycle store {self.path} is unreadable "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
+        try:
+            with conn:
+                conn.execute(_TABLE_SQL)
+                conn.execute(_OWNER_INDEX_SQL)
+                conn.execute(
+                    "INSERT INTO state_schema_components "
+                    "(component, schema_version, owner, recovery_policy, "
+                    "migrated_from, updated_at) VALUES (?, ?, ?, ?, NULL, ?) "
+                    "ON CONFLICT(component) DO UPDATE SET "
+                    "schema_version = excluded.schema_version, "
+                    "owner = excluded.owner, "
+                    "recovery_policy = excluded.recovery_policy, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        LANE_LIFECYCLE_COMPONENT,
+                        LANE_LIFECYCLE_SCHEMA_VERSION,
+                        "core/state/lane_lifecycle.py",
+                        LANE_LIFECYCLE_RECOVERY_POLICY,
+                        _utc_now(),
+                    ),
+                )
+        except sqlite3.DatabaseError as exc:
+            raise LaneLifecycleError(
+                f"lane lifecycle schema init failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def _connect(self) -> sqlite3.Connection:
+        """An autocommit connection for the CAS (the container guard's is not)."""
+        self.ensure_schema()
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout = 2000")
+        return conn
+
+    # -- reads ---------------------------------------------------------------
+
+    def get(self, key: LaneLifecycleKey) -> Optional[LaneLifecycleRecord]:
+        """The lane's row, or ``None`` when it has none. Raises when unreadable."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM {_TABLE} "
+                "WHERE repo_workspace_id = ? AND lane_id = ?",
+                key.as_row(),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise LaneLifecycleError(
+                f"lane lifecycle read failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+        return _record(row) if row is not None else None
+
+    def records(self) -> tuple[LaneLifecycleRecord, ...]:
+        """Every row (the all-lifecycle diagnostic source). Raises when unreadable."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY repo_workspace_id, lane_id"
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise LaneLifecycleError(
+                f"lane lifecycle read failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+        return tuple(_record(row) for row in rows)
+
+    def resolve_owner(self, repo_workspace_id: str, issue_id: str) -> OwnerResolution:
+        """The issue's single active owning lane in this workspace, or fail closed.
+
+        Exactly one active row resolves. Zero (:data:`OWNER_ABSENT`), many
+        (:data:`OWNER_AMBIGUOUS`), or an empty query resolves to **no owner** — a
+        caller must not fall back to "the newest lane" or a provider / pane name.
+        """
+        workspace = norm(repo_workspace_id)
+        issue = norm(issue_id)
+        if not workspace or not issue:
+            return OwnerResolution(
+                status=OWNER_ABSENT, detail="workspace or issue not supplied"
+            )
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT lane_id FROM {_TABLE} WHERE repo_workspace_id = ? "
+                "AND issue_id = ? AND lane_disposition = ?",
+                (workspace, issue, DISPOSITION_ACTIVE),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise LaneLifecycleError(
+                f"lane lifecycle read failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+        if not rows:
+            return OwnerResolution(status=OWNER_ABSENT, detail="no active owner")
+        if len(rows) > 1:
+            return OwnerResolution(
+                status=OWNER_AMBIGUOUS,
+                detail=f"{len(rows)} active owners; the owner index is not holding",
+            )
+        return OwnerResolution(status=OWNER_RESOLVED, lane_id=str(rows[0][0]))
+
+    # -- writes (CAS) --------------------------------------------------------
+
+    def declare_active(
+        self,
+        key: LaneLifecycleKey,
+        *,
+        issue_id: str = "",
+        decision_source: str = "",
+        decision_journal: str = "",
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Declare a fresh lane ``active`` / ``not_requested`` at revision 1.
+
+        Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
+        go through an explicit transition, never a silent overwrite (the
+        tombstone-reviving ``lane_metadata.upsert`` is the anti-pattern). Refuses
+        (:data:`CAS_OWNER_CONFLICT`) when the issue already has an active owner in
+        this workspace: the storage index, not a later check, is what makes double
+        ownership impossible.
+        """
+        issue = norm(issue_id)
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = _locked_row(conn, key)
+            if existing is not None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_ALREADY_DECLARED,
+                    revision=existing.revision,
+                )
+            if issue and _active_owner(conn, key.repo_workspace_id, issue):
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_OWNER_CONFLICT)
+            try:
+                conn.execute(
+                    f"INSERT INTO {_TABLE} ({_COLUMNS}) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        key.repo_workspace_id,
+                        key.lane_id,
+                        issue,
+                        DISPOSITION_ACTIVE,
+                        RELEASE_NOT_REQUESTED,
+                        1,
+                        "",
+                        "",
+                        norm(decision_source),
+                        norm(decision_journal),
+                        stamp,
+                        stamp,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # The index is the backstop the pre-checks above should have caught.
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_OWNER_CONFLICT)
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=1)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise LaneLifecycleError(
+                f"lane lifecycle declare failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def transition_disposition(
+        self,
+        key: LaneLifecycleKey,
+        *,
+        expected_disposition: str,
+        expected_revision: int,
+        target: str,
+        decision_source: str = "",
+        decision_journal: str = "",
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """CAS the lane's disposition, guarded on its exact state + revision.
+
+        Rehydrating (``hibernated -> active``) also resets the release generation:
+        the released processes are gone for good, so the next hibernate opens a
+        *fresh* generation rather than inheriting the last one's terminal state.
+        """
+        if target not in DISPOSITIONS:
+            raise ValueError(f"unknown lane disposition {target!r}")
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _locked_row(conn, key)
+            if current is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            refusal = guard(current, expected_disposition, expected_revision)
+            if refusal is not None:
+                conn.execute("ROLLBACK")
+                return refusal
+            if not disposition_transition_allowed(current.lane_disposition, target):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
+            rehydrating = target == DISPOSITION_ACTIVE
+            if rehydrating and current.issue_id:
+                # While this lane slept, another lane may have taken its issue. Coming
+                # back as a second active owner is exactly the state the owner index
+                # forbids — refuse rather than let the storage engine raise.
+                owner = _active_owner(conn, key.repo_workspace_id, current.issue_id)
+                if owner is not None and owner != key.lane_id:
+                    conn.execute("ROLLBACK")
+                    return CasOutcome(
+                        applied=False,
+                        reason=CAS_OWNER_CONFLICT,
+                        revision=current.revision,
+                    )
+            release = RELEASE_NOT_REQUESTED if rehydrating else current.process_release
+            action = "" if rehydrating else current.release_action_id
+            pins = "" if rehydrating else current.release_pins
+            revision = current.revision + 1
+            try:
+                conn.execute(
+                    f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
+                    "release_action_id = ?, release_pins = ?, revision = ?, "
+                    "decision_source = ?, decision_journal = ?, updated_at = ? "
+                    "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                    (
+                        target,
+                        release,
+                        action,
+                        pins,
+                        revision,
+                        norm(decision_source) or current.decision_source,
+                        norm(decision_journal) or current.decision_journal,
+                        stamp,
+                        key.repo_workspace_id,
+                        key.lane_id,
+                        current.revision,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_OWNER_CONFLICT,
+                    revision=current.revision,
+                )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise LaneLifecycleError(
+                f"lane lifecycle transition failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def supersede_and_activate(
+        self,
+        *,
+        superseded: LaneLifecycleKey,
+        expected_revision: int,
+        recovery: LaneLifecycleKey,
+        issue_id: str,
+        decision_source: str = "",
+        decision_journal: str = "",
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Hand an issue's ownership to a recovery lane in **one** transaction.
+
+        The old owner goes ``active -> superseded`` and the recovery lane becomes
+        the active owner atomically. There is no instant at which the issue has two
+        active owners (the partial unique index would reject it) nor zero (a reader
+        between two separate writes would have failed closed on ``absent``).
+
+        ``revision`` in the outcome is the *recovery* lane's.
+        """
+        issue = norm(issue_id)
+        if not issue:
+            raise ValueError("supersession requires the issue whose ownership moves")
+        if superseded == recovery:
+            raise ValueError("a lane cannot supersede itself")
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _locked_row(conn, superseded)
+            if current is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            refusal = guard(current, DISPOSITION_ACTIVE, expected_revision)
+            if refusal is not None:
+                conn.execute("ROLLBACK")
+                return refusal
+            if current.issue_id != issue:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_UNEXPECTED_STATE,
+                    revision=current.revision,
+                )
+            incoming = _locked_row(conn, recovery)
+            holder = _active_owner(conn, superseded.repo_workspace_id, issue)
+            if holder is not None and holder not in (
+                superseded.lane_id,
+                recovery.lane_id,
+            ):
+                # A third lane already actively owns the issue: this handover is not
+                # ours to make.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_OWNER_CONFLICT,
+                    revision=current.revision,
+                )
+            try:
+                conn.execute(
+                    f"UPDATE {_TABLE} SET lane_disposition = ?, revision = ?, "
+                    "decision_source = ?, decision_journal = ?, updated_at = ? "
+                    "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                    (
+                        DISPOSITION_SUPERSEDED,
+                        current.revision + 1,
+                        norm(decision_source) or current.decision_source,
+                        norm(decision_journal) or current.decision_journal,
+                        stamp,
+                        superseded.repo_workspace_id,
+                        superseded.lane_id,
+                        current.revision,
+                    ),
+                )
+                if incoming is None:
+                    revision = 1
+                    conn.execute(
+                        f"INSERT INTO {_TABLE} ({_COLUMNS}) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            recovery.repo_workspace_id,
+                            recovery.lane_id,
+                            issue,
+                            DISPOSITION_ACTIVE,
+                            RELEASE_NOT_REQUESTED,
+                            revision,
+                            "",
+                            "",
+                            norm(decision_source),
+                            norm(decision_journal),
+                            stamp,
+                            stamp,
+                        ),
+                    )
+                else:
+                    if incoming.lane_disposition not in (
+                        DISPOSITION_ACTIVE,
+                        DISPOSITION_HIBERNATED,
+                    ):
+                        conn.execute("ROLLBACK")
+                        return CasOutcome(
+                            applied=False,
+                            reason=CAS_FORBIDDEN_TRANSITION,
+                            revision=incoming.revision,
+                        )
+                    revision = incoming.revision + 1
+                    conn.execute(
+                        f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
+                        "process_release = ?, release_action_id = ?, release_pins = ?, "
+                        "revision = ?, decision_source = ?, decision_journal = ?, "
+                        "updated_at = ? WHERE repo_workspace_id = ? AND lane_id = ? "
+                        "AND revision = ?",
+                        (
+                            issue,
+                            DISPOSITION_ACTIVE,
+                            RELEASE_NOT_REQUESTED,
+                            "",
+                            "",
+                            revision,
+                            norm(decision_source) or incoming.decision_source,
+                            norm(decision_journal) or incoming.decision_journal,
+                            stamp,
+                            recovery.repo_workspace_id,
+                            recovery.lane_id,
+                            incoming.revision,
+                        ),
+                    )
+            except sqlite3.IntegrityError:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_OWNER_CONFLICT,
+                    revision=current.revision,
+                )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise LaneLifecycleError(
+                f"lane supersession failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def request_release(
+        self,
+        key: LaneLifecycleKey,
+        *,
+        expected_revision: int,
+        action_id: str,
+        pins: Iterable[ReleasePin],
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Open a release generation, pinning the slots it is allowed to close.
+
+        Only a lane that has already left ``active`` may open one: a lane still
+        holding its work is never a release target. The pins are the *only* slots
+        this generation may ever close, and the actuator must re-verify each one
+        against the live inventory before closing it.
+        """
+        action = norm(action_id)
+        if not action:
+            raise ValueError("a release generation requires a non-empty action id")
+        pinned = tuple(pins)
+        if not pinned:
+            raise ValueError("a release generation requires at least one pinned slot")
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _locked_row(conn, key)
+            if current is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.revision != expected_revision:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_STALE_REVISION,
+                    revision=current.revision,
+                )
+            if current.lane_disposition == DISPOSITION_ACTIVE:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_UNEXPECTED_STATE,
+                    revision=current.revision,
+                )
+            if not release_transition_allowed(
+                current.process_release, RELEASE_REQUESTED
+            ):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
+            revision = current.revision + 1
+            conn.execute(
+                f"UPDATE {_TABLE} SET process_release = ?, release_action_id = ?, "
+                "release_pins = ?, revision = ?, updated_at = ? "
+                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                (
+                    RELEASE_REQUESTED,
+                    action,
+                    encode_release_pins(pinned),
+                    revision,
+                    stamp,
+                    key.repo_workspace_id,
+                    key.lane_id,
+                    current.revision,
+                ),
+            )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise LaneLifecycleError(
+                f"lane release request failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def record_release_outcome(
+        self,
+        key: LaneLifecycleKey,
+        *,
+        action_id: str,
+        expected_revision: int,
+        target: str,
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Record a release generation's outcome, guarded by its exact action id.
+
+        The action id is part of the guard so a *stale* generation can never mark a
+        *newer* one done (Design Answer D3): an outcome carrying a foreign action id
+        is refused with :data:`CAS_ACTION_MISMATCH`, not applied to whatever
+        generation happens to be open.
+        """
+        if target not in (RELEASE_PARTIAL, RELEASE_RELEASED):
+            raise ValueError(f"a release outcome is partial or released, not {target!r}")
+        action = norm(action_id)
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _locked_row(conn, key)
+            if current is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.release_action_id != action:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_ACTION_MISMATCH,
+                    revision=current.revision,
+                )
+            if current.revision != expected_revision:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_STALE_REVISION,
+                    revision=current.revision,
+                )
+            if not release_transition_allowed(current.process_release, target):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
+            revision = current.revision + 1
+            conn.execute(
+                f"UPDATE {_TABLE} SET process_release = ?, revision = ?, updated_at = ? "
+                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ? "
+                "AND release_action_id = ?",
+                (
+                    target,
+                    revision,
+                    stamp,
+                    key.repo_workspace_id,
+                    key.lane_id,
+                    current.revision,
+                    action,
+                ),
+            )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise LaneLifecycleError(
+                f"lane release outcome failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+
+# -- internals ---------------------------------------------------------------
+
+
+def _record(row: Sequence[object]) -> LaneLifecycleRecord:
+    return LaneLifecycleRecord(
+        repo_workspace_id=str(row[0]),
+        lane_id=str(row[1]),
+        issue_id=str(row[2] or ""),
+        lane_disposition=str(row[3]),
+        process_release=str(row[4]),
+        revision=int(row[5]),
+        release_action_id=str(row[6] or ""),
+        release_pins=str(row[7] or ""),
+        decision_source=str(row[8] or ""),
+        decision_journal=str(row[9] or ""),
+        created_at=str(row[10]),
+        updated_at=str(row[11]),
+    )
+
+
+def _locked_row(
+    conn: sqlite3.Connection, key: LaneLifecycleKey
+) -> Optional[LaneLifecycleRecord]:
+    """Read the row inside the already-open ``BEGIN IMMEDIATE`` write lock."""
+    row = conn.execute(
+        f"SELECT {_COLUMNS} FROM {_TABLE} WHERE repo_workspace_id = ? AND lane_id = ?",
+        key.as_row(),
+    ).fetchone()
+    return _record(row) if row is not None else None
+
+
+
+def _active_owner(
+    conn: sqlite3.Connection, repo_workspace_id: str, issue_id: str
+) -> Optional[str]:
+    """The lane actively owning ``issue_id``, read inside the write lock.
+
+    Callers pre-check with this rather than classifying a raised
+    ``IntegrityError``: SQLite reports a unique violation by *column list*, not by
+    index name, so the two constraints on this table (the lane primary key and the
+    active-owner index) are not reliably distinguishable from the message text.
+    Holding ``BEGIN IMMEDIATE`` makes the pre-check authoritative — no other writer
+    can slip in between it and the write. The index remains the backstop.
+    """
+    row = conn.execute(
+        f"SELECT lane_id FROM {_TABLE} WHERE repo_workspace_id = ? AND issue_id = ? "
+        "AND lane_disposition = ?",
+        (repo_workspace_id, issue_id, DISPOSITION_ACTIVE),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.DatabaseError:
+        pass
+
+
+# -- module-level read wrappers (fail closed, never "probably active") --------
+
+
+def resolve_lane_owner(
+    repo_workspace_id: str, issue_id: str, *, home: Path | None = None
+) -> OwnerResolution:
+    """The issue's active owning lane, or a fail-closed status.
+
+    An unusable store yields :data:`OWNER_UNKNOWN` — deliberately *not* an empty
+    result that a caller could read as "no conflict, go ahead" (Design Answer D1).
+    """
+    try:
+        return LaneLifecycleStore(home=home).resolve_owner(repo_workspace_id, issue_id)
+    except (LaneLifecycleError, OSError) as exc:
+        return OwnerResolution(status=OWNER_UNKNOWN, detail=type(exc).__name__)
+
+
+def load_lane_lifecycle(
+    *, home: Path | None = None
+) -> Optional[tuple[LaneLifecycleRecord, ...]]:
+    """Every lifecycle row, or ``None`` when the store is unusable (fail closed)."""
+    try:
+        return LaneLifecycleStore(home=home).records()
+    except (LaneLifecycleError, OSError):
+        return None
+
+
+__all__ = (
+    "LANE_LIFECYCLE_COMPONENT",
+    "LANE_LIFECYCLE_RECOVERY_POLICY",
+    "LANE_LIFECYCLE_SCHEMA_VERSION",
+    "LaneLifecycleError",
+    "LaneLifecycleStore",
+    "lane_lifecycle_path",
+    "load_lane_lifecycle",
+    "resolve_lane_owner",
+    # re-exported from lane_lifecycle_model so the component has one import surface
+    "CAS_ACTION_MISMATCH",
+    "CAS_ALREADY_DECLARED",
+    "CAS_APPLIED",
+    "CAS_FORBIDDEN_TRANSITION",
+    "CAS_NOT_FOUND",
+    "CAS_OWNER_CONFLICT",
+    "CAS_STALE_REVISION",
+    "CAS_UNEXPECTED_STATE",
+    "DISPOSITIONS",
+    "DISPOSITION_ACTIVE",
+    "DISPOSITION_HIBERNATED",
+    "DISPOSITION_RETIRED",
+    "DISPOSITION_SUPERSEDED",
+    "OWNER_ABSENT",
+    "OWNER_AMBIGUOUS",
+    "OWNER_RESOLVED",
+    "OWNER_UNKNOWN",
+    "RELEASE_NOT_REQUESTED",
+    "RELEASE_PARTIAL",
+    "RELEASE_RELEASED",
+    "RELEASE_REQUESTED",
+    "RELEASE_STATES",
+    "CasOutcome",
+    "LaneLifecycleKey",
+    "LaneLifecycleRecord",
+    "OwnerResolution",
+    "ReleasePin",
+    "decode_release_pins",
+    "disposition_transition_allowed",
+    "encode_release_pins",
+    "release_transition_allowed",
+)

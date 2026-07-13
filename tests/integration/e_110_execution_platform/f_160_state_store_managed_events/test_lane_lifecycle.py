@@ -1,0 +1,651 @@
+"""Lane lifecycle component tests (Redmine #13689, Design Answer j#76741 Increment 1).
+
+Pins the native ``state.sqlite`` component: the closed disposition / release
+vocabularies and their transition matrix, the CAS guards (expected state, exact
+revision, exact release action generation), the workspace-scoped owner index that
+makes double ownership *unrepresentable*, atomic supersession, fail-closed reads,
+and the ``state_schema_components`` registration.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
+    CAS_ACTION_MISMATCH,
+    CAS_ALREADY_DECLARED,
+    CAS_APPLIED,
+    CAS_FORBIDDEN_TRANSITION,
+    CAS_NOT_FOUND,
+    CAS_OWNER_CONFLICT,
+    CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
+    DISPOSITION_RETIRED,
+    DISPOSITION_SUPERSEDED,
+    LANE_LIFECYCLE_COMPONENT,
+    LANE_LIFECYCLE_RECOVERY_POLICY,
+    LANE_LIFECYCLE_SCHEMA_VERSION,
+    OWNER_ABSENT,
+    OWNER_RESOLVED,
+    OWNER_UNKNOWN,
+    RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
+    RELEASE_RELEASED,
+    RELEASE_REQUESTED,
+    LaneLifecycleError,
+    LaneLifecycleKey,
+    LaneLifecycleStore,
+    ReleasePin,
+    decode_release_pins,
+    disposition_transition_allowed,
+    encode_release_pins,
+    lane_lifecycle_path,
+    load_lane_lifecycle,
+    release_transition_allowed,
+    resolve_lane_owner,
+)
+from mozyo_bridge.core.state.state_store import (  # noqa: E402
+    STATE_CONTAINER_VERSION,
+    STATE_STORE_FILENAME,
+)
+
+WS = "wsMain"
+LANE_A = "issue_13689_lane_a"
+LANE_B = "issue_13689_lane_b"
+ISSUE = "13689"
+
+
+def _pins() -> tuple[ReleasePin, ...]:
+    """The lane's two managed slots, given to the store in arbitrary order."""
+    return (
+        ReleasePin(role="codex", assigned_name=f"mzb1_{WS}_codex_{LANE_A}", locator="%1"),
+        ReleasePin(role="claude", assigned_name=f"mzb1_{WS}_claude_{LANE_A}", locator="%2"),
+    )
+
+
+def _stored_pins() -> tuple[ReleasePin, ...]:
+    """The same slots as the store persists them: role-sorted, so the row is stable."""
+    return tuple(sorted(_pins(), key=lambda p: p.role))
+
+
+class TransitionMatrixTest(unittest.TestCase):
+    """The pure edges (no store)."""
+
+    def test_disposition_edges(self) -> None:
+        for target in (
+            DISPOSITION_SUPERSEDED,
+            DISPOSITION_HIBERNATED,
+            DISPOSITION_RETIRED,
+        ):
+            self.assertTrue(disposition_transition_allowed(DISPOSITION_ACTIVE, target))
+        self.assertTrue(
+            disposition_transition_allowed(DISPOSITION_HIBERNATED, DISPOSITION_ACTIVE)
+        )
+        self.assertTrue(
+            disposition_transition_allowed(DISPOSITION_SUPERSEDED, DISPOSITION_RETIRED)
+        )
+
+    def test_superseded_never_returns_to_active(self) -> None:
+        # Reviving a superseded lane would re-create two active owners for one issue.
+        self.assertFalse(
+            disposition_transition_allowed(DISPOSITION_SUPERSEDED, DISPOSITION_ACTIVE)
+        )
+
+    def test_retired_is_terminal(self) -> None:
+        for target in (
+            DISPOSITION_ACTIVE,
+            DISPOSITION_HIBERNATED,
+            DISPOSITION_SUPERSEDED,
+        ):
+            self.assertFalse(
+                disposition_transition_allowed(DISPOSITION_RETIRED, target)
+            )
+
+    def test_release_edges(self) -> None:
+        self.assertTrue(
+            release_transition_allowed(RELEASE_NOT_REQUESTED, RELEASE_REQUESTED)
+        )
+        self.assertTrue(release_transition_allowed(RELEASE_REQUESTED, RELEASE_PARTIAL))
+        self.assertTrue(release_transition_allowed(RELEASE_REQUESTED, RELEASE_RELEASED))
+        # A pane close is idempotent, so a partial retry that closes more is progress.
+        self.assertTrue(release_transition_allowed(RELEASE_PARTIAL, RELEASE_PARTIAL))
+        self.assertTrue(release_transition_allowed(RELEASE_PARTIAL, RELEASE_RELEASED))
+        self.assertFalse(
+            release_transition_allowed(RELEASE_RELEASED, RELEASE_REQUESTED)
+        )
+        self.assertFalse(
+            release_transition_allowed(RELEASE_NOT_REQUESTED, RELEASE_RELEASED)
+        )
+
+    def test_release_pins_round_trip(self) -> None:
+        self.assertEqual(
+            decode_release_pins(encode_release_pins(_pins())), _stored_pins()
+        )
+        self.assertEqual(decode_release_pins(""), ())
+        self.assertEqual(decode_release_pins("not json"), ())
+
+
+class LaneLifecycleStoreTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.store = LaneLifecycleStore(home=self.home)
+        self.key_a = LaneLifecycleKey(WS, LANE_A)
+        self.key_b = LaneLifecycleKey(WS, LANE_B)
+        self.addCleanup(self._tmp.cleanup)
+
+    # -- component registration ---------------------------------------------
+
+    def test_lives_in_state_sqlite_and_registers_as_native_component(self) -> None:
+        self.store.ensure_schema()
+        path = lane_lifecycle_path(self.home)
+        self.assertEqual(path.name, STATE_STORE_FILENAME)
+        conn = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                STATE_CONTAINER_VERSION,
+            )
+            row = conn.execute(
+                "SELECT schema_version, recovery_policy, migrated_from "
+                "FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], LANE_LIFECYCLE_SCHEMA_VERSION)
+        self.assertEqual(row[1], LANE_LIFECYCLE_RECOVERY_POLICY)
+        self.assertIsNone(row[2])  # native: no legacy file to migrate from
+
+    def test_ensure_schema_is_idempotent(self) -> None:
+        self.store.ensure_schema()
+        self.store.ensure_schema()
+        self.assertEqual(self.store.records(), ())
+
+    def test_key_rejects_a_lane_without_a_lane_id(self) -> None:
+        # A legacy (lane-id-less) lane is #13685's scope, not silently keyed here.
+        with self.assertRaises(ValueError):
+            LaneLifecycleKey(WS, "")
+
+    # -- declare -------------------------------------------------------------
+
+    def test_declare_active_starts_at_revision_one(self) -> None:
+        outcome = self.store.declare_active(
+            self.key_a,
+            issue_id=ISSUE,
+            decision_source="redmine",
+            decision_journal="76741",
+        )
+        self.assertTrue(outcome.applied)
+        self.assertEqual(outcome.revision, 1)
+        record = self.store.get(self.key_a)
+        self.assertEqual(record.lane_disposition, DISPOSITION_ACTIVE)
+        self.assertEqual(record.process_release, RELEASE_NOT_REQUESTED)
+        self.assertEqual(record.issue_id, ISSUE)
+        self.assertEqual(record.decision_journal, "76741")
+        self.assertEqual(record.revision, 1)
+
+    def test_redeclare_is_refused_never_a_silent_overwrite(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        again = self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.assertFalse(again.applied)
+        self.assertEqual(again.reason, CAS_ALREADY_DECLARED)
+
+    def test_second_active_owner_of_one_issue_is_unrepresentable(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        conflict = self.store.declare_active(self.key_b, issue_id=ISSUE)
+        self.assertFalse(conflict.applied)
+        self.assertEqual(conflict.reason, CAS_OWNER_CONFLICT)
+        self.assertIsNone(self.store.get(self.key_b))
+
+    def test_owner_index_is_workspace_scoped(self) -> None:
+        # The same issue number in a DIFFERENT workspace is a legitimate, unrelated
+        # lane — a home-global unique index would have wrongly rejected it.
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        other = self.store.declare_active(
+            LaneLifecycleKey("wsOther", LANE_A), issue_id=ISSUE
+        )
+        self.assertTrue(other.applied)
+
+    def test_issueless_lanes_do_not_collide(self) -> None:
+        self.assertTrue(self.store.declare_active(self.key_a).applied)
+        self.assertTrue(self.store.declare_active(self.key_b).applied)
+
+    # -- disposition CAS -----------------------------------------------------
+
+    def test_transition_requires_the_exact_revision(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        stale = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=99,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.assertFalse(stale.applied)
+        self.assertEqual(stale.reason, CAS_STALE_REVISION)
+        self.assertEqual(stale.revision, 1)
+        self.assertEqual(
+            self.store.get(self.key_a).lane_disposition, DISPOSITION_ACTIVE
+        )
+
+    def test_transition_requires_the_expected_state(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        wrong = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=1,
+            target=DISPOSITION_RETIRED,
+        )
+        self.assertFalse(wrong.applied)
+        self.assertEqual(wrong.reason, CAS_UNEXPECTED_STATE)
+
+    def test_duplicate_transition_is_a_no_op_not_a_clobber(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        first = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.assertTrue(first.applied)
+        replay = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.assertFalse(replay.applied)
+        self.assertEqual(replay.reason, CAS_UNEXPECTED_STATE)
+        self.assertEqual(self.store.get(self.key_a).revision, 2)
+
+    def test_forbidden_edge_is_refused(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_RETIRED,
+        )
+        revived = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_RETIRED,
+            expected_revision=2,
+            target=DISPOSITION_ACTIVE,
+        )
+        self.assertFalse(revived.applied)
+        self.assertEqual(revived.reason, CAS_FORBIDDEN_TRANSITION)
+
+    def test_transition_on_an_undeclared_lane_is_not_found(self) -> None:
+        outcome = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_NOT_FOUND)
+
+    def test_hibernated_lane_releases_its_issue_ownership_slot(self) -> None:
+        # Ownership is *active* ownership: once hibernated, the issue has no active
+        # owner, so a fresh lane may take it (the index no longer covers the row).
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.assertTrue(self.store.declare_active(self.key_b, issue_id=ISSUE).applied)
+
+    def test_rehydrate_is_refused_when_another_lane_took_the_issue(self) -> None:
+        # The hibernate race: while lane A slept, lane B was declared owner of the
+        # issue. Waking A must not produce a second active owner.
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.assertTrue(self.store.declare_active(self.key_b, issue_id=ISSUE).applied)
+        wake = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=2,
+            target=DISPOSITION_ACTIVE,
+        )
+        self.assertFalse(wake.applied)
+        self.assertEqual(wake.reason, CAS_OWNER_CONFLICT)
+        self.assertEqual(
+            self.store.get(self.key_a).lane_disposition, DISPOSITION_HIBERNATED
+        )
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).lane_id, LANE_B)
+
+    def test_supersession_refuses_when_a_third_lane_owns_the_issue(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        third = LaneLifecycleKey(WS, "issue_13689_lane_c")
+        self.store.declare_active(third, issue_id=ISSUE)
+        # A hibernated lane is not `active`, so the guard refuses on state before it
+        # ever reaches the owner check — either way ownership does not move.
+        outcome = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=2,
+            recovery=self.key_b,
+            issue_id=ISSUE,
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).lane_id, "issue_13689_lane_c")
+
+    def test_rehydrate_resets_the_release_generation(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+        )
+        self.store.record_release_outcome(
+            self.key_a,
+            action_id="act-1",
+            expected_revision=3,
+            target=RELEASE_RELEASED,
+        )
+        back = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=4,
+            target=DISPOSITION_ACTIVE,
+        )
+        self.assertTrue(back.applied)
+        record = self.store.get(self.key_a)
+        # A terminal `released` must not leak into the lane's next life.
+        self.assertEqual(record.process_release, RELEASE_NOT_REQUESTED)
+        self.assertEqual(record.release_action_id, "")
+        self.assertEqual(record.pins, ())
+
+    # -- supersession --------------------------------------------------------
+
+    def test_supersession_moves_ownership_atomically(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        outcome = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=1,
+            recovery=self.key_b,
+            issue_id=ISSUE,
+            decision_source="redmine",
+            decision_journal="76741",
+        )
+        self.assertTrue(outcome.applied)
+        self.assertEqual(
+            self.store.get(self.key_a).lane_disposition, DISPOSITION_SUPERSEDED
+        )
+        self.assertEqual(self.store.get(self.key_b).lane_disposition, DISPOSITION_ACTIVE)
+        owner = self.store.resolve_owner(WS, ISSUE)
+        self.assertTrue(owner.resolved)
+        self.assertEqual(owner.lane_id, LANE_B)
+
+    def test_supersession_on_a_stale_revision_changes_nothing(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        outcome = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=42,
+            recovery=self.key_b,
+            issue_id=ISSUE,
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_STALE_REVISION)
+        # Neither side moved: the old lane still owns the issue, the new one is absent.
+        self.assertEqual(
+            self.store.get(self.key_a).lane_disposition, DISPOSITION_ACTIVE
+        )
+        self.assertIsNone(self.store.get(self.key_b))
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).lane_id, LANE_A)
+
+    def test_supersession_refuses_a_foreign_issue(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        outcome = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=1,
+            recovery=self.key_b,
+            issue_id="99999",
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_UNEXPECTED_STATE)
+
+    def test_supersession_can_promote_a_hibernated_recovery_lane(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.declare_active(self.key_b)
+        self.store.transition_disposition(
+            self.key_b,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        outcome = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=1,
+            recovery=self.key_b,
+            issue_id=ISSUE,
+        )
+        self.assertTrue(outcome.applied)
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).lane_id, LANE_B)
+
+    def test_supersession_refuses_a_retired_recovery_lane(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.declare_active(self.key_b)
+        self.store.transition_disposition(
+            self.key_b,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_RETIRED,
+        )
+        outcome = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=1,
+            recovery=self.key_b,
+            issue_id=ISSUE,
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_FORBIDDEN_TRANSITION)
+        # The old owner must survive a refused handover.
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).lane_id, LANE_A)
+
+    # -- release generation --------------------------------------------------
+
+    def _hibernated(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+
+    def test_release_cannot_be_requested_for_an_active_lane(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        outcome = self.store.request_release(
+            self.key_a, expected_revision=1, action_id="act-1", pins=_pins()
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_UNEXPECTED_STATE)
+
+    def test_request_release_pins_the_slots(self) -> None:
+        self._hibernated()
+        outcome = self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+        )
+        self.assertTrue(outcome.applied)
+        record = self.store.get(self.key_a)
+        self.assertEqual(record.process_release, RELEASE_REQUESTED)
+        self.assertEqual(record.release_action_id, "act-1")
+        self.assertEqual(record.pins, _stored_pins())
+
+    def test_request_release_needs_an_action_and_pins(self) -> None:
+        self._hibernated()
+        with self.assertRaises(ValueError):
+            self.store.request_release(
+                self.key_a, expected_revision=2, action_id="", pins=_pins()
+            )
+        with self.assertRaises(ValueError):
+            self.store.request_release(
+                self.key_a, expected_revision=2, action_id="act-1", pins=()
+            )
+
+    def test_partial_release_is_retryable_to_released(self) -> None:
+        self._hibernated()
+        self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+        )
+        partial = self.store.record_release_outcome(
+            self.key_a, action_id="act-1", expected_revision=3, target=RELEASE_PARTIAL
+        )
+        self.assertTrue(partial.applied)
+        done = self.store.record_release_outcome(
+            self.key_a, action_id="act-1", expected_revision=4, target=RELEASE_RELEASED
+        )
+        self.assertTrue(done.applied)
+        self.assertEqual(self.store.get(self.key_a).process_release, RELEASE_RELEASED)
+
+    def test_a_stale_generation_cannot_complete_a_newer_one(self) -> None:
+        # The crash/retry hazard: an old release action must never mark a *new*
+        # generation done (it would report slots closed that are still live).
+        self._hibernated()
+        self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+        )
+        outcome = self.store.record_release_outcome(
+            self.key_a, action_id="act-OLD", expected_revision=3, target=RELEASE_RELEASED
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_ACTION_MISMATCH)
+        self.assertEqual(self.store.get(self.key_a).process_release, RELEASE_REQUESTED)
+
+    def test_release_outcome_rejects_a_non_outcome_target(self) -> None:
+        self._hibernated()
+        with self.assertRaises(ValueError):
+            self.store.record_release_outcome(
+                self.key_a,
+                action_id="act-1",
+                expected_revision=2,
+                target=RELEASE_REQUESTED,
+            )
+
+    def test_released_is_terminal_within_the_generation(self) -> None:
+        self._hibernated()
+        self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+        )
+        self.store.record_release_outcome(
+            self.key_a, action_id="act-1", expected_revision=3, target=RELEASE_RELEASED
+        )
+        again = self.store.record_release_outcome(
+            self.key_a, action_id="act-1", expected_revision=4, target=RELEASE_PARTIAL
+        )
+        self.assertFalse(again.applied)
+        self.assertEqual(again.reason, CAS_FORBIDDEN_TRANSITION)
+
+    # -- owner resolution / durability --------------------------------------
+
+    def test_owner_resolution_is_exact_one(self) -> None:
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).status, OWNER_ABSENT)
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        resolved = self.store.resolve_owner(WS, ISSUE)
+        self.assertEqual(resolved.status, OWNER_RESOLVED)
+        self.assertEqual(resolved.lane_id, LANE_A)
+        # A superseded lane is no longer the owner.
+        self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_SUPERSEDED,
+        )
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).status, OWNER_ABSENT)
+
+    def test_owner_resolution_needs_both_workspace_and_issue(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.assertEqual(self.store.resolve_owner("", ISSUE).status, OWNER_ABSENT)
+        self.assertEqual(self.store.resolve_owner(WS, "").status, OWNER_ABSENT)
+
+    def test_state_survives_a_reopen(self) -> None:
+        self._hibernated()
+        self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+        )
+        reopened = LaneLifecycleStore(home=self.home)
+        record = reopened.get(self.key_a)
+        self.assertEqual(record.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(record.process_release, RELEASE_REQUESTED)
+        self.assertEqual(record.release_action_id, "act-1")
+        self.assertEqual(record.revision, 3)
+
+    def test_records_lists_every_disposition_for_diagnostics(self) -> None:
+        self.store.declare_active(self.key_a, issue_id=ISSUE)
+        self.store.declare_active(self.key_b)
+        self.store.transition_disposition(
+            self.key_b,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+        )
+        got = {r.lane_id: r.lane_disposition for r in self.store.records()}
+        self.assertEqual(
+            got, {LANE_A: DISPOSITION_ACTIVE, LANE_B: DISPOSITION_HIBERNATED}
+        )
+
+
+class FailClosedReadTest(unittest.TestCase):
+    """An unusable store must never read as "active" / "no conflict"."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _corrupt(self) -> None:
+        path = lane_lifecycle_path(self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"this is not a sqlite database")
+
+    def test_owner_lookup_on_a_corrupt_store_is_unknown_not_absent(self) -> None:
+        # `absent` would read as "no other owner, go ahead"; `unknown` blocks.
+        self._corrupt()
+        self.assertEqual(resolve_lane_owner(WS, ISSUE, home=self.home).status, OWNER_UNKNOWN)
+
+    def test_load_on_a_corrupt_store_is_none_not_empty(self) -> None:
+        # `()` would read as "no lanes"; `None` says "we cannot know".
+        self._corrupt()
+        self.assertIsNone(load_lane_lifecycle(home=self.home))
+
+    def test_store_raises_on_a_corrupt_db(self) -> None:
+        self._corrupt()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).records()
+
+    def test_wrappers_read_a_healthy_store(self) -> None:
+        LaneLifecycleStore(home=self.home).declare_active(
+            LaneLifecycleKey(WS, LANE_A), issue_id=ISSUE
+        )
+        self.assertEqual(resolve_lane_owner(WS, ISSUE, home=self.home).lane_id, LANE_A)
+        self.assertEqual(len(load_lane_lifecycle(home=self.home)), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
