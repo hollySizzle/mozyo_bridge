@@ -51,6 +51,14 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 #: unresolvable / non-absolute value disables wrapping (byte-invariant fallback).
 MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
 
+#: The wrapper subcommand every managed launch execs the provider THROUGH (Redmine
+#: #13637): ``<launcher> herdr agent-attest ...``. Named once so the wrapper argv
+#: (:func:`build_agent_start_argv`) and the capability probe
+#: (:func:`build_attest_capability_probe_argv`, Redmine #13748) stay in lockstep — a
+#: probe that verified a different subcommand than the wrapper actually runs would be
+#: a false parity check.
+ATTEST_WRAPPER_SUBCOMMAND: tuple[str, ...] = ("herdr", "agent-attest")
+
 
 def _is_absolute_executable(candidate: str) -> bool:
     """True iff ``candidate`` is an absolute path to an existing executable file.
@@ -93,6 +101,23 @@ def resolve_attest_launcher(env: Mapping[str, str]) -> str:
         return ""
     found = shutil.which("mozyo-bridge", path=path)
     return found if found and _is_absolute_executable(found) else ""
+
+
+def build_attest_capability_probe_argv(launcher: str) -> list[str]:
+    """The argv that probes whether ``launcher`` can run the wrapper subcommand (pure).
+
+    Redmine #13748: :func:`resolve_attest_launcher` proves the launcher is an *executable*
+    but not that its CLI still carries ``herdr agent-attest`` — an installed launcher can
+    lag unreleased source (measured: installed ``mozyo-bridge 0.10.0`` answers
+    ``herdr agent-attest --help`` with argparse ``invalid choice`` / exit 2 while the source
+    tree succeeds). ``--help`` is the actuation-free discriminant: argparse dispatches the
+    subcommand and short-circuits on the help action BEFORE the wrapper's required
+    ``--assigned-name`` / provider exec, so a present subcommand exits 0 and an absent one
+    exits 2 — without recording an attestation, spawning a provider, or touching a pane. The
+    subcommand tokens are shared with the real wrapper (:data:`ATTEST_WRAPPER_SUBCOMMAND`) so
+    the probe can never verify a path the launch would not take.
+    """
+    return [launcher, *ATTEST_WRAPPER_SUBCOMMAND, "--help"]
 
 
 def _provider_command(
@@ -220,8 +245,7 @@ def build_agent_start_argv(
     if attest_launcher:
         run_cmd = [
             attest_launcher,
-            "herdr",
-            "agent-attest",
+            *ATTEST_WRAPPER_SUBCOMMAND,
             "--assigned-name",
             assigned_name,
             "--workspace-id",
@@ -277,7 +301,9 @@ def build_agent_start_argv(
 
 
 __all__ = (
+    "ATTEST_WRAPPER_SUBCOMMAND",
     "MOZYO_BRIDGE_LAUNCHER_ENV",
     "build_agent_start_argv",
+    "build_attest_capability_probe_argv",
     "resolve_attest_launcher",
 )

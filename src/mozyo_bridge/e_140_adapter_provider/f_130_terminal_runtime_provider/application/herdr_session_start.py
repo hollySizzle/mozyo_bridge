@@ -188,6 +188,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _create_workspace,
     _invoke,
     _list_rows,
+    preflight_attest_launcher_capability,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
@@ -571,6 +572,20 @@ def prepare_session(
                 f"(resolved={resolved!r}); refusing to start a lane with an "
                 f"unresolved or mismatched provider"
             )
+
+    # Launcher command-capability preflight (Redmine #13748) — the same fail-closed
+    # boundary as the provider preflight above. The #13637 wrapper execs every launched
+    # provider THROUGH `<attest_launcher> herdr agent-attest ...`; `resolve_attest_launcher`
+    # proves the launcher is executable but NOT that its CLI still carries that subcommand.
+    # An installed launcher lagging unreleased source answers the wrapper with argparse
+    # exit 2, so every wrapped pane dies ~0.4s after start — the `sublane create` "live
+    # locator then vanishes" failure. Verify it here, before any workspace/tab/agent write,
+    # so a capability skew fails closed with recovery guidance and zero herdr actuation.
+    # Gated on a resolved wrapper AND an actual launch plan: an unwrapped (`attest_launcher
+    # == ""`) or adopt-only / dry-run run runs no wrapper, so it is never probed and stays
+    # byte-invariant (Redmine #13637 fallback preserved).
+    if attest_launcher and launch_plans:
+        preflight_attest_launcher_capability(attest_launcher, runner, timeout, env)
 
     # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
     # to launch (all adopt / dry-run) means no workspace create and no reclaim —

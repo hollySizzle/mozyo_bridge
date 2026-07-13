@@ -169,7 +169,15 @@ class _Herdr:
         start_tab=None,
         start_fails=False,
         close_fails=False,
+        attest_capable=True,
     ):
+        # Redmine #13748: whether the resolved launcher's CLI can run the wrapper
+        # subcommand. `True` (default) makes `<launcher> herdr agent-attest --help`
+        # exit 0 (a released / source-capable launcher), keeping the pre-#13748 wrap
+        # tests byte-invariant; `False` models the installed-launcher-lags-source skew
+        # (argparse `invalid choice` / exit 2) the capability preflight must catch.
+        self.attest_capable = attest_capable
+        self.attest_probes: list = []
         self.existing_rows = existing_rows or []
         # By default the launched agent lands in the workspace it was told to via
         # `--workspace` (the realistic herdr behaviour). An explicit `start_locator`
@@ -198,6 +206,18 @@ class _Herdr:
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
         self.calls.append(rest)
+        # Redmine #13748 launcher capability probe: argv[0] is the LAUNCHER (not the
+        # herdr binary) and the tail is the wrapper subcommand — the only invocation
+        # whose tail begins with "herdr". Distinguish it from real herdr calls (whose
+        # tail is ["agent", ...] / ["workspace", ...] / ...) and answer with the
+        # configured capability verdict.
+        if rest[:2] == ["herdr", "agent-attest"]:
+            self.attest_probes.append(list(argv))
+            if self.attest_capable:
+                return subprocess.CompletedProcess(argv, 0, stdout="usage: ...", stderr="")
+            return subprocess.CompletedProcess(
+                argv, 2, stdout="", stderr="invalid choice: 'agent-attest'"
+            )
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self.existing_rows}), stderr=""
@@ -391,6 +411,133 @@ class SessionStartTest(unittest.TestCase):
         self.assertNotIn("agent-attest", start)
         self.assertNotIn("MOZYO_BRIDGE_HOME", "".join(start))
         self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
+
+    # --- Launcher command-capability preflight (Redmine #13748) ---------------
+
+    def _assert_zero_herdr_actuation(self, herdr) -> None:
+        """No workspace / tab / agent / pane write happened (fail-closed boundary)."""
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertEqual(herdr.start_argvs, [])
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_incapable_launcher_via_path_fails_closed_before_side_effects(self) -> None:
+        # Redmine #13748 (acceptance 1/2/3): a launcher resolved from the trusted PATH
+        # (`_fake_launcher_env` puts `mozyo-bridge` on it) is a real executable but its
+        # CLI lacks `herdr agent-attest` — the installed-launcher-lags-unreleased-source
+        # skew (measured: installed 0.10.0 answers exit 2 while source succeeds). The
+        # capability preflight must detect it BEFORE any side effect and fail closed, not
+        # launch a pair of panes that die ~0.4s later.
+        herdr = _Herdr(attest_capable=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=herdr, extra_env=launcher_env
+                )
+        # The launcher WAS probed (not merely stat-checked for executability).
+        self.assertTrue(herdr.attest_probes)
+        self.assertEqual(herdr.attest_probes[0][1:4], ["herdr", "agent-attest", "--help"])
+        # Zero herdr actuation: no partial / immediately-vanishing lane (acceptance 2).
+        self._assert_zero_herdr_actuation(herdr)
+        # Error names the launcher path, the required command, and the recovery actions
+        # (acceptance 5). It is raised, never written to a durable store.
+        msg = str(ctx.exception)
+        self.assertIn(launcher, msg)
+        self.assertIn("herdr agent-attest", msg)
+        self.assertIn("MOZYO_BRIDGE_LAUNCHER", msg)
+
+    def test_incapable_launcher_via_explicit_override_fails_closed(self) -> None:
+        # Redmine #13748 acceptance 4: the explicit `MOZYO_BRIDGE_LAUNCHER` override path
+        # is verified too, not only the PATH fallback. Point the override at a real
+        # absolute executable whose CLI lacks the wrapper subcommand.
+        herdr = _Herdr(attest_capable=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, launcher = self._fake_launcher_env(tmp)
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                # Default launch env (provider stubs on PATH so provider preflight passes);
+                # the override — not PATH — is what resolves the launcher here.
+                self._prepare(
+                    tmp,
+                    providers=["claude"],
+                    herdr=herdr,
+                    extra_env={"MOZYO_BRIDGE_LAUNCHER": launcher},
+                )
+        self.assertTrue(herdr.attest_probes)
+        self.assertEqual(herdr.attest_probes[0][0], launcher)
+        self._assert_zero_herdr_actuation(herdr)
+        self.assertIn("herdr agent-attest", str(ctx.exception))
+
+    def test_capable_launcher_is_probed_then_launches(self) -> None:
+        # Redmine #13748: "単なる実行可能ファイル確認だけでcompatibleと見なさない" — a capable
+        # launcher is actually PROBED (not just stat-checked), and only then does the
+        # wrapped launch proceed. Guards acceptance 6 (the capable path is not regressed).
+        herdr = _Herdr(attest_capable=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            result, _, _ = self._prepare(
+                tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env
+            )
+        # The probe ran with the shared wrapper subcommand + `--help`.
+        self.assertEqual(
+            herdr.attest_probes[0], [launcher, "herdr", "agent-attest", "--help"]
+        )
+        # And the launch proceeded, wrapped through the same launcher.
+        start = herdr.start_argvs[0]
+        self.assertEqual(start[start.index("--") + 1], launcher)
+        self.assertIn("agent-attest", start)
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
+    def test_unresolvable_launcher_skips_capability_probe(self) -> None:
+        # Redmine #13748 / #13637: no resolvable launcher -> `attest_launcher == ""`
+        # (wrapping disabled, byte-invariant fallback). The capability probe must not run
+        # at all (there is no wrapper to verify), and the launch proceeds unwrapped.
+        herdr = _Herdr()  # default PATH has no `mozyo-bridge`
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
+        self.assertEqual(herdr.attest_probes, [])
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
+    def test_incapable_launcher_does_not_block_adopt_only_session(self) -> None:
+        # Redmine #13748: the preflight is gated on an actual launch plan. An adopt-only
+        # session starts NO wrapped process, so an incapable installed launcher on PATH
+        # must not block it (no wrapper runs -> nothing to verify -> never probed).
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    attest_capable=False,
+                    existing_rows=[
+                        {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w1:pOLD"}
+                    ],
+                )
+                binpath = Path(tmp) / "fake-herdr"
+                binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+                env = _launch_env(binpath)
+                env.update(launcher_env)
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex"],
+                    lane_id="lane-1",
+                    env=env,
+                    runner=herdr.run,
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w1:pOLD"
+                    ),
+                )
+        self.assertEqual(result.slots[0].outcome, SLOT_ADOPTED)
+        # Never probed: an adopt-only run has no wrapper to verify.
+        self.assertEqual(herdr.attest_probes, [])
+        self._assert_zero_herdr_actuation(herdr)
 
     def test_wrapped_launch_injects_store_home_matching_reader(self) -> None:
         # Finding 1 (review j#76492): the wrapped launch injects

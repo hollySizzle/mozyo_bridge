@@ -40,6 +40,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _parse_tab_created,
     _parse_workspace_created,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    MOZYO_BRIDGE_LAUNCHER_ENV,
+    build_attest_capability_probe_argv,
+)
 
 
 def _invoke(
@@ -70,6 +74,66 @@ def _invoke(
             or f"herdr {list(tail)!r} exited {completed.returncode}"
         )
     return completed
+
+
+def preflight_attest_launcher_capability(
+    launcher: str,
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+) -> None:
+    """Fail closed unless ``launcher`` can run the ``herdr agent-attest`` wrapper.
+
+    Redmine #13748. The #13637 managed launch execs every provider THROUGH
+    ``<launcher> herdr agent-attest ...`` so the agent self-attests its injected
+    identity env before the provider starts. :func:`resolve_attest_launcher` verifies
+    the launcher is an *executable* but NOT that its CLI still carries that subcommand:
+    an installed launcher can lag unreleased source (measured — installed
+    ``mozyo-bridge 0.10.0`` answers the wrapper subcommand with argparse ``invalid
+    choice`` / exit 2 while the source tree succeeds), so every wrapped pane exits ~0.4 s
+    after start, ``sublane create`` returns a live locator, and the lane then vanishes —
+    the failure this preflight closes.
+
+    The probe (:func:`build_attest_capability_probe_argv`) runs the subcommand with
+    ``--help``, which dispatches and short-circuits before any actuation (no attestation
+    write, no provider exec, no pane). It is invoked HERE — before the caller's first
+    ``workspace`` / ``tab`` / ``agent`` write — so an executable-but-incapable launcher
+    aborts the run with zero side effect. Any non-zero exit, or a mechanical failure to
+    even run the probe, fails closed: without a positive capability signal the wrapped
+    launch is unsafe. The error names the launcher path, the required command, and the
+    two recovery actions (release/install a capable ``mozyo-bridge``, or pin an explicit
+    absolute :data:`MOZYO_BRIDGE_LAUNCHER_ENV`); it is raised, never written to a durable
+    store, so no personal path is persisted.
+
+    Only an executable-but-incapable launcher reaches here. An unresolvable launcher is
+    already ``""`` (wrapping disabled — the byte-invariant #13637 fallback), and the
+    caller only probes when a wrapper will actually run (a launch plan under a resolved
+    launcher); an adopt-only / dry-run session starts no wrapped process and is never
+    probed.
+    """
+    probe = build_attest_capability_probe_argv(launcher)
+    try:
+        completed = runner(
+            probe, capture_output=True, text=True, timeout=timeout, env=dict(env)
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HerdrSessionStartError(
+            f"managed-launch preflight could not run launcher {launcher!r} to verify it "
+            f"provides the required `herdr agent-attest` wrapper subcommand "
+            f"({exc.__class__.__name__}); refusing to launch a provider whose "
+            f"self-attestation wrapper may exit before the provider starts. Recovery: "
+            f"install or release a mozyo-bridge whose CLI has `herdr agent-attest`, or "
+            f"set {MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
+        ) from exc
+    if completed.returncode != 0:
+        raise HerdrSessionStartError(
+            f"selected managed-launch launcher {launcher!r} cannot run the required "
+            f"`herdr agent-attest` wrapper subcommand (probe exited "
+            f"{completed.returncode}); its self-attestation wrapper would exit before the "
+            f"provider starts, leaving a partial / immediately-vanishing lane. Recovery: "
+            f"install or release a mozyo-bridge whose CLI has `herdr agent-attest`, or set "
+            f"{MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
+        )
 
 
 def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
@@ -183,4 +247,5 @@ __all__ = (
     "_create_workspace",
     "_invoke",
     "_list_rows",
+    "preflight_attest_launcher_capability",
 )
