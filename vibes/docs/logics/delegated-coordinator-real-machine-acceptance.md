@@ -67,9 +67,13 @@ j#75661 の判断で #12622 へ supersede した。したがって #12590 を cu
 #12546 を実行する前に満たす現行 predecessor chain は次のとおり。version 名だけで優先順位を
 表現せず、Redmine relation を durable priority record とする。
 
-1. #13582「GK3500 external-parent workspace の governed onboarding」+ #13583「default-lane
-   workflow-role authority」+ #13595「session-start --dry-run の workspace mutation 修正」を
-   解消する。これらは external-parent readiness と route / role / dry-run purity の前提である。
+1. #13581 の predecessor group（Redmine relation `precedes → #13581`）を解消する。open:
+   #13582「GK3500 external-parent workspace の governed onboarding」/ #13598「本 acceptance
+   docs drift 修正」（本 doc 自身）。closed（履歴前提として有効）: #13583「default-lane
+   workflow-role authority」/ #13595「session-start --dry-run の workspace mutation 修正」/
+   #13641「bare mozyo root git-root-first 解決」/ #13637「herdr adopted-agent identity
+   triplet」。これらは external-parent readiness と route / role / dry-run purity / root 解決
+   / agent identity の前提である。
 2. #13581「current Herdr external-parent readiness preflight」で fresh preflight を read-only
    に取り直す。
 3. #12709「GK3500 修正後 祖父・親・子・孫 実機 smoke rerun」を exploratory rerun gate として

@@ -30,9 +30,10 @@ classical tests へ落とす契約、実機に残す最小確認、過去の fai
 `delegated-coordinator-real-machine-acceptance.md` の `Current Roadmap Gates` を読む。
 layout gate は closed #12622「Source/Test layout を Redmine 番号付き Epic/Feature 階層へ
 全面再移行する」を履歴根拠とし、superseded #12590 を current hard gate として扱わない。
-#12546 autonomous parent smoke は、現行 predecessor chain
-#13582 + #13583 + #13595 → #13581 → #12709 の後に実行し、その後に #12461 retirement /
-cleanup verification が続く。
+#12546 autonomous parent smoke は、現行 predecessor chain（Redmine relation
+`precedes → #13581`）の後に実行する。#13581 predecessor は open #13582 / #13598、closed
+（履歴前提）#13583 / #13595 / #13641 / #13637 で、これらが → #13581 → #12709 → #12546 の
+順に並び、その後に #12461 retirement / cleanup verification が続く。
 
 ## #12474 / #12484 / #12485 で分かった failure mode
 
@@ -128,9 +129,11 @@ Redmine MCP 実体に依存せず、receiver に渡す issue surface を fixture
 
 classical tests を通した後、実機 smoke は次だけを見る。
 
-- 現行 predecessor chain（#13582 + #13583 + #13595 → #13581 → #12709）が pre-smoke gate
-  として満たされており、その記録が Redmine #12499 / #12546 から追跡できる。layout gate は
-  closed #12622 を履歴根拠とし、superseded #12590 を current gate として扱わない。
+- #13581 predecessor group（Redmine relation `precedes → #13581`: open #13582 / #13598、
+  closed #13583 / #13595 / #13641 / #13637）→ #13581 → #12709 が pre-smoke gate として
+  満たされており、その記録が Redmine #12499 / #12546 から追跡できる。closed prerequisite も
+  履歴前提として有効。layout gate は closed #12622 を履歴根拠とし、superseded #12590 を
+  current gate として扱わない。
 - fresh panes / worktrees が stale evidence なしで用意される。
 - `delegated-coordinator-real-machine-acceptance.md` が定義する test model
   (`autonomous_parent`, `bounded_read`, `context_rich`) が Start Gate で明示されている。
