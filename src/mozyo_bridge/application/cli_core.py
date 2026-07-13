@@ -53,6 +53,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_sublane_list,
     cmd_sublane_retire,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_supersede import (
+    cmd_sublane_supersede,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -726,6 +729,71 @@ def register_lifecycle(sub) -> None:
     add_repo_option(sublane_retire)
     _add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)
+
+    sublane_supersede = sublane_sub.add_parser(
+        "supersede",
+        help=(
+            "Redmine #13681: hand an issue's ownership from a superseded lane to its "
+            "recovery successor, then release the superseded lane's managed processes "
+            "(tombstone-free — never removes a worktree, deletes a branch, or closes "
+            "the issue). Fail-closed preflight (both identities known, successor "
+            "attested, same issue, original idle). Default is preflight only; "
+            "--execute performs the handover. Exits non-zero when blocked."
+        ),
+    )
+    sublane_supersede.add_argument(
+        "--issue", required=True, help="Redmine issue id whose ownership moves"
+    )
+    sublane_supersede.add_argument(
+        "--original-lane",
+        dest="original_lane",
+        required=True,
+        help="Lane label being superseded (e.g. issue_<id>_<slug>)",
+    )
+    sublane_supersede.add_argument(
+        "--recovery-lane",
+        dest="recovery_lane",
+        required=True,
+        help="Recovery successor lane label taking ownership",
+    )
+    sublane_supersede.add_argument(
+        "--journal",
+        required=True,
+        help="Redmine journal id that authorizes the handover (durable anchor)",
+    )
+    # Durable-record invariants the operator asserts the original lane is idle under
+    # (each defaults to unsatisfied so an omitted flag fails closed).
+    sublane_supersede.add_argument(
+        "--callbacks-drained",
+        dest="callbacks_drained",
+        action="store_true",
+        help="The original lane owes no outstanding coordinator callback.",
+    )
+    sublane_supersede.add_argument(
+        "--no-pending-prompt",
+        dest="no_pending_prompt",
+        action="store_true",
+        help="The original lane has no composer input pending.",
+    )
+    sublane_supersede.add_argument(
+        "--not-working",
+        dest="not_working",
+        action="store_true",
+        help="The original lane has no work in flight.",
+    )
+    sublane_supersede.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Perform the handover: CAS the ownership move (original active->superseded, "
+            "recovery->active owner) and release the original's managed processes. "
+            "Without it this is preflight only (no mutation)."
+        ),
+    )
+    add_repo_option(sublane_supersede)
+    _add_lifecycle_json(sublane_supersede)
+    sublane_supersede.set_defaults(func=cmd_sublane_supersede)
 
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
     # is the opt-in write side: it mints durable herdr assigned names for the

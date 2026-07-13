@@ -218,6 +218,10 @@ def _resolve_sublane_ops(
             lane_label=request.lane_label,
             issue=request.issue,
             branch=request.branch,
+            # Redmine #13681 W1: the durable-anchor journal that authorizes this lane's
+            # owner binding rides the same `--journal` the dispatch leg carries. A create
+            # with no journal is owner-unbound (no lifecycle row).
+            journal=request.journal or "",
             quiet_stdout=quiet_stdout,
         )
     return LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=quiet_stdout)

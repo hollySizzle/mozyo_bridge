@@ -44,6 +44,46 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.shared.errors import die
 
 
+def _resolve_target_disposition(preflight_target: Any) -> Tuple[Optional[str], bool]:
+    """``(disposition, unreadable)`` for the target lane's lifecycle authority (#13681).
+
+    Three distinct outcomes, kept apart so an unreadable authority never masquerades as
+    active (R1 F3, j#77247):
+
+    - ``(None, False)`` — the target has no ``(workspace_id, lane_id)`` unit, a malformed
+      unit, or a readable store with **no row** for the lane (owner-unbound). Byte-
+      invariant: no disposition block. An owner-unbound lane is a deliberate
+      compatibility carve-out until legacy migration (#13685), never assumed active.
+    - ``(disposition, False)`` — a lifecycle row resolved; a non-active disposition
+      zero-sends. Keys on the SAME ``(project workspace segment, lane_label)`` unit the
+      create (W1) and supersede (W2) writes use.
+    - ``(None, True)`` — the store could not be READ (missing driver / corruption /
+      permission). Fail-closed: the send is refused rather than assumed active, because
+      an unreadable authority may be masking a superseded lane (#13689 contract).
+    """
+    workspace = getattr(preflight_target, "workspace_id", None)
+    lane = getattr(preflight_target, "lane_id", None)
+    if not workspace or not lane:
+        return None, False
+    from mozyo_bridge.core.state.lane_lifecycle import (
+        LaneLifecycleError,
+        LaneLifecycleKey,
+        LaneLifecycleStore,
+    )
+
+    try:
+        key = LaneLifecycleKey(str(workspace), str(lane))
+    except ValueError:
+        # A malformed unit cannot address a lifecycle row — not a read failure.
+        return None, False
+    try:
+        record = LaneLifecycleStore().get(key)
+    except (LaneLifecycleError, OSError):
+        # Action-time read failure: fail closed (zero-send), never assumed active.
+        return None, True
+    return (record.lane_disposition, False) if record is not None else (None, False)
+
+
 def enforce_gateway_route(
     args: argparse.Namespace,
     *,
@@ -87,6 +127,9 @@ def enforce_gateway_route(
     # the loader's RepoLocalConfigError.
     binding, _warnings = load_workflow_binding()
     worker_provider = binding.provider_for(ROLE_IMPLEMENTER) or PROVIDER_CLAUDE
+    target_disposition, target_lifecycle_unreadable = _resolve_target_disposition(
+        preflight_target
+    )
     decision = decide_gateway_route(
         GatewayRouteRequest(
             kind=kind,
@@ -99,6 +142,12 @@ def enforce_gateway_route(
             target_role=preflight_target.role,
             allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
             worker_provider=worker_provider,
+            # Redmine #13681 W3 + R1 F2/F3 (j#77247): zero-send ANY delivery to a lane the
+            # lifecycle authority marks non-active (superseded / hibernated / retired), and
+            # fail closed when that authority is unreadable. An owner-unbound lane (no row)
+            # resolves to (None, False) and stays byte-invariant.
+            target_lane_disposition=target_disposition,
+            target_lane_lifecycle_unreadable=target_lifecycle_unreadable,
         )
     )
     if decision.is_blocked:

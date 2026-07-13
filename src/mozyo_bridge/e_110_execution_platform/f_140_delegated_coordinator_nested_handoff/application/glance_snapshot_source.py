@@ -24,7 +24,8 @@ fabricates a false alarm.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from pathlib import Path
+from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     CALLBACK_NONE,
@@ -517,14 +518,119 @@ def enumerate_active_lanes(repo_root) -> tuple:
     except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the glance
         return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
 
+    # Redmine #13681 W4 (Design Answer j#76630 required correction): the active-capacity
+    # roster must exclude a lane the lifecycle authority marks non-active — a superseded /
+    # hibernated / retired lane still holding live panes would otherwise consume capacity
+    # in the window between the disposition write and the process release. Join the
+    # lifecycle records by the lane's `(workspace_id, lane_id)` unit; a lane with
+    # disposition `active`, no lifecycle row (owner-unbound), or an unreadable lifecycle
+    # store stays in the roster (byte-invariant, and over-counting capacity is the
+    # conservative direction — it never over-dispatches). This replaces the dead
+    # `state != "retired"` condition: `view.state` is the pane-liveness projection
+    # (active|gateway_only|worker_only|detached), which never carries `retired`, so the
+    # old filter excluded nothing.
+    disposition_by_unit = _lifecycle_disposition_by_unit()
     roster = []
     for view in views:
         issue = str(getattr(view, "issue", "") or "").strip()
         lane = str(getattr(view, "lane_label", "") or getattr(view, "lane_id", "") or "").strip()
-        state = str(getattr(view, "state", "") or "").strip()
-        if issue and state != "retired":
+        workspace = str(getattr(view, "workspace_id", "") or "").strip()
+        lane_id = str(getattr(view, "lane_id", "") or "").strip()
+        disposition = disposition_by_unit.get((workspace, lane_id))
+        if disposition is not None and disposition != _DISPOSITION_ACTIVE:
+            # Non-active disposition: excluded from active capacity (kept on the
+            # lifecycle diagnostic roster below).
+            continue
+        if issue:
             roster.append((issue, lane))
     return tuple(roster), None
+
+
+#: Bound lazily so the pure glance path never imports the state layer unless a roster
+#: enumeration actually runs.
+_DISPOSITION_ACTIVE = "active"
+
+
+def _lifecycle_disposition_by_unit() -> dict:
+    """``{(workspace_id, lane_id): lane_disposition}`` from the lifecycle store.
+
+    Empty when the store is unusable — a read failure never drops or reclassifies a
+    lane (the roster then keeps every live lane, the pre-#13681 behaviour). The
+    disposition axis is authoritative only when it is readable. Uses the **non-creating**
+    read (R2-F2): folding the roster never writes ``state.sqlite``.
+    """
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
+
+        records = load_lane_lifecycle_readonly()
+    except Exception:  # noqa: BLE001 - a lifecycle read never raises out of the glance
+        return {}
+    if not records:
+        return {}
+    return {
+        (rec.repo_workspace_id, rec.lane_id): rec.lane_disposition for rec in records
+    }
+
+
+def _repo_scope_workspace_id(repo_root) -> Optional[str]:
+    """The current repo's workspace segment for scoping the diagnostic (R2-F3, j#77292).
+
+    ``None`` when it cannot be resolved — the caller then reports the diagnostic
+    degraded rather than guessing (and never leaks another repo's lanes).
+    """
+    if repo_root is None:
+        return None
+    try:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            herdr_workspace_segment,
+        )
+
+        segment = herdr_workspace_segment(Path(repo_root))
+    except Exception:  # noqa: BLE001 - an unresolved scope never raises out of the glance
+        return None
+    return segment or None
+
+
+def enumerate_lifecycle_diagnostic(repo_root=None) -> tuple:
+    """The lifecycle diagnostic roster: this repo's non-active lanes, `(rows, error)`.
+
+    The capacity/diagnostic split the Design Answer (j#76630) requires: a superseded /
+    hibernated / retired lane is excluded from the active-capacity roster
+    (:func:`enumerate_active_lanes`) but MUST stay visible here, together with its
+    process-release progress, so a released lane reads as `superseded/released` on the
+    diagnostic surface rather than vanishing.
+
+    Scoped to the current repo (R2-F3): the lifecycle store is home-scoped (shared
+    across repos), but each row's authority is its ``repo_workspace_id``, so the
+    diagnostic is filtered to the current repo's workspace segment — matching the
+    repo-scoped active roster, never mixing in another repo's lanes. Read-only (R2-F2):
+    the fold uses the non-creating loader, so a read-only ``workflow glance`` never
+    writes ``state.sqlite``. Fail-closed: an unreadable store, or an unresolved repo
+    scope while non-active rows exist, is reported as an error (never a silent empty).
+
+    Each row is `(issue, lane_id, disposition, process_release)`.
+    """
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
+
+        records = load_lane_lifecycle_readonly()
+    except Exception as exc:  # noqa: BLE001
+        return (), f"lifecycle diagnostic enumeration failed ({type(exc).__name__})"
+    if records is None:
+        return (), "lifecycle diagnostic enumeration failed (store unreadable)"
+    non_active = [r for r in records if r.lane_disposition != _DISPOSITION_ACTIVE]
+    if not non_active:
+        # Nothing to diagnose — no scope resolution needed (and none is a failure).
+        return (), None
+    scope_ws = _repo_scope_workspace_id(repo_root)
+    if scope_ws is None:
+        return (), "lifecycle diagnostic scope unresolved (repo workspace id unknown)"
+    rows = tuple(
+        (rec.issue_id, rec.lane_id, rec.lane_disposition, rec.process_release)
+        for rec in non_active
+        if rec.repo_workspace_id == scope_ws
+    )
+    return rows, None
 
 
 def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=None) -> GlanceCollection:
