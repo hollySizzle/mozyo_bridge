@@ -399,10 +399,22 @@ lane_placement:
   (default = project workspace / sublane = lane tab) を占有し (`--split` 無し)、2nd slot が
   `--split <dir>` で隣に置かれる。`--split` は `--tab` と独立に出せる (herdr 0.7.1 は両者を独立 optional
   flag として受理) ため、tab を持たない default pair も縦分割できる。
+- **active-target と first-launch `--focus` (Redmine #13646 R1-F1、実機実測)**: herdr の split は
+  **container の active pane** を割る。`agent start` に pane-target flag は無い。全 launch を
+  `--no-focus` にすると container の空 root pane が active のままなので、2nd slot の `--split <dir>` は
+  **1st agent ではなく root pane** を割り、その root を reclaim した時点で nested split が畳まれ、1st agent
+  の暗黙 split が作った外側の既定 `right` だけが残る = **設定方向が無言で効かない**。
+  → **fresh container で explicit placement を実現する時だけ、1st launch を `--focus`** にして split target
+  を 1st agent へ固定し、2nd 以降は `--split <dir> --no-focus` とする。root pane reclaim は従来どおり
+  **全 launch 成功後** (partial-launch safety を壊さない)。
+  発火条件は狭く限定する: container occupancy = 0 かつ launch 対象 2 件以上かつ `split`/`order` が
+  explicit。**unset / single-provider / heal / mixed adopt では発火しない** (byte/layout invariant)。
+  なお `--split right` literal (#13411) も同じ理由で本来効いておらず、観測される `right` は herdr 既定
+  split の偶然の一致だった。unset lane class はその挙動をそのまま維持する。
 - **single-provider request**: `order` は **未要求の peer を暗黙 launch しない**。heal は欠けた provider
   だけを launch する。
 - **heal**: 生存 sibling の隣へ configured `--split <dir>` で launch する。既存 pane は swap / move /
-  bounce しない。
+  bounce / focus しない (container の唯一の pane = 生存 sibling が既に split target なので `--focus` 不要)。
 - **order best-effort**: herdr `agent start` に pane-target flag は存在しない (実 `--help` 照合) ため、
   役割順序は **launch 順としてのみ**実現できる。configured primary (`order[0]`) が後から復旧し、生存
   sibling の隣へ split するしかない場合は物理順序を満たせないので、その slot の `detail` に

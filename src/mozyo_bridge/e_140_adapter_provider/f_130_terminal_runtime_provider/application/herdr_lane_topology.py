@@ -30,6 +30,7 @@ and route authority are unchanged; only the herdr placement subdivides.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -403,6 +404,112 @@ def resolve_placement_policy(
     return resolved.split, resolved.order
 
 
+def resolve_focus_first_launch(
+    *,
+    config_split: Optional[str],
+    config_order: Optional[Sequence[str]],
+    launch_count: int,
+    container_occupancy: int,
+) -> bool:
+    """True iff this run's FIRST launch must carry ``--focus`` (pure).
+
+    The R1-F1 fix (review j#76613, Design Answer R1 j#76616). herdr splits a container's
+    ACTIVE pane and ``agent start`` has no pane-target flag, so when every launch is
+    ``--no-focus`` the container's empty ROOT pane stays active: the second slot's
+    ``--split <dir>`` splits the root rather than the first agent, and reclaiming the root
+    (after all launches, #13330) collapses that split away — leaving only the outer default
+    ``right`` split the first agent implicitly created. The configured direction silently
+    never applies (live-measured on BOTH the tab-less default pair and the lane tab: the
+    pre-#13646 ``--split right`` literal only *looked* correct because it coincides with
+    herdr's default direction, j#76622). Focusing the first launch pins the container's
+    split target to that agent, so the second slot splits the AGENT and the direction
+    survives the reclaim.
+
+    Deliberately narrow (j#76616), so nothing else changes shape:
+
+    - ``container_occupancy == 0`` — a FRESH container. A heal / mixed adopt joins a
+      container whose only pane is the live sibling, which is therefore already the split
+      target; a live pane is never focused / moved / swapped.
+    - ``launch_count >= 2`` — a full pair. A single-provider request has no second slot to
+      place, so the focus policy never fires.
+    - explicit placement (``config_split`` or ``config_order`` set) — an UNSET lane class
+      keeps ``--no-focus`` on every launch and stays byte-for-byte the pre-#13646 argv.
+      (An unset sublane therefore keeps its historical — coincidentally correct — ``right``
+      layout; only an explicitly configured lane class opts into the corrected placement.)
+
+    Note this keys on the CONFIG being explicit, not on the effective split direction: an
+    unset ``sublane`` still resolves ``split_direction == "right"`` by legacy default, and
+    must NOT gain a ``--focus`` it never had.
+    """
+    if container_occupancy != 0 or launch_count < 2:
+        return False
+    return config_split is not None or config_order is not None
+
+
+@dataclass(frozen=True)
+class ContainerPlan:
+    """How this run places its launches inside the target container (pure value).
+
+    - :attr:`split_direction` — the ``--split`` value a splitting slot uses (``""`` = none).
+    - :attr:`occupancy` — how many of the lane's slots already occupy the container, so the
+      first launch into a fresh one occupies and the rest split beside it.
+    - :attr:`focus_first` — whether the first launch must carry ``--focus`` to own the
+      container's split target (the R1-F1 fix).
+    """
+
+    split_direction: str
+    occupancy: int
+    focus_first: bool
+
+
+def resolve_container_plan(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    target_workspace: str,
+    lane_id: str,
+    *,
+    lane_class: str,
+    target_tab: str,
+    lane_slot_tabs: Sequence[str],
+    config_split: Optional[str],
+    config_order: Optional[Sequence[str]],
+    launch_count: int,
+) -> ContainerPlan:
+    """The whole container placement plan for this run (pure; the single entry point).
+
+    Composes the three decisions the session-start composition root needs — the effective
+    split direction (:func:`resolve_split_direction`), the container's initial occupancy
+    (:func:`initial_container_occupancy`), and whether the first launch must own the split
+    target (:func:`resolve_focus_first_launch`) — so the orchestrator makes ONE call and
+    holds no placement logic of its own.
+
+    The default-lane occupancy is only counted when a split direction is configured, so an
+    unset default lane never reads the inventory and stays byte-for-byte the pre-#13646 launch.
+    """
+    split_direction = resolve_split_direction(lane_class, config_split)
+    occupancy = initial_container_occupancy(
+        rows,
+        workspace_id,
+        target_workspace,
+        lane_id,
+        lane_class=lane_class,
+        target_tab=target_tab,
+        lane_slot_tabs=lane_slot_tabs,
+        count_default_lane=bool(
+            launch_count and target_workspace and config_split is not None
+        ),
+    )
+    focus_first = resolve_focus_first_launch(
+        config_split=config_split,
+        config_order=config_order,
+        launch_count=launch_count,
+        container_occupancy=occupancy,
+    )
+    return ContainerPlan(
+        split_direction=split_direction, occupancy=occupancy, focus_first=focus_first
+    )
+
+
 def slot_placement(
     kind: str,
     provider: str,
@@ -410,12 +517,19 @@ def slot_placement(
     split_direction: str,
     occupancy: int,
     config_order: Optional[Sequence[str]],
-) -> "tuple[str, bool]":
-    """One slot's ``(--split value, order_deferred)`` decision (pure).
+    focus_first: bool = False,
+) -> "tuple[str, bool, bool]":
+    """One slot's ``(--split value, focus, order_deferred)`` decision (pure).
 
     A slot splits only when it actually LAUNCHES into an already-occupied container; the
     container's first launch occupies it and emits no ``--split``. Adopted / planned /
     stale / unattested slots launch nothing, so they never carry a placement flag.
+
+    ``focus`` is set on the FIRST launch into a fresh container when ``focus_first`` applies
+    (see :func:`resolve_focus_first_launch`): that pins the container's split target to the
+    first agent so the later slots split the AGENT, not the empty root pane that would be
+    reclaimed out from under the split (R1-F1, j#76613 / j#76616). Only the first launch is
+    ever focused — a splitting slot never is.
 
     ``order_deferred`` (Design Answer j#76564 Q2) flags the one case the configured order
     cannot be satisfied physically: the configured PRIMARY (``config_order[0]`` — the
@@ -425,10 +539,12 @@ def slot_placement(
     direction and the caller records ``order_deferred_until_full_relaunch`` instead of
     silently claiming the order was applied. A full relaunch of the pair realizes it.
     """
-    if kind != "launch" or occupancy <= 0:
-        return "", False
+    if kind != "launch":
+        return "", False, False
+    if occupancy <= 0:
+        return "", bool(focus_first), False
     deferred = bool(config_order is not None and provider == config_order[0])
-    return split_direction, deferred
+    return split_direction, False, deferred
 
 
 def _host_workspace_label(repo_root: Path) -> str:
@@ -575,7 +691,10 @@ __all__ = (
     "_host_workspace_label",
     "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "ContainerPlan",
     "initial_container_occupancy",
+    "resolve_container_plan",
+    "resolve_focus_first_launch",
     "resolve_launch_order",
     "resolve_placement_policy",
     "resolve_split_direction",

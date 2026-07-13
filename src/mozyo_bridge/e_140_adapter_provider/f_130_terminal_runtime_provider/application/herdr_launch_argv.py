@@ -129,6 +129,7 @@ def build_agent_start_argv(
     target_workspace: str,
     target_tab: str,
     split: str,
+    focus: bool,
     binary: str,
     attest_launcher: str,
     store_home: str,
@@ -165,13 +166,27 @@ def build_agent_start_argv(
     <dir>`` is appended for a slot that splits beside an occupant. ``split`` is the
     resolved direction the caller already decided (``""`` = emit no ``--split``): the
     session-start composition root resolves it from the lane class + ``lane_placement``
-    config, so this pure builder never reads config and only renders the two placement
-    flags. A ``sublane`` slot that historically split gets ``split="right"`` (byte-for-byte
-    the pre-#13646 literal) unless configured otherwise; the ``default`` lane passes
+    config, so this pure builder never reads config and only renders the placement flags.
+    A ``sublane`` slot that historically split gets ``split="right"`` (byte-for-byte the
+    pre-#13646 literal) unless configured otherwise; the ``default`` lane passes
     ``split=""`` unless it is explicitly configured, and passes no ``target_tab`` either,
     so its unconfigured shape stays byte-for-byte the pre-#13411 command. ``--split`` is
     rendered independently of ``--tab`` (herdr 0.7.1 accepts them as independent optional
     flags, live ``--help`` j#76559), which is what lets the tab-less default pair split.
+
+    ``focus`` selects ``--focus`` over the default ``--no-focus`` (Redmine #13646 review
+    R1-F1 j#76613, Design Answer R1 j#76616). **herdr splits the container's ACTIVE pane —
+    ``agent start`` has no pane-target flag** — so with every launch ``--no-focus`` the
+    container's empty root pane stays active and the second slot's ``--split <dir>`` splits
+    *the root*, not the first agent. Reclaiming that root (after all launches, #13330) then
+    collapses the nested split away and leaves only the outer default ``right`` split the
+    first agent implicitly created — i.e. the configured direction silently never applied
+    (live-measured on both the tab-less default pair and the lane tab). Focusing the FIRST
+    launch pins the container's split target to that agent, so the second slot splits the
+    agent and the direction survives the reclaim (live-measured ``direction: down``). The
+    caller fires this narrowly — fresh container, a full pair, explicit placement — so an
+    unset / single-provider / heal / mixed-adopt launch keeps ``--no-focus`` and is
+    byte-invariant, and a live pane is never focused / moved / swapped.
     """
     provider_cmd = _provider_command(
         provider,
@@ -224,7 +239,7 @@ def build_agent_start_argv(
         "--workspace",
         target_workspace,
         *env_flags,
-        "--no-focus",
+        "--focus" if focus else "--no-focus",
         "--",
         *run_cmd,
     ]
