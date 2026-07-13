@@ -125,6 +125,14 @@ class CallbackOutboxRow:
     payload: str
     claim_token: str = ""
     workspace_id: str = ""
+    #: The durable intended-target tuple (Redmine #13683 review R4-F2): the row's expected delivery
+    #: ``lane`` / ``receiver`` (binding-resolved provider) and a ``generation`` / correlation seam.
+    #: The background_service delivery authority binds the re-resolved live target to these, so a
+    #: wrong lane / receiver / unknown generation fails closed. ``target_generation`` is the seam
+    #: #13684's correlated review-result routing populates.
+    target_lane: str = ""
+    target_receiver: str = ""
+    target_generation: str = ""
 
     @property
     def key(self) -> CallbackOutboxKey:
@@ -155,6 +163,9 @@ class CallbackOutboxRow:
             "payload": self.payload,
             "claim_token": self.claim_token,
             "workspace_id": self.workspace_id,
+            "target_lane": self.target_lane,
+            "target_receiver": self.target_receiver,
+            "target_generation": self.target_generation,
         }
 
 
@@ -174,7 +185,8 @@ class CallbackEnqueueResult:
 _SELECT = (
     "SELECT source, issue, journal, normalized_gate, callback_route, state, "
     "attempts, max_attempts, send_attempted, notification_kind, "
-    "notification_summary, gate_mismatch, detail, payload, claim_token, workspace_id "
+    "notification_summary, gate_mismatch, detail, payload, claim_token, workspace_id, "
+    "target_lane, target_receiver, target_generation "
     "FROM callback_outbox"
 )
 
@@ -197,6 +209,9 @@ def _row(r: tuple) -> CallbackOutboxRow:
         payload=r[13],
         claim_token=r[14] if len(r) > 14 else "",
         workspace_id=r[15] if len(r) > 15 else "",
+        target_lane=r[16] if len(r) > 16 else "",
+        target_receiver=r[17] if len(r) > 17 else "",
+        target_generation=r[18] if len(r) > 18 else "",
     )
 
 
@@ -274,6 +289,9 @@ class CallbackOutbox:
         max_attempts: int = CALLBACK_DEFAULT_MAX_ATTEMPTS,
         detail: str = "",
         payload: str = "",
+        target_lane: str = "",
+        target_receiver: str = "",
+        target_generation: str = "",
         cursor_source: Optional[str] = None,
         cursor: Optional[str] = None,
         now: Optional[str] = None,
@@ -322,8 +340,8 @@ class CallbackOutbox:
                     "INSERT INTO callback_outbox (source, issue, journal, normalized_gate, "
                     "callback_route, workspace_id, state, attempts, max_attempts, send_attempted, "
                     "notification_kind, notification_summary, gate_mismatch, detail, payload, "
-                    "seq, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "target_lane, target_receiver, target_generation, seq, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(workspace_id, source, issue, journal, normalized_gate, callback_route) "
                     "DO NOTHING",
                     (
@@ -335,6 +353,9 @@ class CallbackOutbox:
                         1 if gate_mismatch else 0,
                         detail,
                         payload,
+                        str(target_lane or ""),
+                        str(target_receiver or ""),
+                        str(target_generation or ""),
                         next_seq,
                         stamp,
                         stamp,

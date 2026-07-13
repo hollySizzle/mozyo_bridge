@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional, Protocol
+from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from mozyo_bridge.core.state.callback_outbox import (
     CALLBACK_CLAIM_LEASE_SECONDS,
@@ -44,6 +44,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HandoffDeliveryResult,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
+    AUTH_NO_CLAIM,
+    AUTH_NO_LEASE,
     AUTH_OK,
     DeliveryTarget,
     TargetResolution,
@@ -54,6 +56,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_NOT_SENT,
     SEND_UNCERTAIN,
     send_outcome_for_delivery,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
+    PANE_KEY_ID,
+    PANE_KEY_LANE,
+    PANE_KEY_ROLE,
+    PANE_KEY_WORKSPACE,
 )
 
 
@@ -68,50 +76,56 @@ class TargetResolver(Protocol):
 
 
 @dataclass
-class RouteLedgerTargetResolver:
-    """Resolve a row's callback route to live targets from the route ledger + live inventory (R3-F2).
+class BackendNeutralTargetResolver:
+    """Resolve a row's target from the **backend-neutral live inventory** by stable fields (R4-F1).
 
-    The production :class:`TargetResolver`: for a claimed row it reads the durable **route ledger**
-    (:meth:`WorkflowRuntimeStore.read_route_identities`), keeps only this workspace's identities in
-    the coordinator lane the route names, and **cross-checks each against the live inventory** — a
-    ledger entry whose ``last_seen_pane_id`` is not in the live locator set is dropped, so a stale
-    ledger row never delivers to a dead pane. Each surviving identity becomes a
-    :class:`DeliveryTarget` carrying the ROW's own anchor (issue / journal), so the sender's
-    anchor-binding authority (R3-F3) passes for a legitimately-resolved target and fails closed for a
-    drifted one. 0 / >1 live targets are surfaced as-is (the authority fail-closes on either).
+    The production :class:`TargetResolver`. Per the route-identity-ledger authority model, a live
+    target is the stable ``(workspace_id, lane_id, role)`` slot re-matched against the **live**
+    inventory (for Herdr, the canonical assigned name; the transient locator / cached
+    ``last_seen_pane_id`` is never the authority, only send-time evidence). For a claimed row it:
 
-    ``live_locators`` is the injectable live-inventory seam: production wires the workspace-scoped
-    agent discovery; the isolated 2-workspace test injects a fixed live set. A store / inventory read
-    that raises degrades to an empty resolution (fail-closed).
+    - takes the row's durable expected target tuple (``target_receiver`` = the binding-resolved
+      provider role recorded at enqueue, ``target_lane``) — a blank expected receiver is
+      unresolvable and yields no target (fail-closed);
+    - filters the live inventory to this workspace and that **exact role** (so a ``coordinator``
+      route never resolves a different-role pane — e.g. a default-lane Claude — R4-F1) and, when the
+      row records a lane, that lane;
+    - emits a :class:`DeliveryTarget` per surviving live slot, carrying the ROW's own anchor
+      (issue / journal) + expected generation and the live ``id`` as the send-time ``locator``.
+
+    ``live_inventory`` is the injectable backend-neutral inventory seam: production adapts the live
+    Herdr / tmux inventory into the neutral row shape (``neutral_inventory``); tests inject fixed
+    neutral rows. An inventory read that raises degrades to an empty resolution (fail-closed).
     """
 
     workspace_id: str
-    store: object
-    live_locators: Callable[[], "set[str]"]
-    coordinator_lanes: tuple = ("default", "coordinator")
+    live_inventory: Callable[[], "Sequence[Mapping[str, object]]"]
 
     def resolve(self, row: CallbackOutboxRow) -> TargetResolution:
-        route = str(getattr(row, "callback_route", "") or "").strip()
+        expected_receiver = str(getattr(row, "target_receiver", "") or "").strip()
+        expected_lane = str(getattr(row, "target_lane", "") or "").strip()
+        if not expected_receiver:
+            return TargetResolution.of([])  # no binding-resolved expected role -> fail-closed
         try:
-            identities = self.store.read_route_identities()
-        except Exception:  # noqa: BLE001 - an unreadable ledger is a fail-closed no-target
+            rows = list(self.live_inventory())
+        except Exception:  # noqa: BLE001 - an unreadable inventory is a fail-closed no-target
             return TargetResolution.of([])
-        try:
-            live = set(self.live_locators())
-        except Exception:  # noqa: BLE001 - an unreadable inventory drops every live cross-check
-            live = set()
         targets: list[DeliveryTarget] = []
         seen: set = set()
-        for identity in identities:
-            if str(getattr(identity, "workspace_id", "") or "") != self.workspace_id:
+        for entry in rows:
+            if not isinstance(entry, Mapping):
                 continue
-            lane = str(getattr(identity, "lane_id", "") or "")
-            if route == "coordinator" and lane not in self.coordinator_lanes:
+            if str(entry.get(PANE_KEY_WORKSPACE, "") or "") != self.workspace_id:
                 continue
-            locator = str(getattr(identity, "last_seen_pane_id", "") or "").strip()
-            if not locator or locator not in live:
-                continue  # live-inventory cross-check: a dead / unknown pane is never a target
-            role = str(getattr(identity, "role", "") or "")
+            role = str(entry.get(PANE_KEY_ROLE, "") or "")
+            if role != expected_receiver:
+                continue  # exact binding-resolved role match (R4-F1): never a wrong-role pane
+            lane = str(entry.get(PANE_KEY_LANE, "") or "")
+            if expected_lane and lane != expected_lane:
+                continue
+            locator = str(entry.get(PANE_KEY_ID, "") or "").strip()  # send-time evidence only
+            if not locator:
+                continue
             key = (lane, role, locator)
             if key in seen:
                 continue
@@ -121,6 +135,7 @@ class RouteLedgerTargetResolver:
                     workspace_id=self.workspace_id, lane=lane, receiver=role,
                     issue=str(getattr(row, "issue", "") or ""),
                     journal=str(getattr(row, "journal", "") or ""),
+                    generation=str(getattr(row, "target_generation", "") or ""),
                     locator=locator,
                 )
             )
@@ -139,9 +154,9 @@ class BackgroundServiceCallbackSender:
 
     ``workspace_id`` / ``holder`` identify the authority (the lease held by this supervisor process
     for this workspace). ``lease_store`` is read at send time to confirm the lease is still ours and
-    live. ``target_resolver`` re-resolves the exact target; ``transport`` performs the one send.
-    ``expected_generation_fn`` (optional) maps a row to a generation constraint (a no-op returning
-    ``""`` in Phase A; the forward hook for #13684's correlated generation).
+    live. ``target_resolver`` re-resolves the exact target; ``transport`` performs the one send. The
+    row's durable expected tuple (``target_lane`` / ``target_receiver`` / ``target_generation``) is
+    what the authority binds the re-resolved live target to (R4-F2).
     """
 
     workspace_id: str
@@ -151,7 +166,6 @@ class BackgroundServiceCallbackSender:
     transport: DeliveryTransport
     outbox: Optional[CallbackOutbox] = None
     now_fn: Callable[[], str] = _utc_now_iso
-    expected_generation_fn: Optional[Callable[[CallbackOutboxRow], str]] = None
     claim_stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS
 
     def __call__(self, row: CallbackOutboxRow) -> CallbackSendResult:
@@ -167,18 +181,17 @@ class BackgroundServiceCallbackSender:
             resolution = self.target_resolver.resolve(row)
         except Exception:  # noqa: BLE001 - an unreadable route/inventory is a fail-closed no-target
             resolution = TargetResolution.of([])
-        expected_generation = (
-            self.expected_generation_fn(row) if self.expected_generation_fn is not None else ""
-        )
         decision = authorize_background_delivery(
             expected_workspace=self.workspace_id,
             row_workspace=str(getattr(row, "workspace_id", "") or ""),
             row_issue=str(getattr(row, "issue", "") or ""),
             row_journal=str(getattr(row, "journal", "") or ""),
+            row_lane=str(getattr(row, "target_lane", "") or ""),
+            row_receiver=str(getattr(row, "target_receiver", "") or ""),
+            row_generation=str(getattr(row, "target_generation", "") or ""),
             has_lease=has_lease,
             has_claim=has_claim,
             resolution=resolution,
-            expected_generation=expected_generation or "",
         )
         if not decision.authorized or decision.target is None:
             # Deterministic zero-send: the transport is NEVER invoked. NOT_SENT keeps the row
@@ -187,6 +200,14 @@ class BackgroundServiceCallbackSender:
             return CallbackSendResult(
                 SEND_NOT_SENT, persist_ok=False, persist_reason=decision.reason
             )
+        # R4-F3: the target resolution above can take time (a live-inventory read); a takeover /
+        # claim recovery DURING it must still zero-send. Re-verify the lease + claim ownership
+        # IMMEDIATELY before the transport injection — the delivery-authority fence closes right up
+        # to the send edge, so an authority lost mid-resolution never fires the transport.
+        if not self._holds_lease():
+            return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_LEASE)
+        if not self._holds_claim(row):
+            return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_CLAIM)
         try:
             result = self.transport.deliver(row, decision.target)
         except Exception:  # noqa: BLE001 - a transport blow-up mid-send is uncertain (no blind retry)
@@ -230,7 +251,7 @@ class BackgroundServiceCallbackSender:
 
 __all__ = (
     "TargetResolver",
-    "RouteLedgerTargetResolver",
+    "BackendNeutralTargetResolver",
     "DeliveryTransport",
     "BackgroundServiceCallbackSender",
 )

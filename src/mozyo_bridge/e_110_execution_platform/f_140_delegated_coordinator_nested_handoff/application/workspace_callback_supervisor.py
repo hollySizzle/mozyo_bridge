@@ -314,9 +314,14 @@ class WorkspaceCallbackSupervisor:
         try:
             if source is not None:
                 events_supplied = self._supply_events(issue, source, binding)
+                # R4-F2: record the durable expected target tuple (binding-resolved coordinator
+                # provider + lane) on each candidate so the delivery authority binds the live target
+                # to the exact expected role, not just the anchor.
+                target_lane, target_receiver = coordinator_target_tuple(binding, self._route)
                 candidates = tuple(
                     discover_candidates(
-                        source, issue, route=self._route, workspace_id=workspace_id
+                        source, issue, route=self._route, workspace_id=workspace_id,
+                        target_lane=target_lane, target_receiver=target_receiver,
                     )
                 )
             else:
@@ -470,53 +475,79 @@ def background_transport_env(workspace_id: str) -> dict:
     return env
 
 
-def workspace_live_locators(ws: SupervisedWorkspace) -> "set[str]":
-    """Best-effort live agent locators (pane ids) in this workspace (the live-inventory seam).
+def workspace_neutral_inventory(ws: SupervisedWorkspace) -> list:
+    """Best-effort backend-neutral live inventory for this workspace (the live-inventory seam, R4-F1).
 
-    The workspace-scoped live inventory the route resolver cross-checks the route ledger against
-    (design answer j#77216 boundary 4). Reads the live agent discovery, filtered to this workspace's
-    canonical path, and returns the live pane ids. Fail-open to an empty set on any discovery error:
-    an empty live set makes the resolver fail-closed (no confirmed target -> the row stays retryable),
-    never a mis-delivery. Live running agents are the Phase B dogfood surface (#13490 / #13492); the
-    resolver mechanism reads this seam, and the isolated 2-workspace E2E injects a fixed live set.
+    Per the route-identity-ledger authority model, the live target is a stable
+    ``(workspace_id, lane_id, role)`` slot re-matched against the LIVE inventory (for Herdr, the
+    canonical assigned name). This reads the workspace's backend live inventory (Herdr ``agent
+    list`` / tmux) and normalizes it into the neutral row shape via
+    :func:`...domain.backend_neutral_resolver.neutral_inventory`. Fail-open to an empty list on any
+    error: an empty inventory makes the resolver fail-closed (no confirmed target -> the row stays
+    retryable), never a mis-delivery. Live running agents are the Phase B dogfood surface (#13490 /
+    #13492); the resolver mechanism reads this seam, and tests inject fixed neutral rows.
     """
     try:
-        from mozyo_bridge.application.commands import _agents_target_candidates
-        import argparse as _argparse
+        import os
 
-        root = Path(ws.canonical_path).expanduser()
-        locators: set[str] = set()
-        for cand in _agents_target_candidates(_argparse.Namespace(agent=None, session=None)):
-            repo_root = getattr(cand, "repo_root", "") or getattr(cand, "workspace", "")
-            try:
-                same = Path(str(repo_root)).expanduser().resolve() == root.resolve()
-            except OSError:
-                same = False
-            pane = str(getattr(cand, "pane_id", "") or "").strip()
-            if same and pane:
-                locators.add(pane)
-        return locators
-    except Exception:  # noqa: BLE001 - discovery unavailable -> empty live set (resolver fail-closed)
-        return set()
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+            list_herdr_agent_rows,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
+            neutral_inventory,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+            herdr_backend_active,
+        )
+
+        if herdr_backend_active(str(Path(ws.canonical_path))):
+            return list(neutral_inventory(list_herdr_agent_rows(os.environ), backend="herdr"))
+        # tmux backend live-inventory adaptation is the Phase B dogfood surface; fail-closed empty.
+        return []
+    except Exception:  # noqa: BLE001 - inventory unavailable -> empty (resolver fail-closed)
+        return []
 
 
-def default_target_resolver(ws: SupervisedWorkspace, *, store):
-    """Build the production route target resolver for a workspace (design answer j#77216 boundary 4).
+#: The coordinator's durable lane in the route model (the coordinator runs in the default lane).
+_COORDINATOR_LANE = "default"
 
-    Re-resolves a claimed row's route against the durable route ledger (``store``), cross-checked
-    with the workspace-scoped live inventory (:func:`workspace_live_locators`). A ledger entry whose
-    pane is not live is dropped, so delivery only ever targets a confirmed-live route — and 0 / >1
-    live targets fail closed at the authority. The live running-agent surface is the Phase B dogfood
-    (#13490 / #13492); the resolver itself reads the real ledger + inventory seam.
+
+def coordinator_target_tuple(binding: object, route: str) -> "tuple[str, str]":
+    """The durable expected ``(lane, receiver)`` for a callback route, from the provider binding (R4-F2).
+
+    For the coordinator route the receiver is the **binding-resolved coordinator provider**
+    (``claude`` / ``codex``) and the lane is the coordinator default lane — recorded on the outbox
+    row so the delivery authority binds the live target to the exact expected role (not just a lane).
+    An unresolved binding (or a non-coordinator route) yields ``("", "")`` so the row's expected
+    receiver is blank and the delivery fails closed (R4-F1) rather than routing to a wrong role.
+    """
+    if str(route or "").strip() != DEFAULT_CALLBACK_ROUTE:
+        return "", ""
+    provider = ""
+    if binding is not None:
+        try:
+            provider = str(binding.provider_for("coordinator") or "").strip()
+        except Exception:  # noqa: BLE001 - an unresolvable binding -> blank -> fail-closed delivery
+            provider = ""
+    return (_COORDINATOR_LANE, provider) if provider else ("", "")
+
+
+def default_target_resolver(ws: SupervisedWorkspace):
+    """Build the production backend-neutral route target resolver for a workspace (R4-F1).
+
+    Re-resolves a claimed row's target by matching its durable expected tuple (binding-resolved
+    ``target_receiver`` role + ``target_lane``) against the workspace-scoped **backend-neutral live
+    inventory** (:func:`workspace_neutral_inventory`) on the stable ``(workspace, lane, role)``
+    fields — never the cached locator (which is send-time evidence only). 0 / >1 live targets fail
+    closed at the authority. The live running-agent surface is the Phase B dogfood (#13490 / #13492).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
-        RouteLedgerTargetResolver,
+        BackendNeutralTargetResolver,
     )
 
-    return RouteLedgerTargetResolver(
+    return BackendNeutralTargetResolver(
         workspace_id=ws.workspace_id,
-        store=store,
-        live_locators=lambda: workspace_live_locators(ws),
+        live_inventory=lambda: workspace_neutral_inventory(ws),
     )
 
 
@@ -619,7 +650,7 @@ def build_supervisor(
             workspace_id=ws.workspace_id,
             holder=holder,
             lease_store=lease_store,
-            target_resolver=default_target_resolver(ws, store=store),
+            target_resolver=default_target_resolver(ws),
             transport=default_background_transport(ws),
             outbox=outbox,
         )
@@ -651,7 +682,8 @@ __all__ = (
     "default_redmine_source",
     "default_target_resolver",
     "default_background_transport",
-    "workspace_live_locators",
+    "workspace_neutral_inventory",
+    "coordinator_target_tuple",
     "background_transport_env",
     "default_binding",
     "build_supervisor",

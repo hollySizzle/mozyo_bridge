@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AUTH_ANCHOR_MISMATCH,
     AUTH_FOREIGN_WORKSPACE,
     AUTH_GENERATION_MISMATCH,
+    AUTH_TARGET_MISMATCH,
     AUTH_NO_CLAIM,
     AUTH_NO_LEASE,
     AUTH_NO_TARGET,
@@ -53,18 +54,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 NOW = "2026-07-13T00:00:00+00:00"
 
 
-def _row(workspace_id: str, *, claim_token: str = "tok") -> CallbackOutboxRow:
+def _row(
+    workspace_id: str, *, claim_token: str = "tok", target_receiver: str = "codex",
+    target_lane: str = "default", target_generation: str = "",
+) -> CallbackOutboxRow:
     return CallbackOutboxRow(
         source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
         callback_route="coordinator", state=CALLBACK_INFLIGHT, attempts=0, max_attempts=3,
         send_attempted=True, notification_kind="review_request", notification_summary="",
         gate_mismatch=False, detail="", payload="", claim_token=claim_token, workspace_id=workspace_id,
+        target_lane=target_lane, target_receiver=target_receiver, target_generation=target_generation,
     )
 
 
-def _target(workspace_id: str, *, generation: str = "", locator: str = "%1") -> DeliveryTarget:
+def _target(
+    workspace_id: str, *, generation: str = "", locator: str = "%1", receiver: str = "codex",
+    lane: str = "default",
+) -> DeliveryTarget:
     return DeliveryTarget(
-        workspace_id=workspace_id, lane="default", receiver="codex", issue="13683",
+        workspace_id=workspace_id, lane=lane, receiver=receiver, issue="13683",
         journal="77065", generation=generation, locator=locator,
     )
 
@@ -96,8 +104,9 @@ class AuthorizeMatrixTest(unittest.TestCase):
     def _authorize(self, **over):
         base = dict(
             expected_workspace="wsA", row_workspace="wsA", row_issue="13683", row_journal="77065",
+            row_lane="default", row_receiver="codex", row_generation="",
             has_lease=True, has_claim=True,
-            resolution=TargetResolution.of([_target("wsA")]), expected_generation="",
+            resolution=TargetResolution.of([_target("wsA")]),
         )
         base.update(over)
         return authorize_background_delivery(**base)
@@ -132,28 +141,49 @@ class AuthorizeMatrixTest(unittest.TestCase):
 
     def test_generation_mismatch(self):
         d = self._authorize(
-            resolution=TargetResolution.of([_target("wsA", generation="g2")]), expected_generation="g1"
+            resolution=TargetResolution.of([_target("wsA", generation="g2")]), row_generation="g1"
         )
         self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
 
     def test_generation_absent_is_no_constraint(self):
-        d = self._authorize(resolution=TargetResolution.of([_target("wsA", generation="")]), expected_generation="")
+        d = self._authorize(resolution=TargetResolution.of([_target("wsA", generation="")]), row_generation="")
         self.assertTrue(d.authorized)
 
     def test_unknown_target_generation_when_expected_is_zero_send(self):
-        # R3-F3 repro: expected g1, resolved target has NO generation -> strict fail-closed.
+        # R4-F2 repro: expected g1, resolved target has NO generation -> strict fail-closed.
         d = self._authorize(
-            resolution=TargetResolution.of([_target("wsA", generation="")]), expected_generation="g1"
+            resolution=TargetResolution.of([_target("wsA", generation="")]), row_generation="g1"
         )
         self.assertEqual(d.reason, AUTH_GENERATION_MISMATCH)
 
     def test_wrong_anchor_target_is_zero_send(self):
         # R3-F3 repro: a resolved target for a DIFFERENT issue/journal than the row is not delivered.
         wrong = DeliveryTarget(
-            workspace_id="wsA", lane="other", receiver="claude", issue="99999", journal="1", locator="%x"
+            workspace_id="wsA", lane="default", receiver="codex", issue="99999", journal="1", locator="%x"
         )
         d = self._authorize(resolution=TargetResolution.of([wrong]))
         self.assertEqual(d.reason, AUTH_ANCHOR_MISMATCH)
+
+    def test_wrong_receiver_target_is_zero_send(self):
+        # R4-F2 repro: same anchor but a wrong receiver role (a default-lane Claude) is never sent.
+        d = self._authorize(resolution=TargetResolution.of([_target("wsA", receiver="claude")]))
+        self.assertEqual(d.reason, AUTH_TARGET_MISMATCH)
+
+    def test_wrong_lane_target_is_zero_send(self):
+        d = self._authorize(resolution=TargetResolution.of([_target("wsA", lane="other")]))
+        self.assertEqual(d.reason, AUTH_TARGET_MISMATCH)
+
+    def test_blank_expected_receiver_is_zero_send(self):
+        # An unresolved expected receiver (blank) cannot be verified -> fail closed.
+        d = self._authorize(row_receiver="")
+        self.assertEqual(d.reason, AUTH_TARGET_MISMATCH)
+
+    def test_unknown_generation_wrong_lane_receiver_repro(self):
+        # The exact reviewer R4-F2 reproduction: same anchor, wrong lane/receiver, no generation.
+        wrong = _target("wsA", lane="other", receiver="claude", generation="")
+        d = self._authorize(resolution=TargetResolution.of([wrong]))
+        self.assertFalse(d.authorized)
+        self.assertEqual(d.reason, AUTH_TARGET_MISMATCH)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +346,9 @@ class ClaimReverificationTest(unittest.TestCase):
             source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
             callback_route="coordinator", workspace_id="wsA",
         )
-        outbox.enqueue(key, initial_state=CALLBACK_PENDING, now=NOW)
+        outbox.enqueue(
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex", now=NOW
+        )
         claimed = outbox.claim_pending(now=NOW, workspace_id="wsA")
         return outbox, claimed[0]
 
@@ -355,49 +387,98 @@ class ClaimReverificationTest(unittest.TestCase):
         self.assertEqual(self.transport.calls, [])
 
 
-class RouteLedgerResolverTest(unittest.TestCase):
-    """R3-F2: the production resolver reads the route ledger + live inventory (no fake seam)."""
+class BackendNeutralResolverTest(unittest.TestCase):
+    """R4-F1: the production resolver matches stable (workspace/lane/role) against the LIVE inventory."""
 
-    def setUp(self):
-        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
-
-        self.dir = Path(tempfile.mkdtemp())
-        self.store = WorkflowRuntimeStore(path=self.dir / "workflow-runtime.sqlite")
-        # Two workspaces' coordinator route identities in the durable ledger.
-        self.store.put_route_identities([
-            {"route_id": "rA", "issue": "13683", "workspace_id": "wsA", "lane_id": "default",
-             "role": "codex", "pane_name": "coordA", "last_seen_pane_id": "%A"},
-            {"route_id": "rB", "issue": "13684", "workspace_id": "wsB", "lane_id": "default",
-             "role": "codex", "pane_name": "coordB", "last_seen_pane_id": "%B"},
-        ])
-
-    def _resolver(self, workspace_id, live):
+    def _resolver(self, workspace_id, rows):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
-            RouteLedgerTargetResolver,
+            BackendNeutralTargetResolver,
         )
 
-        return RouteLedgerTargetResolver(
-            workspace_id=workspace_id, store=self.store, live_locators=lambda: set(live)
-        )
+        return BackendNeutralTargetResolver(workspace_id=workspace_id, live_inventory=lambda: list(rows))
 
-    def test_resolves_this_workspace_live_coordinator(self):
-        res = self._resolver("wsA", {"%A", "%B"}).resolve(_row("wsA"))
+    def _neutral(self, workspace_id, role, locator, *, lane="default"):
+        # The ledger neutral row shape (workspace_id / lane_id / agent_role / id).
+        return {"workspace_id": workspace_id, "lane_id": lane, "agent_role": role, "id": locator}
+
+    def test_resolves_this_workspace_live_role(self):
+        inv = [self._neutral("wsA", "codex", "%A"), self._neutral("wsB", "codex", "%B")]
+        res = self._resolver("wsA", inv).resolve(_row("wsA"))  # row target_receiver=codex
         self.assertEqual(len(res.targets), 1)
-        self.assertEqual(res.targets[0].workspace_id, "wsA")
+        self.assertEqual(res.targets[0].receiver, "codex")
         self.assertEqual(res.targets[0].locator, "%A")
-        # Anchor carried from the row (so the sender's anchor-binding passes for a real target).
-        self.assertEqual(res.targets[0].issue, "13683")
+        self.assertEqual(res.targets[0].issue, "13683")  # anchor carried from the row
+
+    def test_wrong_role_pane_is_not_resolved(self):
+        # R4-F1 repro: a live default-lane Claude is NEVER resolved for a coordinator(codex) row.
+        inv = [self._neutral("wsA", "claude", "%claudeA")]
+        res = self._resolver("wsA", inv).resolve(_row("wsA", target_receiver="codex"))
+        self.assertEqual(res.targets, ())  # no codex slot live -> fail-closed
 
     def test_no_cross_workspace_resolution(self):
-        # wsA's resolver never resolves wsB's route even though the ledger holds it.
-        res = self._resolver("wsA", {"%A", "%B"}).resolve(_row("wsA"))
+        inv = [self._neutral("wsA", "codex", "%A"), self._neutral("wsB", "codex", "%B")]
+        res = self._resolver("wsA", inv).resolve(_row("wsA"))
         self.assertTrue(all(t.workspace_id == "wsA" for t in res.targets))
         self.assertNotIn("%B", {t.locator for t in res.targets})
 
-    def test_dead_pane_is_dropped(self):
-        # The ledger holds wsA's route but its pane is not live -> no target (fail-closed).
-        res = self._resolver("wsA", set()).resolve(_row("wsA"))
+    def test_blank_expected_receiver_resolves_nothing(self):
+        inv = [self._neutral("wsA", "codex", "%A")]
+        res = self._resolver("wsA", inv).resolve(_row("wsA", target_receiver=""))
         self.assertEqual(res.targets, ())
+
+    def test_empty_inventory_is_fail_closed(self):
+        res = self._resolver("wsA", []).resolve(_row("wsA"))
+        self.assertEqual(res.targets, ())
+
+
+class ClaimLostDuringResolverTest(unittest.TestCase):
+    """R4-F3: an authority lost DURING target resolution must still zero-send (pre-transport fence)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "lease.sqlite")
+
+    def _outbox_with_claimed_row(self):
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox, CallbackOutboxKey
+        from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+
+        outbox = CallbackOutbox(path=self.store_path)
+        key = CallbackOutboxKey(
+            source="redmine", issue="13683", journal="77065", normalized_gate="review_request",
+            callback_route="coordinator", workspace_id="wsA",
+        )
+        outbox.enqueue(
+            key, initial_state=CALLBACK_PENDING, target_lane="default", target_receiver="codex", now=NOW
+        )
+        return outbox, outbox.claim_pending(now=NOW, workspace_id="wsA")[0]
+
+    def test_lease_lost_during_resolver_is_zero_send(self):
+        self.lease_store.acquire("wsA", "superX", now=NOW, ttl_seconds=600)
+        outbox, row = self._outbox_with_claimed_row()
+        transport = _RecordingTransport(HandoffDeliveryResult("sent", "ok"))
+        lease_store = self.lease_store
+
+        class _TakeoverResolver:
+            """Resolves a valid target, but as a side effect the lease is handed to another holder."""
+
+            def resolve(self, row):
+                # Ownership lost mid-resolution: the incumbent releases and another supervisor takes
+                # over (the first _holds_lease already passed; the pre-transport re-check must catch it).
+                lease_store.release("wsA", "superX")
+                lease_store.acquire("wsA", "otherSuper", now=NOW, ttl_seconds=600)
+                return TargetResolution.of([_target("wsA")])
+
+        sender = BackgroundServiceCallbackSender(
+            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
+            target_resolver=_TakeoverResolver(), transport=transport, outbox=outbox,
+            now_fn=lambda: NOW,  # lease live at the first check; the resolver hands it over
+        )
+        result = sender(row)
+        # The pre-transport re-verify catches the lost lease -> zero-send, transport NEVER called.
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(result.outcome, SEND_NOT_SENT)
+        self.assertEqual(result.persist_reason, AUTH_NO_LEASE)
 
 
 class BackgroundTransportEnvTest(unittest.TestCase):

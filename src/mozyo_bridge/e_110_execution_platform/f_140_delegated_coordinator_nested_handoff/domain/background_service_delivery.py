@@ -47,6 +47,7 @@ AUTH_FOREIGN_WORKSPACE = "foreign_workspace"  # the row / resolved target is a d
 AUTH_NO_TARGET = "no_target_resolved"  # the route re-resolution found no live target
 AUTH_AMBIGUOUS_TARGET = "ambiguous_target"  # the route re-resolution found more than one target
 AUTH_ANCHOR_MISMATCH = "anchor_mismatch"  # the resolved target's issue/journal != the row's anchor
+AUTH_TARGET_MISMATCH = "target_tuple_mismatch"  # the resolved target's lane/receiver != the row's
 AUTH_GENERATION_MISMATCH = "generation_mismatch"  # the resolved target's generation is unknown/stale
 
 #: The fail-closed reasons — every one is a deterministic zero-send (nothing was delivered).
@@ -58,6 +59,7 @@ FAIL_CLOSED_REASONS = frozenset(
         AUTH_NO_TARGET,
         AUTH_AMBIGUOUS_TARGET,
         AUTH_ANCHOR_MISMATCH,
+        AUTH_TARGET_MISMATCH,
         AUTH_GENERATION_MISMATCH,
     }
 )
@@ -122,10 +124,12 @@ def authorize_background_delivery(
     row_workspace: str,
     row_issue: str = "",
     row_journal: str = "",
+    row_lane: str = "",
+    row_receiver: str = "",
+    row_generation: str = "",
     has_lease: bool,
     has_claim: bool,
     resolution: TargetResolution,
-    expected_generation: str = "",
 ) -> BackgroundDeliveryDecision:
     """Decide whether a background-service delivery is authorized (pure, fail-closed).
 
@@ -141,10 +145,15 @@ def authorize_background_delivery(
        anchor (:data:`AUTH_ANCHOR_MISMATCH` otherwise) — a re-resolution that drifted to a different
        issue / journal is never delivered (review R3-F3: the delivery is bound to the row's anchor,
        not a resolver-supplied one);
-    6. generation is **strict**: when the row expects a generation, the resolved target must carry
+    6. the resolved target's **lane + receiver** must exact-match the row's durable expected tuple
+       (:data:`AUTH_TARGET_MISMATCH` otherwise — review R4-F2). The row MUST carry a non-blank
+       expected ``receiver`` (an unknown expected target cannot be verified -> fail closed), and the
+       resolved receiver / lane must equal the recorded ones — a live resolution that picked a wrong
+       role / lane is never delivered;
+    7. generation is **strict**: when the row expects a generation, the resolved target must carry
        exactly that generation (:data:`AUTH_GENERATION_MISMATCH` otherwise — an unknown / empty /
-       stale target generation fails closed). No expectation = no constraint (forward hook for
-       #13684's correlated generation).
+       stale target generation fails closed). No expectation = no constraint (the seam #13684's
+       correlated generation populates).
 
     Only when every check passes is the delivery :data:`AUTH_OK` with the single resolved target.
     """
@@ -170,10 +179,19 @@ def authorize_background_delivery(
         or str(target.journal or "").strip() != str(row_journal or "").strip()
     ):
         return BackgroundDeliveryDecision(False, AUTH_ANCHOR_MISMATCH)
-    want_gen = str(expected_generation or "").strip()
+    # Bind the delivery to the ROW's durable expected target tuple (R4-F2). A blank expected
+    # receiver is unverifiable -> fail closed; a resolved lane / receiver that differs from the
+    # recorded expectation is a wrong-target live resolution -> fail closed.
+    want_receiver = str(row_receiver or "").strip()
+    want_lane = str(row_lane or "").strip()
+    if not want_receiver or str(target.receiver or "").strip() != want_receiver:
+        return BackgroundDeliveryDecision(False, AUTH_TARGET_MISMATCH)
+    if want_lane and str(target.lane or "").strip() != want_lane:
+        return BackgroundDeliveryDecision(False, AUTH_TARGET_MISMATCH)
+    want_gen = str(row_generation or "").strip()
     if want_gen and want_gen != str(target.generation or "").strip():
         # Strict: an expected generation must match exactly — an unknown / empty / stale target
-        # generation fails closed (R3-F3), never authorized.
+        # generation fails closed (R3-F3 / R4-F2), never authorized.
         return BackgroundDeliveryDecision(False, AUTH_GENERATION_MISMATCH)
     return BackgroundDeliveryDecision(True, AUTH_OK, target)
 
@@ -187,6 +205,7 @@ __all__ = (
     "AUTH_NO_TARGET",
     "AUTH_AMBIGUOUS_TARGET",
     "AUTH_ANCHOR_MISMATCH",
+    "AUTH_TARGET_MISMATCH",
     "AUTH_GENERATION_MISMATCH",
     "FAIL_CLOSED_REASONS",
     "DeliveryTarget",

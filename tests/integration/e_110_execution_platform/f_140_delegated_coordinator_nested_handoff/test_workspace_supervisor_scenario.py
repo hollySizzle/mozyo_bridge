@@ -204,6 +204,9 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             DeliveryTarget,
             TargetResolution,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+            RoleProviderBinding,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
             SUPERVISION_LOCAL_WAKE,
         )
@@ -219,9 +222,11 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
                 self._wsid = wsid
 
             def resolve(self, row):
+                # A live coordinator (codex) target matching the row's durable expected tuple.
                 return TargetResolution.of([
                     DeliveryTarget(workspace_id=self._wsid, lane="default", receiver="codex",
-                                   issue=str(row.issue), journal=str(row.journal), locator="%coord")
+                                   issue=str(row.issue), journal=str(row.journal),
+                                   generation=str(row.target_generation), locator="%coord")
                 ])
 
         class _CapturingTransport:
@@ -250,6 +255,7 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
                 roster_fn=lambda ws: (("13683",), ""),
                 redmine_source_fn=lambda ws: MappingRedmineJournalSource(payload=_payload("13683")),
                 sender_fn=sender_fn,
+                binding_fn=lambda ws: RoleProviderBinding.default(),  # coordinator -> codex
                 wake_store=SupervisorWakeStore(path=supervisor_wake_path(self.home)),
                 clock=lambda: "2026-07-13T00:00:00+00:00",
             ).run_once(mode=SUPERVISION_LOCAL_WAKE)
