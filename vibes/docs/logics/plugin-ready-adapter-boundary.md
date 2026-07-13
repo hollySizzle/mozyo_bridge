@@ -1750,6 +1750,23 @@ this invariant (j#73404); executable resolution now holds it too. The argv build
 and takes a pre-resolved `ResolvedProviderLaunch`, so it *cannot* fail after a sibling has
 started.
 
+**One snapshot, or the preflight is not whole (review R2-F1).** The `ResolvedProviderLaunch`
+must pin *everything* the builder consumes — the executable, the managed-policy tokens, AND
+every capability (e.g. `tool_shell_env_overrides`) — from the **same registry** the
+executable was resolved from. The first R1-F1 cut threaded the injected registry into
+executable resolution only; the managed policy (`permission_mode_argv`) and the builder's
+capability check re-read the *global* `AGENT_PROVIDER_PROFILES`. So a provider present only
+in an injected registry resolved an empty managed argv and then made the "pure" builder
+*raise* `unknown agent provider` — the builder was neither pure nor snapshot-consistent. A
+partial snapshot is not a whole-plan preflight: it silently works for built-ins (one global
+registry) and fails exactly for the data-only added provider the feature exists to support.
+The fix threads an optional `registry` through the policy resolvers and pins the capability
+on `ResolvedProviderLaunch`; the builder reads only `resolved`. A launch plan with no
+matching resolved entry, or an identity mismatch, fails closed at the composition root
+before the first side effect — never deferred to the builder. The regression that pins this
+passes **only** the injected registry (no global monkeypatch); patching both globals is what
+hid the split.
+
 ### Managed flags are spelled by data, at every chokepoint
 
 The managed-flag concept (`permission_mode`) is core-owned; its **spelling** is profile

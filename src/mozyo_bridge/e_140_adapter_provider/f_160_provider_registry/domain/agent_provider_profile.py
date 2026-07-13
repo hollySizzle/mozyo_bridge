@@ -48,7 +48,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     AgentProviderProfile,
     AgentProviderProfileConfig,
     AgentProviderProfileError,
-    AgentProviderProfileRegistry,
+    AgentProviderProfileRegistry,  # noqa: F401 (used in type annotations)
     ManagedFlagConcept,
 )
 
@@ -155,25 +155,39 @@ def require_profile(provider_id: str) -> AgentProviderProfile:
 # worse than one that reports nothing. These two are that boundary.
 
 
-def provider_supports(provider_id: str, capability: AgentCapability) -> bool:
+def provider_supports(
+    provider_id: str,
+    capability: AgentCapability,
+    *,
+    registry: "Optional[AgentProviderProfileRegistry]" = None,
+) -> bool:
     """Whether ``provider_id`` is registered AND declares ``capability``.
 
     ``False`` for an unknown provider (never raises), so a policy/diagnostic caller
-    can ask about any agent label safely.
+    can ask about any agent label safely. ``registry`` overrides the global built-in
+    set — the launch preflight passes its snapshot so managed-policy resolution reads
+    the SAME registry the executable was resolved from (Redmine #13441 review R2-F1);
+    every other caller keeps the global default.
     """
-    profile = AGENT_PROVIDER_PROFILES.get(provider_id)
+    profiles = AGENT_PROVIDER_PROFILES if registry is None else registry
+    profile = profiles.get(provider_id)
     return profile is not None and profile.has_capability(capability)
 
 
 def provider_managed_flag(
-    provider_id: str, concept: ManagedFlagConcept
+    provider_id: str,
+    concept: ManagedFlagConcept,
+    *,
+    registry: "Optional[AgentProviderProfileRegistry]" = None,
 ) -> Optional[str]:
     """``provider_id``'s spelling of ``concept``, or ``None`` (unknown provider ok).
 
     This is what lets a managed flag be *spelled by data* at the launch chokepoints:
     rename the flag in the profile and every renderer follows, with no source edit.
+    ``registry`` overrides the global built-in set for the launch preflight (R2-F1).
     """
-    profile = AGENT_PROVIDER_PROFILES.get(provider_id)
+    profiles = AGENT_PROVIDER_PROFILES if registry is None else registry
+    profile = profiles.get(provider_id)
     if profile is None:
         return None
     return profile.managed_flag(concept)

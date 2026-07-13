@@ -218,16 +218,26 @@ def resolve_agent_argv0(
 class ResolvedProviderLaunch:
     """Everything a launch needs for one provider, resolved BEFORE any side effect.
 
-    ``executable`` is the verified absolute ``argv[0]``; ``managed_argv`` is the
-    profile-spelled managed policy tokens (e.g. ``("--permission-mode", "auto")``) or
-    ``()``. Both are *values*, so the slot builder renders an argv without performing
-    any further environment lookup — the thing that resolved is exactly the thing that
-    runs.
+    All fields are *values* pinned from ONE registry snapshot, so the slot builder
+    renders an argv performing no further profile/registry lookup — the thing that
+    resolved is exactly the thing that runs, and the builder cannot fail (or read a
+    since-changed global) after a sibling provider has already started (Redmine #13441
+    review R1-F1 / R2-F1):
+
+    - ``executable`` — the verified absolute ``argv[0]``.
+    - ``managed_argv`` — the profile-spelled managed policy tokens (e.g.
+      ``("--permission-mode", "auto")``) or ``()``.
+    - ``tool_shell_env_overrides`` — whether the provider re-expresses its attested
+      identity as tool-shell ``-c`` overrides (Codex, #13614). Pinned here so the
+      builder never re-reads ``provider_has_capability`` (which would be a global
+      lookup that RAISES for a provider present only in an injected registry — the
+      R2-F1 registry split).
     """
 
     provider_id: str
     executable: str
     managed_argv: tuple[str, ...] = ()
+    tool_shell_env_overrides: bool = False
 
 
 def preflight_launch_providers(
@@ -260,17 +270,35 @@ def preflight_launch_providers(
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
         permission_mode_argv,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+        AGENT_PROVIDER_PROFILES,
+    )
+
+    # ONE snapshot for the whole preflight: the executable, the managed policy, and the
+    # capabilities all resolve from the same registry (Redmine #13441 review R2-F1). The
+    # first cut resolved only the executable from `registry` and let the managed policy /
+    # capability fall through to the global `AGENT_PROVIDER_PROFILES`, so a provider
+    # present only in an injected registry resolved an empty managed argv and then made
+    # the "pure" builder RAISE `unknown agent provider`.
+    profiles = AGENT_PROVIDER_PROFILES if registry is None else registry
 
     resolved: dict[str, ResolvedProviderLaunch] = {}
     for provider_id in providers:
         if provider_id in resolved:
             continue
         executable = resolve_agent_executable(provider_id, env, registry=registry)
+        profile = profiles.require(provider_id)
         resolved[provider_id] = ResolvedProviderLaunch(
             provider_id=provider_id,
             executable=executable,
             managed_argv=permission_mode_argv(
-                provider_id, policy_default=permission_mode_default, env=env
+                provider_id,
+                policy_default=permission_mode_default,
+                env=env,
+                registry=registry,
+            ),
+            tool_shell_env_overrides=profile.has_capability(
+                AgentCapability.TOOL_SHELL_ENV_OVERRIDES
             ),
         )
     return resolved

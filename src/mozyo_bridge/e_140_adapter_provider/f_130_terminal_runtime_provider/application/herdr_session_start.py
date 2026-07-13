@@ -546,9 +546,10 @@ def prepare_session(
     # Only `launch` plans are preflighted: an adopt-only / dry-run session starts no
     # process, so it must not begin to require a resolvable provider binary that the
     # pre-#13441 code never needed (byte-invariant for adopt / dry-run).
+    launch_plans = [plan for plan in plans if plan.kind == "launch"]
     try:
         resolved_launches = preflight_launch_providers(
-            [plan.provider for plan in plans if plan.kind == "launch"],
+            [plan.provider for plan in launch_plans],
             env,
             permission_mode_default=claude_permission_mode_default,
         )
@@ -556,6 +557,20 @@ def prepare_session(
         # Includes AgentProviderExecutableError (unknown / undrivable / missing /
         # ambiguous / unsafe-PATH). Re-raised on this module's fail-closed boundary.
         raise HerdrSessionStartError(str(exc)) from exc
+
+    # Completeness / identity guard BEFORE the first side effect (#13441 review R2-F1
+    # must-fix 4): every launch plan must have a matching resolved entry, and the
+    # resolved entry's provider identity must match the plan. This fails closed HERE
+    # (zero workspace / tab / agent) rather than deferring an identity mismatch to the
+    # pure builder, which must never re-derive or re-check it after a sibling started.
+    for plan in launch_plans:
+        resolved = resolved_launches.get(plan.provider)
+        if resolved is None or resolved.provider_id != plan.provider:
+            raise HerdrSessionStartError(
+                f"launch preflight did not resolve provider {plan.provider!r} "
+                f"(resolved={resolved!r}); refusing to start a lane with an "
+                f"unresolved or mismatched provider"
+            )
 
     # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
     # to launch (all adopt / dry-run) means no workspace create and no reclaim —
