@@ -358,6 +358,40 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             # Both leaked shapes are reported.
             self.assertEqual(2, output.count(token))
 
+    def test_r1_segment_bounded_scan_end_to_end(self) -> None:
+        # Redmine #13716 R1: end-to-end through the POSIX-ERE grep first stage.
+        # F1 — a real UPPER_SNAKE credential under a non-`*_ENV` key must block
+        # (the env-name exemption is key-scoped, not value-global). F2 — glued
+        # substrings of a credential keyword must NOT surface as candidates.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        real_secret = "REAL" + "_SECRET_123"
+        leak_line = "API" + "_KEY = \"" + real_secret + "\""
+        glued = "\n".join(
+            (
+                "password" + "_length = 16",
+                "password" + "less = \"" + "ab" + "c123\"",
+                "access" + "_tokenizer = \"" + "ab" + "c123\"",
+                "API" + "_KEY_ENV = \"" + "REDMINE" + "_API_KEY\"",  # env-name def
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "leak.py", leak_line + "\n")
+            self._commit_file(root, "safe.py", glued + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn(real_secret, output)
+            # The glued-substring / env-name-definition lines are not reported.
+            self.assertNotIn("password_length", output)
+            self.assertNotIn("passwordless", output)
+            self.assertNotIn("access_tokenizer", output)
+            self.assertNotIn("REDMINE_API_KEY", output)
+
 
 class SecretValueClassifierTest(unittest.TestCase):
     """Redmine #12175: pin the second-stage credential-value classifier that
@@ -533,6 +567,57 @@ class SecretValueClassifierTest(unittest.TestCase):
             self.assertFalse(
                 release_mod._secret_assignment_is_real(line),
                 msg=f"expected safe widened-key line: {line!r}",
+            )
+
+    def test_13716_r1f1_env_name_exemption_is_key_scoped(self) -> None:
+        # Redmine #13716 R1-F1: the env-var-name exemption must be scoped to the
+        # key context (`*_ENV` key + UPPER_SNAKE value), NOT applied to every
+        # UPPER_SNAKE value. A real credential shaped as an underscore-joined
+        # uppercase literal must still block; only the `*_ENV` name-constant is
+        # safe, and a non-name value under a `*_ENV` key still blocks.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        # Key/value split so the test source carries no contiguous assignment.
+        real_secret = "REAL" + "_SECRET_123"  # UPPER_SNAKE real credential value
+        blocks = (
+            "API" + "_KEY = \"" + real_secret + "\"",              # non-ENV key -> real
+            "API" + "_KEY_ENV = \"" + "sk" + "-live-x9\"",        # ENV key, non-name value
+        )
+        for line in blocks:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected real credential to block: {line!r}",
+            )
+        # `*_ENV` key bound to an UPPER_SNAKE env-var *name* is a reference.
+        env_name_defs = (
+            "API" + "_KEY_ENV = \"" + "REDMINE" + "_API_KEY\"",
+            "API" + "_KEY_ENV = \"" + "MOZYO_REDMINE" + "_API_KEY\"",
+        )
+        for line in env_name_defs:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected env-name definition to be safe: {line!r}",
+            )
+        # The value classifier alone no longer treats UPPER_SNAKE as safe: the
+        # exemption lives in the key-aware assignment classifier.
+        self.assertTrue(release_mod._secret_value_is_real("REAL" + "_SECRET_123"))
+
+    def test_13716_r1f2_segment_bounded_no_glued_substring(self) -> None:
+        # Redmine #13716 R1-F2: the identifier grammar is segment-bounded, so a
+        # credential keyword that is merely a glued substring of an unrelated
+        # identifier must NOT be flagged.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "ab" + "c123"
+        non_credentials = (
+            "password" + "_length = 16",           # `password` + non-ENV suffix
+            "password" + "less = \"" + token + "\"",  # glued suffix, no boundary
+            "access" + "_tokenizer = \"" + token + "\"",  # `access_token` + glued
+        )
+        for line in non_credentials:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected non-credential identifier to be safe: {line!r}",
             )
 
     def test_12693_field_name_false_positives_are_safe(self) -> None:
