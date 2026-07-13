@@ -85,6 +85,14 @@ _RELEASE_EDGES: dict[str, frozenset[str]] = {
     RELEASE_RELEASED: frozenset(),
 }
 
+#: A lane may only come back to ``active`` when no release generation is in flight
+#: (R1-F3 / R1-F2). ``requested`` / ``partial`` mean an actuator is (or may be)
+#: closing this lane's pinned slots right now: silently clearing that generation
+#: would let a half-closed lane re-enter the active roster and take sends while its
+#: panes are still being killed. Only a finished generation (never opened, or fully
+#: ``released``) may be cleared on rehydrate.
+_REHYDRATABLE_RELEASE_STATES = frozenset({RELEASE_NOT_REQUESTED, RELEASE_RELEASED})
+
 # -- CAS outcome vocabulary --------------------------------------------------
 
 CAS_APPLIED = "applied"
@@ -126,6 +134,19 @@ def release_transition_allowed(current: str, target: str) -> bool:
     return target in _RELEASE_EDGES.get(norm(current), frozenset())
 
 
+def rehydrate_allowed(process_release: str) -> bool:
+    """May a lane in this release state come back to ``active``? (pure)
+
+    The single policy both rehydrate paths share — ``transition_disposition`` to
+    ``active`` and ``supersede_and_activate``'s promotion of an existing recovery
+    lane (R1-F2 / R1-F3). An in-flight generation (``requested`` / ``partial``) is
+    refused; there is deliberately no "cancel a release" state, so the caller must
+    finish or abandon the generation through the release API, not by side-stepping
+    it with a disposition write.
+    """
+    return norm(process_release) in _REHYDRATABLE_RELEASE_STATES
+
+
 # -- records -----------------------------------------------------------------
 
 
@@ -149,6 +170,10 @@ class LaneLifecycleKey:
         return (self.repo_workspace_id, self.lane_id)
 
 
+class ReleasePinError(ValueError):
+    """A release pin is unusable — never degraded into "one fewer slot" (R1-F4)."""
+
+
 @dataclass(frozen=True)
 class ReleasePin:
     """One managed slot pinned at release-request time.
@@ -158,11 +183,37 @@ class ReleasePin:
     stable identity ``(workspace, lane, role, assigned_name)`` against the live
     inventory and closes only when the live locator still matches this pin — so a
     slot that was recycled into a *new* agent is never killed by a stale action.
+
+    Every field is required (R1-F4). A pin missing its role / assigned name /
+    locator cannot express that stable identity at all, so it could never be
+    re-resolved and would sit in the authority row as a slot nobody can act on.
+    Rejecting it here keeps the row's pins meaning exactly "the slots this
+    generation may close".
     """
 
     role: str
     assigned_name: str
     locator: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role", norm(self.role))
+        object.__setattr__(self, "assigned_name", norm(self.assigned_name))
+        object.__setattr__(self, "locator", norm(self.locator))
+        missing = [
+            name
+            for name in ("role", "assigned_name", "locator")
+            if not getattr(self, name)
+        ]
+        if missing:
+            raise ReleasePinError(
+                "a release pin requires a non-empty role / assigned_name / locator "
+                f"(missing: {', '.join(missing)}); an unresolvable slot is never pinned"
+            )
+
+    @property
+    def stable_identity(self) -> tuple[str, str]:
+        """The ``(role, assigned_name)`` half of the slot's identity within a lane."""
+        return (self.role, self.assigned_name)
 
     def as_payload(self) -> dict[str, str]:
         return {
@@ -182,19 +233,24 @@ def encode_release_pins(pins: Sequence[ReleasePin]) -> str:
 
 
 def decode_release_pins(raw: str) -> tuple[ReleasePin, ...]:
-    """Read pinned slots back; an unreadable / empty value yields no pins."""
+    """Read pinned slots back. Empty means no pins; corrupt **raises** (R1-F4).
+
+    A malformed row must not decode to a *shorter* pin list: the caller would then
+    close some slots and believe the generation complete, leaving the dropped slots
+    alive. An unreadable pin set is a fail-closed condition, not a degraded one.
+    """
     if not norm(raw):
         return ()
     try:
         loaded = json.loads(raw)
-    except (TypeError, ValueError):
-        return ()
+    except (TypeError, ValueError) as exc:
+        raise ReleasePinError(f"release pins are not readable JSON: {exc}") from exc
     if not isinstance(loaded, list):
-        return ()
+        raise ReleasePinError("release pins must be a list")
     pins: list[ReleasePin] = []
     for item in loaded:
         if not isinstance(item, dict):
-            continue
+            raise ReleasePinError(f"release pin is not an object: {item!r}")
         pins.append(
             ReleasePin(
                 role=norm(item.get("role")),
@@ -203,6 +259,75 @@ def decode_release_pins(raw: str) -> tuple[ReleasePin, ...]:
             )
         )
     return tuple(pins)
+
+
+def validate_release_pins(pins: Sequence[ReleasePin]) -> tuple[ReleasePin, ...]:
+    """The pins a release generation may open with (non-empty, no duplicate slot).
+
+    Two pins for the same ``(role, assigned_name)`` would make the generation's
+    outcome ambiguous — which locator was the one that had to match? Reject rather
+    than pick.
+    """
+    pinned = tuple(pins)
+    if not pinned:
+        raise ReleasePinError("a release generation requires at least one pinned slot")
+    seen: set[tuple[str, str]] = set()
+    for pin in pinned:
+        if pin.stable_identity in seen:
+            raise ReleasePinError(
+                f"duplicate pinned slot {pin.stable_identity!r} in one release generation"
+            )
+        seen.add(pin.stable_identity)
+    return pinned
+
+
+#: The durable-record systems a lifecycle decision may point at. A pointer into an
+#: unknown system cannot be re-read at recovery time, so the vocabulary is closed.
+DECISION_SOURCE_REDMINE = "redmine"
+DECISION_SOURCES = frozenset({DECISION_SOURCE_REDMINE})
+
+
+class DecisionPointerError(ValueError):
+    """A durable decision pointer is missing / malformed (R1-F5); fail closed."""
+
+
+@dataclass(frozen=True)
+class DecisionPointer:
+    """The durable record that authorizes one lifecycle write.
+
+    ``(source, issue_id, journal_id)`` — a *pointer*, never a copy: the journal's
+    body, the issue's status, and any approval stay in Redmine (``workflow_truth``
+    is not duplicated into the DB, ``managed-state-model.md``).
+
+    Required on every write that changes lifecycle authority (R1-F5). The component's
+    recovery policy is ``operator_current_state``: it is rebuilt by an *explicit
+    re-declare from the Redmine durable pointer*, which is only possible if each
+    stored decision actually names the record that made it. Inheriting the previous
+    write's pointer would leave a rehydrate decision pointing at the hibernate
+    journal — an anchor that documents the wrong thing.
+    """
+
+    source: str
+    issue_id: str
+    journal_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", norm(self.source))
+        object.__setattr__(self, "issue_id", norm(self.issue_id))
+        object.__setattr__(self, "journal_id", norm(self.journal_id))
+        if self.source not in DECISION_SOURCES:
+            raise DecisionPointerError(
+                f"unknown decision source {self.source!r}; "
+                f"expected one of {sorted(DECISION_SOURCES)}"
+            )
+        if not self.journal_id:
+            raise DecisionPointerError(
+                "a durable decision pointer requires the journal id that recorded it"
+            )
+
+    def binds_issue(self, issue_id: str) -> bool:
+        """Does this pointer authorize a decision about ``issue_id``?"""
+        return self.issue_id == norm(issue_id)
 
 
 @dataclass(frozen=True)
@@ -292,6 +417,13 @@ def guard(
 
 
 __all__ = (
+    "DECISION_SOURCES",
+    "DECISION_SOURCE_REDMINE",
+    "DecisionPointer",
+    "DecisionPointerError",
+    "ReleasePinError",
+    "rehydrate_allowed",
+    "validate_release_pins",
     "CAS_ACTION_MISMATCH",
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
