@@ -1668,6 +1668,81 @@ reads the selection fresh per process and holds no state.
   into the send — that rail integration was **split out of #13253 into the
   follow-up #13255** (j#72361).
 
+## Implemented Agent Provider Profile Registry (Redmine #13441, Increment 1)
+
+Extends this boundary to the **agent-launch layer**. Before #13441, knowledge of the
+LLM providers mozyo launches (`claude` / `codex`) was hard-coded as closed sets in
+several modules — `pane_resolver.AGENT_COMMANDS`, `agent_launch_argv.LAUNCH_ARGV_PROVIDERS`
+/ `RESERVED_MANAGED_FLAGS`, `herdr_target_resolution.AGENT_PROVIDERS`,
+`agent_discovery.AGENT_KINDS` — so a CLI flag rename or a new CLI-shaped LLM meant
+editing source in several places. Those sets are now **projections of a data registry**.
+
+### Where it lives
+
+- `e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profile_config.py`
+  — the pure schema (`AgentProviderProfile`, `TrustedExecutable`, `InteractionProtocol`,
+  `ManagedFlagConcept`, `AgentCapability`, `AgentProviderProfileRegistry`). No IO.
+- `.../domain/agent_provider_profiles.yaml` — the wheel-packaged built-in profiles.
+- `.../domain/agent_provider_profile.py` — the `importlib.resources` load + the seeded
+  `AGENT_PROVIDER_PROFILES` singleton and the derived vocabulary accessors.
+- `.../application/agent_provider_executable.py` — the trusted executable resolver.
+
+It is a **typed sibling** of `BuiltinProviderRegistry` (#12035), not an extension of it:
+an agent provider is a launchable CLI, not an adapter *category*.
+
+### What a profile owns
+
+`provider_id`; trusted executable *metadata* (a command basename + the NAME of a
+trusted-env override variable); the interaction-protocol family; discovery / process
+aliases; closed mechanical capabilities; and the closed managed-flag **concept** map
+(concept → that provider's flag spelling, e.g. `permission_mode` → `--permission-mode`),
+which doubles as the reserved-flag vocabulary an operator's repo config may not
+re-specify.
+
+### What a profile may never own (enforced, not documented)
+
+A workflow role, a `provider_binding`, any routing / gate / approval authority, a
+default pair / launch topology, an arbitrary callable / module path / entry point, a
+host executable path, or a model / effort *semantic* schema (those stay opaque
+operator-owned `launch_argv` tokens, #13425). Registering a profile makes a provider
+**expressible**, never **launched** — `herdr_launch_command.LAUNCH_PROVIDERS` (the
+default topology) is deliberately NOT derived from the registry.
+
+### Executable trust boundary (supersedes the bare-name argv[0])
+
+The launch chokepoints previously rendered a bare `claude` / `codex` as `argv[0]`,
+leaving provider identity to the exec-time `PATH`. They now render the **verified
+absolute realpath** resolved from the trusted environment (explicit env override →
+trusted `PATH`; unsafe `PATH`, relative override, non-executable, missing, or ambiguous
+all fail closed *before* a pane exists). A committed profile can never name the binary
+that runs (#13245 hostile-checkout boundary).
+
+**Compatibility carve-out (Design Answer j#76725 Q1).** Trusted resolution and a
+byte-invariant built-in argv cannot both hold — re-emitting the bare name after
+resolving would reintroduce the TOCTOU / PATH-substitution hole. The trust boundary
+wins: byte-invariance is narrowed to **every argv token except `argv[0]`**, plus default
+topology, provider order, CLI output, and behavior. Tests pin the *injected* resolver's
+absolute `argv[0]` plus the argv suffix, never a host path literal.
+
+### Honest limit
+
+A data profile absorbs a provider of an **existing** `protocol` family (the claude/codex
+interactive CLI-TUI shape). A provider with a genuinely different interaction protocol
+(different TUI, status semantics, turn-start behavior) still needs adapter code; the
+closed `InteractionProtocol` enum makes that boundary explicit, and an unknown protocol
+fails closed rather than mis-driving a pane. This is the same "Why Not Arbitrary Code
+Plugin Yet" posture as the rest of this document: no external plugin API, no third-party
+module load, no arbitrary script as a trusted provider.
+
+### Increment 1 scope
+
+In scope: the schema / packaged built-ins / loader / validator, the trusted executable
+resolver, and the bounded consumers (launch argv, managed reserved concepts, discovery
+vocabulary). Out of scope (a later increment): the handoff / status / doctor / retire
+consumer sweep, the `workflow_step_herdr` role-authority redesign (that stays #13583
+`provider_binding` authority — a role is never derived from a provider profile), and
+default pair / topology assignment.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

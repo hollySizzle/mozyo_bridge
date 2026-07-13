@@ -1,0 +1,69 @@
+# Built-in agent provider profiles (Redmine #13441, Design Answer j#76725).
+#
+# The runtime source of truth for what the agent-launch layer knows about each
+# interactive-CLI LLM provider. Validated by `agent_provider_profile_config.py`
+# and loaded (via importlib.resources) by `agent_provider_profile.py` — a
+# package-anchored resource, never a cwd / worktree path walk, so a hostile repo
+# checkout cannot shadow it.
+#
+# WHAT CHANGES HERE INSTEAD OF IN SOURCE:
+#   - a provider renames a CLI flag        -> edit its `managed_flags` spelling
+#   - a provider's binary is named anew    -> edit its `executable.command`
+#   - a new interactive-CLI (same protocol) -> add one `profiles:` entry
+#
+# WHAT THIS FILE MAY NEVER CARRY (fail-closed in the schema, not just convention):
+#   - a host executable path / argv / module path / entry point / callable.
+#     `executable` is metadata only: a bare command basename plus the NAME of the
+#     trusted-env variable an operator may set to an absolute path. The binary is
+#     resolved from the trusted environment at launch (#13245 boundary).
+#   - a workflow role, a provider binding, a route, or a default pair. Adding a
+#     profile makes a provider EXPRESSIBLE, never LAUNCHED — default launch
+#     topology is a separate contract (`herdr_launch_command.LAUNCH_PROVIDERS`).
+#   - a model / effort semantic schema. Those stay opaque operator-owned
+#     `launch_argv` tokens (#13425, corrected in j#75397).
+#
+# HONEST LIMIT (#13441 description): a data profile absorbs a provider of an
+# EXISTING `protocol` family. A provider with a genuinely different interaction
+# protocol (different TUI, status semantics, turn-start behavior) needs adapter
+# code; declaring an unknown `protocol` here fails closed rather than mis-driving
+# the pane.
+
+version: "1"
+source: "Redmine #13441 journal #76725 (Coordinator Design Answer, Increment 1)"
+
+profiles:
+  claude:
+    protocol: interactive_cli_tui
+    executable:
+      command: claude
+      env_override: MOZYO_AGENT_CLAUDE_BINARY
+    discovery_aliases:
+      - claude
+    process_names:
+      - claude
+    capabilities:
+      - interactive_tui
+      - launch_argv_override
+      - managed_permission_mode
+    # The managed permission posture (#11925 / #13360): without this flag a
+    # managed Claude worker boots prompt-gated and stalls on its first gated
+    # command. The concept is mozyo policy; only the SPELLING lives here.
+    managed_flags:
+      permission_mode: "--permission-mode"
+
+  codex:
+    protocol: interactive_cli_tui
+    executable:
+      command: codex
+      env_override: MOZYO_AGENT_CODEX_BINARY
+    discovery_aliases:
+      - codex
+    process_names:
+      - codex
+    capabilities:
+      - interactive_tui
+      - launch_argv_override
+      # Codex applies its own env policy to spawned tool shells, so the attested
+      # identity is re-expressed as `-c` overrides at launch (#13614).
+      - tool_shell_env_overrides
+    managed_flags: {}

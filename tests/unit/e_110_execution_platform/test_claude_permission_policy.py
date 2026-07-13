@@ -15,16 +15,24 @@ Covers four surfaces of the policy:
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import io
+import shlex
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
+_TESTS_ROOT = Path(__file__).resolve().parents[2]
+if str(_TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT))
 
+from support.agent_provider_binaries import FakeAgentBinaries
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODE_ENV,
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -37,6 +45,28 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     permission_mode_flag,
     resolve_claude_permission_mode,
 )
+
+# Since #13441 the tmux launch chokepoint renders argv[0] as the provider's verified
+# absolute executable, resolved from the trusted env. These tests clear `os.environ`, so
+# they must supply a PATH — a hermetic one, never the host's, so the suite does not
+# depend on a real `claude` / `codex` being installed.
+PROVIDER_BINS = FakeAgentBinaries(Path(tempfile.mkdtemp(prefix="mzb-perm-bins-")))
+atexit.register(shutil.rmtree, PROVIDER_BINS.bin_dir.parent, True)
+
+
+def _trusted_env(env=None):
+    """``env`` with the hermetic provider PATH the launch chokepoint resolves against.
+
+    PATH is applied LAST so it always wins: a scenario that copies the real
+    ``os.environ`` would otherwise carry the host's PATH and resolve the developer's
+    real ``claude`` / ``codex``, which is exactly what these tests must not do.
+    """
+    return {**(env or {}), "PATH": str(PROVIDER_BINS.bin_dir)}
+
+
+def _argv0(provider):
+    """The shell-quoted absolute argv[0] the launch command must render for ``provider``."""
+    return shlex.quote(PROVIDER_BINS.path(provider))
 
 
 class ResolverPrecedenceTest(unittest.TestCase):
@@ -140,18 +170,18 @@ class LaunchChokepointTest(unittest.TestCase):
     def _command(self, agent, *, policy_default, env):
         from mozyo_bridge.application.commands import _agent_launch_command
 
-        with patch.dict("os.environ", env, clear=True):
+        with patch.dict("os.environ", _trusted_env(env), clear=True):
             return _agent_launch_command(
                 agent, "mozyo-demo", cwd=None, permission_mode_default=policy_default
             )
 
     def test_cockpit_default_renders_auto_without_env(self) -> None:
         cmd = self._command("claude", policy_default="auto", env={})
-        self.assertTrue(cmd.endswith(" claude --permission-mode auto"), cmd)
+        self.assertTrue(cmd.endswith(f" {_argv0('claude')} --permission-mode auto"), cmd)
 
     def test_standalone_default_keeps_bare_claude(self) -> None:
         cmd = self._command("claude", policy_default=None, env={})
-        self.assertTrue(cmd.endswith(" claude"), cmd)
+        self.assertTrue(cmd.endswith(f" {_argv0('claude')}"), cmd)
         self.assertNotIn("--permission-mode", cmd)
 
     def test_env_override_beats_cockpit_default(self) -> None:
@@ -160,11 +190,11 @@ class LaunchChokepointTest(unittest.TestCase):
             policy_default="auto",
             env={CLAUDE_PERMISSION_MODE_ENV: "plan"},
         )
-        self.assertTrue(cmd.endswith(" claude --permission-mode plan"), cmd)
+        self.assertTrue(cmd.endswith(f" {_argv0('claude')} --permission-mode plan"), cmd)
 
     def test_codex_unaffected_by_cockpit_default(self) -> None:
         cmd = self._command("codex", policy_default="auto", env={})
-        self.assertTrue(cmd.endswith(" codex"), cmd)
+        self.assertTrue(cmd.endswith(f" {_argv0('codex')}"), cmd)
         self.assertNotIn("--permission-mode", cmd)
 
     def test_invalid_env_is_hard_error(self) -> None:
@@ -182,7 +212,7 @@ class LaunchChokepointModelFlagTest(unittest.TestCase):
     def _command(self, agent, *, policy_default=None, claude_model=None, env=None):
         from mozyo_bridge.application.commands import _agent_launch_command
 
-        with patch.dict("os.environ", env or {}, clear=True):
+        with patch.dict("os.environ", _trusted_env(env), clear=True):
             return _agent_launch_command(
                 agent,
                 "mozyo-demo",
@@ -196,13 +226,13 @@ class LaunchChokepointModelFlagTest(unittest.TestCase):
             "claude", policy_default="auto", claude_model="claude-opus-4-8"
         )
         self.assertTrue(
-            cmd.endswith(" claude --permission-mode auto --model claude-opus-4-8"),
+            cmd.endswith(f" {_argv0('claude')} --permission-mode auto --model claude-opus-4-8"),
             cmd,
         )
 
     def test_model_flag_without_permission_mode(self) -> None:
         cmd = self._command("claude", policy_default=None, claude_model="sonnet")
-        self.assertTrue(cmd.endswith(" claude --model sonnet"), cmd)
+        self.assertTrue(cmd.endswith(f" {_argv0('claude')} --model sonnet"), cmd)
         self.assertNotIn("--permission-mode", cmd)
 
     def test_no_model_is_byte_identical_to_historical(self) -> None:
@@ -211,12 +241,14 @@ class LaunchChokepointModelFlagTest(unittest.TestCase):
         with_model_unset = self._command("claude", policy_default="auto")
         historical = self._command("claude", policy_default="auto", claude_model=None)
         self.assertEqual(with_model_unset, historical)
-        self.assertTrue(historical.endswith(" claude --permission-mode auto"), historical)
+        self.assertTrue(
+            historical.endswith(f" {_argv0('claude')} --permission-mode auto"), historical
+        )
         self.assertNotIn("--model", historical)
 
     def test_codex_never_gets_model_flag(self) -> None:
         cmd = self._command("codex", claude_model="claude-opus-4-8")
-        self.assertTrue(cmd.endswith(" codex"), cmd)
+        self.assertTrue(cmd.endswith(f" {_argv0('codex')}"), cmd)
         self.assertNotIn("--model", cmd)
 
     def test_invalid_model_is_hard_error(self) -> None:
@@ -257,7 +289,7 @@ class CockpitDryRunPolicyTest(unittest.TestCase):
         env = {k: v for k, v in __import__("os").environ.items()}
         env.pop(CLAUDE_PERMISSION_MODE_ENV, None)
         with patch.object(commands, "resolve_canonical_session", side_effect=fake_resolve), \
-            patch.dict("os.environ", env, clear=True), \
+            patch.dict("os.environ", _trusted_env(env), clear=True), \
             patch.object(commands, "run_tmux") as run_tmux:
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 rc = commands.cmd_layout_apply(self._args())
@@ -278,7 +310,7 @@ class DoctorLaunchPolicySectionTest(unittest.TestCase):
             doctor_claude_launch_policy_section,
         )
 
-        with patch.dict("os.environ", env, clear=True):
+        with patch.dict("os.environ", _trusted_env(env), clear=True):
             return doctor_claude_launch_policy_section()
 
     def test_unset_env_reports_ok_reproducible_auto(self) -> None:

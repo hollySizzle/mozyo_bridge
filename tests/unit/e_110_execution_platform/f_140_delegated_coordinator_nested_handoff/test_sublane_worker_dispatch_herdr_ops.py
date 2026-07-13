@@ -50,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     lane_identity_matches,
 )
 
+from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
 from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_sublane_actuator_herdr_ops import (  # noqa: E501
     HERDR_ENV,
     _fake_binary,
@@ -70,7 +71,7 @@ class _HerdrLaneFixture:
         self.worktree = Path(tmp) / "lane-wt"
         self.worktree.mkdir(exist_ok=True)
         binpath = _fake_binary(tmp)
-        self.env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(self.home)}
+        self.env = with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(self.home)})
 
     def stand_up_lane(self) -> None:
         actuator = HerdrSublaneActuatorOps(

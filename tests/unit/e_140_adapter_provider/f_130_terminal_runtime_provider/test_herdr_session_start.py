@@ -8,8 +8,10 @@ unconfigured binary, and self-identity env injection into the launched agent.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,6 +27,7 @@ if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
 from support.herdr_fake import FakeHerdr
+from support.agent_provider_binaries import DEFAULT_PROVIDER_COMMANDS, FakeAgentBinaries
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
@@ -49,6 +52,34 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 )
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
+
+# Since #13441 a launch renders argv[0] as the provider's verified absolute executable,
+# resolved from the launch env's trusted PATH. These tests must never resolve the host's
+# real `claude` / `codex` (that would make the suite machine-dependent, and `codex` is
+# often not installed at all), so one hermetic bin directory of real executable stubs is
+# shared by the module and put on every launch env's PATH. `PROVIDER_BINS.path("claude")`
+# is then the exact absolute argv[0] each assertion pins.
+PROVIDER_BINS = FakeAgentBinaries(Path(tempfile.mkdtemp(prefix="mzb-provider-bins-")))
+atexit.register(shutil.rmtree, PROVIDER_BINS.bin_dir.parent, True)
+
+
+def _launch_env(binpath, **extra):
+    """The trusted launch env: the herdr binary plus a PATH of hermetic provider stubs."""
+    return {HERDR_ENV: str(binpath), "PATH": str(PROVIDER_BINS.bin_dir), **extra}
+
+
+def _launched_provider(start_argv):
+    """The provider id a launched `agent start` argv runs, from its absolute argv[0].
+
+    argv[0] is no longer the provider label (#13441), so a test that needs to know
+    which provider an argv launched maps the resolved executable back to its id
+    instead of reading the label out of the argv.
+    """
+    argv0 = start_argv[start_argv.index("--") + 1]
+    for provider in DEFAULT_PROVIDER_COMMANDS:
+        if argv0 == PROVIDER_BINS.path(provider):
+            return provider
+    raise AssertionError(f"argv[0] is not a known provider executable: {argv0!r}")
 
 
 def _env_flags(start_argv):
@@ -267,7 +298,13 @@ class SessionStartTest(unittest.TestCase):
         binpath = Path(tmp) / "fake-herdr"
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        env = {HERDR_ENV: str(binpath)}
+        # Since #13441 argv[0] is the provider's verified absolute executable resolved
+        # from the launch env's trusted PATH. Install hermetic provider binaries and
+        # point PATH at them, so these tests never resolve (or depend on) the host's
+        # real `claude` / `codex` — and so `PROVIDER_BINS.path(...)` is the exact
+        # argv[0] each assertion pins.
+        self.binaries = PROVIDER_BINS
+        env = _launch_env(binpath)
         if extra_env:
             env.update(extra_env)
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
@@ -286,13 +323,20 @@ class SessionStartTest(unittest.TestCase):
 
     def _fake_launcher_env(self, tmp):
         # A resolvable absolute `mozyo-bridge` on the launch env PATH, so the #13637
-        # self-check wrapper is applied to the launch.
+        # self-check wrapper is applied to the launch. This PATH is passed as
+        # `extra_env` and therefore REPLACES the default launch PATH, so it must also
+        # carry the #13441 provider stubs — otherwise argv[0] would not resolve and the
+        # launch would fail closed before the wrapper is ever exercised. Both components
+        # are absolute (the resolver refuses a relative one), and only this dir holds
+        # `mozyo-bridge` while only the shared dir holds the providers, so neither
+        # lookup is ambiguous.
         bindir = Path(tmp) / "bin"
-        bindir.mkdir()
+        bindir.mkdir(exist_ok=True)
         launcher = bindir / "mozyo-bridge"
         launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        return {"PATH": str(bindir)}, str(launcher)
+        path = os.pathsep.join([str(bindir), str(PROVIDER_BINS.bin_dir)])
+        return {"PATH": path}, str(launcher)
 
     def test_launch_wraps_provider_in_self_attest_when_launcher_resolves(self) -> None:
         # Redmine #13637: a launch execs the provider THROUGH `mozyo-bridge herdr
@@ -316,7 +360,7 @@ class SessionStartTest(unittest.TestCase):
         self.assertIn("claude", start)
         # The provider is after the LAST `--` (the wrapper's own separator).
         last_sep = len(start) - 1 - start[::-1].index("--")
-        self.assertEqual(start[last_sep + 1], "claude")
+        self.assertEqual(start[last_sep + 1], PROVIDER_BINS.path("claude"))
         # The injected identity env is unchanged (still on herdr --env flags).
         self.assertIn(f"MOZYO_WORKSPACE_ID={ws}", start)
 
@@ -330,7 +374,7 @@ class SessionStartTest(unittest.TestCase):
         start = herdr.start_argvs[0]
         self.assertNotIn("agent-attest", start)
         self.assertNotIn("MOZYO_BRIDGE_HOME", "".join(start))
-        self.assertEqual(start[-2:], ["--", "claude"])
+        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
 
     def test_wrapped_launch_injects_store_home_matching_reader(self) -> None:
         # Finding 1 (review j#76492): the wrapped launch injects
@@ -395,7 +439,7 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )  # NO attestation_reader -> default reader resolves the same home
         self.assertEqual(result.slots[0].outcome, SLOT_ADOPTED)
@@ -415,8 +459,9 @@ class SessionStartTest(unittest.TestCase):
             # The durable name is applied AT START (positional), never via rename.
             self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
             for argv in herdr.start_argvs:
-                # argv = ["agent", "start", <NAME>, "--cwd", ...]
-                provider = argv[argv.index("--") + 1]
+                # argv = ["agent", "start", <NAME>, "--cwd", ...]; argv[0] of the run
+                # command is now the resolved absolute executable, so map it back.
+                provider = _launched_provider(argv)
                 self.assertEqual(argv[2], names[provider])
 
     def test_launch_injects_self_identity_via_env_flags(self) -> None:
@@ -438,7 +483,7 @@ class SessionStartTest(unittest.TestCase):
         self.assertIn("MOZYO_AGENT_ROLE=claude", start)
         self.assertIn("MOZYO_LANE_ID=lane-1", start)
         # `-- <provider>` terminates the argv.
-        self.assertEqual(start[-2:], ["--", "claude"])
+        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
 
     def test_codex_launch_propagates_identity_to_tool_shell_policy(self) -> None:
         herdr = _Herdr()
@@ -450,7 +495,7 @@ class SessionStartTest(unittest.TestCase):
 
         start = herdr.start_argvs[0]
         separator = start.index("--")
-        self.assertEqual(start[separator + 1], "codex")
+        self.assertEqual(start[separator + 1], PROVIDER_BINS.path("codex"))
         self.assertEqual(
             start[separator + 2 :],
             [
@@ -484,7 +529,7 @@ class SessionStartTest(unittest.TestCase):
         separator = start.index("--")
         self.assertEqual(
             start[separator + 1 : separator + 4],
-            ["codex", "-c", 'model="test"'],
+            [PROVIDER_BINS.path("codex"), "-c", 'model="test"'],
         )
         self.assertEqual(
             start[-2:],
@@ -534,7 +579,14 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex"],
                     lane_id="lane-1",
-                    env={"PATH": str(bindir)},  # no MOZYO_HERDR_BINARY
+                    # This PATH intentionally omits MOZYO_HERDR_BINARY (herdr must
+                    # resolve from PATH); it also carries the #13441 provider stubs so
+                    # argv[0] resolves.
+                    env={
+                        "PATH": os.pathsep.join(
+                            [str(bindir), str(PROVIDER_BINS.bin_dir)]
+                        )
+                    },
                     runner=herdr.run,
                 )
         start = herdr.start_argvs[0]
@@ -556,8 +608,7 @@ class SessionStartTest(unittest.TestCase):
             )
         by_provider = {}
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
-            by_provider[provider] = argv
+            by_provider[_launched_provider(argv)] = argv
         claude = by_provider["claude"]
         idx = claude.index("--permission-mode")
         self.assertEqual(claude[idx + 1], "auto")
@@ -595,18 +646,26 @@ class SessionStartTest(unittest.TestCase):
             )
         by_provider = {}
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
-            by_provider[provider] = argv
+            by_provider[_launched_provider(argv)] = argv
         claude = by_provider["claude"]
-        # `-- claude --permission-mode auto --model claude-opus-4-8` (Q4 order).
+        # `-- <abs claude> --permission-mode auto --model claude-opus-4-8` (Q4 order).
+        # argv[0] is the resolved absolute executable (#13441 j#76725 Q1); the flag
+        # tokens and their order are byte-invariant.
         self.assertEqual(
             claude[claude.index("--"):],
-            ["--", "claude", "--permission-mode", "auto", "--model", "claude-opus-4-8"],
+            [
+                "--",
+                PROVIDER_BINS.path("claude"),
+                "--permission-mode",
+                "auto",
+                "--model",
+                "claude-opus-4-8",
+            ],
         )
         codex = by_provider["codex"]
         self.assertEqual(
             codex[codex.index("--") : codex.index("--") + 4],
-            ["--", "codex", "--config", "model_reasoning_effort=high"],
+            ["--", PROVIDER_BINS.path("codex"), "--config", "model_reasoning_effort=high"],
         )
         self.assertEqual(
             codex[-2:],
@@ -642,7 +701,7 @@ class SessionStartTest(unittest.TestCase):
         codex = herdr.start_argvs[0]
         self.assertEqual(
             codex[codex.index("--") : codex.index("--") + 4],
-            ["--", "codex", "--config", "model_reasoning_effort=xhigh"],
+            ["--", PROVIDER_BINS.path("codex"), "--config", "model_reasoning_effort=xhigh"],
         )
         self.assertEqual(
             codex[-2:],
@@ -658,9 +717,11 @@ class SessionStartTest(unittest.TestCase):
                 tmp, providers=["claude", "codex"], herdr=herdr, agent_launch=None
             )
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
+            provider = _launched_provider(argv)
             if provider == "claude":
-                self.assertEqual(argv[-2:], ["--", provider])
+                # argv[0] is the resolved absolute executable; every other token of the
+                # unconfigured Claude launch is byte-invariant (j#76725 Q1).
+                self.assertEqual(argv[-2:], ["--", PROVIDER_BINS.path("claude")])
             else:
                 self.assertEqual(
                     argv[-2:],
@@ -675,7 +736,7 @@ class SessionStartTest(unittest.TestCase):
             self._prepare(tmp, providers=["claude"], herdr=herdr)
         start = herdr.start_argvs[0]
         self.assertNotIn("--permission-mode", start)
-        self.assertEqual(start[-2:], ["--", "claude"])
+        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
 
     def test_launch_env_override_wins_over_policy_default(self) -> None:
         # MOZYO_CLAUDE_PERMISSION_MODE stays the explicit override rail (#11857):
@@ -758,7 +819,7 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                     # The live agent WAS launched with attestation: a present record
                     # generation-bound to its live locator lets the adopt gate adopt it
@@ -802,7 +863,7 @@ class SessionStartTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
                 attestation_reader=(
                     attestation_reader(ws) if attestation_reader else None
@@ -975,7 +1036,7 @@ class SessionStartTest(unittest.TestCase):
                         repo_root=repo,
                         providers=["codex"],
                         lane_id="lane-1",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
 
@@ -986,7 +1047,7 @@ class SessionStartTest(unittest.TestCase):
                 repo_root=repo,
                 providers=list(providers),
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
                 dry_run=True,
             )
@@ -1241,7 +1302,7 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["claude", "codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
@@ -1313,7 +1374,7 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["claude", "codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
@@ -1437,7 +1498,7 @@ class SessionStartTest(unittest.TestCase):
                         repo_root=repo,
                         providers=["claude", "claude"],
                         lane_id="lane-1",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
         # No side effect: not even `agent list` ran (the guard precedes binary
@@ -1482,7 +1543,7 @@ class SessionStartCliTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["claude", "codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(
@@ -1515,7 +1576,7 @@ class SessionStartCliTest(unittest.TestCase):
         def _prepare_with_fake_runner(**kwargs):
             return real_prepare(runner=herdr.run, **kwargs)
 
-        env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+        env = _launch_env(binpath, MOZYO_BRIDGE_HOME=str(home))
         if extra_env:
             env.update(extra_env)
         with patch.dict(os.environ, env, clear=False), patch.object(
@@ -1538,7 +1599,12 @@ class SessionStartCliTest(unittest.TestCase):
             # `agent start ... --`, so keying on the last separator finds the provider
             # whether or not the launch was wrapped.
             last_sep = len(argv) - 1 - argv[::-1].index("--")
-            by_provider[argv[last_sep + 1]] = argv
+            argv0 = argv[last_sep + 1]
+            provider = next(
+                (c for c in DEFAULT_PROVIDER_COMMANDS if argv0 == PROVIDER_BINS.path(c)),
+                argv0,
+            )
+            by_provider[provider] = argv
         return by_provider
 
     def test_cli_session_start_threads_auto_permission_default(self) -> None:
@@ -1638,7 +1704,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex", "claude"],
                     lane_id="issue_13377_x",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
                 # The shared resolver agrees with what was minted (mint == resolve):
@@ -1708,7 +1774,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex", "claude"],
                     lane_id="issue_13595_dry",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                     dry_run=True,
                 )
@@ -1760,7 +1826,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex", "claude"],
                     lane_id="issue_13595_m",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                     dry_run=True,
                 )
@@ -1797,7 +1863,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex"],
                     lane_id="issue_13595_m",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                     dry_run=True,
                 )
@@ -1823,7 +1889,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                         repo_root=wt,
                         providers=["codex"],
                         lane_id="issue_13595_m",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                         dry_run=True,
                     )
@@ -1859,7 +1925,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex"],
                     lane_id="issue_13595_m",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
                 after = _fingerprint([registry_path(home)])
@@ -1907,7 +1973,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex", "claude"],
                     lane_id="issue_13380_b",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
@@ -1945,7 +2011,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                         repo_root=wt,
                         providers=["codex"],
                         lane_id="issue_13377_y",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
         self.assertIn("main checkout has no registered workspace identity", str(ctx.exception))
@@ -1971,7 +2037,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                         repo_root=wt,
                         providers=["codex", "claude"],
                         lane_id="",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
         self.assertIn("requires an explicit lane id", str(ctx.exception))
@@ -2004,7 +2070,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex"],
                     lane_id="",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(result.lane_id, "issue_13377_w")
@@ -2036,7 +2102,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
             )
             ws = read_anchor(repo)["workspace_id"]
@@ -2122,7 +2188,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex", "claude"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         # codex adopts; claude launches into the adopted tab with --split right.
@@ -2165,7 +2231,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex", "claude"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.tab_creates, [])
@@ -2221,7 +2287,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
             )
         return result, herdr
@@ -2323,7 +2389,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
             binpath = Path(tmp) / "fake-herdr"
             binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-            env = {HERDR_ENV: str(binpath)}
+            env = _launch_env(binpath)
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 a = prepare_session(
                     repo_root=repo, providers=["codex", "claude"],
@@ -2368,7 +2434,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                         repo_root=repo,
                         providers=["codex", "claude"],
                         lane_id="lane-a",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=fake.run,
                     )
         self.assertIn("--tab", str(ctx.exception))
@@ -2649,7 +2715,7 @@ class LanePlacementLayoutTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
                 lane_placement=lane_placement,
             )
@@ -2784,7 +2850,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
                 lane_placement=lane_placement,
             )
@@ -3173,7 +3239,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex", "claude"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                     lane_placement=self._placement(sublane={"split": "down"}),
                     attestation_reader=_present_attestation_reader(
@@ -3221,7 +3287,7 @@ class LanePlacementLaunchTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex", "claude"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                     lane_placement=self._placement(
                         sublane={"split": "down", "order": ["claude", "codex"]}

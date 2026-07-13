@@ -745,7 +745,14 @@ def _execute_slot(
     # Launch with the durable name at start; the full `agent start` argv (self-identity
     # `--env`, `MOZYO_HERDR_BINARY`, `--permission-mode`, config tokens, Codex `-c`
     # overrides, lane `--tab`, and the #13637 self-attestation wrap) is assembled by the
-    # cohesive sibling `herdr_launch_argv.build_agent_start_argv` (pure).
+    # cohesive sibling `herdr_launch_argv.build_agent_start_argv`.
+    #
+    # `env` is threaded in so argv[0] resolves to the provider's verified absolute
+    # executable from the SAME trusted environment the launch itself runs under
+    # (Redmine #13441): resolving against a different env than the one handed to
+    # `_invoke` would verify one binary and exec another. An unresolvable / ambiguous
+    # provider binary raises here — before `agent start` runs — so a failed resolution
+    # never leaves a live pane behind.
     launch_argv = build_agent_start_argv(
         assigned_name=plan.assigned_name,
         provider=plan.provider,
@@ -761,6 +768,7 @@ def _execute_slot(
         store_home=store_home,
         claude_permission_mode=claude_permission_mode,
         launch_argv_extra=launch_argv_extra,
+        env=env,
     )
     started = _invoke(
         binary,
