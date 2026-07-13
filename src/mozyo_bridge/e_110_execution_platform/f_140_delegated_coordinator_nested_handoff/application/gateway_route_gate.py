@@ -29,17 +29,15 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
     load_workflow_binding,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    WorkflowProviderUnresolved,
+    resolve_worker_provider,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_route_enforcement import (
     GatewayRouteRequest,
     decide_gateway_route,
     render_block_die_message,
     render_exception_advisory,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
-    PROVIDER_CLAUDE,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
-    ROLE_IMPLEMENTER,
 )
 from mozyo_bridge.shared.errors import die
 
@@ -83,10 +81,17 @@ def enforce_gateway_route(
     # Role-based worker discrimination (Redmine #13174): resolve the implementer
     # (worker) role's runtime provider from the repo-local binding (#12673/#13157;
     # default -> claude, byte-identical) so the authority decision keys on the role,
-    # not the literal `claude` receiver token. A broken config fails closed through
-    # the loader's RepoLocalConfigError.
+    # not the literal `claude` receiver token. A broken config fails closed through the
+    # loader's RepoLocalConfigError; an unbound worker role fails closed here rather than
+    # silently defaulting to a literal (Redmine #13569 j#76969 correction 4) — without a
+    # resolvable worker provider the cross-lane discrimination cannot be made, so the send
+    # is blocked before any text is typed.
     binding, _warnings = load_workflow_binding()
-    worker_provider = binding.provider_for(ROLE_IMPLEMENTER) or PROVIDER_CLAUDE
+    try:
+        worker_provider = resolve_worker_provider(binding=binding)
+    except WorkflowProviderUnresolved as exc:
+        die(str(exc))
+        raise AssertionError("unreachable")
     decision = decide_gateway_route(
         GatewayRouteRequest(
             kind=kind,

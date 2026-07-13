@@ -98,6 +98,18 @@ class HerdrWorkerDispatchOps:
             timeout=self.timeout,
         )
 
+    def worker_provider(self) -> str:
+        """The implementer (worker) role's runtime provider from the binding (Redmine #13569).
+
+        Default ``claude`` (byte-identical); a rebound worker provider moves the herdr
+        ``--to`` receiver with no source edit. Unbound -> fail-closed zero-send.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_worker_provider,
+        )
+
+        return resolve_worker_provider(str(self.repo_root))
+
     def command_authority_pins(self) -> dict:
         """The stable-lane authority pins the replayable outcome command must carry (#13485).
 
@@ -184,6 +196,9 @@ class HerdrWorkerDispatchOps:
             # divergent cwd and validates the herdr worker locator (`worker_pane`, a
             # non-`%pane` handle) as an invalid tmux target — the #13379 j#73722 blocker.
             repo_root=str(self.repo_root),
+            # Redmine #13569: the `--to` receiver is the binding-resolved worker provider
+            # (default `claude`), so a rebound worker follows without a literal edit.
+            worker_provider=self.worker_provider(),
         )
         return _worker_dispatcher._drive_worker_send_argv(argv)
 

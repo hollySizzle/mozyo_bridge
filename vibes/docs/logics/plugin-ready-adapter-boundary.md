@@ -1846,6 +1846,43 @@ delegated-route / sublane launch-dispatch-retire sweep. Unchanged in both increm
 `workflow_step_herdr` / `grandchild_stamp` durable role authority and the default topology
 (a role / default pair is never derived from a provider profile).
 
+### Increment 2B — binding-resolved runtime provider at the actuation sites (Redmine #13569)
+
+2A gave the consumers one *mechanical* snapshot. 2B rebinds the *runtime provider* the
+delegated-route / gateway / sublane actuation sites key on from a hard-coded literal onto
+the workflow role's `RoleProviderBinding` (#12673 / #13157) — the implementer (worker)
+role's provider, the coordinator (gateway) role's provider — so a rebind moves every
+actuation with no consumer literal, while the "gateway-via, worker-never-cross-boundary-direct"
+invariant is expressed in the *resolved* provider rather than the literal `claude`.
+
+The one rule (Coordinator Answer j#76969 correction 4), encoded once in
+`f_140.../application/workflow_provider_resolution.py`: no site writes
+`binding.provider_for(role) or PROVIDER_CLAUDE`. The default is carried by
+`RoleProviderBinding.default()`, so a `None` is a *genuinely unbound* role — an
+actuation-time fail-closed (`WorkflowProviderUnresolved` → zero-send), never a guessed
+literal. The built-in binding binds every role, so every default path is byte-identical.
+
+Binding-resolved sites: `main_lane_guard_gate` / `gateway_route_gate` (the worker-direct
+authority; silent fallback removed, unresolved → fail-closed), `sublane_worker_dispatcher`
++ its herdr ops (the `--to` receiver and readiness probe), `sublane_herdr_retire` (managed
+retire targets — `managed_providers` = the binding's gateway/worker pair), the
+`delegation_route_planner` route heads + the cross-boundary worker-direct guard,
+`route_identity_ledger` / `backend_neutral_resolver` / `delegation_route_executor` (the
+route re-resolution `expected_roles`), `delegation_launch_adopt` (the child-gateway landing
+role), and `target_selector` (the cross-workspace worker-direct refusal). Each takes the
+resolved provider as an explicit input with a built-in default.
+
+Deliberately NOT rebound (fence): the `sublane_lifecycle.GATEWAY_ROLE` / `WORKER_ROLE`
+slot-identity constants are shared with the `workflow_step_herdr` **durable role authority**
+(a role is never derived from a provider) and name the *launched* topology (fenced default
+`codex`/`claude`); the binding-*expected* provider is checked at the actuation sites above,
+so a binding whose worker ≠ the launched pane surfaces a `provider_mismatch` fail-closed
+rather than a silent rebind of the durable authority. The f_120 project-gateway `--to codex`
+machine-token gates stay as a compatibility layer (the binding authority is enforced in the
+f_140 layer, avoiding an f_120 → f_140 dependency inversion). `grandchild_stamp`,
+`workflow_step_herdr`, the default topology, provider-specific Claude/Codex policy, and the
+public notify aliases are unchanged.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

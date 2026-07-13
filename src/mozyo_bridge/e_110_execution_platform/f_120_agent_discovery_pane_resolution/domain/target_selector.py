@@ -146,6 +146,7 @@ def select_target(
     *,
     normalize: Callable[[str], str] = lambda path: path,
     snapshot: AgentProviderRuntimeSnapshot | None = None,
+    worker_provider: str = AGENT_KIND_CLAUDE,
 ) -> TargetSelection:
     """Resolve ``query`` to exactly one candidate pane, fail-closed (Redmine #12663).
 
@@ -216,7 +217,11 @@ def select_target(
 
     if len(project_matched) == 1:
         chosen = project_matched[0]
-        if role == AGENT_KIND_CLAUDE and not _same_repo(
+        # The cross-workspace worker-direct refusal keys on the binding-resolved worker
+        # provider (Redmine #13569 j#76969 correction 3), default ``claude`` — a rebound
+        # worker provider is still refused cross-workspace, the gateway-via invariant not
+        # weakened by the provider name.
+        if role == worker_provider and not _same_repo(
             chosen.repo_root, query.sender_repo_root, normalize
         ):
             # Workspace boundary is the repo root, not the session: a cockpit

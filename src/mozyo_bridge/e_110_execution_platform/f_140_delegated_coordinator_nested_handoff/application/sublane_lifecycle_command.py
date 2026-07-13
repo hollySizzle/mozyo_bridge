@@ -763,6 +763,11 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         execute_herdr_retire_close,
         plan_herdr_retire_close,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_gateway_provider,
+        resolve_worker_provider,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
         herdr_workspace_segment,
@@ -808,11 +813,24 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         rows = list_herdr_agent_rows(os.environ)
     except HerdrSessionStartError:
         return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
+    # The managed slots to retire are the providers the repo-local binding assigns to the
+    # lane's gateway / worker roles (Redmine #13569 Increment 2B): default (codex, claude),
+    # byte-identical. A rebound lane retires ITS slots, and a provider the binding does not
+    # assign is never a retire target. An unbound role (impossible under the default) fails
+    # closed to zero-actuation rather than closing a guessed pane.
+    try:
+        managed_roles = (
+            resolve_gateway_provider(str(repo_root)),
+            resolve_worker_provider(str(repo_root)),
+        )
+    except WorkflowProviderUnresolved:
+        return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
     plan = plan_herdr_retire_close(
         rows,
         workspace_id=workspace_id,
         lane_id=lane_label,
         legacy_workspace_id=legacy_token,
+        managed_roles=managed_roles,
     )
     result = execute_herdr_retire_close(plan)
     # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire

@@ -65,6 +65,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveSublaneActuatorOps,
     resolve_dispatch_admission_args,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    WorkflowProviderUnresolved,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
@@ -180,6 +183,21 @@ class LiveWorkerDispatchOps:
     def _actuator_ops(self) -> LiveSublaneActuatorOps:
         return LiveSublaneActuatorOps(repo_root=self.repo_root)
 
+    def worker_provider(self) -> str:
+        """The runtime provider bound to the implementer (worker) role (Redmine #13569).
+
+        Resolved from the repo-local ``RoleProviderBinding`` (default ``claude``,
+        byte-identical) so the forward keys on the role, not a literal — a rebound worker
+        provider moves the ``--to`` receiver and the readiness probe with no source edit.
+        An unbound worker role raises :class:`WorkflowProviderUnresolved`, which the drive
+        turns into a fail-closed zero-send.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_worker_provider,
+        )
+
+        return resolve_worker_provider(str(self.repo_root))
+
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         return self._actuator_ops().read_lane(worktree_path)
 
@@ -201,8 +219,9 @@ class LiveWorkerDispatchOps:
         )
 
         try:
+            worker_provider = self.worker_provider()
             info = pane_info(worker_pane)
-            if not is_receiver_agent_process(info.get("command", ""), "claude"):
+            if not is_receiver_agent_process(info.get("command", ""), worker_provider):
                 return False
             rendered = capture_pane(worker_pane, WORKER_READY_CAPTURE_LINES)
         except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the drive.
@@ -228,6 +247,7 @@ class LiveWorkerDispatchOps:
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            worker_provider=self.worker_provider(),
         )
         return _drive_worker_send_argv(argv)
 
@@ -286,6 +306,7 @@ def _worker_dispatch_argv(
     allow_direct_worker: bool = False,
     repo_root: Optional[str] = None,
     target_lane: Optional[str] = None,
+    worker_provider: str = "claude",
 ) -> list[str]:
     """The same-lane worker forward as the gateway would type it (pure).
 
@@ -344,7 +365,7 @@ def _worker_dispatch_argv(
         "handoff",
         "send",
         "--to",
-        "claude",
+        worker_provider,
         "--source",
         "redmine",
         "--issue",
@@ -391,6 +412,7 @@ def _replayable_command(
     allow_direct_worker: bool = False,
     target_lane: Optional[str] = None,
     repo_root: Optional[str] = None,
+    worker_provider: str = "claude",
 ) -> str:
     """The replayable retry command surfaced on the outcome / durable journal.
 
@@ -416,6 +438,7 @@ def _replayable_command(
             allow_direct_worker=allow_direct_worker,
             target_lane=target_lane,
             repo_root=repo_root,
+            worker_provider=worker_provider,
         )
     )
 
@@ -479,6 +502,23 @@ class WorkerDispatchUseCase:
         """
         getter = getattr(self.ops, "command_authority_pins", None)
         return getter() if callable(getter) else {}
+
+    def _display_worker_provider(self) -> str:
+        """The worker provider for the *display* / replay command (Redmine #13569).
+
+        Optional port capability read through ``getattr`` — a fake ops (or one that does
+        not resolve a binding) keeps the byte-identical ``claude`` default. An unbound role
+        also degrades to the default here: this is the display string only; the actuation
+        path resolves the same provider and fails closed separately, so a rebound worker's
+        command reads correctly while an unresolved binding never fabricates a send.
+        """
+        getter = getattr(self.ops, "worker_provider", None)
+        if not callable(getter):
+            return "claude"
+        try:
+            return getter()
+        except WorkflowProviderUnresolved:
+            return "claude"
 
     def run(
         self,
@@ -607,6 +647,7 @@ class WorkerDispatchUseCase:
             allow_direct_worker=allow_direct_worker,
             target_lane=pins.get("target_lane"),
             repo_root=pins.get("repo_root"),
+            worker_provider=self._display_worker_provider(),
         )
 
         # 6. Dry-run: preview the resolved transfer; perform nothing.
@@ -744,6 +785,7 @@ class WorkerDispatchUseCase:
                 lane_label=request.lane_label,
                 gateway_callback_target=gateway_pane,
                 target_repo=target_repo,
+                worker_provider=self._display_worker_provider(),
                 **{
                     k: v
                     for k, v in self._command_pins().items()
