@@ -83,7 +83,9 @@ a running herdr 0.7.1::
   env: the server-spawned agent does not inherit the launching client's environment
   (coordinator-measured), so ``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
   ``MOZYO_LANE_ID`` are passed as ``--env KEY=VALUE``.
-- ``--no-focus`` avoids stealing the operator's focus.
+- ``--no-focus`` avoids stealing the operator's focus. The one exception is the first
+  launch of a fresh, explicitly-placed pair, which must own the container's split target
+  (Redmine #13646 R1-F1 — see ``herdr_lane_topology.resolve_focus_first_launch``).
 - output is a single JSON object on stdout; the transient locator for rebind/read is
   ``result.agent.pane_id`` under a ``result.type == "agent_started"`` envelope
   (:func:`herdr_lane_topology._parse_started_agent`, fail-closed).
@@ -140,6 +142,15 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SLOT_STALE as LIVENESS_STALE,
     classify_named_slot,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (
+    SLOT_ADOPTED,
+    SLOT_LAUNCHED,
+    SLOT_PLANNED,
+    SLOT_STALE,
+    SLOT_UNATTESTED,
+    SessionStartResult,
+    SlotResult,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
     PROVIDER_CLAUDE,
@@ -182,108 +193,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _tab_target_for_lane,
     _workspace_prefix,
     herdr_workspace_segment,
-    initial_container_occupancy,
+    resolve_container_plan,
     resolve_launch_order,
     resolve_placement_policy,
-    resolve_split_direction,
     slot_placement,
 )
 from mozyo_bridge.shared.errors import die
-
-# Per-slot outcome tokens.
-SLOT_ADOPTED = "adopted"
-SLOT_LAUNCHED = "launched"
-SLOT_PLANNED = "planned"
-# A host-restart shell / name residue: surfaced read-only (#13518 j#75329; see herdr_slot_liveness).
-SLOT_STALE = LIVENESS_STALE
-# A live slot whose startup self-attestation is absent / stale / missing / conflicting
-# (Redmine #13637): the durable name matches a live agent, but its injected identity
-# env is unverified, so it is surfaced read-only and never blind-adopted.
-SLOT_UNATTESTED = "unattested"
-
-
-@dataclass(frozen=True)
-class SlotResult:
-    """The outcome of preparing one provider slot's durable herdr identity."""
-
-    provider: str
-    assigned_name: str
-    outcome: str
-    locator: str = ""
-    detail: str = ""
-
-    def as_payload(self) -> dict:
-        return {
-            "provider": self.provider,
-            "assigned_name": self.assigned_name,
-            "outcome": self.outcome,
-            "locator": self.locator,
-            "detail": self.detail,
-        }
-
-
-@dataclass
-class SessionStartResult:
-    """The aggregate outcome of a session-start run.
-
-    ``workspace_id`` / ``lane_id`` are the *mozyo* identities (registry anchor +
-    requested lane). The base-pane fields (Redmine #13330) record the empty herdr
-    root pane this run created and reclaimed on a pure cold start:
-
-    - ``herdr_workspace_id`` — the herdr *terminal* workspace the launched agents
-      live in (the one this run created, or the single workspace its adopted
-      agents already occupy). Blank when nothing was launched.
-    - ``base_pane_id`` — the ``root_pane.pane_id`` of the workspace this run
-      **created** (blank when no workspace was created: all-adopt, dry-run, or a
-      launch into an already-existing workspace). Only this exact pane is ever a
-      reclaim target — never a scanned-for shell (fail-closed against closing a
-      user's own shell).
-    - ``base_pane_reclaimed`` — True iff that created root pane was closed.
-    - ``base_pane_detail`` — a non-fatal ``pane close`` failure detail, if any
-      (a failed reclaim leaves harmless cosmetic residue, never a hard failure).
-
-    The tab fields (Redmine #13411) are the lane=tab analogue: a non-default lane
-    lands in its OWN dedicated herdr tab inside the sublane host workspace, its
-    gateway + worker split inside it. The default lane never uses a tab, so these
-    stay blank for it (byte-invariant coordinator path):
-
-    - ``herdr_tab_id`` — the herdr tab the launched lane agents live in (the one
-      this run created, or the tab its adopted slots already occupy). Blank for
-      the default lane / all-adopt / nothing launched.
-    - ``tab_pane_id`` — the ``root_pane.pane_id`` of the tab this run **created**
-      (blank when no tab was created: default lane, all-adopt, or a heal that
-      rejoined an existing tab). Only this exact pane is ever a reclaim target.
-    - ``tab_pane_reclaimed`` — True iff that created tab root pane was closed.
-    - ``tab_pane_detail`` — a non-fatal tab root ``pane close`` failure detail.
-    """
-
-    workspace_id: str
-    lane_id: str
-    slots: list = field(default_factory=list)
-    herdr_workspace_id: str = ""
-    base_pane_id: str = ""
-    base_pane_reclaimed: bool = False
-    base_pane_detail: str = ""
-    herdr_tab_id: str = ""
-    tab_pane_id: str = ""
-    tab_pane_reclaimed: bool = False
-    tab_pane_detail: str = ""
-
-    def as_payload(self) -> dict:
-        return {
-            "workspace_id": self.workspace_id,
-            "lane_id": self.lane_id,
-            "slots": [slot.as_payload() for slot in self.slots],
-            "herdr_workspace_id": self.herdr_workspace_id,
-            "base_pane_id": self.base_pane_id,
-            "base_pane_reclaimed": self.base_pane_reclaimed,
-            "base_pane_detail": self.base_pane_detail,
-            "herdr_tab_id": self.herdr_tab_id,
-            "tab_pane_id": self.tab_pane_id,
-            "tab_pane_reclaimed": self.tab_pane_reclaimed,
-            "tab_pane_detail": self.tab_pane_detail,
-        }
-
 
 def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
     """The absolute herdr binary this launch injects, via the shared resolver.
@@ -679,12 +594,10 @@ def prepare_session(
             result.tab_pane_id = tab_pane_id
         result.herdr_tab_id = target_tab
 
-    # Split placement (Redmine #13411 tab axis + #13646 config-driven direction). The first
-    # slot to land in a container occupies it; every subsequent launching slot — the second
-    # of a fresh pair, or a heal beside an already-live sibling — is placed with
-    # `--split <dir>`. Both decisions are pure (`herdr_lane_topology`).
-    split_direction = resolve_split_direction(lane_class, config_split)
-    occupancy = initial_container_occupancy(
+    # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus). The first
+    # slot occupies the container; later launching slots split beside it. Pure decisions —
+    # see `herdr_lane_topology.resolve_container_plan` for the full contract.
+    plan_of_container = resolve_container_plan(
         rows,
         workspace_id,
         target_workspace,
@@ -692,10 +605,11 @@ def prepare_session(
         lane_class=lane_class,
         target_tab=target_tab,
         lane_slot_tabs=lane_slot_tabs,
-        count_default_lane=bool(
-            launch_plans and target_workspace and config_split is not None
-        ),
+        config_split=config_split,
+        config_order=config_order,
+        launch_count=len(launch_plans),
     )
+    occupancy = plan_of_container.occupancy  # grows per launch (first occupies, rest split)
 
     # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into the
     # resolved target workspace/tab). A launch failure raises here, before reclaim.
@@ -709,12 +623,13 @@ def prepare_session(
             if agent_launch is not None
             else []
         )
-        slot_split, order_deferred = slot_placement(
+        slot_split, slot_focus, order_deferred = slot_placement(
             plan.kind,
             plan.provider,
-            split_direction=split_direction,
+            split_direction=plan_of_container.split_direction,
             occupancy=occupancy,
             config_order=config_order,
+            focus_first=plan_of_container.focus_first,
         )
         result.slots.append(
             _execute_slot(
@@ -725,6 +640,7 @@ def prepare_session(
                 target_workspace=target_workspace,
                 target_tab=target_tab,
                 split=slot_split,
+                focus=slot_focus,
                 binary=binary,
                 attest_launcher=attest_launcher,
                 store_home=store_home,
@@ -769,6 +685,7 @@ def _execute_slot(
     target_workspace: str,
     target_tab: str = "",
     split: str = "",
+    focus: bool = False,
     binary: str,
     attest_launcher: str = "",
     store_home: str = "",
@@ -838,6 +755,7 @@ def _execute_slot(
         target_workspace=target_workspace,
         target_tab=target_tab,
         split=split,
+        focus=focus,
         binary=binary,
         attest_launcher=attest_launcher,
         store_home=store_home,

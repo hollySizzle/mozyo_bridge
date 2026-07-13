@@ -2489,6 +2489,268 @@ class ResolveAttestLauncherTest(unittest.TestCase):
                 self.assertEqual(resolve_attest_launcher({"PATH": empty}), "")
 
 
+class _LayoutHerdr(_Herdr):
+    """A herdr fake that models the LAYOUT semantics, not just the argv (Redmine #13646).
+
+    The argv-only fake cannot catch R1-F1 (review j#76613): it accepts any ``--split`` and
+    reports success, so a launch sequence that renders the right flags but produces the
+    WRONG final layout still passes. This fake reproduces the three live-measured herdr
+    behaviours that together caused the defect (scratch probe j#76622):
+
+    1. **A split targets the container's ACTIVE pane** — ``agent start`` has no pane-target
+       flag, so ``--split <dir>`` splits whatever pane is active in that container.
+    2. **A launch with no ``--split`` still splits**, using herdr's own default direction
+       (live-measured ``right``) against the active pane.
+    3. **``--focus`` makes the new pane active**; ``--no-focus`` leaves the active pane
+       where it was (so a fresh container's empty ROOT pane stays the split target).
+    4. **Closing a pane collapses its split node** into the sibling subtree — which is what
+       silently discarded the configured direction when the root was reclaimed.
+
+    The layout is a binary tree per container (a tab, or the workspace's default tab):
+    ``Leaf(pane)`` or ``Split(direction, first, second)``. :meth:`direction_between` then
+    reports the direction of the split node that actually separates two panes — the thing
+    the operator sees, and the thing the close condition is stated in.
+    """
+
+    #: herdr's own default split direction when a launch passes no `--split` (live-measured).
+    DEFAULT_SPLIT = "right"
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        # container key -> {"tree": node, "active": pane_id}. A node is
+        # ("leaf", pane_id) or ("split", direction, first_node, second_node).
+        self.containers: dict = {}
+
+    # -- layout model ------------------------------------------------------------
+
+    def _container_of(self, pane_id):
+        for key, c in self.containers.items():
+            if pane_id in self._panes(c["tree"]):
+                return key
+        return None
+
+    def _panes(self, node):
+        if node is None:
+            return []
+        if node[0] == "leaf":
+            return [node[1]]
+        return self._panes(node[2]) + self._panes(node[3])
+
+    def _open_container(self, key, root_pane):
+        self.containers[key] = {"tree": ("leaf", root_pane), "active": root_pane}
+
+    def _split_at(self, node, target, direction, new_pane):
+        if node[0] == "leaf":
+            if node[1] != target:
+                return node
+            return ("split", direction, ("leaf", target), ("leaf", new_pane))
+        return (
+            "split",
+            node[1],
+            self._split_at(node[2], target, direction, new_pane),
+            self._split_at(node[3], target, direction, new_pane),
+        )
+
+    def _close_at(self, node, pane):
+        """Remove ``pane``; a split with one surviving child collapses into it."""
+        if node[0] == "leaf":
+            return None if node[1] == pane else node
+        first = self._close_at(node[2], pane)
+        second = self._close_at(node[3], pane)
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return ("split", node[1], first, second)
+
+    def direction_between(self, a, b):
+        """Direction of the split node separating ``a`` and ``b`` (``""`` if none)."""
+        for c in self.containers.values():
+            found = self._dir_between(c["tree"], a, b)
+            if found:
+                return found
+        return ""
+
+    def _dir_between(self, node, a, b):
+        if node is None or node[0] == "leaf":
+            return ""
+        left, right = self._panes(node[2]), self._panes(node[3])
+        if (a in left and b in right) or (b in left and a in right):
+            return node[1]
+        return self._dir_between(node[2], a, b) or self._dir_between(node[3], a, b)
+
+    # -- herdr command interception ---------------------------------------------
+
+    def run(self, argv, **kw):
+        completed = super().run(argv, **kw)
+        rest = list(argv[1:])
+        if rest[:2] == ["workspace", "create"] and completed.returncode == 0:
+            wid = self.created_workspace
+            self._open_container(f"{wid}:default", f"{wid}:p1")
+        elif rest[:2] == ["tab", "create"] and completed.returncode == 0:
+            wid = rest[rest.index("--workspace") + 1]
+            tab_id = self.created_tab or f"{wid}:t1"
+            self._open_container(tab_id, f"{tab_id}-root")
+        elif rest[:2] == ["agent", "start"] and completed.returncode == 0:
+            payload = json.loads(completed.stdout)
+            pane = payload["result"]["agent"]["pane_id"]
+            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else ""
+            key = rest[rest.index("--tab") + 1] if "--tab" in rest else f"{wid}:default"
+            if key not in self.containers:
+                # A heal joins a container that already holds the live sibling; seed it.
+                self._open_container(key, f"{key}-seed")
+            c = self.containers[key]
+            direction = (
+                rest[rest.index("--split") + 1]
+                if "--split" in rest
+                else self.DEFAULT_SPLIT
+            )
+            c["tree"] = self._split_at(c["tree"], c["active"], direction, pane)
+            if "--focus" in rest:
+                c["active"] = pane
+        elif rest[:2] == ["pane", "close"] and completed.returncode == 0:
+            pane = rest[2]
+            key = self._container_of(pane)
+            if key is not None:
+                c = self.containers[key]
+                c["tree"] = self._close_at(c["tree"], pane)
+                if c["active"] == pane:
+                    remaining = self._panes(c["tree"])
+                    c["active"] = remaining[0] if remaining else ""
+        return completed
+
+
+class LanePlacementLayoutTest(unittest.TestCase):
+    """The final LAYOUT a configured pair lands in (Redmine #13646 R1-F1, j#76613/j#76616).
+
+    The regression the argv-only tests could not express: with every launch ``--no-focus``,
+    the container's empty root pane stays the split target, so the second slot splits the
+    ROOT — and reclaiming the root (after all launches, #13330) collapses that split away,
+    leaving only the outer default ``right`` split. The configured direction silently never
+    applied. Focusing the first launch of a fresh, explicitly-placed pair fixes it.
+    """
+
+    def _run(self, tmp, *, herdr, providers, lane, lane_placement=None, rows=None):
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            if rows is not None:
+                herdr.existing_rows = rows(ws)
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env={HERDR_ENV: str(binpath)},
+                runner=herdr.run,
+                lane_placement=lane_placement,
+            )
+        panes = {s.provider: s.locator for s in result.slots}
+        return result, ws, panes
+
+    def test_fake_reproduces_the_r1_f1_collapse_without_focus(self) -> None:
+        # The fake must be able to EXPRESS the original defect, else it proves nothing.
+        # Drive the pre-fix sequence by hand (first launch --no-focus) and confirm the
+        # configured `down` collapses to `right` once the root pane is reclaimed.
+        herdr = _LayoutHerdr(created_workspace="wZ")
+
+        def call(*tail):
+            herdr.run(["/fake-herdr", *tail], capture_output=True, text=True, timeout=5, env={})
+
+        call("workspace", "create", "--cwd", "/x", "--no-focus")
+        call("agent", "start", "a1", "--workspace", "wZ", "--no-focus", "--", "claude")
+        call("agent", "start", "a2", "--workspace", "wZ", "--split", "down", "--no-focus", "--", "codex")
+        root, a1, a2 = "wZ:p1", "wZ:p2", "wZ:p3"
+        # The `down` split landed against the still-active ROOT pane — not against the
+        # first agent — exactly as live-measured (j#76613 / j#76622).
+        self.assertEqual(herdr.direction_between(root, a2), "down")
+        self.assertEqual(herdr.direction_between(a1, a2), "right")
+        call("pane", "close", root)  # production reclaims the root pane after all launches
+        self.assertEqual(
+            herdr.direction_between(a1, a2),
+            "right",
+            "the un-focused sequence must collapse to the outer default split (R1-F1)",
+        )
+
+    def test_configured_default_pair_lands_down_after_root_reclaim(self) -> None:
+        # The close condition: a fresh, explicitly-placed default pair really ends up
+        # split `down` — AFTER the root pane reclaim, which is what used to erase it.
+        herdr = _LayoutHerdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"default": {"split": "down"}}
+                ),
+            )
+        self.assertTrue(herdr.pane_closes, "the root pane must still be reclaimed")
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "down"
+        )
+
+    def test_configured_sublane_pair_lands_down_after_tab_root_reclaim(self) -> None:
+        # The same defect existed in the lane tab (j#76622): the tab root was the split
+        # target, so a configured `down` collapsed to `right` on reclaim.
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"sublane": {"split": "down"}}
+                ),
+            )
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "down"
+        )
+
+    def test_configured_right_lands_right(self) -> None:
+        # An explicitly configured `right` is genuinely applied (it now splits the AGENT),
+        # and still presents as `right` — same observable layout as the legacy default.
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"sublane": {"split": "right"}}
+                ),
+            )
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "right"
+        )
+
+    def test_unset_sublane_layout_is_unchanged(self) -> None:
+        # Byte-invariance is also LAYOUT-invariance: an unset lane class keeps its
+        # historical (coincidentally `right`) result and gains no --focus.
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        for argv in herdr.start_argvs:
+            self.assertIn("--no-focus", argv)
+            self.assertNotIn("--focus", argv)
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "right"
+        )
+
+
 class LanePlacementLaunchTest(unittest.TestCase):
     """Config-driven pane-pair placement (Redmine #13646, Design Answer j#76564).
 
@@ -2799,6 +3061,128 @@ class LanePlacementLaunchTest(unittest.TestCase):
             )
         for slot in result.slots:
             self.assertNotIn("order_deferred_until_full_relaunch", slot.detail)
+
+    # --- focus policy scope (R1-F1 fix, j#76616) -----------------------------------
+
+    def _focus_flags(self, herdr):
+        """(`--focus` present?) per launched slot, in launch order."""
+        return [("--focus" in argv) for argv in herdr.start_argvs]
+
+    def test_configured_fresh_pair_focuses_only_the_first_launch(self) -> None:
+        # The narrow fix: the FIRST launch of a fresh, explicitly-placed full pair carries
+        # --focus (pinning the container's split target to it); the splitter does not.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+            )
+        self.assertEqual(self._focus_flags(herdr), [True, False])
+
+    def test_order_alone_also_triggers_the_focus_policy(self) -> None:
+        # `order` without `split` is still an explicit placement: the pair's geometry is
+        # being declared, so the first launch must own the split target.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
+            )
+        self.assertEqual(self._focus_flags(herdr), [True, False])
+
+    def test_unset_lane_class_never_focuses(self) -> None:
+        # Byte-invariance: an unset lane class keeps `--no-focus` on every launch, even
+        # though its effective split direction is the legacy `right`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        self.assertEqual(self._focus_flags(herdr), [False, False])
+
+    def test_single_provider_request_never_focuses(self) -> None:
+        # No second slot to place -> the focus policy does not fire.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+            )
+        self.assertEqual(self._focus_flags(herdr), [False])
+
+    def test_heal_never_focuses_even_when_configured(self) -> None:
+        # A heal joins a container whose only pane is the LIVE sibling — already the split
+        # target. Focusing (or moving) a live pane is forbidden, so no --focus is emitted.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        self.assertEqual(self._focus_flags(herdr), [False])
+        # It still splits in the configured direction, beside the untouched sibling.
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_mixed_adopt_never_focuses(self) -> None:
+        # One slot adopts a live sibling, the other launches: the container is already
+        # occupied, so this is a heal — no --focus, and the live pane is never touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "codex", "lane-1"),
+                            "pane_id": "w5:pC",
+                            "tab_id": "w5:t3",
+                        }
+                    ]
+                )
+                prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                    lane_placement=self._placement(sublane={"split": "down"}),
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w5:pC"
+                    ),
+                )
+        # Only claude launched (codex adopted) -> a single launch, unfocused.
+        self.assertEqual(self._focus_flags(herdr), [False])
+        self.assertEqual(herdr.pane_closes, [])
 
     # --- no live mutation ----------------------------------------------------------
 
