@@ -277,13 +277,16 @@ def cmd_handoff_q_enter(args: argparse.Namespace) -> int:
 
     if plan.ticketless:
         rc = orchestrate_handoff(args, default_kind=plan.default_kind, ticketless=True)
-        # Redmine #13583 R1-F1: a positively-delivered consultation_callback that echoes a
-        # forward_action_id completes the correlated forward generation (best-effort; rc unchanged).
+        # Redmine #13583 R1-F1 / R2-F2: a consultation_callback that echoes a forward_action_id
+        # completes the correlated forward generation — but ONLY on the transport's structured
+        # positive delivery (`sent`/`ok`, marker observed). rc 0 also covers `pending_input` and a
+        # marker-unobserved `queue_enter`, neither of which handed the message to the receiver.
+        from mozyo_bridge.application.commands import delivery_was_positive
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (  # noqa: E501
             complete_forward_generation_on_callback,
         )
 
-        complete_forward_generation_on_callback(args, delivered=(rc == 0))
+        complete_forward_generation_on_callback(args, delivered=delivery_was_positive(args))
         return rc
     if plan.rail == RAIL_ANCHORED_REPLY:
         return orchestrate_handoff(args, default_kind=plan.default_kind)

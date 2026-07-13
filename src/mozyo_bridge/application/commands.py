@@ -1619,6 +1619,14 @@ def _maybe_restore_previous_active(
     )
 
 
+# Redmine #13583 R2-F2 positive-delivery gate (rc 0 is NOT proof of delivery). The predicate +
+# terminal-path publisher live in `f_130_.../application/delivery_outcome_gate.py`; re-exported.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E402,E501
+    delivery_was_positive,
+    publish_delivery_outcome as _publish_delivery_outcome,
+)
+
+
 @bind_runtime_transport
 def orchestrate_handoff(
     args: argparse.Namespace,
@@ -3041,6 +3049,7 @@ def orchestrate_handoff(
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
         )
+        _publish_delivery_outcome(args, outcome)
         _emit_outcome(
             outcome,
             record_format=record_format,
@@ -3268,6 +3277,7 @@ def orchestrate_handoff(
         # snapshot (`None` for tmux / non-queue-enter). Never influences the wire.
         queue_enter_turn_start_observation=queue_enter_observation,
     )
+    _publish_delivery_outcome(args, outcome)
     # Durable retry telemetry (policy + attempted count + interval) is recorded
     # in the delivery record / narrative only when the Enter-only retry actually
     # engaged. It is wording-layer only: it never reaches the wire enums or the
@@ -3364,7 +3374,8 @@ def cmd_handoff_ticketless_callback(args: argparse.Namespace) -> int:
     )
 
     rc = HandoffCommandUseCase(LiveHandoffCommandOps()).run_ticketless_callback(args)
-    complete_forward_generation_on_callback(args, delivered=(rc == 0))
+    # R2-F2: gate on the transport's structured `sent`/`ok`, never on rc (see delivery_outcome_gate).
+    complete_forward_generation_on_callback(args, delivered=delivery_was_positive(args))
     return rc
 
 

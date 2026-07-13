@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3541
+    lines: 3552
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1044,6 +1044,13 @@ allowlist:
       completion hook after a delivered callback (the hook itself is
       `herdr_workflow_step.complete_forward_generation_on_callback`, not here — only the guarded
       call site remains).
+      Raised 3541 -> 3552 for the #13583 R2-F2 positive-delivery gate: `orchestrate_handoff`
+      publishes its terminal transport outcome at the two delivery paths (`pending_input` + the
+      sent/queue-enter terminal) so a caller can tell a real delivery from an rc-0
+      `pending_input` / marker-unobserved `queue_enter`. The predicate + publisher were
+      **extracted** to the new
+      `f_130_handoff_routing/application/delivery_outcome_gate.py` (only the two call sites + a
+      re-export remain here), so this is +11 for the wiring, not the logic.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
