@@ -154,6 +154,12 @@ _NOT_SENT_BLOCKED_REASONS = frozenset(
         "invalid_anchor",
         "invalid_args",
         "precondition_not_idle",
+        # Redmine #13760: the pre-send startup-admission gate refused BEFORE the first
+        # injection (the receiver is on a trust / setup / login screen), so the send
+        # edge was never crossed — zero text, zero keys, zero ACK. A bounded retry can
+        # therefore never duplicate: each attempt either re-refuses (still zero-send)
+        # or, once an operator has cleared the screen, delivers the anchor exactly once.
+        "receiver_startup_interaction_required",
         "cross_session_claude",
         "target_repo_mismatch",
         "gateway_route_blocked",

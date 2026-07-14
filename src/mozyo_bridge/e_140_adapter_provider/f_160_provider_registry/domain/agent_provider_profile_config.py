@@ -35,7 +35,15 @@ What a profile **owns** (Design Answer j#76725 "Registry ownership"):
   (concept -> flag spelling, e.g. ``permission_mode`` -> ``--permission-mode``).
   This is what turns "Claude's permission flag is called X" from a source branch
   into data, and it doubles as the reserved-flag vocabulary an operator's repo
-  config may not re-specify.
+  config may not re-specify;
+- ``startup_blockers`` — the *mechanical* startup-interaction signatures (Redmine
+  #13760, Design Answer j#77947): the provider's pre-composer screens (a trust
+  confirmation, a first-run theme picker, a login prompt) that look like a live TUI
+  to every status/readiness projection but cannot accept a handoff body. Each
+  blocker is a closed ``{id, all_of}`` record whose signatures must ALL appear
+  (AND), so one generic phrase can never false-positive a ready composer. This is
+  *description*, never authority: the transport reads it to refuse a send, and it
+  can never accept, dismiss, or answer the provider's prompt.
 
 What a profile may **never** own (fail-closed here, not merely documented):
 
@@ -180,8 +188,154 @@ _PROFILE_ENTRY_KEYS: frozenset[str] = frozenset(
         "process_names",
         "capabilities",
         "managed_flags",
+        "startup_blockers",
     }
 )
+
+#: Keys a ``startup_blockers`` entry may carry (Redmine #13760). Closed like every
+#: other profile block: an unknown key is rejected, so a blocker can never grow a
+#: field a future reader might honor as an action ("accept", "keys", "answer") — the
+#: profile describes a screen, it never authorises a response to one.
+_STARTUP_BLOCKER_KEYS: frozenset[str] = frozenset({"id", "all_of"})
+
+#: How many startup blockers one provider may declare. A provider has a handful of
+#: pre-composer screens; a large list is a data mistake (or an attempt to make the
+#: pre-send classifier scan an unbounded corpus on every send), not a real contract.
+MAX_STARTUP_BLOCKERS = 8
+
+#: The AND-arity bounds of one blocker's ``all_of``. The lower bound is the
+#: false-positive guard j#77947 requires: a single generic phrase ("Yes", "continue")
+#: could appear in a perfectly ready composer, so a blocker must be pinned by at
+#: least two co-located signatures from the SAME screen. The upper bound keeps a
+#: blocker falsifiable — a long AND chain is one re-word away from silently never
+#: matching (a fail-OPEN drift, which is the failure this whole gate exists to stop).
+MIN_STARTUP_SIGNATURES = 2
+MAX_STARTUP_SIGNATURES = 6
+
+#: Length bounds on one signature, measured on the *folded* form (the classifier's
+#: match key). A too-short signature matches too much; a too-long one is brittle
+#: against re-wording and pane truncation.
+MIN_STARTUP_SIGNATURE_FOLDED_LEN = 6
+MAX_STARTUP_SIGNATURE_LEN = 160
+
+
+def fold_startup_text(text: object) -> str:
+    """The classifier's match key: lowercased, alphanumerics only (pure, never raises).
+
+    Everything that is not alphanumeric is dropped — whitespace, punctuation, and the
+    box-drawing / border glyphs a TUI dialog frames its lines with. A rendered pane
+    hard-wraps a long line to the pane width (even mid-token) and may reprint a border
+    glyph at the wrap, so a raw substring test against the on-screen text is fragile in
+    exactly the way that would make this gate fail OPEN. Folding both sides to
+    alphanumerics makes the wrap, the frame, and the punctuation vanish, so a signature
+    matches however the TUI folded the screen. Unicode-aware (:meth:`str.isalnum`), so a
+    non-Latin provider UI folds the same way.
+
+    This is the same "normalise away the rendering, then substring-match" posture as the
+    turn-start rail's :func:`~...f_130_terminal_runtime_provider.domain.turn_start_rail.composer_retains_body`,
+    widened from whitespace to all non-alphanumerics because a dialog — unlike a composer
+    body — is framed.
+    """
+    if not isinstance(text, str):
+        return ""
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+@dataclass(frozen=True)
+class StartupBlocker:
+    """One provider startup screen that cannot accept a handoff body (Redmine #13760).
+
+    A blocker is matched when **every** signature in ``all_of`` appears in the folded
+    visible pane content (:func:`fold_startup_text`) — an AND, never an any-match, so a
+    single generic phrase cannot classify a ready composer as blocked (j#77947
+    correction 1). ``blocker_id`` is a fixed token: it is the ONLY thing about the
+    screen that is allowed to reach a structured outcome / journal — the pane's own text
+    is never carried out of the classifier (j#77947 invariant 3).
+
+    Purely mechanical description. A blocker names a screen; it does not say what to do
+    about it, and it carries no keys, no answer, and no authority to dismiss it. Clearing
+    a trust / login prompt stays an operator action in the provider's own UI.
+    """
+
+    blocker_id: str
+    all_of: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.blocker_id, str) or not self.blocker_id.strip():
+            raise AgentProviderProfileError(
+                "startup blocker 'id' must be a non-empty string"
+            )
+        count = len(self.all_of)
+        if count < MIN_STARTUP_SIGNATURES or count > MAX_STARTUP_SIGNATURES:
+            raise AgentProviderProfileError(
+                f"startup blocker {self.blocker_id!r} must declare between "
+                f"{MIN_STARTUP_SIGNATURES} and {MAX_STARTUP_SIGNATURES} 'all_of' "
+                f"signatures, got {count}: one generic phrase would false-positive a "
+                f"ready composer, so a blocker is pinned by co-located signatures from "
+                f"the same screen (Redmine #13760 j#77947)"
+            )
+
+    def matches(self, content: object) -> bool:
+        """True iff every signature appears in ``content`` (pure; never raises)."""
+        folded = fold_startup_text(content)
+        if not folded:
+            return False
+        return all(fold_startup_text(sig) in folded for sig in self.all_of)
+
+    @classmethod
+    def from_record(cls, record: object, *, provider_id: str) -> "StartupBlocker":
+        """Validate one ``startup_blockers`` entry, failing closed on any bad shape."""
+        if not isinstance(record, Mapping):
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} 'startup_blockers' entries must "
+                f"be mappings, got {type(record).__name__}"
+            )
+        unknown = set(record) - _STARTUP_BLOCKER_KEYS
+        if unknown:
+            raise AgentProviderProfileError(
+                f"unknown 'startup_blockers' key(s) {sorted(map(repr, unknown))} in agent "
+                f"provider profile {provider_id!r}; allowed: "
+                f"{sorted(_STARTUP_BLOCKER_KEYS)}. A blocker describes a screen; it never "
+                f"carries an action, a key sequence, or an authority to dismiss it."
+            )
+        missing = _STARTUP_BLOCKER_KEYS - set(record)
+        if missing:
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} startup blocker is missing "
+                f"{sorted(missing)}"
+            )
+        blocker_id = record["id"]
+        if not isinstance(blocker_id, str) or not blocker_id.strip():
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} startup blocker 'id' must be a "
+                f"non-empty string, got {blocker_id!r}"
+            )
+        _reject_forbidden_token(
+            blocker_id, field="startup_blockers.id", provider_id=provider_id
+        )
+        signatures = _string_tuple(
+            record["all_of"],
+            field=f"startup_blockers[{blocker_id}].all_of",
+            provider_id=provider_id,
+        )
+        for signature in signatures:
+            if len(signature) > MAX_STARTUP_SIGNATURE_LEN:
+                raise AgentProviderProfileError(
+                    f"agent provider profile {provider_id!r} startup blocker "
+                    f"{blocker_id!r} signature is {len(signature)} chars; the bound is "
+                    f"{MAX_STARTUP_SIGNATURE_LEN} (a long signature is one re-word away "
+                    f"from silently never matching — a fail-open drift)"
+                )
+            folded = fold_startup_text(signature)
+            if len(folded) < MIN_STARTUP_SIGNATURE_FOLDED_LEN:
+                raise AgentProviderProfileError(
+                    f"agent provider profile {provider_id!r} startup blocker "
+                    f"{blocker_id!r} signature {signature!r} folds to {len(folded)} "
+                    f"alphanumeric char(s); at least {MIN_STARTUP_SIGNATURE_FOLDED_LEN} "
+                    f"are required so a punctuation-only / near-empty signature cannot "
+                    f"match every screen"
+                )
+        return cls(blocker_id=blocker_id, all_of=signatures)
 
 _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
 
@@ -339,6 +493,11 @@ class AgentProviderProfile:
     process_names: tuple[str, ...] = ()
     capabilities: frozenset[AgentCapability] = field(default_factory=frozenset)
     managed_flags: tuple[tuple[ManagedFlagConcept, str], ...] = ()
+    #: Redmine #13760: the provider's pre-composer startup screens, in declaration
+    #: order (the order the classifier reports a first match in). Empty for a provider
+    #: with none declared — which admits every send, exactly as before this field
+    #: existed, so adding the field changes no provider that does not use it.
+    startup_blockers: tuple[StartupBlocker, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_id, str) or not self.provider_id.strip():
@@ -386,6 +545,25 @@ class AgentProviderProfile:
         # know a concept it cannot spell, or spell a flag it is not allowed to apply.
         # Fail closed rather than silently dropping the managed posture (a Claude
         # worker booting prompt-gated is exactly the #13360 stall).
+        for blocker in self.startup_blockers:
+            if not isinstance(blocker, StartupBlocker):
+                raise AgentProviderProfileError(
+                    f"agent provider profile {self.provider_id!r} startup blocker must "
+                    f"be a StartupBlocker, got {type(blocker).__name__}"
+                )
+        blocker_ids = [blocker.blocker_id for blocker in self.startup_blockers]
+        if len(blocker_ids) > MAX_STARTUP_BLOCKERS:
+            raise AgentProviderProfileError(
+                f"agent provider profile {self.provider_id!r} declares "
+                f"{len(blocker_ids)} startup blockers; the bound is "
+                f"{MAX_STARTUP_BLOCKERS}"
+            )
+        if len(set(blocker_ids)) != len(blocker_ids):
+            raise AgentProviderProfileError(
+                f"agent provider profile {self.provider_id!r} declares duplicate startup "
+                f"blocker id(s) {sorted(blocker_ids)}; a blocker id is the fixed token a "
+                f"zero-send outcome reports, so it must identify exactly one screen"
+            )
         concepts = {concept for concept, _ in self.managed_flags}
         has_permission_flag = ManagedFlagConcept.PERMISSION_MODE in concepts
         has_permission_cap = AgentCapability.MANAGED_PERMISSION_MODE in self.capabilities
@@ -519,6 +697,17 @@ class AgentProviderProfile:
                 )
             managed.append((concept, flag))
 
+        raw_blockers = record.get("startup_blockers", []) or []
+        if isinstance(raw_blockers, (str, bytes)) or not isinstance(raw_blockers, Sequence):
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} 'startup_blockers' must be a "
+                f"list of {{id, all_of}} records, got {type(raw_blockers).__name__}"
+            )
+        startup_blockers = tuple(
+            StartupBlocker.from_record(entry, provider_id=provider_id)
+            for entry in raw_blockers
+        )
+
         return cls(
             provider_id=provider_id,
             protocol=protocol,
@@ -537,7 +726,23 @@ class AgentProviderProfile:
             ),
             capabilities=frozenset(capabilities),
             managed_flags=tuple(sorted(managed, key=lambda pair: pair[0].value)),
+            startup_blockers=startup_blockers,
         )
+
+    def match_startup_blocker(self, content: object) -> Optional[StartupBlocker]:
+        """The first declared blocker whose signatures ALL appear in ``content``.
+
+        The pure classifier the pre-send admission gate calls (Redmine #13760). Pure and
+        total: an unreadable / non-string / empty ``content`` matches nothing and is
+        reported as ``None`` — the CALLER must not read that as "startup clear" (an
+        unreadable pane is a transport failure and fails closed on its own path, j#77947
+        invariant 4). A provider with no declared blockers always returns ``None``, so
+        this is byte-invariant for a provider that declares none.
+        """
+        for blocker in self.startup_blockers:
+            if blocker.matches(content):
+                return blocker
+        return None
 
 
 class AgentProviderProfileRegistry:
@@ -736,6 +941,11 @@ class AgentProviderProfileConfig:
 
 __all__ = (
     "AGENT_PROVIDER_PROFILE_RESOURCE",
+    "MAX_STARTUP_BLOCKERS",
+    "MAX_STARTUP_SIGNATURES",
+    "MAX_STARTUP_SIGNATURE_LEN",
+    "MIN_STARTUP_SIGNATURES",
+    "MIN_STARTUP_SIGNATURE_FOLDED_LEN",
     "RECEIVER_AGNOSTIC_PROCESSES",
     "RESERVED_IDENTITY_TOKENS",
     "AgentCapability",
@@ -746,5 +956,7 @@ __all__ = (
     "FORBIDDEN_PROFILE_TOKENS",
     "InteractionProtocol",
     "ManagedFlagConcept",
+    "StartupBlocker",
     "TrustedExecutable",
+    "fold_startup_text",
 )

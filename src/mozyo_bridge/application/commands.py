@@ -2936,9 +2936,35 @@ def orchestrate_handoff(
     marker = build_marker(anchor, kind, receiver)
 
     read_lines = int(getattr(args, "read_lines", 50) or 50)
-    # Internal pane snapshot preflight. The standard path must not require
-    # callers to run `mozyo-bridge read` first.
-    capture_pane(target, read_lines)
+    # Internal pane snapshot preflight (the standard path must not require callers to run
+    # `mozyo-bridge read` first) AND — under herdr — the Redmine #13760 pre-send startup
+    # admission: the same single action-time read is classified against the receiver
+    # provider's declared startup screens, and a trust / first-run / login screen refuses
+    # the send with ZERO bytes typed. The gate body lives in the f_130 seam (module-health;
+    # and it keeps every provider-specific string in profile DATA, out of this module).
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (
+        admit_receiver_startup_or_die,
+    )
+
+    admit_receiver_startup_or_die(
+        args,
+        herdr_send=herdr_send,
+        receiver=receiver,
+        target=target,
+        read_lines=read_lines,
+        capture_pane=capture_pane,
+        emit=_emit,
+        record_format=record_format,
+        record_command=record_command,
+        anchor=anchor,
+        mode=mode,
+        kind=kind,
+        source=source,
+        execution_root=execution_root,
+        role_profile_contract=role_profile_contract,
+        duplicate_lane_panes=duplicate_lane_panes,
+        ledger=_record_herdr_send_ledger,
+    )
 
     # Redmine #12597: activate an admitted inactive split now — after every
     # die-able gate above — so we never steal the operator's focus for a send

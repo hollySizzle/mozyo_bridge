@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3551
+    lines: 3577
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1051,6 +1051,16 @@ allowlist:
       **extracted** to the new
       `f_130_handoff_routing/application/delivery_outcome_gate.py` (only the two call sites + a
       re-export remain here), so this is +11 for the wiring, not the logic.
+      Baseline 3551 -> 3577 for #13760 (startup-admission zero-send): the pre-send
+      startup admission call in `orchestrate_handoff` — the single action-time read
+      that refuses a send to a receiver still on a provider startup screen (trust /
+      first-run setup / login), which #13582 j#77917 proved a readiness-time check
+      cannot catch. Deliberately NOT inline: the gate body (classify, emit the
+      structured blocked outcome, ledger, die) lives in the new
+      `f_130_handoff_routing/application/startup_admission_gate.py`, mirroring the
+      #12918 `gateway_route_gate` precedent, so this module keeps only the call and
+      grows by ~26 lines instead of ~85. The provider-specific screen signatures are
+      profile DATA, never source in here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -1102,7 +1112,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2126
+    lines: 2202
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -1110,6 +1120,18 @@ allowlist:
       count unchanged, legacy path preserved as a `sys.modules` facade. Self-
       module baseline re-point per #12623 conflict-point policy; foreign drift
       and final module_health integration remain #12630's.
+      Baseline 2126 -> 2202 for #13760 (startup-admission zero-send): the
+      `receiver_startup_interaction_required` blocked reason + the additive
+      `startup_admission` structured field, and their three wording branches in
+      `next_action_for` / `_outcome_narrative` / `_receiver_contract_line`. This
+      module owns the closed `Reason` vocabulary and ALL of its per-reason wording
+      in one dispatch (the #13255 rail reasons landed the same way); splitting one
+      reason's prose into a sibling module to buy ~60 lines would fragment that
+      dispatch and make the vocabulary harder to audit, not easier. The gate's
+      behaviour — the pane read, the pure classifier, the emit/die — is NOT here: it
+      is in `f_130_handoff_routing/application/startup_admission_gate.py` and the
+      e_140 `herdr_startup_admission` evaluator, and the provider-specific screen
+      signatures are profile DATA (`agent_provider_profiles.yaml`), not source.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
       delivery outcome / notification body / delivery record (the resolved-text
       rendering stays out of the auto-persist body).
