@@ -82,6 +82,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     ReleasePinError,
     recovery_refusal,
     rehydrate_allowed,
+    replacement_settled,
     validate_release_pins,
     CAS_ACTION_MISMATCH,
     CAS_ALREADY_DECLARED,
@@ -105,6 +106,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     RELEASE_RELEASED,
     RELEASE_REQUESTED,
     RELEASE_STATES,
+    REPLACEMENT_NOT_REQUESTED,
     CasOutcome,
     LaneLifecycleKey,
     LaneLifecycleRecord,
@@ -275,7 +277,7 @@ class LaneLifecycleStore:
             try:
                 conn.execute(
                     f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         key.repo_workspace_id,
                         key.lane_id,
@@ -283,6 +285,9 @@ class LaneLifecycleStore:
                         DISPOSITION_ACTIVE,
                         RELEASE_NOT_REQUESTED,
                         1,
+                        "",
+                        "",
+                        REPLACEMENT_NOT_REQUESTED,
                         "",
                         "",
                         decision.source,
@@ -357,6 +362,13 @@ class LaneLifecycleStore:
                     reason=CAS_FORBIDDEN_TRANSITION,
                     revision=current.revision,
                 )
+            if not replacement_settled(current.replacement_state):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
             rehydrating = target == DISPOSITION_ACTIVE
             if rehydrating and not rehydrate_allowed(current.process_release):
                 conn.execute("ROLLBACK")
@@ -380,11 +392,19 @@ class LaneLifecycleStore:
             release = RELEASE_NOT_REQUESTED if rehydrating else current.process_release
             action = "" if rehydrating else current.release_action_id
             pins = "" if rehydrating else current.release_pins
+            replacement = (
+                REPLACEMENT_NOT_REQUESTED
+                if rehydrating
+                else current.replacement_state
+            )
+            replacement_action = "" if rehydrating else current.replacement_action_id
+            replacement_pins = "" if rehydrating else current.replacement_pins
             revision = current.revision + 1
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
-                    "release_action_id = ?, release_pins = ?, revision = ?, "
+                    "release_action_id = ?, release_pins = ?, replacement_state = ?, "
+                    "replacement_action_id = ?, replacement_pins = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -393,6 +413,9 @@ class LaneLifecycleStore:
                         release,
                         action,
                         pins,
+                        replacement,
+                        replacement_action,
+                        replacement_pins,
                         revision,
                         decision.source,
                         decision.issue_id,
@@ -487,6 +510,13 @@ class LaneLifecycleStore:
                     reason=CAS_UNEXPECTED_STATE,
                     revision=current.revision,
                 )
+            if not replacement_settled(current.replacement_state):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
             incoming = _locked_row(conn, recovery)
             refusal = recovery_refusal(
                 incoming,
@@ -532,7 +562,7 @@ class LaneLifecycleStore:
                     revision = 1
                     conn.execute(
                         f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             recovery.repo_workspace_id,
                             recovery.lane_id,
@@ -540,6 +570,9 @@ class LaneLifecycleStore:
                             DISPOSITION_ACTIVE,
                             RELEASE_NOT_REQUESTED,
                             revision,
+                            "",
+                            "",
+                            REPLACEMENT_NOT_REQUESTED,
                             "",
                             "",
                             decision.source,
@@ -554,7 +587,8 @@ class LaneLifecycleStore:
                     conn.execute(
                         f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
                         "process_release = ?, release_action_id = ?, release_pins = ?, "
-                        "revision = ?, decision_source = ?, decision_issue_id = ?, "
+                        "replacement_state = ?, replacement_action_id = ?, "
+                        "replacement_pins = ?, revision = ?, decision_source = ?, decision_issue_id = ?, "
                         "decision_journal = ?, "
                         "updated_at = ? WHERE repo_workspace_id = ? AND lane_id = ? "
                         "AND revision = ?",
@@ -562,6 +596,9 @@ class LaneLifecycleStore:
                             issue,
                             DISPOSITION_ACTIVE,
                             RELEASE_NOT_REQUESTED,
+                            "",
+                            "",
+                            REPLACEMENT_NOT_REQUESTED,
                             "",
                             "",
                             revision,
@@ -633,6 +670,13 @@ class LaneLifecycleStore:
                 return CasOutcome(
                     applied=False,
                     reason=CAS_UNEXPECTED_STATE,
+                    revision=current.revision,
+                )
+            if not replacement_settled(current.replacement_state):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
                     revision=current.revision,
                 )
             if not release_transition_allowed(
@@ -757,11 +801,14 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         revision=int(row[5]),
         release_action_id=str(row[6] or ""),
         release_pins=str(row[7] or ""),
-        decision_source=str(row[8] or ""),
-        decision_issue_id=str(row[9] or ""),
-        decision_journal=str(row[10] or ""),
-        created_at=str(row[11]),
-        updated_at=str(row[12]),
+        replacement_state=str(row[8] or REPLACEMENT_NOT_REQUESTED),
+        replacement_action_id=str(row[9] or ""),
+        replacement_pins=str(row[10] or ""),
+        decision_source=str(row[11] or ""),
+        decision_issue_id=str(row[12] or ""),
+        decision_journal=str(row[13] or ""),
+        created_at=str(row[14]),
+        updated_at=str(row[15]),
     )
 
 
@@ -915,6 +962,7 @@ __all__ = (
     "RELEASE_RELEASED",
     "RELEASE_REQUESTED",
     "RELEASE_STATES",
+    "REPLACEMENT_NOT_REQUESTED",
     "CasOutcome",
     "LaneLifecycleKey",
     "LaneLifecycleRecord",
@@ -924,4 +972,5 @@ __all__ = (
     "disposition_transition_allowed",
     "encode_release_pins",
     "release_transition_allowed",
+    "replacement_settled",
 )

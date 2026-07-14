@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
+from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
@@ -453,6 +454,36 @@ def cmd_sublane_resume(args: argparse.Namespace) -> int:
     return 1 if outcome.is_blocked else 0
 
 
+def register_sublane_resume_parser(sublane_sub: Any) -> None:
+    """Register ``sublane resume`` outside the at-ceiling core CLI module."""
+    parser = sublane_sub.add_parser(
+        "resume",
+        help=(
+            "Redmine #13682: verify a fresh managed pair and bring a hibernated "
+            "lane back to active. Default is preflight only."
+        ),
+    )
+    parser.add_argument(
+        "--issue", required=True, help="Redmine issue id the hibernated lane owns"
+    )
+    parser.add_argument(
+        "--lane", required=True, help="Hibernated lane label to resume"
+    )
+    parser.add_argument(
+        "--journal", required=True, help="Redmine journal authorizing the resume"
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="CAS hibernated->active after the fresh-pair verification",
+    )
+    add_repo_option(parser)
+    parser.add_argument(
+        "--json", action="store_true", help="Emit structured JSON output"
+    )
+    parser.set_defaults(func=cmd_sublane_resume)
+
+
 __all__ = (
     "BLOCK_ISSUE_REOWNED",
     "BLOCK_NOT_HIBERNATED",
@@ -467,4 +498,5 @@ __all__ = (
     "SublaneResumeUseCase",
     "cmd_sublane_resume",
     "format_resume_text",
+    "register_sublane_resume_parser",
 )

@@ -85,6 +85,76 @@ _RELEASE_EDGES: dict[str, frozenset[str]] = {
     RELEASE_RELEASED: frozenset(),
 }
 
+# -- receiver replacement (quarantine) generation, Redmine #13763 -------------
+#
+# A THIRD axis, deliberately not folded into ``process_release`` (j#78011 contract
+# 1/3/5). The two describe opposite lane states and could never share one column:
+#
+# - ``process_release`` releases the slots of a lane that has ALREADY LEFT
+#   ``active`` (:meth:`...request_release` refuses an active lane outright) — the
+#   lane is giving its capacity back.
+# - a **replacement** happens on a lane that STAYS ``active``: the lane keeps its
+#   issue, worktree, branch and durable next-action, and only its *receiver
+#   process* is exchanged for a fresh one because an uncorrelatable pending
+#   composer made it undrivable. Nothing about the lane's ownership changes.
+#
+# They share the row's single ``revision`` on purpose: that is the whole race
+# fence (j#78011 contract "supersession/hibernateとのraceをCASでfail-closed").
+# A disposition transition bumps the revision and so invalidates an in-flight
+# replacement's ``expected_revision``, and a replacement bumps it and so
+# invalidates a stale hibernate / supersede — neither can act on a row the other
+# has moved under it.
+
+#: No replacement generation is open for this lane.
+REPLACEMENT_NOT_REQUESTED = "not_requested"
+#: An owner-approved replacement is open: the old slot is pinned and its close is
+#: owed. Nothing has been closed yet.
+REPLACEMENT_REQUESTED = "requested"
+#: The pinned old slot was closed but the fresh slot is not yet launched + attested
+#: — j#78011 contract 5's ``replacement_pending``. Re-drivable: a re-run of the SAME
+#: generation resumes at the launch, never re-closing (the close already happened).
+REPLACEMENT_PENDING = "pending"
+#: The fresh slot is live, locator-bound attested, and verified. Terminal *for the
+#: generation*; a later, genuinely new approval may open another one.
+REPLACEMENT_REPLACED = "replaced"
+
+REPLACEMENT_STATES = frozenset(
+    {
+        REPLACEMENT_NOT_REQUESTED,
+        REPLACEMENT_REQUESTED,
+        REPLACEMENT_PENDING,
+        REPLACEMENT_REPLACED,
+    }
+)
+
+#: Allowed replacement edges. ``pending -> pending`` is allowed (a launch retry that
+#: still could not attest the fresh slot is progress-preserving, not a conflict), and
+#: mirrors ``partial -> partial``. ``requested -> requested`` is deliberately absent: a
+#: second :meth:`...request_replacement` on an open generation must be REFUSED, never
+#: silently open a second one — a caller resumes the stored generation instead.
+_REPLACEMENT_EDGES: dict[str, frozenset[str]] = {
+    REPLACEMENT_NOT_REQUESTED: frozenset({REPLACEMENT_REQUESTED}),
+    REPLACEMENT_REQUESTED: frozenset({REPLACEMENT_PENDING}),
+    REPLACEMENT_PENDING: frozenset({REPLACEMENT_PENDING, REPLACEMENT_REPLACED}),
+    # Terminal for THIS generation. A brand-new approval (a new action id + new
+    # pins) may still open a fresh generation — see `replacement_open_allowed`.
+    REPLACEMENT_REPLACED: frozenset(),
+}
+
+#: The replacement states from which a NEW generation may be opened: no generation
+#: has ever run, or the previous one finished. An in-flight one (``requested`` /
+#: ``pending``) is never re-opened — it is resumed.
+_OPENABLE_REPLACEMENT_STATES = frozenset(
+    {REPLACEMENT_NOT_REQUESTED, REPLACEMENT_REPLACED}
+)
+
+#: A replacement generation is *settled* when nothing is in flight. An unsettled one
+#: means an actuator may be closing a pane or launching a fresh slot for this lane
+#: RIGHT NOW, so no disposition may move under it (and no rehydrate may clear it).
+_SETTLED_REPLACEMENT_STATES = frozenset(
+    {REPLACEMENT_NOT_REQUESTED, REPLACEMENT_REPLACED}
+)
+
 #: A lane may only come back to ``active`` when no release generation is in flight
 #: (R1-F3 / R1-F2). ``requested`` / ``partial`` mean an actuator is (or may be)
 #: closing this lane's pinned slots right now: silently clearing that generation
@@ -132,6 +202,21 @@ def disposition_transition_allowed(current: str, target: str) -> bool:
 def release_transition_allowed(current: str, target: str) -> bool:
     """Is ``current -> target`` a legal release edge within one generation? (pure)"""
     return target in _RELEASE_EDGES.get(norm(current), frozenset())
+
+
+def replacement_transition_allowed(current: str, target: str) -> bool:
+    """Is ``current -> target`` a legal receiver-replacement edge? (pure)"""
+    return target in _REPLACEMENT_EDGES.get(norm(current), frozenset())
+
+
+def replacement_open_allowed(current: str) -> bool:
+    """May a new owner-approved replacement generation be opened? (pure)"""
+    return norm(current) in _OPENABLE_REPLACEMENT_STATES
+
+
+def replacement_settled(current: str) -> bool:
+    """Has this lane no receiver replacement actuation in flight? (pure)"""
+    return norm(current) in _SETTLED_REPLACEMENT_STATES
 
 
 def rehydrate_allowed(process_release: str) -> bool:
@@ -281,6 +366,20 @@ def validate_release_pins(pins: Sequence[ReleasePin]) -> tuple[ReleasePin, ...]:
     return pinned
 
 
+def validate_replacement_pins(pins: Sequence[ReleasePin]) -> tuple[ReleasePin, ...]:
+    """Validate the one exact old receiver a replacement may close.
+
+    Replacement is intentionally process-level, not a pair release.  The
+    counterpart is verified as topology but is never part of the close authority.
+    """
+    pinned = validate_release_pins(pins)
+    if len(pinned) != 1:
+        raise ReleasePinError(
+            "a receiver replacement generation requires exactly one pinned slot"
+        )
+    return pinned
+
+
 #: The durable-record systems a lifecycle decision may point at. A pointer into an
 #: unknown system cannot be re-read at recovery time, so the vocabulary is closed.
 DECISION_SOURCE_REDMINE = "redmine"
@@ -397,6 +496,9 @@ class LaneLifecycleRecord:
     revision: int = 1
     release_action_id: str = ""
     release_pins: str = ""
+    replacement_state: str = REPLACEMENT_NOT_REQUESTED
+    replacement_action_id: str = ""
+    replacement_pins: str = ""
     decision_source: str = ""
     decision_issue_id: str = ""
     decision_journal: str = ""
@@ -410,6 +512,11 @@ class LaneLifecycleRecord:
     @property
     def pins(self) -> tuple[ReleasePin, ...]:
         return decode_release_pins(self.release_pins)
+
+    @property
+    def replacement_slots(self) -> tuple[ReleasePin, ...]:
+        """The exact old receiver slots pinned by the replacement generation."""
+        return decode_release_pins(self.replacement_pins)
 
     @property
     def decision(self) -> Optional[DecisionPointer]:
@@ -439,6 +546,9 @@ class LaneLifecycleRecord:
             "revision": self.revision,
             "release_action_id": self.release_action_id,
             "release_pins": [p.as_payload() for p in self.pins],
+            "replacement_state": self.replacement_state,
+            "replacement_action_id": self.replacement_action_id,
+            "replacement_pins": [p.as_payload() for p in self.replacement_slots],
             "decision_source": self.decision_source,
             "decision_issue_id": self.decision_issue_id,
             "decision_journal": self.decision_journal,
@@ -531,6 +641,10 @@ def recovery_refusal(
         return CasOutcome(
             applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
         )
+    if not replacement_settled(incoming.replacement_state):
+        return CasOutcome(
+            applied=False, reason=CAS_FORBIDDEN_TRANSITION, revision=incoming.revision
+        )
     return None
 
 
@@ -542,7 +656,11 @@ __all__ = (
     "DecisionPointerError",
     "ReleasePinError",
     "rehydrate_allowed",
+    "replacement_open_allowed",
+    "replacement_settled",
+    "replacement_transition_allowed",
     "validate_release_pins",
+    "validate_replacement_pins",
     "CAS_ACTION_MISMATCH",
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
@@ -565,6 +683,11 @@ __all__ = (
     "RELEASE_RELEASED",
     "RELEASE_REQUESTED",
     "RELEASE_STATES",
+    "REPLACEMENT_NOT_REQUESTED",
+    "REPLACEMENT_PENDING",
+    "REPLACEMENT_REPLACED",
+    "REPLACEMENT_REQUESTED",
+    "REPLACEMENT_STATES",
     "CasOutcome",
     "LaneLifecycleKey",
     "LaneLifecycleRecord",

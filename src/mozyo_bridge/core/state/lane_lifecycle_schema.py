@@ -32,15 +32,14 @@ from mozyo_bridge.core.state.state_store import (
 
 
 LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
-#: v2 (Redmine #13689 R2-F1): splits the durable decision anchor's issue
-#: (``decision_issue_id``) from the lane's owner binding (``issue_id``). A Redmine
-#: journal is only addressable through its issue, so an anchor without one names
-#: nothing — and an unbound lane legitimately has no binding.
-LANE_LIFECYCLE_SCHEMA_VERSION = 2
-#: The component shapes this build can read and write. ``1`` is migrated additively
-#: to ``2``; anything else — a newer version from a future build, or a foreign value —
+#: v3 (Redmine #13763 j#78052): adds the receiver-replacement generation on the
+#: same row/revision as disposition and release. v2 split the durable decision
+#: anchor's issue (``decision_issue_id``) from the lane's owner binding.
+LANE_LIFECYCLE_SCHEMA_VERSION = 3
+#: The component shapes this build can read and write. ``1`` and ``2`` are migrated
+#: additively to ``3``; anything else — a newer version from a future build, or a foreign value —
 #: fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -58,6 +57,9 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     revision INTEGER NOT NULL,
     release_action_id TEXT NOT NULL DEFAULT '',
     release_pins TEXT NOT NULL DEFAULT '',
+    replacement_state TEXT NOT NULL DEFAULT 'not_requested',
+    replacement_action_id TEXT NOT NULL DEFAULT '',
+    replacement_pins TEXT NOT NULL DEFAULT '',
     decision_source TEXT NOT NULL DEFAULT '',
     decision_issue_id TEXT NOT NULL DEFAULT '',
     decision_journal TEXT NOT NULL DEFAULT '',
@@ -80,7 +82,8 @@ WHERE lane_disposition = '{DISPOSITION_ACTIVE}' AND issue_id <> ''
 
 _COLUMNS = (
     "repo_workspace_id, lane_id, issue_id, lane_disposition, process_release, "
-    "revision, release_action_id, release_pins, decision_source, "
+    "revision, release_action_id, release_pins, replacement_state, "
+    "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at"
 )
 
@@ -283,6 +286,25 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN decision_issue_id TEXT NOT NULL DEFAULT ''"
+                )
+            # v2 -> v3 (Redmine #13763 j#78052): an additive third lifecycle
+            # axis for owner-approved receiver replacement. These fields share
+            # the row revision with disposition / release so their actuators
+            # cannot race past each other.
+            if "replacement_state" not in columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN replacement_state TEXT NOT NULL DEFAULT 'not_requested'"
+                )
+            if "replacement_action_id" not in columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN replacement_action_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "replacement_pins" not in columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN replacement_pins TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(

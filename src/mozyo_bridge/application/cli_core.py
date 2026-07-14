@@ -63,7 +63,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_sublane_hibernate,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (
-    cmd_sublane_resume,
+    register_sublane_resume_parser,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (
+    register_sublane_quarantine_parser,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
@@ -883,43 +886,8 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     _add_lifecycle_json(sublane_hibernate)
     sublane_hibernate.set_defaults(func=cmd_sublane_hibernate)
 
-    sublane_resume = sublane_sub.add_parser(
-        "resume",
-        help=(
-            "Redmine #13682: bring a hibernated lane back to active once a FRESH managed "
-            "pair has been relaunched on its preserved worktree (via `sublane start`). "
-            "Verify + flip only — closes nothing, launches nothing, touches no worktree / "
-            "branch / issue / commit. Fail-closed preflight (lane hibernated and owns the "
-            "issue; release generation settled; issue not re-owned; the relaunched pair is "
-            "both-slots live AND generation-matched attested, #13637). Default is preflight "
-            "only; --execute performs the flip. Exits non-zero when blocked."
-        ),
-    )
-    sublane_resume.add_argument(
-        "--issue", required=True, help="Redmine issue id the hibernated lane owns"
-    )
-    sublane_resume.add_argument(
-        "--lane",
-        required=True,
-        help="Hibernated lane label to resume (e.g. issue_<id>_<slug>)",
-    )
-    sublane_resume.add_argument(
-        "--journal",
-        required=True,
-        help="Redmine journal id that authorizes the resume (durable anchor)",
-    )
-    sublane_resume.add_argument(
-        "--execute",
-        dest="execute",
-        action="store_true",
-        help=(
-            "Perform the resume: CAS the disposition (hibernated->active) after verifying "
-            "the fresh attested pair. Without it this is preflight only (no mutation)."
-        ),
-    )
-    add_repo_option(sublane_resume)
-    _add_lifecycle_json(sublane_resume)
-    sublane_resume.set_defaults(func=cmd_sublane_resume)
+    register_sublane_resume_parser(sublane_sub)
+    register_sublane_quarantine_parser(sublane_sub)
 
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
     # is the opt-in write side: it mints durable herdr assigned names for the
