@@ -48,6 +48,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     evaluate_sublane_admission,
     render_admission_journal,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_actionability import (
+    ACTIONABILITY_COORDINATOR_ACTIONABLE,
+    OWNER_MAIN_COORDINATOR,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_execution_surface import (
+    SURFACE_UNSPECIFIED,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (
     COORDINATOR_BLOCKING_STATES,
     FILL_DISPATCH_NEXT,
@@ -64,6 +71,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LANE_STATE_OWNER_WAITING,
     LANE_STATE_RETIRE_READY,
     LANE_STATE_REVIEW_WAITING,
+    LaneState,
 )
 
 
@@ -254,6 +262,57 @@ class AdmissionDecisionTest(unittest.TestCase):
         outcome = evaluate_sublane_admission(inputs)
         self.assertEqual(outcome.fill_decision, FILL_STOP_OWNER_OR_RELEASE_GATE)
         self.assertEqual(outcome.admission_decision, ADMISSION_STOP_AND_DRAIN)
+
+
+class ActionabilityFailClosedTest(unittest.TestCase):
+    """The Redmine-aware classifier stays fail-closed on the #13756 axes.
+
+    This module classifies a lane from its durable *gate* signals; it cannot see who owns
+    the next action or which execution surface ran the lane. So every lane it produces
+    must carry the fail-closed defaults — a ``review_waiting`` lane classified here still
+    blocks. Reading actionability out of the journal is a separate, explicit step (the
+    coordinator supplies it via ``--lane-spec``), and this test pins that this module did
+    not quietly start guessing it.
+    """
+
+    def test_the_lane_state_this_module_builds_makes_no_claim(self):
+        # `evaluate_sublane_admission` feeds the fill policy `LaneState(issue,
+        # state_class)` — the two-field form. Pin that this form still resolves to the
+        # fail-closed axes, so classification cannot become an implicit delegation.
+        lane = LaneState(issue="12700", state_class=LANE_STATE_REVIEW_WAITING)
+        self.assertEqual(
+            lane.claim.actionability, ACTIONABILITY_COORDINATOR_ACTIONABLE
+        )
+        self.assertEqual(lane.claim.next_action_owner, OWNER_MAIN_COORDINATOR)
+        self.assertEqual(lane.provenance.execution_surface, SURFACE_UNSPECIFIED)
+        self.assertTrue(lane.coordinator_blocking())
+
+    def test_a_delegated_review_gate_still_stops_this_preflight(self):
+        # A `review_request` gate says a review is outstanding; it does not say the
+        # review was delivered to a dedicated gateway. This module must not infer it.
+        outcome = evaluate_sublane_admission(
+            SublaneAdmissionInputs(
+                lane_signals=(_signal(issue="12700", gate=GATE_REVIEW_REQUEST),),
+                ready_independent_work=1,
+                capacity_remaining=2,
+            )
+        )
+        self.assertEqual(outcome.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
+        self.assertEqual(outcome.fill.delegated_in_flight, ())
+
+    def test_classified_lanes_are_not_counted_as_verified_sublanes(self):
+        # A lane with no surface claim is not a managed sublane: narrating a lane count
+        # from this projection must not invent one.
+        outcome = evaluate_sublane_admission(
+            SublaneAdmissionInputs(
+                lane_signals=(_signal(issue="12856", gate=GATE_START),),
+                ready_independent_work=1,
+                capacity_remaining=2,
+            )
+        )
+        self.assertEqual(
+            outcome.fill.capacity_projection.resident_managed_sublanes, 0
+        )
 
 
 class JournalRenderTest(unittest.TestCase):
