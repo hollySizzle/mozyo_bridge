@@ -41,6 +41,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     RELEASE_PARTIAL,
     RELEASE_RELEASED,
     RELEASE_REQUESTED,
+    REPLACEMENT_NOT_REQUESTED,
+    REPLACEMENT_PENDING,
+    REPLACEMENT_REPLACED,
+    REPLACEMENT_REQUESTED,
     DecisionPointer,
     DecisionPointerError,
     LaneLifecycleError,
@@ -56,8 +60,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     load_lane_lifecycle_readonly,
     rehydrate_allowed,
     release_transition_allowed,
+    replacement_transition_allowed,
     resolve_lane_owner,
     validate_release_pins,
+    validate_replacement_pins,
 )
 from mozyo_bridge.core.state.state_store import (  # noqa: E402
     STATE_CONTAINER_VERSION,
@@ -91,6 +97,14 @@ def _pins() -> tuple[ReleasePin, ...]:
 def _stored_pins() -> tuple[ReleasePin, ...]:
     """The same slots as the store persists them: role-sorted, so the row is stable."""
     return tuple(sorted(_pins(), key=lambda p: p.role))
+
+
+def _replacement_pin(locator: str = "%1") -> ReleasePin:
+    return ReleasePin(
+        role="codex",
+        assigned_name=f"mzb1_{WS}_codex_{LANE_A}",
+        locator=locator,
+    )
 
 
 class TransitionMatrixTest(unittest.TestCase):
@@ -153,6 +167,37 @@ class TransitionMatrixTest(unittest.TestCase):
             decode_release_pins("not json")
         with self.assertRaises(ReleasePinError):
             decode_release_pins('[{"role": "codex"}]')
+
+    def test_replacement_edges_require_the_durable_pending_step(self) -> None:
+        self.assertTrue(
+            replacement_transition_allowed(
+                REPLACEMENT_NOT_REQUESTED, REPLACEMENT_REQUESTED
+            )
+        )
+        self.assertTrue(
+            replacement_transition_allowed(REPLACEMENT_REQUESTED, REPLACEMENT_PENDING)
+        )
+        self.assertTrue(
+            replacement_transition_allowed(REPLACEMENT_PENDING, REPLACEMENT_PENDING)
+        )
+        self.assertTrue(
+            replacement_transition_allowed(REPLACEMENT_PENDING, REPLACEMENT_REPLACED)
+        )
+        self.assertFalse(
+            replacement_transition_allowed(
+                REPLACEMENT_REQUESTED, REPLACEMENT_REPLACED
+            )
+        )
+
+    def test_replacement_generation_pins_exactly_one_receiver(self) -> None:
+        self.assertEqual(
+            validate_replacement_pins((_replacement_pin(),)),
+            (_replacement_pin(),),
+        )
+        with self.assertRaises(ReleasePinError):
+            validate_replacement_pins(())
+        with self.assertRaises(ReleasePinError):
+            validate_replacement_pins(_pins())
 
 
 class LaneLifecycleStoreTest(unittest.TestCase):
@@ -594,6 +639,145 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self.assertFalse(again.applied)
         self.assertEqual(again.reason, CAS_FORBIDDEN_TRANSITION)
 
+    # -- active receiver-replacement generation ----------------------------
+
+    def test_replacement_request_pins_receiver_and_anchors_approval(self) -> None:
+        self.store.declare_active(
+            self.key_a, decision=_decision(), issue_id=ISSUE
+        )
+        approval = _decision(journal="78011")
+        outcome = self.store.request_replacement(
+            self.key_a,
+            expected_revision=1,
+            action_id="quarantine:lane:codex:p1",
+            pins=(_replacement_pin(),),
+            decision=approval,
+        )
+        self.assertTrue(outcome.applied)
+        record = self.store.get(self.key_a)
+        self.assertEqual(record.replacement_state, REPLACEMENT_REQUESTED)
+        self.assertEqual(record.replacement_action_id, "quarantine:lane:codex:p1")
+        self.assertEqual(record.replacement_slots, (_replacement_pin(),))
+        self.assertEqual(record.decision, approval)
+
+    def test_replacement_approval_must_belong_to_the_owner_issue(self) -> None:
+        self.store.declare_active(
+            self.key_a, decision=_decision(), issue_id=ISSUE
+        )
+        outcome = self.store.request_replacement(
+            self.key_a,
+            expected_revision=1,
+            action_id="act-1",
+            pins=(_replacement_pin(),),
+            decision=_decision(issue="99999"),
+        )
+        self.assertFalse(outcome.applied)
+        self.assertEqual(outcome.reason, CAS_OWNER_CONFLICT)
+        self.assertEqual(
+            self.store.get(self.key_a).replacement_state,
+            REPLACEMENT_NOT_REQUESTED,
+        )
+
+    def test_replacement_records_pending_then_replaced(self) -> None:
+        self.store.declare_active(
+            self.key_a, decision=_decision(), issue_id=ISSUE
+        )
+        self.store.request_replacement(
+            self.key_a,
+            expected_revision=1,
+            action_id="act-1",
+            pins=(_replacement_pin(),),
+            decision=_decision(journal="78011"),
+        )
+        direct = self.store.record_replacement_outcome(
+            self.key_a,
+            action_id="act-1",
+            expected_revision=2,
+            target=REPLACEMENT_REPLACED,
+        )
+        self.assertFalse(direct.applied)
+        self.assertEqual(direct.reason, CAS_FORBIDDEN_TRANSITION)
+        pending = self.store.record_replacement_outcome(
+            self.key_a,
+            action_id="act-1",
+            expected_revision=2,
+            target=REPLACEMENT_PENDING,
+        )
+        self.assertTrue(pending.applied)
+        replaced = self.store.record_replacement_outcome(
+            self.key_a,
+            action_id="act-1",
+            expected_revision=3,
+            target=REPLACEMENT_REPLACED,
+        )
+        self.assertTrue(replaced.applied)
+        self.assertEqual(
+            self.store.get(self.key_a).replacement_state, REPLACEMENT_REPLACED
+        )
+
+    def test_in_flight_replacement_blocks_hibernate_and_supersession(self) -> None:
+        self.store.declare_active(
+            self.key_a, decision=_decision(), issue_id=ISSUE
+        )
+        self.store.request_replacement(
+            self.key_a,
+            expected_revision=1,
+            action_id="act-1",
+            pins=(_replacement_pin(),),
+            decision=_decision(journal="78011"),
+        )
+        hibernate = self.store.transition_disposition(
+            self.key_a,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=2,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(journal="78012"),
+        )
+        self.assertFalse(hibernate.applied)
+        self.assertEqual(hibernate.reason, CAS_FORBIDDEN_TRANSITION)
+        supersede = self.store.supersede_and_activate(
+            superseded=self.key_a,
+            expected_revision=2,
+            recovery=self.key_b,
+            decision=_decision(journal="78013"),
+        )
+        self.assertFalse(supersede.applied)
+        self.assertEqual(supersede.reason, CAS_FORBIDDEN_TRANSITION)
+        self.assertEqual(self.store.resolve_owner(WS, ISSUE).lane_id, LANE_A)
+
+    def test_terminal_replacement_allows_a_new_generation(self) -> None:
+        self.store.declare_active(
+            self.key_a, decision=_decision(), issue_id=ISSUE
+        )
+        self.store.request_replacement(
+            self.key_a,
+            expected_revision=1,
+            action_id="act-1",
+            pins=(_replacement_pin(),),
+            decision=_decision(journal="78011"),
+        )
+        self.store.record_replacement_outcome(
+            self.key_a,
+            action_id="act-1",
+            expected_revision=2,
+            target=REPLACEMENT_PENDING,
+        )
+        self.store.record_replacement_outcome(
+            self.key_a,
+            action_id="act-1",
+            expected_revision=3,
+            target=REPLACEMENT_REPLACED,
+        )
+        opened = self.store.request_replacement(
+            self.key_a,
+            expected_revision=4,
+            action_id="act-2",
+            pins=(_replacement_pin("%9"),),
+            decision=_decision(journal="78014"),
+        )
+        self.assertTrue(opened.applied)
+        self.assertEqual(self.store.get(self.key_a).replacement_action_id, "act-2")
+
     # -- owner resolution / durability --------------------------------------
 
     def test_owner_resolution_is_exact_one(self) -> None:
@@ -1023,7 +1207,7 @@ class R2RegressionTest(unittest.TestCase):
             conn.close()
         self.assertIn("issue_id", columns)  # owner binding
         self.assertIn("decision_issue_id", columns)  # decision anchor
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
 
     def test_v1_table_migrates_additively(self) -> None:
         # A v1 row's anchor kept only the journal. The migration adds the column; it
@@ -1101,7 +1285,7 @@ class R3RegressionTest(unittest.TestCase):
         self.key = LaneLifecycleKey(WS, LANE_A)
         self.addCleanup(self._tmp.cleanup)
 
-    def _v3_store(self) -> Path:
+    def _v4_store(self) -> Path:
         """A store an imagined future build upgraded past us."""
         store = LaneLifecycleStore(home=self.home)
         store.declare_active(self.key, decision=_decision(), issue_id=ISSUE)
@@ -1109,13 +1293,13 @@ class R3RegressionTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute(
-                "UPDATE state_schema_components SET schema_version = 3 "
+                "UPDATE state_schema_components SET schema_version = 4 "
                 "WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
             )
             conn.execute(
                 "ALTER TABLE lane_lifecycle_records "
-                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'v3'"
+                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'v4'"
             )
             conn.commit()
         finally:
@@ -1125,19 +1309,19 @@ class R3RegressionTest(unittest.TestCase):
     # -- R3-F1: a newer component schema is never downgraded ------------------
 
     def test_f1_newer_component_schema_fails_closed(self) -> None:
-        self._v3_store()
+        self._v4_store()
         with self.assertRaises(LaneLifecycleError):
             LaneLifecycleStore(home=self.home).ensure_schema()
 
     def test_f1_refusal_leaves_the_store_byte_equivalent(self) -> None:
-        path = self._v3_store()
+        path = self._v4_store()
         before = path.read_bytes()
         with self.assertRaises(LaneLifecycleError):
             LaneLifecycleStore(home=self.home).ensure_schema()
         self.assertEqual(path.read_bytes(), before)
 
     def test_f1_version_and_future_columns_survive(self) -> None:
-        path = self._v3_store()
+        path = self._v4_store()
         with self.assertRaises(LaneLifecycleError):
             LaneLifecycleStore(home=self.home).ensure_schema()
         conn = sqlite3.connect(path)
@@ -1156,14 +1340,14 @@ class R3RegressionTest(unittest.TestCase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, 3)  # not re-stamped down to 2
+        self.assertEqual(version, 4)  # not re-stamped down to 3
         self.assertIn("future_guard", columns)
         self.assertEqual(rows, 1)
 
     def test_f1_no_write_reaches_a_newer_component(self) -> None:
         # The point of the refusal: rows here are lifecycle AUTHORITY. A build that
         # does not know v3's semantics must not be able to move them.
-        self._v3_store()
+        self._v4_store()
         store = LaneLifecycleStore(home=self.home)
         with self.assertRaises(LaneLifecycleError):
             store.transition_disposition(
@@ -1175,7 +1359,7 @@ class R3RegressionTest(unittest.TestCase):
             )
 
     def test_f1_readers_fail_closed_never_assume_active(self) -> None:
-        self._v3_store()
+        self._v4_store()
         # `absent` would read as "no owner, go ahead"; unsupported must be `unknown`.
         self.assertEqual(
             resolve_lane_owner(WS, ISSUE, home=self.home).status, OWNER_UNKNOWN
@@ -1185,7 +1369,7 @@ class R3RegressionTest(unittest.TestCase):
             LaneLifecycleStore(home=self.home).records()
 
     def test_f1_a_known_v1_still_migrates(self) -> None:
-        # Fail-closed on *newer* must not break the supported v1 -> v2 path.
+        # Fail-closed on *newer* must not break the supported v1 -> v3 path.
         store = LaneLifecycleStore(home=self.home)
         store.ensure_schema()
         path = lane_lifecycle_path(self.home)
@@ -1209,7 +1393,7 @@ class R3RegressionTest(unittest.TestCase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
 
     # -- R4-F1: a present-but-malformed version is not coerced to a known one --
 
@@ -1405,7 +1589,7 @@ class R3RegressionTest(unittest.TestCase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
 
     def test_f1_integer_stored_as_real_2_0_is_still_accepted(self) -> None:
         # SQLite folds a lossless REAL 2.0 to integer 2; that is a real v2, not
