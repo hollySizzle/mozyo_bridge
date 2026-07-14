@@ -22,6 +22,11 @@ Covered invariants (j#77169):
      3.10-3.13 full matrix + tag<->version-mirror + fresh-install before OIDC
      publish.
   #5 concurrency cancel/serialize semantics + run-summary provenance.
+
+Tag refs are covered at BOTH layers (Redmine #13734 j#78399, from the #13735
+j#78390 F2 finding): the `push` trigger is a branch allowlist, and the job `if`
+expressions still exclude a non-branch ref, so a tag push fires no job even if
+the trigger filter is loosened later.
 """
 
 from __future__ import annotations
@@ -206,6 +211,22 @@ class TestYmlTriggerMatrixTest(unittest.TestCase):
         for trig in ("push", "pull_request", "schedule", "workflow_dispatch"):
             self.assertIn(trig, self.on)
 
+    def test_push_trigger_is_a_branch_allowlist_excluding_tags(self) -> None:
+        # Redmine #13734 j#78399 (from #13735 j#78390 F2): a bare `push:` with no
+        # ref filter also fires on `refs/tags/*`, which is NOT a tier of this
+        # workflow. A `branches` filter restricts the push event to branch refs,
+        # so tags are excluded AT THE TRIGGER. Assert the allowlist shape rather
+        # than a tags-denylist, so a newly added tag pattern cannot slip in.
+        push = self.on["push"]
+        self.assertIsInstance(
+            push, dict, msg="`push:` must carry a branch filter, not fire on every ref"
+        )
+        self.assertIn("branches", push)
+        self.assertEqual(["**"], push["branches"])
+        # No tag opt-in of any form may coexist with the branch allowlist.
+        self.assertNotIn("tags", push)
+        self.assertNotIn("tags-ignore", push)
+
     def test_dispatch_lane_input(self) -> None:
         lane = self.on["workflow_dispatch"]["inputs"]["lane"]
         self.assertEqual("choice", lane["type"])
@@ -240,6 +261,15 @@ class TestYmlTriggerMatrixTest(unittest.TestCase):
         self.assertFalse(_eval(cancel, **_ctx("schedule")))
         self.assertFalse(_eval(cancel, **_ctx("workflow_dispatch", lane="full")))
 
+    def test_tag_ref_is_not_in_the_cancelling_class(self) -> None:
+        # Second layer of the F2 fix: even if a tag ref reached the workflow, it
+        # must not be treated as an ephemeral issue-branch push. Before the fix a
+        # tag ref satisfied "not main / not int_* / not integration_*" and
+        # evaluated True here.
+        cancel = str(self.doc["concurrency"]["cancel-in-progress"])
+        for ref in ("refs/tags/v0.11.0", "refs/tags/nightly"):
+            self.assertFalse(_eval(cancel, **_ctx("push", ref=ref)), msg=ref)
+
 
 class TestYmlRoutingTest(unittest.TestCase):
     """Behavioral routing: which job(s) run for each event (positive+negative)."""
@@ -260,6 +290,18 @@ class TestYmlRoutingTest(unittest.TestCase):
         self.assertFalse(
             self._runs("full-matrix", "push", ref="refs/heads/issue_13734_x")
         )
+
+    def test_tag_push_routes_to_no_job_at_all(self) -> None:
+        # Redmine #13734 j#78399 (#13735 j#78390 F2). A release tag push is not a
+        # tier of test.yml: publish.yml owns release refs. The trigger filter
+        # already keeps tags out of the workflow; this pins the JOB layer too, so
+        # the gate stays fail-closed if that filter is ever loosened. Before the
+        # fix `refs/tags/v0.11.0` evaluated to `['quick']`.
+        for ref in ("refs/tags/v0.11.0", "refs/tags/v1.0.0-rc1", "refs/tags/nightly"):
+            fired = [
+                job for job in self.doc["jobs"] if self._runs(job, "push", ref=ref)
+            ]
+            self.assertEqual([], fired, msg=f"{ref} must fire no job, got {fired}")
 
     def test_pull_request_runs_quick_only(self) -> None:
         self.assertTrue(self._runs("quick", "pull_request"))

@@ -16,6 +16,15 @@ name: Test
 # - Nightly schedule / manual `full` dispatch -> `full-matrix`: the supported
 #   Python 3.10-3.13 full matrix safety lane.
 #
+# TAG pushes are NOT a tier of this workflow (Redmine #13734 j#78399, from the
+# #13735 j#78390 F2 verification finding). `on.push.branches: ["**"]` is a branch
+# ALLOWLIST: a `branches` filter makes a push event match branch refs only, so
+# `refs/tags/*` never enters this workflow. The `quick` job and the concurrency
+# expression additionally require a `refs/heads/` ref, so a tag ref is still
+# fail-closed at the job layer if the trigger filter is ever loosened. Release
+# tags are gated by publish.yml (`release: published` + immutable `github.sha`),
+# not here.
+#
 # The quick lane reuses the SAME #12752 impact resolver the local command uses
 # (`mozyo-bridge tests resolve`), so local and CI selection stay identical. A
 # fail-closed `full` recommendation makes the quick lane run the whole suite on
@@ -28,6 +37,11 @@ name: Test
 
 on:
   push:
+    # Branch allowlist: a `branches` filter restricts the push event to branch
+    # refs, so `refs/tags/*` pushes do NOT trigger this workflow at all. `**`
+    # keeps every branch (including slashed names) on its existing tier.
+    branches:
+      - "**"
   pull_request:
   schedule:
     # Nightly full-suite safety lane (07:00 JST = 22:00 UTC).
@@ -49,11 +63,14 @@ on:
 # integration SHA, scheduled sweep, and on-demand run keeps its own
 # authoritative verdict (the TestPyPI auto dev path keys on the head_sha of a
 # COMPLETED main `Test` run, so cancelling a main run would drop that gate).
+# The `refs/heads/` guard keeps a non-branch ref (e.g. a tag, already excluded by
+# the trigger filter) out of the cancelling class rather than defaulting it in.
 concurrency:
   group: test-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: >-
     ${{ github.event_name == 'pull_request'
         || (github.event_name == 'push'
+            && startsWith(github.ref, 'refs/heads/')
             && github.ref != 'refs/heads/main'
             && !startsWith(github.ref, 'refs/heads/int_')
             && !startsWith(github.ref, 'refs/heads/integration_')) }}
@@ -63,10 +80,17 @@ jobs:
     # Fast feedback lane: PR, issue-branch push, or manual `quick` dispatch.
     # Single Python; lint/health + docs gate + affected tests only. An
     # issue-branch push routes here instead of the full matrix (Redmine #13734).
+    #
+    # The push arm requires a `refs/heads/` ref and THEN excludes the integration
+    # branches: an issue BRANCH is the only push that routes here. A tag ref is
+    # excluded by construction (it is not a branch), so it cannot fall into this
+    # lane by default the way a bare "not main / not int_*" test let it
+    # (Redmine #13734 j#78399 / #13735 j#78390 F2).
     name: Quick lane (affected tests)
     if: >-
       github.event_name == 'pull_request'
       || (github.event_name == 'push'
+          && startsWith(github.ref, 'refs/heads/')
           && github.ref != 'refs/heads/main'
           && !startsWith(github.ref, 'refs/heads/int_')
           && !startsWith(github.ref, 'refs/heads/integration_'))
