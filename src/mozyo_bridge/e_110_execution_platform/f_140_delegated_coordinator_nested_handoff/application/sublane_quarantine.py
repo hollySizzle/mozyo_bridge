@@ -25,16 +25,18 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
-    REPLACEMENT_NOT_REQUESTED,
-    REPLACEMENT_PENDING,
-    REPLACEMENT_REPLACED,
-    REPLACEMENT_REQUESTED,
     DecisionPointer,
     DecisionPointerError,
     LaneLifecycleError,
     LaneLifecycleKey,
     ReleasePin,
     ReleasePinError,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    REPLACEMENT_NOT_REQUESTED,
+    REPLACEMENT_PENDING,
+    REPLACEMENT_REPLACED,
+    REPLACEMENT_REQUESTED,
 )
 from mozyo_bridge.core.state.lane_replacement import LaneReplacementStore
 from mozyo_bridge.core.state.lane_replacement_model import quarantine_action_id

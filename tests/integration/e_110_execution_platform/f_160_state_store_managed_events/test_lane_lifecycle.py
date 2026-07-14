@@ -41,10 +41,6 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     RELEASE_PARTIAL,
     RELEASE_RELEASED,
     RELEASE_REQUESTED,
-    REPLACEMENT_NOT_REQUESTED,
-    REPLACEMENT_PENDING,
-    REPLACEMENT_REPLACED,
-    REPLACEMENT_REQUESTED,
     DecisionPointer,
     DecisionPointerError,
     LaneLifecycleError,
@@ -60,10 +56,19 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     load_lane_lifecycle_readonly,
     rehydrate_allowed,
     release_transition_allowed,
-    replacement_transition_allowed,
     resolve_lane_owner,
     validate_release_pins,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    REPLACEMENT_NOT_REQUESTED,
+    REPLACEMENT_PENDING,
+    REPLACEMENT_REPLACED,
+    REPLACEMENT_REQUESTED,
+    replacement_transition_allowed,
     validate_replacement_pins,
+)
+from mozyo_bridge.core.state.lane_replacement import (  # noqa: E402
+    LaneReplacementStore,
 )
 from mozyo_bridge.core.state.state_store import (  # noqa: E402
     STATE_CONTAINER_VERSION,
@@ -205,6 +210,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self.store = LaneLifecycleStore(home=self.home)
+        self.replacement = LaneReplacementStore(home=self.home)
         self.key_a = LaneLifecycleKey(WS, LANE_A)
         self.key_b = LaneLifecycleKey(WS, LANE_B)
         self.addCleanup(self._tmp.cleanup)
@@ -646,7 +652,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
             self.key_a, decision=_decision(), issue_id=ISSUE
         )
         approval = _decision(journal="78011")
-        outcome = self.store.request_replacement(
+        outcome = self.replacement.request_replacement(
             self.key_a,
             expected_revision=1,
             action_id="quarantine:lane:codex:p1",
@@ -664,7 +670,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self.store.declare_active(
             self.key_a, decision=_decision(), issue_id=ISSUE
         )
-        outcome = self.store.request_replacement(
+        outcome = self.replacement.request_replacement(
             self.key_a,
             expected_revision=1,
             action_id="act-1",
@@ -682,14 +688,14 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self.store.declare_active(
             self.key_a, decision=_decision(), issue_id=ISSUE
         )
-        self.store.request_replacement(
+        self.replacement.request_replacement(
             self.key_a,
             expected_revision=1,
             action_id="act-1",
             pins=(_replacement_pin(),),
             decision=_decision(journal="78011"),
         )
-        direct = self.store.record_replacement_outcome(
+        direct = self.replacement.record_replacement_outcome(
             self.key_a,
             action_id="act-1",
             expected_revision=2,
@@ -697,14 +703,14 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         )
         self.assertFalse(direct.applied)
         self.assertEqual(direct.reason, CAS_FORBIDDEN_TRANSITION)
-        pending = self.store.record_replacement_outcome(
+        pending = self.replacement.record_replacement_outcome(
             self.key_a,
             action_id="act-1",
             expected_revision=2,
             target=REPLACEMENT_PENDING,
         )
         self.assertTrue(pending.applied)
-        replaced = self.store.record_replacement_outcome(
+        replaced = self.replacement.record_replacement_outcome(
             self.key_a,
             action_id="act-1",
             expected_revision=3,
@@ -719,7 +725,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self.store.declare_active(
             self.key_a, decision=_decision(), issue_id=ISSUE
         )
-        self.store.request_replacement(
+        self.replacement.request_replacement(
             self.key_a,
             expected_revision=1,
             action_id="act-1",
@@ -749,26 +755,26 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self.store.declare_active(
             self.key_a, decision=_decision(), issue_id=ISSUE
         )
-        self.store.request_replacement(
+        self.replacement.request_replacement(
             self.key_a,
             expected_revision=1,
             action_id="act-1",
             pins=(_replacement_pin(),),
             decision=_decision(journal="78011"),
         )
-        self.store.record_replacement_outcome(
+        self.replacement.record_replacement_outcome(
             self.key_a,
             action_id="act-1",
             expected_revision=2,
             target=REPLACEMENT_PENDING,
         )
-        self.store.record_replacement_outcome(
+        self.replacement.record_replacement_outcome(
             self.key_a,
             action_id="act-1",
             expected_revision=3,
             target=REPLACEMENT_REPLACED,
         )
-        opened = self.store.request_replacement(
+        opened = self.replacement.request_replacement(
             self.key_a,
             expected_revision=4,
             action_id="act-2",
@@ -840,6 +846,7 @@ class R1RegressionTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self.store = LaneLifecycleStore(home=self.home)
+        self.replacement = LaneReplacementStore(home=self.home)
         self.key_a = LaneLifecycleKey(WS, LANE_A)
         self.key_b = LaneLifecycleKey(WS, LANE_B)
         self.addCleanup(self._tmp.cleanup)
