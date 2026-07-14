@@ -126,6 +126,7 @@ class _FakeOps:
         signal: PendingComposerSignal | None = None,
         row_revision: int = AGENT_REVISION,
         attested_at: str = ATTESTED_AT,
+        receiver_present: bool | None = True,
         close: CloseReceiverResult | None = None,
         verify: FreshReceiverVerification | None = None,
         heal_error: Exception | None = None,
@@ -133,6 +134,7 @@ class _FakeOps:
         self._signal = signal if signal is not None else _signal()
         self._row_revision = row_revision
         self._attested_at = attested_at
+        self._receiver_present = receiver_present
         self._close = close if close is not None else CloseReceiverResult(True)
         self._verify = (
             verify
@@ -150,6 +152,7 @@ class _FakeOps:
             signal=self._signal,
             row_revision=self._row_revision,
             attested_at=self._attested_at,
+            receiver_present=self._receiver_present,
         )
 
     def close_receiver(
@@ -506,6 +509,121 @@ class ReplacementTest(_QuarantineCase):
         self.assertEqual(self._row().lane_disposition, DISPOSITION_ACTIVE)
 
 
+class OwedCloseRevalidationTest(_QuarantineCase):
+    """R1-F1 (j#78347): an owed close re-validates the receiver that is live NOW.
+
+    A crash between the request CAS and the close leaves ``requested`` durable with the
+    close still owed. By the time it is redriven, the pinned locator may hold a receiver
+    that has taken new input or started working — an input the owner never approved
+    discarding. The exact-pin match alone cannot see that, so the approval fences must
+    run again at the close edge.
+    """
+
+    def _crashed_after_request(self) -> None:
+        """Open the generation durably, then stop — exactly as a crash would."""
+        self._active_lane()
+        row = self._row()
+        opened = self.store.request_replacement(
+            self.key,
+            expected_revision=row.revision,
+            action_id=ACTION,
+            pins=(ReleasePin(role=ROLE, assigned_name=NAME, locator=OLD_LOCATOR),),
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id=APPROVAL_JOURNAL
+            ),
+        )
+        self.assertTrue(opened.applied)
+        self.assertEqual(self._row().replacement_state, REPLACEMENT_REQUESTED)
+
+    def _assert_owed_close_withheld(self, ops: _FakeOps) -> None:
+        outcome = self._run(ops)
+        self.assertTrue(outcome.is_blocked)
+        self.assertEqual(ops.closed_pins, [])  # the live receiver survives
+        self.assertEqual(ops.heals, 0)
+        self.assertEqual(outcome.replacement_state, REPLACEMENT_REQUESTED)
+        self.assertIn("owed close withheld", outcome.detail)
+        # The generation stays open and redrivable; nothing was destroyed or lost.
+        self.assertEqual(self._row().replacement_state, REPLACEMENT_REQUESTED)
+
+    def test_receiver_at_a_newer_composer_revision_is_not_closed(self) -> None:
+        # The pinned receiver took new input while the replacement was owed.
+        self._crashed_after_request()
+        self._assert_owed_close_withheld(
+            _FakeOps(row_revision=AGENT_REVISION + 1, receiver_present=True)
+        )
+
+    def test_receiver_that_started_working_is_not_closed(self) -> None:
+        self._crashed_after_request()
+        self._assert_owed_close_withheld(
+            _FakeOps(signal=_signal(agent_state="busy"), receiver_present=True)
+        )
+
+    def test_receiver_that_is_no_longer_a_candidate_is_not_closed(self) -> None:
+        # The composer we approved discarding is gone: the receiver now holds a
+        # correlated, drivable marker (or nothing at all).
+        self._crashed_after_request()
+        self._assert_owed_close_withheld(
+            _FakeOps(
+                signal=_signal(correlated_marker_ids=(MARKER,)), receiver_present=True
+            )
+        )
+
+    def test_receiver_reattested_after_the_approval_is_not_closed(self) -> None:
+        # The slot restarted while the close was owed: a brand-new agent generation
+        # now sits at the same locator.
+        self._crashed_after_request()
+        self._assert_owed_close_withheld(
+            _FakeOps(attested_at=NEWER_ATTESTED_AT, receiver_present=True)
+        )
+
+    def test_unprovable_absence_withholds_the_owed_close(self) -> None:
+        # The inventory could not tell us whether the pinned receiver is still live.
+        # "Unknown" must never be read as "already gone" — that would license a close
+        # (and then a relaunch) against a receiver nobody looked at.
+        self._crashed_after_request()
+        self._assert_owed_close_withheld(
+            _FakeOps(
+                signal=_signal(inventory_readable=False), receiver_present=None
+            )
+        )
+
+    def test_unchanged_receiver_is_closed_exactly_once(self) -> None:
+        # The approved composer / generation is still exactly what the owner saw:
+        # the owed close proceeds, against the one pinned slot.
+        self._crashed_after_request()
+        ops = _FakeOps(receiver_present=True)
+        outcome = self._run(ops)
+
+        self.assertFalse(outcome.is_blocked)
+        self.assertEqual(outcome.replacement_state, REPLACEMENT_REPLACED)
+        self.assertEqual(len(ops.closed_pins), 1)
+        pin = ops.closed_pins[0]
+        self.assertEqual(
+            (pin.role, pin.assigned_name, pin.locator), (ROLE, NAME, OLD_LOCATOR)
+        )
+        self.assertEqual(ops.heals, 1)
+
+    def test_absent_receiver_resumes_the_generation_without_a_second_close(
+        self,
+    ) -> None:
+        # The crash happened AFTER the close: the old receiver is positively gone, so
+        # the redrive owes only the launch. It must not refuse just because the vanished
+        # receiver no longer classifies as a candidate.
+        self._crashed_after_request()
+        ops = _FakeOps(
+            signal=_signal(generation_matches=False),
+            receiver_present=False,
+            close=CloseReceiverResult(False, old_absent=True),
+        )
+        outcome = self._run(ops)
+
+        self.assertFalse(outcome.is_blocked)
+        self.assertEqual(outcome.replacement_state, REPLACEMENT_REPLACED)
+        self.assertFalse(outcome.closed_old_receiver)  # nothing was killed twice
+        self.assertEqual(ops.heals, 1)
+        self.assertEqual(self._row().replacement_state, REPLACEMENT_REPLACED)
+
+
 class ComposerObservationTest(unittest.TestCase):
     """The adapter boundary: pane text enters, only content-free facts leave."""
 
@@ -575,6 +693,45 @@ class _StubOps(LiveSublaneQuarantineOps):
 
     def _providers(self):
         return (GATEWAY_ROLE, ROLE)
+
+
+class InspectPresenceTest(unittest.TestCase):
+    """`receiver_present` is what lets a redrive skip an owed close — so it must
+    only ever say ``False`` when the pinned slot is provably gone (R1-F1 j#78347)."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(
+            quarantine_module, "repo_scope_workspace_id", return_value=WS
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _inspect(self, rows):
+        return _StubOps(rows).inspect(_request()).receiver_present
+
+    def test_live_pinned_locator_is_present(self) -> None:
+        self.assertTrue(self._inspect([_agent_row(NAME, OLD_LOCATOR)]))
+
+    def test_ambiguous_inventory_is_present_not_absent(self) -> None:
+        # The same assigned name is live at two locators, one of them the pinned one.
+        # The generation is unusable, but something IS live there: reading this as
+        # absence would let the owed close proceed unvalidated.
+        self.assertTrue(
+            self._inspect(
+                [_agent_row(NAME, OLD_LOCATOR), _agent_row(NAME, FRESH_LOCATOR)]
+            )
+        )
+
+    def test_recycled_locator_only_is_absent(self) -> None:
+        # Nothing is live at the pinned locator: the pinned process is gone.
+        self.assertFalse(self._inspect([_agent_row(NAME, FRESH_LOCATOR)]))
+
+    def test_unreadable_inventory_is_unknown_not_absent(self) -> None:
+        class _Unreadable(_StubOps):
+            def _rows(self):
+                raise RuntimeError("herdr inventory unreadable")
+
+        self.assertIsNone(_Unreadable([]).inspect(_request()).receiver_present)
 
 
 class CloseReceiverTest(unittest.TestCase):

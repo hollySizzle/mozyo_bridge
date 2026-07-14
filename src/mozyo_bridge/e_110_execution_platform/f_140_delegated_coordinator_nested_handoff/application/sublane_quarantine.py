@@ -148,6 +148,10 @@ class QuarantineInspection:
     signal: PendingComposerSignal
     row_revision: int = -1
     attested_at: str = ""
+    #: Is a managed process still live at the exact pinned ``(assigned name, locator)``?
+    #: ``None`` means the inventory could not prove either way — never read as absence
+    #: (R1-F1 j#78347): only a POSITIVE absence lets a redrive skip the owed close.
+    receiver_present: Optional[bool] = None
     detail: str = ""
 
     @property
@@ -254,6 +258,31 @@ class SublaneQuarantineUseCase:
             classification=classification,
             **changes,
         )
+
+    @staticmethod
+    def _approval_stale_reason(
+        request: QuarantineRequest,
+        inspection: QuarantineInspection,
+        classification: PendingComposerClassification,
+    ) -> str:
+        """Why this approval may not act on the receiver that is live RIGHT NOW.
+
+        The approval names one composer of one agent generation.  These three fences
+        are what make it that narrow, so they must hold at every moment we are about
+        to close — not only when the generation was opened (R1-F1 j#78347: a crash
+        between the request CAS and the close leaves an owed close whose target may
+        since have taken new input or started working; killing it then would destroy
+        an input the owner never approved discarding).
+        """
+        if not classification.quarantine_candidate:
+            return "classification is not quarantine-eligible; zero actuation"
+        if inspection.row_revision != request.approved_revision:
+            return "approval is stale for the current agent/composer revision"
+        if inspection.attested_at and not _not_after(
+            inspection.attested_at, request.approval_observed_at
+        ):
+            return "approval predates the current attested agent generation"
+        return ""
 
     def run(self, request: QuarantineRequest, *, execute: bool) -> QuarantineOutcome:
         inspection = self.ops.inspect(request)
@@ -373,36 +402,18 @@ class SublaneQuarantineUseCase:
                     ),
                 )
         else:
-            # Only opening a NEW generation depends on the current transient
-            # composer observation. Once ``requested`` is durable, a crash may
-            # occur after the exact close and before the ``pending`` CAS; retries
-            # must resume the stored generation even though the old receiver is
-            # now absent and therefore classifies as generation_mismatch.
-            if not classification.quarantine_candidate:
+            # Opening a NEW generation depends on the current transient composer
+            # observation. A stored generation is resumed instead of re-opened — but
+            # resuming never means acting blind: an owed close re-runs these same
+            # fences below (R1-F1 j#78347).
+            stale = self._approval_stale_reason(request, inspection, classification)
+            if stale:
                 return self._base_outcome(
                     request,
                     classification,
                     executed=True,
                     replacement_state=current.state,
-                    detail="classification is not quarantine-eligible; zero actuation",
-                )
-            if inspection.row_revision != request.approved_revision:
-                return self._base_outcome(
-                    request,
-                    classification,
-                    executed=True,
-                    replacement_state=current.state,
-                    detail="approval is stale for the current agent/composer revision",
-                )
-            if inspection.attested_at and not _not_after(
-                inspection.attested_at, request.approval_observed_at
-            ):
-                return self._base_outcome(
-                    request,
-                    classification,
-                    executed=True,
-                    replacement_state=current.state,
-                    detail="approval predates the current attested agent generation",
+                    detail=stale,
                 )
             opened = self.store.request_replacement(
                 key,
@@ -430,6 +441,24 @@ class SublaneQuarantineUseCase:
 
         closed = current.state == REPLACEMENT_PENDING
         if current.state == REPLACEMENT_REQUESTED:
+            # The close is still owed, so it is about to kill whatever is live at the
+            # pinned locator *now* — not necessarily what the owner looked at (R1-F1
+            # j#78347). Re-run the approval fences at this edge unless the old receiver
+            # is POSITIVELY gone: an absent one is the crash-after-close case (contract
+            # 5), whose redrive owes only the launch. An inventory that cannot prove
+            # absence is not absence — it re-validates and fails closed.
+            if inspection.receiver_present is not False:
+                stale = self._approval_stale_reason(
+                    request, inspection, classification
+                )
+                if stale:
+                    return self._base_outcome(
+                        request,
+                        classification,
+                        executed=True,
+                        replacement_state=REPLACEMENT_REQUESTED,
+                        detail=f"{stale}; owed close withheld",
+                    )
             close = self.ops.close_receiver(request, pin)
             if not (close.closed or close.old_absent):
                 return self._base_outcome(
@@ -584,6 +613,7 @@ class LiveSublaneQuarantineOps:
             return QuarantineInspection(
                 workspace_id=workspace_id,
                 signal=PendingComposerSignal(False, None, "unknown", False, False),
+                receiver_present=None,  # unreadable proves nothing; never read as absence
                 detail="inventory_unreadable",
             )
         matches = [
@@ -593,11 +623,17 @@ class LiveSublaneQuarantineOps:
             and _norm(row.get(AGENT_KEY_NAME)) == _norm(request.assigned_name)
         ]
         exact = [row for row in matches if _agent_locator(row) == _norm(request.locator)]
+        # Presence is the exact pinned pair being live AT ALL — deliberately not the
+        # unique-row test below. An ambiguous inventory still means something is live at
+        # that locator, so an owed close must re-validate rather than treat it as the
+        # crash-after-close case (R1-F1 j#78347).
+        present = bool(exact)
         row = exact[0] if len(exact) == 1 and len(matches) == 1 else None
         if row is None:
             return QuarantineInspection(
                 workspace_id=workspace_id,
                 signal=PendingComposerSignal(True, None, "unknown", False, False),
+                receiver_present=present,
                 detail="generation_mismatch",
             )
         decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
@@ -679,6 +715,7 @@ class LiveSublaneQuarantineOps:
             attested_at=_norm(
                 attestation_record.observed_at if attestation_record else ""
             ),
+            receiver_present=present,
             detail="classified_without_persisting_composer_body",
         )
 
