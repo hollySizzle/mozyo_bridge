@@ -137,39 +137,44 @@ class LaneProvenance:
         return self.dispatch_ack == DISPATCH_ACK_WORKER_CONFIRMED
 
 
-# The durable lane metadata / lifecycle identity a `managed_sublane` claim must present.
-# These are the fields that make the closed product term checkable (j#78320 item 1).
+# The full provenance a `managed_sublane` claim must present (#13756 j#78320 item 3:
+# workspace / lane / issue generation / lifecycle revision / durable anchor / gateway /
+# worker identity). Every field is required, without exception — a managed sublane is
+# precisely a lane whose durable lifecycle identity AND resolved gateway/worker pair are
+# both nameable. Relaxing any of these (Review j#78471 finding 2) let a lane with no
+# generation and no pair verify as a sublane, which is the fail-OPEN direction: it makes
+# a superseded/recovery lane indistinguishable and lets an un-paired claim count toward
+# the cap. `dispatch_ack` is required separately (it must be a *known* token, but `none`
+# — resident-but-undispatched — is a legitimate value, so it is not an identity field).
 _REQUIRED_SUBLANE_IDENTITY: tuple[str, ...] = (
     "workspace",
     "lane",
+    "issue_generation",
     "lifecycle_revision",
     "durable_anchor",
+    "gateway_identity",
+    "worker_identity",
 )
 
 
 def missing_sublane_provenance(provenance: LaneProvenance) -> tuple[str, ...]:
     """The provenance fields a ``managed_sublane`` claim is missing (empty tuple = OK).
 
-    Identity fields (:data:`_REQUIRED_SUBLANE_IDENTITY`) are always required. The pair
-    identities are required *at the ACK level that asserts them*: a gateway-dispatched
-    lane must name its gateway, and a worker-confirmed lane must also name its worker —
-    otherwise "worker confirmed" is an unfalsifiable claim. An unrecognized
-    ``dispatch_ack`` token is itself a missing-provenance failure (fail closed rather
-    than reading an unknown ACK as ``none``).
+    Every field in :data:`_REQUIRED_SUBLANE_IDENTITY` is required unconditionally (#13756
+    j#78320 item 3). A managed sublane always has a resolved gateway/worker pair — that
+    is what makes it *managed* — so a lane that cannot name its pair is not a verified
+    sublane even when it claims ``dispatch_ack=none``. The ACK level does not relax the
+    identity requirement; it only records whether the dispatch has happened yet. An
+    unrecognized ``dispatch_ack`` token is itself a failure (fail closed rather than
+    reading an unknown ACK as ``none``).
     """
-    missing: list[str] = []
-    for field in _REQUIRED_SUBLANE_IDENTITY:
-        if not (getattr(provenance, field, "") or "").strip():
-            missing.append(field)
-
+    missing = [
+        field
+        for field in _REQUIRED_SUBLANE_IDENTITY
+        if not (getattr(provenance, field, "") or "").strip()
+    ]
     if provenance.dispatch_ack not in DISPATCH_ACK_STATES:
         missing.append("dispatch_ack")
-        return tuple(missing)
-
-    if provenance.gateway_dispatched() and not provenance.gateway_identity.strip():
-        missing.append("gateway_identity")
-    if provenance.worker_confirmed() and not provenance.worker_identity.strip():
-        missing.append("worker_identity")
     return tuple(missing)
 
 
@@ -201,6 +206,39 @@ def is_verified_managed_sublane(provenance: LaneProvenance) -> bool:
     ``delegated_in_flight`` on.
     """
     return resolve_execution_surface(provenance) == SURFACE_MANAGED_SUBLANE
+
+
+def sublane_identity_key(provenance: LaneProvenance) -> tuple[str, str, str]:
+    """The canonical identity of a managed sublane: (workspace, lane, issue_generation).
+
+    Two verified sublanes with the same key are the *same* lane (a duplicate listing);
+    two with different ``issue_generation`` are distinct lanes (a superseded lane and its
+    recovery lane). :func:`project_capacity` uses this to avoid double-counting a
+    duplicate and to fail closed when the same key carries conflicting facts.
+    """
+    return (
+        provenance.workspace.strip(),
+        provenance.lane.strip(),
+        provenance.issue_generation.strip(),
+    )
+
+
+# The provenance facts that must agree when two items share a canonical identity key. If
+# the same (workspace, lane, generation) is listed twice with a different lifecycle
+# revision / anchor / pair / ACK — or a different blocking verdict — the coordinator has
+# contradictory readings of one lane, so the projection fails that lane closed rather
+# than picking one silently.
+def _identity_conflict_facts(
+    provenance: LaneProvenance, coordinator_blocking: bool
+) -> tuple:
+    return (
+        provenance.lifecycle_revision.strip(),
+        provenance.durable_anchor.strip(),
+        provenance.gateway_identity.strip(),
+        provenance.worker_identity.strip(),
+        provenance.dispatch_ack,
+        coordinator_blocking,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +307,21 @@ class SurfaceItem:
 def project_capacity(items: Iterable[SurfaceItem]) -> CapacityProjection:
     """Render the verified capacity projection from an already-resolved lane set.
 
-    The invariant that makes the count honest: an internal task agent is tallied in
-    ``internal_task_agents`` and **nowhere else**. It never appears in
-    ``resident_managed_sublanes``, so it can neither consume sublane capacity (claiming
-    the pipeline is full) nor fill it (claiming productive parallelism).
+    Two invariants keep the count honest:
+
+    - an internal task agent is tallied in ``internal_task_agents`` and **nowhere else**,
+      so it can neither consume sublane capacity nor fill it;
+    - a verified managed sublane is counted **once per canonical identity**
+      (:func:`sublane_identity_key`). A duplicate listing of the same lane is collapsed
+      (Review j#78471 finding 3: double-counting inflated the productive count). If the
+      same identity is listed twice with conflicting facts (a different lifecycle
+      revision / anchor / pair / ACK / blocking verdict), the coordinator holds
+      contradictory readings of one lane, so that lane fails closed into
+      ``unverified_surface`` instead of a guessed count.
     """
-    resident = 0
-    gateway_dispatched = 0
-    worker_productive = 0
+    # First pass: group verified sublanes by canonical identity, and detect conflicts.
+    first_seen: dict[tuple[str, str, str], SurfaceItem] = {}
+    conflicted: set[tuple[str, str, str]] = set()
     task_agents = 0
     unverified = 0
     other = 0
@@ -284,17 +329,39 @@ def project_capacity(items: Iterable[SurfaceItem]) -> CapacityProjection:
     for item in items:
         surface = resolve_execution_surface(item.provenance)
         if surface == SURFACE_MANAGED_SUBLANE:
-            resident += 1
-            if item.provenance.gateway_dispatched():
-                gateway_dispatched += 1
-            if item.provenance.worker_confirmed() and not item.coordinator_blocking:
-                worker_productive += 1
+            key = sublane_identity_key(item.provenance)
+            prior = first_seen.get(key)
+            if prior is None:
+                first_seen[key] = item
+            elif _identity_conflict_facts(
+                item.provenance, item.coordinator_blocking
+            ) != _identity_conflict_facts(
+                prior.provenance, prior.coordinator_blocking
+            ):
+                conflicted.add(key)
+            # A consistent duplicate is simply dropped (counted once via `first_seen`).
         elif surface == SURFACE_INTERNAL_TASK_AGENT:
             task_agents += 1
         elif surface == SURFACE_UNKNOWN:
             unverified += 1
         else:
             other += 1
+
+    # A conflicted identity cannot be counted as a trustworthy sublane; it joins the
+    # fail-closed unverified bucket (one entry per ambiguous identity).
+    unverified += len(conflicted)
+
+    resident = 0
+    gateway_dispatched = 0
+    worker_productive = 0
+    for key, item in first_seen.items():
+        if key in conflicted:
+            continue
+        resident += 1
+        if item.provenance.gateway_dispatched():
+            gateway_dispatched += 1
+        if item.provenance.worker_confirmed() and not item.coordinator_blocking:
+            worker_productive += 1
 
     return CapacityProjection(
         resident_managed_sublanes=resident,
@@ -323,6 +390,7 @@ __all__ = (
     "missing_sublane_provenance",
     "resolve_execution_surface",
     "is_verified_managed_sublane",
+    "sublane_identity_key",
     "CapacityProjection",
     "SurfaceItem",
     "project_capacity",

@@ -70,6 +70,7 @@ VERIFIED_SUBLANE = LaneProvenance(
     execution_surface=SURFACE_MANAGED_SUBLANE,
     workspace="w19",
     lane="issue_13441_provider_registry",
+    issue_generation="1",
     lifecycle_revision="3",
     durable_anchor="13441#77503",
     gateway_identity="w19:p1",

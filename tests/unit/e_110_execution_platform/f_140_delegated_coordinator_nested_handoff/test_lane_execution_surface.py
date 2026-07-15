@@ -77,32 +77,51 @@ class ProvenanceVerificationTest(unittest.TestCase):
     def test_whitespace_only_identity_field_does_not_satisfy(self):
         self.assertFalse(is_verified_managed_sublane(_verifying(lane="   ")))
 
-    def test_issue_generation_is_recorded_but_not_required_for_verification(self):
-        # Generation distinguishes a superseded lane from its recovery lane; it is not
-        # part of the minimum identity, so its absence must not silently fail the lane
-        # closed without being named.
-        self.assertEqual(missing_sublane_provenance(_verifying(issue_generation="")), ())
-
-    def test_gateway_ack_requires_a_named_gateway(self):
-        provenance = _verifying(
-            dispatch_ack=DISPATCH_ACK_GATEWAY_ACKED, gateway_identity=""
-        )
-        self.assertEqual(missing_sublane_provenance(provenance), ("gateway_identity",))
-
-    def test_worker_confirmed_requires_a_named_worker(self):
-        # "A worker confirmed" with no worker named is exactly the unfalsifiable claim
-        # the incident produced.
-        provenance = _verifying(
-            dispatch_ack=DISPATCH_ACK_WORKER_CONFIRMED, worker_identity=""
-        )
-        self.assertEqual(missing_sublane_provenance(provenance), ("worker_identity",))
+    def test_issue_generation_is_required_for_verification(self):
+        # Review j#78471 finding 2: generation is what distinguishes a superseded lane
+        # from its recovery lane, so a managed_sublane claim without it cannot verify —
+        # failing it closed is the safe direction, not silently accepting it.
+        provenance = _verifying(issue_generation="")
+        self.assertIn("issue_generation", missing_sublane_provenance(provenance))
         self.assertFalse(is_verified_managed_sublane(provenance))
 
-    def test_no_ack_needs_neither_pair_identity(self):
-        provenance = _verifying(
-            dispatch_ack=DISPATCH_ACK_NONE, gateway_identity="", worker_identity=""
+    def test_gateway_identity_is_required_at_every_ack_level(self):
+        # A managed sublane always has a resolved gateway; the ACK level records whether
+        # dispatch happened, it does not excuse naming the pair.
+        for ack in (
+            DISPATCH_ACK_NONE,
+            DISPATCH_ACK_GATEWAY_ACKED,
+            DISPATCH_ACK_WORKER_CONFIRMED,
+        ):
+            with self.subTest(ack=ack):
+                provenance = _verifying(dispatch_ack=ack, gateway_identity="")
+                self.assertIn(
+                    "gateway_identity", missing_sublane_provenance(provenance)
+                )
+
+    def test_worker_identity_is_required_at_every_ack_level(self):
+        # Review j#78471 finding 2: "worker confirmed" with no worker was the original
+        # unfalsifiable claim, but even a resident-but-undispatched managed sublane has a
+        # resolved worker, so the worker must be named regardless of ACK.
+        for ack in (
+            DISPATCH_ACK_NONE,
+            DISPATCH_ACK_GATEWAY_ACKED,
+            DISPATCH_ACK_WORKER_CONFIRMED,
+        ):
+            with self.subTest(ack=ack):
+                provenance = _verifying(dispatch_ack=ack, worker_identity="")
+                self.assertIn(
+                    "worker_identity", missing_sublane_provenance(provenance)
+                )
+                self.assertFalse(is_verified_managed_sublane(provenance))
+
+    def test_no_ack_still_requires_the_full_pair(self):
+        # A resident-but-undispatched sublane (ack=none) is legitimate, but it must still
+        # name both halves of its pair.
+        self.assertEqual(missing_sublane_provenance(_verifying()), ())
+        self.assertEqual(
+            missing_sublane_provenance(_verifying(dispatch_ack=DISPATCH_ACK_NONE)), ()
         )
-        self.assertEqual(missing_sublane_provenance(provenance), ())
 
     def test_unknown_dispatch_ack_token_fails_closed(self):
         provenance = _verifying(dispatch_ack="probably_fine")
@@ -174,22 +193,24 @@ class CapacityProjectionTest(unittest.TestCase):
         self.assertEqual(projection.blocked_or_undispatched_sublanes, 0)
 
     def test_ack_ladder(self):
+        # Three distinct lanes (distinct generations) at ascending ACK levels; each names
+        # its full pair, only the ACK differs.
         items = [
             SurfaceItem(
                 provenance=_verifying(
-                    dispatch_ack=DISPATCH_ACK_NONE,
-                    gateway_identity="",
-                    worker_identity="",
+                    issue_generation="1", dispatch_ack=DISPATCH_ACK_NONE
                 ),
                 coordinator_blocking=False,
             ),
             SurfaceItem(
                 provenance=_verifying(
-                    dispatch_ack=DISPATCH_ACK_GATEWAY_ACKED, worker_identity=""
+                    issue_generation="2", dispatch_ack=DISPATCH_ACK_GATEWAY_ACKED
                 ),
                 coordinator_blocking=False,
             ),
-            SurfaceItem(provenance=_verifying(), coordinator_blocking=False),
+            SurfaceItem(
+                provenance=_verifying(issue_generation="3"), coordinator_blocking=False
+            ),
         ]
         projection = project_capacity(items)
         self.assertEqual(projection.resident_managed_sublanes, 3)
@@ -197,6 +218,37 @@ class CapacityProjectionTest(unittest.TestCase):
         self.assertEqual(projection.gateway_dispatched_sublanes, 2)
         self.assertEqual(projection.worker_confirmed_productive_sublanes, 1)
         self.assertEqual(projection.blocked_or_undispatched_sublanes, 2)
+
+    def test_duplicate_identity_is_counted_once(self):
+        # Review j#78471 finding 3: the same lane listed twice must not double-count.
+        item = SurfaceItem(provenance=_verifying(), coordinator_blocking=False)
+        projection = project_capacity([item, item])
+        self.assertEqual(projection.resident_managed_sublanes, 1)
+        self.assertEqual(projection.worker_confirmed_productive_sublanes, 1)
+
+    def test_conflicting_duplicate_identity_fails_closed(self):
+        # Same canonical identity, contradictory facts (different revision / blocking):
+        # the coordinator holds two readings of one lane, so it fails closed.
+        a = SurfaceItem(
+            provenance=_verifying(lifecycle_revision="4"), coordinator_blocking=False
+        )
+        b = SurfaceItem(
+            provenance=_verifying(lifecycle_revision="9"), coordinator_blocking=True
+        )
+        projection = project_capacity([a, b])
+        self.assertEqual(projection.resident_managed_sublanes, 0)
+        self.assertEqual(projection.unverified_surface, 1)
+
+    def test_distinct_generations_are_distinct_residents(self):
+        superseded = SurfaceItem(
+            provenance=_verifying(issue_generation="1"), coordinator_blocking=True
+        )
+        recovery = SurfaceItem(
+            provenance=_verifying(issue_generation="2"), coordinator_blocking=False
+        )
+        projection = project_capacity([superseded, recovery])
+        self.assertEqual(projection.resident_managed_sublanes, 2)
+        self.assertEqual(projection.worker_confirmed_productive_sublanes, 1)
 
     def test_blocking_lane_is_resident_but_not_productive(self):
         projection = project_capacity(
@@ -208,14 +260,17 @@ class CapacityProjectionTest(unittest.TestCase):
 
     def test_resident_equals_productive_plus_blocked_or_undispatched(self):
         # The projection is meant to be narrated from, so its counts must reconcile.
+        # Distinct generations so these are three distinct residents, not duplicates.
         items = [
-            SurfaceItem(provenance=_verifying(), coordinator_blocking=False),
-            SurfaceItem(provenance=_verifying(), coordinator_blocking=True),
+            SurfaceItem(
+                provenance=_verifying(issue_generation="1"), coordinator_blocking=False
+            ),
+            SurfaceItem(
+                provenance=_verifying(issue_generation="2"), coordinator_blocking=True
+            ),
             SurfaceItem(
                 provenance=_verifying(
-                    dispatch_ack=DISPATCH_ACK_NONE,
-                    gateway_identity="",
-                    worker_identity="",
+                    issue_generation="3", dispatch_ack=DISPATCH_ACK_NONE
                 ),
                 coordinator_blocking=False,
             ),

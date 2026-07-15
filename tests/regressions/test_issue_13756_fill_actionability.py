@@ -61,6 +61,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FILL_DISPATCH_NEXT,
     FILL_STOP_ACTUATION_UNAVAILABLE,
     FILL_STOP_COORDINATOR_BLOCKING,
+    FILL_STOP_UNVERIFIED_SURFACE,
     FILL_STOP_OWNER_OR_RELEASE_GATE,
     FILL_STOP_SOFT_PROFILE_FULL,
     LANE_STATE_BLOCKED,
@@ -346,10 +347,12 @@ class ExecutionSurfaceRegressionTest(unittest.TestCase):
         self.assertEqual(out.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
 
     def test_live_pair_without_dispatch_is_not_productive(self):
+        # A live pair that has not been dispatched: the pair is named (that is what makes
+        # it a resident managed sublane), only the dispatch has not happened.
         lane = LaneState(
             issue="13756",
             state_class=LANE_STATE_IMPLEMENTING,
-            provenance=_provenance(dispatch_ack=DISPATCH_ACK_NONE, worker_identity=""),
+            provenance=_provenance(dispatch_ack=DISPATCH_ACK_NONE),
         )
         projection = evaluate_fill_decision(_inputs(lanes=[lane])).capacity_projection
         self.assertEqual(projection.resident_managed_sublanes, 1)
@@ -359,13 +362,11 @@ class ExecutionSurfaceRegressionTest(unittest.TestCase):
 
     def test_gateway_ack_without_worker_ack_is_not_productive(self):
         # The exact shape of this lane's own j#78365: gateway acked, worker never
-        # confirmed. It must not read as productive work.
+        # confirmed. The pair is still named; it must not read as productive work.
         lane = LaneState(
             issue="13756",
             state_class=LANE_STATE_IMPLEMENTING,
-            provenance=_provenance(
-                dispatch_ack=DISPATCH_ACK_GATEWAY_ACKED, worker_identity=""
-            ),
+            provenance=_provenance(dispatch_ack=DISPATCH_ACK_GATEWAY_ACKED),
         )
         projection = evaluate_fill_decision(_inputs(lanes=[lane])).capacity_projection
         self.assertEqual(projection.gateway_dispatched_sublanes, 1)
@@ -399,8 +400,10 @@ class ExecutionSurfaceRegressionTest(unittest.TestCase):
         self.assertEqual(out.capacity_projection.other_surface, 1)
 
     def test_unverifiable_managed_sublane_claim_fails_closed(self):
-        # Claims `managed_sublane` but cannot name its lifecycle revision or anchor: it
-        # is counted as unverified, never as a sublane, and its delegation is refused.
+        # Claims `managed_sublane` but cannot name its generation / revision / anchor /
+        # pair: it is counted as unverified, never as a sublane, its delegation is
+        # refused, and the unverifiable surface fails the whole lane set closed
+        # (Review j#78471 finding 1).
         lane = LaneState(
             issue="13756",
             state_class=LANE_STATE_REVIEW_WAITING,
@@ -412,11 +415,13 @@ class ExecutionSurfaceRegressionTest(unittest.TestCase):
             ),
         )
         out = evaluate_fill_decision(_inputs(lanes=[lane]))
-        self.assertEqual(out.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
+        self.assertEqual(out.fill_decision, FILL_STOP_UNVERIFIED_SURFACE)
         self.assertEqual(out.capacity_projection.resident_managed_sublanes, 0)
         self.assertEqual(out.capacity_projection.unverified_surface, 1)
 
     def test_free_form_surface_fails_closed(self):
+        # A free-form "lane" label — the exact j#78320 incident shape — fails the lane
+        # set closed rather than dispatching over it (Review j#78471 finding 1).
         lane = LaneState(
             issue="13756",
             state_class=LANE_STATE_REVIEW_WAITING,
@@ -424,8 +429,40 @@ class ExecutionSurfaceRegressionTest(unittest.TestCase):
             provenance=LaneProvenance(execution_surface="parallel lane (task agent)"),
         )
         out = evaluate_fill_decision(_inputs(lanes=[lane]))
-        self.assertEqual(out.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
+        self.assertEqual(out.fill_decision, FILL_STOP_UNVERIFIED_SURFACE)
         self.assertEqual(out.capacity_projection.unverified_surface, 1)
+
+    def test_free_form_surface_on_an_implementing_lane_still_fails_closed(self):
+        # Finding 1's exact probe: an implementing lane (not itself blocking) with a
+        # free-form surface must NOT dispatch_next — the unverifiable surface stops it.
+        lane = LaneState(
+            issue="1",
+            state_class=LANE_STATE_IMPLEMENTING,
+            provenance=LaneProvenance(execution_surface="free-form lane"),
+        )
+        out = evaluate_fill_decision(
+            _inputs(
+                lanes=[lane],
+                ready_independent_work=1,
+                capacity_remaining=10,
+                sublane_hard_cap=10,
+            )
+        )
+        self.assertEqual(out.fill_decision, FILL_STOP_UNVERIFIED_SURFACE)
+        self.assertFalse(out.should_dispatch)
+
+    def test_legacy_unspecified_surface_does_not_trigger_unverified_stop(self):
+        # The compatibility boundary: a legacy `--lane ISSUE:STATE` makes no surface
+        # claim (unspecified), which must NOT be treated as unverified.
+        out = evaluate_fill_decision(
+            _inputs(
+                lanes=[LaneState(issue="1", state_class=LANE_STATE_IMPLEMENTING)],
+                ready_independent_work=1,
+                capacity_remaining=2,
+            )
+        )
+        self.assertEqual(out.fill_decision, FILL_DISPATCH_NEXT)
+        self.assertEqual(out.capacity_projection.unverified_surface, 0)
 
     def test_duplicate_recovery_lane_is_counted_once_per_generation(self):
         # A superseded lane and its recovery lane are distinct generations of the same

@@ -117,7 +117,8 @@ _DELEGATED_REVIEW_SPEC = (
     "actionability=delegated_in_flight,owner=dedicated_gateway,"
     "delivery=sent,callback_expected=true,"
     "surface=managed_sublane,workspace=w19,lane=issue_13441_provider_registry,"
-    "revision=3,anchor=13441#77503,gateway=w19:p1,worker=w19:p2,ack=worker_confirmed"
+    "generation=1,revision=3,anchor=13441#77503,gateway=w19:p1,worker=w19:p2,"
+    "ack=worker_confirmed"
 )
 
 

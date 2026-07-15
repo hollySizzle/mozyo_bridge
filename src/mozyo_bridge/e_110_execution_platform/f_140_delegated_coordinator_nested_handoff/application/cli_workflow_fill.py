@@ -223,6 +223,20 @@ def _print_outcome_text(outcome: FillDecisionOutcome) -> None:
         f"ready_independent_work={outcome.ready_independent_work} "
         f"capacity_remaining={outcome.capacity_remaining}"
     )
+    # Per-lane provenance record, so the durable decision can be replayed line by line.
+    for record in outcome.lanes:
+        print(
+            "lane: "
+            f"issue={record['issue']} state={record['state_class']} "
+            f"actionability={record['actionability']}({record['actionability_reason']}) "
+            f"surface={record['execution_surface_resolved']} "
+            f"owner={record['next_action_owner']} ack={record['dispatch_ack']} "
+            f"workspace={record['workspace'] or '<none>'} "
+            f"lane_label={record['lane'] or '<none>'} "
+            f"generation={record['issue_generation'] or '<none>'} "
+            f"revision={record['lifecycle_revision'] or '<none>'} "
+            f"anchor={record['durable_anchor'] or '<none>'}"
+        )
     print(f"reason: {outcome.reason}")
 
 

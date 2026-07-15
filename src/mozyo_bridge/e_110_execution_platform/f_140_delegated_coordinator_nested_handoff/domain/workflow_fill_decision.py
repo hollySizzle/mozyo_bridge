@@ -71,6 +71,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LaneProvenance,
     SurfaceItem,
     project_capacity,
+    resolve_execution_surface,
 )
 
 # ---------------------------------------------------------------------------
@@ -162,6 +163,13 @@ FILL_STOP_OWNER_OR_RELEASE_GATE = "stop_owner_or_release_gate"
 # instead of substituting internal task agents, direct edits, main-lane work, or bare
 # worktrees for the sublanes it cannot open.
 FILL_STOP_ACTUATION_UNAVAILABLE = "stop_actuation_unavailable"
+# The fail-closed stop for a lane set that contains an unverifiable execution surface
+# (#13756 j#78320 item 5; Review j#78471 finding 1). A lane whose surface claim is
+# free-form or is a `managed_sublane` claim that did not verify resolves to
+# `unknown` / `unverified_surface`. The coordinator cannot trust the capacity reasoning
+# over a lane set it cannot classify, so it stops rather than dispatching past it. This
+# does NOT fire for the legacy `unspecified` no-claim surface (that stays compatible).
+FILL_STOP_UNVERIFIED_SURFACE = "stop_unverified_surface"
 
 FILL_DECISIONS = frozenset(
     {
@@ -172,6 +180,7 @@ FILL_DECISIONS = frozenset(
         FILL_STOP_SOFT_PROFILE_FULL,
         FILL_STOP_OWNER_OR_RELEASE_GATE,
         FILL_STOP_ACTUATION_UNAVAILABLE,
+        FILL_STOP_UNVERIFIED_SURFACE,
     }
 )
 
@@ -262,6 +271,40 @@ class LaneState:
         pre-#13756 state-class test.
         """
         return self.verdict().coordinator_blocking
+
+    def as_record(self) -> dict[str, object]:
+        """The per-item, machine-verifiable record for the durable decision template.
+
+        #13756 j#78320 item 3 / Review j#78471 finding 4: a fill decision must carry each
+        lane's full provenance so a later audit can replay the non-blocking claim, the
+        duplicate-identity check, and the cap arithmetic. Every provenance field the
+        caller supplied is echoed, alongside the resolved actionability verdict/reason and
+        the resolved execution surface, so nothing about the verdict is left implicit.
+        """
+        verdict = self.verdict()
+        provenance = self.provenance
+        return {
+            "issue": self.issue,
+            "state_class": self.state_class,
+            "actionability": verdict.actionability,
+            "actionability_reason": verdict.reason,
+            "coordinator_blocking": verdict.coordinator_blocking,
+            "next_action_owner": self.claim.next_action_owner,
+            "delivery_state": self.claim.delivery_state,
+            "callback_expected": self.claim.callback_expected,
+            "callback_overdue": self.claim.callback_overdue,
+            "unblock_condition": self.claim.unblock_condition,
+            "execution_surface_claim": provenance.execution_surface,
+            "execution_surface_resolved": resolve_execution_surface(provenance),
+            "workspace": provenance.workspace,
+            "lane": provenance.lane,
+            "issue_generation": provenance.issue_generation,
+            "lifecycle_revision": provenance.lifecycle_revision,
+            "durable_anchor": provenance.durable_anchor,
+            "gateway_identity": provenance.gateway_identity,
+            "worker_identity": provenance.worker_identity,
+            "dispatch_ack": provenance.dispatch_ack,
+        }
 
 
 @dataclass(frozen=True)
@@ -383,6 +426,11 @@ class FillDecisionOutcome:
     # #13756 j#78320: the verified execution-surface counts. The only honest source for a
     # narrated lane count.
     capacity_projection: CapacityProjection = field(default_factory=CapacityProjection)
+    # #13756 j#78320 item 3 / Review j#78471 finding 4: the per-lane provenance records
+    # (one :meth:`LaneState.as_record` dict per input lane), so a later audit can replay
+    # every non-blocking claim, the duplicate-identity check, and the cap arithmetic from
+    # the durable decision alone.
+    lanes: tuple[dict[str, object], ...] = ()
 
     @property
     def should_dispatch(self) -> bool:
@@ -400,6 +448,7 @@ class FillDecisionOutcome:
             "ready_independent_work": self.ready_independent_work,
             "capacity_remaining": self.capacity_remaining,
             "capacity_projection": self.capacity_projection.as_payload(),
+            "lanes": [dict(record) for record in self.lanes],
             "advisory": self.advisory,
             "should_dispatch": self.should_dispatch,
         }
@@ -440,15 +489,19 @@ def evaluate_fill_decision(inputs: FillDecisionInputs) -> FillDecisionOutcome:
        :data:`FILL_STOP_ACTUATION_UNAVAILABLE` (#13756 j#78320: a fixed blocked result;
        the coordinator must not substitute task agents / direct edits / main-lane work /
        bare worktrees for the sublanes it cannot open);
-    3. any lane whose next action the **main coordinator** owns (review / owner /
+    3. the lane set contains an unverifiable execution surface ->
+       :data:`FILL_STOP_UNVERIFIED_SURFACE` (#13756 j#78320 item 5: a free-form or
+       failed-verification surface fails closed; the coordinator will not reason about a
+       lane set it cannot classify);
+    4. any lane whose next action the **main coordinator** owns (review / owner /
        integration / close / blocked / callback_due that is not verifiably delegated) ->
        :data:`FILL_STOP_COORDINATOR_BLOCKING` (drain first);
-    4. no ready independent work, but ready work that overlaps an active lane ->
+    5. no ready independent work, but ready work that overlaps an active lane ->
        :data:`FILL_STOP_OVERLAP` (serialize on the dependency);
-    5. no ready work at all -> :data:`FILL_STOP_NO_READY_WORK`;
-    6. ready independent work exists but capacity (soft profile, further limited by the
+    6. no ready work at all -> :data:`FILL_STOP_NO_READY_WORK`;
+    7. ready independent work exists but capacity (soft profile, further limited by the
        managed-sublane hard cap) is exhausted -> :data:`FILL_STOP_SOFT_PROFILE_FULL`;
-    7. otherwise -> :data:`FILL_DISPATCH_NEXT`.
+    8. otherwise -> :data:`FILL_DISPATCH_NEXT`.
 
     Step 3 is where both halves of the invariant live.
     :meth:`FillDecisionInputs.coordinator_blocking_lanes` excludes ``implementing`` (a
@@ -467,6 +520,7 @@ def evaluate_fill_decision(inputs: FillDecisionInputs) -> FillDecisionOutcome:
     retire_ready = inputs.retire_ready_lanes()
     projection = inputs.capacity_projection()
     capacity_remaining = inputs.effective_capacity_remaining()
+    lane_records = tuple(lane.as_record() for lane in inputs.lanes)
 
     def outcome(decision: str, reason: str, next_drain: str) -> FillDecisionOutcome:
         return FillDecisionOutcome(
@@ -480,6 +534,7 @@ def evaluate_fill_decision(inputs: FillDecisionInputs) -> FillDecisionOutcome:
             ready_independent_work=inputs.ready_independent_work,
             capacity_remaining=capacity_remaining,
             capacity_projection=projection,
+            lanes=lane_records,
         )
 
     if inputs.owner_or_release_gate_active:
@@ -496,6 +551,17 @@ def evaluate_fill_decision(inputs: FillDecisionInputs) -> FillDecisionOutcome:
             "the high-level managed-sublane actuation rail is unavailable; report zero "
             "productive sublanes rather than substituting internal task agents, direct "
             "edits, main-lane work, or bare worktrees",
+            NEXT_DRAIN_BLOCKER,
+        )
+
+    if projection.unverified_surface > 0:
+        return outcome(
+            FILL_STOP_UNVERIFIED_SURFACE,
+            "the lane set contains "
+            f"{projection.unverified_surface} lane(s) with an unverifiable execution "
+            "surface (free-form, or a managed-sublane claim whose provenance did not "
+            "verify, or an ambiguous duplicate identity); the coordinator will not "
+            "dispatch over a lane set it cannot classify",
             NEXT_DRAIN_BLOCKER,
         )
 
@@ -565,6 +631,7 @@ __all__ = (
     "FILL_STOP_SOFT_PROFILE_FULL",
     "FILL_STOP_OWNER_OR_RELEASE_GATE",
     "FILL_STOP_ACTUATION_UNAVAILABLE",
+    "FILL_STOP_UNVERIFIED_SURFACE",
     "FILL_DECISIONS",
     "NEXT_DRAIN_NONE",
     "NEXT_DRAIN_REVIEW",
