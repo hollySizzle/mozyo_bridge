@@ -278,6 +278,76 @@ def pin_matched_close_plan(
     )
 
 
+def declared_generation_exactly_live(
+    declared_pins: Sequence[Any],
+    rows: Sequence[Mapping[str, object]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+) -> bool:
+    """Does every LIVE managed slot of the lane exactly match its declared pin? (pure).
+
+    The project-gateway action-time exact-generation fence (Redmine #13811; design #13780
+    j#78386 §1-3): a process-only lifecycle action may release ONLY the lane's declared
+    generation, so a caller must prove the *current* live inventory carries that exact
+    generation before it releases anything. A live managed slot whose ``(role,
+    assigned_name, locator)`` does not exactly equal its declared :class:`ProcessGenerationPin`
+    — a **recycled** locator (the declared process died and relaunched), a **renamed**
+    slot, an **undeclared** role, or an **ambiguous** inventory (one role live at two
+    locators) — is a newer / foreign generation the declared authority does not name, and
+    the action fails closed rather than close it (§2 "newer generation / stale approval ->
+    zero-actuation"). A declared slot that is simply **gone** (no live row) needs no close
+    and does not block (the 0/1/2-slot / dead-process case).
+
+    The action-time discriminant is the **live locator** (§1 "herdr の process 世代
+    discriminant は live locator"), re-resolved against ``role`` + decoded ``assigned_name``
+    — the identity the live inventory actually carries. ``provider`` coincides with ``role``
+    in the current gateway/peer topology, and ``runtime_revision`` has no live observation
+    surface (§1, may be empty), so neither is a separate live match key; a provider swap or
+    a recycled generation both surface as a ``(role, assigned_name, locator)`` mismatch.
+    """
+    declared_by_role: dict[str, tuple[str, str]] = {}
+    for pin in declared_pins:
+        role = _norm(getattr(pin, "role", ""))
+        pair = (_norm(getattr(pin, "assigned_name", "")), _norm(getattr(pin, "locator", "")))
+        if declared_by_role.get(role, pair) != pair:
+            # Two declared pins for one role disagree — an internally ambiguous declaration.
+            return False
+        declared_by_role[role] = pair
+
+    want_ws = _norm(workspace_id)
+    want_lane = _norm_lane(lane_id)
+    live_by_role: dict[str, set[tuple[str, str]]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        identity = decode.identity
+        if identity.workspace_id != want_ws or _norm_lane(identity.lane_id) != want_lane:
+            continue
+        if identity.role not in _LANE_ROLES:
+            continue
+        locator = _agent_locator(row)
+        if not locator:
+            continue
+        live_by_role.setdefault(identity.role, set()).add(
+            (_norm(row.get(AGENT_KEY_NAME)), locator)
+        )
+
+    for role, pairs in live_by_role.items():
+        if len(pairs) != 1:
+            # This role is live at more than one (assigned_name, locator) — ambiguous.
+            return False
+        (live_pair,) = tuple(pairs)
+        if declared_by_role.get(role) != live_pair:
+            # A live slot that is not the declared generation (recycled / renamed / a role
+            # the declaration never named): fail closed rather than close a newer generation.
+            return False
+    return True
+
+
 def release_pins(
     rows: Sequence[Mapping[str, object]], workspace_id: str, lane: str
 ) -> list[ReleasePin]:
@@ -439,6 +509,7 @@ def drive_process_release(
 __all__ = (
     "ReleaseOutcome",
     "SublaneReleaseOps",
+    "declared_generation_exactly_live",
     "drive_process_release",
     "evaluate_pair_attestation",
     "pin_matched_close_plan",

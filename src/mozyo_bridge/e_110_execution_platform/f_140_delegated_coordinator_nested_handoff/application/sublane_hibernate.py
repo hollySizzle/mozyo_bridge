@@ -55,6 +55,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessPinError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
     HerdrRetireClosePlan,
@@ -63,6 +64,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
     ReleaseOutcome,
+    declared_generation_exactly_live,
     drive_process_release,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -84,6 +86,12 @@ BLOCK_PENDING_PROMPT = "pending_composer_input"
 BLOCK_WORKING = "work_in_flight"
 BLOCK_UNRECORDED_BOUNDARY = "dirty_worktree_without_boundary_journal"
 BLOCK_INVENTORY_UNREADABLE = "inventory_unreadable"
+#: A project-gateway lane whose live inventory does not carry its EXACT declared
+#: generation (a recycled / renamed / undeclared-role / ambiguous live slot). Releasing
+#: from the current live rows would close a newer generation than the one declared
+#: (Redmine #13811; design #13780 j#78386 §1-3 "exact pair pins" / "newer generation ->
+#: zero-actuation"); fail closed instead.
+BLOCK_PROJECT_GENERATION_MISMATCH = "project_generation_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +180,11 @@ class HibernatePreflight:
     lane_idle: bool
     boundary_ok: bool
     inventory_readable: bool = True
+    #: A project-gateway lane's live inventory carries its EXACT declared generation
+    #: (Redmine #13811). Always ``True`` for an issue-owned lane (no declared slot set), so
+    #: the issue path is unchanged; a project-gateway lane whose live slots are recycled /
+    #: renamed / ambiguous fails this gate and never releases from a newer generation.
+    project_generation_matched: bool = True
     assertions: HibernateAssertions = field(default_factory=HibernateAssertions)
 
     @property
@@ -183,6 +196,7 @@ class HibernatePreflight:
             and self.lane_idle
             and self.boundary_ok
             and self.inventory_readable
+            and self.project_generation_matched
         )
 
     @property
@@ -209,6 +223,8 @@ class HibernatePreflight:
             reasons.append(BLOCK_UNRECORDED_BOUNDARY)
         if not self.inventory_readable:
             reasons.append(BLOCK_INVENTORY_UNREADABLE)
+        if not self.project_generation_matched:
+            reasons.append(BLOCK_PROJECT_GENERATION_MISMATCH)
         return tuple(reasons)
 
     def as_payload(self) -> dict[str, Any]:
@@ -220,6 +236,7 @@ class HibernatePreflight:
             "lane_idle": self.lane_idle,
             "boundary_ok": self.boundary_ok,
             "inventory_readable": self.inventory_readable,
+            "project_generation_matched": self.project_generation_matched,
             "blocked_reasons": list(self.blocked_reasons),
         }
 
@@ -425,6 +442,29 @@ class SublaneHibernateUseCase:
         # the release close so nothing is re-read between the gate and the actuation.
         rows, inventory_readable = self.ops.read_inventory()
 
+        # Project-gateway action-time exact-generation gate (Redmine #13811; design #13780
+        # j#78386 §1-3). The release closes the lane's CURRENT live slots, so before any
+        # mutation a project-gateway lane must prove those live slots ARE its declared
+        # generation — a recycled / renamed / ambiguous live slot is a newer generation the
+        # declared authority does not name and must never be closed from a stale declaration.
+        # An issue-owned lane (empty project_scope, no declared slot set) skips this: the
+        # gate stays True and the issue path is byte-identical. Only evaluated on a readable
+        # inventory that this exact project lane owns; a corrupt declared snapshot fails
+        # closed (never coerced to "matched").
+        project_generation_matched = True
+        if (
+            project_scope
+            and inventory_readable
+            and rec is not None
+            and record_matches_binding(rec, project_scope=project_scope)
+        ):
+            try:
+                project_generation_matched = declared_generation_exactly_live(
+                    rec.declared_pins, rows, workspace_id=workspace_id, lane_id=lane
+                )
+            except ProcessPinError:
+                project_generation_matched = False
+
         # Idempotent resume: the lane is already hibernated. Skip the commit (its CAS
         # guard would refuse anyway) and re-drive the release, which is itself idempotent
         # (a pane close is, unlike a send). But the re-drive re-checks the lane's CURRENT
@@ -440,8 +480,13 @@ class SublaneHibernateUseCase:
             )
         )
         if already_hibernated:
+            # The redrive also honors the project exact-generation gate: a partial release
+            # is resumed only while the lane's live slots are still its declared generation,
+            # never re-pinning a slot recycled between the partial close and the resume.
             redrive_ok = (
-                inventory_readable and request.assertions.preservation_satisfied
+                inventory_readable
+                and request.assertions.preservation_satisfied
+                and project_generation_matched
             )
             release = None
             if execute and redrive_ok:
@@ -453,6 +498,7 @@ class SublaneHibernateUseCase:
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
                 inventory_readable=inventory_readable,
+                project_generation_matched=project_generation_matched,
                 assertions=request.assertions,
             )
             return HibernateOutcome(
@@ -486,6 +532,7 @@ class SublaneHibernateUseCase:
             lane_idle=request.assertions.lane_idle,
             boundary_ok=request.assertions.boundary_ok,
             inventory_readable=inventory_readable,
+            project_generation_matched=project_generation_matched,
             assertions=request.assertions,
         )
         if not preflight.may_hibernate or not execute:
@@ -642,10 +689,12 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
 __all__ = (
     "BLOCK_CALLBACK_DEBT",
     "BLOCK_INTEGRATION_PENDING",
+    "BLOCK_INVENTORY_UNREADABLE",
     "BLOCK_NOT_PARKED",
     "BLOCK_ORIGINAL_IDENTITY",
     "BLOCK_OWNER_PENDING",
     "BLOCK_PENDING_PROMPT",
+    "BLOCK_PROJECT_GENERATION_MISMATCH",
     "BLOCK_REVIEW_PENDING",
     "BLOCK_UNRECORDED_BOUNDARY",
     "BLOCK_WORKING",

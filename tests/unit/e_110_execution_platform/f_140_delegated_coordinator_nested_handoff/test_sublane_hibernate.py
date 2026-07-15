@@ -45,6 +45,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_ORIGINAL_IDENTITY,
     BLOCK_OWNER_PENDING,
     BLOCK_PENDING_PROMPT,
+    BLOCK_PROJECT_GENERATION_MISMATCH,
     BLOCK_REVIEW_PENDING,
     BLOCK_UNRECORDED_BOUNDARY,
     BLOCK_WORKING,
@@ -611,12 +612,18 @@ class ProjectGatewayHibernateTest(unittest.TestCase):
         )
 
     def _slots(self) -> tuple[ProcessGenerationPin, ...]:
+        # The declared slots carry the SAME encoded assigned name + locator the live
+        # inventory row will show (the #13809 live-adopt observes them), so the action-time
+        # exact-generation gate resolves them against the live rows.
         return (
             ProcessGenerationPin(
-                role="codex", provider="codex", assigned_name=LANE_GW, locator=f"{WS}:p2"
+                role="codex", provider="codex",
+                assigned_name=encode_assigned_name(WS, "codex", LANE_GW),
+                locator=f"{WS}:p2",
             ),
             ProcessGenerationPin(
-                role="claude", provider="claude", assigned_name=LANE_GW,
+                role="claude", provider="claude",
+                assigned_name=encode_assigned_name(WS, "claude", LANE_GW),
                 locator=f"{WS}:p3",
             ),
         )
@@ -640,11 +647,13 @@ class ProjectGatewayHibernateTest(unittest.TestCase):
             assertions=kw.get("assertions", _all_gates()),
         )
 
-    def _gw_ops(self, **kw) -> _FakeOps:
-        rows = [
-            _row("codex", LANE_GW, f"{WS}:p2"),
-            _row("claude", LANE_GW, f"{WS}:p3"),
-        ]
+    def _gw_ops(self, rows=None, **kw) -> _FakeOps:
+        # Default live inventory = the exact declared generation (codex@p2 / claude@p3).
+        if rows is None:
+            rows = [
+                _row("codex", LANE_GW, f"{WS}:p2"),
+                _row("claude", LANE_GW, f"{WS}:p3"),
+            ]
         return _FakeOps(rows=rows, **kw)
 
     def test_project_gateway_lane_hibernates_and_releases(self) -> None:
@@ -770,6 +779,153 @@ class ProjectGatewayHibernateTest(unittest.TestCase):
             self.assertEqual(
                 store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
                 DISPOSITION_HIBERNATED,
+            )
+
+    # -- Redmine #13811 review j#79290 F1: action-time exact-generation fence ----------
+    #
+    # The declared generation is codex@p2 / claude@p3 (see `_slots`). A live inventory
+    # that is NOT that exact generation must never be closed from the stale declaration
+    # (design #13780 j#78386 §1-3 "exact pair pins" / "newer generation -> zero-actuation").
+
+    def test_recycled_generation_blocks_zero_close(self) -> None:
+        # F1 regression: the declared processes died and relaunched at NEW locators
+        # (p20/p30). Hibernate must fail closed — never CAS the disposition, never close the
+        # recycled panes (they are a newer generation the declaration does not name).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            recycled = [
+                _row("codex", LANE_GW, f"{WS}:p20"),
+                _row("claude", LANE_GW, f"{WS}:p30"),
+            ]
+            ops = self._gw_ops(rows=recycled)
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._gw_request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_PROJECT_GENERATION_MISMATCH, outcome.preflight.blocked_reasons
+            )
+            self.assertIsNone(outcome.transition)  # zero-write: no disposition CAS
+            self.assertEqual(ops.close_calls, [])  # zero-close: recycled panes untouched
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_partially_recycled_generation_blocks(self) -> None:
+        # One declared slot exactly live (codex@p2), the other recycled (claude@p30): still
+        # a newer generation — fail closed rather than close the half that matches.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            mixed = [
+                _row("codex", LANE_GW, f"{WS}:p2"),
+                _row("claude", LANE_GW, f"{WS}:p30"),
+            ]
+            outcome = SublaneHibernateUseCase(ops=self._gw_ops(rows=mixed), store=store).run(
+                self._gw_request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_PROJECT_GENERATION_MISMATCH, outcome.preflight.blocked_reasons
+            )
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_ambiguous_inventory_blocks(self) -> None:
+        # The declared codex slot is live at TWO locators (p2 and p2b) — an ambiguous
+        # inventory. Fail closed rather than guess which pane is the declared generation.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            ambiguous = [
+                _row("codex", LANE_GW, f"{WS}:p2"),
+                _row("codex", LANE_GW, f"{WS}:p2b"),
+                _row("claude", LANE_GW, f"{WS}:p3"),
+            ]
+            outcome = SublaneHibernateUseCase(
+                ops=self._gw_ops(rows=ambiguous), store=store
+            ).run(self._gw_request(), execute=True)
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_PROJECT_GENERATION_MISMATCH, outcome.preflight.blocked_reasons
+            )
+
+    def test_one_declared_slot_dead_closes_only_the_live_one(self) -> None:
+        # claude@p3 is gone; codex@p2 is exactly live. A dead declared slot needs no close
+        # and does not block (the 0/1/2-slot case) — hibernate closes only the live codex.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            one_live = [_row("codex", LANE_GW, f"{WS}:p2")]
+            outcome = SublaneHibernateUseCase(
+                ops=self._gw_ops(rows=one_live), store=store
+            ).run(self._gw_request(), execute=True)
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.transition.applied)
+            self.assertEqual({loc for _, loc in outcome.release.closed}, {f"{WS}:p2"})
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
+
+    def test_dead_generation_hibernates_with_no_close(self) -> None:
+        # Both declared processes are gone (an empty live inventory that is readable). There
+        # is nothing to close, but the disposition still moves to hibernated (a hibernated
+        # lane draws zero capacity regardless).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            ops = self._gw_ops(rows=[])
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._gw_request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.transition.applied)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
+
+    def test_recycled_generation_blocks_already_hibernated_redrive(self) -> None:
+        # The redrive path is gated too: a partial release opened on the declared generation
+        # is NEVER resumed onto a slot recycled to a new locator between the partial close
+        # and the resume.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS,
+                lane_id=LANE_GW,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            first = SublaneHibernateUseCase(
+                ops=self._gw_ops(close_result=partial), store=store
+            ).run(self._gw_request(), execute=True)
+            self.assertEqual(first.release.process_release, RELEASE_PARTIAL)
+
+            # codex recycled p2 -> p20 before the resume.
+            recycled = [_row("codex", LANE_GW, f"{WS}:p20")]
+            retry_ops = self._gw_ops(rows=recycled)
+            retry = SublaneHibernateUseCase(ops=retry_ops, store=store).run(
+                self._gw_request(), execute=True
+            )
+            self.assertTrue(retry.already_hibernated)
+            self.assertTrue(retry.is_blocked)
+            self.assertTrue(retry.redrive_blocked)
+            self.assertIn(
+                BLOCK_PROJECT_GENERATION_MISMATCH, retry.preflight.blocked_reasons
+            )
+            self.assertIsNone(retry.release)
+            self.assertEqual(retry_ops.close_calls, [])
+            # Still partial (never falsely advanced to released over a recycled slot).
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).process_release, RELEASE_PARTIAL
             )
 
 
