@@ -91,8 +91,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECON_HEAD_NOT_INTEGRATED,
     RECON_LIVE_PAIR_ABSENT,
     RECON_LIVE_PAIR_PRESENT,
+    RECON_CLOSE_FAILED,
     RECON_NOT_RECONCILABLE_STATE,
-    RECON_PAIR_CHANGED,
     RECON_REVISION_RACE,
     RECON_WORKTREE_BRANCH_MISMATCH,
     run_hibernated_live_reconcile,
@@ -219,7 +219,7 @@ def _pins() -> list[ProcessGenerationPin]:
 
 
 class ReconcileRebindCasMatrix(unittest.TestCase):
-    """``LaneReconcileBindingStore.rebind_released_hibernated_legacy`` fail-closed matrix."""
+    """``LaneReconcileBindingStore.retire_reconciled_hibernated_legacy`` fail-closed matrix."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -238,7 +238,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         rev = expected_revision if expected_revision is not None else (
             rec.revision if rec is not None else 1
         )
-        return self.rebind.rebind_released_hibernated_legacy(
+        return self.rebind.retire_reconciled_hibernated_legacy(
             self.key,
             expected_revision=rev,
             issue_id=issue,
@@ -247,26 +247,27 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             decision=decision if decision is not None else _decision(issue),
         )
 
-    def test_exact_signature_rebinds_binding_and_slots(self) -> None:
+    def test_exact_signature_retires_and_binds(self) -> None:
+        # Retire-first (review j#79282 R2): the ONE CAS moves hibernated -> retired AND writes
+        # the worktree + declared_slots binding + decision.
         self._seed()
         out = self._do()
         self.assertTrue(out.applied)
         self.assertEqual(out.reason, CAS_APPLIED)
         rec = self.store.get(self.key)
-        # Disposition is UNCHANGED (still hibernated); only the binding fields are filled.
-        self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(rec.lane_disposition, DISPOSITION_RETIRED)
         self.assertEqual(rec.worktree_identity, self.token)
         self.assertEqual(len(rec.declared_pins), 2)
+        self.assertEqual(rec.decision_journal, _JOURNAL)
         self.assertEqual(rec.process_release, RELEASE_RELEASED)
 
-    def test_both_fields_already_present_is_idempotent_no_op(self) -> None:
+    def test_second_call_on_retired_row_is_refused(self) -> None:
+        # Once retired, a replay of the retire CAS is refused (not hibernated) — the terminal
+        # is reached exactly once; the owed close resumes through the command layer, not here.
         self._seed()
-        first = self._do()
-        self.assertTrue(first.applied)
+        self.assertTrue(self._do().applied)
         rec = self.store.get(self.key)
-        # Replay at the NEW revision with the exact same binding -> idempotent no-op success,
-        # revision unchanged (the replayable owed-state flow re-runs this safely).
-        second = self.rebind.rebind_released_hibernated_legacy(
+        second = self.rebind.retire_reconciled_hibernated_legacy(
             self.key,
             expected_revision=rec.revision,
             issue_id=_ISSUE,
@@ -274,14 +275,13 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             declared_slots=_pins(),
             decision=_decision(),
         )
-        self.assertTrue(second.applied)
-        self.assertEqual(second.revision, rec.revision)
+        self.assertFalse(second.applied)
+        self.assertEqual(second.reason, CAS_UNEXPECTED_STATE)
+        self.assertEqual(self.store.get(self.key).lane_disposition, DISPOSITION_RETIRED)
 
-    def test_rebind_writes_reconcile_decision_provenance(self) -> None:
-        # Review j#79244 F1: the rebind re-anchors the row decision to THIS reconcile so a
-        # #13809 backfill row (same worktree + slots, different decision) is distinguishable.
+    def test_retire_writes_decision_and_retires(self) -> None:
         self._seed()  # seeded decision journal is _JOURNAL
-        out = self.rebind.rebind_released_hibernated_legacy(
+        out = self.rebind.retire_reconciled_hibernated_legacy(
             self.key,
             expected_revision=self.store.get(self.key).revision,
             issue_id=_ISSUE,
@@ -292,13 +292,16 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         self.assertTrue(out.applied)
         rec = self.store.get(self.key)
         self.assertEqual(rec.decision_journal, "70001")
-        self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(rec.lane_disposition, DISPOSITION_RETIRED)
 
-    def test_non_empty_different_worktree_is_already_declared(self) -> None:
+    def test_non_empty_different_worktree_is_refused(self) -> None:
+        # A row already bound to a DIFFERENT token is a divergent binding this CAS never
+        # overwrites -> zero-write, stays hibernated.
         self._seed(worktree_identity="wt_0000000000000000")
         out = self._do()
         self.assertFalse(out.applied)
-        self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+        self.assertEqual(self.store.get(self.key).lane_disposition, DISPOSITION_HIBERNATED)
         self.assertEqual(self.store.get(self.key).worktree_identity, "wt_0000000000000000")
 
     def test_active_disposition_is_refused(self) -> None:
@@ -369,7 +372,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         self.assertEqual(self.store.get(self.key).worktree_identity, "")
 
     def test_absent_row_is_not_found(self) -> None:
-        out = self.rebind.rebind_released_hibernated_legacy(
+        out = self.rebind.retire_reconciled_hibernated_legacy(
             self.key,
             expected_revision=1,
             issue_id=_ISSUE,
@@ -384,23 +387,23 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         self._seed()
         rev = self.store.get(self.key).revision
         with self.assertRaises(ValueError):
-            self.rebind.rebind_released_hibernated_legacy(
+            self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id="",
                 worktree_identity=self.token, declared_slots=_pins(), decision=_decision(),
             )
         with self.assertRaises(ValueError):
-            self.rebind.rebind_released_hibernated_legacy(
+            self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id=_ISSUE,
                 worktree_identity="", declared_slots=_pins(), decision=_decision(),
             )
         with self.assertRaises(ValueError):
-            self.rebind.rebind_released_hibernated_legacy(
+            self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id=_ISSUE,
                 worktree_identity=self.token, declared_slots=[], decision=_decision(),
             )
         with self.assertRaises(Exception):
             # A decision anchored to a different issue cannot authorize this binding.
-            self.rebind.rebind_released_hibernated_legacy(
+            self.rebind.retire_reconciled_hibernated_legacy(
                 self.key, expected_revision=rev, issue_id=_ISSUE,
                 worktree_identity=self.token, declared_slots=_pins(),
                 decision=_decision(_OTHER_ISSUE),
@@ -749,97 +752,118 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
-    def test_owed_state_partial_replay_records_retirement_without_reclosing(self) -> None:
-        # Simulate a crash AFTER the guarded close closed the pair but BEFORE the retirement
-        # was recorded: the binding is re-established, the row is still hibernated, the pair is
-        # positively absent. The reconcile resumes the owed retirement (no second close).
-        self._seed_row()
+    def _retire_first(self, *, decision=None) -> None:
+        """Drive the retire-first CAS directly (retired + bound + pins), as a completed
+        retire whose pin-matched close is still owed (crash after the CAS, before the close)."""
         rec = LaneLifecycleStore().get(self._key())
-        LaneReconcileBindingStore().rebind_released_hibernated_legacy(
+        LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
             self._key(),
             expected_revision=rec.revision,
             issue_id=_ISSUE,
             worktree_identity=self._token(),
             declared_slots=_pins(),
-            decision=_decision(),  # THIS reconcile's decision (provenance)
+            decision=decision if decision is not None else _decision(),
         )
-        # The pair was already closed -> remove it from the inventory (positive absence).
-        self.rows = [r for r in self.rows if r["pane_id"] in ("w28:p1", "w28:p2")]
-        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_owed_close_partial_replay_resumes_close_without_reretiring(self) -> None:
+        # Retire-first (review j#79282 R2): a crash AFTER the retire CAS committed but BEFORE the
+        # pane close leaves a RETIRED row whose declared_slots record the exact pair, with the
+        # pair still live. The reconcile resumes the pin-matched close of exactly those pins
+        # (never re-retiring), and reports reconciled.
+        self._seed_row()
+        self._retire_first()
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
         result = self._run()
         self.assertEqual(result.state, RECONCILE_RECONCILED, result.detail)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        # The owed pair was closed on resume (only the coordinator pair remains).
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2"})
 
-    def test_owed_state_requires_reconcile_decision_provenance(self) -> None:
-        # Review j#79244 F1: a row bound with a DIFFERENT decision (a #13809 backfill's declare/
-        # hibernate journal) whose pair is absent is NOT the reconcile's owed state — the shared
-        # worktree + declared_slots fields alone are not authority. Route to #13841 instead.
+    def test_owed_close_absent_after_close_is_idempotent_already(self) -> None:
+        # After the retire CAS AND the close, a replay sees retired + positive absence -> an
+        # idempotent no-op (no duplicate close).
         self._seed_row()
-        rec = LaneLifecycleStore().get(self._key())
-        LaneReconcileBindingStore().rebind_released_hibernated_legacy(
-            self._key(),
-            expected_revision=rec.revision,
-            issue_id=_ISSUE,
-            worktree_identity=self._token(),
-            declared_slots=_pins(),
-            decision=DecisionPointer(source="redmine", issue_id=_ISSUE, journal_id="70002"),
-        )
+        self._retire_first()
         self.rows = [r for r in self.rows if r["pane_id"] in ("w28:p1", "w28:p2")]
-        # Reconcile runs with --journal=_JOURNAL (79188) != the row's decision (70002).
         result = self._run()
-        self.assertEqual(result.state, RECONCILE_BLOCKED)
-        self.assertEqual(result.reason, RECON_LIVE_PAIR_ABSENT)
-        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual(result.state, RECONCILE_ALREADY)
+        self.assertTrue(result.ok)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
-    def test_close_time_duplicate_zero_closes(self) -> None:
-        # Review j#79244 F2: a duplicate codex appears at a NEW locator between the initial green
-        # observation and the close. The close-time re-verification must zero-close (ambiguous),
-        # never a name-based sweep of both locators.
-        self._seed_row()
-        base = list(self.rows)
-        dup = base + [_row(_WORKSPACE_ID, "codex", _LANE, "w28:p30")]
-        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={1: lambda: dup})
-        result = self._run(ops=ops)
-        self.assertEqual(result.state, RECONCILE_BLOCKED)
-        self.assertEqual(result.reason, RECON_PAIR_AMBIGUOUS)
-        # Nothing closed; the row is bound (rebind applied) but still hibernated.
-        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
-        self.assertEqual(len(self.rows), 4)
+    def test_hibernated_bound_absent_is_never_retired_on_absence(self) -> None:
+        # Review j#79282 R1: retire-first has NO absence -> retire path, so a hibernated + bound
+        # row whose pair is absent is never retired — regardless of its decision pointer (the
+        # same-pointer collision that made the old decision-equality provenance unsound cannot
+        # occur). Route to #13841 instead. Verified with BOTH a same and a different pointer.
+        from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
 
-    def test_close_time_recycled_locator_zero_closes(self) -> None:
-        # Review j#79244 F2: the pair is recycled to a NEW locator generation between observation
-        # and close (still a clean unique pair). Zero-close — the reconcile only closes the exact
-        # pins it verified, never a newer generation.
-        self._seed_row()
-        recycled = [
-            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
-            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
-            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p31"),  # recycled locator
-            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p4"),
-        ]
-        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={1: lambda: recycled})
-        result = self._run(ops=ops)
-        self.assertEqual(result.state, RECONCILE_BLOCKED)
-        self.assertEqual(result.reason, RECON_PAIR_CHANGED)
-        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        for journal in (_JOURNAL, "70002"):  # same as reconcile --journal, and different
+            with self.subTest(journal=journal):
+                LaneLifecycleStore(path=None)  # ensure home is set
+                key = self._key()
+                # Build a #13809-style bound-then-hibernated row (backfill leaves the decision
+                # as the declare/hibernate journal; here we seed it directly at `journal`).
+                store = LaneLifecycleStore()
+                dec = _decision(journal=journal)
+                store.declare_active(key, decision=dec, issue_id=_ISSUE, worktree_identity="")
+                LaneDeclarationStore().backfill_active_binding(
+                    key,
+                    expected_revision=store.get(key).revision,
+                    issue_id=_ISSUE,
+                    worktree_identity=self._token(),
+                    declared_slots=_pins(),
+                )
+                rec = store.get(key)
+                store.transition_disposition(
+                    key, expected_disposition=DISPOSITION_ACTIVE,
+                    expected_revision=rec.revision, target=DISPOSITION_HIBERNATED, decision=dec,
+                )
+                rec = store.get(key)
+                store.request_release(
+                    key, expected_revision=rec.revision, action_id="rel-1",
+                    pins=[ReleasePin("gateway", "codex-mzb1", "w1:p1"),
+                          ReleasePin("worker", "claude-mzb1", "w1:p2")],
+                )
+                rec = store.get(key)
+                store.record_release_outcome(
+                    key, action_id="rel-1", expected_revision=rec.revision,
+                    target=RELEASE_RELEASED,
+                )
+                # Pair absent.
+                self.rows = [
+                    _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+                    _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
+                ]
+                result = self._run()
+                self.assertEqual(result.state, RECONCILE_BLOCKED)
+                self.assertEqual(result.reason, RECON_LIVE_PAIR_ABSENT)
+                self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
 
-    def test_terminal_retire_is_revision_race_after_concurrent_rehydrate(self) -> None:
-        # Review j#79244 F3: a concurrent rehydrate (hibernated -> active) bumps the row revision
-        # after the reconcile snapshot it. The terminal retire is CAS'd on the EXACT verified
-        # revision, so it refuses (revision_race) rather than retiring the newer active row.
+    def test_close_time_duplicate_is_not_closed(self) -> None:
+        # Review j#79244 F2 (still holds under retire-first): a duplicate codex appears between the
+        # initial green observation and the close. The pin-matched close refuses the ambiguous
+        # name (plan None) -> NEITHER codex locator is closed; the pair stays live, so the retired
+        # lane's owed close is reported incomplete (resumable). The row IS retired (retire-first,
+        # on the verified initial pair), but no wrong/duplicate generation is closed.
         self._seed_row()
-        rec = LaneLifecycleStore().get(self._key())
-        LaneReconcileBindingStore().rebind_released_hibernated_legacy(
-            self._key(),
-            expected_revision=rec.revision,
-            issue_id=_ISSUE,
-            worktree_identity=self._token(),
-            declared_slots=_pins(),
-            decision=_decision(),
+        dup = list(self.rows) + [_row(_WORKSPACE_ID, "codex", _LANE, "w28:p30")]
+        ops = _FakeReconcileOps(
+            lambda: self.rows, rows_by_call={1: lambda: dup, 2: lambda: dup}
         )
-        # Owed state; pair absent. Inject a rehydrate on the reconcile's inventory read, AFTER it
-        # has snapshotted the (hibernated) row but BEFORE the terminal CAS.
-        self.rows = [r for r in self.rows if r["pane_id"] in ("w28:p1", "w28:p2")]
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        # Retired (retire-first) but nothing closed: both codex locators survive.
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_rehydrate_before_retire_cas_is_revision_race_zero_close(self) -> None:
+        # Review j#79282 R2: a concurrent rehydrate (hibernated -> active) between the reconcile's
+        # row snapshot and the retire CAS bumps the revision. Because the retire (terminal write)
+        # runs BEFORE the close, the CAS refuses (revision_race) and NOTHING is closed — the lane
+        # stays active and its pair is untouched (zero-write AND zero-close).
+        self._seed_row()
 
         def _rehydrate():
             store = LaneLifecycleStore()
@@ -852,12 +876,15 @@ class ReconcileOrchestrationTests(unittest.TestCase):
                 decision=_decision(),
             )
 
+        # Fire the rehydrate on the initial inventory read (call 0), after the reconcile has
+        # already snapshotted the hibernated row but before the retire CAS.
         ops = _FakeReconcileOps(lambda: self.rows, on_call={0: _rehydrate})
         result = self._run(ops=ops)
         self.assertEqual(result.state, RECONCILE_BLOCKED)
         self.assertEqual(result.reason, RECON_REVISION_RACE)
-        # The lane was rehydrated, NOT retired.
         self.assertEqual(self._disposition(), DISPOSITION_ACTIVE)
+        # ZERO-CLOSE: the pair is untouched.
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
 
     # -- the fail-closed conditions --------------------------------------
 
@@ -958,14 +985,18 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.reason, RECON_NOT_RECONCILABLE_STATE)
         self.assertEqual(self._disposition(), DISPOSITION_ACTIVE)
 
-    def test_retired_row_with_live_pair_withholds_success(self) -> None:
-        # A persisted retired row does not prove non-liveness: a live pair withholds the
-        # idempotent success (review j#79150 finding 2, applied to the reconcile).
+    def test_retired_row_with_recycled_pair_withholds_success(self) -> None:
+        # A persisted retired row does not prove non-liveness (review j#79150 F2, applied to the
+        # reconcile): a RECYCLED generation (same names, DIFFERENT locators than the recorded
+        # owed-close pins) is not the reconcile's owed close, so the idempotent success is
+        # withheld — the reconcile never closes a generation it did not verify.
         self._seed_row()
-        self._run()
+        self._retire_first()  # retired + recorded pins at p3/p4, close still owed
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
-        # A pair reappears under the retired lane unit.
-        self.rows += [
+        # The recorded pair vanished and a recycled pair reappeared at DIFFERENT locators.
+        self.rows = [
+            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
             _row(_WORKSPACE_ID, "codex", _LANE, "w28:p6"),
             _row(_WORKSPACE_ID, "claude", _LANE, "w28:p7"),
         ]

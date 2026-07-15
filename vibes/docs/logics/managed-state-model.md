@@ -395,44 +395,36 @@ Table naming:
       pair が再稼働/inventory unreadable なら idempotent replay も fail-closed。★`--migrate-hibernated-legacy`
       と `--execute` は競合する destructive intent ゆえ **両指定は command-time zero-write error**(#13841
       review j#79150 F3、黙って一方へ解決しない)。disposition / decision anchor 以外は不変。
-    - **hibernated live-contradiction reconcile binding** (`LaneReconcileBindingStore.rebind_released_hibernated_legacy`,
+    - **hibernated live-contradiction reconcile (retire-first)** (`LaneReconcileBindingStore.retire_reconciled_hibernated_legacy`,
       #13842、live evidence #13756 j#79188)。#13841 migration が **拒否**する側の隙間: **hibernated / released
       legacy** row（`worktree_identity` 空）だが action-time Herdr inventory に exact managed pair が **live** で
       残るケース。#13841 live-zero migration は `live_pair_present` で拒否、#13754 guarded close は
       `worktree_binding_unverified`、#13809 backfill は **active** row 専用 — 3 契約の間に収束経路が無く恒久停止する。
-      この surface は reconcile の前半で、hibernated row に **欠けている worktree + process (`declared_slots`) binding を
-      1 本の bounded CAS で再確立**する（`backfill_active_binding` の hibernated 版: **active** ではなく
-      **hibernated + released** row を対象）。**disposition は不変**（`hibernated` のまま）。書込は「row 存在 かつ exact
-      `expected_revision` 一致」かつ「`hibernated` / `binding_kind='issue'` / この exact issue 所有 / project scope 無し /
-      `process_release='released'` / replacement settled」かつ「`worktree_identity` が **空か token 一致** かつ
-      `declared_slots` が **空か同一**」の全成立時のみ。既存 non-empty mismatch (別 token / recycled generation) は
-      `already_declared`、active/superseded/retired・別 issue は `unexpected_state`、release 未証明/in-flight は
-      `forbidden_transition`、revision race は `stale_revision`、row 不在は `not_found` で zero-write。★**この rebind は
-      binding と同一 atomic CAS で reconcile 自身の decision anchor (reconcile journal) を row へ書く** = owed-state
-      **provenance**（#13842 review j#79244 F1）。#13809 `backfill_active_binding` は同じ worktree+declared_slots 形状を作るが
-      decision を **declare/hibernate journal のまま**残すので、この decision anchor が「reconcile が rebind した owed state」を
-      「pair が偶々消えた既存 bound row」と区別する。両 field+decision 既に一致は idempotent no-op (replay 安全)。public
-      high-level path (`sublane retire --reconcile-hibernated-live`) が binding 再確立の **前**に、exact live pair の
+      public high-level path (`sublane retire --reconcile-hibernated-live`) が **close の前**に、exact live pair の
       `(workspace, lane, issue)` identity・`--worktree` 実 branch==`--branch`・integration ancestry・
       expected assigned names/roles/providers・per-slot startup self-attestation (generation-bound)・
       pair completeness/uniqueness・各 agent idle/turn-ended・pending composer 無し・settled replacement・
       exact lifecycle revision を **連言検証**（foreign/ambiguous/partial/duplicate/unattested/working pair・
-      inventory unreadable・branch mismatch/detached/unintegrated・revision race は zero-write/zero-close）。green 時のみ
-      rebind → **reconcile 自身が close と retire を所有**して **1 本の replayable owed-state flow** に収束する（name-based の
-      #13754 guarded close へは委譲しない、review j#79244 F2/F3）。★**exact-pair close (F2)**: rebind 後に **close 直前で
-      live inventory を再観測**し pair decision を再実行（attestation/idle/uniqueness/foreign を再検証）、exact verified
+      inventory unreadable・branch mismatch/detached/unintegrated・revision race は zero-write/zero-close）。★**retire-first**
+      (#13842 review j#79282 R2, correction boundary option (b)): green 時のみ、**hibernated→retired への 1 本の bounded CAS**
+      で worktree + `declared_slots` pins + reconcile decision を同時 write（`expected_revision` guard）。書込は「row 存在 かつ
+      exact `expected_revision` 一致」かつ「`hibernated` / `binding_kind='issue'` / この exact issue 所有 / project scope 無し /
+      `process_release='released'` / replacement settled」かつ「`worktree_identity` が **空か token 一致** / `declared_slots` が
+      **空か同一**」の全成立時のみ。verify 後の rehydrate/move で row が動いていれば revision(→`stale_revision`)/disposition
+      /release(rehydrate は release を not_requested へ reset)のいずれかで CAS 失敗 → `revision_race`/`not_reconcilable_state`
+      で **zero-write かつ zero-close**（terminal write を **external close の前**に置くのが要: close 後の terminal CAS では
+      閉じた pair を戻せない、review j#79282 R2）。★CAS 成功後は disposition が **retired（terminal）** = rehydrate/move が
+      構造的に不能 → **revision/generation は close 完了まで不変**（R2 option (b) を terminality で保証）。その後 exact verified
       `ProcessGenerationPin` に `pin_matched_close_plan` で **pin-matched** close（exact `(assigned_name, locator)` 一致、
-      duplicate name は plan `None`、pin の exact locator が消えていれば plan が pair 不足、recycled newer locator は
-      locator-diff）— 差分・duplicate・newer generation は **zero-close**（name-based sweep しない）。★**revision-guarded
-      terminal retire (F3)**: close 成功後、reconcile が verify/rebind した **exact revision** を `expected_revision` にして
-      `transition_disposition(hibernated→retired)` を CAS（最新 revision 再読ではない）。verify 後の rehydrate/move は
-      `revision_race` zero-write で、race 後の newer active generation を retire しない。★**duplicate close 防止 / partial
-      replay (F1 provenance)**: CAS 後 / close 後 crash で pair が **positive absence**（readable inventory が zero）かつ
-      binding が此 lane の derived token へ再確立済み (`declared_slots` 有り) **かつ row の decision anchor が此 reconcile を
-      指す** owed state からのみ、pair を **2 度閉じず** owed retirement を **exact revision guard 付き**で記録して再開する。
-      decision provenance が無い（#13809 backfill 由来等の）bound row は owed 扱いせず `live_pair_absent` で #13841 へ route。
-      既 `retired` row をこの issue 所有 + live-zero で no-op success する idempotent replay は維持するが、
-      persisted `retired` は非稼働性を証明しないので pair 再稼働 / inventory unreadable なら success を withhold する。
+      duplicate name は plan `None`、recycled locator は非一致で不close）— duplicate/newer generation は **zero-close**
+      (name-based sweep しない、review j#79244 F2)。★**R1 消滅** (review j#79282 R1): retire は green（live pair 検証）+
+      revision-guarded CAS でのみ発生し **absence→retire path が存在しない**ため、#13809 backfill 由来 bound row を誤 retire
+      できない（generic decision-pointer equality を owed-state authority に使わない）。★**replayable owed state**: retire-first
+      の唯一の durable owed state は「**retired + `declared_slots` pins + pair present**」（retire CAS commit 後・pane close 前の
+      crash）。次 run が **retired-branch** で exact recorded pins を pin-matched close して resume（re-retire せず・duplicate
+      close せず）。pair が positive absence なら `already_reconciled` idempotent no-op。retired 下で **recorded pins と別 locator
+      の recycled pair**・recorded pins 無しの非 reconcile retired row は owed 扱いせず、persisted retired は非稼働性を証明しない
+      ので success を withhold。「hibernated + live pair 無し」は retire せず `live_pair_absent` で #13841 へ route。
       `--reconcile-hibernated-live` は `--execute` / `--migrate-hibernated-legacy` と競合する destructive intent ゆえ
       **2 つ以上の同時指定は command-time zero-write error**。process launch/resume・worktree/branch 削除・raw Herdr/tmux・
       origin/main・production は伴わない（唯一の process mutation は 自 lane の exact managed pair への pin-matched close）。
