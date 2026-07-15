@@ -1262,6 +1262,20 @@ class R2RegressionTest(unittest.TestCase):
                     "2026-07-13T00:00:00+00:00",
                 ),
             )
+            # A real v1 store registers its component at version 1 (Redmine #13754 R5-F1:
+            # a table WITHOUT a metadata row is a partial/unknown state that now fails
+            # closed — a legitimate v1 store is recorded v1, not metadata-less).
+            conn.execute(
+                "INSERT INTO state_schema_components "
+                "(component, schema_version, owner, recovery_policy, migrated_from, "
+                "updated_at) VALUES (?, 1, ?, ?, NULL, ?)",
+                (
+                    LANE_LIFECYCLE_COMPONENT,
+                    "core/state/lane_lifecycle.py",
+                    LANE_LIFECYCLE_RECOVERY_POLICY,
+                    "2026-07-13T00:00:00+00:00",
+                ),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -2053,6 +2067,119 @@ class BackupFirstMigrationTest(unittest.TestCase):
         backups = self._backups()
         self.assertEqual(len(backups), 1)
         self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+
+    # -- R5-F1: a recorded-current store is verified, never silently repaired -------
+
+    def _v4_store_with_binding(self) -> Path:
+        """A healthy current (v4) store carrying a real worktree binding."""
+        LaneLifecycleStore(home=self.home).declare_active(
+            self.key, decision=_decision(), issue_id=ISSUE, worktree_identity="wt_bound01"
+        )
+        return lane_lifecycle_path(self.home)
+
+    def test_intact_current_store_is_a_byte_identical_no_op(self) -> None:
+        path = self._v4_store_with_binding()
+        before = path.read_bytes()
+        LaneLifecycleStore(home=self.home).ensure_schema()  # recorded == current
+        self.assertEqual(path.read_bytes(), before)  # not re-created / re-stamped
+        self.assertEqual(self._backups(), [])  # nothing to preserve
+        record = LaneLifecycleStore(home=self.home).get(self.key)
+        self.assertEqual(record.worktree_identity, "wt_bound01")
+
+    def test_recorded_current_missing_table_fails_closed_no_repair(self) -> None:
+        path = self._v4_store_with_binding()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("DROP TABLE lane_lifecycle_records")  # corrupt: table gone
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        # not silently re-created, and no backup was taken (the store still records v4)
+        self.assertFalse(self._table_present())
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+        self.assertEqual(self._backups(), [])
+
+    def test_recorded_current_missing_column_fails_closed_no_repair(self) -> None:
+        path = self._v4_store_with_binding()
+        conn = sqlite3.connect(path)
+        try:
+            # corrupt: an authority column of the CURRENT shape is gone
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN worktree_identity")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        # not silently re-added (no default repair of the authority field), no backup
+        self.assertNotIn("worktree_identity", self._columns())
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+        self.assertEqual(self._backups(), [])
+
+    def test_table_without_metadata_row_fails_closed(self) -> None:
+        # recorded is None (never registered) but the table exists — a partial / unknown
+        # state the write-side now refuses, matching readonly_component_status.
+        self._v4_store_with_binding()
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "DELETE FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(self._backups(), [])
+
+    def test_old_worktree_v3_fixture_migrates_to_v4_preserving_binding(self) -> None:
+        # The OTHER v3 branch (Redmine #13754 j#78623 already migrated the real home to a
+        # worktree-v3 shape): recorded v3, HAS worktree_identity, LACKS replacement_*.
+        # It must migrate forward to v4 by ADDING the replacement columns while PRESERVING
+        # the existing worktree binding — backed up first.
+        LaneLifecycleStore(home=self.home).declare_active(
+            self.key, decision=_decision(), issue_id=ISSUE, worktree_identity="wt_oldv3"
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            for col in ("replacement_state", "replacement_action_id", "replacement_pins"):
+                conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 3 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        before = path.read_bytes()
+        self.assertNotIn("replacement_state", self._columns())  # precondition
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+        cols = self._columns()
+        self.assertIn("replacement_state", cols)  # the missing v3 group is added
+        self.assertIn("worktree_identity", cols)  # the pre-existing binding column stays
+        record = LaneLifecycleStore(home=self.home).get(self.key)
+        self.assertEqual(record.worktree_identity, "wt_oldv3")  # binding value preserved
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+
+    def _table_present(self) -> bool:
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    ("lane_lifecycle_records",),
+                ).fetchone()
+                is not None
+            )
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
