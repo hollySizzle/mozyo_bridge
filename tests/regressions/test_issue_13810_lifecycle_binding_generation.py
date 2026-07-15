@@ -690,5 +690,146 @@ class SchemaV5MigrationTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
 
+class ReviewCorrectionJ78868Test(unittest.TestCase):
+    """Review j#78868 changes_requested — the confirmed fail-open / codec findings.
+
+    F2 (open_next_generation abandons an in-flight release), F3 (project-gateway reopen
+    with no declared slots), F4 (declared_slots version accepts ``true`` / ``1.0``), F5
+    (exact-duplicate declaration ignores the worktree identity).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.store = LaneLifecycleStore(home=self.home)
+        self.decl = LaneDeclarationStore(home=self.home)
+
+    def _retire(self, key: LaneLifecycleKey, decision: DecisionPointer) -> None:
+        rec = self.store.get(key)
+        out = self.store.transition_disposition(
+            key,
+            expected_disposition=rec.lane_disposition,
+            expected_revision=rec.revision,
+            target=DISPOSITION_RETIRED,
+            decision=decision,
+        )
+        self.assertTrue(out.applied)
+
+    # -- F4: the declared-slots version is an EXACT integer ------------------
+
+    def test_f4_version_true_or_float_is_not_v1(self) -> None:
+        # True == 1 and 1.0 == 1 in Python; a bare `!=` check would accept both as v1.
+        for literal in ("true", "1.0"):
+            with self.subTest(literal=literal):
+                with self.assertRaises(ProcessPinError):
+                    decode_declared_slots('{"version": %s, "slots": []}' % literal)
+        # a genuine v1 still decodes
+        self.assertEqual(decode_declared_slots('{"version": 1, "slots": []}'), ())
+
+    # -- F2: reopening never abandons an in-flight release -------------------
+
+    def test_f2_open_next_generation_refuses_an_in_flight_release(self) -> None:
+        key = LaneLifecycleKey(WS, "f2_lane")
+        self.store.declare_active(key, decision=_issue_decision(), issue_id=ISSUE)
+        rec = self.store.get(key)
+        self.store.transition_disposition(
+            key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=rec.revision,
+            target=DISPOSITION_HIBERNATED, decision=_issue_decision(),
+        )
+        rec = self.store.get(key)
+        # A release generation opens on the (non-active) lane and is left in flight.
+        self.store.request_release(
+            key, expected_revision=rec.revision, action_id="rel1",
+            pins=[ReleasePin(role="codex", assigned_name="n", locator="%1")],
+        )
+        rec = self.store.get(key)
+        self.assertEqual(rec.process_release, "requested")
+        self._retire(key, _issue_decision())
+        rec = self.store.get(key)
+        out = self.decl.open_next_generation(
+            key, expected_revision=rec.revision, expected_generation=rec.lane_generation,
+            decision=_issue_decision(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        rec = self.store.get(key)
+        self.assertEqual(rec.lane_disposition, DISPOSITION_RETIRED)  # zero-write
+        self.assertEqual(rec.process_release, "requested")  # release not abandoned
+
+    def test_f2_open_next_generation_allows_a_finished_release(self) -> None:
+        # The guard is not over-strict: a fully-released (finished) generation is clearable.
+        key = LaneLifecycleKey(WS, "f2_ok_lane")
+        self.store.declare_active(key, decision=_issue_decision(), issue_id=ISSUE)
+        rec = self.store.get(key)
+        self.store.transition_disposition(
+            key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=rec.revision,
+            target=DISPOSITION_HIBERNATED, decision=_issue_decision(),
+        )
+        rec = self.store.get(key)
+        self.store.request_release(
+            key, expected_revision=rec.revision, action_id="rel1",
+            pins=[ReleasePin(role="codex", assigned_name="n", locator="%1")],
+        )
+        rec = self.store.get(key)
+        self.store.record_release_outcome(
+            key, action_id="rel1", expected_revision=rec.revision, target="released",
+        )
+        self._retire(key, _issue_decision())
+        rec = self.store.get(key)
+        out = self.decl.open_next_generation(
+            key, expected_revision=rec.revision, expected_generation=rec.lane_generation,
+            decision=_issue_decision(),
+        )
+        self.assertTrue(out.applied)
+        rec = self.store.get(key)
+        self.assertEqual(rec.lane_generation, 2)
+        self.assertEqual(rec.process_release, "not_requested")  # reset on the new generation
+
+    # -- F3: a project-gateway reopen keeps its provider-bound slot set ------
+
+    def test_f3_project_gateway_reopen_requires_slots(self) -> None:
+        key = LaneLifecycleKey(WS, "pgwv1_f3")
+        self.decl.declare_lane(
+            key, decision=_gw_decision(), binding_kind=BINDING_KIND_PROJECT_GATEWAY,
+            project_scope=SCOPE, declared_slots=_slots(),
+        )
+        self._retire(key, _gw_decision())
+        rec = self.store.get(key)
+        with self.assertRaises(ValueError):
+            self.decl.open_next_generation(
+                key, expected_revision=rec.revision,
+                expected_generation=rec.lane_generation, decision=_gw_decision(),
+                declared_slots=(),
+            )
+        # zero-write: the lane stays retired
+        self.assertEqual(self.store.get(key).lane_disposition, DISPOSITION_RETIRED)
+        # a slot-bearing reopen succeeds
+        out = self.decl.open_next_generation(
+            key, expected_revision=rec.revision, expected_generation=rec.lane_generation,
+            decision=_gw_decision(), declared_slots=(_pin("codex", "%9"),),
+        )
+        self.assertTrue(out.applied)
+
+    # -- F5: exact-duplicate identity includes the worktree ------------------
+
+    def test_f5_redeclare_with_a_different_worktree_is_a_conflict(self) -> None:
+        key = LaneLifecycleKey(WS, "f5_lane")
+        self.decl.declare_lane(
+            key, decision=_issue_decision(), issue_id=ISSUE, worktree_identity="wt_a01"
+        )
+        out = self.decl.declare_lane(
+            key, decision=_issue_decision(), issue_id=ISSUE, worktree_identity="wt_b02"
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
+        self.assertEqual(self.store.get(key).worktree_identity, "wt_a01")  # not overwritten
+        # the exact same worktree remains idempotent
+        again = self.decl.declare_lane(
+            key, decision=_issue_decision(), issue_id=ISSUE, worktree_identity="wt_a01"
+        )
+        self.assertTrue(again.applied)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     ProcessGenerationPin,
     encode_declared_slots,
     norm,
+    rehydrate_allowed,
     replacement_settled,
     validate_declared_slots,
 )
@@ -102,10 +103,11 @@ class LaneDeclarationStore:
         inferred from the derived lane id (j#78386 §6); the caller supplies it.
 
         Idempotent by declaration identity (the #13809 live-adopt requirement): re-declaring
-        the **exact** same active lane — same binding kind, same issue / scope, same declared
-        slot snapshot — is a no-op success (``applied=True``), so adopting a live pair twice
-        never conflicts and never adds a process. A row at the same key whose binding /
-        slots **differ**, or which is not ``active``, is :data:`CAS_ALREADY_DECLARED` — a
+        the **exact** same active lane — same binding kind, same issue / scope, same worktree
+        identity, same declared slot snapshot — is a no-op success (``applied=True``), so
+        adopting a live pair twice never conflicts and never adds a process. A row at the same
+        key whose binding / worktree / slots **differ**, or which is not ``active``, is
+        :data:`CAS_ALREADY_DECLARED` (a divergent re-declare is never silently accepted) — a
         re-declare never silently overwrites an existing authority row (the
         tombstone-reviving ``lane_metadata.upsert`` anti-pattern). An issue / project scope
         already actively owned by *another* lane is :data:`CAS_OWNER_CONFLICT` (the storage
@@ -160,6 +162,7 @@ class LaneDeclarationStore:
                     and norm(existing.binding_kind) == kind
                     and existing.issue_id == issue
                     and existing.project_scope == scope
+                    and existing.worktree_identity == worktree
                     and existing.declared_slots == encoded_slots
                 ):
                     conn.execute("ROLLBACK")
@@ -275,6 +278,20 @@ class LaneDeclarationStore:
                     reason=CAS_FORBIDDEN_TRANSITION,
                     revision=current.revision,
                 )
+            if not rehydrate_allowed(current.process_release):
+                # Reopening is a return-to-active path, so it obeys the same in-flight
+                # release fence as ``transition_disposition``'s rehydrate (Redmine #13810
+                # R1-F2): a ``requested`` / ``partial`` generation means an actuator may be
+                # closing this lane's pinned slots right now. Silently resetting it to
+                # ``not_requested`` (as the write below does) would abandon that in-flight
+                # release; only a finished one (never opened, or fully ``released``) may be
+                # cleared, so a still-open release fails closed zero-write.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
             if not decision.authorizes_binding(current.issue_id):
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -306,6 +323,15 @@ class LaneDeclarationStore:
                         reason=CAS_OWNER_CONFLICT,
                         revision=current.revision,
                     )
+            if norm(current.binding_kind) == BINDING_KIND_PROJECT_GATEWAY and not pinned:
+                # A project-gateway lane always owns a provider-bound slot set; the new
+                # generation must declare it too (Redmine #13810 R1-F3). Only ``declare_lane``
+                # enforced this at create time — the reopen must re-check the kind-specific
+                # requirement rather than accept an empty snapshot for the new incarnation.
+                conn.execute("ROLLBACK")
+                raise ValueError(
+                    "a project-gateway generation reopen requires its provider-bound slot set"
+                )
             revision = current.revision + 1
             generation = current.lane_generation + 1
             try:

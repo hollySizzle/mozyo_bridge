@@ -544,10 +544,18 @@ def decode_declared_slots(raw: str) -> tuple[ProcessGenerationPin, ...]:
     if not isinstance(loaded, dict):
         raise ProcessPinError("declared slots must be a versioned object")
     version = loaded.get("version")
-    if version != DECLARED_SLOTS_VERSION:
+    # An EXACT integer version only (Redmine #13810 R1-F4): Python folds ``True == 1`` and
+    # ``1.0 == 1``, so a bare ``version != DECLARED_SLOTS_VERSION`` would accept a JSON
+    # ``true`` / ``1.0`` as v1 — the same closed-schema trap #13754 R4 fixed for the
+    # component version. ``bool`` is an ``int`` subclass and is not a version.
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != DECLARED_SLOTS_VERSION
+    ):
         raise ProcessPinError(
-            f"declared slots version {version!r} is not {DECLARED_SLOTS_VERSION} "
-            "(unknown / newer snapshot); fail closed"
+            f"declared slots version {version!r} is not exactly {DECLARED_SLOTS_VERSION} "
+            "(unknown / newer / malformed snapshot); fail closed"
         )
     slots = loaded.get("slots")
     if not isinstance(slots, list):
