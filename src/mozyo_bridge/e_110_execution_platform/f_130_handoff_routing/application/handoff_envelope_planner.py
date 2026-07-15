@@ -33,17 +33,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterable, Mapping, Protocol
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     AnchorError,
+    ExecutionRoot,
+    NormalizedAnchor,
     TicketlessAnchor,
     TicketlessConsultationAnchor,
     TicketlessWorkIntakeAnchor,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (
+    HandoffCommandInput,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileError,
+    RoleProfileResolution,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
     TicketlessCallback,
@@ -58,9 +64,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     TicketlessWorkIntakeError,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    TransitionRoleBoundary,
     TransitionRoleError,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
+    WorkflowContractBundle,
     WorkflowContractError,
 )
 
@@ -89,9 +97,13 @@ class EnvelopePlanError(Exception):
 
 @dataclass(frozen=True)
 class AnchorPlan:
-    """The typed anchor + the (at most one) ticketless payload derived from the input."""
+    """The typed anchor + the (at most one) ticketless payload derived from the input.
 
-    anchor: Any
+    ``anchor`` is a :data:`NormalizedAnchor` — the union already covers the Redmine /
+    Asana normalized forms AND the three ticketless anchors this planner derives.
+    """
+
+    anchor: NormalizedAnchor
     callback_payload: TicketlessCallback | None = None
     consultation_payload: TicketlessConsultation | None = None
     work_intake_payload: TicketlessWorkIntake | None = None
@@ -101,11 +113,11 @@ class AnchorPlan:
 class HandoffEnvelope:
     """The resolved pre-send envelope: everything the transport rail types + records."""
 
-    execution_root: Any
-    role_profile_resolution: Any
+    execution_root: ExecutionRoot | None
+    role_profile_resolution: RoleProfileResolution | None
     role_profile_contract: str | None
-    transition_role_boundary: Any
-    workflow_contract_bundle: Any
+    transition_role_boundary: TransitionRoleBoundary | None
+    workflow_contract_bundle: WorkflowContractBundle | None
     body: str
     marker: str
 
@@ -117,44 +129,54 @@ class EnvelopePlannerOps(Protocol):
         self,
         source: str | None,
         *,
-        task_id: Any,
-        comment_id: Any,
-        anchor_url: Any,
-        issue: Any,
-        journal: Any,
-    ) -> Any: ...
+        task_id: str | None,
+        comment_id: str | None,
+        anchor_url: str | None,
+        issue: str | None,
+        journal: str | None,
+    ) -> NormalizedAnchor: ...
 
-    def build_execution_root(self, workdir_abs: str, *, repo_root_abs: str | None) -> Any: ...
+    def build_execution_root(
+        self, workdir_abs: str, *, repo_root_abs: str | None
+    ) -> ExecutionRoot: ...
 
     def infer_repo_root(self, cwd: str) -> str | None: ...
 
     def resolve_handoff_profile_fields(
-        self, role_profile: str, profile_field: Any, human_pointer: str, repo_root: Path
-    ) -> Any: ...
+        self,
+        role_profile: str,
+        profile_field: Iterable[str] | None,
+        human_pointer: str,
+        repo_root: Path,
+    ) -> dict[str, str]: ...
 
-    def resolve_role_profile(self, role_profile: str, profile_fields: Any) -> Any: ...
+    def resolve_role_profile(
+        self, role_profile: str, profile_fields: Mapping[str, str] | None
+    ) -> RoleProfileResolution: ...
 
-    def resolve_transition_role(self, transition_role: str) -> Any: ...
+    def resolve_transition_role(self, transition_role: str) -> TransitionRoleBoundary: ...
 
-    def resolve_workflow_contract(self, workflow_contract: str) -> Any: ...
+    def resolve_workflow_contract(self, workflow_contract: str) -> WorkflowContractBundle: ...
 
     def build_notification_body(
         self,
-        anchor: Any,
+        anchor: NormalizedAnchor,
         kind: str | None,
         summary: str | None,
         receiver: str,
         *,
-        execution_root: Any,
-        role_profile: Any,
-        transition_role: Any,
-        workflow_contract: Any,
-        ticketless_callback: Any,
-        ticketless_consultation: Any,
-        ticketless_work_intake: Any,
+        execution_root: ExecutionRoot | None,
+        role_profile: RoleProfileResolution | None,
+        transition_role: TransitionRoleBoundary | None,
+        workflow_contract: WorkflowContractBundle | None,
+        ticketless_callback: TicketlessCallback | None,
+        ticketless_consultation: TicketlessConsultation | None,
+        ticketless_work_intake: TicketlessWorkIntake | None,
     ) -> str: ...
 
-    def build_marker(self, anchor: Any, kind: str | None, receiver: str) -> str: ...
+    def build_marker(
+        self, anchor: NormalizedAnchor, kind: str | None, receiver: str
+    ) -> str: ...
 
 
 class LiveEnvelopePlannerOps:
@@ -278,7 +300,7 @@ class HandoffEnvelopePlanner:
     def __init__(self, ops: EnvelopePlannerOps | None = None) -> None:
         self._ops = ops or LiveEnvelopePlannerOps()
 
-    def plan_anchor(self, inp: Any) -> AnchorPlan:
+    def plan_anchor(self, inp: HandoffCommandInput) -> AnchorPlan:
         """Build the typed anchor + ticketless payload from the typed input.
 
         Raises :class:`EnvelopePlanError` (``invalid_args`` for a malformed ticketless
@@ -353,9 +375,9 @@ class HandoffEnvelopePlanner:
 
     def plan_delivery_envelope(
         self,
-        inp: Any,
+        inp: HandoffCommandInput,
         *,
-        anchor: Any,
+        anchor: NormalizedAnchor,
         callback_payload: TicketlessCallback | None,
         consultation_payload: TicketlessConsultation | None,
         work_intake_payload: TicketlessWorkIntake | None,
