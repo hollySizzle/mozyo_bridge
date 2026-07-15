@@ -684,6 +684,19 @@ def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
 
 
 def cmd_sublane_retire(args: argparse.Namespace) -> int:
+    # Redmine #13841 review j#79150 finding 3: --execute (guarded pane close) and
+    # --migrate-hibernated-legacy (metadata-only) are conflicting destructive intents. Reject
+    # the combination as a zero-write failure rather than silently resolving to one — the help
+    # promises they are mutually exclusive, and nothing (no preflight, no actuation) runs here.
+    if getattr(args, "migrate_hibernated_legacy", False) and getattr(
+        args, "execute", False
+    ):
+        print(
+            "error: --migrate-hibernated-legacy and --execute are mutually exclusive "
+            "(the migration is metadata-only and never closes a pane); pass exactly one",
+            file=sys.stderr,
+        )
+        return 1
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
@@ -727,8 +740,43 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     # the lane workspace's managed gateway/worker agents. Never removes a worktree / deletes
     # a branch (still runbook per worktree-lifecycle-boundary.md); never touches a foreign
     # agent. The default (no --execute) path is byte-for-byte the preflight-only behaviour.
+    #
+    # Redmine #13841: --migrate-hibernated-legacy is the metadata-only path for a hibernated /
+    # released LEGACY row (empty worktree binding) the guarded close can never retire (it blocks
+    # forever on worktree_binding_unverified) and #13809 backfill does not cover (active-row
+    # only). It launches / closes / resumes NO process. It and --execute are conflicting
+    # destructive intents, so passing both is rejected up front (review j#79150 finding 3, the
+    # guard at the top of this handler) — the branch below runs the migration in the exclusive
+    # case where only --migrate-hibernated-legacy is set, and never the guarded close.
     close_result = None
-    if getattr(args, "execute", False) and outcome.preflight.may_retire:
+    migration_result = None
+    if getattr(args, "migrate_hibernated_legacy", False):
+        if outcome.preflight.may_retire:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
+                run_hibernated_legacy_retire_migration,
+            )
+
+            # Head integration is an action-time invariant the retire preflight (run with
+            # merge_on_retire=False) does not check: probe --branch's ancestry into
+            # --integration-branch read-only. Unknown / non-ancestor fails closed downstream.
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
+                getattr(args, "branch", None) or "",
+                getattr(args, "integration_branch", None) or "",
+            )
+            # The --worktree's ACTUAL checked-out branch (review j#79150 finding 1): the
+            # migration requires it to equal --branch, so the clean + integrated evidence
+            # describes the worktree's real head and not an unrelated branch name.
+            worktree_branch = (
+                ops.branch_for(worktree) if worktree else None
+            )
+            migration_result = run_hibernated_legacy_retire_migration(
+                args,
+                repo_root,
+                head_integrated=head_integrated,
+                worktree_branch=worktree_branch,
+            )
+    elif getattr(args, "execute", False) and outcome.preflight.may_retire:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
             run_guarded_retire_close,
         )
@@ -738,11 +786,16 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     # Redmine #13754: the ACTUATION verdict — not the preflight — decides whether the lane
     # was actually retired. ``decision.state: retire_ok`` says the retire was *permitted*;
     # reading it as "the pair is gone" is exactly the #13748 j#77473 misread (empty close,
-    # exit 0, pair still live). Under --execute the command's success is the conjunction of
-    # both, surfaced as one unambiguous ``retire_ok`` and in the exit code.
-    actuated_ok = close_result is None or close_result.ok
+    # exit 0, pair still live). Under --execute / --migrate-hibernated-legacy the command's
+    # success is the conjunction of the preflight AND the actuation / migration verdict,
+    # surfaced as one unambiguous ``retire_ok`` and in the exit code.
+    actuated_ok = True
     if close_result is not None:
         payload["herdr_retire_close"] = close_result.as_payload()
+        actuated_ok = close_result.ok
+    if migration_result is not None:
+        payload["hibernated_legacy_retire_migration"] = migration_result.as_payload()
+        actuated_ok = migration_result.ok
     payload["retire_ok"] = bool(outcome.preflight.may_retire and actuated_ok)
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -754,6 +807,12 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             )
 
             print(format_retire_close_text(close_result))
+        if migration_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
+                format_migration_text,
+            )
+
+            print(format_migration_text(migration_result))
     return 0 if (outcome.preflight.may_retire and actuated_ok) else 1
 
 
