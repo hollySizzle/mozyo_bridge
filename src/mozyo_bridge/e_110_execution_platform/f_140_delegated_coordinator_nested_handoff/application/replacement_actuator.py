@@ -364,12 +364,19 @@ class ReplacementActuatorUseCase:
     def _reauth_before_effect(
         self, key, holder, gen, pin_identity, expected_phase
     ) -> "ReplacementTransactionRecord | ActuationResult":
-        """Re-authenticate authority immediately before a destructive effect (R1-F1).
+        """Re-authenticate authority immediately before a destructive effect (R1-F1 / R2-F1).
 
         Re-reads the row on a *fresh* clock and renews the lease — a tranche A CAS that
         succeeds ONLY for the current live holder at the matching immutable generation, and
-        which also refreshes the TTL so the effect runs inside a fresh window. Then confirms
-        the participant is still at its ``expected_phase`` (not moved by a concurrent actor).
+        which also refreshes the TTL so the effect runs inside a fresh window. Then re-reads
+        once more and re-verifies **full authority** on the fresh row, not just the
+        participant phase (R2-F1): a foreign claim slipping in between the renew and this read
+        bumps the row's ``revision`` off the value the renew established and moves the holder,
+        which a phase-only check would miss. Fail-closed unless the fresh row still has
+        ``action_generation == gen``, ``revision == renew.revision`` (no intervening write),
+        ``lease_holder == holder``, ``lease_is_live(now)``, and the participant at
+        ``expected_phase``.
+
         Returns the renewed record to actuate against, or a fail-closed
         :class:`ActuationResult` (``lease_lost`` / ``generation_mismatch`` / ``not_found`` /
         ``effect_failed``) — in which case the caller performs ZERO effect.
@@ -398,10 +405,30 @@ class ReplacementActuatorUseCase:
                 detail=renew.reason,
             )
         fresh = self._store.get(key)
-        pin = fresh.find_participant(pin_identity) if fresh is not None else None
-        if fresh is None or pin is None or pin.phase != expected_phase:
+        if fresh is None:
+            return ActuationResult(status=ACTUATION_NOT_FOUND, stopped_on=pin_identity)
+        if fresh.action_generation != gen:
             return ActuationResult(
-                status=ACTUATION_EFFECT_FAILED, stopped_on=pin_identity,
+                status=ACTUATION_GENERATION_MISMATCH, phase=fresh.phase,
+                revision=fresh.revision, stopped_on=pin_identity,
+                detail="generation moved after renew",
+            )
+        if (
+            fresh.revision != renew.revision
+            or fresh.lease_holder != holder
+            or not fresh.lease_is_live(now)
+        ):
+            # A write (a foreign claim) landed between the renew and this read: the revision
+            # is off the one renew established and/or the holder / liveness moved. Zero effect.
+            return ActuationResult(
+                status=ACTUATION_LEASE_LOST, phase=fresh.phase, revision=fresh.revision,
+                stopped_on=pin_identity, detail="lease authority moved after renew",
+            )
+        pin = fresh.find_participant(pin_identity)
+        if pin is None or pin.phase != expected_phase:
+            return ActuationResult(
+                status=ACTUATION_EFFECT_FAILED, phase=fresh.phase,
+                revision=fresh.revision, stopped_on=pin_identity,
                 detail="participant owed phase moved before effect",
             )
         return fresh

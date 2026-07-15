@@ -397,6 +397,53 @@ class LeaseAndGenerationTests(_ActuatorCase):
         self.assertEqual(rec.lease_holder, "OTHER")
         self.assertEqual(self._phase_of(self.gw), PARTICIPANT_CLOSE_OWED)
 
+    def _steal_lease_after_renew(self):
+        # Wrap the store's renew so a foreign holder claims the lease in the window BETWEEN
+        # the renew (which H wins) and the re-authenticate re-read — the R2-F1 gap. The steal
+        # uses a future `now` so H's just-renewed lease is expired and OTHER's claim wins.
+        original = self.store.renew
+
+        def wrapped(key, **kwargs):
+            outcome = original(key, **kwargs)
+            if outcome.applied:
+                current = self.store.get(key)
+                self.store.claim(
+                    current.key, expected_revision=current.revision,
+                    expected_action_generation=GEN, holder="OTHER",
+                    lease_expires_at="2099-01-01T00:00:00+00:00",
+                    now="2030-01-01T00:00:00+00:00",
+                )
+            return outcome
+
+        self.store.renew = wrapped
+
+    def test_foreign_claim_between_renew_and_reread_close_path_zero_effect(self):
+        # R2-F1: the post-renew re-read must re-verify FULL authority (revision / holder /
+        # live / generation), not just the participant phase — else a foreign claim landing
+        # between renew and the read lets an unauthorized close run.
+        self._steal_lease_after_renew()
+        actuator = ReplacementActuatorUseCase(
+            self.store, self.port, clock=lambda: FIXED, lease_ttl_seconds=1
+        )
+        result = actuator.run(self.key, holder="H", expected_action_generation=GEN)
+        self.assertEqual(result.status, ACTUATION_LEASE_LOST)
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(self.store.get(self.key).lease_holder, "OTHER")
+
+    def test_foreign_claim_between_renew_and_reread_launch_path_zero_effect(self):
+        # The same helper guards the launch path: a positively-absent slot advances (bounded
+        # recovery) to launch_owed, and the launch's re-auth must also catch a steal.
+        self.port.old[self.gw.identity] = OLD_SLOT_ABSENT  # bounded recovery -> launch path
+        self._steal_lease_after_renew()
+        actuator = ReplacementActuatorUseCase(
+            self.store, self.port, clock=lambda: FIXED, lease_ttl_seconds=1
+        )
+        result = actuator.run(self.key, holder="H", expected_action_generation=GEN)
+        self.assertEqual(result.status, ACTUATION_LEASE_LOST)
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(self.port.closed, [])
+
 
 class TopologyTests(_ActuatorCase):
     def _self_less_store(self):
