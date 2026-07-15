@@ -2258,6 +2258,57 @@ class BackupFirstMigrationTest(unittest.TestCase):
             lambda conn: conn.execute("DROP INDEX idx_lane_lifecycle_active_owner")
         )
 
+    # -- R7-F1: the owner index is verified by CONSTRAINT, not just by name --------
+
+    def _replace_owner_index(self, create_sql: str):
+        def corrupt(conn):
+            conn.execute("DROP INDEX idx_lane_lifecycle_active_owner")
+            conn.execute(create_sql)
+
+        return corrupt
+
+    def test_same_name_non_unique_wrong_columns_index_fails_closed(self) -> None:
+        # A same-NAMED index that is non-unique and keyed on other columns does NOT enforce
+        # exactly-one-active-owner — it is not this constraint.
+        self._no_mutation_fail_closed(
+            self._replace_owner_index(
+                "CREATE INDEX idx_lane_lifecycle_active_owner "
+                "ON lane_lifecycle_records (lane_id)"
+            )
+        )
+
+    def test_same_name_unique_wrong_predicate_index_fails_closed(self) -> None:
+        # Right name / unique / key columns, but a WIDER predicate (no disposition scope):
+        # it constrains a different row set, not the active-owner invariant.
+        self._no_mutation_fail_closed(
+            self._replace_owner_index(
+                "CREATE UNIQUE INDEX idx_lane_lifecycle_active_owner "
+                "ON lane_lifecycle_records (repo_workspace_id, issue_id) "
+                "WHERE issue_id <> ''"
+            )
+        )
+
+    def test_same_name_unique_no_predicate_index_fails_closed(self) -> None:
+        # A non-partial unique index over the same columns forbids TWO rows to share an
+        # issue even across superseded/hibernated lanes — a different, wrong invariant.
+        self._no_mutation_fail_closed(
+            self._replace_owner_index(
+                "CREATE UNIQUE INDEX idx_lane_lifecycle_active_owner "
+                "ON lane_lifecycle_records (repo_workspace_id, issue_id)"
+            )
+        )
+
+    def test_same_name_index_on_foreign_table_fails_closed(self) -> None:
+        def corrupt(conn):
+            conn.execute("DROP INDEX idx_lane_lifecycle_active_owner")
+            conn.execute("CREATE TABLE other_tbl (a TEXT, b TEXT)")
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_lane_lifecycle_active_owner "
+                "ON other_tbl (a, b) WHERE a = 'x'"
+            )
+
+        self._no_mutation_fail_closed(corrupt)
+
 
 if __name__ == "__main__":
     unittest.main()

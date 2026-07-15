@@ -313,15 +313,52 @@ def _table_present(conn: sqlite3.Connection, name: str) -> bool:
     )
 
 
-def _owner_index_present(conn: sqlite3.Connection) -> bool:
-    """Is the active-owner unique index present? (a critical authority constraint)."""
-    return (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-            (_OWNER_INDEX,),
-        ).fetchone()
-        is not None
+#: The active-owner index's authority-defining shape (Redmine #13754 R7-F1, j#78814): the
+#: key columns in order, and the partial predicate that scopes uniqueness to ACTIVE,
+#: issue-bound rows. A same-named index that is non-unique, keyed on other columns, scoped
+#: by a different predicate, or attached to another table does NOT enforce exactly-one
+#: active owner — it is not this constraint and fails closed.
+_OWNER_INDEX_KEY_COLUMNS = ("repo_workspace_id", "issue_id")
+_OWNER_INDEX_PREDICATE = "lane_disposition = 'active' AND issue_id <> ''"
+
+
+def _verify_owner_index(conn: sqlite3.Connection) -> bool:
+    """Does the active-owner unique partial index exist with its EXACT authority shape?
+
+    Not a name check (Redmine #13754 R7-F1): the exactly-one-active-owner invariant is
+    enforced by the storage engine only when the index is (1) attached to
+    ``lane_lifecycle_records``, (2) UNIQUE, (3) PARTIAL, (4) keyed on
+    ``(repo_workspace_id, issue_id)`` in that order, and (5) scoped by the predicate
+    ``lane_disposition = 'active' AND issue_id <> ''``. A same-named index missing any of
+    these does not enforce the constraint and is a corrupt authority shape.
+    """
+    row = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (_OWNER_INDEX,),
+    ).fetchone()
+    if row is None or row[0] != _TABLE:
+        return False  # absent, or attached to a foreign table
+    listing = {
+        r[1]: (r[2], r[4])  # name -> (unique, partial)
+        for r in conn.execute(f"PRAGMA index_list({_TABLE})")
+    }
+    if listing.get(_OWNER_INDEX) != (1, 1):  # must be UNIQUE and PARTIAL
+        return False
+    key_columns = tuple(
+        r[2] for r in conn.execute(f"PRAGMA index_info({_OWNER_INDEX})")
     )
+    if key_columns != _OWNER_INDEX_KEY_COLUMNS:  # wrong / reordered key columns
+        return False
+    # The partial predicate lives only in the stored CREATE text; collapse whitespace
+    # first (SQLite preserves the original newlines), then extract after WHERE and compare
+    # so formatting does not matter but semantics do.
+    sql = " ".join((row[1] or "").split())
+    marker = " where "
+    where_at = sql.lower().find(marker)
+    if where_at == -1:
+        return False
+    predicate = sql[where_at + len(marker) :].strip()
+    return predicate == _OWNER_INDEX_PREDICATE
 
 
 def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
@@ -337,8 +374,9 @@ def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
     - every present column's authority-affecting definition (type / NOT NULL / default /
       PK order) matches :data:`_COLUMN_DEFS` (a same-named but re-typed / nullable column
       is not the current column);
-    - the active-owner unique index is present (a missing critical constraint is a corrupt
-      shape, not a current one).
+    - the active-owner index enforces its EXACT constraint (:func:`_verify_owner_index`):
+      a same-named index that is non-unique / wrong-keyed / wrong-predicate / on a foreign
+      table does not enforce exactly-one-active-owner and is a corrupt shape (R7-F1).
     """
     if not _table_present(conn, _TABLE):
         return False
@@ -352,7 +390,7 @@ def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
     for name, definition in info.items():
         if _COLUMN_DEFS.get(name) != definition:
             return False
-    return _owner_index_present(conn)
+    return _verify_owner_index(conn)
 
 
 def readonly_component_status(conn: sqlite3.Connection) -> str:
