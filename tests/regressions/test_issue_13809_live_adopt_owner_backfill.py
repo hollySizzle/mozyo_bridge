@@ -38,6 +38,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     CAS_UNEXPECTED_STATE,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
+    CasOutcome,
     LaneLifecycleKey,
     LaneLifecycleStore,
     OWNER_ABSENT,
@@ -336,13 +337,71 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
             sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
         )
 
-    def test_unattested_live_pair_leaves_the_legacy_gap_zero_write(self) -> None:
-        # A legacy row whose live pair cannot self-attest is never backfilled: the gate fails
-        # before the backfill CAS, the row keeps its empty binding, and the lane is
-        # already_owned (its owner row predates this adopt) rather than DECLARED / BACKFILLED.
+    def test_legacy_incomplete_row_unattested_pair_fails_closed(self) -> None:
+        # review j#78975 F1: a legacy INCOMPLETE row (empty worktree binding) whose live pair
+        # cannot self-attest must FAIL CLOSED — NOT collapse to already_owned. Owning the
+        # issue is not a licence to dispatch past a positively suspicious inventory; the row's
+        # binding stays unmet, so the outcome is a blocking owner-unbound token, not proceed.
         self._seed_legacy_owner_row()
-        # no attestation seeded -> unattested gate failure.
-        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_ALREADY_OWNED)
+        outcome = self._call(_pair_rows())  # no attestation seeded -> unattested
+        self.assertEqual(outcome, ADOPT_DECL_UNATTESTED)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)  # dispatch blocked
+        self.assertEqual(self._row_for().worktree_identity, "")  # binding still unmet
+
+    def test_legacy_incomplete_row_ambiguous_pair_fails_closed(self) -> None:
+        # A duplicate mzb1 name (ambiguous live candidate) on a legacy incomplete row fails
+        # closed for the same reason — a herdr name-uniqueness violation is never dispatched
+        # past on the strength of an incomplete owner row.
+        self._seed_legacy_owner_row()
+        self._attest_pair()
+        rows = [_row("codex", "w1:pA"), _row("codex", "w1:pB"), _row("claude", WK_LOC)]
+        outcome = self._call(rows)
+        self.assertEqual(outcome, ADOPT_DECL_DUPLICATE_CANDIDATES)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+        self.assertEqual(self._row_for().worktree_identity, "")
+
+    def test_legacy_incomplete_row_stale_slot_fails_closed(self) -> None:
+        self._seed_legacy_owner_row()
+        self._attest_pair()
+        rows = [_row("codex", GW_LOC, stale=True), _row("claude", WK_LOC)]
+        outcome = self._call(rows)
+        self.assertEqual(outcome, ADOPT_DECL_STALE_SLOT)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+        self.assertEqual(self._row_for().worktree_identity, "")
+
+    def test_non_empty_worktree_mismatch_fails_closed(self) -> None:
+        # A COMPLETE owner row bound to a DIFFERENT worktree than this adopt resolves is not
+        # "this exact lane": the exact-binding check fails, so the divergent adopt is blocked
+        # rather than collapsed to already_owned (review j#78975 F1).
+        LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+            worktree_identity="wt_a_different_lane",
+        )
+        self._attest_pair()
+        outcome = self._call(_pair_rows())
+        self.assertEqual(outcome, ADOPT_DECL_OWNER_CONFLICT)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+        # The pre-existing (different) binding is never overwritten.
+        self.assertEqual(self._row_for().worktree_identity, "wt_a_different_lane")
+
+    def test_legacy_incomplete_row_backfill_cas_race_fails_closed(self) -> None:
+        # A backfill CAS refusal (e.g. a revision race) on a legacy incomplete row also fails
+        # closed — the binding was not completed, so dispatch must not proceed. Simulated with
+        # a store whose backfill CAS loses the race deterministically.
+        self._seed_legacy_owner_row()
+        self._attest_pair()
+
+        class _StaleBackfillStore(LaneDeclarationStore):
+            def backfill_active_binding(self, *a, **k):  # noqa: ANN001, ANN002, ANN003
+                return CasOutcome(applied=False, reason=CAS_STALE_REVISION, revision=99)
+
+        outcome = self._call(
+            _pair_rows(), store_factory=lambda: _StaleBackfillStore(home=self.home)
+        )
+        self.assertEqual(outcome, ADOPT_DECL_OWNER_CONFLICT)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
         self.assertEqual(self._row_for().worktree_identity, "")
 
     def test_backfill_unblocks_the_retire_worktree_fence(self) -> None:
@@ -599,6 +658,25 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         # Live pair present but no attestation seeded -> unattested -> zero-write.
         self.assertEqual(self._drive(adopted=True, rows=_pair_rows()), ADOPT_DECL_UNATTESTED)
         self.assertEqual(self._owner().status, OWNER_ABSENT)
+
+    def _seed_legacy_owner_row(self) -> None:
+        LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+        )
+
+    def test_official_path_legacy_incomplete_unattested_blocks_dispatch(self) -> None:
+        # review j#78975 F1 at the official ops surface: a legacy INCOMPLETE owner row + an
+        # unattested live pair returns an owner-unbound BLOCK token (the use case fails closed
+        # on ADOPT_DECL_OWNER_UNBOUND membership -> dispatch=false), NOT already_owned. The
+        # incomplete binding stays unmet.
+        self._seed_legacy_owner_row()
+        out = self._drive(adopted=True, rows=_pair_rows())  # no attestation seeded
+        self.assertEqual(out, ADOPT_DECL_UNATTESTED)
+        self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
+        row = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
+        self.assertEqual(row.worktree_identity, "")
 
     def _drive_unreadable(self, *, workspace_segment) -> str:
         # R4-F3: the live inventory read RAISES at declaration time (herdr down). The ops

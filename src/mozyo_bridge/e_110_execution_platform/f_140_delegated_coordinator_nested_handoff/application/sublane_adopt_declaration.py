@@ -298,6 +298,11 @@ def declare_adopted_owner_row(
     lane = _norm(lane_id)
     if not (workspace and lane):
         return ADOPT_DECL_UNRESOLVED_UNIT
+    # The lane's canonical worktree token — computed ONCE so the declaration attempt and the
+    # owner-completeness resolution below agree on the exact token this adopt resolved. It is
+    # the completeness anchor: a lane is "already established" (safe to dispatch on a gate /
+    # CAS refusal) only when the state DB owner row is bound to THIS exact token.
+    worktree_token = _worktree_token(repo_root, worktree_path, lane_label)
 
     def _attempt() -> str:
         if attestation_store_factory is not None:
@@ -327,9 +332,9 @@ def declare_adopted_owner_row(
             seen_locators.add(pin.locator)
             pins.append(pin)
 
-        token = _worktree_token(repo_root, worktree_path, lane_label)
-        if token is None:
+        if worktree_token is None:
             return ADOPT_DECL_BAD_TOKEN
+        token = worktree_token
         try:
             key = LaneLifecycleKey(workspace, lane)
             decision = DecisionPointer(
@@ -381,13 +386,24 @@ def declare_adopted_owner_row(
         # Owner-bound: a fresh declaration, an idempotent duplicate, or a legacy row whose
         # missing worktree binding was just filled — all leave the lane the active owner.
         return outcome
-    # R3-F3: a non-``declared`` adopt leaves the lane owner-unbound ONLY if the lane is not
-    # already the active owner of its issue. A prior create / adopt that bound it means the
-    # lane is safe to dispatch even when THIS adopt could not (re-)declare typed pins (a
-    # recycled generation, an unattested fake environment, a divergent re-declare) — the
-    # #13809 hibernate blocker is only the genuinely rowless case.
-    return owner_bound_or(
-        outcome, store_factory=store_factory, workspace=workspace, issue=issue, lane=lane
+    # A gate failure / backfill CAS refusal leaves the lane safe to dispatch ONLY when the
+    # state DB confirms it is already established as THIS EXACT lane — the owner row is bound
+    # to this exact worktree token (a COMPLETE binding), not merely owns the issue (review
+    # j#78975 F1). A legacy INCOMPLETE owner row (empty worktree binding) is exactly what
+    # this residual fixes: letting an ambiguous / unattested / stale live pair, a non-empty
+    # worktree mismatch, or a revision race collapse to ``already_owned`` there would bypass
+    # the items 2/3 fail-closed gate and dispatch to a lane whose binding is still unmet. Its
+    # #13754 retire fence would stay ``worktree_binding_unverified`` while dispatch proceeds.
+    # (An ``unreadable_inventory`` — herdr fully down, no observation — is handled separately
+    # by the ops adapter on ownership authority, R4-F3; only a POSITIVELY suspicious readable
+    # inventory fails closed here.)
+    return complete_owner_bound_or(
+        outcome,
+        store_factory=store_factory,
+        workspace=workspace,
+        issue=issue,
+        lane=lane,
+        worktree_token=worktree_token,
     )
 
 
@@ -401,15 +417,54 @@ def owner_bound_or(
 ) -> str:
     """``already_owned`` when ``lane`` is verified the active owner, else ``reason``.
 
-    The shared owner-bound resolution (Redmine #13810 R4-F3): a fail-closed adopt outcome —
-    including an ``unreadable_inventory`` that the ops adapter hit BEFORE this module could
-    gate — proceeds ONLY when the state DB (a separate authority from the live herdr
-    inventory) confirms this exact lane already owns the issue. It never proceeds on
-    inference: an unreadable / unresolved store, or an owner that is a different / no lane,
-    keeps ``reason`` so the caller fails closed before dispatch.
+    The **ownership-only** resolution for the ``unreadable_inventory`` path (Redmine #13810
+    R4-F3): when herdr is fully down the ops adapter cannot gate at all, so it falls back to
+    the state DB (a separate authority) — this lane may dispatch when it already owns the
+    issue, because a transient inventory outage must not hard-block a lane that genuinely
+    owns its work. It never proceeds on inference: an unreadable / unresolved store, or an
+    owner that is a different / no lane, keeps ``reason`` so the caller fails closed.
+
+    A **readable** but suspicious inventory (an ambiguous / unattested / stale live pair) or
+    a CAS refusal uses :func:`complete_owner_bound_or` instead, which additionally requires a
+    COMPLETE binding — an owner row is not a licence to dispatch past a positively observed
+    problem (review j#78975 F1).
     """
     if _lane_is_active_owner(
         store_factory, _norm(workspace), _norm(issue), _norm(lane)
+    ):
+        return ADOPT_DECL_ALREADY_OWNED
+    return reason
+
+
+def complete_owner_bound_or(
+    reason: str,
+    *,
+    workspace: str,
+    issue: str,
+    lane: str,
+    worktree_token: Optional[str],
+    store_factory: Callable[[], LaneDeclarationStore] = LaneDeclarationStore,
+) -> str:
+    """``already_owned`` only when ``lane`` owns ``issue`` with a COMPLETE, EXACT binding.
+
+    The completeness-aware owner resolution for a gate failure / CAS refusal on a readable
+    inventory (review j#78975 F1). Unlike :func:`owner_bound_or`, owning the issue is not
+    enough: the state DB owner row must ALSO carry a non-empty ``worktree_identity`` equal to
+    the exact token this adopt resolved. That is what distinguishes a lane genuinely already
+    established as THIS exact lane (a completed create / adopt, or a recycled generation of
+    the same worktree — safe to dispatch, preserving Redmine #13810 R3-F1/R3-F3) from a
+    legacy INCOMPLETE row (empty worktree binding) or a DIFFERENT-worktree binding, both of
+    which keep ``reason`` so the caller fails closed before dispatch.
+
+    ``worktree_token`` is ``None`` when the lane's worktree could not be resolved; there is
+    then no exact binding to confirm, so the row is never treated as complete (fail closed).
+    """
+    if _lane_owns_issue_with_binding(
+        store_factory,
+        _norm(workspace),
+        _norm(issue),
+        _norm(lane),
+        _norm(worktree_token) if worktree_token is not None else "",
     ):
         return ADOPT_DECL_ALREADY_OWNED
     return reason
@@ -436,9 +491,38 @@ def _lane_is_active_owner(
     return owner.resolved and owner.lane_id == lane
 
 
+def _lane_owns_issue_with_binding(
+    store_factory: Callable[[], LaneDeclarationStore],
+    workspace: str,
+    issue: str,
+    lane: str,
+    worktree_token: str,
+) -> bool:
+    """Does ``lane`` own ``issue`` AND carry the EXACT ``worktree_token`` binding? (fail-closed)
+
+    The completeness half of the owner check (review j#78975 F1). Reads the same state DB and
+    additionally requires the owner row's ``worktree_identity`` to be non-empty and equal to
+    ``worktree_token``. An empty token, an unreadable store, an owner that is a different / no
+    lane, or a row whose worktree binding is empty / different reads False — so a legacy
+    incomplete row (or a different-worktree row) is never treated as an established lane.
+    """
+    if not worktree_token:
+        return False
+    try:
+        store = LaneLifecycleStore(path=store_factory().path)
+        owner = store.resolve_owner(workspace, issue)
+        if not (owner.resolved and owner.lane_id == lane):
+            return False
+        record = store.get(LaneLifecycleKey(workspace, lane))
+    except (LaneLifecycleError, OSError, ValueError):
+        return False
+    return record is not None and _norm(record.worktree_identity) == worktree_token
+
+
 __all__ = (
     "declare_adopted_owner_row",
     "owner_bound_or",
+    "complete_owner_bound_or",
     "ADOPT_DECL_OWNER_UNBOUND",
     "ADOPT_DECL_ZERO_WRITE",
     "ADOPT_DECL_NOT_ADOPTED",

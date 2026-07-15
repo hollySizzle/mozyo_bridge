@@ -351,6 +351,13 @@ Table naming:
       専用。live-adopt path は `declare_lane` 拒否時にのみこの CAS を試み、成功を `backfilled` として
       rowless declaration (`declared`) と区別して伝播する。disposition / generation / release /
       replacement / decision anchor は不変。
+      ★adopt が gate failure / CAS refusal で終わったとき「既に確立済みゆえ dispatch 安全」と判定する
+      条件は、**issue 所有だけでは不十分**で state DB owner row が **この adopt の resolve した exact
+      worktree token に bound (complete binding)** であることを要する (#13809 review j#78975 F1)。legacy
+      incomplete row (空 worktree) や別 worktree binding では ambiguous / unattested / stale live pair・
+      revision race・non-empty mismatch を `already_owned` に畳まず fail-closed で dispatch を止める
+      (items 2/3 の安全 gate を incomplete row でも維持)。herdr 全断の `unreadable_inventory` は無観測ゆえ
+      別扱いで ownership authority proceed (R4-F3) を維持する。
     - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
