@@ -424,27 +424,30 @@ Table naming:
       の間に busy 化/pending/duplicate/recycled locator になった agent は **zero-close**。★**whole-unit post-close measure
       (review j#79320 R3)**: close 後に **lane unit 全体の expected pair を fresh inventory で測定**（`.absent` = 全 expected slot
       不在）。old pins 消失だけでは成功にせず、recycled/duplicate/foreign が any locator で live なら **success withhold**（terminal
-      retired + live newer pair の false success を排除）。★**collision-proof owed-close ledger + same-flow resume
-      (review j#79346 R5)**: reconcile は retire CAS の **前**に、isolated home-scoped durable component
-      `LaneReconcileOwedStore`（`lane-reconcile-owed.sqlite`、`rebuildable_cache`、schema mismatch/unwritable は record が
-      raise → caller は retire せず fail-closed、read は fail-open None）へ **owed-close entry `(lane_generation, retired_revision)`**
-      を記録（retire 後は必ず entry 存在。ledger 書込失敗時は retire しない＝unresumable owed close を作らない）。retire 済・pane
-      close 未の crash は **同一 reconcile authority で resume**: retired-branch が **ledger を read し `retired_revision==row.revision
-      ∧ lane_generation==row.lane_generation` の時のみ** owed-close と認定（collision-proof: ordinary #13809/#13810-bound retired row は
-      entry 無し→resume せず、review j#79320 R4 維持）、record.declared_pins へ **同じ close-time full re-verify + whole-unit measure**
-      を適用（recycled newer/busy/pending は zero-close）、close 成功で ledger clear。★**lane_lifecycle schema へ v6 column を
-      加えない**判断: provenance は共有 authority schema（#13810 済 test 横断）でなく isolated component に置く（state.sqlite と
-      同一 home ゆえ crash replay で共存、partial loss は fail-closed）＝格納場所の選択であり受入条件の弱化ではない。★**#13754 手動
-      fallback を撤去** (review j#79346 R5): #13754 ordinary close は name/provider-based で declared_slots generation pins を読まず
-      idle/composer/attestation gate も無いため recycled newer generation を close する→crash replay を委ねない。reconcile 自身の
-      retired-branch resume で **one replayable flow** を完結。acceptance「**close済み** partial replay は positive absence + durable
-      owed state から再開」= close 後 = retired + (ledger match) + absent → ledger clear + `already_reconciled`（idempotent, duplicate
-      close せず）で満たす。ledger 無し/mismatch の retired row は resume せず、absent → `already_reconciled`、live → `live_pair_present`
-      withhold。「hibernated + live pair 無し」は retire せず `live_pair_absent` で #13841 へ route。
-      `--reconcile-hibernated-live` は `--execute` / `--migrate-hibernated-legacy` と競合する destructive intent ゆえ
+      retired + live newer pair の false success を排除）。★**collision-proof provenance を authoritative row 上に置く +
+      same-flow resume (review j#79346 R5 / j#79363 R6)**: reconcile owed-close の provenance は **`lane_lifecycle` v6 additive
+      column `reconcile_phase`**（default `''`、reconcile retire CAS が atomic に `'reconciled'` を set、`open_next_generation` が
+      reset）で表す。★**R6**: この owed-state marker は「retired row が reconcile 由来か ordinary retire 由来か」を区別する **唯一の
+      正本**で row から再構築不能ゆえ `rebuildable_cache` にできない。**authoritative row 上に co-locate** することで provenance は row と
+      生死を共にし、loss = state.sqlite loss = component 自身の `operator_current_state` recovery（Redmine から re-declare）に subsume
+      される（別 backup/doctor/repair surface / 単独 losable cache 不要）。★以前の isolated ledger（`lane_reconcile_owed.sqlite`）は
+      「単独 loss で reconcile-retired+live row が恒久 stuck」＝one-replayable-flow 喪失ゆえ撤去。retire 済・pane close 未の crash は
+      **同一 reconcile authority で resume**: retired-branch が **`record.reconcile_phase=='reconciled'` の時のみ** owed-close と認定
+      （collision-proof: ordinary #13809/#13810-bound retired row は phase 空→resume せず、review j#79320 R4 維持）、
+      record.declared_pins へ **同じ close-time full re-verify + whole-unit measure** を適用（recycled newer/busy/pending は zero-close）。
+      ★**#13754 手動 fallback を撤去** (review j#79346 R5): #13754 ordinary close は name/provider-based で declared_slots generation
+      pins を読まず idle/composer/attestation gate も無いため recycled newer generation を close する→crash replay を委ねない。reconcile
+      自身の retired-branch resume で **one replayable flow** を完結。acceptance「**close済み** partial replay は positive absence +
+      durable owed state から再開」= close 後 = retired + phase='reconciled' + absent → `already_reconciled`（idempotent, duplicate
+      close せず）で満たす。phase 空（ordinary）の retired row は resume せず、absent → `already_reconciled`、live → `live_pair_present`
+      withhold。「hibernated + live pair 無し」は retire せず `live_pair_absent` で #13841 へ route。★**typed outcome の事実性
+      (review j#79363 R7)**: retire-first ゆえ blocked verdict でも retire/close は committed 済みうる。verdict に **`retired: bool` +
+      `closed`** を持たせ実発生の durable mutation を保持、text/JSON は zero-write かつ zero-close の時だけ「nothing written or closed」を
+      表示、retire/close 済なら実側効果（`lane retired` / closed targets）を出して post-close newer-generation / partial-close を
+      audit 可能にする。`--reconcile-hibernated-live` は `--execute` / `--migrate-hibernated-legacy` と競合する destructive intent ゆえ
       **2 つ以上の同時指定は command-time zero-write error**。process launch/resume・worktree/branch 削除・raw Herdr/tmux・
       origin/main・production は伴わない（唯一の process mutation は 自 lane の exact managed pair への pin-matched close）。
-    - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
+    - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`

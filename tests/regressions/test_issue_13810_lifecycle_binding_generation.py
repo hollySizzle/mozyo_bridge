@@ -587,8 +587,10 @@ class SchemaV5MigrationTest(unittest.TestCase):
     def test_fresh_store_is_v5_with_both_owner_indexes(self) -> None:
         LaneLifecycleStore(home=self.home).ensure_schema()
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 5)
-        for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots"):
+        # v5 added the binding/generation columns; v6 (Redmine #13842) added reconcile_phase.
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 6)
+        for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
+                    "reconcile_phase"):
             self.assertIn(col, self._columns())
         self.assertIn("idx_lane_lifecycle_active_owner", self._indexes())
         self.assertIn("idx_lane_lifecycle_active_project_owner", self._indexes())
@@ -604,7 +606,10 @@ class SchemaV5MigrationTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
-            for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots"):
+            # Drop the v5 binding/generation columns AND the v6 reconcile_phase so the rewound
+            # shape is a genuine pre-#13810 v4 signature.
+            for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
+                        "reconcile_phase"):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 4 WHERE component = ?",

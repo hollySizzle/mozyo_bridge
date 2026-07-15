@@ -1421,6 +1421,7 @@ class R3RegressionTest(unittest.TestCase):
                 "project_scope",
                 "lane_generation",
                 "declared_slots",
+                "reconcile_phase",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1464,6 +1465,7 @@ class R3RegressionTest(unittest.TestCase):
                 "project_scope",
                 "lane_generation",
                 "declared_slots",
+                "reconcile_phase",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1888,10 +1890,17 @@ class BackupFirstMigrationTest(unittest.TestCase):
             conn.close()
         return path
 
-    #: The v5 (Redmine #13810) binding / generation / declaration columns. A faithful
-    #: pre-v5 fixture drops these too, so the rewound shape matches an actual old signature
-    #: rather than a v5 shape merely re-stamped to an old version (which now fails closed).
-    _V5_COLUMNS = ["binding_kind", "project_scope", "lane_generation", "declared_slots"]
+    #: The post-v4 columns (v5 Redmine #13810 binding/generation/declaration + v6 Redmine #13842
+    #: reconcile_phase). A faithful pre-v5 fixture drops these too, so the rewound shape matches an
+    #: actual old signature rather than a newer shape merely re-stamped to an old version (which
+    #: now fails closed).
+    _V5_COLUMNS = [
+        "binding_kind",
+        "project_scope",
+        "lane_generation",
+        "declared_slots",
+        "reconcile_phase",
+    ]
 
     def _v2_store(self) -> Path:
         """A pre-#13763 / pre-#13754 / pre-#13810 store (no replacement axis, no worktree

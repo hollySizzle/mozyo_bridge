@@ -44,6 +44,23 @@ DISPOSITIONS = frozenset(
     }
 )
 
+# -- reconcile owed-close provenance (v6, Redmine #13842 review j#79363 R6) ---
+#
+# The collision-proof marker the hibernated live-contradiction reconcile writes when it
+# retires a lane (retire-first), so a ``retired`` row it owns an owed pane close on can be
+# told apart from an ordinary #13809 / #13810-bound retired row when it resumes that close
+# after a crash. It lives ON the authoritative row (recovered by the component's own
+# ``operator_current_state`` re-declare), NOT a separate losable cache — a load-bearing
+# owed-state marker must not be a rebuildable cache (R6).
+
+#: No reconcile owed close — an ordinary lane (the default for every migrated pre-v6 row).
+RECONCILE_PHASE_NONE = ""
+#: This lane was retired by the reconcile and owes (or completed) a pin-matched pane close;
+#: the reconcile's retired-branch resume fires only on this value.
+RECONCILE_PHASE_RECONCILED = "reconciled"
+
+RECONCILE_PHASES = frozenset({RECONCILE_PHASE_NONE, RECONCILE_PHASE_RECONCILED})
+
 #: No release generation is open for this lane.
 RELEASE_NOT_REQUESTED = "not_requested"
 #: A release generation is open; its outcome is not yet recorded.
@@ -735,6 +752,7 @@ class LaneLifecycleRecord:
     project_scope: str = ""
     lane_generation: int = 1
     declared_slots: str = ""
+    reconcile_phase: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -805,6 +823,7 @@ class LaneLifecycleRecord:
             "project_scope": self.project_scope,
             "lane_generation": self.lane_generation,
             "declared_slots": [p.as_payload() for p in self.declared_pins],
+            "reconcile_phase": self.reconcile_phase,
         }
 
 
@@ -935,6 +954,9 @@ __all__ = (
     "DISPOSITION_HIBERNATED",
     "DISPOSITION_RETIRED",
     "DISPOSITION_SUPERSEDED",
+    "RECONCILE_PHASES",
+    "RECONCILE_PHASE_NONE",
+    "RECONCILE_PHASE_RECONCILED",
     "OWNER_ABSENT",
     "OWNER_AMBIGUOUS",
     "OWNER_RESOLVED",

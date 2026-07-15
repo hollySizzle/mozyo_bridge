@@ -54,6 +54,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     CAS_UNEXPECTED_STATE,
     DISPOSITION_HIBERNATED,
     DISPOSITION_RETIRED,
+    RECONCILE_PHASE_RECONCILED,
     RELEASE_RELEASED,
     CasOutcome,
     DecisionPointer,
@@ -226,7 +227,7 @@ class LaneReconcileBindingStore:
             conn.execute(
                 f"UPDATE {_TABLE} SET lane_disposition = ?, worktree_identity = ?, "
                 "declared_slots = ?, decision_source = ?, decision_issue_id = ?, "
-                "decision_journal = ?, revision = ?, updated_at = ? "
+                "decision_journal = ?, reconcile_phase = ?, revision = ?, updated_at = ? "
                 "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
                 (
                     DISPOSITION_RETIRED,
@@ -235,6 +236,9 @@ class LaneReconcileBindingStore:
                     decision.source,
                     decision.issue_id,
                     decision.journal_id,
+                    # v6 provenance (Redmine #13842 R6): mark this retirement as the reconcile's,
+                    # so its owed pane-close resume can be told apart from an ordinary retire.
+                    RECONCILE_PHASE_RECONCILED,
                     revision,
                     stamp,
                     key.repo_workspace_id,

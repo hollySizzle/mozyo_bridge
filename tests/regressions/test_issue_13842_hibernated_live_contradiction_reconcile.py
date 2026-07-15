@@ -75,9 +75,8 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
 from mozyo_bridge.core.state.lane_reconcile_binding import (  # noqa: E402
     LaneReconcileBindingStore,
 )
-from mozyo_bridge.core.state.lane_reconcile_owed import (  # noqa: E402
-    LaneReconcileOwedError,
-    LaneReconcileOwedStore,
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    RECONCILE_PHASE_RECONCILED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_herdr_projection,
@@ -99,6 +98,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECON_NOT_RECONCILABLE_STATE,
     RECON_REVISION_RACE,
     RECON_WORKTREE_BRANCH_MISMATCH,
+    format_reconcile_text,
     run_hibernated_live_reconcile,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_hibernated_live_reconcile import (  # noqa: E402,E501
@@ -445,55 +445,59 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             )
 
 
-class ReconcileOwedLedgerTests(unittest.TestCase):
-    """``LaneReconcileOwedStore`` record / read / clear + provenance discipline (review j#79346 R5)."""
+class ReconcilePhaseProvenanceTests(unittest.TestCase):
+    """The v6 ``reconcile_phase`` provenance column (Redmine #13842 review j#79363 R6).
+
+    The reconcile owed-close provenance lives ON the authoritative lane_lifecycle row — a fresh
+    lane is empty, an ordinary retire keeps it empty, and the reconcile retire sets 'reconciled'.
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.path = Path(self._tmp.name) / "owed.sqlite"
-        self.store = LaneReconcileOwedStore(path=self.path)
+        self.path = Path(self._tmp.name) / "state.sqlite"
+        self.key = LaneLifecycleKey(_WORKSPACE_ID, _LANE)
+        self.store = LaneLifecycleStore(path=self.path)
 
-    def test_record_read_roundtrip(self) -> None:
-        self.store.record(
-            workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5
+    def test_fresh_lane_phase_is_empty(self) -> None:
+        self.store.declare_active(self.key, decision=_decision(), issue_id=_ISSUE)
+        self.assertEqual(self.store.get(self.key).reconcile_phase, "")
+
+    def test_reconcile_retire_sets_reconciled_phase(self) -> None:
+        _seed_hibernated_released(self.store, key=self.key)
+        LaneReconcileBindingStore(path=self.path).retire_reconciled_hibernated_legacy(
+            self.key, expected_revision=self.store.get(self.key).revision, issue_id=_ISSUE,
+            worktree_identity="wt_x", declared_slots=_pins(), decision=_decision(),
         )
-        rec = self.store.read(_WORKSPACE_ID, _LANE)
-        self.assertIsNotNone(rec)
-        self.assertEqual((rec.lane_generation, rec.retired_revision), (1, 5))
+        self.assertEqual(self.store.get(self.key).reconcile_phase, RECONCILE_PHASE_RECONCILED)
 
-    def test_record_is_snapshot_replace(self) -> None:
-        self.store.record(workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5)
-        self.store.record(workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=2, retired_revision=9)
-        rec = self.store.read(_WORKSPACE_ID, _LANE)
-        self.assertEqual((rec.lane_generation, rec.retired_revision), (2, 9))
+    def test_ordinary_retire_keeps_empty_phase(self) -> None:
+        # A row retired through the ordinary lifecycle transition keeps an empty phase.
+        _seed_hibernated_released(self.store, key=self.key)
+        rec = self.store.get(self.key)
+        self.store.transition_disposition(
+            self.key, expected_disposition=DISPOSITION_HIBERNATED, expected_revision=rec.revision,
+            target=DISPOSITION_RETIRED, decision=_decision(),
+        )
+        self.assertEqual(self.store.get(self.key).reconcile_phase, "")
 
-    def test_read_absent_is_none(self) -> None:
-        self.assertIsNone(self.store.read(_WORKSPACE_ID, _LANE))
-
-    def test_clear_is_revision_guarded(self) -> None:
-        self.store.record(workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5)
-        # A clear for a DIFFERENT revision (an older completion) does not delete the entry.
-        self.store.clear(workspace_id=_WORKSPACE_ID, lane_id=_LANE, retired_revision=4)
-        self.assertIsNotNone(self.store.read(_WORKSPACE_ID, _LANE))
-        # The matching revision clears it.
-        self.store.clear(workspace_id=_WORKSPACE_ID, lane_id=_LANE, retired_revision=5)
-        self.assertIsNone(self.store.read(_WORKSPACE_ID, _LANE))
-
-    def test_wrong_schema_version_fails_closed(self) -> None:
-        # A newer/foreign schema version is left untouched and read fails open to None (a record
-        # would raise so the caller fails closed).
-        import sqlite3
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA user_version = 99")
-        conn.commit()
-        conn.close()
-        self.assertIsNone(self.store.read(_WORKSPACE_ID, _LANE))
-        with self.assertRaises(LaneReconcileOwedError):
-            self.store.record(
-                workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5
-            )
+    def test_reopen_clears_reconcile_phase(self) -> None:
+        # A re-incarnated generation (open_next_generation) is a fresh active lane; its phase resets.
+        from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+        _seed_hibernated_released(self.store, key=self.key)
+        LaneReconcileBindingStore(path=self.path).retire_reconciled_hibernated_legacy(
+            self.key, expected_revision=self.store.get(self.key).revision, issue_id=_ISSUE,
+            worktree_identity="wt_x", declared_slots=_pins(), decision=_decision(),
+        )
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.reconcile_phase, RECONCILE_PHASE_RECONCILED)
+        LaneDeclarationStore(path=self.path).open_next_generation(
+            self.key, expected_revision=rec.revision, expected_generation=rec.lane_generation,
+            decision=_decision(),
+        )
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+        self.assertEqual(rec.reconcile_phase, "")
 
 
 # ---------------------------------------------------------------------------
@@ -845,16 +849,10 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
     def _retire_first(self, *, decision=None) -> None:
-        """Simulate a real reconcile crash: record the owed-close ledger (as the reconcile does
-        BEFORE its retire CAS), then commit the retire-first CAS — leaving retired + bound + pins
+        """Simulate a real reconcile crash: commit the retire-first CAS (which atomically writes
+        the reconcile_phase='reconciled' provenance ON the row) — leaving retired + bound + pins
         with the pin-matched close still owed (crash after the CAS, before the close)."""
-        from mozyo_bridge.core.state.lane_reconcile_owed import LaneReconcileOwedStore
-
         rec = LaneLifecycleStore().get(self._key())
-        LaneReconcileOwedStore().record(
-            workspace_id=_WORKSPACE_ID, lane_id=_LANE,
-            lane_generation=rec.lane_generation, retired_revision=rec.revision + 1,
-        )
         LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
             self._key(),
             expected_revision=rec.revision,
@@ -865,19 +863,21 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         )
 
     def test_owed_close_resume_closes_recorded_pair(self) -> None:
-        # Review j#79346 R5: a crash after the retire CAS but before the pane close is resumed in
-        # the SAME reconcile authority (the owed-close ledger pins the exact generation). The
-        # retired-branch re-runs the full-conjunct close of exactly the recorded pins.
+        # Review j#79346 R5 + j#79363 R6: a crash after the retire CAS but before the pane close is
+        # resumed in the SAME reconcile authority — the row's reconcile_phase='reconciled'
+        # provenance identifies it. The retired-branch re-runs the full-conjunct close of exactly
+        # the recorded pins.
         self._seed_row()
-        self._retire_first()  # ledger recorded + retired; pair p3/p4 still live
+        self._retire_first()  # retired + reconcile_phase='reconciled'; pair p3/p4 still live
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        self.assertEqual(
+            LaneLifecycleStore().get(self._key()).reconcile_phase, RECONCILE_PHASE_RECONCILED
+        )
         result = self._run()
         self.assertEqual(result.state, RECONCILE_RECONCILED, result.detail)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
-        # The owed pair was closed on resume; the ledger was cleared.
+        # The owed pair was closed on resume.
         self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2"})
-        from mozyo_bridge.core.state.lane_reconcile_owed import LaneReconcileOwedStore
-        self.assertIsNone(LaneReconcileOwedStore().read(_WORKSPACE_ID, _LANE))
 
     def test_owed_close_resume_recycled_newer_withholds(self) -> None:
         # Review j#79346 R5 (the core): after the retire CAS, the live pair recycles to a NEWER
@@ -910,24 +910,31 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.reason, RECON_CLOSE_FAILED)
         self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
 
-    def test_owed_ledger_generation_revision_mismatch_not_resumed(self) -> None:
-        # Review j#79346 R5 provenance discipline: a ledger whose (generation, retired_revision)
-        # does NOT match the live retired row (a stale entry from a reopened / different
-        # generation) is NOT reconcile-owned -> no resume-close (collision-proof).
+    def test_blocked_close_failed_reports_actual_side_effects(self) -> None:
+        # Review j#79363 R7: the GREEN path retires (retire-first) then the post-close whole-unit
+        # measure finds a NEWER generation live -> blocked/close_failed. The typed outcome + text
+        # must report the ACTUAL durable side effects (retired=True, the closed old pins), not
+        # "nothing was written or closed".
         self._seed_row()
-        rec = LaneLifecycleStore().get(self._key())
-        LaneReconcileOwedStore().record(
-            workspace_id=_WORKSPACE_ID, lane_id=_LANE,
-            lane_generation=rec.lane_generation, retired_revision=rec.revision + 99,  # mismatch
-        )
-        LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
-            self._key(), expected_revision=rec.revision, issue_id=_ISSUE,
-            worktree_identity=self._token(), declared_slots=_pins(), decision=_decision(),
-        )
-        result = self._run()  # pair p3/p4 live
+        # call 0 = initial (p3/p4); call 1 = close re-observe (p3/p4, match -> close them);
+        # call 2 = post-close measure = a newer pair at p8/p9.
+        post = [
+            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
+            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p8"),
+            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p9"),
+        ]
+        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={2: lambda: post})
+        result = self._run(ops=ops)
         self.assertEqual(result.state, RECONCILE_BLOCKED)
-        self.assertEqual(result.reason, RECON_LIVE_PAIR_PRESENT)
-        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        # R7: the durable side effects are reported honestly.
+        self.assertTrue(result.retired)
+        self.assertEqual(len(result.closed), 2)  # the old p3/p4 were closed
+        self.assertTrue(result.as_payload()["retired"])
+        text = format_reconcile_text(result)
+        self.assertIn("lane retired", text)
+        self.assertNotIn("nothing was written or closed", text)
 
     def test_ordinary_retired_bound_row_live_pair_not_closed(self) -> None:
         # Review j#79320 R4: an ORDINARY #13809/#13810-bound row retired through the normal

@@ -36,18 +36,19 @@ unique, idle / turn-ended, settled, and generation-bound attested:
    pending pair is zero-closed (review j#79320 R2). After the close it re-measures the WHOLE lane
    unit's expected pair: success requires a positive absence at any locator (review j#79320 R3).
 
-Replayability (the "one replayable owed-state flow", review j#79346 R5): before the retire CAS
-the reconcile records a collision-proof owed-close entry in the durable
-:class:`...lane_reconcile_owed.LaneReconcileOwedStore`, pinning the exact
-``(lane_generation, retired_revision)`` the CAS produces. A crash after the CAS but before the
-pane close is resumed **in this same reconcile authority** — the retired-terminal branch fires
-ONLY when the ledger matches this live retired row's ``(generation, revision)`` (an ordinary
-bound retired row has no entry and is never resumed, review j#79320 R4), and it re-runs the SAME
-full-conjunct close, so a recycled newer generation is never closed. A completed close (positive
-absence) clears the ledger and is an idempotent ``already_reconciled`` no-op. A hibernated row
-with no live pair is NOT an owed state (retire never happens on absence) — it routes to the
-#13841 live-zero migration. The reconcile resumes its OWN owed close; there is deliberately NO
-handoff to the name-based, ungated #13754 close (which would close a newer generation, R5).
+Replayability (the "one replayable owed-state flow", review j#79346 R5 / j#79363 R6): the retire
+CAS writes a collision-proof ``reconcile_phase='reconciled'`` provenance ON the authoritative
+``lane_lifecycle`` row (a v6 column, review j#79363 R6) — co-located with the row, so it is
+recovered by the component's own ``operator_current_state`` re-declare and can never be lost
+independently of the row (a load-bearing owed-state marker is NOT a rebuildable cache). A crash
+after the CAS but before the pane close is resumed **in this same reconcile authority** — the
+retired-terminal branch fires ONLY when ``reconcile_phase == 'reconciled'`` (an ordinary
+#13809/#13810-bound retired row has an empty phase and is never resumed, review j#79320 R4), and
+re-runs the SAME full-conjunct close, so a recycled newer generation is never closed. A completed
+close (positive absence) is an idempotent ``already_reconciled`` no-op. A hibernated row with no
+live pair is NOT an owed state (retire never happens on absence) — it routes to the #13841
+live-zero migration. The reconcile resumes its OWN owed close; there is deliberately NO handoff to
+the name-based, ungated #13754 close (which would close a newer generation, R5).
 
 Boundary (Redmine #13842): NO process launch / resume, no worktree / branch removal, no raw
 Herdr / tmux, no origin/main, no production / tag / publish. The only process mutation is the
@@ -116,6 +117,12 @@ class HibernatedLiveReconcileVerdict:
     ``ok`` (the command's exit-code authority) is true only for a real reconcile or a verified
     idempotent no-op — every other outcome is :data:`RECONCILE_BLOCKED` with the ``reason`` that
     could not be established, never a success.
+
+    ``retired`` and ``closed`` report the durable side effects that ACTUALLY happened, even on a
+    :data:`RECONCILE_BLOCKED` verdict (Redmine #13842 review j#79363 R7): the reconcile is
+    retire-first, so a blocked run may have already committed the ``retired`` disposition and
+    closed some pins (e.g. a post-close whole-unit measure that found a newer generation live).
+    A caller / text renderer must not claim "nothing was written or closed" when either is set.
     """
 
     state: str
@@ -124,6 +131,9 @@ class HibernatedLiveReconcileVerdict:
     workspace_id: str = ""
     lane_id: str = ""
     closed: tuple[str, ...] = ()
+    #: Did this run (or a prior same-flow run this replays) durably retire the lane? A blocked
+    #: verdict with ``retired=True`` still performed a durable write (R7).
+    retired: bool = False
 
     @property
     def ok(self) -> bool:
@@ -137,6 +147,7 @@ class HibernatedLiveReconcileVerdict:
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
             "closed": list(self.closed),
+            "retired": self.retired,
         }
 
 
@@ -146,6 +157,8 @@ def _blocked(
     detail: str = "",
     workspace_id: str = "",
     lane_id: str = "",
+    retired: bool = False,
+    closed: tuple[str, ...] = (),
 ) -> HibernatedLiveReconcileVerdict:
     return HibernatedLiveReconcileVerdict(
         state=RECONCILE_BLOCKED,
@@ -153,6 +166,8 @@ def _blocked(
         detail=detail,
         workspace_id=workspace_id,
         lane_id=lane_id,
+        retired=retired,
+        closed=closed,
     )
 
 
@@ -323,6 +338,7 @@ def run_hibernated_live_reconcile(
         CAS_UNEXPECTED_STATE,
         DISPOSITION_HIBERNATED,
         DISPOSITION_RETIRED,
+        RECONCILE_PHASE_RECONCILED,
         RELEASE_RELEASED,
         DecisionPointer,
         DecisionPointerError,
@@ -575,18 +591,6 @@ def run_hibernated_live_reconcile(
             managed_pairs=managed_pairs,
         )
 
-    def _read_owed(store_cls, ws, lane):
-        try:
-            return store_cls().read(ws, lane)
-        except Exception:  # noqa: BLE001 - an unreadable ledger fails closed (no resume)
-            return None
-
-    def _clear_owed(store_cls, ws, lane, rev):
-        try:
-            store_cls().clear(workspace_id=ws, lane_id=lane, retired_revision=rev)
-        except Exception:  # noqa: BLE001 - a clear failure is harmless (a later resume re-clears)
-            pass
-
     def _close_owed_pair(pins):
         """Re-verify the exact pair at close time, pin-match close it, confirm the WHOLE unit gone.
 
@@ -654,35 +658,28 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
             closed=tuple(f"{role} {loc}" for role, loc in closed),
+            retired=True,
         )
 
     # Terminal (retire-first) branch: this reconcile OR an ordinary lifecycle path may have retired
     # this row. The reconcile resumes its OWN owed close (a crash after the retire CAS committed
     # but before the pane close) — in the SAME reconcile authority, at the EXACT generation it
-    # verified — ONLY when the durable owed-close ledger (:class:`LaneReconcileOwedStore`) carries
-    # a collision-proof entry matching this live retired row's ``(lane_generation, revision)``
-    # (Redmine #13842 review j#79346 R5). An ordinary #13809/#13810-bound retired row has NO
-    # ledger entry, so it is never resumed (review j#79320 R4 preserved). The resume applies the
-    # SAME full close-time re-verification + whole-unit measure as the forward close, so a
-    # recycled newer generation / busy / pending pair is zero-closed — never the name-based,
-    # ungated #13754 close R5 flagged.
-    from mozyo_bridge.core.state.lane_reconcile_owed import LaneReconcileOwedStore
-
+    # verified — ONLY when the row's durable ``reconcile_phase`` provenance says the reconcile
+    # retired it (Redmine #13842 review j#79363 R6: the marker lives ON the authoritative row, so
+    # it is recovered by the component's own re-declare, never a losable cache). An ordinary
+    # #13809/#13810-bound retired row carries an empty phase and is never resumed (review j#79320
+    # R4 preserved). The resume applies the SAME full close-time re-verification + whole-unit
+    # measure as the forward close, so a recycled newer generation / busy / pending pair is
+    # zero-closed — never the name-based, ungated #13754 close R5 flagged.
     if record.lane_disposition == DISPOSITION_RETIRED and (
         record.issue_id or ""
     ).strip() == issue:
-        owed = _read_owed(LaneReconcileOwedStore, workspace_id, lane_label)
-        reconcile_owned = (
-            owed is not None
-            and owed.retired_revision == record.revision
-            and owed.lane_generation == record.lane_generation
-        )
+        reconcile_owned = record.reconcile_phase == RECONCILE_PHASE_RECONCILED
         if not reconcile_owned:
-            # No reconcile owed-close provenance for THIS generation: a completed reconcile
-            # (ledger cleared), or an ordinary bound retired row. A positive absence is a
-            # harmless idempotent no-op; a live pair withholds (a persisted retired disposition
-            # does not prove non-liveness, and the reconcile never closes a pair it cannot prove
-            # it owns — review j#79320 R4).
+            # An ordinary bound retired row (empty phase). A positive absence is a harmless
+            # idempotent no-op; a live pair withholds (a persisted retired disposition does not
+            # prove non-liveness, and the reconcile never closes a pair it cannot prove it owns —
+            # review j#79320 R4). Nothing was written or closed on this run.
             if verdict.absent:
                 return HibernatedLiveReconcileVerdict(
                     state=RECONCILE_ALREADY,
@@ -696,21 +693,18 @@ def run_hibernated_live_reconcile(
             return _blocked(
                 RECON_LIVE_PAIR_PRESENT,
                 detail=(
-                    "the lane is durably retired with no reconcile owed-close provenance for "
-                    "this generation but an expected managed pair is live; a persisted retired "
-                    "disposition does not prove non-liveness, and the reconcile never closes a "
-                    "pair it cannot prove it owns. Success withheld"
+                    "the lane is durably retired with no reconcile owed-close provenance but an "
+                    "expected managed pair is live; a persisted retired disposition does not "
+                    "prove non-liveness, and the reconcile never closes a pair it cannot prove "
+                    "it owns. Success withheld"
                 ),
                 workspace_id=workspace_id,
                 lane_id=lane_label,
             )
-        # Reconcile-owned owed close: resume it in the same flow.
+        # Reconcile-owned owed close: resume it in the same flow. The row is ALREADY durably
+        # retired (this run does not write it again, but it IS a reconcile-retired lane).
         if verdict.absent:
-            # The pane close already completed (a completed reconcile whose ledger clear did not
-            # land): clear now and report the idempotent no-op.
-            _clear_owed(
-                LaneReconcileOwedStore, workspace_id, lane_label, record.revision
-            )
+            # The pane close already completed: the reconcile is done (idempotent no-op).
             return HibernatedLiveReconcileVerdict(
                 state=RECONCILE_ALREADY,
                 detail=(
@@ -730,9 +724,11 @@ def run_hibernated_live_reconcile(
                 detail="the reconcile-retired row carries no readable declared pins to resume",
                 workspace_id=workspace_id,
                 lane_id=lane_label,
+                retired=True,
             )
         closed, ok = _close_owed_pair(recorded)
         if not ok:
+            # The row IS durably retired and some pins may already be closed (report both, R7).
             return _blocked(
                 RECON_CLOSE_FAILED,
                 detail=(
@@ -743,8 +739,9 @@ def run_hibernated_live_reconcile(
                 ),
                 workspace_id=workspace_id,
                 lane_id=lane_label,
+                retired=True,
+                closed=tuple(f"{role} {loc}" for role, loc in closed),
             )
-        _clear_owed(LaneReconcileOwedStore, workspace_id, lane_label, record.revision)
         return _reconciled(closed)
 
     # The reconcilable base signature (Redmine #13842 review j#79320 R1): hibernated + durably
@@ -822,34 +819,10 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    # Record the owed-close ledger BEFORE the retire CAS (review j#79346 R5): an entry must be
-    # present whenever a row becomes reconcile-retired, so a crash after the CAS is resumable in
-    # this same reconcile authority. A ledger write failure fails closed here — the reconcile does
-    # NOT retire, because an unrecorded retire is an unresumable owed close. The ledger pins the
-    # generation + the revision the CAS will produce (record.revision + 1).
-    from mozyo_bridge.core.state.lane_reconcile_owed import (
-        LaneReconcileOwedError,
-        LaneReconcileOwedStore,
-    )
-
-    try:
-        LaneReconcileOwedStore().record(
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-            lane_generation=record.lane_generation,
-            retired_revision=record.revision + 1,
-        )
-    except (LaneReconcileOwedError, OSError) as exc:
-        return _blocked(
-            RECON_STORE_ERROR,
-            detail=(
-                f"the reconcile owed-close ledger could not be recorded ({type(exc).__name__}); "
-                "the reconcile fails closed BEFORE retiring (an unrecorded retire would be an "
-                "unresumable owed close)"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
+    # The retire CAS atomically writes the ``reconcile_phase='reconciled'`` provenance ON the row
+    # (Redmine #13842 review j#79363 R6), so a crash after the CAS but before the pane close is
+    # resumable in this same reconcile authority — no separate losable ledger, and the provenance
+    # is recovered with the row by the component's own re-declare.
     try:
         outcome = LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
             key,
@@ -890,10 +863,12 @@ def run_hibernated_live_reconcile(
             lane_id=lane_label,
         )
     # Durably retired under the exact verified generation (terminal — no rehydrate possible), with
-    # the owed-close ledger recorded. Close the exact pinned pair, re-verifying the full conjunct
-    # at close time (R2) and measuring the whole unit afterwards (R3).
+    # the ``reconcile_phase`` provenance written ON the row. Close the exact pinned pair,
+    # re-verifying the full conjunct at close time (R2) and measuring the whole unit afterwards (R3).
     closed, ok = _close_owed_pair(pins)
     if not ok:
+        # The lane IS durably retired and some pins may already be closed — report both (R7): a
+        # blocked verdict here is NOT zero-write / zero-close.
         return _blocked(
             RECON_CLOSE_FAILED,
             detail=(
@@ -901,13 +876,13 @@ def run_hibernated_live_reconcile(
                 "closed under the full close-time re-verification (a busy / pending / duplicate / "
                 "foreign / recycled generation, a failed close, or an unreadable inventory); the "
                 "expected pair is still live. The reconcile re-runs its own owed close (the "
-                "durable owed-close ledger persists) — no cross-surface handoff"
+                "reconcile_phase provenance persists on the row) — no cross-surface handoff"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
+            retired=True,
+            closed=tuple(f"{role} {loc}" for role, loc in closed),
         )
-    # The owed close completed: clear the ledger (best-effort; a stale entry self-heals).
-    _clear_owed(LaneReconcileOwedStore, workspace_id, lane_label, outcome.revision)
     return _reconciled(closed)
 
 
@@ -922,12 +897,24 @@ def format_reconcile_text(result: HibernatedLiveReconcileVerdict) -> str:
     lines = [f"{header} workspace={unit}"]
     if result.detail:
         lines.append(f"    {result.detail}")
-    if not result.ok:
-        lines.append(
-            "    -> fail-closed: lane NOT reconciled; nothing was written or closed"
-        )
+    # Report the durable side effects that ACTUALLY happened, even on a blocked verdict (Redmine
+    # #13842 review j#79363 R7): a retire-first blocked run may have already committed the retired
+    # disposition and closed some pins, so "nothing was written or closed" is used ONLY when both
+    # are truly zero.
+    if result.retired:
+        lines.append("    - durable write: lane retired (retire-first)")
     for closed in result.closed:
         lines.append(f"    - closed {closed}")
+    if not result.ok:
+        if result.retired or result.closed:
+            lines.append(
+                "    -> fail-closed: the owed close is INCOMPLETE (side effects above); "
+                "the reconcile re-runs its own owed close"
+            )
+        else:
+            lines.append(
+                "    -> fail-closed: lane NOT reconciled; nothing was written or closed"
+            )
     return "\n".join(lines)
 
 

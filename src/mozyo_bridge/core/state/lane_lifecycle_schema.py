@@ -55,11 +55,18 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: never re-derived as project scope from the lane id (j#78386 §6). j#78386's original
 #: "v4" number is deliberately NOT reused: staging is already v4 (worktree binding), so
 #: this tranche takes the next free version v5 (j#78860 item 2).
-LANE_LIFECYCLE_SCHEMA_VERSION = 5
-#: The component shapes this build can read and write. ``1``–``4`` are migrated
-#: additively to ``5``; anything else — a newer version from a future build, or a foreign
+#: v6 (Redmine #13842 review j#79363 R6) adds ``reconcile_phase`` — the collision-proof
+#: provenance the hibernated live-contradiction reconcile writes (``'reconciled'``) so a
+#: retired row can be told apart from an ordinary #13809 / #13810-bound retired row when the
+#: reconcile resumes its own owed pane close after a crash. It lives ON the authoritative row
+#: (co-located, recovered by the component's own ``operator_current_state`` re-declare) rather
+#: than a separate losable cache: a load-bearing owed-state marker must not be a rebuildable
+#: cache (R6). A pre-v6 row migrates with an empty phase (an ordinary / non-reconcile row).
+LANE_LIFECYCLE_SCHEMA_VERSION = 6
+#: The component shapes this build can read and write. ``1``–``5`` are migrated
+#: additively to ``6``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -91,6 +98,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     project_scope TEXT NOT NULL DEFAULT '',
     lane_generation INTEGER NOT NULL DEFAULT 1,
     declared_slots TEXT NOT NULL DEFAULT '',
+    reconcile_phase TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -125,7 +133,7 @@ _COLUMNS = (
     "revision, release_action_id, release_pins, replacement_state, "
     "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
-    "binding_kind, project_scope, lane_generation, declared_slots"
+    "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase"
 )
 
 _V1_COLUMNS = frozenset(
@@ -152,6 +160,7 @@ _V4_ADDS = frozenset({"worktree_identity"})  # #13754 worktree binding
 _V5_ADDS = frozenset(
     {"binding_kind", "project_scope", "lane_generation", "declared_slots"}  # #13810
 )
+_V6_ADDS = frozenset({"reconcile_phase"})  # #13842 reconcile owed-close provenance
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -166,12 +175,14 @@ _SHAPE_V3_REPLACEMENT = _V1_COLUMNS | _V2_ADDS | _V3_ADDS
 _SHAPE_V3_WORKTREE = _V1_COLUMNS | _V2_ADDS | _V4_ADDS
 _SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
 _SHAPE_V5 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS
+_SHAPE_V6 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS | _V6_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
     3: (_SHAPE_V3_REPLACEMENT, _SHAPE_V3_WORKTREE),
     4: (_SHAPE_V4,),
     5: (_SHAPE_V5,),
+    6: (_SHAPE_V6,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -201,6 +212,7 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "project_scope": ("TEXT", 1, "''", 0),
     "lane_generation": ("INTEGER", 1, "1", 0),
     "declared_slots": ("TEXT", 1, "''", 0),
+    "reconcile_phase": ("TEXT", 1, "''", 0),
 }
 
 
@@ -649,7 +661,8 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
         else:
             # A recognized OLDER version whose shape matches one of its KNOWN predecessor
             # signatures (v1, v2, or either v3 branch). Migrate forward: back up first, then
-            # add only the columns that version legitimately lacks to converge on v4.
+            # add only the columns that version legitimately lacks to converge on the current
+            # version.
             current_columns = {
                 row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")
             }
@@ -665,7 +678,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                     f"aborted: {exc}. The store is left untouched (backup-first)."
                 ) from exc
             # One atomic transaction (Redmine #13754 R4-F2): the additive ``ALTER``s that
-            # bring the older shape up to v4 and the version re-stamp run inside this one
+            # bring the older shape up to the current version and the version re-stamp run inside this one
             # ``BEGIN IMMEDIATE`` block, so a failure part-way rolls the whole migration back
             # (schema + recorded version stay at the predecessor) and the backup remains the
             # recovery point. Each ``ALTER`` only ADDS a column the older version legitimately
@@ -722,6 +735,13 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN declared_slots TEXT NOT NULL DEFAULT ''"
+                )
+            # v6 (Redmine #13842): the reconcile owed-close provenance. A pre-v6 row lands with
+            # an empty phase — an ordinary / non-reconcile row (never a guessed 'reconciled').
+            if "reconcile_phase" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN reconcile_phase TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

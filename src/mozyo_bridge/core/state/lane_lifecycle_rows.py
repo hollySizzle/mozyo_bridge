@@ -7,7 +7,7 @@ The row-level DB plumbing that both the core CAS store
 ``lane_lifecycle_records`` row:
 
 - :func:`_record` — decode a ``SELECT`` row (all columns) into a typed record;
-- :func:`_insert_active_row` — the single fresh-``active``-row ``INSERT`` (one 21-column
+- :func:`_insert_active_row` — the single fresh-``active``-row ``INSERT`` (one 22-column
   value tuple, so no call site can drift out of column order with the schema);
 - :func:`_locked_row` — read the row inside an already-open ``BEGIN IMMEDIATE``;
 - :func:`_active_owner` / :func:`_active_project_owner` — the in-lock owner pre-checks for
@@ -71,6 +71,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         project_scope=str(row[18] or ""),
         lane_generation=int(row[19]),
         declared_slots=str(row[20] or ""),
+        reconcile_phase=str(row[21] or ""),
     )
 
 
@@ -100,7 +101,7 @@ def _insert_active_row(
 
     The single place a brand-new lane row is written — used by ``declare_active`` and the
     recovery-lane create inside ``supersede_and_activate`` (core store), and by
-    ``declare_lane`` (declaration service) — so the 21-column value tuple exists once and
+    ``declare_lane`` (declaration service) — so the 22-column value tuple exists once and
     cannot drift per call site.
     """
     conn.execute(
@@ -127,6 +128,7 @@ def _insert_active_row(
             project_scope,
             lane_generation,
             declared_slots,
+            "",  # reconcile_phase: a fresh lane is never reconcile-retired (v6, #13842)
         ),
     )
 
