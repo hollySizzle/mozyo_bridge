@@ -109,6 +109,7 @@ def _target(**overrides) -> GateTarget:
         target_assigned_name="worker-a",
         provider_id="claude",
         agent_generation=3,
+        lane_revision=1,
     )
     kwargs.update(overrides)
     return GateTarget(**kwargs)

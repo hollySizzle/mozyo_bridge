@@ -401,9 +401,15 @@ def _execute_startup_resume_leg(
         f"fence_state: {result.fence_state}\n"
         f"sent: {result.sent}\n"
         f"record_failed: {result.record_failed}\n"
+        f"needs_reconcile: {result.needs_reconcile}\n"
         f"detail: {result.detail}"
     )
-    return (0 if result.ok else 1), text
+    # An operator-reconcile-required outcome must surface a non-zero process status even when
+    # the delivery itself was positive (review j#79366 F2): a `record_failed` durable append or
+    # any `needs_reconcile` state (uncertain / fence row lost) is NOT a success for automation,
+    # independent of the delivery receipt.
+    rc = 0 if (result.ok and not result.needs_reconcile) else 1
+    return rc, text
 
 
 def _maybe_operator_startup_resume_outcome(

@@ -130,6 +130,9 @@ class ResumeHandoffSendPort:
         orig = gate.original_request
 
         def _send() -> SendOutcome:
+            # Exact target/lane/repo bind (review j#79366 F1): the explicit resolved repo root
+            # and lane label, NOT `--target-repo auto` inference, so the re-issue lands in the
+            # exact repo + lane context the gate was pinned against.
             argv = [
                 self.mozyo_bridge_bin,
                 "handoff",
@@ -149,7 +152,9 @@ class ResumeHandoffSendPort:
                 "--mode",
                 "standard",
                 "--target-repo",
-                "auto",
+                repo_root,
+                "--target-lane",
+                gate.target.lane_id,
                 "--record-format",
                 "json",
             ]

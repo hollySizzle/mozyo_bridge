@@ -391,10 +391,14 @@ class GateTarget:
     ``repo_identity_digest`` (opaque; :func:`repo_identity_digest`), ``execution_root``
     (repo-relative, ``"."`` at the root — never absolute), ``lane_id`` /
     ``target_role`` / ``target_assigned_name`` (durable managed identity),
-    ``provider_id``, and a positive ``agent_generation`` (the attested live
-    generation). The gate is honored only against a live re-observation that matches
-    THIS tuple; a blank / mismatched / newer-generation observation is stale and
-    zero-actuation (the projection's stale判定).
+    ``provider_id``, a positive ``agent_generation`` (the attested live generation), and a
+    positive ``lane_revision`` (the lane lifecycle record's CAS revision the gate was pinned
+    against). The gate is honored only against a live re-observation that matches THIS tuple
+    AND the exact ``agent_generation`` AND the exact ``lane_revision``; a blank / mismatched /
+    newer-generation / revision-drifted observation is stale and zero-actuation (review
+    j#79366 F1). ``repo_identity_digest`` is :func:`repo_identity_digest` over the
+    ``workspace_id`` (the registry-authority identity), so the resume can re-derive and
+    re-verify it at action time without a checkout path.
     """
 
     workspace_id: str
@@ -405,6 +409,7 @@ class GateTarget:
     target_assigned_name: str
     provider_id: str
     agent_generation: int
+    lane_revision: int
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -449,6 +454,13 @@ class GateTarget:
                 self.agent_generation, field_name="target.agent_generation"
             ),
         )
+        object.__setattr__(
+            self,
+            "lane_revision",
+            _require_positive_generation(
+                self.lane_revision, field_name="target.lane_revision"
+            ),
+        )
 
     @property
     def identity_key(self) -> tuple[str, str, str, str, str, str]:
@@ -489,6 +501,7 @@ class GateTarget:
             "target_assigned_name": self.target_assigned_name,
             "provider_id": self.provider_id,
             "agent_generation": self.agent_generation,
+            "lane_revision": self.lane_revision,
         }
 
     @classmethod
@@ -503,6 +516,7 @@ class GateTarget:
             target_assigned_name=_get(record, "target_assigned_name"),
             provider_id=_get(record, "provider_id"),
             agent_generation=record.get("agent_generation"),
+            lane_revision=record.get("lane_revision"),
         )
 
 

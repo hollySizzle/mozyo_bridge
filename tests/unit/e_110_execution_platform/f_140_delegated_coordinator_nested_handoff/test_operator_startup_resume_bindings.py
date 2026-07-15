@@ -62,6 +62,7 @@ def _target(**overrides) -> GateTarget:
         target_assigned_name="worker-a",
         provider_id="claude",
         agent_generation=3,
+        lane_revision=1,
     )
     kwargs.update(overrides)
     return GateTarget(**kwargs)
@@ -126,7 +127,7 @@ class ResumeHandoffSendPortTests(unittest.TestCase):
             captured["argv"] = list(argv)
             return 0, '{"status": "sent", "reason": "ok"}'
 
-        send = ResumeHandoffSendPort(locator="w1:p1", runner=runner).build(_done_gate(), ".", {})
+        send = ResumeHandoffSendPort(locator="w1:p1", runner=runner).build(_done_gate(), "/repo/root", {})
         outcome = send()
         self.assertEqual(outcome.turn_start, TURN_START_STARTED)
         argv = captured["argv"]
@@ -137,6 +138,10 @@ class ResumeHandoffSendPortTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--mode") + 1], "standard")
         self.assertEqual(argv[argv.index("--record-format") + 1], "json")
         self.assertEqual(argv[argv.index("--issue") + 1], "13760")
+        # review j#79366 F1 — exact repo + lane bind, not `--target-repo auto`.
+        self.assertEqual(argv[argv.index("--target-repo") + 1], "/repo/root")
+        self.assertEqual(argv[argv.index("--target-lane") + 1], "lane-alpha")
+        self.assertNotIn("auto", argv)
 
     def test_runner_raises_is_unknown_never_started(self) -> None:
         def runner(argv):
@@ -212,23 +217,35 @@ class ResumeTargetResolverTests(unittest.TestCase):
             locator=locator,
         )
 
-    def _record(self, *, disposition=DISPOSITION_ACTIVE, issue="13760", generation=3, pin=None):
+    def _record(
+        self, *, disposition=DISPOSITION_ACTIVE, issue="13760", generation=3, revision=1, pin=None
+    ):
         return SimpleNamespace(
             lane_disposition=disposition,
             issue_id=issue,
             lane_generation=generation,
+            revision=revision,
             declared_pins=(pin if pin is not None else self._pin(),),
         )
 
-    def _resolver(self, *, record=None, rows=None):
+    def _identity(self):
+        # The gate's exact identity — the positive workspace re-resolution returns it verbatim.
+        t = _target()
+        return (t.workspace_id, t.repo_identity_digest, t.execution_root)
+
+    _UNSET = object()
+
+    def _resolver(self, *, record=None, rows=None, workspace=_UNSET):
         rows = rows if rows is not None else [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}]
         rec = record if record is not None else self._record()
+        identity = self._identity() if workspace is self._UNSET else workspace
         return ResumeTargetResolver(
             env={},
             lifecycle_get=lambda ws, lane: rec,
             inventory=lambda env: rows,
             attestation_read=lambda name: SimpleNamespace(),
             capture=lambda loc, lines: self._READY,
+            workspace_resolve=lambda env: identity,
         )
 
     def setUp(self) -> None:
@@ -293,6 +310,51 @@ class ResumeTargetResolverTests(unittest.TestCase):
         self.assertIsNone(
             self._resolver(record=self._record(pin=other_pin)).resolve(_done_gate(), {})
         )
+
+    # review j#79366 F1 — the exact-binding drifts that must all fail closed.
+    def test_revision_drift_none(self) -> None:
+        self.assertIsNone(
+            self._resolver(record=self._record(revision=999)).resolve(_done_gate(), {})
+        )
+
+    def test_foreign_provider_live_row_none(self) -> None:
+        rows = [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1", "provider": "foreign-provider"}]
+        self.assertIsNone(self._resolver(rows=rows).resolve(_done_gate(), {}))
+
+    def test_runtime_revision_drift_none(self) -> None:
+        # Declared pin runtime "declared-r1" vs a live row carrying runtime "live-r2".
+        pin = ProcessGenerationPin(
+            role="implementation_worker",
+            provider="claude",
+            assigned_name="worker-a",
+            locator="w1:p1",
+            runtime_revision="declared-r1",
+        )
+        rows = [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1", "runtime_revision": "live-r2"}]
+        self.assertIsNone(
+            self._resolver(record=self._record(pin=pin), rows=rows).resolve(_done_gate(), {})
+        )
+
+    def test_workspace_id_mismatch_none(self) -> None:
+        self.assertIsNone(
+            self._resolver(workspace=("foreign-ws", *self._identity()[1:])).resolve(_done_gate(), {})
+        )
+
+    def test_repo_digest_mismatch_none(self) -> None:
+        wrong = (self._identity()[0], repo_identity_digest("other-repo"), ".")
+        self.assertIsNone(self._resolver(workspace=wrong).resolve(_done_gate(), {}))
+
+    def test_execution_root_mismatch_none(self) -> None:
+        wrong = (self._identity()[0], self._identity()[1], "projects/elsewhere")
+        self.assertIsNone(self._resolver(workspace=wrong).resolve(_done_gate(), {}))
+
+    def test_workspace_unresolved_none(self) -> None:
+        self.assertIsNone(self._resolver(workspace=None).resolve(_done_gate(), {}))
+
+    def test_advanced_target_carries_revision(self) -> None:
+        r = self._resolver().resolve(_done_gate(), {})
+        assert r is not None
+        self.assertEqual(r.observed.target.lane_revision, 1)
 
 
 if __name__ == "__main__":

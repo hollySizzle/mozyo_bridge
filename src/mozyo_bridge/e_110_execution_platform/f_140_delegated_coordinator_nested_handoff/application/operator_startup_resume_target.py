@@ -105,11 +105,46 @@ def _default_capture(locator: str, lines: int) -> object:
         return ""
 
 
-def _live_locator_for(rows: Sequence[Mapping[str, object]], assigned_name: str) -> Optional[str]:
-    """The single live locator for ``assigned_name``, or None (missing / duplicate -> fail)."""
+#: Re-resolve the live action-time repo identity: ``(workspace_id, repo_identity_digest,
+#: execution_root)``, or None (unresolved -> zero-send). Injectable.
+WorkspaceResolve = Callable[[Mapping[str, str]], Optional["tuple[str, str, str]"]]
+
+
+def _default_workspace_resolve(env: Mapping[str, str]) -> Optional["tuple[str, str, str]"]:
+    """Re-resolve the live action-time repo identity, or None (fail-soft zero-send).
+
+    Resolves the live workspace id from the action-time sender identity (registry authority),
+    derives the pasteable ``repo_identity_digest`` over it (the documented convention — the
+    digest is over the registry workspace id, so it is re-derivable without a checkout path),
+    and reports the repo root ``execution_root`` ``"."``. Any resolution failure returns None
+    so the resolver zero-sends rather than trust the gate's own (possibly forged) identity.
+    """
+    try:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+            resolve_sender_identity,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
+            repo_identity_digest,
+        )
+
+        res = resolve_sender_identity(env, anchor_workspace_id=None)
+        identity = getattr(res, "identity", None)
+        if not getattr(res, "ok", False) or identity is None:
+            return None
+        workspace_id = str(getattr(identity, "workspace_id", "")).strip()
+        if not workspace_id:
+            return None
+        return (workspace_id, repo_identity_digest(workspace_id), ".")
+    except Exception:  # noqa: BLE001 - unresolved live identity -> None (zero-send)
+        return None
+
+
+def _live_row_for(
+    rows: Sequence[Mapping[str, object]], assigned_name: str
+) -> Optional[Mapping[str, object]]:
+    """The single live inventory row for ``assigned_name``, or None (missing / duplicate)."""
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
         AGENT_KEY_NAME,
-        _agent_locator,
     )
 
     matches = [
@@ -118,10 +153,7 @@ def _live_locator_for(rows: Sequence[Mapping[str, object]], assigned_name: str) 
         if isinstance(row, Mapping)
         and str(row.get(AGENT_KEY_NAME, "")).strip() == assigned_name
     ]
-    if len(matches) != 1:
-        return None
-    locator = str(_agent_locator(matches[0])).strip()
-    return locator or None
+    return matches[0] if len(matches) == 1 else None
 
 
 @dataclass(frozen=True)
@@ -133,12 +165,14 @@ class ResumeTargetResolver:
     inventory: InventoryList = field(default=_default_inventory)
     attestation_read: AttestationRead = field(default=_default_attestation_read)
     capture: CaptureVisible = field(default=_default_capture)
+    workspace_resolve: WorkspaceResolve = field(default=_default_workspace_resolve)
     read_lines: int = RESUME_READ_LINES
 
     def resolve(self, gate: OperatorStartupGate, env: Mapping[str, str]) -> Optional[object]:
         target = gate.target
 
-        # 1. Lane lifecycle record: exists, active, issue binding, exact generation.
+        # 1. Lane lifecycle record: exists, active, issue binding, exact generation AND exact
+        #    CAS revision (review j#79366 F1 — a recycled/mutated lane fails closed).
         record = self.lifecycle_get(target.workspace_id, target.lane_id)
         if record is None:
             return None
@@ -151,6 +185,8 @@ class ResumeTargetResolver:
         if str(getattr(record, "issue_id", "")).strip() != gate.original_request.issue:
             return None
         if getattr(record, "lane_generation", None) != target.agent_generation:
+            return None
+        if getattr(record, "revision", None) != target.lane_revision:
             return None
 
         # 2. Exactly one declared pin with the gate's (role, provider, assigned_name).
@@ -167,9 +203,32 @@ class ResumeTargetResolver:
             return None
         pin = pins[0]
 
-        # 3. Exactly one live inventory row for the assigned name; its locator matches the pin.
-        live_locator = _live_locator_for(self.inventory(env), target.target_assigned_name)
-        if live_locator is None or live_locator != str(getattr(pin, "locator", "")).strip():
+        # 3. Exactly one live inventory row for the assigned name, and its FULL
+        #    ProcessGenerationPin.match_key (role/provider/name/locator/runtime_revision) equals
+        #    the declared pin's (review j#79366 F1 — a foreign provider / runtime-revision drift
+        #    fails closed, not just a locator match).
+        from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            _agent_locator,
+        )
+
+        row = _live_row_for(self.inventory(env), target.target_assigned_name)
+        if row is None:
+            return None
+        live_locator = str(_agent_locator(row)).strip()
+        if not live_locator:
+            return None
+        try:
+            live_pin = ProcessGenerationPin(
+                role=str(row.get("role") or target.target_role).strip(),
+                provider=str(row.get("provider") or target.provider_id).strip(),
+                assigned_name=target.target_assigned_name,
+                locator=live_locator,
+                runtime_revision=str(row.get("runtime_revision") or "").strip(),
+            )
+        except Exception:  # noqa: BLE001 - malformed live pin -> fail closed
+            return None
+        if live_pin.match_key != pin.match_key:
             return None
 
         # 4. Identity self-attestation for the live locator is ok.
@@ -188,9 +247,25 @@ class ResumeTargetResolver:
         if not getattr(join, "ok", False):
             return None
 
-        # Confirmed. Build the live target (gate identity + confirmed live generation) and
-        # bind the #13760 visible read to the live locator.
-        live_target = dataclasses.replace(target, agent_generation=record.lane_generation)
+        # 5. Re-resolve the live action-time repo identity and require it EXACTLY matches the
+        #    gate's workspace_id / repo_identity_digest / execution_root (review j#79366 F1 — a
+        #    wrong repo / execution root fails closed; the gate's own identity is not trusted).
+        live_identity = self.workspace_resolve(env)
+        if live_identity is None:
+            return None
+        live_workspace_id, live_digest, live_execution_root = live_identity
+        if (
+            live_workspace_id != target.workspace_id
+            or live_digest != target.repo_identity_digest
+            or live_execution_root != target.execution_root
+        ):
+            return None
+
+        # Confirmed. Build the live target (gate identity + confirmed live generation +
+        # revision) and bind the #13760 visible read to the live locator.
+        live_target = dataclasses.replace(
+            target, agent_generation=record.lane_generation, lane_revision=record.revision
+        )
         captured_locator = live_locator
         read_lines = self.read_lines
         capture = self.capture
@@ -221,5 +296,6 @@ __all__ = (
     "InventoryList",
     "AttestationRead",
     "CaptureVisible",
+    "WorkspaceResolve",
     "ResumeTargetResolver",
 )

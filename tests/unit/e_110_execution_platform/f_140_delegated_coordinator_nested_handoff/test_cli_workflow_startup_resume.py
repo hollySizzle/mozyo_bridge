@@ -56,6 +56,7 @@ def _target() -> GateTarget:
         target_assigned_name="worker-a",
         provider_id="claude",
         agent_generation=3,
+        lane_revision=1,
     )
 
 
@@ -173,30 +174,44 @@ class ResumeLegPredicateAndExecutorTests(unittest.TestCase):
             )
         )
 
-    def test_executor_delegates_to_leg(self) -> None:
-        calls = {}
-
-        def _fake_execute(args, issue):
-            calls["issue"] = issue
-            return type(
-                "R",
-                (),
-                {"result": "resume_delivered", "fence_state": "delivered", "sent": True,
-                 "record_failed": False, "detail": "ok", "ok": True},
-            )()
-
+    def _run_executor(self, **result_fields):
+        fields = dict(
+            result="resume_delivered",
+            fence_state="delivered",
+            sent=True,
+            record_failed=False,
+            needs_reconcile=False,
+            detail="ok",
+            ok=True,
+        )
+        fields.update(result_fields)
         orig = operator_startup_resume_leg.execute_startup_resume
-        operator_startup_resume_leg.execute_startup_resume = _fake_execute
+        operator_startup_resume_leg.execute_startup_resume = lambda args, issue: type("R", (), fields)()
         try:
-            rc, text = cli_workflow._execute_startup_resume_leg(
+            return cli_workflow._execute_startup_resume_leg(
                 _outcome(primitive=PRIMITIVE_OPERATOR_STARTUP_RESUME, execution=EXECUTION_READY),
                 argparse.Namespace(),
             )
         finally:
             operator_startup_resume_leg.execute_startup_resume = orig
+
+    def test_clean_delivery_is_rc_zero(self) -> None:
+        rc, text = self._run_executor()
         self.assertEqual(rc, 0)
-        self.assertEqual(calls["issue"], "13760")
         self.assertIn("resume_delivered", text)
+
+    def test_record_failed_delivery_is_rc_one(self) -> None:
+        # review j#79366 F2: a record_failed / needs_reconcile delivery must surface rc=1 even
+        # though the delivery itself was positive (operator reconcile required).
+        rc, text = self._run_executor(record_failed=True, needs_reconcile=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("record_failed: True", text)
+
+    def test_needs_reconcile_uncertain_is_rc_one(self) -> None:
+        rc, _ = self._run_executor(
+            result="resume_uncertain", fence_state="uncertain", needs_reconcile=True, ok=False
+        )
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":
