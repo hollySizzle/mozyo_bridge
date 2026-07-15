@@ -420,6 +420,26 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
         self.assertEqual(outcome, ADOPT_DECL_UNATTESTED)
         self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
 
+    def test_foreign_provider_snapshot_ambiguous_fails_closed(self) -> None:
+        # F4 (review j#79097): the provider-axis guard must be pinned on the AMBIGUOUS branch
+        # too, not just unattested — a foreign/swapped provider snapshot + a duplicate current
+        # provider slot fails closed rather than collapsing to already_owned.
+        self._seed_complete_row(
+            [
+                ProcessGenerationPin(
+                    role=GATEWAY_ROLE, provider="claude", assigned_name="a", locator="w1:pA"
+                ),
+                ProcessGenerationPin(
+                    role=WORKER_ROLE, provider="codex", assigned_name="b", locator="w1:pB"
+                ),
+            ]
+        )
+        self._attest_pair()
+        rows = [_row("codex", "w1:pA"), _row("codex", "w1:pB"), _row("claude", WK_LOC)]
+        outcome = self._call(rows)
+        self.assertEqual(outcome, ADOPT_DECL_DUPLICATE_CANDIDATES)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+
     def test_matching_provider_complete_row_unattested_is_already_owned(self) -> None:
         # Preserve: a COMPLETE row whose typed pins bind the CURRENT provider pair proceeds as
         # already_owned even on an unattested re-adopt (an established lane; #13810 R3-F3 / F1).
@@ -875,6 +895,31 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         )
         out = self._drive(adopted=True, rows=_pair_rows())  # no attestation seeded
         self.assertEqual(out, ADOPT_DECL_UNATTESTED)
+        self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
+
+    def test_official_path_foreign_provider_snapshot_ambiguous_blocks(self) -> None:
+        # F4 (review j#79097): the official-ops half of the foreign-provider + AMBIGUOUS matrix
+        # cell — a worktree-complete row bound to a swapped provider pair + a duplicate current
+        # provider slot blocks dispatch (owner-unbound), never already_owned.
+        token = _worktree_token(self.coord, self.worktree, LANE)
+        LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+            worktree_identity=token,
+            declared_slots=[
+                ProcessGenerationPin(
+                    role=GATEWAY_ROLE, provider="claude", assigned_name="a", locator="w1:pA"
+                ),
+                ProcessGenerationPin(
+                    role=WORKER_ROLE, provider="codex", assigned_name="b", locator="w1:pB"
+                ),
+            ],
+        )
+        self._attest_pair()
+        rows = [_row("codex", "w1:pA"), _row("codex", "w1:pB"), _row("claude", WK_LOC)]
+        out = self._drive(adopted=True, rows=rows)
+        self.assertEqual(out, ADOPT_DECL_DUPLICATE_CANDIDATES)
         self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
 
     def _drive_unreadable(self, *, workspace_segment) -> str:
