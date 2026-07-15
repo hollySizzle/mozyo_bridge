@@ -202,10 +202,11 @@ class LiveEnvelopePlannerOps:
         )
 
         # `source` is validated against `SOURCES` (non-None) by the facade before the
-        # anchored branch is reached; `normalize_anchor` itself fails closed on any
-        # value outside `SOURCES`, so a stray None would still raise `AnchorError`.
+        # anchored branch is reached; `cast` is a static-only narrow so the RAW value
+        # (including a stray `None`) reaches the domain validator unchanged, preserving
+        # its exact `unknown handoff source: <value>` wording (review j#79040 F2').
         return normalize_anchor(
-            source or "",
+            cast(str, source),
             task_id=task_id,
             comment_id=comment_id,
             anchor_url=anchor_url,
