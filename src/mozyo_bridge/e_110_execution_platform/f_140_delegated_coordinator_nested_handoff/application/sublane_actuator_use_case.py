@@ -675,6 +675,7 @@ class SublaneActuateUseCase:
                 command=None,
             )
         )
+        self.ops.declare_adopted_lane_lifecycle(lane_runtime_root, adopted=adopted)
 
         # Step 4 (--no-dispatch) — nothing to dispatch, so nothing to make ready.
         if not dispatch:

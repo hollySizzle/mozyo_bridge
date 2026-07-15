@@ -120,6 +120,10 @@ class FakeActuatorOps:
     def read_lane(self, worktree_path):
         return _lane()
 
+    def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+        # Redmine #13809: adopt owner-row backfill hook (no-op in this dispatch-gate fake).
+        return None
+
     def probe_gateway_ready(self, gateway_pane):
         # #13293: this fake's lane is always ready, so the readiness wait resolves on
         # the first probe (no back-off) and the dispatch-admission behavior is unchanged.

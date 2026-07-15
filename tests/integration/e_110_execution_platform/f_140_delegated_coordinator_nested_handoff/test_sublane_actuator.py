@@ -152,6 +152,12 @@ class FakeActuatorOps:
             return None
         return self._lane_seq.pop(0)
 
+    def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+        # Redmine #13809: record ONLY the real adopt-path backfill call (adopted=True), so
+        # a create (adopted=False, a no-op) leaves existing calls-list assertions unchanged.
+        if adopted:
+            self.calls.append(("declare_adopted_lane_lifecycle", worktree_path))
+
     def probe_gateway_ready(self, gateway_pane):
         self.calls.append(("probe_gateway_ready", gateway_pane))
         # Consume one scripted value per probe; the final value is sticky.

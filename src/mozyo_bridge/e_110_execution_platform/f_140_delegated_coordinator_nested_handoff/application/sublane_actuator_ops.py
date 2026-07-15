@@ -113,6 +113,19 @@ class SublaneActuatorOps(Protocol):
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]: ...
 
+    def declare_adopted_lane_lifecycle(
+        self, worktree_path: str, *, adopted: bool
+    ) -> None:
+        """Backfill an ADOPTED lane's lifecycle owner binding (Redmine #13809).
+
+        A live-adopt (``adopted`` True) records the lane's owner row through the common
+        declaration service, fail-closed and idempotent — closing the gap where a lane
+        adopted onto a live pair skipped :meth:`append_lane_column` and stayed
+        owner-rowless. A create (``adopted`` False) already declared via the append, so this
+        is a no-op. An adapter whose backend does not own a live-adopt owner row may no-op.
+        """
+        ...
+
     def probe_gateway_ready(self, gateway_pane: str) -> bool:
         """One non-fatal readiness snapshot of the gateway pane (#13293).
 
@@ -252,6 +265,16 @@ class LiveSublaneActuatorOps:
         ]
         if len(basename_matches) == 1:
             return basename_matches[0]
+        return None
+
+    def declare_adopted_lane_lifecycle(
+        self, worktree_path: str, *, adopted: bool
+    ) -> None:
+        # No-op for the tmux/cockpit backend: the standard herdr sublane live-adopt
+        # owner-row gap (Redmine #13809) is the herdr adapter's
+        # (:meth:`...HerdrSublaneActuatorOps.declare_adopted_lane_lifecycle`). The
+        # cockpit lane's owner binding is declared through the cockpit-append CLI this
+        # adapter drives; a live-adopt owner row here is out of #13809's scope.
         return None
 
     def probe_gateway_ready(self, gateway_pane: str) -> bool:

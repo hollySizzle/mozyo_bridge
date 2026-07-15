@@ -502,6 +502,56 @@ class HerdrSublaneActuatorOps:
                 file=sys.stderr,
             )
 
+    def declare_adopted_lane_lifecycle(
+        self, worktree_path: str, *, adopted: bool
+    ) -> None:
+        """Backfill an ADOPTED lane's owner binding via the common service (Redmine #13809).
+
+        The standard live-adopt path skips :meth:`append_lane_column`, so it never reached
+        the create-path :meth:`_declare_lane_lifecycle` and the adopted lane stayed
+        owner-rowless (the ``original_identity_unknown`` that blocks ``sublane hibernate``).
+        Only an ``adopted`` lane needs this — the create path already declared via append.
+        This resolves the live inventory into the lane's slots and delegates the
+        readable/unambiguous gate + fail-closed idempotent declaration to
+        :func:`...sublane_adopt_declaration.declare_adopted_owner_row`; a store error never
+        breaks the actuation (best-effort, like the create-path declare).
+        """
+        if not adopted:
+            return
+        try:
+            rows = self._live_rows()
+        except HerdrSessionStartError:
+            return  # inventory unreadable -> zero-write
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            WorkflowProviderUnresolved,
+        )
+
+        try:
+            providers = self._launch_providers()
+        except WorkflowProviderUnresolved:
+            return
+        resolved = self._resolve_lane_slots(worktree_path, rows, providers)
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARE_ERROR,
+            declare_adopted_owner_row,
+        )
+
+        outcome = declare_adopted_owner_row(
+            journal=self.journal or "",
+            issue=self.issue or "",
+            lane_label=self.lane_label or "",
+            repo_root=self.repo_root,
+            worktree_path=worktree_path,
+            providers=providers,
+            resolved=resolved,
+        )
+        if outcome == ADOPT_DECL_DECLARE_ERROR:
+            print(
+                "warning: adopted lane lifecycle declare skipped (store error); "
+                "lane reads as owner-unbound",
+                file=sys.stderr,
+            )
+
     def heal_lane_column(self, worktree_path: str) -> None:
         """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).
 
