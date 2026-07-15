@@ -58,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATION_EFFECT_FAILED,
     ACTUATION_GENERATION_MISMATCH,
     ACTUATION_IN_PROGRESS,
+    ACTUATION_INVALID_TOPOLOGY,
     ACTUATION_LEASE_LOST,
     ACTUATION_NOT_FOUND,
     ACTUATION_PRESERVATION_BLOCKED,
@@ -66,8 +67,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_DONE,
     attestation_completes,
     bounded_recovery_available,
+    is_self_replacement_topology,
     is_zero_actuation_observation,
     new_close_required,
+    nonself_actuation_order,
     zero_actuation_status,
 )
 
@@ -154,6 +157,14 @@ class ReplacementActuatorUseCase:
                 phase=rec.phase,
                 revision=rec.revision,
             )
+        if not is_self_replacement_topology(rec.participants):
+            # An atomic *self* replacement carries exactly one self participant (R1-F2).
+            # Refuse a zero- / many-self plan BEFORE claiming or any effect, so the
+            # destructive non-self replacement never runs for a non-self-replacement plan.
+            return ActuationResult(
+                status=ACTUATION_INVALID_TOPOLOGY, phase=rec.phase, revision=rec.revision,
+                detail="a self-replacement transaction requires exactly one self participant",
+            )
         now = self._clock()
         claim = self._store.claim(
             key,
@@ -226,14 +237,13 @@ class ReplacementActuatorUseCase:
     def _replacing_nonself_step(
         self, key, rec: ReplacementTransactionRecord, holder, gen, now
     ) -> Optional[ActuationResult]:
-        pending = sorted(
-            (
-                p
-                for p in rec.participants
-                if not p.is_self and p.phase != PARTICIPANT_REPLACED
-            ),
-            key=lambda p: p.identity,
-        )
+        # The design's fixed order (sublane participants, then the default companion), not a
+        # lexical sort (R1-F3). Filter out the already-replaced ones and take the next owed.
+        pending = [
+            p
+            for p in nonself_actuation_order(rec.participants)
+            if p.phase != PARTICIPANT_REPLACED
+        ]
         if not pending:
             # Every non-self participant is replaced; leave replacing_nonself. The
             # awaiting_self_turn_end prerequisite (all non-self replaced) is satisfied.
@@ -280,6 +290,15 @@ class ReplacementActuatorUseCase:
                     revision=rec.revision, stopped_on=pin.identity,
                     preservation_reasons=verdict.reasons, detail=verdict.detail,
                 )
+            # Re-authenticate immediately before the destructive close (R1-F1): the external
+            # observations above may have taken time during which the lease could expire or
+            # be reclaimed. On failure, ZERO close — never actuate without live authority.
+            fresh = self._reauth_before_effect(
+                key, holder, gen, pin.identity, PARTICIPANT_CLOSE_OWED
+            )
+            if isinstance(fresh, ActuationResult):
+                return fresh
+            rec = fresh
             if self._port.close_exact_generation(pin) != CLOSE_DONE:
                 return ActuationResult(
                     status=ACTUATION_EFFECT_FAILED, phase=rec.phase,
@@ -299,8 +318,15 @@ class ReplacementActuatorUseCase:
         return self._cas_terminal(cas, rec, pin)
 
     def _step_launch_owed(self, key, rec, pin, holder, gen, now) -> Optional[ActuationResult]:
-        # A launch of an already-closed slot is bounded recovery — no preservation gate. The
-        # launch is bound to the replacement action id (j#78384 §4).
+        # A launch of an already-closed slot is bounded recovery — no preservation gate. But
+        # it IS a live effect, so re-authenticate the lease immediately before it (R1-F1);
+        # on failure, ZERO launch. The launch is bound to the replacement action id (§4).
+        fresh = self._reauth_before_effect(
+            key, holder, gen, pin.identity, PARTICIPANT_LAUNCH_OWED
+        )
+        if isinstance(fresh, ActuationResult):
+            return fresh
+        rec = fresh
         if self._port.launch_action_bound(rec.action_id, pin) != LAUNCH_DONE:
             # Stay launch_owed (retryable): a later re-run relaunches, never re-closes.
             return ActuationResult(
@@ -334,6 +360,51 @@ class ReplacementActuatorUseCase:
         return self._cas_terminal(cas, rec, pin)
 
     # -- CAS helpers ---------------------------------------------------------
+
+    def _reauth_before_effect(
+        self, key, holder, gen, pin_identity, expected_phase
+    ) -> "ReplacementTransactionRecord | ActuationResult":
+        """Re-authenticate authority immediately before a destructive effect (R1-F1).
+
+        Re-reads the row on a *fresh* clock and renews the lease — a tranche A CAS that
+        succeeds ONLY for the current live holder at the matching immutable generation, and
+        which also refreshes the TTL so the effect runs inside a fresh window. Then confirms
+        the participant is still at its ``expected_phase`` (not moved by a concurrent actor).
+        Returns the renewed record to actuate against, or a fail-closed
+        :class:`ActuationResult` (``lease_lost`` / ``generation_mismatch`` / ``not_found`` /
+        ``effect_failed``) — in which case the caller performs ZERO effect.
+        """
+        now = self._clock()
+        current = self._store.get(key)
+        if current is None:
+            return ActuationResult(status=ACTUATION_NOT_FOUND, stopped_on=pin_identity)
+        if current.action_generation != gen:
+            return ActuationResult(
+                status=ACTUATION_GENERATION_MISMATCH, phase=current.phase,
+                revision=current.revision, stopped_on=pin_identity,
+            )
+        renew = self._store.renew(
+            key, expected_revision=current.revision, expected_action_generation=gen,
+            holder=holder, lease_expires_at=self._expiry(now), now=now,
+        )
+        if not renew.applied:
+            status = (
+                ACTUATION_GENERATION_MISMATCH
+                if renew.reason == CAS_GENERATION_MISMATCH
+                else ACTUATION_LEASE_LOST
+            )
+            return ActuationResult(
+                status=status, revision=renew.revision, stopped_on=pin_identity,
+                detail=renew.reason,
+            )
+        fresh = self._store.get(key)
+        pin = fresh.find_participant(pin_identity) if fresh is not None else None
+        if fresh is None or pin is None or pin.phase != expected_phase:
+            return ActuationResult(
+                status=ACTUATION_EFFECT_FAILED, stopped_on=pin_identity,
+                detail="participant owed phase moved before effect",
+            )
+        return fresh
 
     def _advance_phase(
         self, key, rec, target, holder, gen, now

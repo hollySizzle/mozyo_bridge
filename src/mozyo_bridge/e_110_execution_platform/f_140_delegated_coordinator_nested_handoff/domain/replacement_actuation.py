@@ -25,7 +25,16 @@ action pin — never by re-closing blindly, and never by adopting a recycled slo
 
 from __future__ import annotations
 
-from mozyo_bridge.core.state.replacement_transaction_model import norm
+from typing import Sequence
+
+from mozyo_bridge.core.state.replacement_transaction_model import ParticipantPin, norm
+
+#: The canonical default coordinator lane id — the lane the current coordinator (self) and
+#: its Claude companion sit in (Redmine #13806 R1-F3). Mirrors the ``DEFAULT_LANE = "default"``
+#: the sibling f_140 domain modules (``route_identity_ledger`` / ``workflow_role_authority`` /
+#: ``gateway_route_enforcement``) each declare, and the empty-lane normalization those use; a
+#: local mirror keeps the actuation order from importing an unrelated routing/role module.
+DEFAULT_COORDINATOR_LANE = "default"
 
 # -- old-slot observation (what the adapter sees vs the pinned old generation) ---
 #
@@ -116,6 +125,10 @@ ACTUATION_LEASE_LOST = "lease_lost"
 ACTUATION_GENERATION_MISMATCH = "generation_mismatch"
 #: There is no such transaction to actuate.
 ACTUATION_NOT_FOUND = "not_found"
+#: The transaction's participant topology is not a self-replacement: it does not carry
+#: exactly one self (current coordinator) participant (Redmine #13806 R1-F2). Zero
+#: actuation — an atomic *self* replacement with no (or many) self targets is never driven.
+ACTUATION_INVALID_TOPOLOGY = "invalid_topology"
 
 ACTUATION_STATUSES = frozenset(
     {
@@ -129,6 +142,7 @@ ACTUATION_STATUSES = frozenset(
         ACTUATION_LEASE_LOST,
         ACTUATION_GENERATION_MISMATCH,
         ACTUATION_NOT_FOUND,
+        ACTUATION_INVALID_TOPOLOGY,
     }
 )
 
@@ -187,6 +201,51 @@ def attestation_completes(verdict: str) -> bool:
     return norm(verdict) == ATTEST_BOUND
 
 
+# -- participant topology / actuation order (Redmine #13806 R1-F2 / R1-F3) -------
+
+
+def self_participants(pins: Sequence[ParticipantPin]) -> tuple[ParticipantPin, ...]:
+    """The self (current coordinator) participants of a manifest. (pure)"""
+    return tuple(p for p in pins if p.is_self)
+
+
+def is_self_replacement_topology(pins: Sequence[ParticipantPin]) -> bool:
+    """Does the manifest carry EXACTLY ONE self participant? (pure, Redmine #13806 R1-F2)
+
+    An atomic *self* replacement has one current coordinator to replace. Zero (no self
+    target) or many (an undefined "replaced last") is not a self-replacement topology and is
+    never actuated — the destructive non-self replacement must not run for such a plan.
+    """
+    return len(self_participants(pins)) == 1
+
+
+def is_default_companion(pin: ParticipantPin) -> bool:
+    """A NON-self participant sitting in the default coordinator lane. (pure)
+
+    The current coordinator's companion (the Claude beside the Codex self). It is replaced
+    *after* the sublane participants and *before* the self (j#78384 §2). Determined purely
+    from ``(is_self, lane_id)`` — never a heuristic.
+    """
+    return (not pin.is_self) and norm(pin.lane_id) == DEFAULT_COORDINATOR_LANE
+
+
+def nonself_actuation_order(
+    pins: Sequence[ParticipantPin],
+) -> tuple[ParticipantPin, ...]:
+    """The non-self participants in the design's fixed actuation order. (pure)
+
+    j#78384 §2: sublane worker/gateway first, then the default companion, then (last, and
+    out of tranche B scope) the self. This orders the NON-self participants: every sublane
+    participant (``is_default_companion`` false) before every default companion (true), each
+    group deterministic by identity. Replaces the identity-lexical sort that let the
+    canonical ``default`` lane id sort ahead of the sublanes (Redmine #13806 R1-F3). The
+    classification is a total function of ``(is_self, lane_id)``, so the order is always
+    determinable — no lexical guess.
+    """
+    nonself = [p for p in pins if not p.is_self]
+    return tuple(sorted(nonself, key=lambda p: (is_default_companion(p), p.identity)))
+
+
 __all__ = (
     "OLD_SLOT_PRESENT",
     "OLD_SLOT_ABSENT",
@@ -213,10 +272,16 @@ __all__ = (
     "ACTUATION_LEASE_LOST",
     "ACTUATION_GENERATION_MISMATCH",
     "ACTUATION_NOT_FOUND",
+    "ACTUATION_INVALID_TOPOLOGY",
     "ACTUATION_STATUSES",
+    "DEFAULT_COORDINATOR_LANE",
     "attestation_completes",
     "bounded_recovery_available",
+    "is_default_companion",
+    "is_self_replacement_topology",
     "is_zero_actuation_observation",
     "new_close_required",
+    "nonself_actuation_order",
+    "self_participants",
     "zero_actuation_status",
 )

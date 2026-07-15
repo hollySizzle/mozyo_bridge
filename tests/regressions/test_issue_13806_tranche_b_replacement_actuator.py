@@ -54,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATION_EFFECT_FAILED,
     ACTUATION_GENERATION_MISMATCH,
     ACTUATION_IN_PROGRESS,
+    ACTUATION_INVALID_TOPOLOGY,
     ACTUATION_LEASE_LOST,
     ACTUATION_NOT_FOUND,
     ACTUATION_PRESERVATION_BLOCKED,
@@ -71,8 +72,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OLD_SLOT_RECYCLED,
     attestation_completes,
     bounded_recovery_available,
+    is_default_companion,
+    is_self_replacement_topology,
     is_zero_actuation_observation,
     new_close_required,
+    nonself_actuation_order,
+    self_participants,
     zero_actuation_status,
 )
 
@@ -360,6 +365,126 @@ class LeaseAndGenerationTests(_ActuatorCase):
         self.assertEqual(second.status, ACTUATION_LEASE_LOST)
         self.assertEqual(second_port.closed, [])
 
+    def test_lease_stolen_during_preservation_probe_does_zero_effect(self):
+        # R1-F1: a foreign holder claims the lease DURING the (slow) preservation probe. The
+        # re-authentication immediately before the close must catch it — zero close/launch.
+        class StealingPort(FakeActuatorPort):
+            def __init__(self, store, key):
+                super().__init__()
+                self._store = store
+                self._key = key
+
+            def observe_preservation(self, pin):
+                # A foreign holder reclaims the lease mid-observation (H's lease expired).
+                current = self._store.get(self._key)
+                self._store.claim(
+                    self._key, expected_revision=current.revision,
+                    expected_action_generation=GEN, holder="OTHER",
+                    lease_expires_at="2099-01-01T00:00:00+00:00",
+                    now="2030-01-01T00:00:00+00:00",
+                )
+                return PreservationObservation(
+                    identity_matches=True, attestation_fresh=True
+                )
+
+        port = StealingPort(self.store, self.key)
+        result = self._run(holder="H", port=port)
+        self.assertEqual(result.status, ACTUATION_LEASE_LOST)
+        self.assertEqual(port.closed, [])  # no unauthorized close
+        self.assertEqual(port.launched, [])
+        # the durable row shows the foreign holder and the participant un-actuated
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.lease_holder, "OTHER")
+        self.assertEqual(self._phase_of(self.gw), PARTICIPANT_CLOSE_OWED)
+
+
+class TopologyTests(_ActuatorCase):
+    def _self_less_store(self):
+        home = Path(tempfile.mkdtemp())
+        store = ReplacementTransactionStore(home=home)
+        key = ReplacementTransactionKey("ws", "self_less")
+        store.plan_transaction(
+            key,
+            action_generation=GEN,
+            decision=DecisionPointer(
+                source="redmine", issue_id="13806", journal_id="78948"
+            ),
+            continuation=ContinuationPointer(
+                source="redmine", issue_id="13806", journal_id="78948",
+                expected_gate="g", next_semantic_action="n",
+            ),
+            participants=[_gateway()],  # NO self participant
+        )
+        return store, key
+
+    def test_self_less_plan_is_invalid_topology_zero_effect(self):
+        # R1-F2: a valid tranche A plan with no self participant is never actuated.
+        store, key = self._self_less_store()
+        port = FakeActuatorPort()
+        result = ReplacementActuatorUseCase(store, port, clock=lambda: FIXED).run(
+            key, holder="H", expected_action_generation=GEN
+        )
+        self.assertEqual(result.status, ACTUATION_INVALID_TOPOLOGY)
+        self.assertNotEqual(result.status, ACTUATION_ARMED)
+        self.assertEqual(port.closed, [])  # zero destructive effect
+        self.assertEqual(port.launched, [])
+        # nothing was claimed / advanced either
+        rec = store.get(key)
+        self.assertEqual(rec.lease_holder, "")
+        self.assertEqual(rec.find_participant(_gateway().identity).phase,
+                         PARTICIPANT_CLOSE_OWED)
+
+
+class ActuationOrderTests(_ActuatorCase):
+    def setUp(self):
+        # A 4-participant manifest: a default-lane companion, an issue sublane gateway +
+        # worker, and the self coordinator.
+        self.home = Path(tempfile.mkdtemp())
+        self.store = ReplacementTransactionStore(home=self.home)
+        self.key = ReplacementTransactionKey("ws", "ordered")
+        self.companion = ParticipantPin(
+            lane_id="default", role="companion", provider="claude",
+            assigned_name="cl", old_locator="w:0",
+        )
+        self.gw = ParticipantPin(
+            lane_id="issue_x", role="gateway", provider="codex",
+            assigned_name="gw", old_locator="w:1",
+        )
+        self.wk = ParticipantPin(
+            lane_id="issue_x", role="worker", provider="claude",
+            assigned_name="wk", old_locator="w:2",
+        )
+        self.sc = ParticipantPin(
+            lane_id="default", role="coordinator", provider="codex",
+            assigned_name="cx", old_locator="w:3", is_self=True,
+        )
+        self.store.plan_transaction(
+            self.key,
+            action_generation=GEN,
+            decision=DecisionPointer(
+                source="redmine", issue_id="13806", journal_id="78948"
+            ),
+            continuation=ContinuationPointer(
+                source="redmine", issue_id="13806", journal_id="78948",
+                expected_gate="g", next_semantic_action="n",
+            ),
+            participants=[self.companion, self.gw, self.wk, self.sc],
+        )
+        self.port = FakeActuatorPort()
+
+    def test_default_companion_replaced_after_sublanes(self):
+        # R1-F3: the default companion closes AFTER the sublane gateway/worker, never first.
+        result = ReplacementActuatorUseCase(
+            self.store, self.port, clock=lambda: FIXED
+        ).run(self.key, holder="H", expected_action_generation=GEN)
+        self.assertEqual(result.status, ACTUATION_ARMED)
+        roles = [ident[1] for ident in self.port.closed]  # role component of identity
+        self.assertEqual(roles[-1], "companion")  # companion is the last non-self closed
+        self.assertLess(roles.index("gateway"), roles.index("companion"))
+        self.assertLess(roles.index("worker"), roles.index("companion"))
+        # the self coordinator is still never actuated
+        self.assertNotIn(self.sc.identity, self.port.closed)
+
 
 class ResultPayloadTests(_ActuatorCase):
     def test_result_payload_shape(self):
@@ -403,6 +528,32 @@ class PureDomainTests(unittest.TestCase):
 
     def test_port_protocol_is_runtime_checkable(self):
         self.assertIsInstance(FakeActuatorPort(), ExactGenerationActuatorPort)
+
+    def test_self_replacement_topology(self):
+        gw, wk, sc = _gateway(), _worker(), _self_coordinator()
+        self.assertTrue(is_self_replacement_topology([gw, sc]))
+        self.assertFalse(is_self_replacement_topology([gw, wk]))  # zero self
+        self.assertEqual(self_participants([gw, wk, sc]), (sc,))
+
+    def test_is_default_companion(self):
+        companion = ParticipantPin(
+            lane_id="default", role="companion", provider="claude",
+            assigned_name="cl", old_locator="w:0",
+        )
+        self.assertTrue(is_default_companion(companion))
+        self.assertFalse(is_default_companion(_gateway()))  # sublane lane
+        self.assertFalse(is_default_companion(_self_coordinator()))  # self, not companion
+
+    def test_nonself_actuation_order_puts_sublanes_before_default_companion(self):
+        companion = ParticipantPin(
+            lane_id="default", role="companion", provider="claude",
+            assigned_name="cl", old_locator="w:0",
+        )
+        gw, wk, sc = _gateway(), _worker(), _self_coordinator()
+        order = nonself_actuation_order([companion, gw, wk, sc])
+        self.assertNotIn(sc, order)  # self excluded
+        self.assertEqual(order[-1], companion)  # default companion last among non-self
+        self.assertEqual(set(order[:-1]), {gw, wk})
 
 
 if __name__ == "__main__":
