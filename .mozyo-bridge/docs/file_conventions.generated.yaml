@@ -129,6 +129,27 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: coordinator fill decision / lane actionability / execution-surface source
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_fill_decision.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_actionability.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_execution_surface.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/sublane_admission.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_fill.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_admission.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_actionability.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_execution_surface.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_sublane_admission.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision_cli.py
+  - tests/regressions/test_issue_13756_fill_actionability.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/specs/delegated-coordinator-decision-records.md
+    と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: herdr default-lane durable workflow-role authority source
   patterns:
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py

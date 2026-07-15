@@ -1550,6 +1550,28 @@ file_conventions:
       - rule-project-agent-workflow
       - skill-workflow-reference
 
+  - id: fc-coordinator-fill-actionability
+    name: coordinator fill decision / lane actionability / execution-surface source
+    patterns:
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_fill_decision.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_actionability.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_execution_surface.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/sublane_admission.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_fill.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_admission.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_actionability.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_execution_surface.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_sublane_admission.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision_cli.py
+      - tests/regressions/test_issue_13756_fill_actionability.py
+    severity: block
+    document_refs:
+      - logic-coordinator-sublane-development-flow
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: fc-herdr-workflow-role-authority
     name: herdr default-lane durable workflow-role authority source
     patterns:
