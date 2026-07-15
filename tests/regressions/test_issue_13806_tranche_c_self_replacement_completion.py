@@ -46,6 +46,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DRAIN_ATTESTATION_FAILED,
     DRAIN_COMPLETED,
     DRAIN_GENERATION_MISMATCH,
+    DRAIN_NOT_READY,
     DRAIN_SEND_ERROR,
     DRAIN_SEND_FAILED,
     DRAIN_SEND_OK,
@@ -139,6 +140,23 @@ class FakeSealPort:
         return self.observation
 
 
+class FlippingSealPort:
+    """Returns ``first`` on the initial observation, then ``rest`` on every later one.
+
+    Models a seal that regresses between the executor's fast-fail check and the close
+    boundary (R1-F1).
+    """
+
+    def __init__(self, first, rest):
+        self.first = first
+        self.rest = rest
+        self.calls = 0
+
+    def observe_self_close_seals(self, record, self_pin):
+        self.calls += 1
+        return self.first if self.calls == 1 else self.rest
+
+
 class FakeDrainPort:
     def __init__(self, *, attest=True, send=DRAIN_SEND_OK, confirm_after_send=True):
         self.attest = attest
@@ -208,8 +226,11 @@ class _TrancheCCase(unittest.TestCase):
         return result
 
     def _executor(self, seals):
+        # The executor takes the raw actuation PORT (it builds its own self-seal-aware
+        # actuator internally, R1-F1). It shares `act_port` with the arming actuator so the
+        # `closed` / `launched` trace stays consistent.
         return SelfCloseExecutorUseCase(
-            self.store, self.actuator, FakeSealPort(seals)
+            self.store, self.act_port, FakeSealPort(seals), clock=lambda: FIXED
         )
 
     def _phase_of(self, pin):
@@ -279,6 +300,24 @@ class SelfCloseExecutorTests(_TrancheCCase):
         )
         self.assertNotEqual(result.status, SELF_CLOSE_REPLACED)
         self.assertNotIn(self.sc.identity, self.act_port.closed)
+
+    def test_self_seal_regression_at_close_boundary_blocks_zero_close(self):
+        # R1-F1: a self seal (pending composer, turn resuming) regressing AFTER the executor's
+        # initial check but BEFORE the destructive close must block the close, not slip through.
+        self._arm()
+        flipping = FlippingSealPort(
+            first=_all_seals(),
+            rest=_all_seals(no_pending_composer=False, turn_ended=False),
+        )
+        executor = SelfCloseExecutorUseCase(
+            self.store, self.act_port, flipping, clock=lambda: FIXED
+        )
+        result = executor.run(self.key, holder="EXEC", expected_action_generation=GEN)
+        self.assertEqual(result.status, SELF_CLOSE_BLOCKED)
+        self.assertNotIn(self.sc.identity, self.act_port.closed)  # zero close
+        self.assertEqual(self._phase_of(self.sc), PARTICIPANT_CLOSE_OWED)  # owed unchanged
+        # the seal was re-observed at the close boundary (more than the one fast-fail check)
+        self.assertGreater(flipping.calls, 1)
 
     def test_self_close_then_crash_replays(self):
         # First run replaces the self; a re-run is idempotent (self already replaced) and
@@ -373,6 +412,52 @@ class ContinuationDrainTests(_TrancheCCase):
         self.assertEqual(resume.status, DRAIN_COMPLETED)
         self.assertEqual(self.store.get(self.key).phase, PHASE_COMPLETED)
         self.assertEqual(port.sent, ["dispatch_once"])  # still only one send total
+
+    def test_claim_refused_on_not_ready_transaction_zero_write(self):
+        # R1-F2: a fresh coordinator must NOT claim a not-ready transaction (still `planned`,
+        # or self_close_armed with an un-replaced self) — a premature claim would block the
+        # legitimate executor for the TTL.
+        # (a) planned (nothing armed yet)
+        before = self.store.get(self.key)
+        port = FakeDrainPort()
+        result = FreshCoordinatorDrainUseCase(
+            self.store, port, clock=lambda: FIXED
+        ).run(self.key, holder="FRESH", expected_action_generation=GEN)
+        after = self.store.get(self.key)
+        self.assertEqual(result.status, DRAIN_NOT_READY)
+        self.assertEqual(after.revision, before.revision)  # zero write
+        self.assertEqual(after.lease_holder, "")  # never claimed
+        self.assertEqual(port.sent, [])
+        # (b) self_close_armed but the self is NOT yet replaced. (The arm leaves the lease
+        # held by the executor; the point is the drain does not PREMATURELY re-claim it.)
+        self._arm()
+        before = self.store.get(self.key)
+        self.assertEqual(before.phase, PHASE_SELF_CLOSE_ARMED)
+        port2 = FakeDrainPort()
+        result2 = FreshCoordinatorDrainUseCase(
+            self.store, port2, clock=lambda: FIXED
+        ).run(self.key, holder="FRESH", expected_action_generation=GEN)
+        after = self.store.get(self.key)
+        self.assertEqual(result2.status, DRAIN_NOT_READY)
+        self.assertEqual(after.revision, before.revision)  # zero write
+        self.assertEqual(after.lease_holder, before.lease_holder)  # not re-claimed by FRESH
+        self.assertNotEqual(after.lease_holder, "FRESH")
+        self.assertEqual(port2.sent, [])
+
+    def test_valid_resume_still_claims_and_drains(self):
+        # R1-F2 must not break a valid resume: a transaction already at draining_continuation
+        # (attempted) is claimable and drains to completion.
+        self._replace_self()
+        port = FakeDrainPort(confirm_after_send=False)  # first pass: uncertain
+        FreshCoordinatorDrainUseCase(self.store, port, clock=lambda: FIXED).run(
+            self.key, holder="FRESH", expected_action_generation=GEN
+        )
+        self.assertEqual(self.store.get(self.key).phase, PHASE_DRAINING_CONTINUATION)
+        port.confirmed = True  # the gate now confirms
+        resume = FreshCoordinatorDrainUseCase(
+            self.store, port, clock=lambda: FIXED
+        ).run(self.key, holder="FRESH", expected_action_generation=GEN)
+        self.assertEqual(resume.status, DRAIN_COMPLETED)
 
     def test_drain_generation_mismatch(self):
         self._replace_self()

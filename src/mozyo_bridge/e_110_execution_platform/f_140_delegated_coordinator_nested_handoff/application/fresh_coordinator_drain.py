@@ -28,12 +28,14 @@ from mozyo_bridge.core.state.replacement_transaction import ReplacementTransacti
 from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_GENERATION_MISMATCH,
     CAS_LEASE_NOT_HELD,
+    PARTICIPANT_REPLACED,
     PHASE_COMPLETED,
     PHASE_DRAINING_CONTINUATION,
     PHASE_FRESH_COORDINATOR_CLAIMED,
     PHASE_SELF_CLOSE_ARMED,
     ContinuationPointer,
     ReplacementTransactionKey,
+    ReplacementTransactionRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.session_replacement_reconcile import (  # noqa: E501
     DRAIN_ATTEMPTED,
@@ -64,6 +66,29 @@ DRAIN_SEND_FAILED = "send_failed"
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _drain_ready(record: ReplacementTransactionRecord) -> bool:
+    """May a fresh coordinator claim + drain this transaction? (pure, Redmine #13806 R1-F2)
+
+    Admits ONLY a transaction that is genuinely ready for the fresh-coordinator hand-off:
+
+    - ``self_close_armed`` with the self participant already ``replaced`` (the executor
+      finished; the drain is about to advance to ``fresh_coordinator_claimed``);
+    - ``fresh_coordinator_claimed`` or ``draining_continuation`` (a valid resume).
+
+    Every other phase — ``planned`` / ``claimed`` / ``replacing_nonself`` /
+    ``awaiting_self_turn_end`` / ``self_close_armed`` with an **un-replaced** self — is not
+    ready: claiming it would prematurely hold the lease and block the legitimate self-close
+    executor. (``completed`` is handled by the idempotent return before this check.)
+    """
+    phase = record.phase
+    if phase in (PHASE_FRESH_COORDINATOR_CLAIMED, PHASE_DRAINING_CONTINUATION):
+        return True
+    if phase == PHASE_SELF_CLOSE_ARMED:
+        self_pins = [p for p in record.participants if p.is_self]
+        return len(self_pins) == 1 and self_pins[0].phase == PARTICIPANT_REPLACED
+    return False
 
 
 @runtime_checkable
@@ -164,6 +189,19 @@ class FreshCoordinatorDrainUseCase:
             return DrainResult(
                 status=DRAIN_COMPLETED, phase=rec.phase, revision=rec.revision,
                 drain_state=DRAIN_CONFIRMED,
+            )
+        # Readiness prerequisite BEFORE any claim (R1-F2): a fresh coordinator may claim only
+        # a transaction that is ready for it — ``self_close_armed`` with the self participant
+        # already ``replaced``, or a valid resume phase. On a not-ready transaction (planned /
+        # claimed / replacing_nonself / awaiting_self_turn_end / self_close_armed-with-
+        # unreplaced-self) the claim would prematurely hold the lease and block the legitimate
+        # executor, so this returns ``not_ready`` with ZERO claim / lease / send. The check is
+        # on ``rec`` — the exact revision the claim below uses — so a concurrent write is
+        # caught by the claim's own revision CAS.
+        if not _drain_ready(rec):
+            return DrainResult(
+                status=DRAIN_NOT_READY, phase=rec.phase, revision=rec.revision,
+                detail="transaction not ready for the fresh-coordinator claim",
             )
         now = self._clock()
         claim = self._store.claim(
