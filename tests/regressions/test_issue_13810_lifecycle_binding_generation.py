@@ -98,8 +98,10 @@ def _slots() -> tuple[ProcessGenerationPin, ...]:
 class ProcessGenerationPinModelTest(unittest.TestCase):
     """The typed pin and its versioned declared-slots codec (pure)."""
 
-    def test_identity_and_evidence_fields_are_required(self) -> None:
-        for missing in ("role", "provider", "assigned_name", "locator", "runtime_revision"):
+    def test_identity_fields_are_required(self) -> None:
+        # role / provider / assigned_name / locator are the required identity; a pin
+        # missing any of them cannot be re-resolved against the live inventory.
+        for missing in ("role", "provider", "assigned_name", "locator"):
             kwargs = dict(
                 role="claude",
                 provider="claude",
@@ -112,17 +114,23 @@ class ProcessGenerationPinModelTest(unittest.TestCase):
                 with self.assertRaises(ProcessPinError):
                     ProcessGenerationPin(**kwargs)
 
-    def test_attested_at_is_optional_evidence(self) -> None:
+    def test_runtime_revision_and_attested_at_are_optional_evidence(self) -> None:
+        # R3-F1: the herdr generation discriminant is the LOCATOR (the attestation store
+        # records no runtime version), so a live-adopt pin declares an empty runtime
+        # revision honestly rather than fabricating one — the locator still identifies it.
         pin = ProcessGenerationPin(
-            role="claude",
-            provider="claude",
-            assigned_name="n",
-            locator="%1",
-            runtime_revision="1.0",
+            role="claude", provider="claude", assigned_name="n", locator="%1"
         )
+        self.assertEqual(pin.runtime_revision, "")
         self.assertEqual(pin.attested_at, "")
         self.assertEqual(pin.stable_identity, ("claude", "claude", "n"))
-        self.assertEqual(pin.match_key, ("claude", "claude", "n", "%1", "1.0"))
+        self.assertEqual(pin.match_key, ("claude", "claude", "n", "%1", ""))
+        # a caller that DOES observe a runtime revision may still supply it
+        rich = ProcessGenerationPin(
+            role="c", provider="c", assigned_name="n", locator="%1",
+            runtime_revision="1.0",
+        )
+        self.assertEqual(rich.match_key, ("c", "c", "n", "%1", "1.0"))
 
     def test_declared_slots_round_trip_is_deterministic(self) -> None:
         forward = encode_declared_slots(_slots())

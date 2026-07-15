@@ -25,6 +25,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_NOT_ATTEMPTED,
     DISPATCH_SKIPPED,
+    REASON_ADOPT_OWNER_UNBOUND,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
@@ -675,7 +676,42 @@ class SublaneActuateUseCase:
                 command=None,
             )
         )
-        self.ops.declare_adopted_lane_lifecycle(lane_runtime_root, adopted=adopted)
+        # Redmine #13809 / #13810 R3-F3: a live ADOPT declares the lane's owner row via the
+        # common declaration service and MUST succeed (fresh or idempotent) before dispatch;
+        # an owner-unbound outcome (ambiguous / stale / unattested / recycled / conflict)
+        # fails closed here rather than dispatching to a lane hibernate can never resolve.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_OWNER_UNBOUND,
+        )
+
+        adopt_outcome = self.ops.declare_adopted_lane_lifecycle(
+            lane_runtime_root, adopted=adopted
+        )
+        if adopt_outcome in ADOPT_DECL_OWNER_UNBOUND:
+            steps.append(
+                ActuationStep(
+                    order=3,
+                    title="declare adopted lane owner",
+                    status=STEP_BLOCKED,
+                    detail=f"adopted lane owner binding not declared ({adopt_outcome}); "
+                    "refusing to dispatch to an owner-unbound lane",
+                    command=None,
+                )
+            )
+            return self._blocked(
+                request,
+                launch_action=launch.action,
+                reason=f"adopted lane owner binding not declared ({adopt_outcome}); "
+                "fail-closed before dispatch (owner-unbound lane)",
+                reasons=(REASON_ADOPT_OWNER_UNBOUND,),
+                dispatch=dispatch,
+                steps=tuple(steps),
+                gateway_pane=gateway_pane,
+                worker_pane=worker_pane,
+                adopted=adopted,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
+            )
 
         # Step 4 (--no-dispatch) — nothing to dispatch, so nothing to make ready.
         if not dispatch:

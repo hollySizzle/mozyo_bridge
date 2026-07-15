@@ -504,24 +504,33 @@ class HerdrSublaneActuatorOps:
 
     def declare_adopted_lane_lifecycle(
         self, worktree_path: str, *, adopted: bool
-    ) -> None:
+    ) -> str:
         """Backfill an ADOPTED lane's owner binding via the common service (Redmine #13809).
 
         The standard live-adopt path skips :meth:`append_lane_column`, so it never reached
         the create-path :meth:`_declare_lane_lifecycle` and the adopted lane stayed
         owner-rowless (the ``original_identity_unknown`` that blocks ``sublane hibernate``).
         Only an ``adopted`` lane needs this — the create path already declared via append.
-        This resolves the live inventory into the lane's slots and delegates the
-        readable/unambiguous gate + fail-closed idempotent declaration to
-        :func:`...sublane_adopt_declaration.declare_adopted_owner_row`; a store error never
-        breaks the actuation (best-effort, like the create-path declare).
+        This resolves the live inventory unit and hands the RAW rows to
+        :func:`...sublane_adopt_declaration.declare_adopted_owner_row`, which does the
+        raw-multiplicity / liveness / startup-attestation gate + fail-closed idempotent
+        declaration. Returns the outcome status the use case propagates (only
+        ``ADOPT_DECL_DECLARED`` authorizes proceeding to dispatch, R3-F3); a store error is
+        logged but never breaks the actuation.
         """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARE_ERROR,
+            ADOPT_DECL_NOT_ADOPTED,
+            ADOPT_DECL_UNREADABLE,
+            declare_adopted_owner_row,
+        )
+
         if not adopted:
-            return
+            return ADOPT_DECL_NOT_ADOPTED
         try:
             rows = self._live_rows()
         except HerdrSessionStartError:
-            return  # inventory unreadable -> zero-write
+            return ADOPT_DECL_UNREADABLE  # inventory unreadable -> owner-unbound
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
             WorkflowProviderUnresolved,
         )
@@ -529,21 +538,20 @@ class HerdrSublaneActuatorOps:
         try:
             providers = self._launch_providers()
         except WorkflowProviderUnresolved:
-            return
-        resolved = self._resolve_lane_slots(worktree_path, rows, providers)
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
-            ADOPT_DECL_DECLARE_ERROR,
-            declare_adopted_owner_row,
+            return ADOPT_DECL_UNREADABLE
+        workspace_id, lane_id, _slots = self._resolve_lane_slots(
+            worktree_path, rows, providers
         )
-
         outcome = declare_adopted_owner_row(
             journal=self.journal or "",
             issue=self.issue or "",
             lane_label=self.lane_label or "",
             repo_root=self.repo_root,
             worktree_path=worktree_path,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
             providers=providers,
-            resolved=resolved,
+            rows=rows,
         )
         if outcome == ADOPT_DECL_DECLARE_ERROR:
             print(
@@ -551,6 +559,7 @@ class HerdrSublaneActuatorOps:
                 "lane reads as owner-unbound",
                 file=sys.stderr,
             )
+        return outcome
 
     def heal_lane_column(self, worktree_path: str) -> None:
         """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).

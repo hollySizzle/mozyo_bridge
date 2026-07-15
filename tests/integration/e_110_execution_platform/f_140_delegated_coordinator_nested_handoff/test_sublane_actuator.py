@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
+    REASON_ADOPT_OWNER_UNBOUND,
     REASON_LANE_MISMATCH,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
@@ -95,7 +96,12 @@ class FakeActuatorOps:
         append_argv=None,
         gateway_ready=True,
         workspace_root="/ws",
+        adopt_outcome=None,
     ):
+        # Redmine #13809 R3-F3: the adopt owner-row declaration outcome this fake reports;
+        # default proceeds (a successful declaration). A test overrides it to a fail-closed
+        # status to exercise the owner-unbound dispatch block.
+        self._adopt_outcome = adopt_outcome
         self._git = git
         # #13392: the optional canonical-workspace-root capability the use case reads to
         # collapse a non-git (skip_no_git) lane's runtime root off the phantom worktree.
@@ -155,8 +161,15 @@ class FakeActuatorOps:
     def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
         # Redmine #13809: record ONLY the real adopt-path backfill call (adopted=True), so
         # a create (adopted=False, a no-op) leaves existing calls-list assertions unchanged.
-        if adopted:
-            self.calls.append(("declare_adopted_lane_lifecycle", worktree_path))
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARED,
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        if not adopted:
+            return ADOPT_DECL_NOT_ADOPTED
+        self.calls.append(("declare_adopted_lane_lifecycle", worktree_path))
+        return self._adopt_outcome or ADOPT_DECL_DECLARED
 
     def probe_gateway_ready(self, gateway_pane):
         self.calls.append(("probe_gateway_ready", gateway_pane))
@@ -440,6 +453,38 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertNotIn("append_lane_column", ops._names())
         # a reuse launch never calls create_worktree
         self.assertNotIn("create_worktree", ops._names())
+
+    def test_adopt_owner_unbound_blocks_before_dispatch(self):
+        # Redmine #13809 R3-F3: a live adopt whose owner declaration is refused by a
+        # fail-closed condition (here, an unattested live pair) fails closed BEFORE dispatch
+        # rather than reporting a false success while the lane stays owner-unbound.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_UNATTESTED,
+        )
+
+        ops = FakeActuatorOps(
+            git=True, worktree_exists=True, lanes=[_lane()],
+            adopt_outcome=ADOPT_DECL_UNATTESTED,
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_ADOPT_OWNER_UNBOUND, outcome.blocked_reasons)
+        self.assertIn("owner-unbound", outcome.reason)
+        self.assertNotIn("dispatch", ops._names())  # no dispatch to an unbound lane
+
+    def test_adopt_owner_unbound_by_design_still_proceeds(self):
+        # An owner-unbound-BY-DESIGN outcome (a journal-less adopt: no anchor to declare) is
+        # NOT a #13809 failure — the create path also declares nothing — so it proceeds.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_NO_ANCHOR,
+        )
+
+        ops = FakeActuatorOps(
+            git=True, worktree_exists=True, lanes=[_lane()],
+            adopt_outcome=ADOPT_DECL_NO_ANCHOR,
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
     def test_non_git_skips_worktree_but_still_appends(self):
         ops = FakeActuatorOps(git=False, lanes=[None, _lane()])

@@ -105,6 +105,12 @@ REASON_STAMP_FAILED = "stamp_failed"
 #: Adopting or dispatching to it would misdeliver #<issue> to the wrong gateway, so the
 #: ambiguous target fails closed before any adopt / dispatch.
 REASON_LANE_MISMATCH = "lane_identity_mismatch"
+#: A live ADOPT could not declare the lane's lifecycle owner binding (Redmine #13809 /
+#: #13810 R3-F3): the raw live pair was ambiguous / stale / unattested / a recycled
+#: generation, or the declaration conflicted. Dispatching to an owner-unbound lane would
+#: leave the ``original_identity_unknown`` hibernate blocker in place, so the adopt fails
+#: closed before dispatch rather than reporting a false success.
+REASON_ADOPT_OWNER_UNBOUND = "adopt_owner_unbound"
 #: The gateway ``implementation_request`` dispatch returned a non-zero / failed outcome.
 REASON_HANDOFF_FAILED = "handoff_failed"
 #: The #13002 work-unit granularity gate refused: an ``epic`` / ``feature`` unit was

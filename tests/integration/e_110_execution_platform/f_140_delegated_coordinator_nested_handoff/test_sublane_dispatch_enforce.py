@@ -121,8 +121,14 @@ class FakeActuatorOps:
         return _lane()
 
     def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
-        # Redmine #13809: adopt owner-row backfill hook (no-op in this dispatch-gate fake).
-        return None
+        # Redmine #13809: adopt owner-row backfill hook; this dispatch-gate fake always
+        # proceeds (a successful declaration / non-gated create).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARED,
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        return ADOPT_DECL_DECLARED if adopted else ADOPT_DECL_NOT_ADOPTED
 
     def probe_gateway_ready(self, gateway_pane):
         # #13293: this fake's lane is always ready, so the readiness wait resolves on

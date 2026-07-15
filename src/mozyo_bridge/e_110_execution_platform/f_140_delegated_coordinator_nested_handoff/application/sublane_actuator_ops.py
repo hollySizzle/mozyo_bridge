@@ -115,14 +115,20 @@ class SublaneActuatorOps(Protocol):
 
     def declare_adopted_lane_lifecycle(
         self, worktree_path: str, *, adopted: bool
-    ) -> None:
+    ) -> str:
         """Backfill an ADOPTED lane's lifecycle owner binding (Redmine #13809).
 
         A live-adopt (``adopted`` True) records the lane's owner row through the common
         declaration service, fail-closed and idempotent — closing the gap where a lane
         adopted onto a live pair skipped :meth:`append_lane_column` and stayed
-        owner-rowless. A create (``adopted`` False) already declared via the append, so this
-        is a no-op. An adapter whose backend does not own a live-adopt owner row may no-op.
+        owner-rowless. A create (``adopted`` False) already declared via the append.
+
+        Returns an outcome status from
+        :mod:`...sublane_adopt_declaration` (``ADOPT_DECL_*``): only a value in
+        ``ADOPT_DECL_PROCEED`` (a fresh / idempotent ``declared``, or the non-gated
+        ``not_adopted``) authorizes the caller to proceed to dispatch; any other value
+        leaves the lane owner-unbound and the caller must fail closed (R3-F3). An adapter
+        whose backend does not manage adopt owner rows returns ``ADOPT_DECL_NOT_ADOPTED``.
         """
         ...
 
@@ -269,13 +275,16 @@ class LiveSublaneActuatorOps:
 
     def declare_adopted_lane_lifecycle(
         self, worktree_path: str, *, adopted: bool
-    ) -> None:
-        # No-op for the tmux/cockpit backend: the standard herdr sublane live-adopt
-        # owner-row gap (Redmine #13809) is the herdr adapter's
-        # (:meth:`...HerdrSublaneActuatorOps.declare_adopted_lane_lifecycle`). The
+    ) -> str:
+        # The tmux/cockpit backend does not gate adopt owner rows: the standard herdr
+        # sublane live-adopt owner-row gap (Redmine #13809) is the herdr adapter's. The
         # cockpit lane's owner binding is declared through the cockpit-append CLI this
-        # adapter drives; a live-adopt owner row here is out of #13809's scope.
-        return None
+        # adapter drives; ``not_adopted`` signals the use case not to fail closed here.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        return ADOPT_DECL_NOT_ADOPTED
 
     def probe_gateway_ready(self, gateway_pane: str) -> bool:
         # #13293: one non-fatal readiness snapshot — the gateway's foreground process is

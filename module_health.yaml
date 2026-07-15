@@ -1293,6 +1293,26 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
+  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_use_case.py
+    lines: 1036
+    reason: >-
+      Backend-agnostic sublane actuation choreography (create / adopt / confirm /
+      dispatch). Already at 999 lines before #13810; the #13809 review (j#78890
+      R3-F3) required an owner-unbound fail-closed BLOCK on the adopt path (consume
+      the LaneDeclarationStore declaration outcome and stop before dispatch when the
+      lane is owner-unbound), which crossed it to 1036. The declaration gate + typed
+      pins + attestation logic itself was extracted to the cohesive sibling
+      `sublane_adopt_declaration.py` (~330 lines); only the block-or-proceed control
+      flow (which must return the use case's `_blocked` result with the request
+      context) lands here. Splitting this shared orchestration mid-review-cycle for a
+      ~35-line fail-closed branch is disproportionate risk; the decomposition of the
+      `_execute` block-site repetition (the several `_blocked` call sites share most
+      kwargs and could route through one thin `_block` helper) is deferred to a
+      follow-up under this issue's Version.
+    owner_issue: "#13810"
+    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
+    expires: "2027-10-08"
+
 
 # herdr_session_start.py was allowlisted at 1027 lines (owner_issue #13425, split
 # deferred pending #13392). Redmine #13411 (lane=tab subdivision) resolved the

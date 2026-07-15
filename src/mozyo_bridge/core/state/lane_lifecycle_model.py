@@ -424,13 +424,21 @@ class ProcessGenerationPin:
     a *new* provider process, or the same name re-launched at a newer runtime revision, is
     a different pin and is never actuated on a stale approval.
 
-    ``role`` / ``provider`` / ``assigned_name`` are the stable identity, ``locator`` /
-    ``runtime_revision`` are the live evidence observed at declaration time, and all five
-    are required — a pin missing any of them cannot express the identity the action-time
-    preflight re-resolves against the live inventory, so it is refused rather than stored
-    as an un-actionable slot (the :class:`ReleasePin` R1-F4 discipline, extended).
-    ``attested_at`` is the startup-attestation timestamp; it is *evidence, not identity*
-    (a slot may be declared before it is attested), so it is stored but may be empty.
+    ``role`` / ``provider`` / ``assigned_name`` are the stable identity and ``locator`` is
+    the live-generation evidence — all four are required, because a pin missing any of them
+    cannot express the identity the action-time preflight re-resolves against the live
+    inventory, so it is refused rather than stored as an un-actionable slot (the
+    :class:`ReleasePin` R1-F4 discipline, extended).
+
+    ``runtime_revision`` and ``attested_at`` are supplementary *evidence, not identity*, so
+    both may be empty (Redmine #13810 R3-F1): the herdr process-generation discriminant is
+    the **live locator** (``herdr-native-identity.md`` / the startup self-attestation store,
+    which deliberately records NO runtime version), not a runtime-version string. A live
+    adopt whose inventory carries only the slot name + locator declares a pin with an empty
+    ``runtime_revision`` — an honest "not observed", never a fabricated version — and the
+    locator alone still distinguishes a recycled generation. A caller that DOES observe a
+    runtime revision (a richer declaration surface) may supply it and it enters
+    :attr:`match_key`.
 
     This is a **declaration snapshot**, never a liveness fact: whether the slot still
     exists is re-read from the live Herdr inventory every time (``managed-state-model.md``
@@ -441,7 +449,7 @@ class ProcessGenerationPin:
     provider: str
     assigned_name: str
     locator: str
-    runtime_revision: str
+    runtime_revision: str = ""
     attested_at: str = ""
 
     def __post_init__(self) -> None:
@@ -450,13 +458,13 @@ class ProcessGenerationPin:
             object.__setattr__(self, name, norm(getattr(self, name)))
         missing = [
             name
-            for name in ("role", "provider", "assigned_name", "locator", "runtime_revision")
+            for name in ("role", "provider", "assigned_name", "locator")
             if not getattr(self, name)
         ]
         if missing:
             raise ProcessPinError(
                 "a process generation pin requires a non-empty role / provider / "
-                "assigned_name / locator / runtime_revision "
+                "assigned_name / locator "
                 f"(missing: {', '.join(missing)}); an unresolvable slot is never pinned"
             )
 
