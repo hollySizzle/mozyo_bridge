@@ -246,6 +246,7 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
             f"loaded: {status['loaded']}",
             f"pid: {status['pid']}",
             f"scheduled_interval_seconds: {status['scheduled_interval_seconds']}",
+            f"home_pin: {status['home_pin']}",
             f"executable_matches: {status['executable_matches']}",
             f"keep_alive_present: {status['keep_alive_present']}",
             f"credential_readiness: {status['credential_readiness']}",

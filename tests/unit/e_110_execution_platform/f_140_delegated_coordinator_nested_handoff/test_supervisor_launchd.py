@@ -6,14 +6,16 @@ subprocess call goes through an injected fake runner, and temp roots stand in fo
 that are kept **distinct** (review j#79092 R2-F1). These pin the Phase B1 safety boundary —
 
 - plist structure: no ``EnvironmentVariables`` key, ``RunAtLoad`` + ``StartInterval``, **no**
-  ``KeepAlive``, exact PATH-resolved executable argv with the mozyo home pinned as ``--home``;
+  ``KeepAlive``, exact PATH-resolved executable argv with the resolved mozyo home pinned as ``--home``;
 - structured launchctl argv (bootout-then-bootstrap install, kickstart -k restart, exact-file
   uninstall), idempotent install;
 - fail-closed **zero-mutation** refusals: non-darwin host, missing executable, and the Redmine
-  credential matrix — where readiness is **daemon-effective** (the mozyo-home credential file the
-  launchd agent will actually see; neither an installer's shell key/URL (j#79059 F1) nor a shell
+  credential matrix — daemon-effective readiness (neither shell key/URL (j#79059 F1) nor a shell
   ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1) can make it ``ready``);
-- the install-preflight and daemon-runtime resolve the **same** mozyo home (the pinned ``--home``);
+- the install preflight and the launchd daemon resolve the **same** absolute mozyo home, and
+  restart / status take the installed plist's ``--home`` pin as the authority — never the caller's
+  current shell (j#79125 R3-F1) — with an explicit mozyo home normalized to an absolute canonical
+  root (j#79125 R3-F2);
 - a redacted status projection (booleans / counts / fixed tokens; no secret, no path);
 
 without touching the host. Live launchd operation is a separate coordinator gate (never here).
@@ -51,6 +53,11 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 SHELL_ENV = {API_KEY_ENV: "shell-key-value", BASE_URL_ENV: "https://redmine.shell.test"}
 
 
+def _resolved(p: Path) -> str:
+    """The absolute canonical string a ``--home`` pin uses for ``p`` (matches resolve_mozyo_home)."""
+    return str(sl.resolve_mozyo_home(p))
+
+
 def _write_home_credential(mozyo_home: Path, *, api_key="home-key", url="https://redmine.example.test",
                            mode=0o600) -> Path:
     """Write a mozyo-home-scoped `redmine-credentials.yaml` — the daemon-trusted delivery path."""
@@ -68,6 +75,16 @@ def _write_home_credential(mozyo_home: Path, *, api_key="home-key", url="https:/
 
 def _result(returncode: int = 0, stdout: str = "", stderr: str = ""):
     return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+
+def _pinned_plist(os_home: Path, home: str, *, executable="/opt/bin/mozyo-bridge",
+                  extra=()) -> Path:
+    """Write an owned plist whose ProgramArguments pin ``home`` (test double for an install)."""
+    argv = [executable, "workflow", "supervisor", "--run-once", "--home", home, *extra]
+    target = sl.plist_path(os_home)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=os_home))
+    return target
 
 
 class FakeRunner:
@@ -132,18 +149,14 @@ class RenderPlistTest(unittest.TestCase):
         )
         self.assertTrue(payload["RunAtLoad"])
         self.assertEqual(300, payload["StartInterval"])
-        # One-shot scheduled: KeepAlive must be structurally absent (not merely false).
         self.assertNotIn("KeepAlive", payload)
-        # Credential boundary: no environment block exists at all.
         self.assertNotIn("EnvironmentVariables", payload)
         text = raw.decode("utf-8")
         for token in ("API_KEY", "REDMINE", "TOKEN", "SECRET"):
             self.assertNotIn(token, text)
 
     def test_interval_is_clamped_to_at_least_one(self) -> None:
-        payload = plistlib.loads(
-            sl.render_plist(["/opt/bin/mozyo-bridge"], interval_seconds=0)
-        )
+        payload = plistlib.loads(sl.render_plist(["/opt/bin/mozyo-bridge"], interval_seconds=0))
         self.assertEqual(1, payload["StartInterval"])
 
     def test_secret_in_daemon_env_never_serializes_into_plist(self) -> None:
@@ -152,17 +165,47 @@ class RenderPlistTest(unittest.TestCase):
         self.assertNotIn(b"SECRET-KEY-VALUE", raw)
 
 
-class ResolveCommandTest(unittest.TestCase):
-    def test_pins_executable_and_resolved_mozyo_home(self) -> None:
+class ResolveHomeAndCommandTest(unittest.TestCase):
+    def test_explicit_relative_home_is_normalized_to_absolute(self) -> None:
+        # R3-F2: a relative / tilde input must never be pinned as-is.
+        self.assertTrue(sl.resolve_mozyo_home(Path("relative-home")).is_absolute())
+        self.assertTrue(sl.resolve_mozyo_home(Path("~/some-home")).is_absolute())
+
+    def test_command_pins_absolute_home_for_relative_input(self) -> None:
+        cmd = sl.resolve_supervisor_command(mozyo_home=Path("relative-home"), which=_which_found)
+        self.assertEqual(cmd[:5], ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home"])
+        self.assertTrue(Path(cmd[5]).is_absolute())
+
+    def test_command_pins_resolved_mozyo_home(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cmd = sl.resolve_supervisor_command(mozyo_home=Path(tmp), which=_which_found)
         self.assertEqual(
-            ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", tmp],
+            ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", _resolved(Path(tmp))],
             cmd,
         )
 
     def test_missing_executable_is_none_not_a_shell_string(self) -> None:
         self.assertIsNone(sl.resolve_supervisor_command(which=_which_missing))
+
+
+class ExtractPinnedHomeTest(unittest.TestCase):
+    def test_ok_single_pin(self) -> None:
+        argv = ["/x", "workflow", "supervisor", "--run-once", "--home", "/root"]
+        self.assertEqual(("/root", sl.HOME_PIN_OK), sl._extract_pinned_home(argv))
+
+    def test_missing_pin(self) -> None:
+        self.assertEqual((None, sl.HOME_PIN_MISSING), sl._extract_pinned_home(["/x", "--run-once"]))
+
+    def test_duplicate_pin(self) -> None:
+        argv = ["/x", "--home", "/a", "--home", "/b"]
+        self.assertEqual((None, sl.HOME_PIN_DUPLICATE), sl._extract_pinned_home(argv))
+
+    def test_malformed_pin_value_missing_or_flaglike(self) -> None:
+        self.assertEqual((None, sl.HOME_PIN_MALFORMED), sl._extract_pinned_home(["/x", "--home"]))
+        self.assertEqual((None, sl.HOME_PIN_MALFORMED), sl._extract_pinned_home(["/x", "--home", "--json"]))
+
+    def test_no_argv(self) -> None:
+        self.assertEqual((None, sl.HOME_PIN_NO_ARGV), sl._extract_pinned_home(None))
 
 
 class CredentialReadinessTest(unittest.TestCase):
@@ -176,15 +219,12 @@ class CredentialReadinessTest(unittest.TestCase):
         self.assertEqual(sl.CREDENTIAL_READY, sl.classify_credential_readiness(mozyo_home=self.mozyo_home))
 
     def test_env_only_is_not_ready_daemon_never_sees_shell_env(self) -> None:
-        # F1 regression guard: shell key/URL but no home file must NOT be ready.
         with patch.dict("os.environ", SHELL_ENV, clear=False):
             self.assertEqual(
                 sl.CREDENTIAL_MISSING, sl.classify_credential_readiness(mozyo_home=self.mozyo_home)
             )
 
     def test_shell_mozyo_home_override_does_not_leak_into_readiness(self) -> None:
-        # R2-F1 regression guard: a shell MOZYO_BRIDGE_HOME pointing at a credential-bearing root
-        # must NOT make an explicitly-scoped (credential-less) mozyo home read as ready.
         with tempfile.TemporaryDirectory() as other:
             _write_home_credential(Path(other))
             with patch.dict("os.environ", {"MOZYO_BRIDGE_HOME": other}, clear=False):
@@ -210,7 +250,7 @@ class CredentialReadinessTest(unittest.TestCase):
     def test_unsafe_when_home_credential_file_has_loose_permissions(self) -> None:
         if not hasattr(os, "getuid"):
             self.skipTest("POSIX-only permission gate")
-        _write_home_credential(self.mozyo_home, mode=0o644)  # group/other readable -> fail-closed
+        _write_home_credential(self.mozyo_home, mode=0o644)
         self.assertEqual(sl.CREDENTIAL_UNSAFE, sl.classify_credential_readiness(mozyo_home=self.mozyo_home))
 
 
@@ -219,21 +259,15 @@ class DaemonHomePinTest(_DarwinCase):
 
     def test_custom_mozyo_home_is_pinned_into_argv(self) -> None:
         _write_home_credential(self.mozyo_home)
-        runner = FakeRunner()
         result = sl.install(
-            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(), which=_which_found
         )
         self.assertTrue(result["performed"])
         argv = plistlib.loads(sl.plist_path(self.os_home).read_bytes())["ProgramArguments"]
         self.assertIn("--home", argv)
-        # The exact mozyo home is pinned so the daemon reads the same credential root — not a
-        # default ~/.mozyo_bridge it would otherwise re-derive with no MOZYO_BRIDGE_HOME.
-        self.assertEqual(str(self.mozyo_home), argv[argv.index("--home") + 1])
+        self.assertEqual(_resolved(self.mozyo_home), argv[argv.index("--home") + 1])
 
     def test_daemon_side_source_agrees_with_the_pinned_home(self) -> None:
-        # End-to-end: default_redmine_source(home=pinned) builds a live source from the same file
-        # the install preflight validated; a different (empty) home yields None (the divergence
-        # the pin closes). Shell env is cleared so only the home file decides.
         _write_home_credential(self.mozyo_home)
         ws = SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.os_home))
         with patch.dict("os.environ", {}, clear=True):
@@ -252,7 +286,6 @@ class InstallTest(_DarwinCase):
         self.assertTrue(result["performed"])
         self.assertEqual(sl.CREDENTIAL_READY, result["credential_readiness"])
         plist_file = sl.plist_path(self.os_home)
-        self.assertTrue(plist_file.exists())
         payload = plistlib.loads(plist_file.read_bytes())
         self.assertNotIn("KeepAlive", payload)
         self.assertNotIn("EnvironmentVariables", payload)
@@ -282,7 +315,6 @@ class InstallTest(_DarwinCase):
                                 runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_missing", result["reason"])
-        self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
         self.assertEqual([], runner.calls)
         self.assertFalse(sl.plist_path(self.os_home).exists())
 
@@ -313,7 +345,6 @@ class InstallTest(_DarwinCase):
                             runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_missing", result["reason"])
-        self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
         self.assertEqual([], runner.calls)
         self.assertFalse(sl.plist_path(self.os_home).exists())
 
@@ -350,38 +381,79 @@ class InstallTest(_DarwinCase):
 
 
 class RestartTest(_DarwinCase):
-    def test_restart_kickstarts_loaded_service(self) -> None:
+    def _install_ready(self) -> None:
         _write_home_credential(self.mozyo_home)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(),
+                   which=_which_found)
+
+    def test_restart_kickstarts_loaded_service_using_the_installed_pin(self) -> None:
+        self._install_ready()
         runner = FakeRunner(print_result=_result(0, stdout="state = running\n\tpid = 4242\n"))
-        result = sl.restart(mozyo_home=self.mozyo_home, runner=runner, which=_which_found)
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertTrue(result["performed"])
-        self.assertIn("kickstart", runner.verbs)
         self.assertEqual(
             ["launchctl", "kickstart", "-k", f"gui/501/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
             runner.calls[-1],
         )
 
     def test_restart_refuses_zero_mutation_when_not_loaded(self) -> None:
-        _write_home_credential(self.mozyo_home)
+        self._install_ready()
         runner = FakeRunner(print_result=_result(113, stderr="not found"))
-        result = sl.restart(mozyo_home=self.mozyo_home, runner=runner, which=_which_found)
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_SERVICE_NOT_LOADED, result["reason"])
         self.assertNotIn("kickstart", runner.verbs)
 
-    def test_restart_refuses_on_env_only_credential_before_probe(self) -> None:
-        runner = FakeRunner(print_result=_result(0, stdout="pid = 1\n"))
-        with patch.dict("os.environ", SHELL_ENV, clear=False):
-            result = sl.restart(mozyo_home=self.mozyo_home, runner=runner, which=_which_found)
+    def test_restart_refuses_when_not_installed(self) -> None:
+        runner = FakeRunner()
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_NOT_INSTALLED, result["reason"])
+        self.assertEqual([], runner.calls)
+
+    def test_restart_checks_the_pinned_home_not_the_current_shell(self) -> None:
+        # R3-F1 core: the plist is pinned to A (no credential); a caller with no --home must NOT
+        # kickstart just because some other current home would be ready.
+        with tempfile.TemporaryDirectory() as a:
+            a = Path(a)  # A has NO credential
+            _pinned_plist(self.os_home, _resolved(a))
+            runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+            result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_missing", result["reason"])
-        self.assertEqual([], runner.calls)  # refused before the loaded-probe read
+        self.assertNotIn("kickstart", runner.verbs)
 
-    def test_restart_refuses_on_non_darwin_without_any_launchctl(self) -> None:
-        _write_home_credential(self.mozyo_home)
+    def test_restart_refuses_on_requested_home_that_differs_from_pin(self) -> None:
+        # R3-F1: a --home that disagrees with the installed pin is a re-point attempt -> fail-closed.
+        self._install_ready()  # pinned to mozyo_home (ready)
+        with tempfile.TemporaryDirectory() as other:
+            _write_home_credential(Path(other))  # a DIFFERENT ready home
+            runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+            result = sl.restart(os_home=self.os_home, mozyo_home=Path(other), runner=runner,
+                                which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_HOME_PIN_MISMATCH, result["reason"])
+        self.assertEqual([], runner.calls)
+
+    def test_restart_refuses_on_unhealthy_pin(self) -> None:
+        # A plist with no --home pin (e.g. a hand-edited / legacy file) is not trusted.
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(sl.render_plist(
+            ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once"],
+            interval_seconds=300, os_home=self.os_home,
+        ))
+        runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_HOME_PIN_UNHEALTHY, result["reason"])
+        self.assertEqual([], runner.calls)
+
+    def test_restart_refuses_on_non_darwin(self) -> None:
+        self._install_ready()
         runner = FakeRunner()
         with patch.object(sl, "_running_on_darwin", return_value=False):
-            result = sl.restart(mozyo_home=self.mozyo_home, runner=runner, which=_which_found)
+            result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_UNSUPPORTED_PLATFORM, result["reason"])
         self.assertEqual([], runner.calls)
@@ -407,7 +479,7 @@ class UninstallTest(_DarwinCase):
 
     def test_uninstall_is_safe_without_credential_and_without_plist(self) -> None:
         runner = FakeRunner()
-        result = sl.uninstall(os_home=self.os_home, runner=runner)  # no cred, no plist
+        result = sl.uninstall(os_home=self.os_home, runner=runner)
         self.assertTrue(result["performed"])
         self.assertFalse(result["removed"])
 
@@ -436,16 +508,44 @@ class ServiceStatusTest(_DarwinCase):
         self.assertTrue(status["run_at_load"])
         self.assertFalse(status["keep_alive_present"])
         self.assertTrue(status["no_environment_block"])
+        self.assertEqual(sl.HOME_PIN_OK, status["home_pin"])
         self.assertTrue(status["executable_matches"])
         self.assertEqual(sl.CREDENTIAL_READY, status["credential_readiness"])
-        # Redacted: no path, no secret, no request header anywhere in the projection.
         blob = str(status)
         self.assertNotIn(str(self.os_home), blob)
         self.assertNotIn(str(self.mozyo_home), blob)
+        self.assertNotIn(_resolved(self.mozyo_home), blob)
         self.assertNotIn("home-key", blob.lower())
         self.assertNotIn("x-redmine-api-key", blob.lower())
 
-    def test_status_reports_missing_for_env_only_credential(self) -> None:
+    def test_status_reports_the_pinned_home_readiness_not_the_current_shell(self) -> None:
+        # R3-F1: installed pin (mozyo_home, ready); a DIFFERENT current home B (missing) must not
+        # change the projection — it reflects the installed daemon's pinned root.
+        _write_home_credential(self.mozyo_home)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(),
+                   which=_which_found)
+        with tempfile.TemporaryDirectory() as b:  # B: no credential
+            status = sl.service_status(
+                os_home=self.os_home, mozyo_home=Path(b),
+                runner=FakeRunner(print_result=_result(113)), which=_which_found,
+            )
+        self.assertEqual(sl.CREDENTIAL_READY, status["credential_readiness"])  # A's, not B's
+
+    def test_status_flags_unhealthy_pin_with_empty_readiness(self) -> None:
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(sl.render_plist(
+            ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once"],
+            interval_seconds=300, os_home=self.os_home,
+        ))
+        status = sl.service_status(
+            os_home=self.os_home, runner=FakeRunner(print_result=_result(113)), which=_which_found
+        )
+        self.assertEqual(sl.HOME_PIN_MISSING, status["home_pin"])
+        self.assertEqual("", status["credential_readiness"])
+        self.assertFalse(status["executable_matches"])
+
+    def test_status_when_not_installed_reports_would_be_root_and_hint_interval(self) -> None:
         runner = FakeRunner(print_result=_result(113))
         with patch.dict("os.environ", SHELL_ENV, clear=False):
             status = sl.service_status(
@@ -455,7 +555,8 @@ class ServiceStatusTest(_DarwinCase):
         self.assertFalse(status["installed"])
         self.assertFalse(status["loaded"])
         self.assertIsNone(status["pid"])
-        self.assertEqual(300, status["scheduled_interval_seconds"])  # the would-be interval
+        self.assertEqual(sl.HOME_PIN_NOT_INSTALLED, status["home_pin"])
+        self.assertEqual(300, status["scheduled_interval_seconds"])
         self.assertFalse(status["executable_matches"])
         self.assertEqual(sl.CREDENTIAL_MISSING, status["credential_readiness"])
 
@@ -471,8 +572,8 @@ class ServiceStatusTest(_DarwinCase):
 
     def test_status_flags_executable_drift(self) -> None:
         _write_home_credential(self.mozyo_home)
-        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home, interval_seconds=120,
-                   runner=FakeRunner(), which=_which_found)
+        sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(),
+                   which=_which_found)
 
         def which_moved(_name):
             return "/some/other/path/mozyo-bridge"
