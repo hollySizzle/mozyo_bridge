@@ -88,9 +88,14 @@ PROJECT_NEWER_GENERATION = "newer_generation"
 #: The live observation is at an OLDER generation than the gate's pinned target — a
 #: stale snapshot that must not actuate the approved (newer) generation. Zero-write.
 PROJECT_STALE_GENERATION = "stale_generation"
-#: The supplied existing gate is already terminal (consumed or superseded): its
-#: approval is spent and can never actuate again. Zero-write.
-PROJECT_SUPERSEDED = "superseded"
+#: A re-projection was supplied an ``existing_gate`` but the caller's continuation
+#: identity — ``gate_id`` / ``action_generation`` / ``original_request`` — does not
+#: match it. A re-projection must CONTINUE the same gate under the same action
+#: generation (the approval scope is ``one_target_one_action_generation``); a caller
+#: presenting a different gate id / action generation / original request is trying to
+#: re-bind an existing gate and fails closed before any read (review j#79003 Finding
+#: 1). Zero-write.
+PROJECT_GATE_BINDING_MISMATCH = "gate_binding_mismatch"
 
 #: All recognized dispositions.
 PROJECTION_DISPOSITIONS: frozenset[str] = frozenset(
@@ -104,7 +109,7 @@ PROJECTION_DISPOSITIONS: frozenset[str] = frozenset(
         PROJECT_IDENTITY_MISMATCH,
         PROJECT_NEWER_GENERATION,
         PROJECT_STALE_GENERATION,
-        PROJECT_SUPERSEDED,
+        PROJECT_GATE_BINDING_MISMATCH,
     }
 )
 
@@ -177,8 +182,16 @@ class OperatorStartupGateProjection:
     :class:`OperatorStartupGate` — present **only** for
     :data:`PROJECT_OPERATOR_ACTION_REQUIRED`. ``admission`` is #13760's underlying
     :class:`StartupAdmission` when the classifier ran (absent when the projection
-    short-circuited on identity / generation before reading the pane). ``detail`` is a
-    public-safe one-line explanation. No field carries pane text or a path.
+    short-circuited on identity / generation before reading the pane).
+
+    ``detail`` is a **human-only** one-line explanation for logs / exception text; it
+    is deliberately NOT part of any pasteable / machine-readable surface. The whole
+    point of a projection is a pasteable durable record, and a free-text field cannot
+    be guaranteed path/secret-safe the way closed tokens can, so
+    :meth:`to_telemetry_dict` emits only the closed ``disposition`` token, the
+    fixed-token admission, and the path-safe gate — never ``detail`` (review j#79003
+    Finding 4). The built-in projector's details are fixed prose, but the telemetry
+    contract does not depend on that.
     """
 
     disposition: str
@@ -207,8 +220,13 @@ class OperatorStartupGateProjection:
         return self.disposition == PROJECT_OPERATOR_ACTION_REQUIRED
 
     def to_telemetry_dict(self) -> dict:
-        """Fixed tokens only — no pane text, no paths (durable-record safe)."""
-        record: dict = {"disposition": self.disposition, "detail": self.detail}
+        """Fixed tokens only — no pane text, no paths, no free-form ``detail``.
+
+        Durable-record safe by construction: only the closed ``disposition`` token,
+        the fixed-token admission, and the path-safe gate projection. ``detail`` is
+        human-only and never enters this pasteable surface (review j#79003 Finding 4).
+        """
+        record: dict = {"disposition": self.disposition}
         if self.admission is not None:
             record["startup_admission"] = self.admission.to_telemetry_dict()
         if self.gate is not None:
@@ -233,18 +251,21 @@ def project_operator_startup_gate(
 
     Order of judgment, each step fail-closed before the next:
 
-    1. **Spent gate.** A supplied ``existing_gate`` that is already terminal
-       (consumed / superseded) yields :data:`PROJECT_SUPERSEDED` — its approval can
-       never actuate again — before anything is read.
-    2. **Identity resolution.** An ``ambiguous`` observation yields
+    1. **Identity resolution.** An ``ambiguous`` observation yields
        :data:`PROJECT_AMBIGUOUS_TARGET`; an ``unresolved`` one yields
        :data:`PROJECT_IDENTITY_UNRESOLVED`. A gate cannot be pinned to a blank or
        ambiguous target.
-    3. **Stale判定 against an existing gate.** When ``existing_gate`` is supplied and
-       resolved, the live target is compared to the gate's pin: a different managed
-       identity is :data:`PROJECT_IDENTITY_MISMATCH`; a newer generation is
-       :data:`PROJECT_NEWER_GENERATION` (the approval is stale); an older generation is
-       :data:`PROJECT_STALE_GENERATION`.
+    2. **Gate-binding fence (re-projection).** When ``existing_gate`` is supplied, the
+       caller must be CONTINUING that gate: the ``gate_id`` / ``action_generation`` /
+       ``original_request`` passed in must equal the existing gate's. A divergence is a
+       caller trying to re-bind an existing gate to a different action generation — a
+       violation of the ``one_target_one_action_generation`` approval scope — and
+       yields :data:`PROJECT_GATE_BINDING_MISMATCH` before any read (review j#79003
+       Finding 1).
+    3. **Stale判定 against an existing gate.** The live target is compared to the gate's
+       pin: a different managed identity is :data:`PROJECT_IDENTITY_MISMATCH`; a newer
+       generation is :data:`PROJECT_NEWER_GENERATION` (the gate is superseded); an older
+       generation is :data:`PROJECT_STALE_GENERATION`.
     4. **Startup classification.** #13760's :func:`evaluate_startup_admission` reads the
        pane once and classifies it: admitted -> :data:`PROJECT_STARTUP_CLEAR`; blocked
        -> :data:`PROJECT_OPERATOR_ACTION_REQUIRED` with a fresh ``required`` gate pinned
@@ -256,17 +277,7 @@ def project_operator_startup_gate(
     output is the projection, and the caller decides whether to durably record it — the
     record itself is the resume tranche's (#13813) to reserve and send against.
     """
-    # 1. A spent gate can never actuate again — decide before reading anything.
-    if existing_gate is not None and existing_gate.is_terminal:
-        return OperatorStartupGateProjection(
-            disposition=PROJECT_SUPERSEDED,
-            detail=(
-                f"existing gate {existing_gate.gate_id} is already "
-                f"{existing_gate.state}; its approval is spent and cannot actuate"
-            ),
-        )
-
-    # 2. The identity must resolve to exactly one well-formed live target.
+    # 1. The identity must resolve to exactly one well-formed live target.
     if observed.resolution == RESOLUTION_AMBIGUOUS:
         return OperatorStartupGateProjection(
             disposition=PROJECT_AMBIGUOUS_TARGET,
@@ -279,15 +290,35 @@ def project_operator_startup_gate(
         return OperatorStartupGateProjection(
             disposition=PROJECT_IDENTITY_UNRESOLVED,
             detail=(
-                "no live target resolved from the registry / runtime; a gate cannot "
+                "no live target resolved from the registry or runtime; a gate cannot "
                 "be pinned to a blank target"
             ),
         )
     live_target: GateTarget = observed.target
 
-    # 3. Stale判定: a supplied gate is only honored against a live target that matches
-    #    its pinned identity AND its exact action generation.
     if existing_gate is not None:
+        # 2. Gate-binding fence: a re-projection continues the SAME gate under the SAME
+        #    action generation. The approval scope is one_target_one_action_generation,
+        #    so a caller presenting a different gate id / action generation / original
+        #    request is re-binding an existing gate and fails closed BEFORE any read —
+        #    otherwise the blocked branch below would mint a fresh gate at the new
+        #    action generation, silently defeating the fence (review j#79003 Finding 1).
+        if (
+            gate_id != existing_gate.gate_id
+            or action_generation != existing_gate.action_generation
+            or original_request != existing_gate.original_request
+        ):
+            return OperatorStartupGateProjection(
+                disposition=PROJECT_GATE_BINDING_MISMATCH,
+                detail=(
+                    "re-projection identity (gate id / action generation / original "
+                    "request) does not match the existing gate; a re-projection must "
+                    "continue the same gate under the same action generation"
+                ),
+            )
+
+        # 3. Stale判定: the gate is honored only against a live target that matches its
+        #    pinned identity AND its exact agent generation.
         pinned = existing_gate.target
         if not live_target.same_identity(pinned):
             return OperatorStartupGateProjection(
@@ -381,13 +412,13 @@ def project_operator_startup_gate(
 __all__ = (
     "PROJECTION_DISPOSITIONS",
     "PROJECT_AMBIGUOUS_TARGET",
+    "PROJECT_GATE_BINDING_MISMATCH",
     "PROJECT_IDENTITY_MISMATCH",
     "PROJECT_IDENTITY_UNRESOLVED",
     "PROJECT_NEWER_GENERATION",
     "PROJECT_OPERATOR_ACTION_REQUIRED",
     "PROJECT_STALE_GENERATION",
     "PROJECT_STARTUP_CLEAR",
-    "PROJECT_SUPERSEDED",
     "PROJECT_UNKNOWN_PROVIDER",
     "PROJECT_UNREADABLE",
     "RESOLUTION_AMBIGUOUS",

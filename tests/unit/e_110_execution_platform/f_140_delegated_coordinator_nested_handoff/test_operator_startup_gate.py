@@ -2,10 +2,11 @@
 
 Hermetic, no-side-effect tests for the pure gate schema
 (:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate`).
-They pin the two things the projection tranche must guarantee: the record is a
-faithful, round-trippable model of the j#78409 schema, and it is pasteable — it
-never carries an absolute path, a pane body, a credential, or a login method, and
-its repo identity is an opaque digest.
+They pin what the projection tranche must guarantee: the record is a faithful,
+round-trippable model of the required projection, it is pasteable (no absolute path,
+pane body, credential, or login method; the repo identity is an opaque digest), and —
+after review j#79003 — **v1 realizes only the ``required`` state**, with a zero-write
+invariant (no approval, default resume) so no contradictory durable record can exist.
 
 Neutral placeholder identifiers only; no live tmux, no Redmine, no host paths.
 """
@@ -36,6 +37,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OriginalRequest,
     build_required_gate,
     operator_startup_gate_record_lines,
+    reject_path_or_secret_shaped,
     repo_identity_digest,
 )
 
@@ -90,6 +92,19 @@ class RepoIdentityDigestTests(unittest.TestCase):
             repo_identity_digest("   ")
 
 
+class RejectPathOrSecretShapedTests(unittest.TestCase):
+    def test_absolute_path_rejected(self) -> None:
+        with self.assertRaises(OperatorStartupGateError):
+            reject_path_or_secret_shaped("/Users/me/x", field_name="f")
+
+    def test_secret_token_rejected(self) -> None:
+        with self.assertRaises(OperatorStartupGateError):
+            reject_path_or_secret_shaped("my_api_key_here", field_name="f")
+
+    def test_plain_identifier_ok(self) -> None:
+        reject_path_or_secret_shaped("worker-a", field_name="f")  # no raise
+
+
 class GateTargetTests(unittest.TestCase):
     def test_well_formed_round_trips(self) -> None:
         target = _target()
@@ -114,6 +129,10 @@ class GateTargetTests(unittest.TestCase):
     def test_repo_relative_execution_root_allowed(self) -> None:
         self.assertEqual(_target(execution_root="projects/x").execution_root, "projects/x")
 
+    def test_parent_traversal_execution_root_rejected(self) -> None:
+        with self.assertRaises(OperatorStartupGateError):
+            _target(execution_root="../escape")
+
     def test_non_positive_generation_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
             _target(agent_generation=0)
@@ -136,9 +155,7 @@ class GateTargetTests(unittest.TestCase):
 class OriginalRequestTests(unittest.TestCase):
     def test_non_redmine_source_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
-            OriginalRequest(
-                source="asana", issue="1", journal="2", delivery_id="d"
-            )
+            OriginalRequest(source="asana", issue="1", journal="2", delivery_id="d")
 
     def test_blank_field_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
@@ -150,8 +167,14 @@ class OriginalRequestTests(unittest.TestCase):
                 source="redmine", issue="1", journal="2", delivery_id="api_key-xyz"
             )
 
+    def test_round_trip(self) -> None:
+        original = _original()
+        self.assertEqual(OriginalRequest.from_record(original.to_record()), original)
+
 
 class GateApprovalTests(unittest.TestCase):
+    # GateApproval is the #13813 transition type; #13812 v1 never attaches it to a
+    # gate, but it is a defined, validated schema part and is tested standalone.
     def test_default_shape_is_pinned(self) -> None:
         approval = GateApproval(source_journal="78412")
         self.assertEqual(approval.scope, APPROVAL_SCOPE_ONE_TARGET)
@@ -175,7 +198,7 @@ class GateApprovalTests(unittest.TestCase):
         self.assertEqual(GateApproval.from_record(approval.to_record()), approval)
 
 
-class OperatorStartupGateTests(unittest.TestCase):
+class OperatorStartupGateV1Tests(unittest.TestCase):
     def _gate(self, **overrides) -> OperatorStartupGate:
         kwargs = dict(
             gate_id="gate-1",
@@ -198,27 +221,31 @@ class OperatorStartupGateTests(unittest.TestCase):
         )
         self.assertEqual(gate.state, STATE_REQUIRED)
         self.assertIsNone(gate.approval)
-        self.assertFalse(gate.is_terminal)
+        self.assertEqual(gate.resume, GateResume())
 
     def test_required_with_approval_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
             self._gate(approval=GateApproval(source_journal="78412"))
 
-    def test_owner_approved_without_approval_rejected(self) -> None:
+    def test_required_with_nondefault_resume_rejected(self) -> None:
+        # Finding 2: a required gate with a reserved fence / consumed delivery is a
+        # contradictory record and must not be constructible.
         with self.assertRaises(OperatorStartupGateError):
-            self._gate(state=STATE_OWNER_APPROVED)
-
-    def test_owner_approved_with_approval_ok(self) -> None:
-        gate = self._gate(
-            state=STATE_OWNER_APPROVED, approval=GateApproval(source_journal="78412")
-        )
-        self.assertEqual(gate.state, STATE_OWNER_APPROVED)
-
-    def test_superseded_with_approval_rejected(self) -> None:
+            self._gate(resume=GateResume(dispatch_fence_state="reserved"))
         with self.assertRaises(OperatorStartupGateError):
-            self._gate(
-                state=STATE_SUPERSEDED, approval=GateApproval(source_journal="78412")
-            )
+            self._gate(resume=GateResume(consumed_delivery_record="deliv-x"))
+        with self.assertRaises(OperatorStartupGateError):
+            self._gate(resume=GateResume(startup_clear_observed_at="2026-07-16T01:00:00Z"))
+
+    def test_deferred_transition_states_rejected(self) -> None:
+        # Finding 2: v1 realizes only `required`; the transition-bearing states are
+        # #13813's (they carry owner-approval / resume evidence with invariants v1
+        # does not define). Constructing one fails closed regardless of approval.
+        for state in (STATE_OWNER_APPROVED, STATE_CONSUMED, STATE_SUPERSEDED):
+            with self.assertRaises(OperatorStartupGateError):
+                self._gate(state=state, approval=GateApproval(source_journal="78412"))
+            with self.assertRaises(OperatorStartupGateError):
+                self._gate(state=state)
 
     def test_unknown_state_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
@@ -228,20 +255,8 @@ class OperatorStartupGateTests(unittest.TestCase):
         with self.assertRaises(OperatorStartupGateError):
             self._gate(action_generation=0)
 
-    def test_consumed_is_terminal(self) -> None:
-        gate = self._gate(
-            state=STATE_CONSUMED, approval=GateApproval(source_journal="78412")
-        )
-        self.assertTrue(gate.is_terminal)
-
     def test_round_trip_required(self) -> None:
         gate = self._gate()
-        self.assertEqual(OperatorStartupGate.from_record(gate.to_record()), gate)
-
-    def test_round_trip_owner_approved(self) -> None:
-        gate = self._gate(
-            state=STATE_OWNER_APPROVED, approval=GateApproval(source_journal="78412")
-        )
         self.assertEqual(OperatorStartupGate.from_record(gate.to_record()), gate)
 
     def test_public_projection_equals_to_record(self) -> None:
@@ -254,10 +269,12 @@ class OperatorStartupGateTests(unittest.TestCase):
         with self.assertRaises(OperatorStartupGateError):
             OperatorStartupGate.from_record(record)
 
-    def test_resume_default_is_not_reserved(self) -> None:
-        gate = self._gate()
-        self.assertEqual(gate.resume, GateResume())
-        self.assertIsNone(gate.resume.startup_clear_observed_at)
+    def test_from_record_transition_state_rejected(self) -> None:
+        # A persisted record naming a #13813 state fails closed under v1.
+        record = self._gate().to_record()
+        record["state"] = STATE_CONSUMED
+        with self.assertRaises(OperatorStartupGateError):
+            OperatorStartupGate.from_record(record)
 
 
 class RecordLinesRedactionTests(unittest.TestCase):
@@ -287,9 +304,17 @@ class RecordLinesRedactionTests(unittest.TestCase):
             self.assertNotIn("password", line)
 
     def test_states_operator_ui_boundary(self) -> None:
-        blob = "\n".join(self._lines())
-        self.assertIn("operator", blob.lower())
-        self.assertIn("read-only", blob.lower())
+        blob = "\n".join(self._lines()).lower()
+        self.assertIn("operator", blob)
+        self.assertIn("read-only", blob)
+
+    def test_does_not_promise_exactly_once_resume(self) -> None:
+        # Finding 3: the formatter must not guarantee an exactly-once re-issue that
+        # #13813 has not implemented; it must mark resume as pending.
+        blob = "\n".join(self._lines()).lower()
+        self.assertNotIn("lands exactly once", blob)
+        self.assertIn("pending", blob)
+        self.assertIn("#13813", "\n".join(self._lines()))
 
 
 if __name__ == "__main__":
