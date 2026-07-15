@@ -355,11 +355,15 @@ Table naming:
       区別して伝播する。disposition / generation / release / replacement / decision anchor は不変。
       ★adopt が gate failure / CAS refusal で終わったとき「既に確立済みゆえ dispatch 安全」と判定する
       条件は、**issue 所有だけでは不十分**で state DB owner row が **complete かつ exact な binding**
-      — `worktree_identity` 非空 かつ token 一致、**かつ** `declared_slots` が decode-valid で gateway+worker
-      provider-role を含む non-empty typed pin set — を持つことを要する (#13809 review j#78975 F1 / j#79015 F2)。
-      いずれかの軸が incomplete な legacy row (空 worktree、または pins-only gap) や別 worktree binding では
+      — `worktree_identity` 非空 かつ token 一致、**かつ** `declared_slots` が decode-valid で
+      **この adopt の provider pair** に紐づく `(GATEWAY_ROLE, gateway_provider)` / `(WORKER_ROLE, worker_provider)`
+      pin を含む non-empty typed pin set — を持つことを要する (#13809 review j#78975 F1 / j#79015 F2 /
+      j#79074 F3)。completeness は role 名だけでなく `(role, provider)` pair で照合し、role は揃うが provider が
+      異なる **swapped/foreign snapshot**（provider_binding 切替後の旧 pin 等）は complete としない。locator /
+      runtime_revision は照合対象外で、同 provider pair の recycled generation（別 locator）は complete を保つ。
+      いずれかの軸が incomplete な legacy row (空 worktree、pins-only gap) や別 worktree / 別 provider binding では
       ambiguous / unattested / stale live pair・revision race・non-empty mismatch を `already_owned` に畳まず
-      fail-closed で dispatch を止める (items 2/3 の安全 gate を incomplete row でも維持)。herdr 全断の
+      fail-closed で dispatch を止める (items 2/3 の安全 gate を維持)。herdr 全断の
       `unreadable_inventory` は無観測ゆえ別扱いで ownership authority proceed (R4-F3) を維持する。
     - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle

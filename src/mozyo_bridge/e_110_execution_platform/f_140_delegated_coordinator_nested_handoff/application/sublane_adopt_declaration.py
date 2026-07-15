@@ -404,6 +404,7 @@ def declare_adopted_owner_row(
         issue=issue,
         lane=lane,
         worktree_token=worktree_token,
+        providers=providers,
     )
 
 
@@ -443,6 +444,7 @@ def complete_owner_bound_or(
     issue: str,
     lane: str,
     worktree_token: Optional[str],
+    providers: tuple[str, str],
     store_factory: Callable[[], LaneDeclarationStore] = LaneDeclarationStore,
 ) -> str:
     """``already_owned`` only when ``lane`` owns ``issue`` with a COMPLETE, EXACT binding.
@@ -451,11 +453,12 @@ def complete_owner_bound_or(
     inventory (review j#78975 F1 / j#79015 F2). Unlike :func:`owner_bound_or`, owning the
     issue is not enough: the state DB owner row must ALSO carry BOTH halves of a complete
     binding — a non-empty ``worktree_identity`` equal to the exact token this adopt resolved,
-    AND a non-empty typed-pin snapshot with the gateway + worker roles. That is what
-    distinguishes a lane genuinely already established as THIS exact lane (a completed create /
-    adopt, or a recycled generation of the same worktree — safe to dispatch, preserving
-    Redmine #13810 R3-F1/R3-F3) from a legacy row incomplete on EITHER axis (an empty worktree
-    binding, or the v4->v5 pins-only gap) or a DIFFERENT-worktree binding, all of which keep
+    AND a non-empty typed-pin snapshot binding the gateway + worker **roles to THIS adopt's
+    ``providers``**. That is what distinguishes a lane genuinely already established as THIS
+    exact lane (a completed create / adopt, or a recycled generation of the same worktree +
+    provider pair — safe to dispatch, preserving Redmine #13810 R3-F1/R3-F3) from a legacy row
+    incomplete on an axis (an empty worktree binding, the v4->v5 pins-only gap) or a binding
+    that is a DIFFERENT worktree or a DIFFERENT / foreign provider pair — all of which keep
     ``reason`` so the caller fails closed before dispatch.
 
     ``worktree_token`` is ``None`` when the lane's worktree could not be resolved; there is
@@ -467,6 +470,7 @@ def complete_owner_bound_or(
         _norm(issue),
         _norm(lane),
         _norm(worktree_token) if worktree_token is not None else "",
+        providers,
     ):
         return ADOPT_DECL_ALREADY_OWNED
     return reason
@@ -499,21 +503,23 @@ def _lane_owns_issue_with_binding(
     issue: str,
     lane: str,
     worktree_token: str,
+    providers: tuple[str, str],
 ) -> bool:
     """Does ``lane`` own ``issue`` with a COMPLETE, EXACT binding? (fail-closed)
 
-    The completeness half of the owner check (review j#78975 F1 / j#79015 F2). Reads the same
-    state DB and additionally requires the owner row to carry BOTH halves of a complete binding:
+    The completeness half of the owner check (review j#78975 F1 / j#79015 F2 / j#79074 F3).
+    Reads the same state DB and additionally requires the owner row to carry BOTH halves of a
+    complete binding:
 
     - ``worktree_identity`` non-empty and equal to ``worktree_token`` (the exact worktree);
-    - a ``declared_slots`` snapshot that decodes valid and carries the gateway + worker
-      provider-role pins (a non-empty typed pin set).
+    - a ``declared_slots`` snapshot that decodes valid and binds the gateway + worker roles to
+      THIS adopt's ``providers`` (a non-empty typed pin set with the exact provider pair).
 
     An empty token, an unreadable store, an owner that is a different / no lane, a row whose
     worktree binding is empty / different, OR a row whose typed pins are empty / undecodable /
-    missing a required role reads False — so a legacy row that is incomplete on EITHER axis
-    (empty worktree binding, or the v4->v5 pins-only gap) is never treated as an established
-    lane the caller may dispatch to on a gate / CAS failure.
+    missing a required role-provider pair reads False — so a legacy row incomplete on an axis
+    (empty worktree binding, the v4->v5 pins-only gap) or a foreign / swapped provider snapshot
+    is never treated as an established lane the caller may dispatch to on a gate / CAS failure.
     """
     if not worktree_token:
         return False
@@ -527,23 +533,35 @@ def _lane_owns_issue_with_binding(
         return False
     if record is None or _norm(record.worktree_identity) != worktree_token:
         return False
-    return _binding_has_required_pins(record)
+    return _binding_has_required_pins(record, providers)
 
 
-def _binding_has_required_pins(record) -> bool:
-    """Does the row's declared-slot snapshot decode valid with both required roles? (fail-closed)
+def _binding_has_required_pins(record, providers: tuple[str, str]) -> bool:
+    """Does the snapshot bind the gateway + worker roles to THIS provider pair? (fail-closed)
 
-    The typed-pins half of completeness (review j#79015 F2): a complete binding records the
-    provider-role slots this adopt path declares — the gateway and the worker. An empty
-    snapshot (the v4->v5 pins-only gap), an undecodable one (fail-closed by contract), or one
-    missing either required role is NOT complete, so the row is not an established lane.
+    The typed-pins half of completeness (review j#79015 F2 / j#79074 F3): a complete binding
+    records the provider-role slots this adopt path declares — the gateway bound to
+    ``gateway_provider`` and the worker to ``worker_provider``. It matches on the
+    ``(role, provider)`` pair, NOT the role label alone: a snapshot from a DIFFERENT provider
+    binding (a swapped / foreign provider pair) carries the same two role labels but the wrong
+    providers, and must not authorize the current provider pair's fail-closed gate (Redmine
+    #13809 j#78945 item 2 — the action-time provider/role pin). ``locator`` / ``runtime_revision``
+    are deliberately NOT compared here, so a recycled generation of the SAME provider pair
+    (same ``(role, provider)``, a fresh locator) still reads complete (preserving #13810).
+
+    An empty snapshot (the v4->v5 pins-only gap), an undecodable one (fail-closed by contract),
+    or one missing either expected role-provider pair is NOT complete.
     """
+    gateway_provider, worker_provider = providers
     try:
         pins = record.declared_pins  # decode_declared_slots; raises on a corrupt snapshot
     except ProcessPinError:
         return False
-    roles = {pin.role for pin in pins}
-    return GATEWAY_ROLE in roles and WORKER_ROLE in roles
+    role_provider = {(pin.role, pin.provider) for pin in pins}
+    return (
+        (GATEWAY_ROLE, _norm(gateway_provider)) in role_provider
+        and (WORKER_ROLE, _norm(worker_provider)) in role_provider
+    )
 
 
 __all__ = (

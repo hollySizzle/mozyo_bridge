@@ -387,6 +387,55 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
         self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
         self.assertEqual(self._row_for().declared_pins, ())
 
+    # -- provider-role completeness: a foreign provider snapshot is not complete (j#79074 F3) --
+
+    def _seed_complete_row(self, pins: list) -> str:
+        """A worktree-complete row carrying an explicit typed-pin snapshot (any provider pair)."""
+        token = _worktree_token(self.coord, self.worktree, LANE)
+        out = LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+            worktree_identity=token,
+            declared_slots=pins,
+        )
+        self.assertTrue(out.applied)
+        return token
+
+    def test_foreign_provider_snapshot_unattested_fails_closed(self) -> None:
+        # F3: a stored snapshot whose ROLES match but whose PROVIDERS are swapped/foreign is
+        # NOT complete for the current provider pair (PROVIDERS=("codex","claude")). An
+        # unattested adopt fails closed rather than dispatching on a stale-provider snapshot.
+        self._seed_complete_row(
+            [
+                ProcessGenerationPin(
+                    role=GATEWAY_ROLE, provider="claude", assigned_name="a", locator="w1:pA"
+                ),
+                ProcessGenerationPin(
+                    role=WORKER_ROLE, provider="codex", assigned_name="b", locator="w1:pB"
+                ),
+            ]
+        )
+        outcome = self._call(_pair_rows())  # no attestation seeded
+        self.assertEqual(outcome, ADOPT_DECL_UNATTESTED)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+
+    def test_matching_provider_complete_row_unattested_is_already_owned(self) -> None:
+        # Preserve: a COMPLETE row whose typed pins bind the CURRENT provider pair proceeds as
+        # already_owned even on an unattested re-adopt (an established lane; #13810 R3-F3 / F1).
+        self._seed_complete_row(
+            [
+                ProcessGenerationPin(
+                    role=GATEWAY_ROLE, provider="codex", assigned_name="a", locator="w1:pA"
+                ),
+                ProcessGenerationPin(
+                    role=WORKER_ROLE, provider="claude", assigned_name="b", locator="w1:pB"
+                ),
+            ]
+        )
+        outcome = self._call(_pair_rows())  # unattested, but the row is complete + matching
+        self.assertEqual(outcome, ADOPT_DECL_ALREADY_OWNED)
+
     def test_legacy_incomplete_row_unattested_pair_fails_closed(self) -> None:
         # review j#78975 F1: a legacy INCOMPLETE row (empty worktree binding) whose live pair
         # cannot self-attest must FAIL CLOSED — NOT collapse to already_owned. Owning the
@@ -804,6 +853,29 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         self.assertEqual(
             sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
         )
+
+    def test_official_path_foreign_provider_snapshot_unattested_blocks(self) -> None:
+        # review j#79074 F3 at the official ops surface: a worktree-complete row whose typed
+        # pins bind a SWAPPED/foreign provider pair + an unattested live pair returns an
+        # owner-unbound BLOCK token (dispatch=false), NOT already_owned.
+        token = _worktree_token(self.coord, self.worktree, LANE)
+        LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+            worktree_identity=token,
+            declared_slots=[
+                ProcessGenerationPin(
+                    role=GATEWAY_ROLE, provider="claude", assigned_name="a", locator="w1:pA"
+                ),
+                ProcessGenerationPin(
+                    role=WORKER_ROLE, provider="codex", assigned_name="b", locator="w1:pB"
+                ),
+            ],
+        )
+        out = self._drive(adopted=True, rows=_pair_rows())  # no attestation seeded
+        self.assertEqual(out, ADOPT_DECL_UNATTESTED)
+        self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
 
     def _drive_unreadable(self, *, workspace_segment) -> str:
         # R4-F3: the live inventory read RAISES at declaration time (herdr down). The ops
