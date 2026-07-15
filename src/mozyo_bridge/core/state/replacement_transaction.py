@@ -611,13 +611,17 @@ class ReplacementTransactionStore:
         is :data:`CAS_FORBIDDEN_TRANSITION`. A duplicate transition simply fails the exact
         expected-revision guard, so a resuming holder re-reads the phase and continues.
 
-        It also enforces the **cross-axis prerequisite** (R1-F1,
+        It also enforces the **cross-axis prerequisite** (R1-F1 / R2-F1,
         :func:`transaction_phase_prerequisite_met`): the transaction may not leave
-        ``replacing_nonself`` until every non-self participant is ``replaced``, nor reach
-        ``completed`` until *all* participants are — so ``completed`` with an unfinished
-        participant, or a self-close before the non-self participants, is unrepresentable.
-        A prerequisite miss is :data:`CAS_FORBIDDEN_TRANSITION`, zero-write.
-        ``expected_action_generation`` pins the immutable generation (R1-F2).
+        ``replacing_nonself`` until every non-self participant is ``replaced``; may not enter
+        ``fresh_coordinator_claimed`` until the self participant exists and is ``replaced``
+        (a fresh coordinator only claims after the old self is closed, relaunched, and
+        attested); and may not reach ``completed`` until *all* participants are. So
+        ``completed`` with an unfinished participant, a self-close before the non-self
+        participants, or a ``fresh_coordinator_claimed`` with an un-replaced self, is
+        unrepresentable. A prerequisite miss is :data:`CAS_FORBIDDEN_TRANSITION`, zero-write.
+        ``expected_action_generation`` pins the immutable generation (R1-F2), validated as a
+        positive exact ``int`` (R2-F2).
         """
         if target not in TRANSACTION_PHASES:
             raise ValueError(f"unknown transaction phase {target!r}")
@@ -711,11 +715,14 @@ class ReplacementTransactionStore:
         moves — its identity manifest is preserved byte-for-byte, so a transition can never
         re-identify a participant.
 
-        It also enforces the **cross-axis actuation gate** (R1-F1,
+        It also enforces the **cross-axis actuation gate** (R1-F1 / R2-F1,
         :func:`participant_actuation_phase_allowed`): a non-self participant may be actuated
         only while the transaction is ``replacing_nonself``, and the self (current
-        coordinator) participant only once its self-close is armed
-        (``self_close_armed`` onward) — so the current coordinator is always replaced last.
+        coordinator) participant only while the transaction is ``self_close_armed`` — that
+        one armed window only, never after. The old self is closed, relaunched, and attested
+        entirely within ``self_close_armed``; by the time the transaction enters
+        ``fresh_coordinator_claimed`` the self is already ``replaced`` (its prerequisite), so
+        the current coordinator is always replaced last and is never advanced past its window.
         A move outside the participant's allowed transaction phase is
         :data:`CAS_FORBIDDEN_TRANSITION`, zero-write.
 
