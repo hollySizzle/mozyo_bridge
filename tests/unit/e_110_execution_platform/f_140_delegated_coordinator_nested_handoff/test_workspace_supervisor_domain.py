@@ -1,8 +1,8 @@
-"""Pure workspace-supervision domain tests (Redmine #13683 Phase A).
+"""Pure workspace-supervision domain tests (Redmine #13683).
 
 Pins the pure decisions the composition root composes: which issues a pass supervises under each
 wake mode (and that a wake for a non-active issue is ignored, not trusted), the redaction-safe
-report roll-up, and the secret-free service definition + Phase-A host-mutation gate.
+report roll-up, and the secret-free, ``keep_alive=False`` one-shot service definition.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
-    PHASE_A_SERVICE_MUTATION_REASON,
     SUPERVISION_BOUNDED_RECONCILIATION,
     SUPERVISION_LOCAL_WAKE,
     IssueSupervisionOutcome,
@@ -98,8 +97,13 @@ class ServiceDefinitionTest(unittest.TestCase):
     def test_interval_is_clamped_to_at_least_one(self) -> None:
         self.assertEqual(build_service_definition(reconciliation_interval_seconds=0).reconciliation_interval_seconds, 1)
 
-    def test_phase_a_mutation_reason_is_stable(self) -> None:
-        self.assertEqual(PHASE_A_SERVICE_MUTATION_REASON, "phase_a_no_host_service_mutation")
+    def test_keep_alive_defaults_false_for_one_shot_sweep(self) -> None:
+        # The command is a bounded --run-once sweep re-run on an interval; KeepAlive would be a
+        # tight restart loop, so the declarative contract pins keep_alive=False (j#78995).
+        d = build_service_definition()
+        self.assertFalse(d.keep_alive)
+        self.assertTrue(d.run_at_login)
+        self.assertFalse(d.as_payload()["keep_alive"])
 
 
 if __name__ == "__main__":

@@ -16,10 +16,14 @@ Actions (mutually exclusive):
 - ``--status`` — read-only: the registry workspaces, current supervisor leases, and the
   home-scoped runtime-store event count + callback-outbox backlog. Mutates nothing.
 - ``--service-status`` / ``--install`` / ``--restart`` / ``--uninstall`` — the **service lifecycle
-  command contract**. ``--service-status`` prints the resolved (secret-free) service definition and
-  reports that the host service is not activated. The three mutating verbs are **fail-closed in
-  Phase A**: they print the resolved plan + refusal reason and exit non-zero WITHOUT touching the
-  host / login service — the real activation is Phase B (installed parity #13524 / #13526).
+  command contract**, realized in Phase B1 as the owned macOS LaunchAgent lifecycle
+  (:mod:`...application.supervisor_launchd`). ``--service-status`` prints a redacted host-service
+  projection (plist / loaded / pid / scheduled interval / executable-match / credential readiness) +
+  the secret-free declarative definition. ``--install`` / ``--restart`` / ``--uninstall`` drive the
+  owned LaunchAgent: the scheduled ``--run-once`` sweep is wired with ``RunAtLoad`` + ``StartInterval``
+  (never ``KeepAlive``) and a plist carrying **no** ``EnvironmentVariables``. They exit 0 on a
+  performed action and non-zero on a fail-closed refusal (non-darwin, missing executable, non-ready
+  credential, restart-not-loaded), touching nothing but the owned label / plist.
 
 A source / store error is a ``SystemExit`` with a redacted message (never a credential / URL /
 pane id / absolute path).
@@ -36,7 +40,6 @@ from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
-    PHASE_A_SERVICE_MUTATION_REASON,
     SUPERVISION_BOUNDED_RECONCILIATION,
     SUPERVISION_LOCAL_WAKE,
     build_service_definition,
@@ -206,57 +209,73 @@ def _service_definition(args: argparse.Namespace):
 
 
 def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
-    """The service lifecycle command contract (Phase A: report; host mutation is Phase B).
+    """The service lifecycle command contract (Phase B1: real macOS LaunchAgent lifecycle).
 
-    ``--service-status`` reports the resolved definition + that the host service is not activated
-    (exit 0). ``--install`` / ``--restart`` / ``--uninstall`` are fail-closed in Phase A: they
-    print the plan + the :data:`PHASE_A_SERVICE_MUTATION_REASON` refusal and exit non-zero WITHOUT
-    touching the host / login service — the real activation is Phase B (#13524 / #13526 parity).
+    ``--service-status`` reports the redacted host-service projection + the secret-free declarative
+    definition (exit 0, mutates nothing). ``--install`` / ``--restart`` / ``--uninstall`` drive the
+    owned LaunchAgent (:mod:`...application.supervisor_launchd`): they exit 0 on a performed action
+    and non-zero on a fail-closed refusal (non-darwin host, missing executable, non-ready Redmine
+    credential, or — for restart — a service that is not loaded), never touching anything but the
+    owned label / plist. No Redmine fetch, gate progression, route, or callback delivery happens
+    here; installing the agent is orthogonal to what it does when it runs.
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+        supervisor_launchd,
+    )
+
     as_json = bool(getattr(args, "as_json", False))
+    home = _home_from_args(args)
     definition = _service_definition(args)
+
     if verb == "service-status":
-        payload = {
-            "action": "service-status",
-            "installed": False,
-            "phase": "A",
-            "note": "host service activation is Phase B (#13524 / #13526 installed parity)",
-            "definition": definition.as_payload(),
-        }
+        status = supervisor_launchd.service_status(
+            home=home, interval_hint=definition.reconciliation_interval_seconds
+        )
+        payload = dict(status)
+        payload["phase"] = "B1"
+        payload["definition"] = definition.as_payload()
         lines = [
             "action: service-status",
-            "installed: False",
-            "phase: A (host service activation deferred to Phase B: #13524 / #13526)",
-            f"service_label: {definition.label}",
+            "phase: B1 (macOS LaunchAgent lifecycle; RunAtLoad + StartInterval, no KeepAlive)",
+            f"service_label: {status['label']}",
+            f"platform_supported: {status['platform_supported']}",
+            f"installed: {status['installed']}",
+            f"loaded: {status['loaded']}",
+            f"pid: {status['pid']}",
+            f"scheduled_interval_seconds: {status['scheduled_interval_seconds']}",
+            f"executable_matches: {status['executable_matches']}",
+            f"keep_alive_present: {status['keep_alive_present']}",
+            f"credential_readiness: {status['credential_readiness']}",
             f"command: {' '.join(definition.command)}",
-            f"reconciliation_interval_seconds: {definition.reconciliation_interval_seconds}",
-            f"run_at_login: {definition.run_at_login}",
         ]
         _emit(payload, as_json=as_json, text_lines=lines)
         return 0
 
-    # install / restart / uninstall: fail-closed, no host mutation in Phase A.
-    payload = {
-        "action": verb,
-        "performed": False,
-        "reason": PHASE_A_SERVICE_MUTATION_REASON,
-        "note": (
-            "Phase A does not mutate the host / login service; run this after Phase B installed "
-            "parity (#13524 / #13526). No launchd/login service was changed."
-        ),
-        "definition": definition.as_payload(),
-    }
+    if verb == "install":
+        result = supervisor_launchd.install(
+            home=home, interval_seconds=definition.reconciliation_interval_seconds
+        )
+    elif verb == "restart":
+        result = supervisor_launchd.restart(home=home)
+    else:  # uninstall
+        result = supervisor_launchd.uninstall(home=home)
+
+    payload = dict(result)
+    performed = bool(result.get("performed"))
     lines = [
-        f"action: {verb}",
-        "performed: False",
-        f"reason: {PHASE_A_SERVICE_MUTATION_REASON}",
-        "note: Phase A does not mutate the host/login service; activation is Phase B "
-        "(#13524 / #13526). No launchd/login service was changed.",
-        f"service_label: {definition.label}",
-        f"command: {' '.join(definition.command)}",
+        f"action: {result.get('action', verb)}",
+        f"performed: {performed}",
+        f"reason: {result.get('reason', '')}",
     ]
+    if "credential_readiness" in result:
+        lines.append(f"credential_readiness: {result['credential_readiness']}")
+    if "removed" in result:
+        lines.append(f"removed: {result['removed']}")
+    if "scheduled_interval_seconds" in result:
+        lines.append(f"scheduled_interval_seconds: {result['scheduled_interval_seconds']}")
+    lines.append(f"service_label: {definition.label}")
     _emit(payload, as_json=as_json, text_lines=lines)
-    return 1
+    return 0 if performed else 1
 
 
 def cmd_workflow_supervisor(args: argparse.Namespace) -> int:
@@ -291,9 +310,11 @@ def register_supervisor(workflow_sub) -> None:
             "one bounded supervised sweep (a refused lease skips the workspace: the "
             "duplicate-supervisor fence); `--wake WORKSPACE:ISSUE` switches to local_wake mode. "
             "`--status` is a read-only registry / lease / backlog view. The service lifecycle "
-            "contract (`--service-status` / `--install` / `--restart` / `--uninstall`) reports the "
-            "secret-free service definition; the three mutating verbs are fail-closed in Phase A "
-            "(host activation is Phase B, #13524 / #13526)."
+            "contract (`--service-status` / `--install` / `--restart` / `--uninstall`) is the owned "
+            "macOS LaunchAgent lifecycle (Phase B1): `--service-status` is a redacted projection + "
+            "secret-free definition; the mutating verbs drive the one-shot RunAtLoad + StartInterval "
+            "agent (no KeepAlive, no EnvironmentVariables) and fail-closed on non-darwin / missing "
+            "executable / non-ready credential."
         ),
         help=(
             "Workspace callback supervisor: run-once / status / service lifecycle contract. "
@@ -315,15 +336,16 @@ def register_supervisor(workflow_sub) -> None:
     )
     action.add_argument(
         "--install", action="store_true",
-        help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
+        help="Install the owned LaunchAgent (RunAtLoad + StartInterval one-shot sweep). Fail-closed "
+             "on non-darwin / missing executable / non-ready credential.",
     )
     action.add_argument(
         "--restart", action="store_true",
-        help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
+        help="Kickstart the loaded LaunchAgent. Fail-closed if not loaded / non-darwin / non-ready.",
     )
     action.add_argument(
         "--uninstall", action="store_true",
-        help="Service lifecycle contract: fail-closed in Phase A (host activation is Phase B).",
+        help="Boot out and remove exactly the owned LaunchAgent plist (no credential required).",
     )
     p.add_argument(
         "--local-wake", dest="local_wake", action="store_true",

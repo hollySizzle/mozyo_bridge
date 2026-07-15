@@ -22,9 +22,12 @@ store / lease I/O so they are deterministically testable:
 - **the service lifecycle contract** (:class:`SupervisorServiceDefinition` /
   :func:`build_service_definition`): the *declarative* definition of the supervisor daemon a host
   service manager would run, carrying **no secrets** (Redmine is the durable auth authority; a
-  credential is never written into a service definition or its logs — j#77065). Phase A ships the
-  command **contract**; the actual host install/restart/uninstall is Phase B (gated on #13524 /
-  #13526 installed parity), expressed here by :data:`PHASE_A_SERVICE_MUTATION_REASON`.
+  credential is never written into a service definition or its logs — j#77065). The command is the
+  bounded ``--run-once`` sweep; ``keep_alive`` is ``False`` because the sweep exits and is re-run on
+  the host interval (mapping a one-shot command onto KeepAlive would be a tight restart loop —
+  j#78995). The concrete macOS LaunchAgent realization (``RunAtLoad`` + ``StartInterval``, no
+  KeepAlive, no ``EnvironmentVariables``) lives in Phase B1's
+  ``application/supervisor_launchd.py``; this module stays pure and secret-free.
 """
 
 from __future__ import annotations
@@ -55,10 +58,6 @@ SKIP_NO_ACTIVE_ISSUES = "no_active_issues_to_supervise"  # roster read OK but no
 #: The renew fence tripped mid-sweep: this workspace's lease was lost (taken over after expiry),
 #: so the supervisor stopped before the next issue's side-effects (Redmine #13683 review R1-F1).
 SKIP_LEASE_LOST = "lease_lost_midsweep"
-
-#: Phase A refuses to mutate the host / login service (install / restart / uninstall). The actual
-#: activation is Phase B, gated on installed parity (#13524 / #13526). j#77065 boundary.
-PHASE_A_SERVICE_MUTATION_REASON = "phase_a_no_host_service_mutation"
 
 
 @dataclass(frozen=True)
@@ -233,6 +232,10 @@ class SupervisorServiceDefinition:
     command: tuple[str, ...]
     reconciliation_interval_seconds: int
     run_at_login: bool
+    #: Always ``False`` for this supervisor: the command is a bounded ``--run-once`` sweep that
+    #: exits, scheduled by a host interval (launchd ``StartInterval`` in Phase B1), NOT kept alive.
+    #: Mapping a one-shot command onto ``KeepAlive`` would be a tight restart loop (j#78995), so the
+    #: declarative contract pins ``keep_alive=False`` and the rendered launchd plist omits KeepAlive.
     keep_alive: bool
 
     def as_payload(self) -> dict[str, object]:
@@ -254,15 +257,17 @@ def build_service_definition(
     command_prefix: Sequence[str] = ("mozyo-bridge", "workflow", "supervisor"),
     reconciliation_interval_seconds: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     run_at_login: bool = True,
-    keep_alive: bool = True,
+    keep_alive: bool = False,
     label: str = DEFAULT_SUPERVISOR_SERVICE_LABEL,
 ) -> SupervisorServiceDefinition:
     """Build the supervisor daemon's declarative service definition (pure, no secrets).
 
     The command is ``<command_prefix> --run-once`` — the service manager invokes one bounded
     supervised sweep per tick (the run-once entrypoint), so residency lives in the host manager's
-    ``keep_alive`` / interval, not an unbounded in-process poll (the wait/polling doctrine keeps
-    the bounded cadence in the watcher/service layer, never an LLM turn).
+    scheduled interval, not an unbounded in-process poll (the wait/polling doctrine keeps the
+    bounded cadence in the watcher/service layer, never an LLM turn). ``keep_alive`` defaults to
+    **False**: the sweep exits and is re-run on the interval (launchd ``RunAtLoad`` + ``StartInterval``
+    in Phase B1), so KeepAlive would only produce a tight restart loop (j#78995).
     """
     interval = max(1, int(reconciliation_interval_seconds))
     command = tuple(str(p) for p in command_prefix) + ("--run-once",)
@@ -284,7 +289,6 @@ __all__ = (
     "SKIP_ROSTER_UNREADABLE",
     "SKIP_NO_ACTIVE_ISSUES",
     "SKIP_LEASE_LOST",
-    "PHASE_A_SERVICE_MUTATION_REASON",
     "IssueSelection",
     "select_supervised_issues",
     "IssueSupervisionOutcome",
