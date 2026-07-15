@@ -27,6 +27,20 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AnchorError,
+    TicketlessConsultationAnchor,
+    TicketlessWorkIntakeAnchor,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
+    CALLBACK_METHODS as CONSULT_CALLBACK_METHODS,
+    CONSULTATION_PROJECT_DOMAIN,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
+    CALLBACK_METHODS as WORK_INTAKE_CALLBACK_METHODS,
+    ROLE_DELEGATED_COORDINATOR,
+    WORK_SHAPE_DOMAIN_DESIGN,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    ROLE_PROJECT_GATEWAY,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (
     HandoffCommandInput,
@@ -154,6 +168,90 @@ class PlanAnchorTest(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.reason, "invalid_args")
         self.assertEqual(ctx.exception.outcome_extra, {})
+
+    # -- Asana: same non-ticketless branch as Redmine, delegating to the port ----
+    def test_asana_anchor_delegates_to_normalize_anchor_port(self) -> None:
+        ops = FakeOps(anchor="ASANA")
+        plan = HandoffEnvelopePlanner(ops).plan_anchor(
+            _inp(source="asana", task_id="T1", comment_id="C1")
+        )
+        self.assertEqual(plan.anchor, "ASANA")
+        self.assertIsNone(plan.callback_payload)
+        # the anchored branch DOES call the normalize_anchor port, with source=asana
+        self.assertIn(("normalize_anchor", "asana", None, None), ops.calls)
+
+    # -- ticketless consultation --------------------------------------------------
+    def test_ticketless_consultation_success(self) -> None:
+        ops = FakeOps()
+        plan = HandoffEnvelopePlanner(ops).plan_anchor(
+            _inp(
+                ticketless=True,
+                ticketless_consultation=True,
+                consultation_kind=CONSULTATION_PROJECT_DOMAIN,
+                callback_to_role="grandparent_coordinator",
+                callback_methods=tuple(CONSULT_CALLBACK_METHODS),
+                read_contract="project_gateway",
+            )
+        )
+        self.assertIsNotNone(plan.consultation_payload)
+        self.assertIsNone(plan.callback_payload)
+        self.assertIsNone(plan.work_intake_payload)
+        self.assertIsInstance(plan.anchor, TicketlessConsultationAnchor)
+        # ticketless branch must NOT touch the normalize_anchor port
+        self.assertFalse(any(c[0] == "normalize_anchor" for c in ops.calls))
+
+    def test_ticketless_consultation_invalid_raises_without_port_call(self) -> None:
+        ops = FakeOps()
+        with self.assertRaises(EnvelopePlanError) as ctx:
+            HandoffEnvelopePlanner(ops).plan_anchor(
+                _inp(
+                    ticketless=True,
+                    ticketless_consultation=True,
+                    consultation_kind="not-a-real-consultation",
+                    callback_to_role="grandparent_coordinator",
+                    callback_methods=tuple(CONSULT_CALLBACK_METHODS),
+                    read_contract="project_gateway",
+                )
+            )
+        self.assertEqual(ctx.exception.reason, "invalid_args")
+        self.assertEqual(ctx.exception.outcome_extra, {})
+        self.assertFalse(any(c[0] == "normalize_anchor" for c in ops.calls))
+
+    # -- ticketless work-intake ---------------------------------------------------
+    def test_ticketless_work_intake_success(self) -> None:
+        ops = FakeOps()
+        plan = HandoffEnvelopePlanner(ops).plan_anchor(
+            _inp(
+                ticketless=True,
+                ticketless_work_intake=True,
+                work_shape=WORK_SHAPE_DOMAIN_DESIGN,
+                callback_to_role=ROLE_PROJECT_GATEWAY,
+                callback_methods=tuple(WORK_INTAKE_CALLBACK_METHODS),
+                read_contract=ROLE_DELEGATED_COORDINATOR,
+            )
+        )
+        self.assertIsNotNone(plan.work_intake_payload)
+        self.assertIsNone(plan.callback_payload)
+        self.assertIsNone(plan.consultation_payload)
+        self.assertIsInstance(plan.anchor, TicketlessWorkIntakeAnchor)
+        self.assertFalse(any(c[0] == "normalize_anchor" for c in ops.calls))
+
+    def test_ticketless_work_intake_invalid_raises_without_port_call(self) -> None:
+        ops = FakeOps()
+        with self.assertRaises(EnvelopePlanError) as ctx:
+            HandoffEnvelopePlanner(ops).plan_anchor(
+                _inp(
+                    ticketless=True,
+                    ticketless_work_intake=True,
+                    work_shape="not-a-real-work-shape",
+                    callback_to_role=ROLE_PROJECT_GATEWAY,
+                    callback_methods=tuple(WORK_INTAKE_CALLBACK_METHODS),
+                    read_contract=ROLE_DELEGATED_COORDINATOR,
+                )
+            )
+        self.assertEqual(ctx.exception.reason, "invalid_args")
+        self.assertEqual(ctx.exception.outcome_extra, {})
+        self.assertFalse(any(c[0] == "normalize_anchor" for c in ops.calls))
 
 
 class PlanDeliveryEnvelopeTest(unittest.TestCase):
