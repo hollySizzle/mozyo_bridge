@@ -27,7 +27,6 @@ empty provider / bad schema) raises ``RepoLocalConfigError`` out of the loader, 
 
 from __future__ import annotations
 
-import argparse
 from typing import Any, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -69,11 +68,11 @@ def resolve_coordinator_provider(repo_root: Optional[str] = None) -> str:
 
 
 def main_lane_guard_blocked(
-    args: argparse.Namespace,
     *,
     receiver: str,
     kind: Optional[str],
     preflight_target: Any,
+    has_main_lane_exception: bool,
 ) -> bool:
     """Apply the #12441 main-lane guard with the implementer role resolved by binding.
 
@@ -81,6 +80,9 @@ def main_lane_guard_blocked(
     and runs the pure predicate against the resolved target's cockpit/lane/role facts.
     Returns ``True`` when ``orchestrate_handoff`` must fail closed (the caller emits the
     structured outcome and ``die``s); ``False`` when the send may proceed.
+
+    Redmine #13729: takes the resolved ``has_main_lane_exception`` bool (the handoff
+    facade computes it from ``inp.main_lane_exception``) so the gate is Namespace-free.
     """
     implementer_provider = resolve_implementer_provider()
     return main_lane_implementation_request_blocked(
@@ -90,7 +92,7 @@ def main_lane_guard_blocked(
         target_is_cockpit_pane=(preflight_target.view_kind == VIEW_KIND_COCKPIT_PANE),
         target_binds_implementer=preflight_target.binds_receiver(implementer_provider),
         implementer_provider=implementer_provider,
-        has_main_lane_exception=bool(getattr(args, "main_lane_exception", None)),
+        has_main_lane_exception=has_main_lane_exception,
     )
 
 

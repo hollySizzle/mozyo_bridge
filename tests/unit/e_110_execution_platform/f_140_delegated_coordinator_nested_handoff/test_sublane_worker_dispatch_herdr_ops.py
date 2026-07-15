@@ -471,12 +471,16 @@ class InnerSendBackendPinTests(unittest.TestCase):
 
     def _effective_backend_from_argv(self, argv: list) -> bool:
         from mozyo_bridge.application.cli import build_parser, normalize_paths
+        from mozyo_bridge.application.commands_common import repo_root_from_args
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
             herdr_effective_backend_selected,
         )
 
         ns = normalize_paths(build_parser().parse_args(argv))
-        return herdr_effective_backend_selected(ns)
+        # Redmine #13729: the predicate takes the facade-resolved repo root + target scalar.
+        return herdr_effective_backend_selected(
+            repo_root=repo_root_from_args(ns), target=getattr(ns, "target", None)
+        )
 
     def test_pinned_repo_resolves_herdr_from_a_divergent_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:

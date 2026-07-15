@@ -109,10 +109,10 @@ class MainLaneGuardBlockedTest(unittest.TestCase):
             main_lane_guard_gate, "resolve_implementer_provider", return_value=provider
         ):
             return main_lane_guard_blocked(
-                _FakeArgs(),
                 receiver=receiver,
                 kind="implementation_request",
                 preflight_target=pre,
+                has_main_lane_exception=False,
             )
 
     def test_default_binding_blocks_claude_main_lane_impl(self) -> None:
@@ -153,10 +153,10 @@ class MainLaneGuardBlockedTest(unittest.TestCase):
         ):
             self.assertFalse(
                 main_lane_guard_blocked(
-                    _FakeArgs(main_lane_exception="#12441 j#99999"),
                     receiver="claude",
                     kind="implementation_request",
                     preflight_target=pre,
+                    has_main_lane_exception=True,
                 )
             )
 

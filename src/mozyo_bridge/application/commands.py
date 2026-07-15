@@ -56,6 +56,7 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
     maybe_persist_delivery_record as _maybe_persist_delivery_record,
     record_command_from_args as _record_command_from_args,
     record_format_from_args as _record_format_from_args,
+    record_format_from_value as _record_format_from_value,
     record_herdr_send_ledger as _record_herdr_send_ledger,
     submit_lines_for as _submit_lines_for,
 )
@@ -1626,6 +1627,7 @@ def _maybe_restore_previous_active(
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E402,E501
     delivery_was_positive,
     make_publishing_emitter as _make_publishing_emitter,
+    publish_delivery_outcome as _publish_delivery_outcome,
 )
 
 
@@ -1689,13 +1691,31 @@ def orchestrate_handoff(
     # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
     # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
     # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
-    _emit = _make_publishing_emitter(args, _emit_outcome)
-    herdr_send = herdr_effective_backend_selected(args)
+    # Redmine #13729: the emitter takes a facade-owned publish callback (not the
+    # Namespace); the facade writes the delivery outcome onto its own `args` — its
+    # caller wrappers read it back via `delivery_was_positive(args)` after this
+    # returns — so the outcome hand-back stays byte-identical while the emitter and
+    # every deep helper are Namespace-free.
+    _emit = _make_publishing_emitter(
+        lambda outcome: _publish_delivery_outcome(args, outcome), _emit_outcome
+    )
+    # Redmine #13729: the facade's single Namespace->Path boundary conversion. The
+    # herdr backend predicate already resolves this repo root unconditionally, so
+    # computing it once here (and passing it to the herdr helpers + the profile
+    # block) is behaviour-neutral and keeps `repo_root_from_args` off the deep path.
+    repo_root = repo_root_from_args(args)
+    herdr_send = herdr_effective_backend_selected(repo_root=repo_root, target=inp.target)
     if not herdr_send:
         require_tmux()
 
-    record_format = _record_format_from_args(args)
-    record_command = _record_command_from_args(args)
+    record_format = _record_format_from_value(inp.record_format)
+    record_command = str(inp.record_command) if inp.record_command else None
+
+    # Redmine #13729: `--target-repo auto` / herdr-auto resolution mutated
+    # `args.target_repo` in place and later gates re-read it. Model that as an
+    # explicit typed facade-local resolution scalar so no gate reads a mutated
+    # Namespace attribute. Seeded from the initial parsed value.
+    resolved_target_repo = inp.target_repo
 
     receiver = inp.to
     if receiver not in RECEIVERS:
@@ -1933,7 +1953,13 @@ def orchestrate_handoff(
         # no single live agent) emits a `target_unavailable` blocked outcome and dies
         # — never a silent tmux fallback.
         try:
-            target_info = resolve_herdr_send_target(args, receiver=receiver)
+            target_info = resolve_herdr_send_target(
+                repo_root=repo_root,
+                target=inp.target,
+                target_repo=inp.target_repo,
+                target_lane=inp.target_lane,
+                receiver=receiver,
+            )
         except HerdrSendEntryError as exc:
             _emit(
                 make_outcome(
@@ -2052,12 +2078,12 @@ def orchestrate_handoff(
     # hand-passed `--target-repo <root>`; auto cannot weaken them (a pane with
     # no reachable marker is rejected here, and `--to claude` cross-session is
     # still blocked downstream regardless).
-    if getattr(args, "target_repo", None) == AUTO_TARGET_REPO and herdr_send:
+    if resolved_target_repo == AUTO_TARGET_REPO and herdr_send:
         # Redmine #13331 (j#73312 #2): herdr has no `%pane` to infer from, so `auto`
         # resolves to the sender's own repo root (the same-workspace target's repo). tmux
         # `auto` is untouched (guarded on `herdr_send`). See `herdr_auto_target_repo`.
-        args.target_repo = herdr_auto_target_repo(args)
-    elif getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
+        resolved_target_repo = herdr_auto_target_repo(repo_root)
+    elif resolved_target_repo == AUTO_TARGET_REPO:
         raw_target = inp.target
         if not is_explicit_pane_target(raw_target):
             _emit(
@@ -2126,7 +2152,7 @@ def orchestrate_handoff(
             f"target_cwd={auto_cwd!r} -> repo_root={auto_root!r}",
             file=sys.stderr,
         )
-        args.target_repo = auto_root
+        resolved_target_repo = auto_root
 
     # Explicit-pane preflight projection (Redmine #11908): resolve the target
     # pane onto the canonical `TargetRecord` identity vocabulary
@@ -2158,7 +2184,10 @@ def orchestrate_handoff(
     )
 
     if main_lane_guard_blocked(
-        args, receiver=receiver, kind=kind, preflight_target=preflight_target
+        receiver=receiver,
+        kind=kind,
+        preflight_target=preflight_target,
+        has_main_lane_exception=bool(inp.main_lane_exception),
     ):
         _emit(
             make_outcome(
@@ -2281,7 +2310,7 @@ def orchestrate_handoff(
         if not same_session:
             both_sessions_known = bool(sender_session) and bool(target_session)
             explicit_target = bool(inp.target)
-            has_target_repo = bool(getattr(args, "target_repo", None))
+            has_target_repo = bool(resolved_target_repo)
             cross_session_admitted = (
                 both_sessions_known and explicit_target and has_target_repo
             )
@@ -2425,7 +2454,6 @@ def orchestrate_handoff(
         else None
     )
     enforce_gateway_route(
-        args,
         kind=kind,
         receiver=receiver,
         preflight_target=preflight_target,
@@ -2436,10 +2464,11 @@ def orchestrate_handoff(
         record_format=record_format,
         record_command=record_command,
         emit=_emit,
+        allow_direct_worker=bool(inp.allow_direct_worker),
         sender_lane_unit=herdr_sender_lane_unit,
     )
 
-    expected_target_repo = getattr(args, "target_repo", None)
+    expected_target_repo = resolved_target_repo
     if expected_target_repo:
         expected_resolved = str(Path(expected_target_repo).expanduser().resolve())
         # Prefer the real Git worktree root over a nested project-local scaffold
@@ -2785,7 +2814,7 @@ def orchestrate_handoff(
     workdir_arg = inp.workdir
     if workdir_arg:
         workdir_abs = str(Path(workdir_arg).expanduser().resolve())
-        repo_anchor = getattr(args, "target_repo", None)
+        repo_anchor = resolved_target_repo
         if repo_anchor and repo_anchor != AUTO_TARGET_REPO:
             repo_anchor_abs = str(Path(repo_anchor).expanduser().resolve())
         else:
@@ -2811,7 +2840,7 @@ def orchestrate_handoff(
                 role_profile_arg,
                 inp.profile_field,
                 anchor.human_pointer(),
-                repo_root_from_args(args),
+                repo_root,
             )
             role_profile_resolution = resolve_role_profile(
                 role_profile_arg, profile_fields
@@ -2963,7 +2992,6 @@ def orchestrate_handoff(
     )
 
     admit_receiver_startup_or_die(
-        args,
         herdr_send=herdr_send,
         receiver=receiver,
         target=target,
@@ -3047,7 +3075,10 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
+            submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
             turn_start_lines=turn_start_lines,
         )
         # Redmine #13300: persist every event-rail outcome (incl. delivered-not-started)
@@ -3055,8 +3086,8 @@ def orchestrate_handoff(
         _record_herdr_send_ledger(outcome)
         if status == "sent":
             _maybe_persist_delivery_record(
-                args,
                 outcome,
+                persist_delivery=bool(inp.persist_delivery),
                 duplicate_lane_panes=duplicate_lane_panes,
                 record_format=record_format,
                 turn_start_lines=turn_start_lines,
@@ -3098,11 +3129,14 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
+            submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
         )
         _maybe_persist_delivery_record(
-            args,
             outcome,
+            persist_delivery=bool(inp.persist_delivery),
             duplicate_lane_panes=duplicate_lane_panes,
             record_format=record_format,
         )
@@ -3137,7 +3171,10 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
+            submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
         )
         _emit_handoff_marker_timeout_guidance(receiver)
         die(
@@ -3244,7 +3281,10 @@ def orchestrate_handoff(
                 command=record_command,
                 duplicate_lane_panes=duplicate_lane_panes or None,
                 role_profile_contract=role_profile_contract,
-                submit_lines=_submit_lines_for(args, outcome),
+                submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
                 turn_start_lines=turn_start_lines,
             )
             die(
@@ -3350,12 +3390,15 @@ def orchestrate_handoff(
         role_profile_contract=role_profile_contract,
         retry=retry_record,
         activation=target_activation,
-        submit_lines=_submit_lines_for(args, outcome),
+        submit_lines=_submit_lines_for(
+            outcome, submit_intent=inp.submit_intent,
+            submit_delivery_id=inp.submit_delivery_id,
+        ),
         turn_start_lines=turn_start_lines,
     )
     _maybe_persist_delivery_record(
-        args,
         outcome,
+        persist_delivery=bool(inp.persist_delivery),
         duplicate_lane_panes=duplicate_lane_panes,
         record_format=record_format,
         retry=retry_record,

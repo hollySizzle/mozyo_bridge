@@ -133,20 +133,25 @@ def marker_timeout_guidance_lines(receiver: str, retry_budget: int) -> List[str]
     ]
 
 
-def submit_lines_for(args: "argparse.Namespace", outcome) -> List[str] | None:
+def submit_lines_for(
+    outcome, *, submit_intent: str | None, submit_delivery_id: str | None
+) -> List[str] | None:
     """Build the additive q-enter `- Submit:` telemetry lines, or None.
 
     Redmine #12705: only the LLM-facing q-enter front door sets
-    ``args.submit_intent`` (+ the deterministic ``args.submit_delivery_id`` it
-    already printed in its own envelope), so a normal `handoff send` / `reply`
-    has no submit telemetry and its record is byte-identical. The composer-residue
-    classification is a pure projection of the transport ``(status, reason)``, so
-    it cannot drift from the rail's own marker/rollback decision.
+    ``submit_intent`` (+ the deterministic ``submit_delivery_id`` it already printed
+    in its own envelope), so a normal `handoff send` / `reply` has no submit
+    telemetry and its record is byte-identical. The composer-residue classification
+    is a pure projection of the transport ``(status, reason)``, so it cannot drift
+    from the rail's own marker/rollback decision.
+
+    Redmine #13729: takes the two scalars instead of the ``argparse.Namespace`` so
+    the handoff facade stays the only place the Namespace lives.
     """
-    intent = getattr(args, "submit_intent", None)
+    intent = submit_intent
     if not intent:
         return None
-    delivery_id = getattr(args, "submit_delivery_id", None) or "—"
+    delivery_id = submit_delivery_id or "—"
     return submit_record_lines(
         status=outcome.status,
         reason=outcome.reason,
@@ -220,7 +225,16 @@ class DeliveryRecordUseCase:
         through the port's ``die`` so the CLI error is identical to the original
         ``commands`` body.
         """
-        raw = getattr(args, "record_format", None) or RECORD_FORMAT_BOTH
+        return self.record_format_from_value(getattr(args, "record_format", None))
+
+    def record_format_from_value(self, record_format: "str | None") -> str:
+        """Resolve ``--record-format`` from its raw value (Redmine #13729).
+
+        The Namespace-free core the handoff facade calls with ``inp.record_format``;
+        :meth:`record_format_from_args` delegates here so the args-reading form stays
+        byte-identical for its existing callers.
+        """
+        raw = record_format or RECORD_FORMAT_BOTH
         if raw not in RECORD_FORMATS:
             self._ops.die(
                 f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {raw!r}"
@@ -305,9 +319,9 @@ class DeliveryRecordUseCase:
 
     def maybe_persist(
         self,
-        args: "argparse.Namespace",
         outcome,
         *,
+        persist_delivery: bool,
         duplicate_lane_panes: list[str] | None,
         record_format: str,
         retry: QueueEnterRetryOutcome | None = None,
@@ -347,7 +361,7 @@ class DeliveryRecordUseCase:
         Guardrail #6; the credential boundary is reused verbatim from
         ``redmine_context``).
         """
-        if not getattr(args, "persist_delivery", False):
+        if not persist_delivery:
             return
         try:
             # `command=None`: the durable sink path must not auto-journal the
@@ -502,10 +516,22 @@ def record_format_from_args(args: "argparse.Namespace") -> str:
     return DeliveryRecordUseCase(LiveDeliveryRecordOps()).record_format_from_args(args)
 
 
+def record_format_from_value(record_format: "str | None") -> str:
+    """Namespace-free live :meth:`DeliveryRecordUseCase.record_format_from_value`.
+
+    The handoff facade (Redmine #13729) resolves ``--record-format`` from
+    ``inp.record_format`` through this, so no Namespace reaches the record layer;
+    ``die`` still routes through the ``commands`` module at call time.
+    """
+    return DeliveryRecordUseCase(LiveDeliveryRecordOps()).record_format_from_value(
+        record_format
+    )
+
+
 def maybe_persist_delivery_record(
-    args: "argparse.Namespace",
     outcome,
     *,
+    persist_delivery: bool,
     duplicate_lane_panes: list[str] | None,
     record_format: str,
     retry: QueueEnterRetryOutcome | None = None,
@@ -522,8 +548,8 @@ def maybe_persist_delivery_record(
     ``commands._maybe_persist_delivery_record``).
     """
     DeliveryRecordUseCase(LiveDeliveryRecordOps()).maybe_persist(
-        args,
         outcome,
+        persist_delivery=persist_delivery,
         duplicate_lane_panes=duplicate_lane_panes,
         record_format=record_format,
         retry=retry,
