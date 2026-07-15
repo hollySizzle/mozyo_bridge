@@ -395,6 +395,35 @@ Table naming:
       pair が再稼働/inventory unreadable なら idempotent replay も fail-closed。★`--migrate-hibernated-legacy`
       と `--execute` は競合する destructive intent ゆえ **両指定は command-time zero-write error**(#13841
       review j#79150 F3、黙って一方へ解決しない)。disposition / decision anchor 以外は不変。
+    - **hibernated live-contradiction reconcile binding** (`LaneReconcileBindingStore.rebind_released_hibernated_legacy`,
+      #13842、live evidence #13756 j#79188)。#13841 migration が **拒否**する側の隙間: **hibernated / released
+      legacy** row（`worktree_identity` 空）だが action-time Herdr inventory に exact managed pair が **live** で
+      残るケース。#13841 live-zero migration は `live_pair_present` で拒否、#13754 guarded close は
+      `worktree_binding_unverified`、#13809 backfill は **active** row 専用 — 3 契約の間に収束経路が無く恒久停止する。
+      この surface は reconcile の前半で、hibernated row に **欠けている worktree + process (`declared_slots`) binding を
+      1 本の bounded CAS で再確立**する（`backfill_active_binding` の hibernated 版: **active** ではなく
+      **hibernated + released** row を対象）。**disposition は不変**（`hibernated` のまま。後続の #13754 guarded close が
+      `retired` へ移す）。書込は「row 存在 かつ exact `expected_revision` 一致」かつ「`hibernated` /
+      `binding_kind='issue'` / この exact issue 所有 / project scope 無し / `process_release='released'` /
+      replacement settled」かつ「`worktree_identity` が **空か token 一致** かつ `declared_slots` が **空か同一**」の
+      全成立時のみ。既存 non-empty mismatch (別 token / recycled generation) は `already_declared`、active/superseded/retired・
+      別 issue は `unexpected_state`、release 未証明/in-flight は `forbidden_transition`、revision race は `stale_revision`、
+      row 不在は `not_found` で zero-write。両 field 既に一致は idempotent no-op (replay 安全)。public high-level path
+      (`sublane retire --reconcile-hibernated-live`) が binding 再確立の **前**に、exact live pair の
+      `(workspace, lane, issue)` identity・`--worktree` 実 branch==`--branch`・integration ancestry・
+      expected assigned names/roles/providers・per-slot startup self-attestation (generation-bound)・
+      pair completeness/uniqueness・各 agent idle/turn-ended・pending composer 無し・settled replacement・
+      exact lifecycle revision を **連言検証**（foreign/ambiguous/partial/duplicate/unattested/working pair・
+      inventory unreadable・branch mismatch/detached/unintegrated・revision race は zero-write/zero-close）。green 時のみ
+      rebind → #13754 guarded close (pair close + terminal `retired` 記録) へ handoff し、**1 本の replayable
+      owed-state flow** に収束する。★**duplicate close 防止 / partial replay**: CAS 後 / close 後 crash で pair が
+      **positive absence**（readable inventory が zero）かつ binding が此 lane の derived token へ再確立済み
+      (`declared_slots` 有り) の **durable owed state** からは、pair を **2 度閉じず** owed retirement を直接記録して
+      再開する。既 `retired` row をこの issue 所有 + live-zero で no-op success する idempotent replay は維持するが、
+      persisted `retired` は非稼働性を証明しないので pair 再稼働 / inventory unreadable なら success を withhold する。
+      `--reconcile-hibernated-live` は `--execute` / `--migrate-hibernated-legacy` と競合する destructive intent ゆえ
+      **2 つ以上の同時指定は command-time zero-write error**。process launch/resume・worktree/branch 削除・raw Herdr/tmux・
+      origin/main・production は伴わない（唯一の process mutation は #13754 guarded close の自 lane managed pair close）。
     - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
