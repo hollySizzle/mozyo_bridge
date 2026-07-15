@@ -120,11 +120,12 @@ class LaneReconcileBindingStore:
         - its process release is durably ``released`` and no receiver replacement is in flight
           (:data:`CAS_FORBIDDEN_TRANSITION`) — the "already released" proof the caller pairs
           with a live-inventory read;
-        - its ``worktree_identity`` is **empty or already equal** to the incoming token, and its
-          ``declared_slots`` snapshot is **empty or already equal** to the incoming set. A
-          *non-empty different* worktree or slot snapshot (a recycled generation whose live
-          locators differ) is :data:`CAS_UNEXPECTED_STATE` zero-write — this CAS never
-          overwrites an established, divergent binding.
+        - its ``worktree_identity`` AND its ``declared_slots`` are **both empty** — the defining
+          **legacy** signature (Redmine #13842 review j#79320 R1). A row with ANY existing
+          binding (a #13754 / #13809 / #13810-bound row) is refused :data:`CAS_UNEXPECTED_STATE`
+          zero-write: a bound row is the ordinary #13754 guarded retire's domain, and this
+          legacy-contradiction surface reconciles ONLY the empty-binding legacy row the ticket
+          scopes it to (non-regression of the #13754 ordinary path).
 
         On success the row is ``retired`` (**terminal**): no ``retired -> active`` edge exists,
         so the caller then closes the exact pinned pair under a generation that can no longer
@@ -179,13 +180,15 @@ class LaneReconcileBindingStore:
                 or norm(current.binding_kind) != BINDING_KIND_ISSUE
                 or current.issue_id != issue
                 or current.project_scope
-                or (current.worktree_identity and current.worktree_identity != worktree)
-                or (current.declared_slots and current.declared_slots != encoded_slots)
+                or current.worktree_identity
+                or current.declared_slots
             ):
-                # Not the exact reconcilable signature: an active / superseded / retired row, a
-                # project-gateway binding, a different issue, or an already-bound-to-a-different
-                # token / slot snapshot (a divergent binding this CAS never overwrites). Refused
-                # zero-write.
+                # Not the exact EMPTY-binding legacy signature (Redmine #13842 review j#79320
+                # R1): an active / superseded / retired row, a project-gateway binding, a
+                # different issue, or an already-bound row (non-empty ``worktree_identity`` or
+                # ``declared_slots``). A bound row is the #13754 ordinary guarded retire's domain
+                # (non-regression) — this legacy-contradiction surface reconciles ONLY the
+                # empty-binding legacy row the ticket scopes it to. Refused zero-write.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,

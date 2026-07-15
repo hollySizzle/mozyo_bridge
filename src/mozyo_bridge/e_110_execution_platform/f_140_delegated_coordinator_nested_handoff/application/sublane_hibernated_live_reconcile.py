@@ -556,28 +556,42 @@ def run_hibernated_live_reconcile(
             for s in slots
         ]
 
-    def _close_owed_pair(pins):
-        """Pin-matched close of the EXACT verified pair, then confirm it is gone.
-
-        The lane is ALREADY durably ``retired`` when this runs (retire-first), so the close is
-        cleanup under an immutable generation (a rehydrate is impossible after ``retired``). It
-        closes ONLY the exact ``(assigned_name, locator)`` pins via ``pin_matched_close_plan``
-        (a duplicate name / foreign / undecodable pin fails the whole plan closed -> zero-close;
-        a pin whose exact locator is gone is simply not a target), then re-reads the inventory to
-        confirm none of the exact pins is still live. Returns ``(closed, still_live)`` — a
-        ``still_live`` True means the owed close did not complete (ambiguous / failed /
-        unreadable) and is resumable, so the caller withholds success.
-        """
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-            AGENT_KEY_NAME,
-            _agent_locator,
-            _norm as _hnorm,
+    def _observe(rows_):
+        return _observe_pair(
+            rows_,
+            live_ops,
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            managed_pairs=managed_pairs,
         )
 
+    def _close_owed_pair(pins):
+        """Re-verify the exact pair at close time, pin-match close it, confirm the WHOLE unit gone.
+
+        The reconcile has retired the row (retire-first). Before closing ANY pane it re-observes a
+        fresh inventory and re-runs the FULL pair decision (Redmine #13842 review j#79320 R2):
+        idle / turn-ended, no pending composer, generation-bound attestation, uniqueness, and no
+        foreign provider are ALL re-checked at close time, and the live pair must still be the
+        EXACT pins the reconcile pinned (same assigned names + same locators). Only then does it
+        pin-match close those exact ``(assigned_name, locator)`` targets. AFTER the close it
+        measures the WHOLE lane unit's expected managed pair afresh (R3): success requires a
+        **positive absence** of the expected pair at ANY locator — a recycled / duplicate /
+        foreign slot still live withholds (never a false success off "the old pins are gone").
+        Returns ``(closed, ok)``; ``ok`` False means the owed close did not complete and the caller
+        withholds success (resumable via the ordinary #13754 retire).
+        """
         try:
             rows2 = live_ops.agent_rows()
         except HerdrSessionStartError:
-            return ((), True)
+            return ((), False)
+        obs2 = _observe(rows2)
+        v2 = decide_pair_reconcile(obs2)
+        observed = sorted(s.locator for s in obs2.slots if s.present)
+        if not (v2.green and observed == sorted(p.locator for p in pins)):
+            # Not the exact verified pair at close time: busy / pending / foreign / duplicate, or
+            # recycled to different locators. Zero-close (R2/R3) — never close an unverified or
+            # changed generation.
+            return ((), False)
         plan = pin_matched_close_plan(
             [
                 ReleasePin(role=p.provider, assigned_name=p.assigned_name, locator=p.locator)
@@ -587,45 +601,44 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-        closed = ()
-        if plan is not None and plan.close_targets:
-            try:
-                closed = execute_herdr_retire_close(plan).closed
-            except HerdrSessionStartError:
-                return ((), True)
+        if plan is None or len(plan.close_targets) != len(pins):
+            return ((), False)
+        try:
+            close = execute_herdr_retire_close(plan)
+        except HerdrSessionStartError:
+            return ((), False)
+        if close.failed:
+            return (close.closed, False)
+        # Post-close: measure the WHOLE lane unit's expected pair afresh (R3). Success requires a
+        # positive absence — any expected managed slot still live (a recycled newer generation, a
+        # duplicate, a foreign slot) withholds, never a false success off the old pins being gone.
         try:
             rows3 = live_ops.agent_rows()
         except HerdrSessionStartError:
-            return (closed, True)
-        live_pairs = {
-            (_hnorm(r.get(AGENT_KEY_NAME)), _agent_locator(r))
-            for r in rows3
-            if isinstance(r, Mapping)
-        }
-        still_live = any((p.assigned_name, p.locator) in live_pairs for p in pins)
-        return (closed, still_live)
+            return (close.closed, False)
+        return (close.closed, decide_pair_reconcile(_observe(rows3)).absent)
 
-    def _reconciled(closed, *, resumed):
+    def _reconciled(closed):
         return HibernatedLiveReconcileVerdict(
             state=RECONCILE_RECONCILED,
             detail=(
-                "resumed the owed close of a reconcile-retired lane's exact pinned pair "
-                "(retire-first replay)"
-                if resumed
-                else (
-                    "the exact verified live pair's lane was retired (retire-first, revision-"
-                    "guarded) and the pinned pair closed under the now-immutable generation"
-                )
+                "the exact verified live pair's lane was retired (retire-first, revision-guarded) "
+                "and the pinned pair closed under the now-immutable generation"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
             closed=tuple(f"{role} {loc}" for role, loc in closed),
         )
 
-    # Terminal (retire-first) branch: a row this reconcile already retired may still OWE its
-    # pin-matched close (a crash after the retire CAS committed but before the pane close). Its
-    # ``declared_slots`` record the exact pair, so resume the owed close of EXACTLY those pins —
-    # never re-retiring (already retired), never a name-based sweep.
+    # Terminal (retire-first) branch: this reconcile OR an ordinary lifecycle path may have retired
+    # this row. The reconcile NEVER closes a pair under a retired row (Redmine #13842 review
+    # j#79320 R4): without a collision-proof reconcile-specific marker it cannot tell its own owed
+    # close apart from an ordinary #13809/#13810-bound retired row, so it refuses to close either.
+    # A positive absence is an idempotent no-op (a completed reconcile, or an ordinary retire —
+    # closing nothing is harmless); a live pair WITHHOLDS success (a persisted retired disposition
+    # does not prove non-liveness). A reconcile retire whose pane close crashed before completing
+    # is recovered by the ordinary ``sublane retire --execute`` (#13754), which attests the
+    # now-bound row and closes the pair — non-regressive.
     if record.lane_disposition == DISPOSITION_RETIRED and (
         record.issue_id or ""
     ).strip() == issue:
@@ -639,48 +652,26 @@ def run_hibernated_live_reconcile(
                 workspace_id=workspace_id,
                 lane_id=lane_label,
             )
-        try:
-            recorded = list(record.declared_pins)
-        except (ProcessPinError, ValueError):
-            recorded = []
-        observed_locators = sorted(s.locator for s in observation.slots if s.present)
-        recorded_locators = sorted(p.locator for p in recorded)
-        # Resume the owed close ONLY when the CURRENTLY-live pair is EXACTLY the recorded pins
-        # (same unique/idle/attested green pair AND the same locators). Anything else under a
-        # retired row — no recorded pins (a non-reconcile retire), a duplicate / busy pair, or a
-        # RECYCLED generation at different locators — is not this reconcile's owed close: a
-        # persisted retired disposition does not prove non-liveness (managed-state-model.md
-        # boundary), and the reconcile never closes a generation it did not verify, so the
-        # success is withheld (never claim the expected pair is gone while it is live).
-        if not (recorded and verdict.green and observed_locators == recorded_locators):
-            return _blocked(
-                RECON_LIVE_PAIR_PRESENT,
-                detail=(
-                    "the lane is durably retired but the live pair is not the exact recorded "
-                    "owed-close generation (no reconcile pins, a duplicate / busy pair, or a "
-                    "recycled generation at different locators); a persisted retired disposition "
-                    "does not prove non-liveness — success withheld"
-                ),
-                workspace_id=workspace_id,
-                lane_id=lane_label,
-            )
-        closed, still_live = _close_owed_pair(recorded)
-        if still_live:
-            return _blocked(
-                RECON_CLOSE_FAILED,
-                detail=(
-                    "the reconcile-retired lane's owed pin-matched close did not complete "
-                    "(ambiguous / failed / unreadable); the pair is still live (resumable)"
-                ),
-                workspace_id=workspace_id,
-                lane_id=lane_label,
-            )
-        return _reconciled(closed, resumed=True)
+        return _blocked(
+            RECON_LIVE_PAIR_PRESENT,
+            detail=(
+                "the lane is durably retired but an expected managed pair is live; the "
+                "reconcile does NOT close a pair under a retired row (it cannot tell its own "
+                "owed close apart from an ordinary bound retired row without a collision-proof "
+                "marker) — a persisted retired disposition does not prove non-liveness. Recover "
+                "an owed reconcile close via `sublane retire --execute` (#13754). Success withheld"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
 
-    # The reconcilable base signature: hibernated + durably released + settled replacement +
-    # issue binding + owns this exact issue + no project scope. Any other shape is not this
-    # reconcile's target (an active lane backfills through #13809; a live-zero legacy row
-    # migrates through #13841).
+    # The reconcilable base signature (Redmine #13842 review j#79320 R1): hibernated + durably
+    # released + settled replacement + issue binding + owns this exact issue + no project scope +
+    # **EMPTY worktree binding AND empty declared_slots** (the legacy signature). A row with ANY
+    # existing binding is the #13754 ordinary guarded retire's domain (non-regression), not this
+    # legacy-contradiction surface's — a #13809/#13810-bound lane never routes here. Any other
+    # shape is not the reconcile's target (an active lane backfills through #13809; a live-zero
+    # legacy row migrates through #13841).
     if (
         record.lane_disposition != DISPOSITION_HIBERNATED
         or norm(record.binding_kind) != BINDING_KIND_ISSUE
@@ -688,12 +679,15 @@ def run_hibernated_live_reconcile(
         or record.project_scope
         or record.process_release != RELEASE_RELEASED
         or not replacement_settled(record.replacement_state)
+        or record.worktree_identity
+        or record.declared_slots
     ):
         return _blocked(
             RECON_NOT_RECONCILABLE_STATE,
             detail=(
-                "the durable row is not the hibernated + released + settled + owns-issue "
-                "legacy signature the reconcile targets"
+                "the durable row is not the hibernated + released + settled + owns-issue + "
+                "EMPTY-worktree-binding legacy signature the reconcile targets (a bound row "
+                "retires through the ordinary #13754 guarded close)"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
@@ -786,20 +780,23 @@ def run_hibernated_live_reconcile(
             lane_id=lane_label,
         )
     # Durably retired under the exact verified generation (terminal — no rehydrate possible).
-    # Close the exact pinned pair.
-    closed, still_live = _close_owed_pair(pins)
-    if still_live:
+    # Close the exact pinned pair, re-verifying the full conjunct at close time (R2) and measuring
+    # the whole unit afterwards (R3).
+    closed, ok = _close_owed_pair(pins)
+    if not ok:
         return _blocked(
             RECON_CLOSE_FAILED,
             detail=(
-                "the lane was retired (retire-first) but the pin-matched close did not complete "
-                "(ambiguous / failed / unreadable); the pair is still live (resumable — the "
-                "retired lane's owed close re-runs on the next reconcile)"
+                "the lane was retired (retire-first) but the exact pinned pair could not be "
+                "closed under the full close-time re-verification (a busy / pending / duplicate / "
+                "foreign / recycled generation, a failed close, or an unreadable inventory); the "
+                "expected pair is still live. Recover the owed close via `sublane retire "
+                "--execute` (#13754)"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    return _reconciled(closed, resumed=False)
+    return _reconciled(closed)
 
 
 # ---------------------------------------------------------------------------

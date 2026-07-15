@@ -294,15 +294,46 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
         self.assertEqual(rec.decision_journal, "70001")
         self.assertEqual(rec.lane_disposition, DISPOSITION_RETIRED)
 
-    def test_non_empty_different_worktree_is_refused(self) -> None:
-        # A row already bound to a DIFFERENT token is a divergent binding this CAS never
-        # overwrites -> zero-write, stays hibernated.
-        self._seed(worktree_identity="wt_0000000000000000")
+    def test_non_empty_worktree_is_refused(self) -> None:
+        # Review j#79320 R1: ANY existing worktree binding (even one equal to the incoming token)
+        # is refused — the reconcile targets ONLY the EMPTY-binding legacy row; a bound row is the
+        # #13754 ordinary retire's domain.
+        for existing in ("wt_0000000000000000", "wt_deadbeefcafef00d"):  # different, then == token
+            with self.subTest(existing=existing):
+                self.store = LaneLifecycleStore(path=self.path)
+                # fresh key per subtest
+                self.key = LaneLifecycleKey(_WORKSPACE_ID, f"{_LANE}_{existing[-4:]}")
+                self.rebind = LaneReconcileBindingStore(path=self.path)
+                _seed_hibernated_released(self.store, key=self.key, worktree_identity=existing)
+                out = self.rebind.retire_reconciled_hibernated_legacy(
+                    self.key, expected_revision=self.store.get(self.key).revision,
+                    issue_id=_ISSUE, worktree_identity=self.token, declared_slots=_pins(),
+                    decision=_decision(),
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+                self.assertEqual(self.store.get(self.key).lane_disposition, DISPOSITION_HIBERNATED)
+
+    def test_non_empty_declared_slots_is_refused(self) -> None:
+        # Review j#79320 R1: a row with an existing declared_slots snapshot (a #13809/#13810-bound
+        # row) is refused — empty declared_slots is part of the legacy signature.
+        self.store.declare_active(
+            self.key, decision=_decision(), issue_id=_ISSUE, worktree_identity=""
+        )
+        from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+        LaneDeclarationStore(path=self.path).backfill_active_binding(
+            self.key, expected_revision=self.store.get(self.key).revision,
+            issue_id=_ISSUE, worktree_identity=self.token, declared_slots=_pins(),
+        )
+        rec = self.store.get(self.key)
+        self.store.transition_disposition(
+            self.key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=rec.revision,
+            target=DISPOSITION_HIBERNATED, decision=_decision(),
+        )
         out = self._do()
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
         self.assertEqual(self.store.get(self.key).lane_disposition, DISPOSITION_HIBERNATED)
-        self.assertEqual(self.store.get(self.key).worktree_identity, "wt_0000000000000000")
 
     def test_active_disposition_is_refused(self) -> None:
         self.store.declare_active(
@@ -579,6 +610,7 @@ class _FakeReconcileOps:
         attest: bool = True,
         rows_by_call=None,
         on_call=None,
+        busy_from_call=None,
     ) -> None:
         self._rows_ref = rows_ref
         self._runtime = runtime
@@ -587,6 +619,9 @@ class _FakeReconcileOps:
         self._attest = attest
         self._rows_by_call = rows_by_call or {}
         self._on_call = on_call or {}
+        # After this many agent_rows() calls, runtime reads BUSY (a slot that started working
+        # between the initial observation and the close-time re-observation).
+        self._busy_from_call = busy_from_call
         self._call = 0
         self._last_rows: list = []
 
@@ -602,6 +637,8 @@ class _FakeReconcileOps:
         return list(self._last_rows)
 
     def runtime_state(self, locator: str) -> str:
+        if self._busy_from_call is not None and self._call > self._busy_from_call:
+            return RUNTIME_BUSY
         return self._runtime
 
     def observe_composer(self, locator: str):
@@ -765,19 +802,132 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             decision=decision if decision is not None else _decision(),
         )
 
-    def test_owed_close_partial_replay_resumes_close_without_reretiring(self) -> None:
-        # Retire-first (review j#79282 R2): a crash AFTER the retire CAS committed but BEFORE the
-        # pane close leaves a RETIRED row whose declared_slots record the exact pair, with the
-        # pair still live. The reconcile resumes the pin-matched close of exactly those pins
-        # (never re-retiring), and reports reconciled.
+    def test_retired_with_live_pair_withholds_no_close(self) -> None:
+        # Review j#79320 R4: the reconcile NEVER closes a pair under a retired row (it cannot tell
+        # its own owed close from an ordinary bound retired row without a collision-proof marker).
+        # A crash after the retire CAS but before the close leaves retired + live pair -> the
+        # reconcile withholds (no close); recovery is via the ordinary #13754 retire.
         self._seed_row()
         self._retire_first()
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
-        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
         result = self._run()
-        self.assertEqual(result.state, RECONCILE_RECONCILED, result.detail)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_LIVE_PAIR_PRESENT)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
-        # The owed pair was closed on resume (only the coordinator pair remains).
+        # NOT closed: the reconcile refuses to close a pair under a retired row.
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_ordinary_retired_bound_row_live_pair_not_closed(self) -> None:
+        # Review j#79320 R4: an ORDINARY #13809/#13810-bound row retired through the normal
+        # lifecycle (with typed declared_slots) whose pair is live must NOT be closed by the
+        # reconcile — the retired-branch has no reconcile-specific provenance, so it withholds.
+        from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+
+        store = LaneLifecycleStore()
+        key = self._key()
+        store.declare_active(key, decision=_decision(), issue_id=_ISSUE, worktree_identity=self._token())
+        LaneDeclarationStore().backfill_active_binding(
+            key, expected_revision=store.get(key).revision, issue_id=_ISSUE,
+            worktree_identity=self._token(), declared_slots=_pins(),
+        )
+        rec = store.get(key)
+        store.transition_disposition(
+            key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=rec.revision,
+            target=DISPOSITION_RETIRED, decision=_decision(),
+        )
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        # Its pair is live (p3/p4).
+        result = self._run()
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_LIVE_PAIR_PRESENT)
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_bound_hibernated_live_pair_is_not_reconcilable(self) -> None:
+        # Review j#79320 R1: a #13809-bound (non-empty worktree + typed pins) hibernated/released
+        # row whose pair is LIVE is NOT reconcilable — the reconcile targets ONLY the empty-binding
+        # legacy row; a bound row retires through the ordinary #13754 guarded close.
+        from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+
+        store = LaneLifecycleStore()
+        key = self._key()
+        store.declare_active(key, decision=_decision(), issue_id=_ISSUE, worktree_identity="")
+        LaneDeclarationStore().backfill_active_binding(
+            key, expected_revision=store.get(key).revision, issue_id=_ISSUE,
+            worktree_identity=self._token(), declared_slots=_pins(),
+        )
+        rec = store.get(key)
+        store.transition_disposition(
+            key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=rec.revision,
+            target=DISPOSITION_HIBERNATED, decision=_decision(),
+        )
+        rec = store.get(key)
+        store.request_release(
+            key, expected_revision=rec.revision, action_id="rel-1",
+            pins=[ReleasePin("gateway", "codex-mzb1", "w1:p1"),
+                  ReleasePin("worker", "claude-mzb1", "w1:p2")],
+        )
+        rec = store.get(key)
+        store.record_release_outcome(
+            key, action_id="rel-1", expected_revision=rec.revision, target=RELEASE_RELEASED,
+        )
+        # Pair live (p3/p4).
+        result = self._run()
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_NOT_RECONCILABLE_STATE)
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_close_time_busy_withholds_no_close(self) -> None:
+        # Review j#79320 R2: an agent that starts working BETWEEN the initial green observation and
+        # the close-time re-observation must NOT be closed. The close re-runs the full pair
+        # decision; a busy agent -> zero-close, withheld.
+        self._seed_row()
+        ops = _FakeReconcileOps(lambda: self.rows, busy_from_call=1)  # idle at obs 0, busy after
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)  # retire-first happened
+        # The busy pair was NOT closed.
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_close_time_recycled_at_reobserve_no_close(self) -> None:
+        # Review j#79320 R2: the pair recycles to NEW locators (p3/p4 -> p6/p7) BEFORE the close.
+        # The close-time re-observe sees the pair at different locators than the pinned ones ->
+        # zero-close; the newer generation is NOT closed.
+        self._seed_row()
+        recycled = [
+            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
+            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p6"),
+            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p7"),
+        ]
+        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={1: lambda: recycled, 2: lambda: recycled})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_close_time_recycled_after_close_no_false_success(self) -> None:
+        # Review j#79320 R3: the pinned pair is closed cleanly, but a NEWER generation appears
+        # (p8/p9) AFTER the close. The post-close whole-unit measure sees the expected pair still
+        # live at new locators -> withholds success (never a false success off "old pins gone").
+        self._seed_row()
+        # call 0 = initial (p3/p4); call 1 (close re-observe) = p3/p4 (match -> close them);
+        # call 2 (post-close measure) = a recycled newer pair at p8/p9.
+        post = [
+            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
+            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p8"),
+            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p9"),
+        ]
+        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={2: lambda: post})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)  # withheld: newer pair still live
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        # The pinned pair WAS closed (p3/p4 gone from the live inventory), but success is withheld
+        # because the whole-unit measure found a newer pair live.
         self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2"})
 
     def test_owed_close_absent_after_close_is_idempotent_already(self) -> None:
@@ -791,11 +941,11 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
-    def test_hibernated_bound_absent_is_never_retired_on_absence(self) -> None:
-        # Review j#79282 R1: retire-first has NO absence -> retire path, so a hibernated + bound
-        # row whose pair is absent is never retired — regardless of its decision pointer (the
-        # same-pointer collision that made the old decision-equality provenance unsound cannot
-        # occur). Route to #13841 instead. Verified with BOTH a same and a different pointer.
+    def test_hibernated_bound_absent_is_not_reconcilable(self) -> None:
+        # Review j#79282 R1 + j#79320 R1: a hibernated + BOUND row (non-empty worktree + typed
+        # pins) is not the reconcile's empty-binding legacy target, so it is refused as
+        # not_reconcilable — never retired — regardless of its decision pointer (no same-pointer
+        # collision). Verified with BOTH a same and a different pointer.
         from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
 
         for journal in (_JOURNAL, "70002"):  # same as reconcile --journal, and different
@@ -837,7 +987,7 @@ class ReconcileOrchestrationTests(unittest.TestCase):
                 ]
                 result = self._run()
                 self.assertEqual(result.state, RECONCILE_BLOCKED)
-                self.assertEqual(result.reason, RECON_LIVE_PAIR_ABSENT)
+                self.assertEqual(result.reason, RECON_NOT_RECONCILABLE_STATE)
                 self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
 
     def test_close_time_duplicate_is_not_closed(self) -> None:
