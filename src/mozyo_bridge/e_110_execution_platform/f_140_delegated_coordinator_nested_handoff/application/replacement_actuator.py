@@ -187,6 +187,107 @@ class ReplacementActuatorUseCase:
             )
         return self._drive(key, holder, expected_action_generation)
 
+    def drive_self_participant(
+        self,
+        key: ReplacementTransactionKey,
+        *,
+        holder: str,
+        expected_action_generation: int,
+    ) -> ActuationResult:
+        """Drive ONLY the self participant's owed progression during ``self_close_armed``.
+
+        The tranche C entry (Redmine #13806): tranche B's :meth:`run` arms the transaction
+        at ``self_close_armed`` and never touches the self coordinator. Once a
+        process-external executor is ready to replace the current coordinator, THIS drives
+        the self participant ``close_owed -> launch_owed -> verify_owed -> replaced`` — the
+        old self generation is closed and the fresh coordinator launched + attested — reusing
+        the exact same evidence-gated steps, pre-effect lease re-authentication, and CAS
+        discipline as the non-self path (so the R1/R2/R3 lease fences apply identically).
+
+        It refuses unless the transaction is at ``self_close_armed`` (the only phase the self
+        participant may be actuated in), and it releases the lease when the self reaches
+        ``replaced`` so a **fresh, action-attested** coordinator can then claim it and drain
+        the continuation (j#78384 §2 step 7 — the executor never claims the fresh coordinator
+        itself). Returns ``armed`` when the self is already / now ``replaced`` (the transaction
+        is ready for the fresh-coordinator claim), or a fail-closed status.
+        """
+        rec = self._store.get(key)
+        if rec is None:
+            return ActuationResult(status=ACTUATION_NOT_FOUND)
+        if rec.action_generation != expected_action_generation:
+            return ActuationResult(
+                status=ACTUATION_GENERATION_MISMATCH, phase=rec.phase,
+                revision=rec.revision,
+            )
+        if rec.phase != PHASE_SELF_CLOSE_ARMED:
+            # The self participant is actuated only in its armed window; refuse otherwise.
+            return ActuationResult(
+                status=ACTUATION_EFFECT_FAILED, phase=rec.phase, revision=rec.revision,
+                detail="self participant may only be driven at self_close_armed",
+            )
+        self_pins = [p for p in rec.participants if p.is_self]
+        if len(self_pins) != 1:
+            return ActuationResult(
+                status=ACTUATION_INVALID_TOPOLOGY, phase=rec.phase, revision=rec.revision,
+                detail="exactly one self participant required",
+            )
+        self_identity = self_pins[0].identity
+        now = self._clock()
+        claim = self._store.claim(
+            key, expected_revision=rec.revision,
+            expected_action_generation=expected_action_generation, holder=holder,
+            lease_expires_at=self._expiry(now), now=now,
+        )
+        if not claim.applied:
+            status = (
+                ACTUATION_GENERATION_MISMATCH
+                if claim.reason == CAS_GENERATION_MISMATCH
+                else ACTUATION_LEASE_LOST
+            )
+            return ActuationResult(
+                status=status, phase=rec.phase, revision=claim.revision,
+                detail=claim.reason,
+            )
+        gen = expected_action_generation
+        max_iterations = 8
+        for _ in range(max_iterations):
+            now = self._clock()
+            rec = self._store.get(key)
+            if rec is None:
+                return ActuationResult(status=ACTUATION_NOT_FOUND)
+            if rec.action_generation != gen:
+                return ActuationResult(
+                    status=ACTUATION_GENERATION_MISMATCH, phase=rec.phase,
+                    revision=rec.revision,
+                )
+            if rec.lease_holder != holder or not rec.lease_is_live(now):
+                return ActuationResult(
+                    status=ACTUATION_LEASE_LOST, phase=rec.phase, revision=rec.revision,
+                    detail="lease not live",
+                )
+            if rec.phase != PHASE_SELF_CLOSE_ARMED:
+                return ActuationResult(
+                    status=ACTUATION_EFFECT_FAILED, phase=rec.phase,
+                    revision=rec.revision, detail="phase moved off self_close_armed",
+                )
+            self_pin = rec.find_participant(self_identity)
+            if self_pin is not None and self_pin.phase == PARTICIPANT_REPLACED:
+                # The self is replaced; hand the lease back so a fresh coordinator may claim.
+                self._store.release(
+                    key, expected_revision=rec.revision,
+                    expected_action_generation=gen, holder=holder, now=now,
+                )
+                return ActuationResult(
+                    status=ACTUATION_ARMED, phase=rec.phase, revision=rec.revision,
+                    stopped_on=self_identity,
+                )
+            terminal = self._actuate_participant(key, rec, self_pin, holder, gen, now)
+            if terminal is not None:
+                return terminal
+        return ActuationResult(
+            status=ACTUATION_EFFECT_FAILED, detail="self-drive iteration cap exceeded"
+        )
+
     # -- driver --------------------------------------------------------------
 
     def _drive(self, key, holder, gen) -> ActuationResult:
