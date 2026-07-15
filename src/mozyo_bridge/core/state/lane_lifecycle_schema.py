@@ -23,7 +23,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    BINDING_KIND_ISSUE,
+    BINDING_KIND_PROJECT_GATEWAY,
+    DISPOSITION_ACTIVE,
+)
 from mozyo_bridge.core.state.state_store import (
     BACKUPS_DIRNAME,
     STATE_CONTAINER_VERSION,
@@ -43,17 +47,26 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: A v1/v2/v3 row lands with an empty binding — a known-unbound lane whose execute retire
 #: fails closed until it is re-declared. (This is the collision fix: #13754's worktree
 #: field takes the NEXT free version v4, so it never clashes with #13763's v3 shape.)
-LANE_LIFECYCLE_SCHEMA_VERSION = 4
-#: The component shapes this build can read and write. ``1``/``2``/``3`` are migrated
-#: additively to ``4``; anything else — a newer version from a future build, or a foreign
+#: v5 (Redmine #13810, Design Answer j#78386) adds the binding/generation/declaration
+#: triple: ``binding_kind`` (issue | project_gateway), full ``project_scope``,
+#: ``lane_generation`` (positive monotonic incarnation), and the versioned
+#: ``declared_slots`` :class:`ProcessGenerationPin` snapshot. A pre-v5 row migrates with
+#: ``binding_kind='issue'`` / empty scope / generation 1 / empty slots — its ownership is
+#: never re-derived as project scope from the lane id (j#78386 §6). j#78386's original
+#: "v4" number is deliberately NOT reused: staging is already v4 (worktree binding), so
+#: this tranche takes the next free version v5 (j#78860 item 2).
+LANE_LIFECYCLE_SCHEMA_VERSION = 5
+#: The component shapes this build can read and write. ``1``–``4`` are migrated
+#: additively to ``5``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
 
 _TABLE = "lane_lifecycle_records"
 _OWNER_INDEX = "idx_lane_lifecycle_active_owner"
+_PROJECT_OWNER_INDEX = "idx_lane_lifecycle_active_project_owner"
 
 _TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {_TABLE} (
@@ -74,6 +87,10 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     worktree_identity TEXT NOT NULL DEFAULT '',
+    binding_kind TEXT NOT NULL DEFAULT 'issue',
+    project_scope TEXT NOT NULL DEFAULT '',
+    lane_generation INTEGER NOT NULL DEFAULT 1,
+    declared_slots TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -89,11 +106,26 @@ ON {_TABLE} (repo_workspace_id, issue_id)
 WHERE lane_disposition = '{DISPOSITION_ACTIVE}' AND issue_id <> ''
 """
 
+#: At most one ACTIVE project-gateway owner per (workspace, project_scope) — v5
+#: (Redmine #13810). The storage-engine twin of the issue owner index: a
+#: project-gateway lane owns a full ``project_scope``, not an issue, so double
+#: project ownership is made unrepresentable on the *scope*, not the (empty) issue.
+#: Scoped to ``binding_kind='project_gateway'`` so an issue lane — which always has an
+#: empty ``project_scope`` — is never caught by it, and to a non-empty scope so a
+#: not-yet-scoped row is exempt (mirroring the issue index's ``issue_id <> ''``).
+_PROJECT_OWNER_INDEX_SQL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS {_PROJECT_OWNER_INDEX}
+ON {_TABLE} (repo_workspace_id, project_scope)
+WHERE lane_disposition = '{DISPOSITION_ACTIVE}'
+  AND binding_kind = '{BINDING_KIND_PROJECT_GATEWAY}' AND project_scope <> ''
+"""
+
 _COLUMNS = (
     "repo_workspace_id, lane_id, issue_id, lane_disposition, process_release, "
     "revision, release_action_id, release_pins, replacement_state, "
     "replacement_action_id, replacement_pins, decision_source, "
-    "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity"
+    "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
+    "binding_kind, project_scope, lane_generation, declared_slots"
 )
 
 _V1_COLUMNS = frozenset(
@@ -117,6 +149,9 @@ _V3_ADDS = frozenset(
     {"replacement_state", "replacement_action_id", "replacement_pins"}  # #13763
 )
 _V4_ADDS = frozenset({"worktree_identity"})  # #13754 worktree binding
+_V5_ADDS = frozenset(
+    {"binding_kind", "project_scope", "lane_generation", "declared_slots"}  # #13810
+)
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -130,11 +165,13 @@ _SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
 _SHAPE_V3_REPLACEMENT = _V1_COLUMNS | _V2_ADDS | _V3_ADDS
 _SHAPE_V3_WORKTREE = _V1_COLUMNS | _V2_ADDS | _V4_ADDS
 _SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
+_SHAPE_V5 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
     3: (_SHAPE_V3_REPLACEMENT, _SHAPE_V3_WORKTREE),
     4: (_SHAPE_V4,),
+    5: (_SHAPE_V5,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -160,6 +197,10 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "created_at": ("TEXT", 1, None, 0),
     "updated_at": ("TEXT", 1, None, 0),
     "worktree_identity": ("TEXT", 1, "''", 0),
+    "binding_kind": ("TEXT", 1, "'issue'", 0),
+    "project_scope": ("TEXT", 1, "''", 0),
+    "lane_generation": ("INTEGER", 1, "1", 0),
+    "declared_slots": ("TEXT", 1, "''", 0),
 }
 
 
@@ -321,6 +362,61 @@ def _table_present(conn: sqlite3.Connection, name: str) -> bool:
 _OWNER_INDEX_KEY_COLUMNS = ("repo_workspace_id", "issue_id")
 _OWNER_INDEX_PREDICATE = "lane_disposition = 'active' AND issue_id <> ''"
 
+#: The v5 project-gateway owner index's authority-defining shape (Redmine #13810), the
+#: twin of :data:`_OWNER_INDEX_PREDICATE`. A same-named index that is non-unique, keyed on
+#: other columns, or scoped by a different predicate does NOT enforce exactly-one active
+#: project owner and is a corrupt authority shape.
+_PROJECT_OWNER_INDEX_KEY_COLUMNS = ("repo_workspace_id", "project_scope")
+_PROJECT_OWNER_INDEX_PREDICATE = (
+    "lane_disposition = 'active' AND binding_kind = 'project_gateway' "
+    "AND project_scope <> ''"
+)
+
+
+def _verify_partial_owner_index(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    key_columns: tuple[str, ...],
+    predicate: str,
+) -> bool:
+    """Does ``name`` exist on this table as a UNIQUE PARTIAL index with EXACTLY this shape?
+
+    The shared verifier behind both the issue owner index (Redmine #13754 R7-F1) and the
+    v5 project-gateway owner index (Redmine #13810): the exactly-one-active-owner invariant
+    is enforced by the storage engine only when the index is (1) attached to
+    ``lane_lifecycle_records``, (2) UNIQUE, (3) PARTIAL, (4) keyed on ``key_columns`` in
+    that order, and (5) scoped by ``predicate``. A same-named index missing any of these
+    does not enforce the constraint and is a corrupt authority shape.
+    """
+    row = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (name,),
+    ).fetchone()
+    if row is None or row[0] != _TABLE:
+        return False  # absent, or attached to a foreign table
+    listing = {
+        r[1]: (r[2], r[4])  # name -> (unique, partial)
+        for r in conn.execute(f"PRAGMA index_list({_TABLE})")
+    }
+    if listing.get(name) != (1, 1):  # must be UNIQUE and PARTIAL
+        return False
+    live_key_columns = tuple(
+        r[2] for r in conn.execute(f"PRAGMA index_info({name})")
+    )
+    if live_key_columns != key_columns:  # wrong / reordered key columns
+        return False
+    # The partial predicate lives only in the stored CREATE text; collapse whitespace
+    # first (SQLite preserves the original newlines), then extract after WHERE and compare
+    # so formatting does not matter but semantics do.
+    sql = " ".join((row[1] or "").split())
+    marker = " where "
+    where_at = sql.lower().find(marker)
+    if where_at == -1:
+        return False
+    live_predicate = sql[where_at + len(marker) :].strip()
+    return live_predicate == predicate
+
 
 def _verify_owner_index(conn: sqlite3.Connection) -> bool:
     """Does the active-owner unique partial index exist with its EXACT authority shape?
@@ -332,33 +428,28 @@ def _verify_owner_index(conn: sqlite3.Connection) -> bool:
     ``lane_disposition = 'active' AND issue_id <> ''``. A same-named index missing any of
     these does not enforce the constraint and is a corrupt authority shape.
     """
-    row = conn.execute(
-        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
-        (_OWNER_INDEX,),
-    ).fetchone()
-    if row is None or row[0] != _TABLE:
-        return False  # absent, or attached to a foreign table
-    listing = {
-        r[1]: (r[2], r[4])  # name -> (unique, partial)
-        for r in conn.execute(f"PRAGMA index_list({_TABLE})")
-    }
-    if listing.get(_OWNER_INDEX) != (1, 1):  # must be UNIQUE and PARTIAL
-        return False
-    key_columns = tuple(
-        r[2] for r in conn.execute(f"PRAGMA index_info({_OWNER_INDEX})")
+    return _verify_partial_owner_index(
+        conn,
+        name=_OWNER_INDEX,
+        key_columns=_OWNER_INDEX_KEY_COLUMNS,
+        predicate=_OWNER_INDEX_PREDICATE,
     )
-    if key_columns != _OWNER_INDEX_KEY_COLUMNS:  # wrong / reordered key columns
-        return False
-    # The partial predicate lives only in the stored CREATE text; collapse whitespace
-    # first (SQLite preserves the original newlines), then extract after WHERE and compare
-    # so formatting does not matter but semantics do.
-    sql = " ".join((row[1] or "").split())
-    marker = " where "
-    where_at = sql.lower().find(marker)
-    if where_at == -1:
-        return False
-    predicate = sql[where_at + len(marker) :].strip()
-    return predicate == _OWNER_INDEX_PREDICATE
+
+
+def _verify_project_owner_index(conn: sqlite3.Connection) -> bool:
+    """Does the v5 project-gateway active-owner unique partial index hold (Redmine #13810)?
+
+    The exact-shape twin of :func:`_verify_owner_index` for the project scope. Only a v5
+    store carries it (its predicate names ``binding_kind`` / ``project_scope``, columns
+    that exist only from v5), so :func:`_schema_signature_matches` requires it only when
+    the recorded version is v5.
+    """
+    return _verify_partial_owner_index(
+        conn,
+        name=_PROJECT_OWNER_INDEX,
+        key_columns=_PROJECT_OWNER_INDEX_KEY_COLUMNS,
+        predicate=_PROJECT_OWNER_INDEX_PREDICATE,
+    )
 
 
 def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
@@ -376,7 +467,11 @@ def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
       is not the current column);
     - the active-owner index enforces its EXACT constraint (:func:`_verify_owner_index`):
       a same-named index that is non-unique / wrong-keyed / wrong-predicate / on a foreign
-      table does not enforce exactly-one-active-owner and is a corrupt shape (R7-F1).
+      table does not enforce exactly-one-active-owner and is a corrupt shape (R7-F1);
+    - and, on a v5 store, the project-gateway active-owner index enforces its EXACT
+      constraint too (:func:`_verify_project_owner_index`, Redmine #13810). It is required
+      only for v5 because its predicate names columns (``binding_kind`` / ``project_scope``)
+      that exist only from v5.
     """
     if not _table_present(conn, _TABLE):
         return False
@@ -390,7 +485,11 @@ def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
     for name, definition in info.items():
         if _COLUMN_DEFS.get(name) != definition:
             return False
-    return _verify_owner_index(conn)
+    if not _verify_owner_index(conn):
+        return False
+    if recorded >= 5 and not _verify_project_owner_index(conn):
+        return False
+    return True
 
 
 def readonly_component_status(conn: sqlite3.Connection) -> str:
@@ -533,6 +632,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                 )
             conn.execute(_TABLE_SQL)
             conn.execute(_OWNER_INDEX_SQL)
+            conn.execute(_PROJECT_OWNER_INDEX_SQL)
             _stamp_component_version(conn)
         elif not _schema_signature_matches(conn, recorded):
             # A recorded version whose live shape is NOT one of that version's known
@@ -596,7 +696,35 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN worktree_identity TEXT NOT NULL DEFAULT ''"
                 )
+            # v5 (Redmine #13810): the binding / generation / declaration columns. Each
+            # ADD lands the existing rows on the migration default — ``binding_kind='issue'``
+            # (every pre-v5 lane was an issue lane, j#78386 §6), empty ``project_scope`` (an
+            # issue lane owns no scope, and a legacy empty-issue row is NOT re-derived as a
+            # project lane), ``lane_generation=1`` (the first incarnation), empty
+            # ``declared_slots`` (no snapshot was captured then) — never a guessed authority
+            # value.
+            if "binding_kind" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN binding_kind TEXT NOT NULL DEFAULT 'issue'"
+                )
+            if "project_scope" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN project_scope TEXT NOT NULL DEFAULT ''"
+                )
+            if "lane_generation" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN lane_generation INTEGER NOT NULL DEFAULT 1"
+                )
+            if "declared_slots" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN declared_slots TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute(_OWNER_INDEX_SQL)
+            conn.execute(_PROJECT_OWNER_INDEX_SQL)
             _stamp_component_version(conn)
         conn.execute("COMMIT")
         locked = False

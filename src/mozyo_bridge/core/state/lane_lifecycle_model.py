@@ -173,6 +173,10 @@ CAS_FORBIDDEN_TRANSITION = "forbidden_transition"
 CAS_ACTION_MISMATCH = "action_generation_mismatch"
 CAS_OWNER_CONFLICT = "owner_conflict"
 CAS_ALREADY_DECLARED = "already_declared"
+#: An ``open_next_generation`` (Redmine #13810) whose ``expected_generation`` no longer
+#: matches the row's ``lane_generation``: the incarnation the caller meant to re-open has
+#: already been superseded by a newer one, so a stale approval never re-opens it.
+CAS_GENERATION_MISMATCH = "generation_mismatch"
 
 # -- owner resolution vocabulary ---------------------------------------------
 
@@ -380,6 +384,191 @@ def validate_replacement_pins(pins: Sequence[ReleasePin]) -> tuple[ReleasePin, .
     return pinned
 
 
+# -- lane binding kind (Redmine #13810) --------------------------------------
+#
+# What the lane's ownership is *bound to*. An issue lane owns a Redmine issue
+# (``issue_id``); a project-gateway lane owns a full canonical project scope
+# (``project_scope``) and never an issue. The two are separate authorities with
+# separate owner indexes (Design Answer j#78386): a project-gateway lane is not an
+# issue lane with an empty issue, it is a different binding whose uniqueness is on the
+# scope, not the issue.
+
+#: The lane owns a Redmine issue (or is a legacy unbound issue lane; see
+#: :attr:`LaneLifecycleRecord.is_legacy_unbound`). The migration default for every
+#: pre-v5 row — those were all issue-kind lanes (j#78386 §6).
+BINDING_KIND_ISSUE = "issue"
+#: The lane owns a full canonical project scope (a derived ``pgwv1_...`` gateway lane).
+#: ``issue_id`` is empty; ``project_scope`` carries the full scope (never a digest).
+BINDING_KIND_PROJECT_GATEWAY = "project_gateway"
+
+BINDING_KINDS = frozenset({BINDING_KIND_ISSUE, BINDING_KIND_PROJECT_GATEWAY})
+
+
+class ProcessPinError(ValueError):
+    """A typed process-generation pin is unusable; fail closed (never degraded)."""
+
+
+#: The declared-slot snapshot envelope version (Redmine #13810). Bumped when the pin
+#: shape changes so an older build reading a newer snapshot fails closed rather than
+#: dropping fields it does not understand.
+DECLARED_SLOTS_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ProcessGenerationPin:
+    """One provider-bound slot as observed when a lane generation was declared.
+
+    The richer successor to :class:`ReleasePin` (Redmine #13810, Design Answer j#78386):
+    a slot is matched not by ``locator`` alone but by the whole tuple
+    ``(role, provider, assigned_name, locator, runtime_revision)`` — a slot recycled into
+    a *new* provider process, or the same name re-launched at a newer runtime revision, is
+    a different pin and is never actuated on a stale approval.
+
+    ``role`` / ``provider`` / ``assigned_name`` are the stable identity, ``locator`` /
+    ``runtime_revision`` are the live evidence observed at declaration time, and all five
+    are required — a pin missing any of them cannot express the identity the action-time
+    preflight re-resolves against the live inventory, so it is refused rather than stored
+    as an un-actionable slot (the :class:`ReleasePin` R1-F4 discipline, extended).
+    ``attested_at`` is the startup-attestation timestamp; it is *evidence, not identity*
+    (a slot may be declared before it is attested), so it is stored but may be empty.
+
+    This is a **declaration snapshot**, never a liveness fact: whether the slot still
+    exists is re-read from the live Herdr inventory every time (``managed-state-model.md``
+    ``### 正本境界``). ``declared_slots`` is "what was observed / authorized then".
+    """
+
+    role: str
+    provider: str
+    assigned_name: str
+    locator: str
+    runtime_revision: str
+    attested_at: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("role", "provider", "assigned_name", "locator", "runtime_revision",
+                     "attested_at"):
+            object.__setattr__(self, name, norm(getattr(self, name)))
+        missing = [
+            name
+            for name in ("role", "provider", "assigned_name", "locator", "runtime_revision")
+            if not getattr(self, name)
+        ]
+        if missing:
+            raise ProcessPinError(
+                "a process generation pin requires a non-empty role / provider / "
+                "assigned_name / locator / runtime_revision "
+                f"(missing: {', '.join(missing)}); an unresolvable slot is never pinned"
+            )
+
+    @property
+    def stable_identity(self) -> tuple[str, str, str]:
+        """The provider-bound ``(role, provider, assigned_name)`` slot identity."""
+        return (self.role, self.provider, self.assigned_name)
+
+    @property
+    def match_key(self) -> tuple[str, str, str, str, str]:
+        """The full tuple the actuator re-resolves against a live process (evidence)."""
+        return (self.role, self.provider, self.assigned_name, self.locator,
+                self.runtime_revision)
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "role": self.role,
+            "provider": self.provider,
+            "assigned_name": self.assigned_name,
+            "locator": self.locator,
+            "runtime_revision": self.runtime_revision,
+            "attested_at": self.attested_at,
+        }
+
+
+def validate_declared_slots(
+    slots: Sequence[ProcessGenerationPin],
+) -> tuple[ProcessGenerationPin, ...]:
+    """The provider-bound slots a declaration may carry (no duplicate slot identity).
+
+    Two pins sharing a ``(role, provider, assigned_name)`` identity would make the
+    declared set ambiguous — which locator/runtime revision is authoritative for that
+    slot? Reject rather than pick (the :func:`validate_release_pins` discipline). An
+    *empty* set is allowed here: an issue lane declares no slots at create time; the
+    per-binding-kind requirement (a project gateway must declare its slot set) is the
+    declaration service's, not this pure validator's.
+    """
+    declared = tuple(slots)
+    seen: set[tuple[str, str, str]] = set()
+    for pin in declared:
+        if pin.stable_identity in seen:
+            raise ProcessPinError(
+                f"duplicate declared slot {pin.stable_identity!r} in one generation"
+            )
+        seen.add(pin.stable_identity)
+    return declared
+
+
+def encode_declared_slots(slots: Sequence[ProcessGenerationPin]) -> str:
+    """Serialize the declared slot set as a versioned envelope (deterministic).
+
+    Empty slots serialize to ``""`` (an issue lane with no declared slots), so a v5 row
+    is byte-identical to the migrated pre-v5 default and the round-trip is stable.
+    """
+    declared = tuple(slots)
+    if not declared:
+        return ""
+    return json.dumps(
+        {
+            "version": DECLARED_SLOTS_VERSION,
+            "slots": [
+                p.as_payload()
+                for p in sorted(declared, key=lambda p: p.stable_identity)
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def decode_declared_slots(raw: str) -> tuple[ProcessGenerationPin, ...]:
+    """Read the declared slot set back. Empty means none; corrupt / unknown **raises**.
+
+    Fail-closed like :func:`decode_release_pins`: a malformed or newer-versioned snapshot
+    must never decode to a *shorter* / dropped-field slot list, which would let a caller
+    believe it had authorized fewer slots than the row records. An unreadable snapshot is
+    a fail-closed condition, not a degraded one.
+    """
+    if not norm(raw):
+        return ()
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ProcessPinError(f"declared slots are not readable JSON: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ProcessPinError("declared slots must be a versioned object")
+    version = loaded.get("version")
+    if version != DECLARED_SLOTS_VERSION:
+        raise ProcessPinError(
+            f"declared slots version {version!r} is not {DECLARED_SLOTS_VERSION} "
+            "(unknown / newer snapshot); fail closed"
+        )
+    slots = loaded.get("slots")
+    if not isinstance(slots, list):
+        raise ProcessPinError("declared slots envelope has no slot list")
+    pins: list[ProcessGenerationPin] = []
+    for item in slots:
+        if not isinstance(item, dict):
+            raise ProcessPinError(f"declared slot is not an object: {item!r}")
+        pins.append(
+            ProcessGenerationPin(
+                role=norm(item.get("role")),
+                provider=norm(item.get("provider")),
+                assigned_name=norm(item.get("assigned_name")),
+                locator=norm(item.get("locator")),
+                runtime_revision=norm(item.get("runtime_revision")),
+                attested_at=norm(item.get("attested_at")),
+            )
+        )
+    return tuple(pins)
+
+
 #: The durable-record systems a lifecycle decision may point at. A pointer into an
 #: unknown system cannot be re-read at recovery time, so the vocabulary is closed.
 DECISION_SOURCE_REDMINE = "redmine"
@@ -494,6 +683,19 @@ class LaneLifecycleRecord:
     lane's worktree cannot drive the retire (a foreign close). Empty on a v1/v2/v3 row (a
     known-unbound lane whose execute retire fails closed until re-declared) — never a
     guessed value.
+
+    v5 (Redmine #13810) adds the binding/generation/declaration triple:
+
+    - ``binding_kind`` (``issue`` | ``project_gateway``) — what the lane's ownership is
+      bound to. Every migrated pre-v5 row is ``issue`` (j#78386 §6); a ``project_gateway``
+      lane owns a ``project_scope`` and never an issue.
+    - ``project_scope`` — the full canonical project scope for a project-gateway lane
+      (never a digest, never inferred from the derived lane id). Empty for issue lanes.
+    - ``lane_generation`` — the positive monotonic incarnation counter. A retired
+      generation is terminal; a re-created same-semantic route bumps it via an explicit
+      ``open_next_generation`` CAS, invalidating a stale generation's approvals.
+    - ``declared_slots`` — the versioned :class:`ProcessGenerationPin` snapshot observed
+      when this generation was declared. A declaration snapshot, not liveness.
     """
 
     repo_workspace_id: str
@@ -513,6 +715,10 @@ class LaneLifecycleRecord:
     created_at: str = ""
     updated_at: str = ""
     worktree_identity: str = ""
+    binding_kind: str = BINDING_KIND_ISSUE
+    project_scope: str = ""
+    lane_generation: int = 1
+    declared_slots: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -526,6 +732,21 @@ class LaneLifecycleRecord:
     def replacement_slots(self) -> tuple[ReleasePin, ...]:
         """The exact old receiver slots pinned by the replacement generation."""
         return decode_release_pins(self.replacement_pins)
+
+    @property
+    def declared_pins(self) -> tuple[ProcessGenerationPin, ...]:
+        """The provider-bound slots declared for this generation (a snapshot)."""
+        return decode_declared_slots(self.declared_slots)
+
+    @property
+    def is_legacy_unbound(self) -> bool:
+        """An issue-kind lane that owns no issue (a pre-v5 empty-issue row, j#78386 §6).
+
+        Surfaced as such rather than silently back-filled: its ``project_scope`` is
+        **not** auto-completed from the lane id, and its ``binding_kind`` stays ``issue``
+        (a project-gateway lane is an explicit declaration, never a guess).
+        """
+        return norm(self.binding_kind) == BINDING_KIND_ISSUE and not norm(self.issue_id)
 
     @property
     def decision(self) -> Optional[DecisionPointer]:
@@ -564,6 +785,10 @@ class LaneLifecycleRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "worktree_identity": self.worktree_identity,
+            "binding_kind": self.binding_kind,
+            "project_scope": self.project_scope,
+            "lane_generation": self.lane_generation,
+            "declared_slots": [p.as_payload() for p in self.declared_pins],
         }
 
 
@@ -665,6 +890,15 @@ __all__ = (
     "DecisionPointer",
     "DecisionPointerError",
     "ReleasePinError",
+    "ProcessPinError",
+    "ProcessGenerationPin",
+    "BINDING_KINDS",
+    "BINDING_KIND_ISSUE",
+    "BINDING_KIND_PROJECT_GATEWAY",
+    "DECLARED_SLOTS_VERSION",
+    "decode_declared_slots",
+    "encode_declared_slots",
+    "validate_declared_slots",
     "rehydrate_allowed",
     "replacement_open_allowed",
     "replacement_settled",
@@ -674,6 +908,7 @@ __all__ = (
     "CAS_ACTION_MISMATCH",
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
+    "CAS_GENERATION_MISMATCH",
     "CAS_FORBIDDEN_TRANSITION",
     "CAS_NOT_FOUND",
     "CAS_OWNER_CONFLICT",

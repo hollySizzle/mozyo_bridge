@@ -20,8 +20,8 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional
 
-from mozyo_bridge.core.state.lane_lifecycle import (
-    LaneLifecycleStore,
+from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _locked_row,
     _rollback,
     _utc_now,

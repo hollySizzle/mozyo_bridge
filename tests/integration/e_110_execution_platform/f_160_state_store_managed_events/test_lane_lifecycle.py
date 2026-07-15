@@ -1410,12 +1410,17 @@ class R3RegressionTest(unittest.TestCase):
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
             for col in (
                 "decision_issue_id",
                 "replacement_state",
                 "replacement_action_id",
                 "replacement_pins",
                 "worktree_identity",
+                "binding_kind",
+                "project_scope",
+                "lane_generation",
+                "declared_slots",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1449,11 +1454,16 @@ class R3RegressionTest(unittest.TestCase):
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
             for col in (
                 "replacement_state",
                 "replacement_action_id",
                 "replacement_pins",
                 "worktree_identity",
+                "binding_kind",
+                "project_scope",
+                "lane_generation",
+                "declared_slots",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1864,6 +1874,9 @@ class BackupFirstMigrationTest(unittest.TestCase):
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
+            # A pre-v5 store never had the project-owner index; SQLite also refuses to drop
+            # a column a partial index depends on, so rewinding past v5 removes it first.
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
             for col in drop_columns:
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1875,8 +1888,14 @@ class BackupFirstMigrationTest(unittest.TestCase):
             conn.close()
         return path
 
+    #: The v5 (Redmine #13810) binding / generation / declaration columns. A faithful
+    #: pre-v5 fixture drops these too, so the rewound shape matches an actual old signature
+    #: rather than a v5 shape merely re-stamped to an old version (which now fails closed).
+    _V5_COLUMNS = ["binding_kind", "project_scope", "lane_generation", "declared_slots"]
+
     def _v2_store(self) -> Path:
-        """A pre-#13763 / pre-#13754 store (no replacement axis, no worktree binding)."""
+        """A pre-#13763 / pre-#13754 / pre-#13810 store (no replacement axis, no worktree
+        binding, no binding/generation columns)."""
         return self._downgrade_to(
             2,
             [
@@ -1884,13 +1903,15 @@ class BackupFirstMigrationTest(unittest.TestCase):
                 "replacement_action_id",
                 "replacement_pins",
                 "worktree_identity",
-            ],
+            ]
+            + self._V5_COLUMNS,
         )
 
     def _v3_store(self) -> Path:
-        """The current-staging store (#13763 replacement axis) BEFORE #13754's worktree
-        binding — the exact collision fixture the integration finding (j#78705) named."""
-        return self._downgrade_to(3, ["worktree_identity"])
+        """The staging store (#13763 replacement axis) BEFORE #13754's worktree binding and
+        #13810's binding/generation columns — the exact collision fixture the integration
+        finding (j#78705) named, rewound past v5."""
+        return self._downgrade_to(3, ["worktree_identity"] + self._V5_COLUMNS)
 
     def _backups(self):
         d = self.home / "backups"
@@ -2169,7 +2190,14 @@ class BackupFirstMigrationTest(unittest.TestCase):
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
-            for col in ("replacement_state", "replacement_action_id", "replacement_pins"):
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
+            # Drop the replacement group AND the v5 (#13810) columns so the rewound shape is
+            # a genuine worktree-v3 signature (worktree present, replacement + binding absent).
+            for col in (
+                "replacement_state",
+                "replacement_action_id",
+                "replacement_pins",
+            ) + tuple(self._V5_COLUMNS):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 3 WHERE component = ?",
@@ -2226,12 +2254,13 @@ class BackupFirstMigrationTest(unittest.TestCase):
         # A pure v2 shape (NEITHER v3 branch's extra columns) recorded as v3 is NOT a known
         # v3 signature — it must fail closed, never be migrated / re-stamped (R6-F1).
         def corrupt(conn):
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
             for col in (
                 "replacement_state",
                 "replacement_action_id",
                 "replacement_pins",
                 "worktree_identity",
-            ):
+            ) + tuple(self._V5_COLUMNS):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 3 WHERE component = ?",

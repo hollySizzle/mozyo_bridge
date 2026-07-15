@@ -70,24 +70,31 @@ have a single import surface.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional
 
 from mozyo_bridge.core.state.lane_lifecycle_model import (
+    BINDING_KIND_ISSUE,
+    BINDING_KIND_PROJECT_GATEWAY,
+    BINDING_KINDS,
     DECISION_SOURCE_REDMINE,
     DECISION_SOURCES,
     DecisionPointer,
     DecisionPointerError,
+    ProcessGenerationPin,
+    ProcessPinError,
     ReleasePinError,
+    encode_declared_slots,
     recovery_refusal,
     rehydrate_allowed,
     replacement_settled,
+    validate_declared_slots,
     validate_release_pins,
     CAS_ACTION_MISMATCH,
     CAS_ALREADY_DECLARED,
     CAS_APPLIED,
     CAS_FORBIDDEN_TRANSITION,
+    CAS_GENERATION_MISMATCH,
     CAS_NOT_FOUND,
     CAS_OWNER_CONFLICT,
     CAS_STALE_REVISION,
@@ -132,9 +139,14 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     lane_lifecycle_path,
     readonly_component_status,
 )
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from mozyo_bridge.core.state.lane_lifecycle_rows import (
+    _active_owner,
+    _insert_active_row,
+    _locked_row,
+    _record,
+    _rollback,
+    _utc_now,
+)
 
 
 # -- store -------------------------------------------------------------------
@@ -283,28 +295,18 @@ class LaneLifecycleStore:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_OWNER_CONFLICT)
             try:
-                conn.execute(
-                    f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        key.repo_workspace_id,
-                        key.lane_id,
-                        issue,
-                        DISPOSITION_ACTIVE,
-                        RELEASE_NOT_REQUESTED,
-                        1,
-                        "",
-                        "",
-                        REPLACEMENT_NOT_REQUESTED,
-                        "",
-                        "",
-                        decision.source,
-                        decision.issue_id,
-                        decision.journal_id,
-                        stamp,
-                        stamp,
-                        worktree,
-                    ),
+                # An issue-kind lane at generation 1 with no declared-slot snapshot: the
+                # v5 binding/generation/declaration columns land on their additive defaults
+                # (Redmine #13810). ``declare_lane`` is the surface that declares a
+                # project-gateway lane or carries a declared-slot set.
+                _insert_active_row(
+                    conn,
+                    key=key,
+                    issue=issue,
+                    decision=decision,
+                    revision=1,
+                    stamp=stamp,
+                    worktree=worktree,
                 )
             except sqlite3.IntegrityError:
                 # The index is the backstop the pre-checks above should have caught.
@@ -569,32 +571,18 @@ class LaneLifecycleStore:
                 )
                 if incoming is None:
                     revision = 1
-                    conn.execute(
-                        f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            recovery.repo_workspace_id,
-                            recovery.lane_id,
-                            issue,
-                            DISPOSITION_ACTIVE,
-                            RELEASE_NOT_REQUESTED,
-                            revision,
-                            "",
-                            "",
-                            REPLACEMENT_NOT_REQUESTED,
-                            "",
-                            "",
-                            decision.source,
-                            decision.issue_id,
-                            decision.journal_id,
-                            stamp,
-                            stamp,
-                            # A supersede handover is not a create: the recovery lane's
-                            # worktree binding (Redmine #13754) is written when that lane
-                            # is created, not here. Empty => its execute retire fails
-                            # closed until then, never a guessed binding.
-                            "",
-                        ),
+                    # A supersede handover creates an issue-kind recovery lane at
+                    # generation 1. Its worktree binding (Redmine #13754) and any
+                    # declared-slot snapshot (Redmine #13810) are written when that lane is
+                    # actually created / declared, not here — empty defaults, so its execute
+                    # retire fails closed until then, never a guessed binding.
+                    _insert_active_row(
+                        conn,
+                        key=recovery,
+                        issue=issue,
+                        decision=decision,
+                        revision=revision,
+                        stamp=stamp,
                     )
                 else:
                     revision = incoming.revision + 1
@@ -802,70 +790,6 @@ class LaneLifecycleStore:
             conn.close()
 
 
-# -- internals ---------------------------------------------------------------
-
-
-def _record(row: Sequence[object]) -> LaneLifecycleRecord:
-    return LaneLifecycleRecord(
-        repo_workspace_id=str(row[0]),
-        lane_id=str(row[1]),
-        issue_id=str(row[2] or ""),
-        lane_disposition=str(row[3]),
-        process_release=str(row[4]),
-        revision=int(row[5]),
-        release_action_id=str(row[6] or ""),
-        release_pins=str(row[7] or ""),
-        replacement_state=str(row[8] or REPLACEMENT_NOT_REQUESTED),
-        replacement_action_id=str(row[9] or ""),
-        replacement_pins=str(row[10] or ""),
-        decision_source=str(row[11] or ""),
-        decision_issue_id=str(row[12] or ""),
-        decision_journal=str(row[13] or ""),
-        created_at=str(row[14]),
-        updated_at=str(row[15]),
-        worktree_identity=str(row[16] or ""),
-    )
-
-
-def _locked_row(
-    conn: sqlite3.Connection, key: LaneLifecycleKey
-) -> Optional[LaneLifecycleRecord]:
-    """Read the row inside the already-open ``BEGIN IMMEDIATE`` write lock."""
-    row = conn.execute(
-        f"SELECT {_COLUMNS} FROM {_TABLE} WHERE repo_workspace_id = ? AND lane_id = ?",
-        key.as_row(),
-    ).fetchone()
-    return _record(row) if row is not None else None
-
-
-
-def _active_owner(
-    conn: sqlite3.Connection, repo_workspace_id: str, issue_id: str
-) -> Optional[str]:
-    """The lane actively owning ``issue_id``, read inside the write lock.
-
-    Callers pre-check with this rather than classifying a raised
-    ``IntegrityError``: SQLite reports a unique violation by *column list*, not by
-    index name, so the two constraints on this table (the lane primary key and the
-    active-owner index) are not reliably distinguishable from the message text.
-    Holding ``BEGIN IMMEDIATE`` makes the pre-check authoritative — no other writer
-    can slip in between it and the write. The index remains the backstop.
-    """
-    row = conn.execute(
-        f"SELECT lane_id FROM {_TABLE} WHERE repo_workspace_id = ? AND issue_id = ? "
-        "AND lane_disposition = ?",
-        (repo_workspace_id, issue_id, DISPOSITION_ACTIVE),
-    ).fetchone()
-    return str(row[0]) if row is not None else None
-
-
-def _rollback(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ROLLBACK")
-    except sqlite3.DatabaseError:
-        pass
-
-
 # -- module-level read wrappers (fail closed, never "probably active") --------
 
 
@@ -943,6 +867,13 @@ __all__ = (
     "DecisionPointer",
     "DecisionPointerError",
     "ReleasePinError",
+    "ProcessPinError",
+    "ProcessGenerationPin",
+    "BINDING_KINDS",
+    "BINDING_KIND_ISSUE",
+    "BINDING_KIND_PROJECT_GATEWAY",
+    "encode_declared_slots",
+    "validate_declared_slots",
     "rehydrate_allowed",
     "validate_release_pins",
     "LANE_LIFECYCLE_COMPONENT",
@@ -959,6 +890,7 @@ __all__ = (
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
     "CAS_FORBIDDEN_TRANSITION",
+    "CAS_GENERATION_MISMATCH",
     "CAS_NOT_FOUND",
     "CAS_OWNER_CONFLICT",
     "CAS_STALE_REVISION",

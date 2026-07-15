@@ -308,6 +308,32 @@ Table naming:
     unsupported として DB を書き換えない」の実装)。rows は lifecycle authority であり、metadata を
     v2 へ書き戻すと **newer semantics を知らない code が authority を更新できてしまう**。read/write は
     `unknown` / `None` / error へ落ち、active を推定しない。
+  - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
+    j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
+    同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement
+    row の revision が分裂し atomic CAS が失われる)。追加 field:
+    - `binding_kind` (`issue` | `project_gateway`)。lane の所有対象。migration 前の全 row は `issue`。
+      `project_gateway` lane は issue を持たず `project_scope` を所有する。`issue` kind かつ空 issue の
+      row は `legacy_unbound` として **可視化**し、project scope を lane digest から自動補完しない。
+    - `project_scope`。project-gateway lane の **canonical full scope** (digest ではない。derived
+      `pgwv1_...` lane id から推測しない)。active な project owner は第二の partial unique index
+      `(repo_workspace_id, project_scope) WHERE lane_disposition='active' AND
+      binding_kind='project_gateway' AND project_scope <> ''` で **workspace scope** に固定する
+      (issue owner index の双子)。
+    - `lane_generation`。positive monotonic な incarnation。retired generation は terminal。同一
+      semantic route の再起動は `retired -> active` の implicit revive **禁止**で、明示 CAS
+      `open_next_generation` (generation+1、release/replacement axes reset) のみ。古い generation の
+      approval / pin / action id は stale として無効化される。
+    - `declared_slots`。宣言時点の versioned `ProcessGenerationPin` snapshot (各 slot は
+      `role / provider / assigned_name / locator / runtime_revision / attested_at`)。`locator` 単独では
+      なく identity+evidence tuple で照合する。current liveness ではなく **観測 snapshot** であり、
+      存在確認は毎回 live inventory を読む。既存 release/replacement `ReleasePin` の後方互換 decode は維持。
+    - **common declaration service** (`LaneDeclarationStore.declare_lane`) が issue / project 双方を
+      fail-closed に宣言する。exact duplicate は idempotent (#13809 live-adopt)、既存 owner conflict /
+      別 issue-or-scope / 不読・ambiguous inventory は zero-write。bulk / implicit backfill は禁止。
+    - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
+      byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
+      adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
 
 Ownership rules:
