@@ -31,6 +31,18 @@ live evidence (role / provider / assigned_name / **locator**) and stored as
 duplicate. ``runtime_revision`` is left empty: the herdr generation discriminant is the
 locator (the attestation store deliberately records NO runtime version), so a runtime
 revision is never fabricated. No process is closed/relaunched and no route is mutated.
+
+Legacy-owner residual (Redmine #13809 j#78944 / j#78945): a **pre-#13754** owner row is
+already ``active`` and already owns the issue, but its ``worktree_identity`` is empty, so
+``declare_lane`` reads the gate-verified live worktree as a *divergent* re-declare and
+refuses — leaving ``retire --execute`` permanently blocked on ``worktree_binding_unverified``.
+When declare_lane refuses, this module attempts the bounded
+:meth:`...lane_declaration.LaneDeclarationStore.backfill_active_binding` CAS, which fills
+**only** that one empty binding field (and the empty ``declared_slots`` snapshot) on the row
+the lane already owns, reported as :data:`ADOPT_DECL_BACKFILLED`. A non-empty mismatch, a
+different / non-active / project-gateway row, a recycled generation, or a revision race is
+zero-write — declare_lane's "a divergent re-declare must not overwrite" is preserved, not
+generally relaxed.
 """
 
 from __future__ import annotations
@@ -89,6 +101,12 @@ ADOPT_DECL_BAD_TOKEN = "unresolvable_worktree_token"
 ADOPT_DECL_BAD_ANCHOR = "unusable_decision_anchor"
 #: The declaration was applied (a fresh owner row, or an idempotent exact-duplicate adopt).
 ADOPT_DECL_DECLARED = "declared"
+#: An EXISTING ``active`` legacy owner row (already owns the issue) whose ``worktree_identity``
+#: was empty had its missing worktree binding + typed pins filled by the bounded backfill CAS
+#: (Redmine #13809 residual j#78944 / j#78945). Owner-bound and safe to dispatch, like
+#: :data:`ADOPT_DECL_DECLARED`, but reported distinctly so the pre-existing-incomplete-row
+#: correction is regressed apart from the rowless declaration.
+ADOPT_DECL_BACKFILLED = "backfilled"
 #: THIS adopt could not (re-)declare (a gate failure, or a divergent re-declare), BUT the
 #: lane is ALREADY the active owner of its issue — a prior create / adopt bound it, so the
 #: lane is owner-bound and safe to dispatch (Redmine #13810 R3-F3). Only a genuinely
@@ -320,7 +338,8 @@ def declare_adopted_owner_row(
         except (DecisionPointerError, ValueError):
             return ADOPT_DECL_BAD_ANCHOR
         try:
-            result = store_factory().declare_lane(
+            store = store_factory()
+            result = store.declare_lane(
                 key,
                 decision=decision,
                 binding_kind=BINDING_KIND_ISSUE,
@@ -328,15 +347,39 @@ def declare_adopted_owner_row(
                 declared_slots=pins,
                 worktree_identity=token,
             )
+            # ``applied`` is true for a fresh declare AND an idempotent exact-duplicate
+            # adopt (same live pins); a refusal wrote nothing.
+            if result.applied:
+                return ADOPT_DECL_DECLARED
+            # declare_lane refused. The one refusal this residual (Redmine #13809 j#78945)
+            # closes is a **pre-#13754 legacy** owner row: already ``active`` and already
+            # owns this issue, but with an empty ``worktree_identity`` — so declare_lane read
+            # the live worktree as a divergent re-declare and refused, leaving retire blocked
+            # on ``worktree_binding_unverified``. Attempt the bounded missing-field backfill
+            # CAS on THIS row (guarded on declare_lane's observed revision). It fills only the
+            # empty binding + typed pins; a non-empty mismatch / different issue / non-active /
+            # recycled generation / revision race is zero-write, so declare_lane's
+            # divergent-re-declare refusal is preserved, not generally relaxed.
+            backfill = store.backfill_active_binding(
+                key,
+                expected_revision=result.revision,
+                issue_id=issue,
+                worktree_identity=token,
+                declared_slots=pins,
+            )
         except (LaneLifecycleError, DecisionPointerError, OSError, ProcessPinError):
             return ADOPT_DECL_DECLARE_ERROR
-        # ``applied`` is true for a fresh declare AND an idempotent exact-duplicate adopt
-        # (same live pins); a refusal (owner conflict, or a recycled generation whose live
-        # pins differ) wrote nothing — a legitimate zero-write.
-        return ADOPT_DECL_DECLARED if result.applied else ADOPT_DECL_OWNER_CONFLICT
+        if backfill.applied:
+            return ADOPT_DECL_BACKFILLED
+        # Neither a fresh declaration nor a legacy backfill applied: another lane owns the
+        # issue, or a divergent binding (a recycled generation whose live pins differ) already
+        # exists — a legitimate zero-write.
+        return ADOPT_DECL_OWNER_CONFLICT
 
     outcome = _attempt()
-    if outcome == ADOPT_DECL_DECLARED:
+    if outcome in (ADOPT_DECL_DECLARED, ADOPT_DECL_BACKFILLED):
+        # Owner-bound: a fresh declaration, an idempotent duplicate, or a legacy row whose
+        # missing worktree binding was just filled — all leave the lane the active owner.
         return outcome
     # R3-F3: a non-``declared`` adopt leaves the lane owner-unbound ONLY if the lane is not
     # already the active owner of its issue. A prior create / adopt that bound it means the
@@ -401,6 +444,7 @@ __all__ = (
     "ADOPT_DECL_NOT_ADOPTED",
     "ADOPT_DECL_UNREADABLE",
     "ADOPT_DECL_DECLARED",
+    "ADOPT_DECL_BACKFILLED",
     "ADOPT_DECL_ALREADY_OWNED",
     "ADOPT_DECL_OWNER_CONFLICT",
     "ADOPT_DECL_DECLARE_ERROR",

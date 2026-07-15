@@ -32,16 +32,23 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
 )
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore  # noqa: E402
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
+    CAS_ALREADY_DECLARED,
+    CAS_NOT_FOUND,
+    CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
     DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
     LaneLifecycleKey,
     LaneLifecycleStore,
     OWNER_ABSENT,
     OWNER_RESOLVED,
     DecisionPointer,
+    ProcessGenerationPin,
     resolve_lane_owner,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E402
     ADOPT_DECL_ALREADY_OWNED,
+    ADOPT_DECL_BACKFILLED,
     ADOPT_DECL_DECLARED,
     ADOPT_DECL_DUPLICATE_CANDIDATES,
     ADOPT_DECL_INCOMPLETE_PAIR,
@@ -53,7 +60,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADOPT_DECL_UNATTESTED,
     ADOPT_DECL_UNREADABLE,
     ADOPT_DECL_UNRESOLVED_UNIT,
+    _worktree_token,
     declare_adopted_owner_row,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E402
+    attest_retire_target,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E402
+    REASON_WORKTREE_BINDING_UNVERIFIED,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E402
+    GATEWAY_ROLE,
+    WORKER_ROLE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402
     encode_assigned_name,
@@ -247,6 +265,276 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
         self._attest_pair()
         self._call(_pair_rows())
         self.assertTrue(self._owner().resolved)
+
+    # -- legacy active owner row: missing worktree binding backfill (j#78944/j#78945) --
+
+    def _seed_legacy_owner_row(self) -> None:
+        """A pre-#13754 legacy owner row: ``active``, owns the issue, empty worktree binding.
+
+        Exactly the residual #13809 measured (j#78944): the owner row EXISTS (unlike the
+        rowless #13835 case) but its ``worktree_identity`` is empty, so ``declare_lane`` reads
+        the live worktree as a divergent re-declare and retire stays ``worktree_binding_unverified``.
+        """
+        out = LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+        )
+        self.assertTrue(out.applied)
+        self.assertEqual(self._row_for().worktree_identity, "")
+
+    def test_legacy_incomplete_owner_row_is_backfilled(self) -> None:
+        # The pre-existing-incomplete-row correction, reported DISTINCTLY from a rowless
+        # declaration: the existing active row's empty worktree + typed pins are filled.
+        self._seed_legacy_owner_row()
+        rev0 = self._row_for().revision
+        self._attest_pair()
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_BACKFILLED)
+        row = self._row_for()
+        self.assertTrue(row.worktree_identity)  # the missing binding was filled
+        self.assertEqual(row.revision, rev0 + 1)  # one bounded CAS write
+        self.assertEqual(
+            sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
+        )
+        self.assertTrue(all(p.attested_at == ATTESTED_AT for p in row.declared_pins))
+        # Still the same active owner of the same issue (ownership never disrupted).
+        self.assertEqual(row.lane_disposition, DISPOSITION_ACTIVE)
+        self.assertEqual(row.issue_id, ISSUE)
+        self.assertEqual(self._owner().lane_id, LANE)
+
+    def test_rowless_is_declared_but_legacy_is_backfilled(self) -> None:
+        # The two paths are distinct outcomes: a rowless lane DECLARES a fresh owner row; a
+        # pre-existing incomplete row is BACKFILLED. (Regressed apart per j#78945 item 4.)
+        self._attest_pair()
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_DECLARED)
+
+    def test_backfilled_row_is_idempotent_on_re_adopt(self) -> None:
+        self._seed_legacy_owner_row()
+        self._attest_pair()
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_BACKFILLED)
+        rev = self._row_for().revision
+        # Second identical adopt: declare_lane now sees an EXACT duplicate -> declared,
+        # never a second write.
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_DECLARED)
+        self.assertEqual(self._row_for().revision, rev)
+
+    def test_recycled_generation_never_overwrites_a_filled_binding(self) -> None:
+        # Once the worktree binding is filled, a DIFFERENT live pair (recycled generation) is
+        # NOT backfilled over the row: the worktree is already non-empty, so the bounded
+        # surface refuses zero-write and the lane proceeds as already_owned (its own row).
+        self._seed_legacy_owner_row()
+        self._attest_pair(GW_LOC, WK_LOC)
+        self.assertEqual(self._call(_pair_rows(GW_LOC, WK_LOC)), ADOPT_DECL_BACKFILLED)
+        rev = self._row_for().revision
+        self._attest_pair("w9:p9", "w9:p8")  # attest the recycled generation
+        self.assertEqual(
+            self._call(_pair_rows("w9:p9", "w9:p8")), ADOPT_DECL_ALREADY_OWNED
+        )
+        row = self._row_for()
+        self.assertEqual(row.revision, rev)  # unchanged — recycled pins NOT stored
+        self.assertEqual(
+            sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
+        )
+
+    def test_unattested_live_pair_leaves_the_legacy_gap_zero_write(self) -> None:
+        # A legacy row whose live pair cannot self-attest is never backfilled: the gate fails
+        # before the backfill CAS, the row keeps its empty binding, and the lane is
+        # already_owned (its owner row predates this adopt) rather than DECLARED / BACKFILLED.
+        self._seed_legacy_owner_row()
+        # no attestation seeded -> unattested gate failure.
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_ALREADY_OWNED)
+        self.assertEqual(self._row_for().worktree_identity, "")
+
+    def test_backfill_unblocks_the_retire_worktree_fence(self) -> None:
+        # #13754 retire fence: a legacy row's empty worktree binding fails the retire
+        # attestation closed; after the adopt backfill the SAME token attests (synthetic,
+        # isolated home — no live pane/process/route mutation and no real #13754 lane).
+        self._seed_legacy_owner_row()
+        token = _worktree_token(self.coord, self.worktree, LANE)
+        self.assertTrue(token)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False):
+            attested, reason, _ = attest_retire_target(
+                WS, LANE, issue=ISSUE, worktree_identity=token
+            )
+        self.assertFalse(attested)  # legacy row: no worktree binding -> fail closed
+        self.assertEqual(reason, REASON_WORKTREE_BINDING_UNVERIFIED)
+        self._attest_pair()
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_BACKFILLED)
+        self.assertEqual(self._row_for().worktree_identity, token)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False):
+            attested, reason, _ = attest_retire_target(
+                WS, LANE, issue=ISSUE, worktree_identity=token
+            )
+        self.assertTrue(attested)  # binding filled -> the fence now passes
+        self.assertEqual(reason, "")
+
+
+class BackfillActiveBindingCasTest(unittest.TestCase):
+    """The bounded missing-field backfill CAS in isolation (Redmine #13809 residual).
+
+    Fills ONLY the empty worktree binding + declared-slot snapshot of an existing ``active``
+    issue owner row, guarded on the exact revision. It never relaxes ``declare_lane``'s "a
+    divergent re-declare must not overwrite": a non-empty mismatch, a different / non-active /
+    project-gateway row, or a revision race is zero-write.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / "home"
+        self.home.mkdir()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = LaneDeclarationStore(home=self.home)
+        self.key = LaneLifecycleKey(WS, LANE)
+        self.decision = DecisionPointer(
+            source="redmine", issue_id=ISSUE, journal_id=JOURNAL
+        )
+        self.token = "wt_lane_token"
+
+    def _pins(self, gw: str = GW_LOC, wk: str = WK_LOC) -> list:
+        return [
+            ProcessGenerationPin(
+                role=GATEWAY_ROLE, provider="codex", assigned_name="gw", locator=gw
+            ),
+            ProcessGenerationPin(
+                role=WORKER_ROLE, provider="claude", assigned_name="wk", locator=wk
+            ),
+        ]
+
+    def _seed_legacy(self) -> int:
+        out = self.store.declare_lane(self.key, decision=self.decision, issue_id=ISSUE)
+        self.assertTrue(out.applied)
+        return out.revision
+
+    def _row(self):
+        return LaneLifecycleStore(home=self.home).get(self.key)
+
+    def test_fills_missing_worktree_and_pins(self) -> None:
+        rev = self._seed_legacy()
+        self.assertEqual(self._row().worktree_identity, "")
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=rev,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertTrue(out.applied)
+        self.assertEqual(out.revision, rev + 1)
+        row = self._row()
+        self.assertEqual(row.worktree_identity, self.token)
+        self.assertEqual(
+            sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
+        )
+        self.assertEqual(row.lane_disposition, DISPOSITION_ACTIVE)  # untouched
+        self.assertEqual(row.issue_id, ISSUE)
+
+    def test_exact_backfill_is_idempotent_no_op(self) -> None:
+        rev = self._seed_legacy()
+        first = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=rev,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        second = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=first.revision,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertTrue(second.applied)
+        self.assertEqual(second.revision, first.revision)  # no re-write
+        self.assertEqual(self._row().revision, first.revision)
+
+    def test_revision_race_is_zero_write(self) -> None:
+        rev = self._seed_legacy()
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=rev + 5,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_STALE_REVISION)
+        self.assertEqual(self._row().worktree_identity, "")
+
+    def test_non_empty_worktree_mismatch_is_zero_write(self) -> None:
+        out0 = self.store.declare_lane(
+            self.key,
+            decision=self.decision,
+            issue_id=ISSUE,
+            worktree_identity="wt_original",
+            declared_slots=self._pins(),
+        )
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=out0.revision,
+            issue_id=ISSUE,
+            worktree_identity="wt_different",
+            declared_slots=self._pins(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
+        self.assertEqual(self._row().worktree_identity, "wt_original")
+
+    def test_different_issue_is_zero_write(self) -> None:
+        rev = self._seed_legacy()
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=rev,
+            issue_id="99999",
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+        self.assertEqual(self._row().worktree_identity, "")
+
+    def test_non_active_disposition_is_zero_write(self) -> None:
+        rev = self._seed_legacy()
+        LaneLifecycleStore(home=self.home).transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rev,
+            target=DISPOSITION_HIBERNATED,
+            decision=self.decision,
+        )
+        row = self._row()
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=row.revision,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+        self.assertEqual(self._row().worktree_identity, "")
+
+    def test_missing_row_is_not_found(self) -> None:
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=1,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_NOT_FOUND)
+
+    def test_empty_issue_or_worktree_raises(self) -> None:
+        rev = self._seed_legacy()
+        with self.assertRaises(ValueError):
+            self.store.backfill_active_binding(
+                self.key, expected_revision=rev, issue_id="", worktree_identity=self.token
+            )
+        with self.assertRaises(ValueError):
+            self.store.backfill_active_binding(
+                self.key, expected_revision=rev, issue_id=ISSUE, worktree_identity=""
+            )
 
 
 class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):

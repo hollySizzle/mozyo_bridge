@@ -338,6 +338,19 @@ Table naming:
     - **common declaration service** (`LaneDeclarationStore.declare_lane`) が issue / project 双方を
       fail-closed に宣言する。exact duplicate は idempotent (#13809 live-adopt)、既存 owner conflict /
       別 issue-or-scope / 不読・ambiguous inventory は zero-write。bulk / implicit backfill は禁止。
+    - **bounded missing-field backfill** (`LaneDeclarationStore.backfill_active_binding`, #13809
+      residual j#78944 / j#78945)。pre-#13754 の **legacy active owner row** は issue を所有済みだが
+      `worktree_identity` が空で、`declare_lane` は live worktree を divergent re-declare と読んで
+      拒否し、`retire --execute` が恒久的に `worktree_binding_unverified` で止まる。この surface は
+      **その空 binding field (と空 `declared_slots` snapshot) だけ**を exact `expected_revision` CAS で
+      補完する。書込は「row が active / `binding_kind='issue'` / この exact issue を所有 / project scope
+      無し」かつ「`worktree_identity` が空」かつ「revision 一致」の全条件成立時のみ。既に bound な worktree
+      への **non-empty mismatch は上書きせず** zero-write (`already_declared`)、exact match は idempotent
+      no-op、別 issue / non-active disposition は `unexpected_state`、revision race は `stale_revision`。
+      `declare_lane` の「divergent re-declare は上書き禁止」を一般的に緩める surface ではなく、欠落 field
+      専用。live-adopt path は `declare_lane` 拒否時にのみこの CAS を試み、成功を `backfilled` として
+      rowless declaration (`declared`) と区別して伝播する。disposition / generation / release /
+      replacement / decision anchor は不変。
     - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。

@@ -213,6 +213,140 @@ class LaneDeclarationStore:
         finally:
             conn.close()
 
+    def backfill_active_binding(
+        self,
+        key: LaneLifecycleKey,
+        *,
+        expected_revision: int,
+        issue_id: str,
+        worktree_identity: str,
+        declared_slots: Sequence[ProcessGenerationPin] = (),
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Fill the MISSING binding of an existing ``active`` issue owner row (Redmine #13809).
+
+        The bounded residual companion to :meth:`declare_lane`, for the measured live-adopt
+        gap (j#78944 / j#78945): a **pre-#13754 legacy** owner row is already ``active`` and
+        already owns its issue, but its ``worktree_identity`` is empty — so ``declare_lane``
+        treats the live adopt as a *divergent* re-declare (worktree differs) and refuses
+        zero-write, and ``retire --execute`` stays permanently blocked on
+        ``worktree_binding_unverified``. This surface fills that one empty field (and the
+        empty ``declared_slots`` snapshot) via an exact ``expected_revision`` CAS, so the
+        gate-verified live worktree + typed pins land on the row the lane already owns.
+
+        Deliberately **not** a relaxation of ``declare_lane``'s "a divergent re-declare must
+        not overwrite" (the tombstone-reviving ``lane_metadata.upsert`` anti-pattern the
+        component exists to prevent). It writes ONLY when every check holds:
+
+        - the row exists, is ``active``, is an ``issue`` binding, owns **this exact** issue,
+          and owns no project scope — otherwise :data:`CAS_UNEXPECTED_STATE` (a non-active
+          disposition, a different / project-gateway binding, or a *different issue* is
+          zero-write, never coerced);
+        - its ``worktree_identity`` is **empty** (the gap). A row already bound to a
+          worktree is never overwritten: an exact match (same worktree + same slots) is an
+          idempotent no-op success, and any *non-empty* divergence is :data:`CAS_ALREADY_DECLARED`
+          zero-write. A non-empty ``declared_slots`` that differs is likewise refused — the
+          missing-field surface fills a gap, it never edits an existing snapshot;
+        - the caller's ``expected_revision`` still matches — a concurrent write that moved
+          the row loses :data:`CAS_STALE_REVISION` rather than clobbering the newer state.
+
+        The lane's disposition / generation / release / replacement / decision anchor are
+        untouched; only the empty binding fields are filled. ``issue_id`` and
+        ``worktree_identity`` are required non-empty (this surface only backfills a bound
+        issue lane's worktree identity, never guesses one).
+        """
+        issue = norm(issue_id)
+        worktree = norm(worktree_identity)
+        if not issue:
+            raise ValueError(
+                "a binding backfill requires the exact issue the row must already own"
+            )
+        if not worktree:
+            raise ValueError(
+                "a binding backfill requires a non-empty canonical worktree identity"
+            )
+        pinned = validate_declared_slots(tuple(declared_slots))
+        encoded_slots = encode_declared_slots(pinned)
+        stamp = now or _utc_now()
+        conn = self._lifecycle._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _locked_row(conn, key)
+            if current is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.revision != expected_revision:
+                # A concurrent declare / transition moved the row; never clobber it.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=CAS_STALE_REVISION, revision=current.revision
+                )
+            if (
+                current.lane_disposition != DISPOSITION_ACTIVE
+                or norm(current.binding_kind) != BINDING_KIND_ISSUE
+                or current.issue_id != issue
+                or current.project_scope
+            ):
+                # Only an active issue lane that already owns THIS exact issue is a backfill
+                # target: a non-active disposition, a project-gateway binding, or a different
+                # issue is a genuinely different row, refused zero-write (never coerced).
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_UNEXPECTED_STATE,
+                    revision=current.revision,
+                )
+            if current.worktree_identity:
+                # The row is already bound. Fill nothing: an exact match is an idempotent
+                # no-op, any non-empty divergence is a conflict declare_lane already refuses.
+                if (
+                    current.worktree_identity == worktree
+                    and current.declared_slots == encoded_slots
+                ):
+                    conn.execute("ROLLBACK")
+                    return CasOutcome(
+                        applied=True, reason=CAS_APPLIED, revision=current.revision
+                    )
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_ALREADY_DECLARED,
+                    revision=current.revision,
+                )
+            if current.declared_slots and current.declared_slots != encoded_slots:
+                # The worktree is missing but a divergent slot snapshot already exists: this
+                # is not a clean legacy gap, so it is not silently overwritten either.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_ALREADY_DECLARED,
+                    revision=current.revision,
+                )
+            revision = current.revision + 1
+            conn.execute(
+                f"UPDATE {_TABLE} SET worktree_identity = ?, declared_slots = ?, "
+                "revision = ?, updated_at = ? "
+                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
+                (
+                    worktree,
+                    encoded_slots,
+                    revision,
+                    stamp,
+                    key.repo_workspace_id,
+                    key.lane_id,
+                    current.revision,
+                ),
+            )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise LaneLifecycleError(
+                f"lane binding backfill failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
     def open_next_generation(
         self,
         key: LaneLifecycleKey,
