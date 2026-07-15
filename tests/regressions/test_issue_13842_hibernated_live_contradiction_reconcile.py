@@ -92,6 +92,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECON_LIVE_PAIR_ABSENT,
     RECON_LIVE_PAIR_PRESENT,
     RECON_NOT_RECONCILABLE_STATE,
+    RECON_PAIR_CHANGED,
+    RECON_REVISION_RACE,
     RECON_WORKTREE_BRANCH_MISMATCH,
     run_hibernated_live_reconcile,
 )
@@ -231,7 +233,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
     def _seed(self, **kwargs) -> None:
         _seed_hibernated_released(self.store, key=self.key, **kwargs)
 
-    def _do(self, *, expected_revision=None, issue=_ISSUE, token=None, pins=None):
+    def _do(self, *, expected_revision=None, issue=_ISSUE, token=None, pins=None, decision=None):
         rec = self.store.get(self.key)
         rev = expected_revision if expected_revision is not None else (
             rec.revision if rec is not None else 1
@@ -242,6 +244,7 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             issue_id=issue,
             worktree_identity=token if token is not None else self.token,
             declared_slots=pins if pins is not None else _pins(),
+            decision=decision if decision is not None else _decision(issue),
         )
 
     def test_exact_signature_rebinds_binding_and_slots(self) -> None:
@@ -269,9 +272,27 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self.token,
             declared_slots=_pins(),
+            decision=_decision(),
         )
         self.assertTrue(second.applied)
         self.assertEqual(second.revision, rec.revision)
+
+    def test_rebind_writes_reconcile_decision_provenance(self) -> None:
+        # Review j#79244 F1: the rebind re-anchors the row decision to THIS reconcile so a
+        # #13809 backfill row (same worktree + slots, different decision) is distinguishable.
+        self._seed()  # seeded decision journal is _JOURNAL
+        out = self.rebind.rebind_released_hibernated_legacy(
+            self.key,
+            expected_revision=self.store.get(self.key).revision,
+            issue_id=_ISSUE,
+            worktree_identity=self.token,
+            declared_slots=_pins(),
+            decision=DecisionPointer(source="redmine", issue_id=_ISSUE, journal_id="70001"),
+        )
+        self.assertTrue(out.applied)
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.decision_journal, "70001")
+        self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
 
     def test_non_empty_different_worktree_is_already_declared(self) -> None:
         self._seed(worktree_identity="wt_0000000000000000")
@@ -354,18 +375,36 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self.token,
             declared_slots=_pins(),
+            decision=_decision(),
         )
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_NOT_FOUND)
 
     def test_empty_inputs_raise(self) -> None:
         self._seed()
+        rev = self.store.get(self.key).revision
         with self.assertRaises(ValueError):
-            self._do(issue="")
+            self.rebind.rebind_released_hibernated_legacy(
+                self.key, expected_revision=rev, issue_id="",
+                worktree_identity=self.token, declared_slots=_pins(), decision=_decision(),
+            )
         with self.assertRaises(ValueError):
-            self._do(token="")
+            self.rebind.rebind_released_hibernated_legacy(
+                self.key, expected_revision=rev, issue_id=_ISSUE,
+                worktree_identity="", declared_slots=_pins(), decision=_decision(),
+            )
         with self.assertRaises(ValueError):
-            self._do(pins=[])
+            self.rebind.rebind_released_hibernated_legacy(
+                self.key, expected_revision=rev, issue_id=_ISSUE,
+                worktree_identity=self.token, declared_slots=[], decision=_decision(),
+            )
+        with self.assertRaises(Exception):
+            # A decision anchored to a different issue cannot authorize this binding.
+            self.rebind.rebind_released_hibernated_legacy(
+                self.key, expected_revision=rev, issue_id=_ISSUE,
+                worktree_identity=self.token, declared_slots=_pins(),
+                decision=_decision(_OTHER_ISSUE),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +558,13 @@ def _init_repo(root: Path, *, anchor: bool) -> None:
 
 
 class _FakeReconcileOps:
-    """Injected observation ops: reads the shared fake inventory; drives per-slot facts."""
+    """Injected observation ops: reads the shared fake inventory; drives per-slot facts.
+
+    ``rows_by_call`` overrides the rows returned for a specific ``agent_rows`` call index
+    (call 0 = initial observation, call 1 = close-time re-observation) so a TOCTOU change
+    between the two reads can be exercised. ``on_call`` fires a side-effect hook before a
+    given call returns (used to inject a concurrent lifecycle race).
+    """
 
     def __init__(
         self,
@@ -529,15 +574,29 @@ class _FakeReconcileOps:
         readable: bool = True,
         has_pending=False,
         attest: bool = True,
+        rows_by_call=None,
+        on_call=None,
     ) -> None:
         self._rows_ref = rows_ref
         self._runtime = runtime
         self._readable = readable
         self._has_pending = has_pending
         self._attest = attest
+        self._rows_by_call = rows_by_call or {}
+        self._on_call = on_call or {}
+        self._call = 0
+        self._last_rows: list = []
 
     def agent_rows(self):
-        return list(self._rows_ref())
+        index = self._call
+        self._call += 1
+        if index in self._on_call:
+            self._on_call[index]()
+        if index in self._rows_by_call:
+            self._last_rows = list(self._rows_by_call[index]())
+        else:
+            self._last_rows = list(self._rows_ref())
+        return list(self._last_rows)
 
     def runtime_state(self, locator: str) -> str:
         return self._runtime
@@ -548,7 +607,10 @@ class _FakeReconcileOps:
     def read_attestation(self, assigned_name: str):
         if not self._attest:
             return None
-        for row in self._rows_ref():
+        # Attest against the MOST RECENTLY observed inventory so a recycled slot at a new
+        # locator reads generation-matched (its record.locator tracks the live locator) — this
+        # lets the pair_changed (locator-diff) path be exercised apart from stale attestation.
+        for row in (self._last_rows or list(self._rows_ref())):
             if row.get("name") == assigned_name:
                 decode = decode_assigned_name(assigned_name)
                 if not decode.ok:
@@ -699,6 +761,7 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=self._token(),
             declared_slots=_pins(),
+            decision=_decision(),  # THIS reconcile's decision (provenance)
         )
         # The pair was already closed -> remove it from the inventory (positive absence).
         self.rows = [r for r in self.rows if r["pane_id"] in ("w28:p1", "w28:p2")]
@@ -706,6 +769,95 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         result = self._run()
         self.assertEqual(result.state, RECONCILE_RECONCILED, result.detail)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+
+    def test_owed_state_requires_reconcile_decision_provenance(self) -> None:
+        # Review j#79244 F1: a row bound with a DIFFERENT decision (a #13809 backfill's declare/
+        # hibernate journal) whose pair is absent is NOT the reconcile's owed state — the shared
+        # worktree + declared_slots fields alone are not authority. Route to #13841 instead.
+        self._seed_row()
+        rec = LaneLifecycleStore().get(self._key())
+        LaneReconcileBindingStore().rebind_released_hibernated_legacy(
+            self._key(),
+            expected_revision=rec.revision,
+            issue_id=_ISSUE,
+            worktree_identity=self._token(),
+            declared_slots=_pins(),
+            decision=DecisionPointer(source="redmine", issue_id=_ISSUE, journal_id="70002"),
+        )
+        self.rows = [r for r in self.rows if r["pane_id"] in ("w28:p1", "w28:p2")]
+        # Reconcile runs with --journal=_JOURNAL (79188) != the row's decision (70002).
+        result = self._run()
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_LIVE_PAIR_ABSENT)
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_close_time_duplicate_zero_closes(self) -> None:
+        # Review j#79244 F2: a duplicate codex appears at a NEW locator between the initial green
+        # observation and the close. The close-time re-verification must zero-close (ambiguous),
+        # never a name-based sweep of both locators.
+        self._seed_row()
+        base = list(self.rows)
+        dup = base + [_row(_WORKSPACE_ID, "codex", _LANE, "w28:p30")]
+        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={1: lambda: dup})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_PAIR_AMBIGUOUS)
+        # Nothing closed; the row is bound (rebind applied) but still hibernated.
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual(len(self.rows), 4)
+
+    def test_close_time_recycled_locator_zero_closes(self) -> None:
+        # Review j#79244 F2: the pair is recycled to a NEW locator generation between observation
+        # and close (still a clean unique pair). Zero-close — the reconcile only closes the exact
+        # pins it verified, never a newer generation.
+        self._seed_row()
+        recycled = [
+            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
+            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p31"),  # recycled locator
+            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p4"),
+        ]
+        ops = _FakeReconcileOps(lambda: self.rows, rows_by_call={1: lambda: recycled})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_PAIR_CHANGED)
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_terminal_retire_is_revision_race_after_concurrent_rehydrate(self) -> None:
+        # Review j#79244 F3: a concurrent rehydrate (hibernated -> active) bumps the row revision
+        # after the reconcile snapshot it. The terminal retire is CAS'd on the EXACT verified
+        # revision, so it refuses (revision_race) rather than retiring the newer active row.
+        self._seed_row()
+        rec = LaneLifecycleStore().get(self._key())
+        LaneReconcileBindingStore().rebind_released_hibernated_legacy(
+            self._key(),
+            expected_revision=rec.revision,
+            issue_id=_ISSUE,
+            worktree_identity=self._token(),
+            declared_slots=_pins(),
+            decision=_decision(),
+        )
+        # Owed state; pair absent. Inject a rehydrate on the reconcile's inventory read, AFTER it
+        # has snapshotted the (hibernated) row but BEFORE the terminal CAS.
+        self.rows = [r for r in self.rows if r["pane_id"] in ("w28:p1", "w28:p2")]
+
+        def _rehydrate():
+            store = LaneLifecycleStore()
+            cur = store.get(self._key())
+            store.transition_disposition(
+                self._key(),
+                expected_disposition=DISPOSITION_HIBERNATED,
+                expected_revision=cur.revision,
+                target=DISPOSITION_ACTIVE,
+                decision=_decision(),
+            )
+
+        ops = _FakeReconcileOps(lambda: self.rows, on_call={0: _rehydrate})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_REVISION_RACE)
+        # The lane was rehydrated, NOT retired.
+        self.assertEqual(self._disposition(), DISPOSITION_ACTIVE)
 
     # -- the fail-closed conditions --------------------------------------
 

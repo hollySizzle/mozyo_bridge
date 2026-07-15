@@ -49,6 +49,8 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DISPOSITION_HIBERNATED,
     RELEASE_RELEASED,
     CasOutcome,
+    DecisionPointer,
+    DecisionPointerError,
     LaneLifecycleKey,
     ProcessGenerationPin,
     encode_declared_slots,
@@ -85,15 +87,28 @@ class LaneReconcileBindingStore:
         issue_id: str,
         worktree_identity: str,
         declared_slots: Sequence[ProcessGenerationPin],
+        decision: DecisionPointer,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Fill the MISSING binding of a hibernated / released legacy owner row, or fail closed.
 
-        Writes ONLY the empty ``worktree_identity`` + ``declared_slots`` binding fields, and
-        ONLY when every part of the exact reconcilable signature holds — so an active /
-        superseded / retired row, an unproven / in-flight release, a receiver replacement in
-        flight, a different issue / binding, an already-bound-to-a-*different*-token row, or a
-        concurrent write never rebinds:
+        Writes the empty ``worktree_identity`` + ``declared_slots`` binding fields **plus the
+        reconcile's own ``decision`` anchor** (Redmine #13842 review j#79244 F1), and ONLY when
+        every part of the exact reconcilable signature holds — so an active / superseded /
+        retired row, an unproven / in-flight release, a receiver replacement in flight, a
+        different issue / binding, an already-bound-to-a-*different*-token row, or a concurrent
+        write never rebinds:
+
+        The ``decision`` anchor is the reconcile-specific **provenance** the caller's owed-state
+        resume keys on: a #13809 ``backfill_active_binding`` row carries the SAME
+        ``worktree_identity`` + ``declared_slots`` shape but its decision names the declare /
+        hibernate journal, NOT this reconcile's, so recording the reconcile decision here — in
+        the SAME atomic CAS that establishes the binding, leaving no window between the rebind
+        and its provenance — lets a positive-absence resume tell "this reconcile rebound and
+        owes a retirement" apart from "a pre-existing bound row whose pair happens to be gone"
+        (review j#79244 F1). It is deliberately NOT the #13809 backfill's "fill a gap, do not
+        touch authority" posture: the reconcile rebind IS a deliberate owner-authorized step of
+        a retire flow, so it re-anchors the decision to the record that authorized it.
 
         - the row exists (:data:`CAS_NOT_FOUND`) and its ``expected_revision`` still matches
           (:data:`CAS_STALE_REVISION` — a concurrent declare / transition that moved the row
@@ -114,11 +129,12 @@ class LaneReconcileBindingStore:
           present is an idempotent no-op success (the replayable reconcile flow re-runs this
           without a second write); otherwise the empty field(s) are filled.
 
-        Deliberately mutates NO disposition, release, replacement, generation, or decision
-        anchor — the row stays ``hibernated`` and the subsequent #13754 guarded close moves it
-        to ``retired``. ``issue_id`` and ``worktree_identity`` are required non-empty (this
-        surface only rebinds a bound issue lane's binding, never guesses one), and the
-        ``declared_slots`` set records the exact live pair the reconcile committed to closing.
+        Deliberately mutates NO disposition, release, replacement, or generation — the row
+        stays ``hibernated`` and the subsequent revision-guarded retire CAS moves it to
+        ``retired``. It DOES re-anchor the decision (provenance, above). ``issue_id`` and
+        ``worktree_identity`` are required non-empty (this surface only rebinds a bound issue
+        lane's binding, never guesses one), and the ``declared_slots`` set records the exact
+        live pair the reconcile committed to closing.
         """
         issue = norm(issue_id)
         worktree = norm(worktree_identity)
@@ -131,6 +147,11 @@ class LaneReconcileBindingStore:
             raise ValueError(
                 "a hibernated legacy reconcile rebind requires a non-empty canonical "
                 "worktree identity"
+            )
+        if not decision.authorizes_binding(issue):
+            raise DecisionPointerError(
+                f"decision is anchored to issue {decision.issue_id!r} but the reconcile "
+                f"rebind targets a lane bound to {issue!r}"
             )
         # An unusable declared slot (missing identity / evidence) or a duplicate slot fails
         # here, never stored (the ProcessGenerationPin discipline). The reconcile always
@@ -206,10 +227,13 @@ class LaneReconcileBindingStore:
             if (
                 current.worktree_identity == worktree
                 and current.declared_slots == encoded_slots
+                and current.decision_source == decision.source
+                and current.decision_issue_id == decision.issue_id
+                and current.decision_journal == decision.journal_id
             ):
-                # Nothing missing: both fields are already exactly present -> idempotent no-op.
-                # The replayable reconcile flow (a crash after the rebind commit) re-runs this
-                # and resumes without a second write.
+                # Nothing to change: the binding AND the reconcile decision anchor are already
+                # exactly present -> idempotent no-op. The replayable reconcile flow (a crash
+                # after the rebind commit) re-runs this and resumes without a second write.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=True, reason=CAS_APPLIED, revision=current.revision
@@ -217,11 +241,15 @@ class LaneReconcileBindingStore:
             revision = current.revision + 1
             conn.execute(
                 f"UPDATE {_TABLE} SET worktree_identity = ?, declared_slots = ?, "
+                "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                 "revision = ?, updated_at = ? "
                 "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
                 (
                     worktree,
                     encoded_slots,
+                    decision.source,
+                    decision.issue_id,
+                    decision.journal_id,
                     revision,
                     stamp,
                     key.repo_workspace_id,
