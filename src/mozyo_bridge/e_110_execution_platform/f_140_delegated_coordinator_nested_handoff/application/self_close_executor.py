@@ -12,13 +12,17 @@ by reusing the tranche B actuator's :meth:`...ReplacementActuatorUseCase.drive_s
 re-authentication, and CAS discipline apply — the old generation is closed, the fresh
 coordinator launched + attested).
 
-The self-specific seals are re-observed **at the destructive-close boundary**, not once
-early (Redmine #13806 R1-F1): a :class:`_SelfSealAwareActuatorPort` re-runs
-:func:`decide_self_close` inside the self participant's ``observe_preservation`` — the last
-observation the tranche B close path makes right before the close — so a seal that regresses
-(a pending composer appearing, a turn resuming) folds into a fail-closed preservation block
-with zero close. This reuses the tranche B close path and its preservation gate; there is no
-second close primitive.
+The self-specific seals are re-observed **at the exact destructive-close call site**, not
+once early (Redmine #13806 R1-F1 / R2-F1): a :class:`_SelfSealAwareActuatorPort` re-runs
+:func:`decide_self_close` inside the self participant's ``close_exact_generation`` — reached
+by the tranche B close path AFTER its ``observe_preservation`` and its ``_reauth_before_effect``
+(lease re-auth), immediately before the inner close. A seal that regresses (a pending composer
+appearing, a turn resuming) anywhere up to that point makes the wrapper REFUSE the close
+(return :data:`...replacement_actuation.CLOSE_ERROR`), so the tranche B close path leaves the
+participant ``close_owed`` with zero close and the failing seal surfaced. The guard is at the
+close call site — not at ``observe_preservation``, which would leave the observe→close window
+open (the R2-F1 residual). This reuses the tranche B close path; there is no second close
+primitive.
 
 It performs NO fresh-coordinator claim: after the self is ``replaced`` and the lease
 released, a fresh action-attested coordinator claims and drains
