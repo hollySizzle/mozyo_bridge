@@ -48,8 +48,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADOPT_DECL_NO_ANCHOR,
     ADOPT_DECL_NOT_ADOPTED,
     ADOPT_DECL_OWNER_CONFLICT,
+    ADOPT_DECL_OWNER_UNBOUND,
     ADOPT_DECL_STALE_SLOT,
     ADOPT_DECL_UNATTESTED,
+    ADOPT_DECL_UNREADABLE,
     ADOPT_DECL_UNRESOLVED_UNIT,
     declare_adopted_owner_row,
 )
@@ -64,6 +66,7 @@ JOURNAL = "78400"
 PROVIDERS = ("codex", "claude")
 GW_LOC = "w1:pG"
 WK_LOC = "w1:pW"
+ATTESTED_AT = "2026-07-15T00:00:00+00:00"
 
 
 def _row(provider: str, locator: str, *, stale: bool = False) -> dict:
@@ -98,7 +101,7 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
                 lane_id=LANE,
                 locator=locator,
                 verdict=VERDICT_PRESENT,
-                observed_at="2026-07-15T00:00:00+00:00",
+                observed_at=ATTESTED_AT,
             )
         )
 
@@ -143,7 +146,23 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
         # R3-F1: the typed live pins are stored (locators enter the identity).
         locators = sorted(p.locator for p in row.declared_pins)
         self.assertEqual(locators, sorted([GW_LOC, WK_LOC]))
+        # R4-F1: runtime_revision is empty (no herdr runtime surface), but the verified
+        # attestation's observed_at is stored as attested_at (real evidence, not discarded).
         self.assertTrue(all(p.runtime_revision == "" for p in row.declared_pins))
+        self.assertTrue(all(p.attested_at == ATTESTED_AT for p in row.declared_pins))
+
+    def test_raw_live_plus_stale_duplicate_is_zero_write(self) -> None:
+        # R4-F2 / herdr-native-identity §3.4: a duplicate assigned name is multiple_matches
+        # fail-closed EVEN when one row is live and the other a locator-bearing stale residue
+        # (the multiplicity is raw, checked before the liveness filter).
+        self._attest_pair()
+        rows = [
+            _row("codex", GW_LOC),
+            _row("codex", "w9:pSTALE", stale=True),  # same name, stale residue
+            _row("claude", WK_LOC),
+        ]
+        self.assertEqual(self._call(rows), ADOPT_DECL_DUPLICATE_CANDIDATES)
+        self.assertEqual(self._owner().status, OWNER_ABSENT)
 
     def test_same_live_pair_is_idempotent(self) -> None:
         self._attest_pair()
@@ -248,7 +267,7 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
                 IdentityAttestationRecord(
                     assigned_name=encode_assigned_name(WS, provider, LANE),
                     workspace_id=WS, role=provider, lane_id=LANE, locator=loc,
-                    verdict=VERDICT_PRESENT, observed_at="2026-07-15T00:00:00+00:00",
+                    verdict=VERDICT_PRESENT, observed_at=ATTESTED_AT,
                 )
             )
 
@@ -292,6 +311,46 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         # Live pair present but no attestation seeded -> unattested -> zero-write.
         self.assertEqual(self._drive(adopted=True, rows=_pair_rows()), ADOPT_DECL_UNATTESTED)
         self.assertEqual(self._owner().status, OWNER_ABSENT)
+
+    def _drive_unreadable(self, *, workspace_segment) -> str:
+        # R4-F3: the live inventory read RAISES at declaration time (herdr down). The ops
+        # adapter must fall back to an ownership read (state DB), never proceed on inference.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        ops = self._ops()
+
+        def _boom(*a, **k):
+            raise HerdrSessionStartError("herdr down")
+
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False), \
+                patch.object(type(ops), "_live_rows", _boom), \
+                patch(
+                    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_"
+                    "nested_handoff.application.sublane_actuator_herdr_ops."
+                    "herdr_workspace_segment",
+                    return_value=workspace_segment,
+                ):
+            return ops.declare_adopted_lane_lifecycle(self.worktree, adopted=True)
+
+    def test_unreadable_inventory_owner_unbound_is_a_block_token(self) -> None:
+        out = self._drive_unreadable(workspace_segment=WS)  # unbound: no prior owner row
+        self.assertEqual(out, ADOPT_DECL_UNREADABLE)
+        self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
+        self.assertEqual(self._owner().status, OWNER_ABSENT)
+
+    def test_unreadable_inventory_on_an_already_owned_lane_proceeds(self) -> None:
+        # A prior create/adopt already bound the lane: the state DB confirms ownership, so an
+        # unreadable inventory does NOT block (the #13809 blocker is only the rowless case).
+        LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+        )
+        out = self._drive_unreadable(workspace_segment=WS)
+        self.assertEqual(out, ADOPT_DECL_ALREADY_OWNED)
+        self.assertNotIn(out, ADOPT_DECL_OWNER_UNBOUND)
 
 
 if __name__ == "__main__":

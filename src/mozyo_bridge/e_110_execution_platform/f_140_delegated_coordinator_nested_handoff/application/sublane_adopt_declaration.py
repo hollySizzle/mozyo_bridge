@@ -113,6 +113,8 @@ ADOPT_DECL_DECLARE_ERROR = "declare_error"
 #: last would refuse legitimate journal-less create/adopt flows, not close the #13809 gap.
 ADOPT_DECL_OWNER_UNBOUND = frozenset(
     {
+        ADOPT_DECL_UNREADABLE,
+        ADOPT_DECL_UNRESOLVED_UNIT,
         ADOPT_DECL_INCOMPLETE_PAIR,
         ADOPT_DECL_DUPLICATE_CANDIDATES,
         ADOPT_DECL_STALE_SLOT,
@@ -167,13 +169,15 @@ def _resolve_attested_slot(
     workspace_id: str,
     lane_id: str,
     provider: str,
+    role: str,
     attestation_store,
-) -> tuple[Optional[str], str]:
-    """Resolve ONE provider's live, attested slot from the RAW rows, or a zero-write reason.
+) -> tuple[Optional[ProcessGenerationPin], str]:
+    """Resolve ONE provider's live, attested slot into a typed pin, or a zero-write reason.
 
-    Returns ``(locator, "")`` on success or ``(None, reason)`` on any fail-closed condition:
-    a duplicate live candidate for the slot, a stale shell residue, a missing locator, or a
-    startup self-attestation that is not present + generation-bound to the live locator.
+    Returns ``(pin, "")`` on success or ``(None, reason)`` on any fail-closed condition: a
+    duplicate assigned name (RAW candidate multiplicity), a stale shell residue, a missing
+    locator, or a startup self-attestation that is not present + generation-bound to the
+    live locator.
     """
     want_lane = _norm_lane(lane_id)
     candidates = []
@@ -191,16 +195,18 @@ def _resolve_attested_slot(
         if identity.role != provider:
             continue
         candidates.append(row)
-    # Raw multiplicity is checked BEFORE any first-wins collapse (R3-F2): a duplicate
-    # ``mzb1`` name for one slot is an ambiguous target, not a resolved pane.
-    live = [row for row in candidates if classify_named_slot(row) == SLOT_LIVE]
-    if not live:
-        # No live candidate: either absent (incomplete pair) or every candidate was a
-        # stale residue. Distinguish so the caller can tell an incomplete pair from residue.
-        return (None, ADOPT_DECL_STALE_SLOT if candidates else ADOPT_DECL_INCOMPLETE_PAIR)
-    if len(live) > 1:
+    # RAW candidate multiplicity is checked BEFORE the liveness filter (Redmine #13810
+    # R4-F2, review j#78909 / ``herdr-native-identity.md`` §3.4 / §5): a duplicate assigned
+    # name is ``multiple_matches`` — a herdr name-uniqueness violation this never guesses
+    # past, even when one row is live and the other is a locator-bearing stale residue.
+    if len(candidates) > 1:
         return (None, ADOPT_DECL_DUPLICATE_CANDIDATES)
-    row = live[0]
+    if not candidates:
+        return (None, ADOPT_DECL_INCOMPLETE_PAIR)
+    row = candidates[0]
+    if classify_named_slot(row) != SLOT_LIVE:
+        # A locator-bearing stale shell residue is never adopted.
+        return (None, ADOPT_DECL_STALE_SLOT)
     assigned_name = _norm(row.get(AGENT_KEY_NAME))
     locator = _norm(_agent_locator(row))
     if not assigned_name or not locator:
@@ -216,7 +222,21 @@ def _resolve_attested_slot(
     if not join.ok:
         # absent / stale / missing / conflict startup self-attestation -> zero-write.
         return (None, ADOPT_DECL_UNATTESTED)
-    return (locator, "")
+    # role/provider/assigned_name/locator are the typed identity; ``attested_at`` carries the
+    # verified startup self-attestation's ``observed_at`` (real evidence, R4-F1); the herdr
+    # generation discriminant is the locator, so ``runtime_revision`` stays empty (there is
+    # no herdr runtime-version surface to observe — it is never fabricated).
+    try:
+        pin = ProcessGenerationPin(
+            role=role,
+            provider=provider,
+            assigned_name=assigned_name,
+            locator=locator,
+            attested_at=_norm(record.observed_at) if record is not None else "",
+        )
+    except ProcessPinError:
+        return (None, ADOPT_DECL_INCOMPLETE_PAIR)
+    return (pin, "")
 
 
 def declare_adopted_owner_row(
@@ -269,39 +289,21 @@ def declare_adopted_owner_row(
             (gateway_provider, GATEWAY_ROLE),
             (worker_provider, WORKER_ROLE),
         ):
-            locator, reason = _resolve_attested_slot(
+            pin, reason = _resolve_attested_slot(
                 rows=rows,
                 workspace_id=workspace,
                 lane_id=lane,
                 provider=provider,
+                role=role,
                 attestation_store=attestation_store,
             )
-            if locator is None:
+            if pin is None:
                 return reason
-            if locator in seen_locators:
+            if pin.locator in seen_locators:
                 # Two slots on one locator is an ambiguous / recycled target.
                 return ADOPT_DECL_AMBIGUOUS_LOCATORS
-            seen_locators.add(locator)
-            # role/provider/assigned_name/locator are the typed identity; runtime_revision
-            # is left empty (the herdr generation discriminant is the locator).
-            assigned_name = _norm(
-                next(
-                    row.get(AGENT_KEY_NAME)
-                    for row in rows
-                    if isinstance(row, Mapping) and _norm(_agent_locator(row)) == locator
-                )
-            )
-            try:
-                pins.append(
-                    ProcessGenerationPin(
-                        role=role,
-                        provider=provider,
-                        assigned_name=assigned_name,
-                        locator=locator,
-                    )
-                )
-            except ProcessPinError:
-                return ADOPT_DECL_INCOMPLETE_PAIR
+            seen_locators.add(pin.locator)
+            pins.append(pin)
 
         token = _worktree_token(repo_root, worktree_path, lane_label)
         if token is None:
@@ -337,9 +339,33 @@ def declare_adopted_owner_row(
     # lane is safe to dispatch even when THIS adopt could not (re-)declare typed pins (a
     # recycled generation, an unattested fake environment, a divergent re-declare) — the
     # #13809 hibernate blocker is only the genuinely rowless case.
-    if _lane_is_active_owner(store_factory, workspace, issue, lane):
+    return owner_bound_or(
+        outcome, store_factory=store_factory, workspace=workspace, issue=issue, lane=lane
+    )
+
+
+def owner_bound_or(
+    reason: str,
+    *,
+    workspace: str,
+    issue: str,
+    lane: str,
+    store_factory: Callable[[], LaneDeclarationStore] = LaneDeclarationStore,
+) -> str:
+    """``already_owned`` when ``lane`` is verified the active owner, else ``reason``.
+
+    The shared owner-bound resolution (Redmine #13810 R4-F3): a fail-closed adopt outcome —
+    including an ``unreadable_inventory`` that the ops adapter hit BEFORE this module could
+    gate — proceeds ONLY when the state DB (a separate authority from the live herdr
+    inventory) confirms this exact lane already owns the issue. It never proceeds on
+    inference: an unreadable / unresolved store, or an owner that is a different / no lane,
+    keeps ``reason`` so the caller fails closed before dispatch.
+    """
+    if _lane_is_active_owner(
+        store_factory, _norm(workspace), _norm(issue), _norm(lane)
+    ):
         return ADOPT_DECL_ALREADY_OWNED
-    return outcome
+    return reason
 
 
 def _lane_is_active_owner(
@@ -365,6 +391,7 @@ def _lane_is_active_owner(
 
 __all__ = (
     "declare_adopted_owner_row",
+    "owner_bound_or",
     "ADOPT_DECL_OWNER_UNBOUND",
     "ADOPT_DECL_ZERO_WRITE",
     "ADOPT_DECL_NOT_ADOPTED",

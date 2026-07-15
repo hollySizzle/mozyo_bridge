@@ -325,9 +325,16 @@ Table naming:
       `open_next_generation` (generation+1、release/replacement axes reset) のみ。古い generation の
       approval / pin / action id は stale として無効化される。
     - `declared_slots`。宣言時点の versioned `ProcessGenerationPin` snapshot (各 slot は
-      `role / provider / assigned_name / locator / runtime_revision / attested_at`)。`locator` 単独では
-      なく identity+evidence tuple で照合する。current liveness ではなく **観測 snapshot** であり、
-      存在確認は毎回 live inventory を読む。既存 release/replacement `ReleasePin` の後方互換 decode は維持。
+      `role / provider / assigned_name / locator / runtime_revision / attested_at`)。**required
+      identity は `role / provider / assigned_name / locator`** で、`locator` 単独ではなく
+      identity tuple で照合する。`runtime_revision` と `attested_at` は **optional evidence**
+      (#13810 R4-F1): herdr の process 世代 discriminant は **live locator** であり
+      (`herdr-native-identity.md`、startup self-attestation store は runtime version を保存しない)、
+      runtime version の観測 surface が無い場合は空とする (fabricate しない)。`attested_at` は
+      検証済み startup self-attestation の `observed_at` を保存する。observation surface を持つ
+      richer 宣言経路は runtime_revision を供給してよく `match_key` に入る。current liveness では
+      なく **観測 snapshot** であり、存在確認は毎回 live inventory を読む。既存 release/replacement
+      `ReleasePin` の後方互換 decode は維持。
     - **common declaration service** (`LaneDeclarationStore.declare_lane`) が issue / project 双方を
       fail-closed に宣言する。exact duplicate は idempotent (#13809 live-adopt)、既存 owner conflict /
       別 issue-or-scope / 不読・ambiguous inventory は zero-write。bulk / implicit backfill は禁止。

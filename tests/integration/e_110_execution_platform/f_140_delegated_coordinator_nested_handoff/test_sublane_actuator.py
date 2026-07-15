@@ -455,22 +455,26 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertNotIn("create_worktree", ops._names())
 
     def test_adopt_owner_unbound_blocks_before_dispatch(self):
-        # Redmine #13809 R3-F3: a live adopt whose owner declaration is refused by a
-        # fail-closed condition (here, an unattested live pair) fails closed BEFORE dispatch
-        # rather than reporting a false success while the lane stays owner-unbound.
+        # Redmine #13809 R3-F3 / R4-F3: a live adopt whose owner declaration is refused by a
+        # fail-closed condition — an unattested live pair, OR an inventory that became
+        # unreadable at declaration time (after the lane was confirmed) — fails closed BEFORE
+        # dispatch rather than reporting a false success while the lane stays owner-unbound.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
             ADOPT_DECL_UNATTESTED,
+            ADOPT_DECL_UNREADABLE,
         )
 
-        ops = FakeActuatorOps(
-            git=True, worktree_exists=True, lanes=[_lane()],
-            adopt_outcome=ADOPT_DECL_UNATTESTED,
-        )
-        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
-        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
-        self.assertIn(REASON_ADOPT_OWNER_UNBOUND, outcome.blocked_reasons)
-        self.assertIn("owner-unbound", outcome.reason)
-        self.assertNotIn("dispatch", ops._names())  # no dispatch to an unbound lane
+        for token in (ADOPT_DECL_UNATTESTED, ADOPT_DECL_UNREADABLE):
+            with self.subTest(token=token):
+                ops = FakeActuatorOps(
+                    git=True, worktree_exists=True, lanes=[_lane()],
+                    adopt_outcome=token,
+                )
+                outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+                self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+                self.assertIn(REASON_ADOPT_OWNER_UNBOUND, outcome.blocked_reasons)
+                self.assertIn("owner-unbound", outcome.reason)
+                self.assertNotIn("dispatch", ops._names())  # no dispatch to an unbound lane
 
     def test_adopt_owner_unbound_by_design_still_proceeds(self):
         # An owner-unbound-BY-DESIGN outcome (a journal-less adopt: no anchor to declare) is

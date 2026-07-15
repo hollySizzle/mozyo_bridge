@@ -523,6 +523,7 @@ class HerdrSublaneActuatorOps:
             ADOPT_DECL_NOT_ADOPTED,
             ADOPT_DECL_UNREADABLE,
             declare_adopted_owner_row,
+            owner_bound_or,
         )
 
         if not adopted:
@@ -530,7 +531,10 @@ class HerdrSublaneActuatorOps:
         try:
             rows = self._live_rows()
         except HerdrSessionStartError:
-            return ADOPT_DECL_UNREADABLE  # inventory unreadable -> owner-unbound
+            # Inventory unreadable at declaration time (herdr down / unconfigured binary):
+            # owner-unbound UNLESS the state DB (separate authority) confirms this lane
+            # already owns the issue. Never proceed on inference (Redmine #13810 R4-F3).
+            return self._adopt_unreadable_outcome()
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
             WorkflowProviderUnresolved,
         )
@@ -538,7 +542,7 @@ class HerdrSublaneActuatorOps:
         try:
             providers = self._launch_providers()
         except WorkflowProviderUnresolved:
-            return ADOPT_DECL_UNREADABLE
+            return self._adopt_unreadable_outcome()
         workspace_id, lane_id, _slots = self._resolve_lane_slots(
             worktree_path, rows, providers
         )
@@ -560,6 +564,31 @@ class HerdrSublaneActuatorOps:
                 file=sys.stderr,
             )
         return outcome
+
+    def _adopt_unreadable_outcome(self) -> str:
+        """The adopt outcome when the live inventory could not be read at declaration time.
+
+        Redmine #13810 R4-F3: an unreadable inventory / unresolved provider pair leaves the
+        lane owner-unbound and must block dispatch — UNLESS the state DB (a separate
+        authority from the live herdr inventory) confirms this lane already owns the issue.
+        The ownership read is keyed on the SAME ``herdr_workspace_segment(self.repo_root)`` /
+        ``lane_label`` unit the create-path declaration used.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_UNREADABLE,
+            owner_bound_or,
+        )
+
+        try:
+            workspace = herdr_workspace_segment(self.repo_root)
+        except (OSError, ValueError):
+            workspace = ""
+        return owner_bound_or(
+            ADOPT_DECL_UNREADABLE,
+            workspace=workspace,
+            issue=self.issue or "",
+            lane=self.lane_label or "",
+        )
 
     def heal_lane_column(self, worktree_path: str) -> None:
         """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).
