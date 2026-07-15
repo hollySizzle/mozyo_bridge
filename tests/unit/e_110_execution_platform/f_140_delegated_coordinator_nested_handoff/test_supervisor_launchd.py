@@ -9,7 +9,9 @@ pin the Phase B1 safety boundary —
 - structured launchctl argv (bootout-then-bootstrap install, kickstart -k restart, exact-file
   uninstall), idempotent install;
 - fail-closed **zero-mutation** refusals: non-darwin host, missing executable, and the Redmine
-  credential matrix (missing / incomplete / unsafe-malformed / ready);
+  credential matrix — where readiness is **daemon-effective** (the home-scoped credential file the
+  launchd agent will actually see; an installer's shell env can never make it ``ready`` — review
+  j#79059 F1);
 - a redacted status projection (booleans / counts / fixed tokens; no secret, no path);
 
 without touching the host. Live launchd operation is a separate coordinator gate (never here).
@@ -19,7 +21,6 @@ from __future__ import annotations
 
 import os
 import plistlib
-import stat
 import sys
 import tempfile
 import unittest
@@ -40,7 +41,23 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
     credentials_path,
 )
 
-READY_ENV = {API_KEY_ENV: "secret-key-value", BASE_URL_ENV: "https://redmine.example.test"}
+#: A shell env that WOULD look ready on the interactive path — but the launchd daemon never sees it.
+SHELL_ENV = {API_KEY_ENV: "shell-key-value", BASE_URL_ENV: "https://redmine.shell.test"}
+
+
+def _write_home_credential(home: Path, *, api_key="home-key", url="https://redmine.example.test",
+                           mode=0o600) -> Path:
+    """Write a home-scoped `redmine-credentials.yaml` — the daemon-trusted delivery path."""
+    cred = credentials_path(home)
+    cred.parent.mkdir(parents=True, exist_ok=True)
+    body = "redmine:\n"
+    if api_key is not None:
+        body += f"  api_key: {api_key}\n"
+    if url is not None:
+        body += f"  url: {url}\n"
+    cred.write_text(body, encoding="utf-8")
+    os.chmod(cred, mode)
+    return cred
 
 
 def _result(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -143,54 +160,42 @@ class CredentialReadinessTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
 
-    def test_ready_when_key_and_url_present(self) -> None:
-        self.assertEqual(
-            sl.CREDENTIAL_READY,
-            sl.classify_credential_readiness(home=self.home, environ=READY_ENV),
-        )
+    def test_ready_only_from_secure_home_credential_file(self) -> None:
+        _write_home_credential(self.home)
+        self.assertEqual(sl.CREDENTIAL_READY, sl.classify_credential_readiness(home=self.home))
 
-    def test_incomplete_when_only_key(self) -> None:
-        self.assertEqual(
-            sl.CREDENTIAL_INCOMPLETE,
-            sl.classify_credential_readiness(home=self.home, environ={API_KEY_ENV: "k"}),
-        )
+    def test_env_only_is_not_ready_daemon_never_sees_shell_env(self) -> None:
+        # The F1 regression guard: shell env with key+URL but no home file must NOT be ready,
+        # because the launchd agent (no EnvironmentVariables in its plist) never inherits it.
+        with patch.dict("os.environ", SHELL_ENV, clear=False):
+            self.assertEqual(sl.CREDENTIAL_MISSING, sl.classify_credential_readiness(home=self.home))
+
+    def test_incomplete_when_home_file_has_only_key(self) -> None:
+        _write_home_credential(self.home, url=None)
+        self.assertEqual(sl.CREDENTIAL_INCOMPLETE, sl.classify_credential_readiness(home=self.home))
 
     def test_missing_when_nothing_configured(self) -> None:
-        self.assertEqual(
-            sl.CREDENTIAL_MISSING,
-            sl.classify_credential_readiness(home=self.home, environ={}),
-        )
+        self.assertEqual(sl.CREDENTIAL_MISSING, sl.classify_credential_readiness(home=self.home))
 
     def test_unsafe_when_home_credential_file_is_malformed(self) -> None:
         cred = credentials_path(self.home)
         cred.parent.mkdir(parents=True, exist_ok=True)
         cred.write_text("- not\n- a mapping\n", encoding="utf-8")
         os.chmod(cred, 0o600)
-        self.assertEqual(
-            sl.CREDENTIAL_UNSAFE,
-            sl.classify_credential_readiness(home=self.home, environ={}),
-        )
+        self.assertEqual(sl.CREDENTIAL_UNSAFE, sl.classify_credential_readiness(home=self.home))
 
     def test_unsafe_when_home_credential_file_has_loose_permissions(self) -> None:
         if not hasattr(os, "getuid"):
             self.skipTest("POSIX-only permission gate")
-        cred = credentials_path(self.home)
-        cred.parent.mkdir(parents=True, exist_ok=True)
-        cred.write_text("redmine:\n  api_key: k\n  url: https://r.example\n", encoding="utf-8")
-        os.chmod(cred, 0o644)  # group/other readable -> fail-closed
-        self.assertEqual(
-            sl.CREDENTIAL_UNSAFE,
-            sl.classify_credential_readiness(home=self.home, environ={}),
-        )
+        _write_home_credential(self.home, mode=0o644)  # group/other readable -> fail-closed
+        self.assertEqual(sl.CREDENTIAL_UNSAFE, sl.classify_credential_readiness(home=self.home))
 
 
 class InstallTest(_DarwinCase):
-    def test_install_writes_plist_and_bootstraps_when_ready(self) -> None:
+    def test_install_writes_plist_and_bootstraps_when_home_credential_ready(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner()
-        result = sl.install(
-            home=self.home, interval_seconds=300, environ=READY_ENV,
-            runner=runner, which=_which_found,
-        )
+        result = sl.install(home=self.home, interval_seconds=300, runner=runner, which=_which_found)
         self.assertTrue(result["performed"])
         self.assertEqual(sl.CREDENTIAL_READY, result["credential_readiness"])
         plist_file = sl.plist_path(self.home)
@@ -198,7 +203,6 @@ class InstallTest(_DarwinCase):
         payload = plistlib.loads(plist_file.read_bytes())
         self.assertNotIn("KeepAlive", payload)
         self.assertNotIn("EnvironmentVariables", payload)
-        # bootout (ignore-failure) then bootstrap, structured argv only.
         self.assertEqual(
             [
                 ["launchctl", "bootout", f"gui/501/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
@@ -208,27 +212,39 @@ class InstallTest(_DarwinCase):
         )
 
     def test_install_is_idempotent(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner()
-        sl.install(home=self.home, interval_seconds=300, environ=READY_ENV,
-                   runner=runner, which=_which_found)
+        sl.install(home=self.home, interval_seconds=300, runner=runner, which=_which_found)
         first = sl.plist_path(self.home).read_bytes()
-        sl.install(home=self.home, interval_seconds=300, environ=READY_ENV,
-                   runner=runner, which=_which_found)
+        sl.install(home=self.home, interval_seconds=300, runner=runner, which=_which_found)
         second = sl.plist_path(self.home).read_bytes()
         self.assertEqual(first, second)
 
+    def test_install_refuses_zero_mutation_on_env_only_credential(self) -> None:
+        # F1 regression guard at the install boundary: shell env, no home file -> refuse, no plist.
+        runner = FakeRunner()
+        with patch.dict("os.environ", SHELL_ENV, clear=False):
+            result = sl.install(home=self.home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual("redmine_credential_missing", result["reason"])
+        self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
+        self.assertEqual([], runner.calls)
+        self.assertFalse(sl.plist_path(self.home).exists())
+
     def test_install_refuses_zero_mutation_on_non_darwin(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner()
         with patch.object(sl, "_running_on_darwin", return_value=False):
-            result = sl.install(home=self.home, environ=READY_ENV, runner=runner, which=_which_found)
+            result = sl.install(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_UNSUPPORTED_PLATFORM, result["reason"])
-        self.assertEqual([], runner.calls)  # no launchctl
-        self.assertFalse(sl.plist_path(self.home).exists())  # no plist written
+        self.assertEqual([], runner.calls)
+        self.assertFalse(sl.plist_path(self.home).exists())
 
     def test_install_refuses_zero_mutation_on_missing_executable(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner()
-        result = sl.install(home=self.home, environ=READY_ENV, runner=runner, which=_which_missing)
+        result = sl.install(home=self.home, runner=runner, which=_which_missing)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_EXECUTABLE_NOT_FOUND, result["reason"])
         self.assertEqual([], runner.calls)
@@ -236,7 +252,7 @@ class InstallTest(_DarwinCase):
 
     def test_install_refuses_zero_mutation_on_missing_credential(self) -> None:
         runner = FakeRunner()
-        result = sl.install(home=self.home, environ={}, runner=runner, which=_which_found)
+        result = sl.install(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_missing", result["reason"])
         self.assertEqual(sl.CREDENTIAL_MISSING, result["credential_readiness"])
@@ -244,8 +260,9 @@ class InstallTest(_DarwinCase):
         self.assertFalse(sl.plist_path(self.home).exists())
 
     def test_install_refuses_zero_mutation_on_incomplete_credential(self) -> None:
+        _write_home_credential(self.home, url=None)
         runner = FakeRunner()
-        result = sl.install(home=self.home, environ={API_KEY_ENV: "k"}, runner=runner, which=_which_found)
+        result = sl.install(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_incomplete", result["reason"])
         self.assertEqual([], runner.calls)
@@ -256,25 +273,26 @@ class InstallTest(_DarwinCase):
         cred.write_text("- not a mapping\n", encoding="utf-8")
         os.chmod(cred, 0o600)
         runner = FakeRunner()
-        result = sl.install(home=self.home, environ={}, runner=runner, which=_which_found)
+        result = sl.install(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_unsafe", result["reason"])
         self.assertEqual([], runner.calls)
         self.assertFalse(sl.plist_path(self.home).exists())
 
-    def test_install_bootstrap_failure_is_reported(self) -> None:
+    def test_install_bootstrap_failure_is_reported_without_host_detail(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner(default=_result(1, stderr="boom"))
-        result = sl.install(home=self.home, environ=READY_ENV, runner=runner, which=_which_found)
+        result = sl.install(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_BOOTSTRAP_FAILED, result["reason"])
-        # The plist was written, but the redacted reason carries no host detail.
         self.assertNotIn("boom", str(result))
 
 
 class RestartTest(_DarwinCase):
     def test_restart_kickstarts_loaded_service(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner(print_result=_result(0, stdout="state = running\n\tpid = 4242\n"))
-        result = sl.restart(home=self.home, environ=READY_ENV, runner=runner, which=_which_found)
+        result = sl.restart(home=self.home, runner=runner, which=_which_found)
         self.assertTrue(result["performed"])
         self.assertIn("kickstart", runner.verbs)
         self.assertEqual(
@@ -283,27 +301,29 @@ class RestartTest(_DarwinCase):
         )
 
     def test_restart_refuses_zero_mutation_when_not_loaded(self) -> None:
+        _write_home_credential(self.home)
         runner = FakeRunner(print_result=_result(113, stderr="not found"))
-        result = sl.restart(home=self.home, environ=READY_ENV, runner=runner, which=_which_found)
+        result = sl.restart(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_SERVICE_NOT_LOADED, result["reason"])
-        # print (the read) may run, but kickstart (the mutation) must not.
         self.assertNotIn("kickstart", runner.verbs)
 
-    def test_restart_refuses_on_non_darwin_without_any_launchctl(self) -> None:
-        runner = FakeRunner()
-        with patch.object(sl, "_running_on_darwin", return_value=False):
-            result = sl.restart(home=self.home, environ=READY_ENV, runner=runner, which=_which_found)
-        self.assertFalse(result["performed"])
-        self.assertEqual(sl.REASON_UNSUPPORTED_PLATFORM, result["reason"])
-        self.assertEqual([], runner.calls)
-
-    def test_restart_refuses_on_missing_credential_before_probe(self) -> None:
+    def test_restart_refuses_on_env_only_credential_before_probe(self) -> None:
         runner = FakeRunner(print_result=_result(0, stdout="pid = 1\n"))
-        result = sl.restart(home=self.home, environ={}, runner=runner, which=_which_found)
+        with patch.dict("os.environ", SHELL_ENV, clear=False):
+            result = sl.restart(home=self.home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual("redmine_credential_missing", result["reason"])
         self.assertEqual([], runner.calls)  # refused before the loaded-probe read
+
+    def test_restart_refuses_on_non_darwin_without_any_launchctl(self) -> None:
+        _write_home_credential(self.home)
+        runner = FakeRunner()
+        with patch.object(sl, "_running_on_darwin", return_value=False):
+            result = sl.restart(home=self.home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_UNSUPPORTED_PLATFORM, result["reason"])
+        self.assertEqual([], runner.calls)
 
 
 class UninstallTest(_DarwinCase):
@@ -326,7 +346,7 @@ class UninstallTest(_DarwinCase):
 
     def test_uninstall_is_safe_without_credential_and_without_plist(self) -> None:
         runner = FakeRunner()
-        result = sl.uninstall(home=self.home, runner=runner)  # no env, no plist
+        result = sl.uninstall(home=self.home, runner=runner)  # no cred, no plist
         self.assertTrue(result["performed"])
         self.assertFalse(result["removed"])
 
@@ -341,12 +361,10 @@ class UninstallTest(_DarwinCase):
 
 class ServiceStatusTest(_DarwinCase):
     def test_status_of_installed_loaded_service_is_redacted_projection(self) -> None:
-        sl.install(home=self.home, interval_seconds=120, environ=READY_ENV,
-                   runner=FakeRunner(), which=_which_found)
+        _write_home_credential(self.home)
+        sl.install(home=self.home, interval_seconds=120, runner=FakeRunner(), which=_which_found)
         runner = FakeRunner(print_result=_result(0, stdout="state = running\n\tpid = 4242\n"))
-        status = sl.service_status(
-            home=self.home, environ=READY_ENV, runner=runner, which=_which_found
-        )
+        status = sl.service_status(home=self.home, runner=runner, which=_which_found)
         self.assertTrue(status["installed"])
         self.assertTrue(status["loaded"])
         self.assertEqual(4242, status["pid"])
@@ -359,14 +377,16 @@ class ServiceStatusTest(_DarwinCase):
         # Redacted: no path, no secret, no request header anywhere in the projection.
         blob = str(status)
         self.assertNotIn(str(self.home), blob)
-        self.assertNotIn("secret-key-value", blob.lower())
+        self.assertNotIn("home-key", blob.lower())
         self.assertNotIn("x-redmine-api-key", blob.lower())
 
-    def test_status_when_not_installed_reports_hint_interval_and_missing_credential(self) -> None:
+    def test_status_reports_missing_for_env_only_credential(self) -> None:
+        # F1 regression guard at the status boundary: shell env must not read as ready.
         runner = FakeRunner(print_result=_result(113))
-        status = sl.service_status(
-            home=self.home, interval_hint=300, environ={}, runner=runner, which=_which_found
-        )
+        with patch.dict("os.environ", SHELL_ENV, clear=False):
+            status = sl.service_status(
+                home=self.home, interval_hint=300, runner=runner, which=_which_found
+            )
         self.assertFalse(status["installed"])
         self.assertFalse(status["loaded"])
         self.assertIsNone(status["pid"])
@@ -378,22 +398,19 @@ class ServiceStatusTest(_DarwinCase):
         def no_launchctl(_argv):
             raise FileNotFoundError("launchctl")
 
-        status = sl.service_status(
-            home=self.home, environ={}, runner=no_launchctl, which=_which_missing
-        )
+        status = sl.service_status(home=self.home, runner=no_launchctl, which=_which_missing)
         self.assertFalse(status["loaded"])
         self.assertIsNone(status["pid"])
 
     def test_status_flags_executable_drift(self) -> None:
-        sl.install(home=self.home, interval_seconds=120, environ=READY_ENV,
-                   runner=FakeRunner(), which=_which_found)
+        _write_home_credential(self.home)
+        sl.install(home=self.home, interval_seconds=120, runner=FakeRunner(), which=_which_found)
 
         def which_moved(_name):
             return "/some/other/path/mozyo-bridge"
 
         status = sl.service_status(
-            home=self.home, environ=READY_ENV, runner=FakeRunner(print_result=_result(113)),
-            which=which_moved,
+            home=self.home, runner=FakeRunner(print_result=_result(113)), which=which_moved
         )
         self.assertFalse(status["executable_matches"])
 

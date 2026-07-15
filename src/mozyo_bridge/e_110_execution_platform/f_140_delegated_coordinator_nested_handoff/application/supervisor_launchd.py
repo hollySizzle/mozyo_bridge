@@ -163,19 +163,21 @@ def render_plist(
 # ---------------------------------------------------------------------------
 
 
-def classify_credential_readiness(
-    *, home: Optional[Path] = None, environ: Optional[dict] = None
-) -> str:
-    """Classify Redmine credential readiness into a fixed, secret-safe token.
+def classify_credential_readiness(*, home: Optional[Path] = None) -> str:
+    """Classify **daemon-effective** Redmine credential readiness into a fixed, secret-safe token.
 
-    Mirrors exactly what the live supervisor needs to reach Redmine
-    (:meth:`LiveRedmineJournalSource.from_environment`: an api key **and** a normalizable base
-    URL). A present-but-unsafe / malformed credential file surfaces as :data:`CREDENTIAL_UNSAFE`
-    (the resolver already refuses to read it and returns a redacted warning), so an operator sees
-    that the fail-closed refusal is deliberate, not a silent drop. Returns only a token — never the
-    key, the URL, or the warning text.
+    Judges what the *launchd-managed* supervisor will actually have at run time, not what the
+    installer's interactive shell happens to hold. By this module's own plist design the agent
+    carries **no** ``EnvironmentVariables`` and launchd inherits no shell environment, so the
+    daemon's only credential source is the home-scoped file (``resolve_redmine_credentials``'s file
+    path). Readiness therefore resolves with an **empty environ**: an installer's exported
+    ``MOZYO_REDMINE_*`` can never produce a false ``ready`` for a daemon that will not see it
+    (Redmine #13683 review j#79059 F1). Ready needs an api key **and** a normalizable base URL from
+    the home file; a present-but-unsafe / malformed file surfaces as :data:`CREDENTIAL_UNSAFE` (the
+    resolver refuses to read it and returns a redacted warning), so a fail-closed refusal is visibly
+    deliberate. Returns only a token — never the key, the URL, or the warning text.
     """
-    creds = resolve_redmine_credentials(home, environ=environ)
+    creds = resolve_redmine_credentials(home, environ={})
     if creds.warnings:
         return CREDENTIAL_UNSAFE
     has_key = bool(creds.api_key)
@@ -240,22 +242,22 @@ def install(
     *,
     home: Optional[Path] = None,
     interval_seconds: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
-    environ: Optional[dict] = None,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
     """Write the owned plist and (re)bootstrap the agent. Idempotent; fail-closed zero-mutation.
 
     Refuses — before any filesystem write or launchctl call — on a non-darwin host, a missing
-    executable, or a non-ready Redmine credential. On success the plist is rewritten idempotently
-    and the agent is booted out (ignore-failure) then bootstrapped.
+    executable, or a non-ready **daemon-effective** Redmine credential (the home-scoped file the
+    launchd agent will actually see; an installer's shell env does not count). On success the plist
+    is rewritten idempotently and the agent is booted out (ignore-failure) then bootstrapped.
     """
     if not _running_on_darwin():
         return _refused("install", REASON_UNSUPPORTED_PLATFORM)
     command = resolve_supervisor_command(which=which)
     if command is None:
         return _refused("install", REASON_EXECUTABLE_NOT_FOUND)
-    readiness = classify_credential_readiness(home=home, environ=environ)
+    readiness = classify_credential_readiness(home=home)
     if readiness != CREDENTIAL_READY:
         return _refused(
             "install", _CREDENTIAL_REFUSAL_REASON[readiness], credential_readiness=readiness
@@ -288,21 +290,20 @@ def install(
 def restart(
     *,
     home: Optional[Path] = None,
-    environ: Optional[dict] = None,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
     """Kickstart (kill + relaunch) the *loaded* agent. Fail-closed zero-mutation.
 
     Refuses — before any launchctl mutation — on a non-darwin host, a missing executable, a
-    non-ready credential, or a service that is not currently loaded (restart never bootstraps a
-    fresh service; that is ``install``).
+    non-ready **daemon-effective** credential (home-scoped file, not shell env), or a service that
+    is not currently loaded (restart never bootstraps a fresh service; that is ``install``).
     """
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM)
     if resolve_supervisor_command(which=which) is None:
         return _refused("restart", REASON_EXECUTABLE_NOT_FOUND)
-    readiness = classify_credential_readiness(home=home, environ=environ)
+    readiness = classify_credential_readiness(home=home)
     if readiness != CREDENTIAL_READY:
         return _refused(
             "restart", _CREDENTIAL_REFUSAL_REASON[readiness], credential_readiness=readiness
@@ -355,16 +356,16 @@ def service_status(
     *,
     home: Optional[Path] = None,
     interval_hint: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
-    environ: Optional[dict] = None,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
     """A read-only, redacted projection of the host service state. Mutates nothing.
 
     Reports plist existence, loaded/pid, the *scheduled* interval (read from the installed plist),
-    whether the installed executable still matches the PATH-resolved one, and credential readiness
-    — as booleans / counts / fixed tokens only. Never emits a credential value, a request header, a
-    repo-local path, or pane text. Works on any platform and with no credential configured.
+    whether the installed executable still matches the PATH-resolved one, and **daemon-effective**
+    credential readiness (the home-scoped file the launchd agent will see, not the caller's shell
+    env) — as booleans / counts / fixed tokens only. Never emits a credential value, a request
+    header, a repo-local path, or pane text. Works on any platform and with no credential.
     """
     target = plist_path(home)
     plist_exists = target.exists()
@@ -401,7 +402,7 @@ def service_status(
         "keep_alive_present": keep_alive_present,
         "no_environment_block": no_environment_block,
         "executable_matches": executable_matches,
-        "credential_readiness": classify_credential_readiness(home=home, environ=environ),
+        "credential_readiness": classify_credential_readiness(home=home),
     }
 
 
