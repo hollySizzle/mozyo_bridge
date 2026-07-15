@@ -146,6 +146,20 @@ def register_sublane_retire(
             "branch (still runbook); never closes a foreign agent. No-op under tmux."
         ),
     )
+    sublane_retire.add_argument(
+        "--migrate-hibernated-legacy",
+        dest="migrate_hibernated_legacy",
+        action="store_true",
+        help=(
+            "Redmine #13841: metadata-only migration for a hibernated / released LEGACY "
+            "owner row (empty worktree binding) whose live pair is gone. Only when the "
+            "preflight permits retirement AND the durable row is hibernated + released + "
+            "empty-worktree + owns --issue AND the live inventory shows zero managed slots "
+            "AND --branch is integrated, moves it directly to the terminal `retired` "
+            "disposition via a bounded CAS. Launches / closes / resumes NO process; removes "
+            "no worktree / branch. Mutually exclusive with --execute (never a pane close)."
+        ),
+    )
     add_repo_option(sublane_retire)
     add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)

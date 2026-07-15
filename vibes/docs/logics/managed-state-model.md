@@ -365,6 +365,28 @@ Table naming:
       ambiguous / unattested / stale live pair・revision race・non-empty mismatch を `already_owned` に畳まず
       fail-closed で dispatch を止める (items 2/3 の安全 gate を維持)。herdr 全断の
       `unreadable_inventory` は無観測ゆえ別扱いで ownership authority proceed (R4-F3) を維持する。
+    - **hibernated legacy retire migration** (`LaneRetireMigrationStore.retire_released_hibernated_legacy`,
+      #13841、live evidence #13756 j#79114–j#79115)。**hibernated / released legacy** row —
+      coordinator が hibernate 済み、process release が durable に `released` へ到達、live pair は消滅、
+      だが `worktree_identity` が **空**（pre-#13754 で未記録）— は既存 path のどれでも retire できない:
+      `retire --execute` は worktree binding を先に attest するため空 binding で恒久的に
+      `worktree_binding_unverified`(閉じる live pair も無い)、#13809 backfill は **active** row 専用。
+      new pair を起動して再退役するのは不要な actuation ゆえ採らず、この surface は該当 row を
+      **直接** #13689 terminal `retired` disposition へ 1 本の bounded CAS で移す — **metadata only**、
+      process launch/close/resume も worktree/branch 削除も伴わない。書込は「row 存在 かつ exact
+      `expected_revision` 一致」かつ「`hibernated` / `binding_kind='issue'` / この exact issue 所有 /
+      project scope 無し / `worktree_identity` **空**」かつ「process release が durable に `released`
+      (unproven / in-flight は fail-closed) / replacement settled」の全成立時のみ。それ以外の shape
+      (active/superseded/retired、別 issue、**non-empty (既 #13754-bound) worktree**、release 未証明、
+      revision race、row 不在) は zero-write。`transition_disposition` の generic edge を使わない理由は、
+      release proof と empty-worktree signature が **guard の一部**であって caller の promise ではないため。
+      `released` は「release command 完了」であって slots 消滅の証明ではない (`### 正本境界`) ので、
+      public high-level path (`sublane retire --migrate-hibernated-legacy`) は durable proof を
+      **live-inventory zero read**（expected managed slot が 1 つでも live なら `live_pair_present`
+      fail-closed）と、`--branch` の `--integration-branch` への **ancestry probe**(unknown/非 ancestor は
+      fail-closed)と対にする。closed status / clean worktree / latest review / callback drain は command の
+      `may_retire` preflight が上流で gate する。duplicate replay は既 `retired` row (この issue 所有) を
+      idempotent no-op success として読むことで冪等。disposition / decision anchor 以外は不変。
     - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
