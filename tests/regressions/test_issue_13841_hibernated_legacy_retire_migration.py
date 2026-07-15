@@ -89,6 +89,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MIGRATE_NOT_LEGACY_STATE,
     MIGRATE_RELEASE_NOT_PROVEN,
     MIGRATE_RETIRED,
+    MIGRATE_WORKTREE_BRANCH_MISMATCH,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E402,E501
     REASON_NO_WORKTREE_ANCHOR,
@@ -590,17 +591,71 @@ class RetireMigrationCommandTests(unittest.TestCase):
         self.assertFalse(payload["retire_ok"])
         self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
 
+    def test_worktree_branch_mismatch_blocks(self) -> None:
+        # review j#79150 finding 1: the --worktree is on the lane branch, but --branch names a
+        # DIFFERENT branch. The clean + integrated evidence would then describe `main` while the
+        # worktree's real head is the lane branch — refuse zero-write.
+        self._seed_row()
+        code, payload = self._migrate(branch="main")
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["retire_ok"])
+        self.assertEqual(
+            self._mig(payload)["reason"], MIGRATE_WORKTREE_BRANCH_MISMATCH
+        )
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_already_retired_replay_with_live_pair_blocks(self) -> None:
+        # review j#79150 finding 2: a persisted `retired` does not prove the pair is currently
+        # gone. After a migration, a relaunched live pair must make the idempotent replay fail
+        # closed (live_pair_present), NOT report already_retired success.
+        self._seed_row()
+        self._migrate()
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        # A pair reappears under the retired lane unit.
+        self.rows += [
+            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p3"),
+            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p4"),
+        ]
+        code, payload = self._migrate()
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["retire_ok"])
+        self.assertEqual(self._mig(payload)["reason"], MIGRATE_LIVE_PAIR_PRESENT)
+        # The row stays retired (zero-write); only the success verdict is withheld.
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+
     # -- non-regression of the #13754 guarded close ----------------------
 
-    def test_migration_flag_never_runs_the_guarded_close(self) -> None:
-        # Even with BOTH flags, --migrate-hibernated-legacy takes precedence and the guarded
-        # close never runs (no pane close, no herdr_retire_close verdict).
+    def test_both_destructive_flags_are_rejected_zero_write(self) -> None:
+        # review j#79150 finding 3: --migrate-hibernated-legacy and --execute are conflicting
+        # destructive intents — passing both is a zero-write error (exit 1), never a silent
+        # resolution to one. Nothing is actuated and the row is untouched.
         self._seed_row()
-        code, payload = self._migrate(also_execute=True)
-        self.assertEqual(code, 0)
-        self.assertNotIn("herdr_retire_close", payload)
-        self.assertIn("hibernated_legacy_retire_migration", payload)
-        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        args = argparse.Namespace(
+            repo=str(self.primary),
+            issue=_ISSUE,
+            journal=_JOURNAL,
+            lane_label=_LANE,
+            worktree=str(self.lane_worktree),
+            branch=_LANE,
+            integration_branch="main",
+            execute=True,
+            migrate_hibernated_legacy=True,
+            json=True,
+            issue_closed=True,
+            callbacks_drained=True,
+            verified=True,
+            durable_record=True,
+            target_identity_known=True,
+            latest_generation_admissible=True,
+            review_generation_json=None,
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sublane_lifecycle_command.cmd_sublane_retire(args)
+        self.assertEqual(code, 1)
+        self.assertIn("mutually exclusive", err.getvalue())
+        self.assertEqual(out.getvalue().strip(), "")  # no JSON, no actuation
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
 
     def test_plain_execute_without_migration_flag_is_unchanged(self) -> None:
         # Regression guard: an active #13754-bound lane still retires through the guarded

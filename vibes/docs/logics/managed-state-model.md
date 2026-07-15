@@ -385,8 +385,16 @@ Table naming:
       **live-inventory zero read**（expected managed slot が 1 つでも live なら `live_pair_present`
       fail-closed）と、`--branch` の `--integration-branch` への **ancestry probe**(unknown/非 ancestor は
       fail-closed)と対にする。closed status / clean worktree / latest review / callback drain は command の
-      `may_retire` preflight が上流で gate する。duplicate replay は既 `retired` row (この issue 所有) を
-      idempotent no-op success として読むことで冪等。disposition / decision anchor 以外は不変。
+      `may_retire` preflight が上流で gate する。★**worktree↔branch identity**(#13841 review j#79150 F1):
+      clean probe は `--worktree`、integration probe は `--branch` を測るので、`--worktree` の実 checkout
+      branch(`git rev-parse --abbrev-ref HEAD`)が `--branch` と一致しない限り無関係 branch の clean/integrated
+      証拠で退役しうる → 実 branch==`--branch` を action-time 要求、不一致/detached/解決不能/空 branch は
+      `worktree_branch_mismatch` zero-write。★duplicate replay の冪等性(既 `retired` row をこの issue 所有で
+      no-op success)は維持するが、**success を返す前に live-inventory zero を action-time 確認**する
+      (#13841 review j#79150 F2): persisted `retired` は現在の非稼働性を証明しないので、retired 復元後に
+      pair が再稼働/inventory unreadable なら idempotent replay も fail-closed。★`--migrate-hibernated-legacy`
+      と `--execute` は競合する destructive intent ゆえ **両指定は command-time zero-write error**(#13841
+      review j#79150 F3、黙って一方へ解決しない)。disposition / decision anchor 以外は不変。
     - v1–v4 → v5 migration は backup-first additive。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。

@@ -157,7 +157,8 @@ def register_sublane_retire(
             "empty-worktree + owns --issue AND the live inventory shows zero managed slots "
             "AND --branch is integrated, moves it directly to the terminal `retired` "
             "disposition via a bounded CAS. Launches / closes / resumes NO process; removes "
-            "no worktree / branch. Mutually exclusive with --execute (never a pane close)."
+            "no worktree / branch. Mutually exclusive with --execute: passing both is a "
+            "zero-write error (the migration never closes a pane)."
         ),
     )
     add_repo_option(sublane_retire)

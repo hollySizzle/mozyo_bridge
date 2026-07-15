@@ -64,6 +64,11 @@ MIGRATE_BLOCKED = "blocked"
 #: guarded close (:mod:`...sublane_herdr_retire`) so an operator reads one vocabulary.
 MIGRATE_LIVE_PAIR_PRESENT = "live_pair_present"
 MIGRATE_HEAD_NOT_INTEGRATED = "head_not_integrated"
+#: The caller's ``--worktree`` is not actually checked out on the caller's ``--branch``
+#: (a mismatch, a detached HEAD, or an unresolvable checkout). The clean / integrated
+#: evidence would then describe a branch other than the worktree's real head, so the
+#: identity is refused zero-write (review j#79150 finding 1).
+MIGRATE_WORKTREE_BRANCH_MISMATCH = "worktree_branch_mismatch"
 MIGRATE_LIFECYCLE_UNREADABLE = "lifecycle_unreadable"
 #: The bounded CAS refused: the row is not the exact hibernated / released / empty-worktree
 #: legacy signature (a different issue / disposition / binding, or an already-#13754-bound
@@ -134,18 +139,25 @@ def run_hibernated_legacy_retire_migration(
     repo_root: Path,
     *,
     head_integrated: Optional[bool],
+    worktree_branch: Optional[str],
 ):
     """Metadata-only migrate a hibernated / released legacy lane to ``retired`` (Redmine #13841).
 
     Returns a :class:`HibernatedLegacyRetireVerdict`, or ``None`` when the repo is not on the
     herdr backend (the migration is a herdr lane-lifecycle operation, like the guarded close).
+
     ``head_integrated`` is the command's read-only ancestry probe result (``--branch`` reachable
-    from ``--integration-branch``); ``None`` / ``False`` fails closed.
+    from ``--integration-branch``); ``None`` / ``False`` fails closed. ``worktree_branch`` is the
+    ``--worktree``'s ACTUAL checked-out branch (``git rev-parse --abbrev-ref HEAD``, ``None`` when
+    unresolvable / detached): it must equal ``--branch``, so the clean + integrated evidence
+    describes the worktree's real head and not an unrelated branch name (review j#79150 finding 1).
 
     The command runs this only when its ``may_retire`` preflight already passed (issue closed,
     worktree clean, latest review admissible, callbacks drained, target identity known), so
-    those axes are established upstream. This adds the axes the preflight cannot: head
-    integration, a live-inventory zero read, and the released-legacy-state CAS.
+    those axes are established upstream. This adds the axes the preflight cannot: the worktree ↔
+    branch identity, head integration, a live-inventory zero read, and the released-legacy-state
+    CAS. Every success — including an idempotent already-retired replay — is action-time verified
+    against the live inventory before it is reported (review j#79150 finding 2).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
@@ -219,6 +231,31 @@ def run_hibernated_legacy_retire_migration(
             ),
             lane_id=lane_label,
         )
+    # Worktree ↔ branch identity (review j#79150 finding 1): the clean probe measures the
+    # --worktree while the integration probe measures --branch, so unless the --worktree is
+    # ACTUALLY checked out on --branch the two describe different heads — an unrelated branch's
+    # clean / integrated evidence could then license the retire. Require the worktree's real
+    # branch (git rev-parse --abbrev-ref HEAD) to equal --branch; a mismatch, a detached HEAD
+    # ("HEAD"), an unresolvable checkout (None), or an empty --branch fails closed zero-write.
+    want_branch = (getattr(args, "branch", "") or "").strip()
+    actual_branch = (worktree_branch or "").strip()
+    if (
+        not want_branch
+        or not actual_branch
+        or actual_branch == "HEAD"
+        or actual_branch != want_branch
+    ):
+        return _blocked(
+            MIGRATE_WORKTREE_BRANCH_MISMATCH,
+            detail=(
+                f"the --worktree is not checked out on --branch {want_branch or '<none>'} "
+                f"(actual head: {actual_branch or '<unresolved/detached>'}); its clean + "
+                "integrated evidence cannot be attributed to the lane's branch, so the "
+                "migration fails closed"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
     # Head-integration is an action-time invariant (Redmine #13841): the retire preflight runs
     # with merge_on_retire=False, so it does NOT check integration — this probe does. Unknown
     # (probe could not answer) or non-ancestor fails closed.
@@ -277,21 +314,13 @@ def run_hibernated_legacy_retire_migration(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    if record.lane_disposition == DISPOSITION_RETIRED and (
-        record.issue_id or ""
-    ).strip() == issue:
-        # Idempotent duplicate replay: the row already reached the terminal disposition and
-        # owns this exact issue. A verified no-op success (no second write).
-        return HibernatedLegacyRetireVerdict(
-            state=MIGRATE_ALREADY_RETIRED,
-            detail="the lane is already durably retired; migration is an idempotent no-op",
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
     # No live pair may remain (Redmine #13841 ``active/live pair`` fail-closed). A durable
     # ``released`` record is NOT liveness (``lane_lifecycle`` boundary), so the released-state
     # CAS below is paired with this live-inventory zero read. An unreadable inventory is NOT an
-    # empty one — folding it to "nothing live" is the #13682 R1-F1 / #13754 anti-pattern.
+    # empty one — folding it to "nothing live" is the #13682 R1-F1 / #13754 anti-pattern. This
+    # runs BEFORE the idempotent already-retired success (review j#79150 finding 2): a persisted
+    # ``retired`` disposition does not prove the pair is currently gone, so even a duplicate
+    # replay is only a success once the live inventory is readable AND measures zero live pair.
     try:
         rows = list_herdr_agent_rows(os.environ)
     except HerdrSessionStartError as exc:
@@ -346,6 +375,22 @@ def run_hibernated_legacy_retire_migration(
             workspace_id=workspace_id,
             lane_id=lane_label,
             expected_live=live,
+        )
+    if record.lane_disposition == DISPOSITION_RETIRED and (
+        record.issue_id or ""
+    ).strip() == issue:
+        # Idempotent duplicate replay: the row already reached the terminal disposition and
+        # owns this exact issue. A verified no-op success — reported only AFTER the live-zero
+        # read above confirmed no pair is currently live (review j#79150 finding 2), so a
+        # persisted ``retired`` never reports success while a pair was relaunched under it.
+        return HibernatedLegacyRetireVerdict(
+            state=MIGRATE_ALREADY_RETIRED,
+            detail=(
+                "the lane is already durably retired and no expected managed slot is live; "
+                "migration is an idempotent no-op"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
         )
     # The released-legacy-state CAS: hibernated + durable released + empty worktree binding +
     # this exact issue + settled replacement, guarded on the row's exact revision. Every other
@@ -439,6 +484,7 @@ __all__ = (
     "MIGRATE_BLOCKED",
     "MIGRATE_LIVE_PAIR_PRESENT",
     "MIGRATE_HEAD_NOT_INTEGRATED",
+    "MIGRATE_WORKTREE_BRANCH_MISMATCH",
     "MIGRATE_LIFECYCLE_UNREADABLE",
     "MIGRATE_NOT_LEGACY_STATE",
     "MIGRATE_RELEASE_NOT_PROVEN",

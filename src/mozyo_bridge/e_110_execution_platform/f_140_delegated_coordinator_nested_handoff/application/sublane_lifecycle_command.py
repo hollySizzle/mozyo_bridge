@@ -684,6 +684,19 @@ def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
 
 
 def cmd_sublane_retire(args: argparse.Namespace) -> int:
+    # Redmine #13841 review j#79150 finding 3: --execute (guarded pane close) and
+    # --migrate-hibernated-legacy (metadata-only) are conflicting destructive intents. Reject
+    # the combination as a zero-write failure rather than silently resolving to one — the help
+    # promises they are mutually exclusive, and nothing (no preflight, no actuation) runs here.
+    if getattr(args, "migrate_hibernated_legacy", False) and getattr(
+        args, "execute", False
+    ):
+        print(
+            "error: --migrate-hibernated-legacy and --execute are mutually exclusive "
+            "(the migration is metadata-only and never closes a pane); pass exactly one",
+            file=sys.stderr,
+        )
+        return 1
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
@@ -744,12 +757,22 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             # Head integration is an action-time invariant the retire preflight (run with
             # merge_on_retire=False) does not check: probe --branch's ancestry into
             # --integration-branch read-only. Unknown / non-ancestor fails closed downstream.
-            head_integrated = LiveSublaneLifecycleOps(repo_root=repo_root).branch_integrated(
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
                 getattr(args, "branch", None) or "",
                 getattr(args, "integration_branch", None) or "",
             )
+            # The --worktree's ACTUAL checked-out branch (review j#79150 finding 1): the
+            # migration requires it to equal --branch, so the clean + integrated evidence
+            # describes the worktree's real head and not an unrelated branch name.
+            worktree_branch = (
+                ops.branch_for(worktree) if worktree else None
+            )
             migration_result = run_hibernated_legacy_retire_migration(
-                args, repo_root, head_integrated=head_integrated
+                args,
+                repo_root,
+                head_integrated=head_integrated,
+                worktree_branch=worktree_branch,
             )
     elif getattr(args, "execute", False) and outcome.preflight.may_retire:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
