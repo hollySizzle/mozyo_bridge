@@ -43,42 +43,80 @@ from typing import Optional
 
 #: The closed schema version. Bumped only by a deliberate, migration-aware change;
 #: an unrecognized version fails closed at :meth:`OperatorStartupGate.from_record`.
-OPERATOR_STARTUP_GATE_SCHEMA_VERSION = 1
+#:
+#: **v2 (#13813 resume tranche).** #13812 v1 realized only the ``required`` state (a
+#: fresh, zero-write projection). #13813 realizes the full append-only transition
+#: lattice — ``owner_approved`` -> ``operator_reported_done`` -> ``verified_clear`` ->
+#: ``consumed`` (with ``superseded`` as the invalidation branch) — each with the
+#: owner-approval / resume invariants v1 deliberately deferred. The wire shape is
+#: unchanged (same ``state`` / ``approval`` / ``resume`` fields); what v2 adds is the
+#: set of *valid* ``(state, approval, resume)`` combinations. :meth:`from_record`
+#: stays migration-aware: it still reads a v1 record, which — because v1 only ever
+#: realized ``required`` — is admitted only in the ``required`` state and re-stamped v2.
+OPERATOR_STARTUP_GATE_SCHEMA_VERSION = 2
+
+#: The prior schema version #13812 wrote (``required`` gates only). Still readable.
+OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1 = 1
 
 # ---------------------------------------------------------------------------
 # Gate state (j#78409 schema ``state``). The design's full state lattice is an
-# append-only transition chain — required -> owner_approved -> operator_reported_done
-# -> verified_clear -> consumed (with superseded as the invalidation branch) — where
-# each transition is recorded under the SAME ``gate_id`` / ``action_generation``.
+# append-only transition chain, each transition recorded under the SAME ``gate_id`` /
+# ``action_generation``:
 #
-# BUT the transition-bearing states carry owner-approval and resume evidence whose
-# invariants are the resume tranche's (#13813) to define and enforce: which state
-# requires a clear timestamp, which requires a reserved fence, whether a superseded
-# gate retains its prior approval as audit history. Guessing those invariants here —
-# before #13813 exists — is exactly what the Task split (j#78409 A/B) defers, and a
-# v1 that could *construct* those states without their invariants would let a
-# contradictory durable record exist (review j#79003 Finding 2). So **#13812 v1
-# realizes only ``required``**: a fresh, zero-write projection with no approval and a
-# default resume. The transition states below are named for documentation and for
-# #13813 to realize under a schema revision; a v1 gate in any of them fails closed.
+#   required -> owner_approved -> operator_reported_done -> verified_clear -> consumed
+#
+# with ``superseded`` as the invalidation branch off any non-terminal state. #13812 v1
+# realized only ``required`` and deferred the transition-bearing states — which carry
+# owner-approval and resume evidence — to this tranche (#13813). Their invariants,
+# enforced by ``validate_state_invariants`` in the sibling
+# :mod:`.operator_startup_gate_lattice` (which ``__post_init__`` delegates to), are what
+# make a contradictory durable record impossible to construct (the review j#79003
+# Finding 2 discipline, now extended across the whole lattice rather than only guarding
+# ``required``):
+#
+# - ``required``:               no approval, default (all-unset) resume.
+# - ``owner_approved``:         approval present, default resume (the owner approved the
+#                               operator UI action, but nothing has been observed clear
+#                               and the outbox fence is untouched).
+# - ``operator_reported_done``: approval present, default resume (the operator reports
+#                               they cleared the screen in the provider UI, but the agent
+#                               has not re-verified startup-clear yet).
+# - ``verified_clear``:         approval present, ``startup_clear_observed_at`` set, the
+#                               fence reserved-or-uncertain (a send was attempted but its
+#                               turn-start is not confirmed), no consumed delivery. This
+#                               is the reserve-but-not-delivered rung: it needs operator
+#                               reconcile, never a blind retry.
+# - ``consumed``:               approval present, ``startup_clear_observed_at`` set, the
+#                               fence ``delivered``, a ``consumed_delivery_record`` set.
+#                               The original request was re-issued exactly once. Terminal.
+# - ``superseded``:             the invalidation branch (a newer generation / a durable
+#                               supersede). It retains whatever approval / resume it was
+#                               invalidated from as audit history, so its resume fields
+#                               are only screened for shape, not constrained by rung.
+#                               Terminal.
 # ---------------------------------------------------------------------------
-#: The only state #13812 v1 realizes: an operator UI action is required and the
-#: projection is zero-write (no approval, default resume).
+#: An operator UI action is required; the projection is zero-write (no approval,
+#: default resume). The only state #13812 v1 realized.
 STATE_REQUIRED = "required"
 
-#: Transition-bearing states the design lattice defines but #13812 v1 does NOT
-#: realize (owner-approval / resume evidence is the resume tranche's, #13813). A v1
-#: gate constructed in any of these fails closed. Kept named so the schema is
-#: documented and #13813 can realize them under a schema revision.
+#: The owner approved the one-target/one-generation operator UI action (approval
+#: present); nothing observed clear yet, fence untouched.
 STATE_OWNER_APPROVED = "owner_approved"
+#: The operator reports they cleared the startup screen in the provider's own UI; the
+#: agent has not re-verified startup-clear yet. This is the resume precondition.
 STATE_OPERATOR_REPORTED_DONE = "operator_reported_done"
+#: The agent positively re-observed startup-clear and reserved the outbox fence, but the
+#: send's turn-start is not confirmed delivered (reserve/uncertain rung -> reconcile).
 STATE_VERIFIED_CLEAR = "verified_clear"
+#: The original request was re-issued exactly once (fence delivered). Terminal.
 STATE_CONSUMED = "consumed"
+#: The gate was invalidated (newer generation / durable supersede). Terminal.
 STATE_SUPERSEDED = "superseded"
 
-#: The future transition states, as a set, for the fail-closed v1 diagnostic.
-_DEFERRED_TRANSITION_STATES: frozenset[str] = frozenset(
+#: Every recognized state.
+_KNOWN_STATES: frozenset[str] = frozenset(
     {
+        STATE_REQUIRED,
         STATE_OWNER_APPROVED,
         STATE_OPERATOR_REPORTED_DONE,
         STATE_VERIFIED_CLEAR,
@@ -86,6 +124,17 @@ _DEFERRED_TRANSITION_STATES: frozenset[str] = frozenset(
         STATE_SUPERSEDED,
     }
 )
+
+#: Terminal states: a gate here has completed its exactly-once resume (``consumed``) or
+#: been invalidated (``superseded``); it never actuates another send.
+TERMINAL_STATES: frozenset[str] = frozenset({STATE_CONSUMED, STATE_SUPERSEDED})
+
+# The state-machine mechanics — the per-state ``(approval, resume)`` invariants, the
+# forward-only transition edges, the transition builders, and the pasteable renderers —
+# live in the sibling :mod:`.operator_startup_gate_lattice`, so this module stays a
+# focused home for the record types (module-health gate, #12321). The record's
+# ``__post_init__`` imports the validator lazily (below) to keep the two modules free of
+# an import cycle.
 
 # ---------------------------------------------------------------------------
 # Approval vocabulary (j#78409 schema ``approval``). The approval scope is pinned
@@ -110,10 +159,34 @@ FORBIDDEN_ACTIONS: frozenset[str] = frozenset(
 #: (the delegated-coordinator workflow's tracker); a non-Redmine source fails closed.
 ORIGINAL_REQUEST_SOURCE_REDMINE = "redmine"
 
-#: Resume ``dispatch_fence_state`` values the projection may express. The reserve /
-#: send transitions themselves are the resume tranche (#13813); at projection time a
-#: gate is only ever ``not_reserved`` (nothing has touched the outbox fence).
+#: Resume ``dispatch_fence_state`` values the gate may project. These MIRROR the
+#: :mod:`...core.state.dispatch_outbox_fence` fence-state vocabulary, but they are the
+#: gate's own **pointer** tokens — a read-only projection of what the fence reported —
+#: never a second idempotency authority (the exactly-once authority is the one
+#: ``DispatchOutboxFence``; j#78409 correction "第二ledgerを作らない"). Kept as local
+#: constants so the pure, pasteable domain does not import the SQLite fence module.
+#:
+#: At #13812 projection time a gate is only ever ``not_reserved``. The resume tranche
+#: (#13813) advances it: ``reserved`` once the fence reserve is won, then ``delivered``
+#: on a confirmed turn-start (-> ``consumed``) or ``uncertain`` on an unconfirmed
+#: outcome (-> ``verified_clear``, operator reconcile). ``cancelled`` mirrors a durable
+#: supersede confirmed before the send.
 FENCE_NOT_RESERVED = "not_reserved"
+FENCE_RESERVED = "reserved"
+FENCE_DELIVERED = "delivered"
+FENCE_UNCERTAIN = "uncertain"
+FENCE_CANCELLED = "cancelled"
+
+#: Every recognized resume fence-state pointer token.
+_RESUME_FENCE_STATES: frozenset[str] = frozenset(
+    {
+        FENCE_NOT_RESERVED,
+        FENCE_RESERVED,
+        FENCE_DELIVERED,
+        FENCE_UNCERTAIN,
+        FENCE_CANCELLED,
+    }
+)
 
 
 class OperatorStartupGateError(ValueError):
@@ -588,13 +661,15 @@ class GateResume:
                     field_name="resume.startup_clear_observed_at",
                 ),
             )
-        object.__setattr__(
-            self,
-            "dispatch_fence_state",
-            _require_token(
-                self.dispatch_fence_state, field_name="resume.dispatch_fence_state"
-            ),
+        fence_state = _require_token(
+            self.dispatch_fence_state, field_name="resume.dispatch_fence_state"
         )
+        if fence_state not in _RESUME_FENCE_STATES:
+            raise OperatorStartupGateError(
+                f"operator startup gate resume.dispatch_fence_state {fence_state!r} is "
+                f"not a recognized fence pointer; allowed: {sorted(_RESUME_FENCE_STATES)}"
+            )
+        object.__setattr__(self, "dispatch_fence_state", fence_state)
         if self.consumed_delivery_record is not None:
             object.__setattr__(
                 self,
@@ -658,17 +733,10 @@ class OperatorStartupGate:
                 self.action_generation, field_name="action_generation"
             ),
         )
-        if self.state in _DEFERRED_TRANSITION_STATES:
-            raise OperatorStartupGateError(
-                f"operator startup gate state {self.state!r} is a transition-bearing "
-                f"state whose owner-approval / resume invariants are the resume "
-                f"tranche's (#13813) to define; #13812 v1 realizes only "
-                f"{STATE_REQUIRED!r} (a zero-write projection)"
-            )
-        if self.state != STATE_REQUIRED:
+        if self.state not in _KNOWN_STATES:
             raise OperatorStartupGateError(
                 f"operator startup gate state {self.state!r} is not recognized; "
-                f"#13812 v1 realizes only {STATE_REQUIRED!r}"
+                f"allowed: {sorted(_KNOWN_STATES)}"
             )
         if self.schema_version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
             raise OperatorStartupGateError(
@@ -696,25 +764,14 @@ class OperatorStartupGate:
             raise OperatorStartupGateError(
                 "operator startup gate resume must be a GateResume"
             )
-        # v1 zero-write projection invariant (review j#79003 Finding 2): a `required`
-        # gate is the read-only projection of a blocker before any operator action, so
-        # it carries NO owner approval (the owner has not acted) and a DEFAULT resume
-        # (nothing observed clear, fence not reserved, no delivery consumed). Enforcing
-        # both here makes a contradictory record — a `required` gate that claims a
-        # reserved fence or a consumed delivery — impossible to construct, rather than
-        # merely unlikely. The approval-bearing and resume-advanced states are #13813's.
-        if self.approval is not None:
-            raise OperatorStartupGateError(
-                f"a {STATE_REQUIRED!r} operator startup gate must not carry an owner "
-                f"approval record; an approval is granted only on the transition out "
-                f"of {STATE_REQUIRED!r}, which the resume tranche (#13813) owns"
-            )
-        if self.resume != GateResume():
-            raise OperatorStartupGateError(
-                f"a {STATE_REQUIRED!r} operator startup gate must carry the default "
-                f"resume (nothing observed clear, {FENCE_NOT_RESERVED!r}, no consumed "
-                f"delivery); an advanced resume state is the resume tranche's (#13813)"
-            )
+        # Delegate the per-state invariant check to the lattice module. The import is
+        # lazy (at instantiation, not module load) so the record module and the lattice
+        # module — which imports these record types — have no import cycle.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate_lattice import (
+            validate_state_invariants,
+        )
+
+        validate_state_invariants(self.state, self.approval, self.resume)
 
     def to_record(self) -> dict:
         """Full, pasteable serialization (the durable-record shape).
@@ -742,13 +799,30 @@ class OperatorStartupGate:
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> "OperatorStartupGate":
-        """Rebuild a gate from a persisted record (inverse of :meth:`to_record`)."""
+        """Rebuild a gate from a persisted record (inverse of :meth:`to_record`).
+
+        Migration-aware (schema v2): a current v2 record is read as-is, and a legacy v1
+        record — which #13812 only ever wrote in the ``required`` state — is still read,
+        admitted **only** in ``required`` and re-stamped v2. A v1 record naming any other
+        state is rejected: v1 never realized a transition-bearing state, so such a record
+        is malformed / forged rather than a genuine legacy gate. Any other version fails
+        closed.
+        """
         _require_mapping(record, field_name="operator_startup_gate")
         version = record.get("schema_version", OPERATOR_STARTUP_GATE_SCHEMA_VERSION)
-        if version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
+        state = str(_get(record, "state"))
+        if version == OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1:
+            if state != STATE_REQUIRED:
+                raise OperatorStartupGateError(
+                    f"operator startup gate v1 record names state {state!r}; v1 only "
+                    f"ever realized {STATE_REQUIRED!r}, so a v1 record in any other "
+                    f"state is malformed"
+                )
+        elif version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
             raise OperatorStartupGateError(
                 f"operator startup gate schema_version {version!r} is unsupported; "
-                f"this build understands {OPERATOR_STARTUP_GATE_SCHEMA_VERSION}"
+                f"this build understands {OPERATOR_STARTUP_GATE_SCHEMA_VERSION} "
+                f"(and reads legacy {OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1})"
             )
         approval_record = record.get("approval")
         resume_record = record.get("resume")
@@ -800,57 +874,6 @@ def build_required_gate(
         approval=None,
         resume=GateResume(),
     )
-
-
-def operator_startup_gate_record_lines(gate: OperatorStartupGate) -> list[str]:
-    """Render the pasteable durable-record projection lines (pure, redaction-safe).
-
-    Follows the #13760 ``startup_admission_record_lines`` precedent: fixed tokens and
-    a verdict only — no free text, no pane content, no absolute paths — so it is safe
-    in a pasteable delivery record / Redmine journal. It names the exact target by its
-    stable tokens and the opaque repo digest, the referenced blocker id, the approval
-    scope, and the resume anchor, and states plainly that clearing the screen is an
-    operator UI action this gate never performs.
-    """
-    # A v1 gate is always `required` with no approval; the line is phrased for that
-    # state (the owner has not acted). #13813 renders the approved-state lines.
-    approval = "awaiting owner approval"
-    return [
-        (
-            f"- operator_action_required (startup gate {gate.gate_id}, "
-            f"action_generation={gate.action_generation}, state={gate.state}): the "
-            f"{gate.target.provider_id} receiver is showing the "
-            f"{gate.classification.blocker_id} startup screen, which cannot accept a "
-            f"handoff body."
-        ),
-        (
-            f"  target: workspace={gate.target.workspace_id} "
-            f"repo={gate.target.repo_identity_digest} "
-            f"execution_root={gate.target.execution_root} lane={gate.target.lane_id} "
-            f"role={gate.target.target_role} name={gate.target.target_assigned_name} "
-            f"agent_generation={gate.target.agent_generation}"
-        ),
-        (
-            f"  classification: profile_version={gate.classification.profile_version} "
-            f"classifier_version={gate.classification.classifier_version} "
-            f"observed_at={gate.classification.observed_at}"
-        ),
-        (
-            f"  approval: {approval}. original_request: "
-            f"#{gate.original_request.issue} j#{gate.original_request.journal} "
-            f"(delivery_id={gate.original_request.delivery_id})."
-        ),
-        (
-            "  Clearing the screen is an operator action in the provider's own UI. "
-            "This projection is read-only: it never answers the prompt, sends a key, "
-            "or reserves the dispatch outbox. Resume is PENDING — the startup-clear "
-            "re-observation, the outbox fence reserve, and the exactly-once re-issue "
-            "of the original request are the resume tranche's (#13813, not yet "
-            "implemented). Do NOT re-issue the request from this projection: it makes "
-            "no exactly-once guarantee, so a manual re-send risks a lost or duplicate "
-            "request (Redmine #13812 projection / #13760 detection / #13813 resume)."
-        ),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -934,10 +957,21 @@ __all__ = (
     "ALLOWED_ACTION_OPERATOR_UI",
     "APPROVAL_SCOPE_ONE_TARGET",
     "FENCE_NOT_RESERVED",
+    "FENCE_RESERVED",
+    "FENCE_DELIVERED",
+    "FENCE_UNCERTAIN",
+    "FENCE_CANCELLED",
     "FORBIDDEN_ACTIONS",
     "OPERATOR_STARTUP_GATE_SCHEMA_VERSION",
+    "OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1",
     "ORIGINAL_REQUEST_SOURCE_REDMINE",
     "STATE_REQUIRED",
+    "STATE_OWNER_APPROVED",
+    "STATE_OPERATOR_REPORTED_DONE",
+    "STATE_VERIFIED_CLEAR",
+    "STATE_CONSUMED",
+    "STATE_SUPERSEDED",
+    "TERMINAL_STATES",
     "GateApproval",
     "GateClassification",
     "GateResume",
@@ -946,7 +980,6 @@ __all__ = (
     "OperatorStartupGateError",
     "OriginalRequest",
     "build_required_gate",
-    "operator_startup_gate_record_lines",
     "reject_path_or_secret_shaped",
     "repo_identity_digest",
 )
