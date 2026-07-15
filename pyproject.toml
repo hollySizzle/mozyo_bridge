@@ -129,6 +129,9 @@ python_version = "3.10"
 mypy_path = "src"
 files = [
     "src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain",
+    # Redmine #13729 tranche 2: the handoff Anchor/Profile Envelope Planner boundary
+    # (typed value objects + Protocol port + fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_envelope_planner.py",
 ]
 # The repo is not yet type-clean as a whole: do not chase imports out of the
 # typed island into untyped modules, and tolerate third-party packages that
@@ -148,6 +151,16 @@ no_implicit_optional = true
 # globally) is how the gate ratchets one bounded context at a time.
 [[tool.mypy.overrides]]
 module = "mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 2: the handoff envelope planner boundary is held to the
+# same fully-annotated bar as the CI-verification island (value objects / Protocol
+# port / live adapter all typed). Ratcheted one bounded context at a time.
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true

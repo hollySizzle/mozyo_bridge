@@ -15,6 +15,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from typing import cast
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -25,22 +26,46 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     HandoffEnvelope,
     HandoffEnvelopePlanner,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner import (
+    EnvelopePlannerOps,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AnchorError,
+    AsanaAnchor,
+    ExecutionRoot,
+    NormalizedAnchor,
+    RedmineAnchor,
     TicketlessConsultationAnchor,
     TicketlessWorkIntakeAnchor,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
+    RoleProfileResolution,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
+    TicketlessCallback,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
     CALLBACK_METHODS as CONSULT_CALLBACK_METHODS,
     CONSULTATION_PROJECT_DOMAIN,
+    TicketlessConsultation,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
     CALLBACK_METHODS as WORK_INTAKE_CALLBACK_METHODS,
     ROLE_DELEGATED_COORDINATOR,
+    TicketlessWorkIntake,
     WORK_SHAPE_DOMAIN_DESIGN,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    TransitionRoleBoundary,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
+    WorkflowContractBundle,
+    resolve_workflow_contract,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    ROLE_GRANDPARENT_COORDINATOR,
     ROLE_PROJECT_GATEWAY,
+    resolve_transition_role,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (
     HandoffCommandInput,
@@ -56,83 +81,115 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow
 )
 
 
-class _Role:
-    def __init__(self, resolved_text: str) -> None:
-        self.resolved_text = resolved_text
-
-
 class FakeOps:
-    """Constructor-injectable fake :class:`EnvelopePlannerOps` with per-call scripting."""
+    """Constructor-injected typed fake :class:`EnvelopePlannerOps`.
 
-    def __init__(self, **overrides) -> None:
+    Every method returns the REAL concrete value object its Protocol signature
+    declares (so the tests pin concrete types, not stand-in doubles) while recording
+    calls and honouring per-call ``<name>_raises`` scripting for the error branches.
+    """
+
+    def __init__(self, **overrides: object) -> None:
         self.calls: list[tuple] = []
         self._overrides = overrides
 
-    def _maybe_raise(self, name):
+    def _maybe_raise(self, name: str) -> None:
         exc = self._overrides.get(f"{name}_raises")
         if exc is not None:
-            raise exc
+            raise cast(Exception, exc)
 
-    def normalize_anchor(self, source, *, task_id, comment_id, anchor_url, issue, journal):
+    def normalize_anchor(
+        self, source, *, task_id, comment_id, anchor_url, issue, journal
+    ) -> NormalizedAnchor:
         self.calls.append(("normalize_anchor", source, issue, journal))
         self._maybe_raise("normalize_anchor")
-        return self._overrides.get("anchor", ("ANCHOR", source, issue))
+        if source == "asana":
+            return AsanaAnchor(task_id=task_id or "T1", comment_id=comment_id)
+        return RedmineAnchor(issue=issue or "9", journal=journal or "9")
 
-    def build_execution_root(self, workdir_abs, *, repo_root_abs):
+    def build_execution_root(self, workdir_abs, *, repo_root_abs) -> ExecutionRoot:
         self.calls.append(("build_execution_root", workdir_abs, repo_root_abs))
-        return ("EXEC", workdir_abs, repo_root_abs)
+        return ExecutionRoot(workdir=workdir_abs, repo_root=repo_root_abs)
 
-    def infer_repo_root(self, cwd):
+    def infer_repo_root(self, cwd) -> str | None:
         self.calls.append(("infer_repo_root", cwd))
-        return self._overrides.get("inferred_root", "/inferred")
+        return cast("str | None", self._overrides.get("inferred_root", "/inferred"))
 
-    def resolve_handoff_profile_fields(self, role_profile, profile_field, human_pointer, repo_root):
+    def resolve_handoff_profile_fields(
+        self, role_profile, profile_field, human_pointer, repo_root
+    ) -> dict[str, str]:
         self.calls.append(("resolve_handoff_profile_fields", role_profile, human_pointer))
         self._maybe_raise("resolve_handoff_profile_fields")
         return {"role": role_profile}
 
-    def resolve_role_profile(self, role_profile, profile_fields):
+    def resolve_role_profile(self, role_profile, profile_fields) -> RoleProfileResolution:
         self.calls.append(("resolve_role_profile", role_profile))
         self._maybe_raise("resolve_role_profile")
-        return _Role(f"contract::{role_profile}")
+        return RoleProfileResolution(
+            role_profile=role_profile,
+            profile_source="builtin",
+            profile_version="1",
+            resolved_text=f"contract::{role_profile}",
+            unresolved_placeholders=(),
+        )
 
-    def resolve_transition_role(self, transition_role):
+    def resolve_transition_role(self, transition_role) -> TransitionRoleBoundary:
+        # These two value objects self-validate in ``__post_init__``; delegate to the
+        # real (pure) token resolver so the fake returns a genuinely valid concrete
+        # boundary/bundle, and a bad token fails closed exactly as production does.
         self.calls.append(("resolve_transition_role", transition_role))
         self._maybe_raise("resolve_transition_role")
-        return ("TRANSITION", transition_role)
+        return resolve_transition_role(transition_role)
 
-    def resolve_workflow_contract(self, workflow_contract):
+    def resolve_workflow_contract(self, workflow_contract) -> WorkflowContractBundle:
         self.calls.append(("resolve_workflow_contract", workflow_contract))
         self._maybe_raise("resolve_workflow_contract")
-        return ("CONTRACT", workflow_contract)
+        return resolve_workflow_contract(workflow_contract)
 
-    def build_notification_body(self, anchor, kind, summary, receiver, **kw):
-        self.calls.append(("build_notification_body", kind, receiver, kw))
+    def build_notification_body(
+        self,
+        anchor,
+        kind,
+        summary,
+        receiver,
+        *,
+        execution_root,
+        role_profile,
+        transition_role,
+        workflow_contract,
+        ticketless_callback,
+        ticketless_consultation,
+        ticketless_work_intake,
+    ) -> str:
+        self.calls.append(("build_notification_body", kind, receiver))
         self._maybe_raise("build_notification_body")
         return f"BODY::{kind}::{receiver}"
 
-    def build_marker(self, anchor, kind, receiver):
+    def build_marker(self, anchor, kind, receiver) -> str:
         self.calls.append(("build_marker", kind, receiver))
         return f"MARKER::{kind}::{receiver}"
+
+
+# Structural conformance to the typed port (fails at import if a signature drifts).
+_FAKE_OPS_IS_PORT: EnvelopePlannerOps = FakeOps()
 
 
 def _inp(**kw) -> HandoffCommandInput:
     return HandoffCommandInput(**kw)
 
 
-class _Anchorish:
-    def human_pointer(self):
-        return "#9 j#9"
+def _anchor() -> NormalizedAnchor:
+    return RedmineAnchor(issue="9", journal="9")
 
 
 class PlanAnchorTest(unittest.TestCase):
     def test_redmine_anchor_success(self) -> None:
-        ops = FakeOps(anchor="RM")
+        ops = FakeOps()
         plan = HandoffEnvelopePlanner(ops).plan_anchor(
             _inp(source="redmine", issue="9", journal="9")
         )
         self.assertIsInstance(plan, AnchorPlan)
-        self.assertEqual(plan.anchor, "RM")
+        self.assertIsInstance(plan.anchor, RedmineAnchor)
         self.assertIsNone(plan.callback_payload)
         self.assertIn(("normalize_anchor", "redmine", "9", "9"), ops.calls)
 
@@ -157,7 +214,7 @@ class PlanAnchorTest(unittest.TestCase):
                 read_contract="grandparent_coordinator",
             )
         )
-        self.assertIsNotNone(plan.callback_payload)
+        self.assertIsInstance(plan.callback_payload, TicketlessCallback)
         self.assertIsNone(plan.consultation_payload)
         self.assertIsNone(plan.work_intake_payload)
 
@@ -171,11 +228,11 @@ class PlanAnchorTest(unittest.TestCase):
 
     # -- Asana: same non-ticketless branch as Redmine, delegating to the port ----
     def test_asana_anchor_delegates_to_normalize_anchor_port(self) -> None:
-        ops = FakeOps(anchor="ASANA")
+        ops = FakeOps()
         plan = HandoffEnvelopePlanner(ops).plan_anchor(
             _inp(source="asana", task_id="T1", comment_id="C1")
         )
-        self.assertEqual(plan.anchor, "ASANA")
+        self.assertIsInstance(plan.anchor, AsanaAnchor)
         self.assertIsNone(plan.callback_payload)
         # the anchored branch DOES call the normalize_anchor port, with source=asana
         self.assertIn(("normalize_anchor", "asana", None, None), ops.calls)
@@ -193,7 +250,7 @@ class PlanAnchorTest(unittest.TestCase):
                 read_contract="project_gateway",
             )
         )
-        self.assertIsNotNone(plan.consultation_payload)
+        self.assertIsInstance(plan.consultation_payload, TicketlessConsultation)
         self.assertIsNone(plan.callback_payload)
         self.assertIsNone(plan.work_intake_payload)
         self.assertIsInstance(plan.anchor, TicketlessConsultationAnchor)
@@ -230,7 +287,7 @@ class PlanAnchorTest(unittest.TestCase):
                 read_contract=ROLE_DELEGATED_COORDINATOR,
             )
         )
-        self.assertIsNotNone(plan.work_intake_payload)
+        self.assertIsInstance(plan.work_intake_payload, TicketlessWorkIntake)
         self.assertIsNone(plan.callback_payload)
         self.assertIsNone(plan.consultation_payload)
         self.assertIsInstance(plan.anchor, TicketlessWorkIntakeAnchor)
@@ -257,7 +314,7 @@ class PlanAnchorTest(unittest.TestCase):
 class PlanDeliveryEnvelopeTest(unittest.TestCase):
     def _plan(self, ops, inp, **kw):
         base = dict(
-            anchor=_Anchorish(),
+            anchor=_anchor(),
             callback_payload=None,
             consultation_payload=None,
             work_intake_payload=None,
@@ -285,7 +342,9 @@ class PlanDeliveryEnvelopeTest(unittest.TestCase):
         env = self._plan(
             ops, _inp(workdir="/w"), resolved_target_repo="/target-repo"
         )
-        self.assertEqual(env.execution_root[0], "EXEC")
+        self.assertIsInstance(env.execution_root, ExecutionRoot)
+        assert env.execution_root is not None
+        self.assertEqual(env.execution_root.repo_root, "/target-repo")
         # infer_repo_root NOT called when an explicit target repo is present
         self.assertFalse(any(c[0] == "infer_repo_root" for c in ops.calls))
 
@@ -320,7 +379,12 @@ class PlanDeliveryEnvelopeTest(unittest.TestCase):
         ops = FakeOps(resolve_workflow_contract_raises=WorkflowContractError("bad wc"))
         with self.assertRaises(EnvelopePlanError) as ctx:
             self._plan(
-                ops, _inp(role_profile="r", transition_role="t", workflow_contract="w")
+                ops,
+                _inp(
+                    role_profile="r",
+                    transition_role=ROLE_GRANDPARENT_COORDINATOR,
+                    workflow_contract="w",
+                ),
             )
         exc = ctx.exception
         self.assertEqual(
