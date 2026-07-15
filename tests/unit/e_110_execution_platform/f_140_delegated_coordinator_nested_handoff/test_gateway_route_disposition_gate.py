@@ -121,7 +121,6 @@ class DispositionGateWiringTest(unittest.TestCase):
             gateway_route_gate, "load_workflow_binding", return_value=(_FakeBinding(), [])
         ), patch.object(gateway_route_gate, "die", side_effect=_Die):
             enforce_gateway_route(
-                args,
                 kind="implementation_request",
                 receiver="codex",
                 preflight_target=target,
@@ -132,6 +131,7 @@ class DispositionGateWiringTest(unittest.TestCase):
                 record_format="text",
                 record_command=None,
                 emit=lambda outcome, **kw: emitted.append(outcome),
+                allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
                 sender_lane_unit=(None, None),
             )
         return emitted

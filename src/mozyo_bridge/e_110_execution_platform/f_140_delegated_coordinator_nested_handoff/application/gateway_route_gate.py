@@ -16,7 +16,6 @@ through the exact same record path as every other ``orchestrate_handoff`` gate.
 
 from __future__ import annotations
 
-import argparse
 import sys
 from typing import Any, Callable, Optional, Tuple
 
@@ -84,7 +83,6 @@ def _resolve_target_disposition(preflight_target: Any) -> Tuple[Optional[str], b
 
 
 def enforce_gateway_route(
-    args: argparse.Namespace,
     *,
     kind: str | None,
     receiver: str,
@@ -96,6 +94,7 @@ def enforce_gateway_route(
     record_format: str,
     record_command: str | None,
     emit: Callable[..., None],
+    allow_direct_worker: bool,
     sender_lane_unit: Optional[Tuple[Optional[str], Optional[str]]] = None,
 ) -> None:
     """Apply the #12918 gateway-route gate; fail closed on a cross-lane worker send.
@@ -156,7 +155,7 @@ def enforce_gateway_route(
             target_workspace_id=preflight_target.workspace_id,
             target_lane_id=preflight_target.lane_id,
             target_role=preflight_target.role,
-            allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
+            allow_direct_worker=allow_direct_worker,
             worker_provider=worker_provider,
             gateway_provider=gateway_provider,
             # Redmine #13681 W3 + R1 F2/F3 (j#77247): zero-send ANY delivery to a lane the

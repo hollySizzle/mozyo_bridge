@@ -4,32 +4,45 @@
 ``argparse.Namespace`` (plus ``orchestrate_handoff``'s entry-policy keyword
 parameters) is converted into the typed
 :class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input.HandoffCommandInput`
-value object. "The Namespace ends here" (design j#78394): later tranches take the
-value object, not the Namespace.
+value object. "The Namespace ends here" (design j#78394; review j#78706 R1): the
+facade reads every parsed input off the value object and passes typed scalars /
+callbacks to the routing / target / gate / record helpers — none of them receives
+the ``argparse.Namespace``.
 
-The conversion is a *dumb field capture*: every field is read with exactly the
-``getattr(args, "<name>", <default>)`` default the original ``orchestrate_handoff``
-body used at its primary read site, and no coercion is applied. The body keeps
-its own normalization (``inp.mode or MODE_QUEUE_ENTER``,
-``float(inp.landing_timeout or 8.0)``, ``int(inp.read_lines or 50)``, ...), so
-substituting ``inp.<field>`` for the ``getattr`` call is byte-for-byte
-behaviour-preserving.
+The conversion is a *default-preserving field capture*: every field is read with
+exactly the ``getattr(args, "<name>", <default>)`` default the original
+``orchestrate_handoff`` body used at its primary read site, and no coercion is
+applied (the facade keeps its own ``or`` / ``int`` / ``float`` normalization).
+The two repeatable list inputs are snapshotted into tuples (review j#78706 R2) so
+the value object is deeply immutable: a later mutation of the original Namespace
+list cannot mutate the captured input.
 
-``mode`` and ``landing_timeout`` are the two fields whose original body read used
-a non-``None`` / dual default. Both are captured raw with a ``None`` default: the
-body's surviving ``or MODE_QUEUE_ENTER`` / ``or 8.0`` reproduce the original value
-for every input (absent attribute, ``None``, ``""``, ``0``), and
-``landing_timeout``'s second read site (``getattr(args, "landing_timeout", None)``)
-already used a ``None`` default.
+``mode`` and ``landing_timeout`` are captured raw with a ``None`` default: the
+facade's surviving ``or MODE_QUEUE_ENTER`` / ``or 8.0`` reproduce the original
+value for every input (absent attribute, ``None``, ``""``, ``0``), and
+``landing_timeout``'s second read site already used a ``None`` default.
 """
 
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_command_input import (
     HandoffCommandInput,
 )
+
+
+def _as_tuple(value: Any) -> tuple[str, ...] | None:
+    """Snapshot a repeatable list input into an immutable tuple (``None`` -> ``None``).
+
+    ``callback_methods`` and ``profile_field`` reach the Namespace as mutable
+    lists; capturing a tuple makes :class:`HandoffCommandInput` deeply immutable
+    (review j#78706 R2) without changing any downstream iteration.
+    """
+    if value is None:
+        return None
+    return tuple(value)
 
 
 class HandoffNamespaceAdapter:
@@ -79,18 +92,23 @@ class HandoffNamespaceAdapter:
             workflow_next_owner=getattr(args, "workflow_next_owner", None),
             callback_reason=getattr(args, "callback_reason", None),
             callback_to_role=getattr(args, "callback_to_role", None),
-            callback_methods=getattr(args, "callback_methods", None),
+            callback_methods=_as_tuple(getattr(args, "callback_methods", None)),
             read_contract=getattr(args, "read_contract", None),
             forward_action_id=getattr(args, "forward_action_id", ""),
             # target / activation
             target=getattr(args, "target", None),
+            target_repo=getattr(args, "target_repo", None),
+            target_lane=getattr(args, "target_lane", None),
             target_project=getattr(args, "target_project", None),
             no_target_activation=getattr(args, "no_target_activation", False),
             restore_previous_active=getattr(args, "restore_previous_active", False),
+            # route gates
+            allow_direct_worker=getattr(args, "allow_direct_worker", False),
+            main_lane_exception=getattr(args, "main_lane_exception", None),
             # execution root / profile / contract
             workdir=getattr(args, "workdir", None),
             role_profile=getattr(args, "role_profile", None),
-            profile_field=getattr(args, "profile_field", None),
+            profile_field=_as_tuple(getattr(args, "profile_field", None)),
             transition_role=getattr(args, "transition_role", None),
             workflow_contract=getattr(args, "workflow_contract", None),
             # transport rail knobs
@@ -101,4 +119,10 @@ class HandoffNamespaceAdapter:
             queue_enter_retry_interval=getattr(
                 args, "queue_enter_retry_interval", None
             ),
+            # delivery record / outcome
+            record_format=getattr(args, "record_format", None),
+            record_command=getattr(args, "record_command", None),
+            persist_delivery=getattr(args, "persist_delivery", False),
+            submit_intent=getattr(args, "submit_intent", None),
+            submit_delivery_id=getattr(args, "submit_delivery_id", None),
         )

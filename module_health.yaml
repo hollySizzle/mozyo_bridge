@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3593
+    lines: 3636
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1073,6 +1073,17 @@ allowlist:
       (mutated in place, re-read by not-yet-extracted target resolution). Later
       tranches (design j#78394 Tasks 2-5) extract the 1699-line body and drain this
       toward `commands.py < 2200`.
+      Raised 3593 -> 3636 for #13729 tranche 1 review j#78706 correction (R1
+      Namespace confinement): the facade now captures the full command input in
+      `HandoffCommandInput`, resolves the repo root once at its boundary, models
+      the `--target-repo auto` mutation as a typed local (`resolved_target_repo`),
+      passes a publish callback + typed scalars (allow_direct_worker /
+      main_lane_exception / target_repo / target_lane / record / submit / persist)
+      to the herdr target trio, the gateway-route / main-lane / startup-admission
+      gates, and the delivery-record helpers, so no routing / target / gate /
+      record helper accepts an `argparse.Namespace`. The +43 is the explicit
+      typed-scalar wiring at those call sites; the helper bodies did NOT move here
+      (their logic stays in their own modules, drained one family per tranche).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -23,6 +23,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     VIEW_KIND_NORMAL_WINDOW,
@@ -47,6 +48,25 @@ def _args(repo):
     ns.repo = str(repo)
     ns.to = "claude"
     return ns
+
+
+# Redmine #13729: the herdr send helpers are now Namespace-free; these thin
+# adapters derive the same scalars the facade passes (repo root + raw target
+# fields) from an ``args`` fixture, so the fixtures stay unchanged.
+def _effective_from_args(args):
+    return herdr_effective_backend_selected(
+        repo_root=repo_root_from_args(args), target=getattr(args, "target", None)
+    )
+
+
+def _resolve_from_args(args, *, receiver):
+    return resolve_herdr_send_target(
+        repo_root=repo_root_from_args(args),
+        target=getattr(args, "target", None),
+        target_repo=getattr(args, "target_repo", None),
+        target_lane=getattr(args, "target_lane", None),
+        receiver=receiver,
+    )
 
 
 class _Ctx:
@@ -127,7 +147,7 @@ class EffectiveBackendSelectionTest(unittest.TestCase):
             self.assertTrue(herdr_backend_selected(args))
             self.assertTrue(explicit_tmux_pane_target(args))
             # ...but the effective (target-kind-narrowed) predicate routes it to tmux.
-            self.assertFalse(herdr_effective_backend_selected(args))
+            self.assertFalse(_effective_from_args(args))
 
     def test_implicit_receiver_target_stays_effective_herdr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,21 +155,21 @@ class EffectiveBackendSelectionTest(unittest.TestCase):
             # No explicit target (role-based `--to claude` implicit resolution).
             args = self._args(ctx.repo, target=None)
             self.assertFalse(explicit_tmux_pane_target(args))
-            self.assertTrue(herdr_effective_backend_selected(args))
+            self.assertTrue(_effective_from_args(args))
             # A receiver-label target (not a `%pane`) is also implicit resolution.
             args_label = self._args(ctx.repo, target="claude")
             self.assertFalse(explicit_tmux_pane_target(args_label))
-            self.assertTrue(herdr_effective_backend_selected(args_label))
+            self.assertTrue(_effective_from_args(args_label))
 
     def test_tmux_config_is_never_effective_herdr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(tmp, backend="tmux")
             # Neither an explicit pane nor an implicit target flips a tmux config.
             self.assertFalse(
-                herdr_effective_backend_selected(self._args(ctx.repo, target="%45"))
+                _effective_from_args(self._args(ctx.repo, target="%45"))
             )
             self.assertFalse(
-                herdr_effective_backend_selected(self._args(ctx.repo, target=None))
+                _effective_from_args(self._args(ctx.repo, target=None))
             )
 
 
@@ -158,7 +178,7 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
         with patch("subprocess.run", ctx.run), patch.dict(
             os.environ, ctx.env(with_sender=with_sender), clear=True
         ):
-            return resolve_herdr_send_target(_args(ctx.repo), receiver=receiver)
+            return _resolve_from_args(_args(ctx.repo), receiver=receiver)
 
     def test_synthesizes_normal_window_projection(self) -> None:
         # Redmine #13305: the real send path is now lane-in-match, so the target must
@@ -273,7 +293,7 @@ class CrossWorkspaceHerdrSendTargetTest(unittest.TestCase):
         with patch("subprocess.run", ctx.run), patch.dict(
             os.environ, ctx.env(), clear=True
         ):
-            return resolve_herdr_send_target(args, receiver=args.to)
+            return _resolve_from_args(args, receiver=args.to)
 
     def test_resolves_lane_gateway_in_target_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,7 +371,7 @@ class SharedWorkspaceExplicitLaneDispatchTest(unittest.TestCase):
         with patch("subprocess.run", ctx.run), patch.dict(
             os.environ, ctx.env(), clear=True
         ):
-            return resolve_herdr_send_target(args, receiver=args.to)
+            return _resolve_from_args(args, receiver=args.to)
 
     @staticmethod
     def _lane_worktree(tmp, ctx) -> Path:
@@ -453,7 +473,7 @@ class CoordinatorPseudoTargetHerdrSendTest(unittest.TestCase):
         with patch("subprocess.run", ctx.run), patch.dict(
             os.environ, ctx.env(), clear=True
         ):
-            return resolve_herdr_send_target(args, receiver=args.to)
+            return _resolve_from_args(args, receiver=args.to)
 
     @staticmethod
     def _rows(ws):

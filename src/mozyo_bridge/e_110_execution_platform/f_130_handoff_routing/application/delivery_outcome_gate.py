@@ -22,6 +22,7 @@ predicate the callers read.
 from __future__ import annotations
 
 import argparse
+from typing import Any, Callable
 
 #: The only transport result that counts as a positive delivery: the send landed AND the landing
 #: marker was observed.
@@ -54,7 +55,7 @@ def delivery_was_positive(args: argparse.Namespace) -> bool:
     )
 
 
-def make_publishing_emitter(args: argparse.Namespace, emit):
+def make_publishing_emitter(publish: Callable[[Any], None], emit):
     """Wrap ``emit`` so every emitted outcome is published first (Redmine #13583 R3-F1).
 
     ``orchestrate_handoff`` has many terminal paths (blocked / invalid-args / pending / the
@@ -64,10 +65,16 @@ def make_publishing_emitter(args: argparse.Namespace, emit):
     always ``False`` and a correlated forward generation could never complete (a fail-safe stuck
     lifecycle). Routing every emit through this wrapper makes publication a property of *emitting*,
     so a newly added terminal path cannot silently miss it.
+
+    Redmine #13729: takes a ``publish`` callback instead of the ``argparse.Namespace``.
+    The facade — which owns the Namespace as its caller's return channel — passes
+    ``lambda outcome: publish_delivery_outcome(args, outcome)``, so this wrapper (and
+    every deep handoff helper) is Namespace-free while the delivery-outcome hand-back
+    stays byte-identical.
     """
 
     def _emit(outcome, **emit_kwargs):
-        publish_delivery_outcome(args, outcome)
+        publish(outcome)
         emit(outcome, **emit_kwargs)
 
     return _emit
