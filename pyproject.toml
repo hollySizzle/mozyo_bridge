@@ -132,6 +132,10 @@ files = [
     # Redmine #13729 tranche 2: the handoff Anchor/Profile Envelope Planner boundary
     # (typed value objects + Protocol port + fully-annotated live adapter).
     "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_envelope_planner.py",
+    # Its constructor-injected fake port: checked so the `EnvelopePlannerOps`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_envelope_planner.py",
 ]
 # The repo is not yet type-clean as a whole: do not chase imports out of the
 # typed island into untyped modules, and tolerate third-party packages that

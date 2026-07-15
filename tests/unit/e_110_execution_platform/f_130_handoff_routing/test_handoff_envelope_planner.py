@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import Iterable, Mapping, cast
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -99,7 +99,14 @@ class FakeOps:
             raise cast(Exception, exc)
 
     def normalize_anchor(
-        self, source, *, task_id, comment_id, anchor_url, issue, journal
+        self,
+        source: str | None,
+        *,
+        task_id: str | None,
+        comment_id: str | None,
+        anchor_url: str | None,
+        issue: str | None,
+        journal: str | None,
     ) -> NormalizedAnchor:
         self.calls.append(("normalize_anchor", source, issue, journal))
         self._maybe_raise("normalize_anchor")
@@ -107,22 +114,30 @@ class FakeOps:
             return AsanaAnchor(task_id=task_id or "T1", comment_id=comment_id)
         return RedmineAnchor(issue=issue or "9", journal=journal or "9")
 
-    def build_execution_root(self, workdir_abs, *, repo_root_abs) -> ExecutionRoot:
+    def build_execution_root(
+        self, workdir_abs: str, *, repo_root_abs: str | None
+    ) -> ExecutionRoot:
         self.calls.append(("build_execution_root", workdir_abs, repo_root_abs))
         return ExecutionRoot(workdir=workdir_abs, repo_root=repo_root_abs)
 
-    def infer_repo_root(self, cwd) -> str | None:
+    def infer_repo_root(self, cwd: str) -> str | None:
         self.calls.append(("infer_repo_root", cwd))
         return cast("str | None", self._overrides.get("inferred_root", "/inferred"))
 
     def resolve_handoff_profile_fields(
-        self, role_profile, profile_field, human_pointer, repo_root
+        self,
+        role_profile: str,
+        profile_field: Iterable[str] | None,
+        human_pointer: str,
+        repo_root: Path,
     ) -> dict[str, str]:
         self.calls.append(("resolve_handoff_profile_fields", role_profile, human_pointer))
         self._maybe_raise("resolve_handoff_profile_fields")
         return {"role": role_profile}
 
-    def resolve_role_profile(self, role_profile, profile_fields) -> RoleProfileResolution:
+    def resolve_role_profile(
+        self, role_profile: str, profile_fields: Mapping[str, str] | None
+    ) -> RoleProfileResolution:
         self.calls.append(("resolve_role_profile", role_profile))
         self._maybe_raise("resolve_role_profile")
         return RoleProfileResolution(
@@ -133,7 +148,7 @@ class FakeOps:
             unresolved_placeholders=(),
         )
 
-    def resolve_transition_role(self, transition_role) -> TransitionRoleBoundary:
+    def resolve_transition_role(self, transition_role: str) -> TransitionRoleBoundary:
         # These two value objects self-validate in ``__post_init__``; delegate to the
         # real (pure) token resolver so the fake returns a genuinely valid concrete
         # boundary/bundle, and a bad token fails closed exactly as production does.
@@ -141,36 +156,40 @@ class FakeOps:
         self._maybe_raise("resolve_transition_role")
         return resolve_transition_role(transition_role)
 
-    def resolve_workflow_contract(self, workflow_contract) -> WorkflowContractBundle:
+    def resolve_workflow_contract(self, workflow_contract: str) -> WorkflowContractBundle:
         self.calls.append(("resolve_workflow_contract", workflow_contract))
         self._maybe_raise("resolve_workflow_contract")
         return resolve_workflow_contract(workflow_contract)
 
     def build_notification_body(
         self,
-        anchor,
-        kind,
-        summary,
-        receiver,
+        anchor: NormalizedAnchor,
+        kind: str,
+        summary: str | None,
+        receiver: str,
         *,
-        execution_root,
-        role_profile,
-        transition_role,
-        workflow_contract,
-        ticketless_callback,
-        ticketless_consultation,
-        ticketless_work_intake,
+        execution_root: ExecutionRoot | None,
+        role_profile: RoleProfileResolution | None,
+        transition_role: TransitionRoleBoundary | None,
+        workflow_contract: WorkflowContractBundle | None,
+        ticketless_callback: TicketlessCallback | None,
+        ticketless_consultation: TicketlessConsultation | None,
+        ticketless_work_intake: TicketlessWorkIntake | None,
     ) -> str:
         self.calls.append(("build_notification_body", kind, receiver))
         self._maybe_raise("build_notification_body")
         return f"BODY::{kind}::{receiver}"
 
-    def build_marker(self, anchor, kind, receiver) -> str:
+    def build_marker(
+        self, anchor: NormalizedAnchor, kind: str, receiver: str
+    ) -> str:
         self.calls.append(("build_marker", kind, receiver))
         return f"MARKER::{kind}::{receiver}"
 
 
-# Structural conformance to the typed port (fails at import if a signature drifts).
+# Structural conformance to the typed port: mypy checks this assignment (the test
+# module is in the bounded mypy island), so a FakeOps signature that drifts from
+# `EnvelopePlannerOps` fails the `python -m mypy` gate. It is NOT a runtime check.
 _FAKE_OPS_IS_PORT: EnvelopePlannerOps = FakeOps()
 
 
@@ -202,6 +221,16 @@ class PlanAnchorTest(unittest.TestCase):
         self.assertEqual(exc.message, "bad anchor")
         self.assertEqual(exc.outcome_extra, {})
         self.assertEqual(exc.emit_extra, {})
+
+    def test_none_source_preserves_domain_wording_via_live_port(self) -> None:
+        # Review j#79040 F2': the live adapter must hand a raw `None` source to the
+        # domain validator unchanged (static-only `cast`), so the AnchorError keeps its
+        # `unknown handoff source: None` wording — not `''` (which `source or ""` gave).
+        with self.assertRaises(EnvelopePlanError) as ctx:
+            HandoffEnvelopePlanner().plan_anchor(_inp(source=None))
+        self.assertEqual(ctx.exception.reason, "invalid_anchor")
+        self.assertIn("unknown handoff source: None", ctx.exception.message)
+        self.assertNotIn("unknown handoff source: ''", ctx.exception.message)
 
     def test_ticketless_callback_success(self) -> None:
         plan = HandoffEnvelopePlanner(FakeOps()).plan_anchor(
