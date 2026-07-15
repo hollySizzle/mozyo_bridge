@@ -132,7 +132,15 @@ class StartupBlocker:
                 f"ready composer, so a blocker is pinned by co-located signatures from "
                 f"the same screen (Redmine #13760 j#77947)"
             )
-        seen: list[str] = []
+        # Redmine #13760 review j#78529 finding 1: independence is checked in the SAME
+        # folded domain the matcher uses, not on raw strings. `matches` folds every
+        # signature (`fold_startup_text`) before the substring test, so two signatures
+        # that differ only in case / punctuation / whitespace fold to the SAME key, and a
+        # signature whose folded key is a substring of another's is implied by it. Either
+        # shape lets a single displayed phrase satisfy more than one AND term — the exact
+        # collapse the AND exists to prevent — even though the raw strings are distinct.
+        # So the guard rejects folded-duplicate AND folded-substring-containment.
+        folded_keys: list[str] = []
         for signature in self.all_of:
             if not isinstance(signature, str) or not signature.strip():
                 raise AgentProviderProfileError(
@@ -140,12 +148,6 @@ class StartupBlocker:
                     f"non-empty strings; got {signature!r}. A blank / non-string signature "
                     f"folds to '' and would match every screen, collapsing the AND"
                 )
-            if signature in seen:
-                raise AgentProviderProfileError(
-                    f"startup blocker {self.blocker_id!r} lists signature {signature!r} "
-                    f"more than once; a duplicate does not strengthen the AND"
-                )
-            seen.append(signature)
             if len(signature) > MAX_STARTUP_SIGNATURE_LEN:
                 raise AgentProviderProfileError(
                     f"startup blocker {self.blocker_id!r} signature is {len(signature)} "
@@ -160,6 +162,18 @@ class StartupBlocker:
                     f"{MIN_STARTUP_SIGNATURE_FOLDED_LEN} are required so a punctuation-only "
                     f"/ near-empty signature cannot match every screen"
                 )
+            for other in folded_keys:
+                if folded == other or folded in other or other in folded:
+                    raise AgentProviderProfileError(
+                        f"startup blocker {self.blocker_id!r} signature {signature!r} is not "
+                        f"independent of another signature once folded (folded key "
+                        f"{folded!r}): a duplicate, a case/punctuation/whitespace variant, "
+                        f"or a substring of another signature. One displayed phrase would "
+                        f"then satisfy more than one AND term, so the AND does not require "
+                        f"two co-located signatures — declare distinct, non-overlapping "
+                        f"phrases from the screen (Redmine #13760 j#78529)"
+                    )
+            folded_keys.append(folded)
 
     def matches(self, content: object) -> bool:
         """True iff every signature appears in ``content`` (pure; never raises).

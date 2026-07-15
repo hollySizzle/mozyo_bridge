@@ -1712,9 +1712,13 @@ no provider-specific string lives in a transport or command module. A blocker ca
 key, no answer, and no authority to dismiss the screen — clearing a trust / login prompt
 stays an operator action in the provider's own UI (mozyo never auto-accepts one).
 
-The config artifact itself carries `version` + `source` as durable contract pointers;
-an **unknown** version fails closed at load (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review
-j#78481 F2) rather than being read on a partially-understood schema.
+The config artifact itself carries `version` + `source` as durable contract pointers.
+An **unknown** version fails closed at load (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review
+j#78481 F2) rather than being read on a partially-understood schema, and the declared
+version **gates the accepted shape**: `startup_blockers` is the v2 addition, so a
+`version: "1"` record that carries it fails closed (#13760 review j#78529 F2). The "v2
+adds startup_blockers" claim and the fields the loader actually honors therefore cannot
+drift.
 
 ### What a profile may never own (enforced, not documented)
 

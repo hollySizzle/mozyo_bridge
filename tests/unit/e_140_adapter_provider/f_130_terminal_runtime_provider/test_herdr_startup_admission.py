@@ -60,7 +60,9 @@ IDLE_COMPOSER = '╭────────────────╮\n│ > T
 
 def _profile(provider_id="testprovider", blockers=()):
     record = {
-        "version": "1",
+        # v2: the startup_blockers field is the v2 addition, so a profile that declares it
+        # must be on a schema version that has it (#13760 review j#78529 F2).
+        "version": "2",
         "source": "test",
         "profiles": {
             provider_id: {
@@ -178,6 +180,108 @@ class StartupBlockerTypeInvariantTest(unittest.TestCase):
         blocker = StartupBlocker("trust", ("phrase one here", "phrase two here"))
         self.assertTrue(blocker.matches("phrase one here and phrase two here"))
         self.assertFalse(blocker.matches("phrase one here only"))
+
+
+class StartupBlockerFoldedIndependenceTest(unittest.TestCase):
+    """Review j#78529 finding 1: independence is checked in the FOLDED domain.
+
+    The R1 duplicate guard compared RAW signatures, but the matcher folds every signature
+    before the substring test. So two raw-distinct signatures that fold to the same key
+    (case / punctuation / whitespace variants), or one whose folded key is a substring of
+    another's, would pass the R1 guard yet let a SINGLE displayed phrase satisfy every AND
+    term — the exact collapse the AND exists to prevent.
+    """
+
+    def test_case_only_variant_is_rejected(self) -> None:
+        with self.assertRaises(AgentProviderProfileError):
+            StartupBlocker("trust", ("Generic Phrase", "generic phrase"))
+
+    def test_punctuation_only_variant_is_rejected(self) -> None:
+        with self.assertRaises(AgentProviderProfileError):
+            StartupBlocker("trust", ("generic phrase", "generic-phrase"))
+
+    def test_whitespace_only_variant_is_rejected(self) -> None:
+        with self.assertRaises(AgentProviderProfileError):
+            StartupBlocker("trust", ("generic phrase   ", "generic phrase"))
+
+    def test_substring_containment_is_rejected(self) -> None:
+        # A pane showing "generic phrase here" would match BOTH, so the two are not
+        # independent AND terms — the AND reduces to the longer one alone.
+        with self.assertRaises(AgentProviderProfileError):
+            StartupBlocker("trust", ("generic phrase", "generic phrase here"))
+
+    def test_a_single_phrase_can_no_longer_satisfy_the_whole_and(self) -> None:
+        # The regression property: for every fold-collapsing pair, the object that would
+        # have let one phrase match all AND terms cannot be constructed.
+        for pair in [
+            ("generic phrase", "generic-phrase"),
+            ("Generic Phrase", "generic phrase"),
+            ("generic phrase", "generic phrase here"),
+        ]:
+            with self.subTest(pair=pair):
+                with self.assertRaises(AgentProviderProfileError):
+                    StartupBlocker("trust", pair)
+
+    def test_record_load_also_rejects_fold_collapsing_signatures(self) -> None:
+        with self.assertRaises(AgentProviderProfileError):
+            _profile(blockers=[{"id": "trust", "all_of": ["generic phrase", "generic-phrase"]}])
+
+    def test_genuinely_independent_signatures_are_accepted(self) -> None:
+        blocker = StartupBlocker("trust", ("phrase one alpha", "phrase two beta"))
+        self.assertFalse(blocker.matches("phrase one alpha only"))
+        self.assertTrue(blocker.matches("phrase one alpha and phrase two beta"))
+
+    def test_every_packaged_blocker_has_independent_signatures(self) -> None:
+        # The shipped Claude blockers must satisfy the stronger independence rule (they are
+        # re-validated on every load, so this pins that the packaged data actually passes).
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (  # noqa: E501
+            AGENT_PROVIDER_PROFILES,
+        )
+
+        for blocker in AGENT_PROVIDER_PROFILES.require("claude").startup_blockers:
+            folded = [fold_startup_text(sig) for sig in blocker.all_of]
+            for i, a in enumerate(folded):
+                for j, b in enumerate(folded):
+                    if i != j:
+                        self.assertFalse(
+                            a in b,
+                            msg=f"{blocker.blocker_id}: folded {a!r} ⊆ {b!r}",
+                        )
+
+
+class ConfigVersionShapeGateTest(unittest.TestCase):
+    """Review j#78529 finding 2: the declared version gates the accepted shape.
+
+    A `version: "1"` artifact (the pre-startup_blockers shape) may not carry
+    `startup_blockers`; `version: "2"` may. Without this, the "v2 adds startup_blockers"
+    contract drifts from what the loader actually honors.
+    """
+
+    def _config(self, version, *, with_blockers):
+        profile = {
+            "protocol": "interactive_cli_tui",
+            "executable": {"command": "p", "env_override": "P_BIN"},
+        }
+        if with_blockers:
+            profile["startup_blockers"] = [
+                {"id": "trust", "all_of": ["phrase one alpha", "phrase two beta"]}
+            ]
+        return AgentProviderProfileConfig.from_record(
+            {"version": version, "source": "test", "profiles": {"p": profile}}
+        )
+
+    def test_v1_without_startup_blockers_loads(self) -> None:
+        config = self._config("1", with_blockers=False)
+        self.assertEqual(config.profiles[0].startup_blockers, ())
+
+    def test_v1_with_startup_blockers_fails_closed(self) -> None:
+        with self.assertRaises(AgentProviderProfileError) as ctx:
+            self._config("1", with_blockers=True)
+        self.assertIn("startup_blockers", str(ctx.exception))
+
+    def test_v2_with_and_without_startup_blockers_both_load(self) -> None:
+        self.assertEqual(len(self._config("2", with_blockers=True).profiles[0].startup_blockers), 1)
+        self.assertEqual(self._config("2", with_blockers=False).profiles[0].startup_blockers, ())
 
 
 class ConfigSchemaVersionTest(unittest.TestCase):

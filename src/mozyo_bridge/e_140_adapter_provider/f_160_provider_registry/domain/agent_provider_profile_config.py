@@ -219,6 +219,23 @@ _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
 #: loader a new shape.
 SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2"})
 
+#: Schema versions whose shape predates ``startup_blockers`` (Redmine #13760 review
+#: j#78529 finding 2). The field is the v2 addition, so a ``version: "1"`` artifact that
+#: declares it is a shape/version drift and fails closed — the declared "v2 adds
+#: startup_blockers" contract and the runtime shape stay in lock-step instead of the loader
+#: silently honoring a field the artifact's own version says it does not have. An explicit
+#: set (not a ``<`` comparison) so a future ``"10"`` cannot be mis-ordered against ``"2"``.
+_VERSIONS_WITHOUT_STARTUP_BLOCKERS: frozenset[str] = frozenset({"1"})
+#: The version a profile is nominally on when it may carry startup_blockers (for messages).
+_STARTUP_BLOCKERS_MIN_VERSION = "2"
+
+#: The version threaded to :meth:`AgentProviderProfile.from_record` when no config wrapper
+#: supplies one (a bare, context-free profile parse in a test). The newest supported
+#: version — a context-free parse is not artificially restricted; the artifact-level
+#: version gate is enforced by :meth:`AgentProviderProfileConfig.from_record`, which always
+#: passes the real declared version.
+_DEFAULT_PARSE_VERSION = "2"
+
 #: Wheel-packaged resource (a sibling of the registry module) shipping the built-in
 #: profiles. Read via ``importlib.resources`` in :mod:`.agent_provider_profile` — a
 #: package-anchored resource, never a cwd / worktree path walk, so a hostile repo
@@ -485,13 +502,22 @@ class AgentProviderProfile:
         return capability in self.capabilities
 
     @classmethod
-    def from_record(cls, provider_id: object, record: object) -> "AgentProviderProfile":
+    def from_record(
+        cls,
+        provider_id: object,
+        record: object,
+        *,
+        schema_version: str = _DEFAULT_PARSE_VERSION,
+    ) -> "AgentProviderProfile":
         """Validate one already-parsed profile entry, failing closed.
 
         Rejects: a non-string / empty / authority-shaped ``provider_id``, a
         non-mapping entry, an unknown or missing entry key, an unknown protocol,
         an unknown capability, an unknown managed-flag concept, a non-flag-shaped
-        flag spelling, and every shape :class:`TrustedExecutable` refuses.
+        flag spelling, every shape :class:`TrustedExecutable` refuses, and — Redmine
+        #13760 review j#78529 finding 2 — a ``startup_blockers`` field on a
+        ``schema_version`` older than :data:`_STARTUP_BLOCKERS_MIN_VERSION` (the field
+        is the v2 addition, so a v1 record declaring it is a shape/version drift).
         """
         if not isinstance(provider_id, str) or not provider_id.strip():
             raise AgentProviderProfileError(
@@ -510,6 +536,15 @@ class AgentProviderProfile:
                 f"profile {provider_id!r}; allowed: {sorted(_PROFILE_ENTRY_KEYS)}. A "
                 f"profile never carries a workflow role, a binding, a topology, or a "
                 f"module path (Redmine #13441 j#76725)."
+            )
+        if "startup_blockers" in record and schema_version in _VERSIONS_WITHOUT_STARTUP_BLOCKERS:
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} declares 'startup_blockers' but "
+                f"the config schema version is {schema_version!r}; that field was added in "
+                f"version {_STARTUP_BLOCKERS_MIN_VERSION!r}. A version's declared shape and "
+                f"the fields the loader honors must not drift — bump the artifact to "
+                f"version {_STARTUP_BLOCKERS_MIN_VERSION!r} to use startup_blockers "
+                f"(Redmine #13760 j#78529)."
             )
         missing = {"protocol", "executable"} - set(record)
         if missing:
@@ -813,7 +848,7 @@ class AgentProviderProfileConfig:
                 "of provider id -> profile"
             )
         profiles = tuple(
-            AgentProviderProfile.from_record(pid, entry)
+            AgentProviderProfile.from_record(pid, entry, schema_version=version)
             for pid, entry in sorted(raw_profiles.items(), key=lambda kv: str(kv[0]))
         )
         return cls(version=version, source=source, profiles=profiles)
