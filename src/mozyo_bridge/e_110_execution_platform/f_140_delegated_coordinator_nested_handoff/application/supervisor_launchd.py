@@ -180,8 +180,11 @@ def resolve_supervisor_command(
     """The exact argv the agent runs, or ``None`` when the executable is not on PATH.
 
     The executable is PATH-resolved at install time (so the plist survives shell-env differences)
-    and the **resolved mozyo home** is pinned as ``--home <root>`` so the launchd daemon reads the
-    same credential / registry root the install preflight validated (j#79092 R2-F1). A missing
+    and normalized to an **absolute canonical path** (``os.path.abspath``): a relative PATH entry
+    makes ``shutil.which`` return a relative path, which a LaunchAgent would resolve from its own
+    working directory rather than the installer's — the same cwd divergence closed for the ``--home``
+    pin (j#79149 R5-F1). The **resolved mozyo home** is likewise pinned as ``--home <root>`` so the
+    daemon reads the credential / registry root the preflight validated (j#79092 R2-F1). A missing
     executable is a fail-closed condition the caller turns into a zero-mutation refusal (install the
     package first) — never a shell string and never a guessed path.
     """
@@ -189,7 +192,7 @@ def resolve_supervisor_command(
     if not executable:
         return None
     return [
-        executable,
+        os.path.abspath(executable),
         *SUPERVISOR_ARGV_TAIL,
         SUPERVISOR_HOME_FLAG,
         str(resolve_mozyo_home(mozyo_home)),

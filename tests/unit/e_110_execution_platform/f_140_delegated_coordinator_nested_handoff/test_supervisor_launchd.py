@@ -115,6 +115,11 @@ def _which_missing(_name: str):
     return None
 
 
+def _which_relative(_name: str):
+    # A relative PATH entry makes shutil.which return a relative path (R5-F1).
+    return "bin/mozyo-bridge"
+
+
 class _DarwinCase(unittest.TestCase):
     """Base: force darwin + a fixed uid, and provide distinct os_home / mozyo_home temp roots."""
 
@@ -183,6 +188,12 @@ class ResolveHomeAndCommandTest(unittest.TestCase):
             ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", _resolved(Path(tmp))],
             cmd,
         )
+
+    def test_relative_executable_is_normalized_to_absolute(self) -> None:
+        # R5-F1: a relative which() result must never be pinned as-is.
+        cmd = sl.resolve_supervisor_command(mozyo_home=Path("/tmp"), which=_which_relative)
+        self.assertTrue(Path(cmd[0]).is_absolute())
+        self.assertEqual(os.path.abspath("bin/mozyo-bridge"), cmd[0])
 
     def test_missing_executable_is_none_not_a_shell_string(self) -> None:
         self.assertIsNone(sl.resolve_supervisor_command(which=_which_missing))
@@ -379,6 +390,16 @@ class InstallTest(_DarwinCase):
         self.assertEqual([], runner.calls)
         self.assertFalse(sl.plist_path(self.os_home).exists())
 
+    def test_install_pins_absolute_executable_for_relative_which(self) -> None:
+        # R5-F1: even a relative PATH resolution is pinned as an absolute path in the plist.
+        _write_home_credential(self.mozyo_home)
+        result = sl.install(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                            runner=FakeRunner(), which=_which_relative)
+        self.assertTrue(result["performed"])
+        argv0 = plistlib.loads(sl.plist_path(self.os_home).read_bytes())["ProgramArguments"][0]
+        self.assertTrue(Path(argv0).is_absolute())
+        self.assertEqual(os.path.abspath("bin/mozyo-bridge"), argv0)
+
     def test_install_bootstrap_failure_is_reported_without_host_detail(self) -> None:
         _write_home_credential(self.mozyo_home)
         runner = FakeRunner(default=_result(1, stderr="boom"))
@@ -476,6 +497,16 @@ class RestartTest(_DarwinCase):
         runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
         result = sl.restart(os_home=self.os_home, runner=runner,
                             which=lambda _n: "/new/current/mozyo-bridge")
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+        self.assertNotIn("kickstart", runner.verbs)
+
+    def test_restart_refuses_on_relative_installed_executable(self) -> None:
+        # R5-F1: a legacy plist pinning a relative executable is caught by the argv-drift authority.
+        _write_home_credential(self.mozyo_home)
+        _pinned_plist(self.os_home, _resolved(self.mozyo_home), executable="bin/mozyo-bridge")
+        runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertFalse(result["performed"])
         self.assertEqual(sl.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
         self.assertNotIn("kickstart", runner.verbs)
@@ -638,6 +669,15 @@ class ServiceStatusTest(_DarwinCase):
         )
         self.assertFalse(status["loaded"])
         self.assertIsNone(status["pid"])
+
+    def test_status_flags_relative_installed_executable(self) -> None:
+        # R5-F1: an installed relative executable reads as executable_matches=False in the projection.
+        _write_home_credential(self.mozyo_home)
+        _pinned_plist(self.os_home, _resolved(self.mozyo_home), executable="bin/mozyo-bridge")
+        status = sl.service_status(
+            os_home=self.os_home, runner=FakeRunner(print_result=_result(113)), which=_which_found
+        )
+        self.assertFalse(status["executable_matches"])
 
     def test_status_flags_executable_drift(self) -> None:
         _write_home_credential(self.mozyo_home)
