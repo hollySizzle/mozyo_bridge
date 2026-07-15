@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3577
+    lines: 3636
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1061,6 +1061,29 @@ allowlist:
       #12918 `gateway_route_gate` precedent, so this module keeps only the call and
       grows by ~26 lines instead of ~85. The provider-specific screen signatures are
       profile DATA, never source in here.
+      Raised 3577 -> 3593 for #13729 tranche 1 (handoff OOP decomposition, typed
+      input seam): `orchestrate_handoff` converts its `argparse.Namespace` + entry
+      policy once into the typed frozen `HandoffCommandInput` and reads scalar
+      inputs off it instead of scattered `getattr(args, ...)`. The value object +
+      Namespace adapter live in the new
+      `f_130_handoff_routing/domain/handoff_command_input.py` +
+      `application/handoff_command_input_adapter.py`; this module keeps only the
+      one-time conversion + the (~1:1) `inp.<field>` reads, so the +16 is the seam
+      scaffold (import + single conversion). `target_repo` stays on the Namespace
+      (mutated in place, re-read by not-yet-extracted target resolution). Later
+      tranches (design j#78394 Tasks 2-5) extract the 1699-line body and drain this
+      toward `commands.py < 2200`.
+      Raised 3593 -> 3636 for #13729 tranche 1 review j#78706 correction (R1
+      Namespace confinement): the facade now captures the full command input in
+      `HandoffCommandInput`, resolves the repo root once at its boundary, models
+      the `--target-repo auto` mutation as a typed local (`resolved_target_repo`),
+      passes a publish callback + typed scalars (allow_direct_worker /
+      main_lane_exception / target_repo / target_lane / record / submit / persist)
+      to the herdr target trio, the gateway-route / main-lane / startup-admission
+      gates, and the delivery-record helpers, so no routing / target / gate /
+      record helper accepts an `argparse.Namespace`. The +43 is the explicit
+      typed-scalar wiring at those call sites; the helper bodies did NOT move here
+      (their logic stays in their own modules, drained one family per tranche).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

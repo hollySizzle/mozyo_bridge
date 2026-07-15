@@ -149,7 +149,6 @@ class F3bGatewayGateUsesTargetRepoBinding(unittest.TestCase):
             args = argparse.Namespace(allow_direct_worker=False)
             emitted = []
             grg.enforce_gateway_route(
-                args,
                 kind="reply",  # non-governed => allowed, but the binding load still runs
                 receiver="codex",
                 preflight_target=target,
@@ -160,6 +159,7 @@ class F3bGatewayGateUsesTargetRepoBinding(unittest.TestCase):
                 record_format="both",
                 record_command=None,
                 emit=lambda *a, **k: emitted.append(a),
+                allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
                 sender_lane_unit=("wsA", "laneA"),
             )
         finally:

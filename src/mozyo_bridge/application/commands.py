@@ -56,6 +56,7 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
     maybe_persist_delivery_record as _maybe_persist_delivery_record,
     record_command_from_args as _record_command_from_args,
     record_format_from_args as _record_format_from_args,
+    record_format_from_value as _record_format_from_value,
     record_herdr_send_ledger as _record_herdr_send_ledger,
     submit_lines_for as _submit_lines_for,
 )
@@ -149,6 +150,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     normalize_anchor,
     resolve_queue_enter_retry_policy,
     resolve_standard_target_admission_policy,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_command_input_adapter import (
+    HandoffNamespaceAdapter,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (
     resolve_handoff_profile_fields,
@@ -1623,6 +1627,7 @@ def _maybe_restore_previous_active(
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E402,E501
     delivery_was_positive,
     make_publishing_emitter as _make_publishing_emitter,
+    publish_delivery_outcome as _publish_delivery_outcome,
 )
 
 
@@ -1667,25 +1672,56 @@ def orchestrate_handoff(
     would let an explicit `%pane` for a foreign Claude pane be typed into under
     a ``to=codex`` marker, defeating the gateway boundary.
     """
+    # Redmine #13729 (tranche 1): the Namespace ends here. Scalar inputs + entry
+    # policy convert once into the typed `HandoffCommandInput`; `args` still
+    # carries the mutated `target_repo` and threads to the not-yet-extracted
+    # target/transport helpers (design j#78394 Tasks 3-4).
+    inp = HandoffNamespaceAdapter.from_namespace(
+        args,
+        default_kind=default_kind,
+        require_receiver_binding=require_receiver_binding,
+        ticketless=ticketless,
+        ticketless_consultation=ticketless_consultation,
+        ticketless_work_intake=ticketless_work_intake,
+    )
+
     # Redmine #13261 (increment 2): resolve the backend once and gate every tmux-only
     # step on it. Under herdr a pure session has no tmux server, so `require_tmux()`
     # (and the tmux gates below) must not run; the target is resolved herdr-natively.
     # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
     # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
     # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
-    _emit = _make_publishing_emitter(args, _emit_outcome)
-    herdr_send = herdr_effective_backend_selected(args)
+    # Redmine #13729: the emitter takes a facade-owned publish callback (not the
+    # Namespace); the facade writes the delivery outcome onto its own `args` — its
+    # caller wrappers read it back via `delivery_was_positive(args)` after this
+    # returns — so the outcome hand-back stays byte-identical while the emitter and
+    # every deep helper are Namespace-free.
+    _emit = _make_publishing_emitter(
+        lambda outcome: _publish_delivery_outcome(args, outcome), _emit_outcome
+    )
+    # Redmine #13729: the facade's single Namespace->Path boundary conversion. The
+    # herdr backend predicate already resolves this repo root unconditionally, so
+    # computing it once here (and passing it to the herdr helpers + the profile
+    # block) is behaviour-neutral and keeps `repo_root_from_args` off the deep path.
+    repo_root = repo_root_from_args(args)
+    herdr_send = herdr_effective_backend_selected(repo_root=repo_root, target=inp.target)
     if not herdr_send:
         require_tmux()
 
-    record_format = _record_format_from_args(args)
-    record_command = _record_command_from_args(args)
+    record_format = _record_format_from_value(inp.record_format)
+    record_command = str(inp.record_command) if inp.record_command else None
 
-    receiver = getattr(args, "to", None)
+    # Redmine #13729: `--target-repo auto` / herdr-auto resolution mutated
+    # `args.target_repo` in place and later gates re-read it. Model that as an
+    # explicit typed facade-local resolution scalar so no gate reads a mutated
+    # Namespace attribute. Seeded from the initial parsed value.
+    resolved_target_repo = inp.target_repo
+
+    receiver = inp.to
     if receiver not in RECEIVERS:
         die(f"--to must be one of {sorted(RECEIVERS)}; got {receiver!r}")
 
-    if ticketless:
+    if inp.ticketless:
         # Redmine #12703: the ticketless no-anchor callback rail carries no Redmine
         # / Asana anchor, so it does not accept `--source` and is not in `SOURCES`.
         # The source token is fixed to `ticketless` for the marker / outcome. This
@@ -1693,16 +1729,16 @@ def orchestrate_handoff(
         # anchor requirement is untouched.
         source = SOURCE_TICKETLESS
     else:
-        source = getattr(args, "source", None)
+        source = inp.source
         if source not in SOURCES:
             die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
 
-    kind = getattr(args, "kind", None) or default_kind
-    mode = getattr(args, "mode", MODE_QUEUE_ENTER) or MODE_QUEUE_ENTER
+    kind = inp.kind or inp.default_kind
+    mode = inp.mode or MODE_QUEUE_ENTER
     if mode not in MODES:
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 
-    if mode == MODE_QUEUE_ENTER and bool(getattr(args, "force", False)):
+    if mode == MODE_QUEUE_ENTER and bool(inp.force):
         # Per the relaxed queue-enter rail contract, the agent gate must be
         # stricter than strict `standard`: `--force` cannot be used to bypass
         # non-agent target checks under this rail. The rail only makes sense
@@ -1746,7 +1782,7 @@ def orchestrate_handoff(
         )
         die(f"--kind must be one of {sorted(KIND_LABELS)}; got {kind!r}")
 
-    summary = getattr(args, "summary", None)
+    summary = inp.summary
 
     # Redmine #12703: the structured ticketless callback result (return leg), built
     # distinctly from the transport outcome. `None` for every anchored send/reply.
@@ -1761,7 +1797,7 @@ def orchestrate_handoff(
     # `ticketless_work_intake=True`.
     ticketless_work_intake_payload: TicketlessWorkIntake | None = None
 
-    if ticketless and ticketless_work_intake:
+    if inp.ticketless and inp.ticketless_work_intake:
         # Redmine #12748: build the structured FORWARD work-intake payload, then
         # derive the no-anchor `TicketlessWorkIntakeAnchor` from it. Construction
         # fails closed (blocked / invalid_args) on an unknown token or an empty /
@@ -1771,13 +1807,13 @@ def orchestrate_handoff(
         # rail; the payload restates the invariants for the child).
         try:
             ticketless_work_intake_payload = TicketlessWorkIntake(
-                work_shape=getattr(args, "work_shape", None),
-                callback_to_role=getattr(args, "callback_to_role", None),
-                callback_methods=getattr(args, "callback_methods", None),
-                read_contract=getattr(args, "read_contract", None),
+                work_shape=inp.work_shape,
+                callback_to_role=inp.callback_to_role,
+                callback_methods=inp.callback_methods,
+                read_contract=inp.read_contract,
                 # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
                 # so the child's returning callback echoes it to complete the exact generation.
-                forward_action_id=getattr(args, "forward_action_id", "") or "",
+                forward_action_id=inp.forward_action_id or "",
             )
         except TicketlessWorkIntakeError as exc:
             _emit(
@@ -1801,7 +1837,7 @@ def orchestrate_handoff(
             work_shape=ticketless_work_intake_payload.work_shape,
             callback_to_role=ticketless_work_intake_payload.callback_to_role,
         )
-    elif ticketless and ticketless_consultation:
+    elif inp.ticketless and inp.ticketless_consultation:
         # Redmine #12740: build the structured FORWARD consultation payload, then
         # derive the no-anchor `TicketlessConsultationAnchor` from it. Construction
         # fails closed (blocked / invalid_args) on an unknown token or an empty /
@@ -1810,13 +1846,13 @@ def orchestrate_handoff(
         # consultation rail; the payload restates the invariant for the receiver).
         try:
             ticketless_consultation_payload = TicketlessConsultation(
-                consultation_kind=getattr(args, "consultation_kind", None),
-                callback_to_role=getattr(args, "callback_to_role", None),
-                callback_methods=getattr(args, "callback_methods", None),
-                read_contract=getattr(args, "read_contract", None),
+                consultation_kind=inp.consultation_kind,
+                callback_to_role=inp.callback_to_role,
+                callback_methods=inp.callback_methods,
+                read_contract=inp.read_contract,
                 # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
                 # so the gateway's returning callback echoes it to complete the exact generation.
-                forward_action_id=getattr(args, "forward_action_id", "") or "",
+                forward_action_id=inp.forward_action_id or "",
             )
         except TicketlessConsultationError as exc:
             _emit(
@@ -1840,7 +1876,7 @@ def orchestrate_handoff(
             consultation_kind=ticketless_consultation_payload.consultation_kind,
             callback_to_role=ticketless_consultation_payload.callback_to_role,
         )
-    elif ticketless:
+    elif inp.ticketless:
         # Build the structured callback result, then derive the no-anchor
         # `TicketlessAnchor` from it. Construction fails closed (blocked /
         # invalid_args) on an unknown token or — critically — on a dispatch
@@ -1848,14 +1884,14 @@ def orchestrate_handoff(
         # Redmine anchor; the child -> grandchild boundary is not relaxed).
         try:
             ticketless_callback_payload = TicketlessCallback(
-                classification=getattr(args, "classification", None),
-                dispatch_decision=getattr(args, "dispatch_decision", None),
-                next_action_owner=getattr(args, "workflow_next_owner", None),
-                callback_reason=getattr(args, "callback_reason", None),
-                read_contract=getattr(args, "read_contract", None),
+                classification=inp.classification,
+                dispatch_decision=inp.dispatch_decision,
+                next_action_owner=inp.workflow_next_owner,
+                callback_reason=inp.callback_reason,
+                read_contract=inp.read_contract,
                 # Redmine #13583 R1-F1: echo the forward generation id the consultation/work-intake
                 # carried, so a positively-delivered callback completes the exact forward generation.
-                forward_action_id=getattr(args, "forward_action_id", "") or "",
+                forward_action_id=inp.forward_action_id or "",
             )
         except TicketlessCallbackError as exc:
             _emit(
@@ -1883,11 +1919,11 @@ def orchestrate_handoff(
         try:
             anchor = normalize_anchor(
                 source,
-                task_id=getattr(args, "task_id", None),
-                comment_id=getattr(args, "comment_id", None),
-                anchor_url=getattr(args, "anchor_url", None),
-                issue=getattr(args, "issue", None),
-                journal=getattr(args, "journal", None),
+                task_id=inp.task_id,
+                comment_id=inp.comment_id,
+                anchor_url=inp.anchor_url,
+                issue=inp.issue,
+                journal=inp.journal,
             )
         except AnchorError as exc:
             _emit(
@@ -1917,7 +1953,13 @@ def orchestrate_handoff(
         # no single live agent) emits a `target_unavailable` blocked outcome and dies
         # — never a silent tmux fallback.
         try:
-            target_info = resolve_herdr_send_target(args, receiver=receiver)
+            target_info = resolve_herdr_send_target(
+                repo_root=repo_root,
+                target=inp.target,
+                target_repo=inp.target_repo,
+                target_lane=inp.target_lane,
+                receiver=receiver,
+            )
         except HerdrSendEntryError as exc:
             _emit(
                 make_outcome(
@@ -1937,7 +1979,7 @@ def orchestrate_handoff(
             die(str(exc))
             raise AssertionError("unreachable")
     else:
-        target_arg = getattr(args, "target", None) or receiver
+        target_arg = inp.target or receiver
         try:
             target_info = pane_info(target_arg)
         except SystemExit:
@@ -2036,13 +2078,13 @@ def orchestrate_handoff(
     # hand-passed `--target-repo <root>`; auto cannot weaken them (a pane with
     # no reachable marker is rejected here, and `--to claude` cross-session is
     # still blocked downstream regardless).
-    if getattr(args, "target_repo", None) == AUTO_TARGET_REPO and herdr_send:
+    if resolved_target_repo == AUTO_TARGET_REPO and herdr_send:
         # Redmine #13331 (j#73312 #2): herdr has no `%pane` to infer from, so `auto`
         # resolves to the sender's own repo root (the same-workspace target's repo). tmux
         # `auto` is untouched (guarded on `herdr_send`). See `herdr_auto_target_repo`.
-        args.target_repo = herdr_auto_target_repo(args)
-    elif getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
-        raw_target = getattr(args, "target", None)
+        resolved_target_repo = herdr_auto_target_repo(repo_root)
+    elif resolved_target_repo == AUTO_TARGET_REPO:
+        raw_target = inp.target
         if not is_explicit_pane_target(raw_target):
             _emit(
                 make_outcome(
@@ -2110,7 +2152,7 @@ def orchestrate_handoff(
             f"target_cwd={auto_cwd!r} -> repo_root={auto_root!r}",
             file=sys.stderr,
         )
-        args.target_repo = auto_root
+        resolved_target_repo = auto_root
 
     # Explicit-pane preflight projection (Redmine #11908): resolve the target
     # pane onto the canonical `TargetRecord` identity vocabulary
@@ -2142,7 +2184,10 @@ def orchestrate_handoff(
     )
 
     if main_lane_guard_blocked(
-        args, receiver=receiver, kind=kind, preflight_target=preflight_target
+        receiver=receiver,
+        kind=kind,
+        preflight_target=preflight_target,
+        has_main_lane_exception=bool(inp.main_lane_exception),
     ):
         _emit(
             make_outcome(
@@ -2173,7 +2218,7 @@ def orchestrate_handoff(
         )
         raise AssertionError("unreachable")
 
-    if (mode == MODE_QUEUE_ENTER or require_receiver_binding) and not preflight_target.binds_receiver(receiver):
+    if (mode == MODE_QUEUE_ENTER or inp.require_receiver_binding) and not preflight_target.binds_receiver(receiver):
         # Step 9 (v0.2; role-aware since Redmine #11822, projection since #11908;
         # mode-independent for receiver-locked wrappers since Redmine #11779).
         # Under the relaxed queue-enter rail, marker miss does NOT roll back, so
@@ -2264,8 +2309,8 @@ def orchestrate_handoff(
         )
         if not same_session:
             both_sessions_known = bool(sender_session) and bool(target_session)
-            explicit_target = bool(getattr(args, "target", None))
-            has_target_repo = bool(getattr(args, "target_repo", None))
+            explicit_target = bool(inp.target)
+            has_target_repo = bool(resolved_target_repo)
             cross_session_admitted = (
                 both_sessions_known and explicit_target and has_target_repo
             )
@@ -2409,7 +2454,6 @@ def orchestrate_handoff(
         else None
     )
     enforce_gateway_route(
-        args,
         kind=kind,
         receiver=receiver,
         preflight_target=preflight_target,
@@ -2420,10 +2464,11 @@ def orchestrate_handoff(
         record_format=record_format,
         record_command=record_command,
         emit=_emit,
+        allow_direct_worker=bool(inp.allow_direct_worker),
         sender_lane_unit=herdr_sender_lane_unit,
     )
 
-    expected_target_repo = getattr(args, "target_repo", None)
+    expected_target_repo = resolved_target_repo
     if expected_target_repo:
         expected_resolved = str(Path(expected_target_repo).expanduser().resolve())
         # Prefer the real Git worktree root over a nested project-local scaffold
@@ -2495,7 +2540,7 @@ def orchestrate_handoff(
     # paths (it still gates on the Git repo root); the project scope is derived
     # separately from the target pane's cwd via the bounded project discovery, or
     # read from a stamped `@mozyo_project_scope` pane option when present.
-    expected_project = getattr(args, "target_project", None)
+    expected_project = inp.target_project
     if expected_project:
         target_cwd = target_info.get("cwd") or ""
         # Project scope is layered UNDER the Git repo identity and is never a
@@ -2621,10 +2666,10 @@ def orchestrate_handoff(
     # overrides), not scattered per caller/wrapper.
     admission_policy = resolve_standard_target_admission_policy(
         activate_inactive=(
-            False if getattr(args, "no_target_activation", False) else None
+            False if inp.no_target_activation else None
         ),
         restore_previous_active=(
-            True if getattr(args, "restore_previous_active", False) else None
+            True if inp.restore_previous_active else None
         ),
     )
     admission = evaluate_standard_target_admission(
@@ -2737,7 +2782,7 @@ def orchestrate_handoff(
             raise AssertionError("unreachable")
     else:
         try:
-            ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
+            ensure_agent_target(target_info, receiver, force=bool(inp.force))
         except SystemExit:
             _emit(
                 make_outcome(
@@ -2766,10 +2811,10 @@ def orchestrate_handoff(
     # is wording/record-layer only — it does not gate pane selection and does
     # not relax any cross-session / cross-lane boundary.
     execution_root = None
-    workdir_arg = getattr(args, "workdir", None)
+    workdir_arg = inp.workdir
     if workdir_arg:
         workdir_abs = str(Path(workdir_arg).expanduser().resolve())
-        repo_anchor = getattr(args, "target_repo", None)
+        repo_anchor = resolved_target_repo
         if repo_anchor and repo_anchor != AUTO_TARGET_REPO:
             repo_anchor_abs = str(Path(repo_anchor).expanduser().resolve())
         else:
@@ -2788,14 +2833,14 @@ def orchestrate_handoff(
     # `--profile-field`, or an unresolvable required default; omitting
     # `--role-profile` is the explicit fallback of no profile expansion.
     role_profile_resolution = None
-    role_profile_arg = getattr(args, "role_profile", None)
+    role_profile_arg = inp.role_profile
     if role_profile_arg:
         try:
             profile_fields = resolve_handoff_profile_fields(
                 role_profile_arg,
-                getattr(args, "profile_field", None),
+                inp.profile_field,
                 anchor.human_pointer(),
-                repo_root_from_args(args),
+                repo_root,
             )
             role_profile_resolution = resolve_role_profile(
                 role_profile_arg, profile_fields
@@ -2831,7 +2876,7 @@ def orchestrate_handoff(
     # Fail closed (blocked / invalid_args) on an unknown token; omitting it is the
     # explicit fallback of no role binding.
     transition_role_boundary = None
-    transition_role_arg = getattr(args, "transition_role", None)
+    transition_role_arg = inp.transition_role
     if transition_role_arg:
         try:
             transition_role_boundary = resolve_transition_role(transition_role_arg)
@@ -2865,7 +2910,7 @@ def orchestrate_handoff(
     # contract binding. The bundle carries resolvable doc pointers (catalog ids +
     # canonical + monorepo-nested paths), never doc bodies.
     workflow_contract_bundle = None
-    workflow_contract_arg = getattr(args, "workflow_contract", None)
+    workflow_contract_arg = inp.workflow_contract
     if workflow_contract_arg:
         try:
             workflow_contract_bundle = resolve_workflow_contract(workflow_contract_arg)
@@ -2935,7 +2980,7 @@ def orchestrate_handoff(
 
     marker = build_marker(anchor, kind, receiver)
 
-    read_lines = int(getattr(args, "read_lines", 50) or 50)
+    read_lines = int(inp.read_lines or 50)
     # Internal pane snapshot preflight (the standard path must not require callers to run
     # `mozyo-bridge read` first) AND — under herdr — the Redmine #13760 pre-send startup
     # admission: the same single action-time read is classified against the receiver
@@ -2947,7 +2992,6 @@ def orchestrate_handoff(
     )
 
     admit_receiver_startup_or_die(
-        args,
         herdr_send=herdr_send,
         receiver=receiver,
         target=target,
@@ -3031,7 +3075,10 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
+            submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
             turn_start_lines=turn_start_lines,
         )
         # Redmine #13300: persist every event-rail outcome (incl. delivered-not-started)
@@ -3039,8 +3086,8 @@ def orchestrate_handoff(
         _record_herdr_send_ledger(outcome)
         if status == "sent":
             _maybe_persist_delivery_record(
-                args,
                 outcome,
+                persist_delivery=bool(inp.persist_delivery),
                 duplicate_lane_panes=duplicate_lane_panes,
                 record_format=record_format,
                 turn_start_lines=turn_start_lines,
@@ -3082,17 +3129,20 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
+            submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
         )
         _maybe_persist_delivery_record(
-            args,
             outcome,
+            persist_delivery=bool(inp.persist_delivery),
             duplicate_lane_panes=duplicate_lane_panes,
             record_format=record_format,
         )
         return 0
 
-    landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
+    landing_timeout = float(inp.landing_timeout or 8.0)
     landing_lines = max(read_lines, 200)
     marker_observed = wait_for_text(target, marker, landing_lines, landing_timeout)
 
@@ -3121,7 +3171,10 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
+            submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
         )
         _emit_handoff_marker_timeout_guidance(receiver)
         die(
@@ -3130,7 +3183,7 @@ def orchestrate_handoff(
         )
         raise AssertionError("unreachable")
 
-    submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
+    submit_delay = max(0.0, float(inp.submit_delay or 0.0))
     if submit_delay:
         time.sleep(submit_delay)
 
@@ -3144,7 +3197,7 @@ def orchestrate_handoff(
     # behavior untouched (its marker-unobserved path stays `sent` / `queue_enter`).
     standard_rail = mode == MODE_STANDARD
     turn_start_window = _resolve_turn_start_window(
-        getattr(args, "landing_timeout", None), landing_timeout
+        inp.landing_timeout, landing_timeout
     )
     turn_start_baseline = (
         capture_pane(target, landing_lines) if standard_rail else None
@@ -3165,8 +3218,8 @@ def orchestrate_handoff(
     # `resolve_queue_enter_retry_policy` (the config boundary) and are
     # overridable via `--queue-enter-retry-window` / `-interval`.
     retry_policy = resolve_queue_enter_retry_policy(
-        getattr(args, "queue_enter_retry_window", None),
-        getattr(args, "queue_enter_retry_interval", None),
+        inp.queue_enter_retry_window,
+        inp.queue_enter_retry_interval,
     )
     retry_engaged = (
         mode == MODE_QUEUE_ENTER and not marker_observed and retry_policy.enabled
@@ -3228,7 +3281,10 @@ def orchestrate_handoff(
                 command=record_command,
                 duplicate_lane_panes=duplicate_lane_panes or None,
                 role_profile_contract=role_profile_contract,
-                submit_lines=_submit_lines_for(args, outcome),
+                submit_lines=_submit_lines_for(
+                outcome, submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+            ),
                 turn_start_lines=turn_start_lines,
             )
             die(
@@ -3334,12 +3390,15 @@ def orchestrate_handoff(
         role_profile_contract=role_profile_contract,
         retry=retry_record,
         activation=target_activation,
-        submit_lines=_submit_lines_for(args, outcome),
+        submit_lines=_submit_lines_for(
+            outcome, submit_intent=inp.submit_intent,
+            submit_delivery_id=inp.submit_delivery_id,
+        ),
         turn_start_lines=turn_start_lines,
     )
     _maybe_persist_delivery_record(
-        args,
         outcome,
+        persist_delivery=bool(inp.persist_delivery),
         duplicate_lane_panes=duplicate_lane_panes,
         record_format=record_format,
         retry=retry_record,

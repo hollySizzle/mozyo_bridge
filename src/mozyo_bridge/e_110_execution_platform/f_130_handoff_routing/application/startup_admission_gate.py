@@ -24,7 +24,6 @@ question at the last instant before the first keystroke.
 
 from __future__ import annotations
 
-import argparse
 from typing import Any, Callable, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
@@ -51,7 +50,6 @@ REASON_UNREADABLE = "target_unavailable"
 
 
 def admit_receiver_startup_or_die(
-    args: argparse.Namespace,
     *,
     herdr_send: bool,
     receiver: str,

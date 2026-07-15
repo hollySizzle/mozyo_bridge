@@ -77,12 +77,24 @@ class HerdrSendEntryError(ValueError):
         self.reason = reason
 
 
-def _terminal_transport_config(args: argparse.Namespace) -> Optional[TerminalTransportConfig]:
-    """The repo-local ``terminal_transport`` selection, or ``None`` if unreadable."""
+def _terminal_transport_config_for_root(
+    repo_root: Path,
+) -> Optional[TerminalTransportConfig]:
+    """The repo-local ``terminal_transport`` selection for a resolved repo root.
+
+    The Namespace-free core (Redmine #13729): the handoff facade resolves the repo
+    root once at its boundary and passes the ``Path`` in, so this and the callers
+    below never touch an ``argparse.Namespace``.
+    """
     try:
-        return load_repo_local_config(repo_root_from_args(args)).terminal_transport
+        return load_repo_local_config(repo_root).terminal_transport
     except RepoLocalConfigError:
         return None
+
+
+def _terminal_transport_config(args: argparse.Namespace) -> Optional[TerminalTransportConfig]:
+    """The repo-local ``terminal_transport`` selection, or ``None`` if unreadable."""
+    return _terminal_transport_config_for_root(repo_root_from_args(args))
 
 
 def herdr_backend_selected(args: argparse.Namespace) -> bool:
@@ -110,8 +122,13 @@ def explicit_tmux_pane_target(args: argparse.Namespace) -> bool:
     return is_explicit_pane_target(getattr(args, "target", None))
 
 
-def herdr_effective_backend_selected(args: argparse.Namespace) -> bool:
+def herdr_effective_backend_selected(*, repo_root: Path, target: str | None) -> bool:
     """True iff this send should use the herdr backend **for its target kind** (#13320).
+
+    Redmine #13729: the handoff facade passes the resolved ``repo_root`` (its
+    boundary Namespace->Path conversion) and the raw ``--target`` scalar, so this
+    predicate is Namespace-free. Behaviour is byte-identical to the former
+    ``herdr_backend_selected(args) and not explicit_tmux_pane_target(args)``.
 
     The single effective-backend predicate shared by both send-path branch points —
     the ``@bind_runtime_transport`` decorator (which installs the herdr binding +
@@ -131,11 +148,16 @@ def herdr_effective_backend_selected(args: argparse.Namespace) -> bool:
     ``%pane`` / absent tmux / receiver-binding mismatch still fails closed on the tmux
     path exactly as it does under ``backend: tmux``.
     """
-    return herdr_backend_selected(args) and not explicit_tmux_pane_target(args)
+    config = _terminal_transport_config_for_root(repo_root)
+    backend_selected = config is not None and config.backend == BACKEND_HERDR
+    return backend_selected and not is_explicit_pane_target(target)
 
 
-def herdr_auto_target_repo(args: argparse.Namespace) -> str:
+def herdr_auto_target_repo(repo_root: Path) -> str:
     """Resolve ``--target-repo auto`` for a herdr send to the sender's own repo root.
+
+    Redmine #13729: takes the facade-resolved ``repo_root`` (Namespace-free);
+    byte-identical to the former ``str(repo_root_from_args(args))``.
 
     Redmine #13331 (j#73312 scope addition #2): a herdr send has no tmux ``%pane`` /
     ``pane_current_path`` to infer a target repo from, so the ``%pane``-only ``auto`` gate is
@@ -147,7 +169,7 @@ def herdr_auto_target_repo(args: argparse.Namespace) -> str:
     ``target_repo_mismatch`` gate like a hand-passed root. Kept out of the oversized
     ``commands.py`` (module-health gate); the command module calls this from its herdr branch.
     """
-    return str(repo_root_from_args(args))
+    return str(repo_root)
 
 
 def _legacy_lane_token(repo_root: Path) -> str:
@@ -172,7 +194,7 @@ def _legacy_lane_token(repo_root: Path) -> str:
         return ""
 
 
-def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
+def _explicit_target_workspace_id(target_repo: str | None) -> str:
     """The herdr workspace *segment* of an explicit ``--target-repo <path>``, or ``""``.
 
     Redmine #13377 (shared project workspace): a lane worktree's segment resolves to the
@@ -186,7 +208,7 @@ def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
     ``auto`` sentinel, an unset value, or an unresolvable path (so the caller falls back
     to same-workspace resolution rather than guessing a workspace).
     """
-    raw = getattr(args, "target_repo", None)
+    raw = target_repo
     if not raw or raw == AUTO_TARGET_REPO:
         return ""
     try:
@@ -195,8 +217,20 @@ def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
         return ""
 
 
-def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dict:
+def resolve_herdr_send_target(
+    *,
+    repo_root: Path,
+    target: str | None,
+    target_repo: str | None,
+    target_lane: str | None,
+    receiver: str,
+) -> dict:
     """Resolve the herdr-native send target and synthesize its pane record (fail-closed).
+
+    Redmine #13729: the handoff facade passes the resolved ``repo_root`` and the
+    raw ``--target`` / ``--target-repo`` / ``--target-lane`` scalars, so this
+    resolver is Namespace-free; behaviour is byte-identical to the former
+    ``args``-reading form.
 
     Resolves the sender identity (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
     ``MOZYO_LANE_ID`` cross-checked against the repo anchor), lists the live herdr
@@ -214,13 +248,12 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     ``binds_receiver`` still resolves the strong role. Raises
     :class:`HerdrSendEntryError` on any fail-closed condition.
     """
-    config = _terminal_transport_config(args)
+    config = _terminal_transport_config_for_root(repo_root)
     if config is None or config.backend != BACKEND_HERDR:
         raise HerdrSendEntryError(
             "herdr send target requested but the herdr backend is not selected",
             reason="backend_not_selected",
         )
-    repo_root = repo_root_from_args(args)
     # Redmine #13377 (design j#73613): the sender's own workspace segment. A lane agent
     # (gateway / worker) runs in a linked git worktree, whose segment now resolves to the
     # MAIN checkout's workspace identity (shared project workspace) — matching the
@@ -291,9 +324,9 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     # route authority; the live locator stays transient cache). A `--target-repo` that
     # resolves to the sender's own workspace (or `auto` / unset) falls through to the
     # same-workspace path unchanged.
-    target_workspace_id = _explicit_target_workspace_id(args)
+    target_workspace_id = _explicit_target_workspace_id(target_repo)
     cross_workspace = bool(target_workspace_id) and target_workspace_id != sender.workspace_id
-    explicit_lane = getattr(args, "target_lane", None)
+    explicit_lane = target_lane
     # Redmine #13476 (Design Consultation Answer j#74599, Option A): the sublane->parent
     # coordinator callback keeps the backend-neutral documented form
     # `--to codex --target coordinator`. `--target coordinator` is a semantic pseudo-target
@@ -311,7 +344,7 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     # `--to` public choices stay `claude|codex` (this is an internal, semantic translation).
     route_receiver = (
         RECEIVER_COORDINATOR
-        if _norm(getattr(args, "target", None)) == RECEIVER_COORDINATOR
+        if _norm(target) == RECEIVER_COORDINATOR
         else receiver
     )
     if cross_workspace:
@@ -361,7 +394,7 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     #   The explicit pair rides the same like-for-like precedent as cross-workspace;
     # - every other same-workspace send (no explicit lane) keeps `cwd` = the sender's
     #   repo root, so the repo gate's conservatism for implicit sends is unchanged.
-    raw_target_repo = getattr(args, "target_repo", None)
+    raw_target_repo = target_repo
     explicit_target_repo = bool(raw_target_repo) and raw_target_repo != AUTO_TARGET_REPO
     if cross_workspace or (explicit_target_repo and _norm(explicit_lane)):
         target_cwd = str(Path(raw_target_repo).expanduser())
