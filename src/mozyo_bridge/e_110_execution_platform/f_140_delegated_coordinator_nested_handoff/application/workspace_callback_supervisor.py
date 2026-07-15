@@ -160,7 +160,7 @@ class WorkspaceCallbackSupervisor:
         lease_ttl_seconds: int = SUPERVISOR_LEASE_TTL_SECONDS,
         release_after: bool = True,
         callback_route: str = DEFAULT_CALLBACK_ROUTE,
-        reconcile_leg_fn: Optional[Callable[[str, str, object], object]] = None,
+        reconcile_leg_fn: Optional[Callable[[str, str, object, bool], object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -272,6 +272,11 @@ class WorkspaceCallbackSupervisor:
                     skipped_reason=SKIP_ROSTER_UNREADABLE,
                 )
             selection = select_supervised_issues(roster, mode=mode, wake_issues=wake_issues)
+            # The turn-end edge signal for the reconcile leg (Redmine #13758 R2-F1): an issue
+            # named by a local wake is a genuine edge; a bounded-reconciliation periodic re-read
+            # (an issue swept only because it is on the roster) is NOT an edge, so its reconcile
+            # cycle must not advance the self-heal counter.
+            wake_set = {str(i).strip() for i in wake_issues if str(i).strip()}
             if not selection.supervised:
                 return WorkspaceSupervisionOutcome(
                     workspace_id=wsid,
@@ -297,7 +302,9 @@ class WorkspaceCallbackSupervisor:
                 ):
                     lease_lost = True
                     break
-                issue_outcome = self._supervise_issue(wsid, issue, source, sender, binding)
+                issue_outcome = self._supervise_issue(
+                    wsid, issue, source, sender, binding, is_edge=issue in wake_set
+                )
                 issue_outcomes.append(issue_outcome)
                 if issue_outcome.error == ISSUE_LEASE_LOST:
                     # The send-boundary fence tripped mid-issue (a takeover during this issue's
@@ -330,6 +337,7 @@ class WorkspaceCallbackSupervisor:
         source: Optional[RedmineJournalSource],
         sender: Callable[[CallbackOutboxRow], str],
         binding: object,
+        is_edge: bool = False,
     ) -> IssueSupervisionOutcome:
         """Supply durable events + drain the callback outbox for one issue (fail-open per issue).
 
@@ -413,7 +421,7 @@ class WorkspaceCallbackSupervisor:
         # are observable via `workflow glance`. Disabled when no leg was wired.
         if self._reconcile_leg_fn is not None:
             try:
-                self._reconcile_leg_fn(workspace_id, issue, source)
+                self._reconcile_leg_fn(workspace_id, issue, source, is_edge)
             except Exception:  # noqa: BLE001 - a reconcile failure never breaks the sweep
                 pass
 

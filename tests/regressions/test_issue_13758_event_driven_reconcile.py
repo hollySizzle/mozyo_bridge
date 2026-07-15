@@ -56,6 +56,7 @@ def _observe(**kw):
         prior_send_uncertain=False,
         route_status=ROUTE_RESOLVED,
         expected_next_owner=WORKER,
+        is_edge=True,
     )
     base.update(kw)
     obs = ReconcileObservation(**base)

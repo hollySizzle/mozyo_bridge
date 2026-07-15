@@ -29,6 +29,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AuthorityFacts,
     ExecutionSurfaceFacts,
     ReconcileFacts,
+    facts_from_lifecycle_record,
     reconcile_facts_from_record,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
@@ -165,6 +166,54 @@ class ExecutionSurfaceFactsTest(unittest.TestCase):
         self.assertEqual(facts.gateway_dispatch_state, DISPATCH_STATE_DISPATCHED)
         self.assertEqual(facts.worker_dispatch_state, DISPATCH_STATE_UNKNOWN)  # fail-closed
         self.assertTrue(facts.productive_capacity_eligible)
+
+
+class _FakeLifecycleRecord:
+    def __init__(self, **kw):
+        self.binding_kind = kw.get("binding_kind", "issue")
+        self.decision_issue_id = kw.get("decision_issue_id", "13758")
+        self.decision_journal = kw.get("decision_journal", "79337")
+        self.worktree_identity = kw.get("worktree_identity", "wt-abc")
+        self.declared_slots = kw.get("declared_slots", "slots-json")
+        self.lane_generation = kw.get("lane_generation", 2)
+        self.revision = kw.get("revision", 5)
+
+
+class FactsFromLifecycleTest(unittest.TestCase):
+    def test_none_record_is_empty(self):
+        authority, execution = facts_from_lifecycle_record(None)
+        self.assertEqual(authority.active_provider, "unknown")
+        self.assertEqual(execution.execution_surface, "unknown")
+
+    def test_issue_lane_projects_worker_authority_and_managed_sublane(self):
+        authority, execution = facts_from_lifecycle_record(
+            _FakeLifecycleRecord(), active_provider="claude"
+        )
+        self.assertEqual(authority.active_execution_role, "implementation_worker")
+        self.assertEqual(authority.active_provider, "claude")
+        self.assertEqual(authority.authority_anchor, "13758:79337")
+        self.assertEqual(authority.authority_generation, "2")
+        self.assertEqual(authority.concurrent_actor_count, 1)
+        self.assertEqual(execution.execution_surface, EXECUTION_SURFACE_MANAGED_SUBLANE)
+        self.assertTrue(execution.managed_lane_identity_verified)  # worktree + slots present
+        self.assertEqual(execution.lane_lifecycle_revision, "5")
+        self.assertTrue(execution.productive_capacity_eligible)
+        # live-only fields stay fail-closed (deferred to #13492).
+        self.assertEqual(execution.gateway_dispatch_state, DISPATCH_STATE_UNKNOWN)
+        self.assertEqual(authority.superseded_authority_generation, "")
+
+    def test_incomplete_binding_is_unverified_and_not_capacity_eligible(self):
+        _, execution = facts_from_lifecycle_record(
+            _FakeLifecycleRecord(declared_slots="")  # pins-only gap -> not verified
+        )
+        self.assertFalse(execution.managed_lane_identity_verified)
+        self.assertFalse(execution.productive_capacity_eligible)
+
+    def test_project_gateway_lane_projects_gateway_role(self):
+        authority, _ = facts_from_lifecycle_record(
+            _FakeLifecycleRecord(binding_kind="project_gateway")
+        )
+        self.assertEqual(authority.active_execution_role, "project_gateway")
 
 
 class FoldJoinTest(unittest.TestCase):

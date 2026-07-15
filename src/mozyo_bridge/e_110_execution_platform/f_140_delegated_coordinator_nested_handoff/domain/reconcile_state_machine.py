@@ -254,6 +254,13 @@ class ReconcileObservation:
     prior_send_uncertain: bool = False
     route_status: str = ROUTE_UNRESOLVED
     expected_next_owner: str = ""
+    #: A genuine ``busy -> turn_ended`` wake edge triggered this cycle (a local wake for this
+    #: issue), NOT a bounded-reconciliation periodic re-read. The self-heal ladder / counter
+    #: advances ONLY on an edge (acceptance §5/§7: "edge 後に完了した reconcile cycle" で加算、
+    #: "repeated done snapshots / duplicate wake" では加算しない). A non-edge sweep still delivers
+    #: a gate-advance and escalates on a deadline / uncertain send, but never increments the
+    #: self-heal counter (Redmine #13758 review R2-F1).
+    is_edge: bool = False
 
     @property
     def gate_advanced_effective(self) -> bool:
@@ -359,16 +366,35 @@ def advance_reconcile(
         return _none(RECONCILE_COORDINATOR_ESCALATION, count, REASON_ALREADY_ESCALATED)
 
     # 5a. A prior self-heal whose delivery is uncertain is never blind-resent; the anomaly is
-    #     surfaced to the coordinator (acceptance §8). This pre-empts the ladder.
+    #     surfaced to the coordinator (acceptance §8). This pre-empts the ladder. State-based,
+    #     so a bounded reconciliation sweep may surface it (no edge required).
     if observation.prior_send_uncertain:
         return _escalate(count, REASON_SELF_HEAL_UNCERTAIN)
 
-    # 5b. The edge-based counter increments on this completed no-progress cycle (§5). The
-    #     deadline elapsing OR reaching the 2-attempt cap escalates once; otherwise a bounded
-    #     self-heal to the expected owner.
-    next_count = count + 1
+    # 5b. The bounded self-heal deadline elapsing escalates once — valid on any sweep, because
+    #     bounded reconciliation is the deadline detector (no edge required).
     if observation.deadline_exceeded:
-        return _escalate(max(next_count, SELF_HEAL_MAX_ATTEMPTS + 1), REASON_DEADLINE_EXCEEDED)
+        return _escalate(max(count + 1, SELF_HEAL_MAX_ATTEMPTS + 1), REASON_DEADLINE_EXCEEDED)
+
+    # 5c. Advancing the self-heal ladder (and its edge-based counter) requires a GENUINE
+    #     turn-ended wake edge (acceptance §5/§7). A bounded-reconciliation periodic re-read
+    #     (no edge) must NOT increment the counter or re-notify — otherwise repeated sweeps /
+    #     duplicate wakes alone would reach three-strike (review R2-F1). No edge -> no-op.
+    if not observation.is_edge:
+        # No phase / counter change and no revision bump: a bounded sweep that finds no
+        # progress is not a completed reconcile cycle, it is just an observation.
+        return ReconcileDecision(
+            action=RECONCILE_ACTION_NONE,
+            reason=REASON_NOT_TURN_END_EDGE,
+            next_phase=current,
+            next_failure_count=count,
+            route="",
+            mutates_state=False,
+        )
+
+    # 5d. The edge-based counter increments on this completed no-progress cycle (§5). Reaching
+    #     the 2-attempt cap escalates once; otherwise a bounded self-heal to the expected owner.
+    next_count = count + 1
     if next_count > SELF_HEAL_MAX_ATTEMPTS:
         return _escalate(next_count, REASON_THREE_STRIKE)
 

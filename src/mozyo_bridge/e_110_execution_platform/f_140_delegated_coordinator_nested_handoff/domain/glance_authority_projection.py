@@ -213,6 +213,67 @@ class ExecutionSurfaceFacts:
         }
 
 
+#: Binding kinds (mirrors lane_lifecycle #13810; literal so this domain stays decoupled).
+_BINDING_PROJECT_GATEWAY = "project_gateway"
+_ROLE_PROJECT_GATEWAY = "project_gateway"
+_ROLE_IMPLEMENTATION_WORKER = "implementation_worker"
+
+
+def facts_from_lifecycle_record(
+    record, *, active_provider: str = UNKNOWN_TOKEN
+) -> "tuple[AuthorityFacts, ExecutionSurfaceFacts]":
+    """Project a ``lane_lifecycle`` record onto ``(AuthorityFacts, ExecutionSurfaceFacts)``. (pure)
+
+    The NON-LIVE authority / execution-surface projection (Redmine #13758 review R2-F4): the
+    active execution role (from ``binding_kind``), the resolved provider, the authority anchor
+    (``decision_issue_id:decision_journal``) and generation (``lane_generation``), the
+    execution surface (an enumerated active managed lane is ``managed_sublane``), the lane
+    identity verification (a complete binding — non-empty worktree + declared slots), the
+    lifecycle revision, and capacity eligibility. ``record`` is a duck-typed
+    ``LaneLifecycleRecord`` (kept out of a core-state import). ``None`` -> fail-closed empty.
+
+    The fields that genuinely need the LIVE inventory — ``gateway_dispatch_state`` /
+    ``worker_dispatch_state`` (pane liveness), ``superseded_authority_generation`` /
+    ``transition_reason`` / ``worktree_mutation_attribution`` (authority-transition history) —
+    are left at their fail-closed unknown/blank tokens and connect at the installed-artifact
+    live surface (#13492); they are never fabricated from the durable record alone.
+    """
+    if record is None:
+        return AuthorityFacts(), ExecutionSurfaceFacts()
+    binding_kind = str(getattr(record, "binding_kind", "") or "").strip()
+    active_role = (
+        _ROLE_PROJECT_GATEWAY
+        if binding_kind == _BINDING_PROJECT_GATEWAY
+        else _ROLE_IMPLEMENTATION_WORKER
+    )
+    decision_issue = str(getattr(record, "decision_issue_id", "") or "").strip()
+    decision_journal = str(getattr(record, "decision_journal", "") or "").strip()
+    anchor = (
+        f"{decision_issue}:{decision_journal}"
+        if decision_issue and decision_journal
+        else ""
+    )
+    worktree = str(getattr(record, "worktree_identity", "") or "").strip()
+    slots = str(getattr(record, "declared_slots", "") or "").strip()
+    verified = bool(worktree) and bool(slots)
+    authority = AuthorityFacts(
+        active_execution_role=active_role,
+        active_provider=_norm(active_provider) or UNKNOWN_TOKEN,
+        authority_anchor=anchor,
+        authority_generation=str(getattr(record, "lane_generation", "") or "").strip(),
+        # A single resolved active managed lane is one actor (the live concurrency check is #13492).
+        concurrent_actor_count=1,
+    ).validated()
+    execution = ExecutionSurfaceFacts(
+        execution_surface=EXECUTION_SURFACE_MANAGED_SUBLANE,
+        managed_lane_identity_verified=verified,
+        lane_lifecycle_revision=str(getattr(record, "revision", "") or "").strip(),
+        # Capacity eligibility follows the verified managed-sublane fail-close in validated().
+        productive_capacity_eligible=verified,
+    ).validated()
+    return authority, execution
+
+
 def reconcile_facts_from_record(record) -> ReconcileFacts:
     """Project a ``reconcile_state`` component row onto :class:`ReconcileFacts`. (pure)
 
@@ -248,4 +309,5 @@ __all__ = (
     "AuthorityFacts",
     "ExecutionSurfaceFacts",
     "reconcile_facts_from_record",
+    "facts_from_lifecycle_record",
 )

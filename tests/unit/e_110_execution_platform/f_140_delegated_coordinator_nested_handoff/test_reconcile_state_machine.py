@@ -87,6 +87,7 @@ def _obs(**kw) -> ReconcileObservation:
         prior_send_uncertain=False,
         route_status=ROUTE_RESOLVED,
         expected_next_owner=WORKER,
+        is_edge=True,  # default to a genuine turn-end edge; non-edge cases override
     )
     base.update(kw)
     return ReconcileObservation(**base)
@@ -330,6 +331,48 @@ class SelfHealLadderTest(unittest.TestCase):
                 (RECONCILE_ACTION_NONE, 3),
             ],
         )
+
+
+class EdgeGatingTest(unittest.TestCase):
+    def test_non_edge_sweep_does_not_self_heal_or_increment(self):
+        # review R2-F1: a bounded-reconciliation sweep (no turn-end edge) must not advance the
+        # self-heal ladder or the counter.
+        d = advance_reconcile(
+            phase=RECONCILE_TURN_ENDED_GATE_PENDING,
+            reconcile_failure_count=0,
+            observation=_obs(is_edge=False),
+        )
+        self.assertEqual(d.action, RECONCILE_ACTION_NONE)
+        self.assertFalse(d.sends)
+        self.assertFalse(d.mutates_state)  # no revision bump on a non-edge no-progress sweep
+        self.assertEqual(d.next_failure_count, 0)
+
+    def test_repeated_non_edge_sweeps_never_reach_three_strike(self):
+        phase, count = RECONCILE_TURN_ENDED_GATE_PENDING, 0
+        for _ in range(5):
+            d = advance_reconcile(
+                phase=phase, reconcile_failure_count=count, observation=_obs(is_edge=False)
+            )
+            self.assertNotEqual(d.action, RECONCILE_ACTION_ESCALATE)
+            phase, count = d.next_phase, d.next_failure_count
+        self.assertEqual(count, 0)  # never grew without an edge
+
+    def test_non_edge_sweep_still_delivers_advanced_gate(self):
+        # A bounded sweep still catches a missed gate delivery.
+        d = advance_reconcile(
+            phase=RECONCILE_TURN_ENDED_GATE_PENDING,
+            reconcile_failure_count=0,
+            observation=_obs(is_edge=False, gate_advanced=True),
+        )
+        self.assertEqual(d.action, RECONCILE_ACTION_DELIVER)
+
+    def test_non_edge_sweep_still_escalates_on_deadline(self):
+        d = advance_reconcile(
+            phase=RECONCILE_TURN_ENDED_GATE_PENDING,
+            reconcile_failure_count=0,
+            observation=_obs(is_edge=False, deadline_exceeded=True),
+        )
+        self.assertEqual(d.action, RECONCILE_ACTION_ESCALATE)
 
 
 class DeadlineAndUncertainTest(unittest.TestCase):

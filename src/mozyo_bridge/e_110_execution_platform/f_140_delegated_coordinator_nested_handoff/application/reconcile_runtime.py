@@ -84,6 +84,13 @@ class ReconcileCycleInput:
     deadline: str = ""
     target_lane: str = ""
     target_generation: str = ""
+    #: The delivery target the outbox row records for the LIVE resolver (Redmine #13758 review
+    #: R2-F2): the binding-resolved provider of the ``expected_next_owner`` (``claude`` for a
+    #: worker, ``codex`` for a gateway/auditor), NOT the role token — the background-service
+    #: resolver re-matches this against the live inventory to reach the same-lane pane, so a raw
+    #: role label (which is not a resolvable target) never ships. The ``callback_route`` keeps
+    #: the role token (it is the outbox UNIQUE-key distinguisher, not the delivery target).
+    target_receiver: str = ""
 
 
 def outbox_key_for(
@@ -188,8 +195,11 @@ def reconcile_once(
             advanced_gate_journal=observation.advanced_gate_journal,
         )
         kind = _kind_for(decision)
+        # The delivery target_receiver is the binding-resolved provider (cycle.target_receiver)
+        # for a same-lane self-heal — a resolver-matchable identity, NOT the role token (R2-F2).
+        # A coordinator deliver/escalate leaves it blank (the coordinator route resolves itself).
         receiver = (
-            "" if decision.route == COORDINATOR_ROUTE else str(decision.route).strip()
+            "" if decision.route == COORDINATOR_ROUTE else str(cycle.target_receiver or "").strip()
         )
         enqueued = outbox.enqueue(
             key,

@@ -45,7 +45,7 @@ class ReconcileLegHarness(unittest.TestCase):
         self.store = ReconcileStateStore(path=self.tmp / "state.sqlite")
         self.outbox = CallbackOutbox(path=self.tmp / "workflow-runtime.sqlite")
 
-    def _leg(self, markers, *, live_generation=1, disposition="active"):
+    def _leg(self, markers, *, live_generation=1, disposition="active", is_edge=True):
         return reconcile_leg_once(
             issue="13758",
             workspace_id="ws1",
@@ -55,6 +55,7 @@ class ReconcileLegHarness(unittest.TestCase):
             lifecycle_disposition=disposition,
             outbox=self.outbox,
             reconcile_store=self.store,
+            is_edge=is_edge,
         )
 
     def _rows(self):
@@ -72,14 +73,43 @@ class SelfHealFlow(ReconcileLegHarness):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].callback_route, "implementation_worker")
         self.assertEqual(rows[0].normalized_gate, "self_heal_attempt_1")
-        # The record is anchored on the awaited gate.
-        key = ReconcileStateKey("ws1", "lane-a", "13758:await:implementation_done")
+        # review R2-F2: the delivery target_receiver is the worker PROVIDER (claude), a
+        # resolver-matchable identity, not the raw role token.
+        self.assertEqual(rows[0].target_receiver, "claude")
+        # review R2-F3: the record is anchored on issue + generation + dispatch baseline + gate.
+        key = ReconcileStateKey("ws1", "lane-a", "13758:g1:from0:await:implementation_done")
         self.assertIsNotNone(self.store.get(key))
 
     def test_review_request_position_self_heals_to_gateway(self):
         rep = self._leg(markers=[_Marker(gate="review_request", journal="79368")])
         self.assertEqual(rep["action"], "self_heal")
         self.assertEqual(rep["route"], "implementation_gateway")
+
+    def test_non_edge_sweep_does_not_self_heal(self):
+        # review R2-F1: a bounded-reconciliation sweep (is_edge=False) does not self-heal.
+        rep = self._leg(markers=[], is_edge=False)
+        self.assertEqual(rep["action"], "none")
+        self.assertEqual(len(self._rows()), 0)
+
+    def test_correction_loop_same_gate_new_round_is_a_distinct_record(self):
+        # review R2-F3: changes_requested -> correction re-awaits implementation_done in a NEW
+        # round (from the review_result position) -> a distinct record, fresh counter.
+        self._leg(markers=[])  # round-1 await implementation_done from baseline 0
+        # round 2: review_result(changes_requested) landed at 79500 -> re-await implementation_done.
+        rep = self._leg(
+            markers=[
+                _Marker(gate="implementation_done", journal="79400"),
+                _Marker(gate="review_request", journal="79420"),
+                _Marker(gate="review_result", journal="79500", review_conclusion="changes_requested"),
+            ]
+        )
+        self.assertEqual(rep["action"], "self_heal")
+        # a distinct anchor keyed on the review_result baseline (79500), not the round-1 one.
+        round2 = ReconcileStateKey(
+            "ws1", "lane-a", "13758:g1:from79500:await:implementation_done"
+        )
+        self.assertIsNotNone(self.store.get(round2))
+        self.assertEqual(self.store.get(round2).reconcile_failure_count, 1)  # fresh counter
 
 
 class DeliverFlow(ReconcileLegHarness):
@@ -139,10 +169,13 @@ class SupervisorWiringTest(unittest.TestCase):
             roster_fn=lambda ws: (("13758",), ""),
             redmine_source_fn=lambda ws: None,
             sender_fn=lambda ws: (lambda row: "delivered"),
-            reconcile_leg_fn=lambda wsid, issue, source: calls.append((wsid, issue)),
+            reconcile_leg_fn=lambda wsid, issue, source, is_edge: calls.append(
+                (wsid, issue, is_edge)
+            ),
         )
-        supervisor.run_once()
-        self.assertIn(("ws1", "13758"), calls)
+        # A local wake for the issue -> is_edge=True is threaded to the leg.
+        supervisor.run_once(mode="local_wake", wake_hints=[("ws1", "13758")])
+        self.assertIn(("ws1", "13758", True), calls)
 
 
 if __name__ == "__main__":

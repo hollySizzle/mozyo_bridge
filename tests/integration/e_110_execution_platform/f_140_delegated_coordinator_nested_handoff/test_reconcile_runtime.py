@@ -60,6 +60,7 @@ def _cycle() -> ReconcileCycleInput:
         expected_next_owner=WORKER,
         lane_generation=1,
         target_lane="lane-a",
+        target_receiver="claude",  # the resolver-matchable worker provider (R2-F2)
     )
 
 
@@ -77,6 +78,7 @@ def _observe(**kw):
         prior_send_uncertain=False,
         route_status=ROUTE_RESOLVED,
         expected_next_owner=WORKER,
+        is_edge=True,
     )
     base.update(kw)
     obs = ReconcileObservation(**base)
@@ -177,7 +179,8 @@ class SelfHealLadderFlow(ReconcileRuntimeHarness):
         self.assertIn(RECONCILE_COORDINATOR_ESCALATION, rows)
         self.assertEqual(rows["self_heal_attempt_1"].callback_route, WORKER)
         self.assertEqual(rows["self_heal_attempt_1"].notification_kind, KIND_SELF_HEAL)
-        self.assertEqual(rows["self_heal_attempt_1"].target_receiver, WORKER)
+        # review R2-F2: the delivery target is the resolver-matchable provider, not the role.
+        self.assertEqual(rows["self_heal_attempt_1"].target_receiver, "claude")
         self.assertEqual(rows[RECONCILE_COORDINATOR_ESCALATION].callback_route, "coordinator")
         self.assertEqual(
             rows[RECONCILE_COORDINATOR_ESCALATION].notification_kind, KIND_ESCALATION

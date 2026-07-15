@@ -48,9 +48,6 @@ from typing import Callable, Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
     HandoffDeliveryResult,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_delivery_route import (
-    callback_receiver_provider,
-)
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 
 #: The runner seam: given an argv list, returns ``(returncode, stdout)``. Injectable for tests.
@@ -138,15 +135,9 @@ class HandoffCallbackSendPort:
             # workspace's sender (never delivered here, never mis-sent on ambient env).
             reason = "workspace_mismatch" if row_ws else "workspace_unattested_row"
             return HandoffDeliveryResult("blocked", reason)
-        # Resolve the delivery provider from the row's semantic receiver (Redmine #13758 F2):
-        # a reconcile self-heal to an implementation-worker receiver is a sanctioned same-lane
-        # ``--to claude`` dispatch; every other / unknown receiver (coordinator, gateway,
-        # auditor, the legacy discovery routes) stays ``--to codex`` (the pre-#13758 default),
-        # so existing callback rows are unchanged and only a worker self-heal switches provider.
-        provider = callback_receiver_provider(row)
         argv = [
             self.mozyo_bridge_bin, "handoff", "send",
-            "--to", provider,
+            "--to", "codex",
             "--target", row.callback_route,
             "--source", "redmine",
             "--issue", row.issue,

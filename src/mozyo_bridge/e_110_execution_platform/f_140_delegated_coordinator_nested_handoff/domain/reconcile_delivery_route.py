@@ -44,18 +44,25 @@ def receiver_role_of(row: object) -> str:
     return str(getattr(row, "callback_route", "") or "").strip()
 
 
-def callback_receiver_provider(row: object) -> str:
-    """Resolve the ``--to`` provider for a callback row (pure, fail-closed to ``codex``).
+def provider_for_role(role: object) -> str:
+    """The delivery provider for an expected-owner role (pure, fail-closed to ``codex``).
 
-    A recognized implementation-worker receiver -> :data:`PROVIDER_CLAUDE` (same-lane); every
-    other / unknown receiver -> :data:`PROVIDER_CODEX` (the pre-#13758 default, so no existing
-    discovery / coordinator row changes provider).
+    A worker role -> :data:`PROVIDER_CLAUDE` (a same-lane Claude worker); every other role
+    (gateway / auditor / coordinator / unknown) -> :data:`PROVIDER_CODEX`. This is the
+    resolver-matchable ``target_receiver`` the reconcile self-heal row carries (Redmine #13758
+    review R2-F2): the background-service resolver re-matches the provider against the live
+    inventory, so a raw role token (an unresolvable target) never ships.
     """
     return (
         PROVIDER_CLAUDE
-        if receiver_role_of(row) in WORKER_RECEIVER_ROLES
+        if str(role or "").strip() in WORKER_RECEIVER_ROLES
         else PROVIDER_CODEX
     )
+
+
+def callback_receiver_provider(row: object) -> str:
+    """Resolve the delivery provider for a callback row from its semantic receiver (pure)."""
+    return provider_for_role(receiver_role_of(row))
 
 
 def is_same_lane_worker(row: object) -> bool:
@@ -68,6 +75,7 @@ __all__ = (
     "PROVIDER_CODEX",
     "WORKER_RECEIVER_ROLES",
     "receiver_role_of",
+    "provider_for_role",
     "callback_receiver_provider",
     "is_same_lane_worker",
 )

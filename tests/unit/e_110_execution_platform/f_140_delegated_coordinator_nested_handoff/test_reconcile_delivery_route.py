@@ -24,6 +24,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PROVIDER_CLAUDE,
     PROVIDER_CODEX,
     callback_receiver_provider,
+    provider_for_role,
 )
 
 
@@ -69,36 +70,30 @@ class ProviderResolverTest(unittest.TestCase):
         self.assertEqual(callback_receiver_provider(row), PROVIDER_CLAUDE)
 
 
-class SendPortArgvTest(unittest.TestCase):
-    """The routing must reach the REAL send port argv (review F2), via an injected runner."""
+class ProviderForRoleTest(unittest.TestCase):
+    """review R2-F2: the reconcile row's target_receiver is the owner's provider, resolver-matchable."""
 
-    def _capture_argv(self, row):
+    def test_worker_role_resolves_to_claude_provider(self):
+        self.assertEqual(provider_for_role("implementation_worker"), PROVIDER_CLAUDE)
+
+    def test_gateway_and_others_resolve_to_codex(self):
+        self.assertEqual(provider_for_role("implementation_gateway"), PROVIDER_CODEX)
+        self.assertEqual(provider_for_role("auditor"), PROVIDER_CODEX)
+        self.assertEqual(provider_for_role(""), PROVIDER_CODEX)
+
+    def test_send_port_stays_codex_after_revert(self):
+        # review R2-F2: the naive send port no longer routes worker rows (the provider now flows
+        # via the row's target_receiver -> the resolver-backed sender); it stays --to codex.
         captured = {}
 
         def fake_runner(argv):
             captured["argv"] = argv
             return 0, '{"status": "delivered", "reason": "ok"}'
 
+        row = _row(callback_route="implementation_worker", target_receiver="claude")
         HandoffCallbackSendPort(runner=fake_runner, attested_workspace_id="ws1")(row)
-        return captured["argv"]
-
-    def test_worker_self_heal_argv_is_to_claude(self):
-        argv = self._capture_argv(
-            _row(callback_route="implementation_worker", target_receiver="implementation_worker")
-        )
-        i = argv.index("--to")
-        self.assertEqual(argv[i + 1], "claude")
-
-    def test_coordinator_callback_argv_is_to_codex(self):
-        argv = self._capture_argv(_row(callback_route="coordinator"))
-        i = argv.index("--to")
-        self.assertEqual(argv[i + 1], "codex")
-
-    def test_escalation_row_argv_is_to_codex(self):
-        row = _row(callback_route="coordinator", normalized_gate="coordinator_escalation")
-        argv = self._capture_argv(row)
-        i = argv.index("--to")
-        self.assertEqual(argv[i + 1], "codex")
+        i = captured["argv"].index("--to")
+        self.assertEqual(captured["argv"][i + 1], "codex")
 
 
 if __name__ == "__main__":

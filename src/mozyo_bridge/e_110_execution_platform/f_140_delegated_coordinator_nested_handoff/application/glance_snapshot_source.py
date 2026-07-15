@@ -41,8 +41,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     lane_signal_from_gate_facts,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_authority_projection import (
+    AuthorityFacts,
+    ExecutionSurfaceFacts,
     ReconcileFacts,
+    facts_from_lifecycle_record,
     reconcile_facts_from_record,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_delivery_route import (
+    provider_for_role,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
     ANOMALY_NONE,
@@ -677,8 +683,55 @@ def _reconcile_more_relevant(candidate, incumbent) -> bool:
     return str(getattr(candidate, "updated_at", "")) > str(getattr(incumbent, "updated_at", ""))
 
 
+#: Role tokens for the authority projection (mirrors lane_lifecycle #13810 binding kinds).
+_ROLE_PROJECT_GATEWAY = "project_gateway"
+_ROLE_IMPLEMENTATION_WORKER = "implementation_worker"
+
+
+def authority_execution_index() -> dict:
+    """``{issue_id: (AuthorityFacts, ExecutionSurfaceFacts)}`` from the lane lifecycle. (fail-open)
+
+    The NON-LIVE authority / execution-surface producer (Redmine #13758 review R2-F4): reads
+    the active lifecycle records (the non-creating readonly read) and projects each onto the
+    authority + execution-surface facts (active role from ``binding_kind``, the resolved
+    provider, the authority anchor / generation, the managed-sublane surface + verified
+    identity + revision + capacity). A store read failure degrades to an empty index (every
+    lane's group stays the fail-closed unknown facts). The live-pane dispatch states connect at
+    #13492 (see :func:`...glance_authority_projection.facts_from_lifecycle_record`).
+    """
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
+
+        records = load_lane_lifecycle_readonly()
+    except Exception:  # noqa: BLE001 - a lifecycle read never raises out of the glance
+        return {}
+    out: dict = {}
+    for rec in records or ():
+        issue = str(getattr(rec, "issue_id", "") or "").strip()
+        if not issue:
+            continue
+        if str(getattr(rec, "lane_disposition", "") or "").strip() != _DISPOSITION_ACTIVE:
+            continue
+        binding_kind = str(getattr(rec, "binding_kind", "") or "").strip()
+        active_role = (
+            _ROLE_PROJECT_GATEWAY
+            if binding_kind == _ROLE_PROJECT_GATEWAY
+            else _ROLE_IMPLEMENTATION_WORKER
+        )
+        out[issue] = facts_from_lifecycle_record(
+            rec, active_provider=provider_for_role(active_role)
+        )
+    return out
+
+
 def active_lane_snapshots(
-    roster, *, redmine_source=None, store=None, ledger=None, reconcile_store=None
+    roster,
+    *,
+    redmine_source=None,
+    store=None,
+    ledger=None,
+    reconcile_store=None,
+    authority_index=None,
 ) -> GlanceCollection:
     """Fold every active-lane roster entry into a snapshot (Redmine grammar + advisory store).
 
@@ -700,6 +753,7 @@ def active_lane_snapshots(
     notes: list = []
     store_index = _store_gate_index(store)
     reconcile_index = _reconcile_index(reconcile_store)
+    authority_map = dict(authority_index) if authority_index else {}
     ordered_issues = [str(issue or "").strip() for issue, _ in roster]
     deliveries = _issue_deliveries([i for i in ordered_issues if i], ledger)
 
@@ -763,6 +817,10 @@ def active_lane_snapshots(
                 delivery=deliveries.get(issue, DeliveryObservation()),
                 durable_facts_available=not degraded,
                 reconcile=reconcile_index.get(issue, ReconcileFacts()),
+                authority=authority_map.get(issue, (AuthorityFacts(), None))[0]
+                or AuthorityFacts(),
+                execution=(authority_map.get(issue) or (None, ExecutionSurfaceFacts()))[1]
+                or ExecutionSurfaceFacts(),
             )
         )
     return GlanceCollection(snapshots=tuple(snaps), notes=tuple(notes))

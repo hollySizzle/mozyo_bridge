@@ -37,6 +37,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_runtime import (
     reconcile_once as _reconcile_once,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_delivery_route import (
+    provider_for_role,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_gate_chain import (
     expected_next,
 )
@@ -108,6 +111,29 @@ def _self_heal_gate_for_phase(phase: str) -> str:
     return ""
 
 
+def _second_latest_journal(markers: Iterable[object], below: int) -> str:
+    """The highest gate journal strictly below ``below`` (the dispatch position before it)."""
+    best = -1
+    for m in markers or ():
+        j = _int(getattr(m, "journal", ""), default=-1)
+        if best < j < below:
+            best = j
+    return str(best) if best >= 0 else "0"
+
+
+def _anchor(issue: str, generation: int, baseline_journal: str, gate: str) -> str:
+    """The reconcile record anchor — issue + lane generation + dispatch baseline + awaited gate.
+
+    Includes the lane ``generation`` (the #13810 incarnation — a recycled lane is a fresh
+    record) AND the dispatch/review-round baseline journal (the position the await opened
+    from), so a ``changes_requested -> correction -> re-review`` loop that awaits the SAME gate
+    (implementation_done again) in a NEW round gets a distinct durable record instead of
+    reusing the prior round's terminal one (Redmine #13758 review R2-F3): the acceptance key is
+    ``workspace + lane + issue + exact action/review generation``.
+    """
+    return f"{issue}:g{int(generation)}:from{baseline_journal}:await:{gate}"
+
+
 def reconcile_leg_once(
     *,
     issue: str,
@@ -118,6 +144,7 @@ def reconcile_leg_once(
     lifecycle_disposition: str,
     outbox: CallbackOutbox,
     reconcile_store: ReconcileStateStore,
+    is_edge: bool = False,
     redmine_readable: bool = True,
     deadline: str = "",
     now: Optional[str] = None,
@@ -130,27 +157,34 @@ def reconcile_leg_once(
     same-lane owner (approved review awaiting owner close, blocked, etc.) yields ``None`` — no
     reconcile (acceptance §6, fail-safe). Otherwise builds the fail-closed observation
     (generation correlation, gate-advance detection vs the persisted baseline, the outbox
-    deliver / self-heal state, the lifecycle disposition, the deadline) and runs
-    :func:`reconcile_once`.
+    deliver / self-heal state, the lifecycle disposition, the deadline, the turn-end edge) and
+    runs :func:`reconcile_once`. ``is_edge`` is True only for a genuine turn-ended wake (a local
+    wake for this issue); a bounded-reconciliation sweep passes ``False`` so the self-heal
+    counter never grows without an edge (review R2-F1).
     """
     wsid, laneid, issue_s = (
         str(workspace_id).strip(),
         str(lane_id).strip(),
         str(issue).strip(),
     )
+    generation = int(live_generation) if live_generation > 0 else 0
     latest = _latest_gate_marker(markers)
     latest_gate = str(getattr(latest, "gate", "")).strip() if latest is not None else ""
+    latest_journal = _int(getattr(latest, "journal", ""), default=0) if latest is not None else 0
     conclusion = (
         str(getattr(latest, "review_conclusion", "")).strip() if latest is not None else ""
     )
     terminal = str(lifecycle_disposition or "").strip() in _TERMINAL_DISPOSITIONS
 
     # (1) Deliver a just-landed await first: if the current latest gate has an OPEN (non-terminal)
-    #     reconcile record, that await's gate has landed -> reconcile THAT record so it delivers
-    #     the coordinator callback and closes, before opening the next await (review F1: the leg's
-    #     deliver branch is reachable in production, keyed byte-identically to discovery — F3).
+    #     reconcile record — anchored on the gate BEFORE it (its dispatch baseline) — that await's
+    #     gate has landed, so reconcile THAT record to deliver the coordinator callback and close,
+    #     before opening the next await (the leg's deliver branch is reachable — F1 — keyed
+    #     byte-identically to discovery — F3).
     if latest_gate:
-        landed_key = ReconcileStateKey(wsid, laneid, f"{issue_s}:await:{latest_gate}")
+        landed_baseline = _second_latest_journal(markers, latest_journal)
+        landed_anchor = _anchor(issue_s, generation, landed_baseline, latest_gate)
+        landed_key = ReconcileStateKey(wsid, laneid, landed_anchor)
         landed_record = reconcile_store.get(landed_key)
         if landed_record is not None and landed_record.phase not in _TERMINAL_PHASES:
             return _run_cycle(
@@ -159,10 +193,11 @@ def reconcile_leg_once(
                 lane_id=laneid,
                 expected_gate=latest_gate,
                 expected_owner=str(landed_record.expected_next_owner or "").strip(),
-                baseline_journal=str(landed_record.latest_journal_id or "0"),
+                baseline_journal=str(landed_record.latest_journal_id or landed_baseline),
                 markers=markers,
-                live_generation=int(live_generation),
+                live_generation=generation,
                 terminal=terminal,
+                is_edge=bool(is_edge),
                 outbox=outbox,
                 reconcile_store=reconcile_store,
                 redmine_readable=bool(redmine_readable),
@@ -176,18 +211,20 @@ def reconcile_leg_once(
     if exp is None:
         return None  # no same-lane-owed next gate -> nothing to reconcile
     expected_gate, expected_owner = exp
-    baseline_journal = str(getattr(latest, "journal", "")).strip() if latest is not None else "0"
-    baseline_journal = baseline_journal or "0"
+    baseline_journal = str(latest_journal) if latest_journal > 0 else "0"
     return _run_cycle(
-        key=ReconcileStateKey(wsid, laneid, f"{issue_s}:await:{expected_gate}"),
+        key=ReconcileStateKey(
+            wsid, laneid, _anchor(issue_s, generation, baseline_journal, expected_gate)
+        ),
         issue=issue_s,
         lane_id=laneid,
         expected_gate=expected_gate,
         expected_owner=expected_owner,
         baseline_journal=baseline_journal,
         markers=markers,
-        live_generation=int(live_generation),
+        live_generation=generation,
         terminal=terminal,
+        is_edge=bool(is_edge),
         outbox=outbox,
         reconcile_store=reconcile_store,
         redmine_readable=bool(redmine_readable),
@@ -208,6 +245,7 @@ def _run_cycle(
     markers: Iterable[object],
     live_generation: int,
     terminal: bool,
+    is_edge: bool,
     outbox: CallbackOutbox,
     reconcile_store: ReconcileStateStore,
     redmine_readable: bool,
@@ -222,6 +260,10 @@ def _run_cycle(
         dispatch_journal=baseline_journal,
         expected_gate=expected_gate,
         expected_next_owner=expected_owner,
+        # The resolver-matchable delivery target: the owner's provider (worker -> claude), NOT
+        # the role token (review R2-F2). The background-service resolver re-matches this against
+        # the live inventory to reach the same-lane pane.
+        target_receiver=provider_for_role(expected_owner),
         lane_generation=int(live_generation) if live_generation > 0 else 0,
         deadline=deadline,
         target_lane=lane_id,
@@ -269,6 +311,7 @@ def _run_cycle(
             prior_send_uncertain=prior_uncertain,
             route_status=ROUTE_RESOLVED,
             expected_next_owner=expected_owner,
+            is_edge=bool(is_edge),
         )
 
     return _reconcile_once(
@@ -308,7 +351,9 @@ def build_reconcile_leg_fn(
     never aborts the supervisor sweep).
     """
 
-    def _leg(workspace_id: str, issue: str, source: object) -> Optional[dict]:
+    def _leg(
+        workspace_id: str, issue: str, source: object, is_edge: bool = False
+    ) -> Optional[dict]:
         try:
             lane_id, live_generation, disposition = lane_facts_fn(workspace_id, issue)
         except Exception:  # noqa: BLE001 - an unresolved lane is a fail-open skip (no reconcile)
@@ -332,6 +377,7 @@ def build_reconcile_leg_fn(
                 lifecycle_disposition=disposition,
                 outbox=outbox,
                 reconcile_store=reconcile_store,
+                is_edge=bool(is_edge),
                 redmine_readable=readable,
             )
         except Exception:  # noqa: BLE001 - a reconcile failure never breaks the supervisor sweep
