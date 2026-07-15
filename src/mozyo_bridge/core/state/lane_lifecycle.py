@@ -236,6 +236,7 @@ class LaneLifecycleStore:
         *,
         decision: DecisionPointer,
         issue_id: str = "",
+        worktree_identity: str = "",
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Declare a fresh lane ``active`` / ``not_requested`` at revision 1.
@@ -245,6 +246,12 @@ class LaneLifecycleStore:
         of the record that declared it and is always complete, unbound or not
         (R2-F1). When the lane *is* bound, the two must name the same issue: a
         decision filed on an unrelated ticket does not authorize this ownership.
+
+        ``worktree_identity`` (v4, Redmine #13754) is the lane's canonical worktree
+        token, written here at authoritative create time so ``retire --execute`` can
+        prove the caller's ``--worktree`` belongs to the lane before closing. Empty is
+        allowed (a lane whose worktree is not yet bound), and reads back fail-closed at
+        retire — never a guessed binding.
 
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the
@@ -259,6 +266,7 @@ class LaneLifecycleStore:
                 f"decision is anchored to issue {decision.issue_id!r} but the lane "
                 f"is being bound to {issue!r}"
             )
+        worktree = norm(worktree_identity)
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -277,7 +285,7 @@ class LaneLifecycleStore:
             try:
                 conn.execute(
                     f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         key.repo_workspace_id,
                         key.lane_id,
@@ -295,6 +303,7 @@ class LaneLifecycleStore:
                         decision.journal_id,
                         stamp,
                         stamp,
+                        worktree,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -562,7 +571,7 @@ class LaneLifecycleStore:
                     revision = 1
                     conn.execute(
                         f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             recovery.repo_workspace_id,
                             recovery.lane_id,
@@ -580,6 +589,11 @@ class LaneLifecycleStore:
                             decision.journal_id,
                             stamp,
                             stamp,
+                            # A supersede handover is not a create: the recovery lane's
+                            # worktree binding (Redmine #13754) is written when that lane
+                            # is created, not here. Empty => its execute retire fails
+                            # closed until then, never a guessed binding.
+                            "",
                         ),
                     )
                 else:
@@ -809,6 +823,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         decision_journal=str(row[13] or ""),
         created_at=str(row[14]),
         updated_at=str(row[15]),
+        worktree_identity=str(row[16] or ""),
     )
 
 

@@ -486,6 +486,14 @@ class LaneLifecycleRecord:
     the lane in its current state, and is always complete. The two are separate
     (R2-F1): an unbound lane still has a decision, and that decision must stay
     re-readable.
+
+    ``worktree_identity`` (v4, Redmine #13754) is the lane's **canonical worktree
+    binding** — the ``wt_``/``dl_`` path token of the worktree the lane runs in, written
+    at authoritative create time. ``sublane retire --execute`` proves the caller's
+    ``--worktree`` resolves to this exact token before closing anything, so a sibling
+    lane's worktree cannot drive the retire (a foreign close). Empty on a v1/v2/v3 row (a
+    known-unbound lane whose execute retire fails closed until re-declared) — never a
+    guessed value.
     """
 
     repo_workspace_id: str
@@ -504,6 +512,7 @@ class LaneLifecycleRecord:
     decision_journal: str = ""
     created_at: str = ""
     updated_at: str = ""
+    worktree_identity: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -554,6 +563,7 @@ class LaneLifecycleRecord:
             "decision_journal": self.decision_journal,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "worktree_identity": self.worktree_identity,
         }
 
 

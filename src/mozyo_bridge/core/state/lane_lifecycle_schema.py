@@ -17,6 +17,7 @@ leaves the DB untouched).
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Optional
 
 from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
 from mozyo_bridge.core.state.state_store import (
+    BACKUPS_DIRNAME,
     STATE_CONTAINER_VERSION,
     StateStoreError,
     connect_state_container_rw,
@@ -32,14 +34,20 @@ from mozyo_bridge.core.state.state_store import (
 
 
 LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
-#: v3 (Redmine #13763 j#78052): adds the receiver-replacement generation on the
-#: same row/revision as disposition and release. v2 split the durable decision
-#: anchor's issue (``decision_issue_id``) from the lane's owner binding.
-LANE_LIFECYCLE_SCHEMA_VERSION = 3
-#: The component shapes this build can read and write. ``1`` and ``2`` are migrated
-#: additively to ``3``; anything else — a newer version from a future build, or a foreign value —
-#: fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+#: v2 split the durable decision anchor's issue (``decision_issue_id``) from the lane's
+#: owner binding. v3 (Redmine #13763 j#78052) adds the receiver-replacement generation on
+#: the same row/revision as disposition and release.
+#: v4 (Redmine #13754, integration j#78705) adds ``worktree_identity`` — the lane's
+#: canonical worktree binding, so ``sublane retire --execute`` proves the caller's
+#: ``--worktree`` from a fail-closed authority (not the display-only ``lane_metadata``).
+#: A v1/v2/v3 row lands with an empty binding — a known-unbound lane whose execute retire
+#: fails closed until it is re-declared. (This is the collision fix: #13754's worktree
+#: field takes the NEXT free version v4, so it never clashes with #13763's v3 shape.)
+LANE_LIFECYCLE_SCHEMA_VERSION = 4
+#: The component shapes this build can read and write. ``1``/``2``/``3`` are migrated
+#: additively to ``4``; anything else — a newer version from a future build, or a foreign
+#: value — fails closed and the store is left untouched (R3-F1).
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -65,6 +73,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     decision_journal TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    worktree_identity TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -84,8 +93,74 @@ _COLUMNS = (
     "repo_workspace_id, lane_id, issue_id, lane_disposition, process_release, "
     "revision, release_action_id, release_pins, replacement_state, "
     "replacement_action_id, replacement_pins, decision_source, "
-    "decision_issue_id, decision_journal, created_at, updated_at"
+    "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity"
 )
+
+_V1_COLUMNS = frozenset(
+    {
+        "repo_workspace_id",
+        "lane_id",
+        "issue_id",
+        "lane_disposition",
+        "process_release",
+        "revision",
+        "release_action_id",
+        "release_pins",
+        "decision_source",
+        "decision_journal",
+        "created_at",
+        "updated_at",
+    }
+)
+_V2_ADDS = frozenset({"decision_issue_id"})  # R2-F1: split the decision anchor's issue
+_V3_ADDS = frozenset(
+    {"replacement_state", "replacement_action_id", "replacement_pins"}  # #13763
+)
+_V4_ADDS = frozenset({"worktree_identity"})  # #13754 worktree binding
+
+#: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
+#: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
+#: equality — no unknown extra columns, no missing columns), or it is a partial /
+#: incompatible authority shape and fails closed (never silently re-created, migrated, or
+#: re-stamped). v3 is the collision point where TWO branches legitimately exist — the
+#: staging replacement-v3 and the already-live #13754 worktree-v3 — so v3 allows exactly
+#: those two shapes and NOTHING ELSE (a pure-v2 shape recorded v3 is NOT a known v3).
+_SHAPE_V1 = _V1_COLUMNS
+_SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
+_SHAPE_V3_REPLACEMENT = _V1_COLUMNS | _V2_ADDS | _V3_ADDS
+_SHAPE_V3_WORKTREE = _V1_COLUMNS | _V2_ADDS | _V4_ADDS
+_SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
+_ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
+    1: (_SHAPE_V1,),
+    2: (_SHAPE_V2,),
+    3: (_SHAPE_V3_REPLACEMENT, _SHAPE_V3_WORKTREE),
+    4: (_SHAPE_V4,),
+}
+
+#: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
+#: pk_order)`` as ``PRAGMA table_info`` reports it. A same-named but re-typed / nullable /
+#: default-changed / PK-shifted column is NOT the current column — it fails closed rather
+#: than being read as authoritative (R6-F1). ``pk_order`` is the 1-based composite-PK
+#: position (0 for a non-PK column); ``default`` is the SQL literal ``table_info`` returns.
+_COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
+    "repo_workspace_id": ("TEXT", 1, None, 1),
+    "lane_id": ("TEXT", 1, None, 2),
+    "issue_id": ("TEXT", 1, "''", 0),
+    "lane_disposition": ("TEXT", 1, None, 0),
+    "process_release": ("TEXT", 1, None, 0),
+    "revision": ("INTEGER", 1, None, 0),
+    "release_action_id": ("TEXT", 1, "''", 0),
+    "release_pins": ("TEXT", 1, "''", 0),
+    "replacement_state": ("TEXT", 1, "'not_requested'", 0),
+    "replacement_action_id": ("TEXT", 1, "''", 0),
+    "replacement_pins": ("TEXT", 1, "''", 0),
+    "decision_source": ("TEXT", 1, "''", 0),
+    "decision_issue_id": ("TEXT", 1, "''", 0),
+    "decision_journal": ("TEXT", 1, "''", 0),
+    "created_at": ("TEXT", 1, None, 0),
+    "updated_at": ("TEXT", 1, None, 0),
+    "worktree_identity": ("TEXT", 1, "''", 0),
+}
 
 
 class LaneLifecycleError(RuntimeError):
@@ -99,6 +174,78 @@ def lane_lifecycle_path(home: Path | None = None) -> Path:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _backup_stamp(now: str) -> str:
+    """Compact filesystem-safe stamp (``20260621T130000Z``) for a backup dir."""
+    parsed = datetime.fromisoformat(now)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    """Best-effort ``ROLLBACK`` so a failed migration leaves the store byte-unchanged."""
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.DatabaseError:
+        pass
+
+
+def _stamp_component_version(conn: sqlite3.Connection) -> None:
+    """Register / re-stamp this component at the current schema version (native form)."""
+    conn.execute(
+        "INSERT INTO state_schema_components "
+        "(component, schema_version, owner, recovery_policy, "
+        "migrated_from, updated_at) VALUES (?, ?, ?, ?, NULL, ?) "
+        "ON CONFLICT(component) DO UPDATE SET "
+        "schema_version = excluded.schema_version, "
+        "owner = excluded.owner, "
+        "recovery_policy = excluded.recovery_policy, "
+        "updated_at = excluded.updated_at",
+        (
+            LANE_LIFECYCLE_COMPONENT,
+            LANE_LIFECYCLE_SCHEMA_VERSION,
+            "core/state/lane_lifecycle.py",
+            LANE_LIFECYCLE_RECOVERY_POLICY,
+            _utc_now(),
+        ),
+    )
+
+
+def backup_state_container(path: Path) -> Optional[Path]:
+    """Copy an existing ``state.sqlite`` into ``backups/state-<ts>/`` before a write.
+
+    A **component** write migration (an additive ``ALTER`` on authoritative rows) must
+    honor ``managed-state-model.md`` (``### backup / downgrade / partial migration``)
+    like the container's legacy import does: copy the DB under home before the first
+    write; a copy failure raises :class:`StateStoreError` so the caller fails closed with
+    the DB byte-unchanged. Returns the backup dir, or ``None`` when there is nothing to
+    preserve yet (a fresh store has no prior authority).
+
+    The backup directory **never overwrites an existing snapshot** (Redmine #13754
+    R4-F1): the second-precision stamp can collide, so a taken directory gets a numeric
+    suffix (``…-1``, ``…-2``) rather than a clobbering ``copy2`` over a prior backup.
+    Migration is serialized upstream, so this is defense in depth — a pre-migration
+    snapshot is preserved even if two backups ever share a second.
+    """
+    if not path.exists():
+        return None
+    base = path.parent / BACKUPS_DIRNAME / f"state-{_backup_stamp(_utc_now())}"
+    try:
+        backup_dir = base
+        suffix = 1
+        while backup_dir.exists():
+            backup_dir = base.with_name(f"{base.name}-{suffix}")
+            suffix += 1
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(path, backup_dir / path.name)
+    except OSError as exc:
+        raise StateStoreError(
+            f"backup near {base} failed ({exc}); migration aborted "
+            f"(nothing was written)"
+        ) from exc
+    return backup_dir
 
 #: Sentinel for a component row whose version is present but not an exact integer
 #: (a REAL like ``2.5``, TEXT, BLOB, …). It is deliberately outside
@@ -164,6 +311,86 @@ def _table_present(conn: sqlite3.Connection, name: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+#: The active-owner index's authority-defining shape (Redmine #13754 R7-F1, j#78814): the
+#: key columns in order, and the partial predicate that scopes uniqueness to ACTIVE,
+#: issue-bound rows. A same-named index that is non-unique, keyed on other columns, scoped
+#: by a different predicate, or attached to another table does NOT enforce exactly-one
+#: active owner — it is not this constraint and fails closed.
+_OWNER_INDEX_KEY_COLUMNS = ("repo_workspace_id", "issue_id")
+_OWNER_INDEX_PREDICATE = "lane_disposition = 'active' AND issue_id <> ''"
+
+
+def _verify_owner_index(conn: sqlite3.Connection) -> bool:
+    """Does the active-owner unique partial index exist with its EXACT authority shape?
+
+    Not a name check (Redmine #13754 R7-F1): the exactly-one-active-owner invariant is
+    enforced by the storage engine only when the index is (1) attached to
+    ``lane_lifecycle_records``, (2) UNIQUE, (3) PARTIAL, (4) keyed on
+    ``(repo_workspace_id, issue_id)`` in that order, and (5) scoped by the predicate
+    ``lane_disposition = 'active' AND issue_id <> ''``. A same-named index missing any of
+    these does not enforce the constraint and is a corrupt authority shape.
+    """
+    row = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (_OWNER_INDEX,),
+    ).fetchone()
+    if row is None or row[0] != _TABLE:
+        return False  # absent, or attached to a foreign table
+    listing = {
+        r[1]: (r[2], r[4])  # name -> (unique, partial)
+        for r in conn.execute(f"PRAGMA index_list({_TABLE})")
+    }
+    if listing.get(_OWNER_INDEX) != (1, 1):  # must be UNIQUE and PARTIAL
+        return False
+    key_columns = tuple(
+        r[2] for r in conn.execute(f"PRAGMA index_info({_OWNER_INDEX})")
+    )
+    if key_columns != _OWNER_INDEX_KEY_COLUMNS:  # wrong / reordered key columns
+        return False
+    # The partial predicate lives only in the stored CREATE text; collapse whitespace
+    # first (SQLite preserves the original newlines), then extract after WHERE and compare
+    # so formatting does not matter but semantics do.
+    sql = " ".join((row[1] or "").split())
+    marker = " where "
+    where_at = sql.lower().find(marker)
+    if where_at == -1:
+        return False
+    predicate = sql[where_at + len(marker) :].strip()
+    return predicate == _OWNER_INDEX_PREDICATE
+
+
+def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
+    """Does the live table EXACTLY match one of ``recorded``'s allowed signatures?
+
+    Redmine #13754 R6-F1 (j#78803): the classifier must accept only a *known* shape, not a
+    minimum column floor. This verifies, with no mutation:
+
+    - the table exists;
+    - its column-NAME set equals one of :data:`_ALLOWED_SHAPES_BY_VERSION` for ``recorded``
+      exactly (no unknown extra column, no missing column — a pure-v2 shape recorded v3 is
+      rejected, an extra column on a v4 store is rejected);
+    - every present column's authority-affecting definition (type / NOT NULL / default /
+      PK order) matches :data:`_COLUMN_DEFS` (a same-named but re-typed / nullable column
+      is not the current column);
+    - the active-owner index enforces its EXACT constraint (:func:`_verify_owner_index`):
+      a same-named index that is non-unique / wrong-keyed / wrong-predicate / on a foreign
+      table does not enforce exactly-one-active-owner and is a corrupt shape (R7-F1).
+    """
+    if not _table_present(conn, _TABLE):
+        return False
+    info = {
+        row[1]: (row[2], row[3], row[4], row[5])  # name -> (type, notnull, dflt, pk)
+        for row in conn.execute(f"PRAGMA table_info({_TABLE})")
+    }
+    names = frozenset(info)
+    if names not in _ALLOWED_SHAPES_BY_VERSION.get(recorded, ()):
+        return False
+    for name, definition in info.items():
+        if _COLUMN_DEFS.get(name) != definition:
+            return False
+    return _verify_owner_index(conn)
 
 
 def readonly_component_status(conn: sqlite3.Connection) -> str:
@@ -256,11 +483,22 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             f"lane lifecycle store {path} is unreadable "
             f"({type(exc).__name__}); fail closed"
         ) from exc
+    # Serialize the whole migration under one exclusive write lock (Redmine #13754 R4-F1):
+    # ``BEGIN IMMEDIATE`` takes the reserved lock BEFORE the version is read, so a
+    # concurrent first-use caller cannot read the same pre-migration version, back up, and
+    # overwrite the only pre-migration snapshot with a post-migration copy. The lock is
+    # cross-process (SQLite file locks + the container guard's ``busy_timeout``); a second
+    # migrator blocks, re-reads the now-current version, and does nothing. The container
+    # guard's connection is default-isolation; switch it to autocommit so an explicit
+    # ``BEGIN IMMEDIATE`` (not Python's implicit deferred transaction) governs the section.
+    conn.isolation_level = None
+    locked = False
     try:
-        # Read the recorded component version BEFORE any DDL/DML: the refusal
-        # below must leave the store byte-equivalent, and `CREATE TABLE IF NOT
-        # EXISTS` / `ALTER` / the metadata upsert would each already be a write
-        # under a schema we do not understand.
+        conn.execute("BEGIN IMMEDIATE")
+        locked = True
+        # Read the recorded component version UNDER the lock and BEFORE any DDL/DML: the
+        # downgrade refusal below must leave the store byte-equivalent, and this read is
+        # now authoritative (no concurrent migrator can move it out from under us).
         recorded = _recorded_version(conn)
         if recorded is not None and recorded not in _RECOGNIZED_SCHEMA_VERSIONS:
             detail = (
@@ -273,61 +511,105 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                 f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The store is left untouched "
                 f"(downgrade-safe); use a newer build."
             )
-        with conn:
+        # Classify the recorded version against the EXACT live table signature before any
+        # DDL/DML (Redmine #13754 R5-F1 / R6-F1): the migration must never silently
+        # re-create a missing table, default-repair a missing / re-typed authority column,
+        # or adopt an unknown-shaped store as a known one. ``CREATE TABLE IF NOT EXISTS`` +
+        # idempotent ``ALTER`` + a subset check would do exactly that. Instead a recognized
+        # recorded version must match one of its version's ALLOWED signatures exactly
+        # (:func:`_schema_signature_matches`) — otherwise it is a corrupt / partial /
+        # incompatible authority shape and fails closed (``managed-state-model.md``: a
+        # partial migration is never a success, an authoritative component is never silently
+        # overwritten, repair is an explicit path).
+        table_exists = _table_present(conn, _TABLE)
+        if recorded is None:
+            # A component this build never registered. Only a genuinely fresh store (no
+            # table) is a create; a table *without* its metadata row is a partial / unknown
+            # state — fail closed exactly like the read-side ``readonly_component_status``.
+            if table_exists:
+                raise LaneLifecycleError(
+                    "lane lifecycle table exists without a component metadata row "
+                    "(partial / unknown state); fail closed (no silent adoption)."
+                )
             conn.execute(_TABLE_SQL)
-            # v1 -> v2 (R2-F1): additive, mirroring the sibling native component's
-            # ``lane_metadata`` v2 migration. A v1 row's anchor kept only the
-            # journal, so its ``decision_issue_id`` lands empty — that row is a
-            # known-incomplete anchor, not a silently-repaired one.
-            columns = {
+            conn.execute(_OWNER_INDEX_SQL)
+            _stamp_component_version(conn)
+        elif not _schema_signature_matches(conn, recorded):
+            # A recorded version whose live shape is NOT one of that version's known
+            # signatures: a missing table, a missing / extra / re-typed column, or a missing
+            # active-owner index. Never re-create / default-repair / re-stamp it.
+            raise LaneLifecycleError(
+                f"lane lifecycle records v{recorded} but its live table shape does not match "
+                f"a known v{recorded} signature (corrupt / partial / incompatible authority "
+                f"shape); fail closed (no silent repair). Restore from a backup."
+            )
+        elif recorded == LANE_LIFECYCLE_SCHEMA_VERSION:
+            # Intact current: the signature already matches. Do NOT re-run DDL or re-stamp.
+            pass
+        else:
+            # A recognized OLDER version whose shape matches one of its KNOWN predecessor
+            # signatures (v1, v2, or either v3 branch). Migrate forward: back up first, then
+            # add only the columns that version legitimately lacks to converge on v4.
+            current_columns = {
                 row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")
             }
-            if "decision_issue_id" not in columns:
+            # Backup-first (Redmine #13754 R3-F1): copy the DB under home BEFORE the first
+            # ``ALTER``; a backup failure aborts with nothing written. Under the lock the DB
+            # on disk is the committed pre-``ALTER`` state and no other writer can change it
+            # during the copy, so the snapshot is a faithful, unique pre-migration copy.
+            try:
+                backup_state_container(path)
+            except StateStoreError as exc:
+                raise LaneLifecycleError(
+                    f"lane lifecycle migration to v{LANE_LIFECYCLE_SCHEMA_VERSION} "
+                    f"aborted: {exc}. The store is left untouched (backup-first)."
+                ) from exc
+            # One atomic transaction (Redmine #13754 R4-F2): the additive ``ALTER``s that
+            # bring the older shape up to v4 and the version re-stamp run inside this one
+            # ``BEGIN IMMEDIATE`` block, so a failure part-way rolls the whole migration back
+            # (schema + recorded version stay at the predecessor) and the backup remains the
+            # recovery point. Each ``ALTER`` only ADDS a column the older version legitimately
+            # lacks — an existing row lands with the column's empty default (a known-unbound
+            # / known-incomplete field), never a silently-guessed authority value.
+            if "decision_issue_id" not in current_columns:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN decision_issue_id TEXT NOT NULL DEFAULT ''"
                 )
-            # v2 -> v3 (Redmine #13763 j#78052): an additive third lifecycle
-            # axis for owner-approved receiver replacement. These fields share
-            # the row revision with disposition / release so their actuators
-            # cannot race past each other.
-            if "replacement_state" not in columns:
+            if "replacement_state" not in current_columns:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN replacement_state TEXT NOT NULL DEFAULT 'not_requested'"
                 )
-            if "replacement_action_id" not in columns:
+            if "replacement_action_id" not in current_columns:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN replacement_action_id TEXT NOT NULL DEFAULT ''"
                 )
-            if "replacement_pins" not in columns:
+            if "replacement_pins" not in current_columns:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN replacement_pins TEXT NOT NULL DEFAULT ''"
                 )
+            if "worktree_identity" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN worktree_identity TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute(_OWNER_INDEX_SQL)
-            conn.execute(
-                "INSERT INTO state_schema_components "
-                "(component, schema_version, owner, recovery_policy, "
-                "migrated_from, updated_at) VALUES (?, ?, ?, ?, NULL, ?) "
-                "ON CONFLICT(component) DO UPDATE SET "
-                "schema_version = excluded.schema_version, "
-                "owner = excluded.owner, "
-                "recovery_policy = excluded.recovery_policy, "
-                "updated_at = excluded.updated_at",
-                (
-                    LANE_LIFECYCLE_COMPONENT,
-                    LANE_LIFECYCLE_SCHEMA_VERSION,
-                    "core/state/lane_lifecycle.py",
-                    LANE_LIFECYCLE_RECOVERY_POLICY,
-                    _utc_now(),
-                ),
-            )
+            _stamp_component_version(conn)
+        conn.execute("COMMIT")
+        locked = False
     except sqlite3.DatabaseError as exc:
+        if locked:
+            _rollback_quietly(conn)
         raise LaneLifecycleError(
             f"lane lifecycle schema init failed ({type(exc).__name__}); fail closed"
         ) from exc
+    except LaneLifecycleError:
+        if locked:
+            _rollback_quietly(conn)
+        raise
     finally:
         conn.close()
 
