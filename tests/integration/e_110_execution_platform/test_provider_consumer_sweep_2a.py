@@ -61,7 +61,7 @@ from mozyo_bridge.application.commands_status import (  # noqa: E402
 def _snapshot(profiles: dict):
     return build_runtime_snapshot(
         AgentProviderProfileConfig.from_record(
-            {"version": "t", "source": "test-fixture", "profiles": profiles}
+            {"version": "1", "source": "test-fixture", "profiles": profiles}
         ).to_registry()
     )
 

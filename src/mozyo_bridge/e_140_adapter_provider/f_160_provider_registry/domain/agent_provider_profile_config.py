@@ -35,7 +35,15 @@ What a profile **owns** (Design Answer j#76725 "Registry ownership"):
   (concept -> flag spelling, e.g. ``permission_mode`` -> ``--permission-mode``).
   This is what turns "Claude's permission flag is called X" from a source branch
   into data, and it doubles as the reserved-flag vocabulary an operator's repo
-  config may not re-specify.
+  config may not re-specify;
+- ``startup_blockers`` — the *mechanical* startup-interaction signatures (Redmine
+  #13760, Design Answer j#77947): the provider's pre-composer screens (a trust
+  confirmation, a first-run theme picker, a login prompt) that look like a live TUI
+  to every status/readiness projection but cannot accept a handoff body. Each
+  blocker is a closed ``{id, all_of}`` record whose signatures must ALL appear
+  (AND), so one generic phrase can never false-positive a ready composer. This is
+  *description*, never authority: the transport reads it to refuse a send, and it
+  can never accept, dismiss, or answer the provider's prompt.
 
 What a profile may **never** own (fail-closed here, not merely documented):
 
@@ -180,10 +188,53 @@ _PROFILE_ENTRY_KEYS: frozenset[str] = frozenset(
         "process_names",
         "capabilities",
         "managed_flags",
+        "startup_blockers",
     }
 )
 
+# The startup-blocker schema (`StartupBlocker` / `fold_startup_text` / the bounds)
+# lives in its own leaf module (module-health) and is imported back here so every
+# existing importer of these names is unchanged (Redmine #13760 review j#78481).
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_startup_blocker import (  # noqa: E501
+    MAX_STARTUP_BLOCKERS,
+    MAX_STARTUP_SIGNATURES,
+    MAX_STARTUP_SIGNATURE_LEN,
+    MIN_STARTUP_SIGNATURES,
+    MIN_STARTUP_SIGNATURE_FOLDED_LEN,
+    StartupBlocker,
+    fold_startup_text,
+)
+
+
 _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
+
+#: The agent-provider-profile schema versions this code understands (Redmine #13760
+#: review j#78481 finding 2). ``"1"`` is the #13441 shape (executable / protocol /
+#: discovery / capabilities / managed_flags); ``"2"`` adds the #13760 optional
+#: ``startup_blockers``. Both are still readable because ``startup_blockers`` is optional
+#: and backward-compatible, but an UNKNOWN version fails closed at load — a schema this
+#: code does not understand must never be run on a partially-understood provider contract
+#: (the design gate j#77947 Q1 required version to be fail-closed validated, not merely
+#: non-empty). Adding a version here is the deliberate, reviewable act of teaching the
+#: loader a new shape.
+SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2"})
+
+#: Schema versions whose shape predates ``startup_blockers`` (Redmine #13760 review
+#: j#78529 finding 2). The field is the v2 addition, so a ``version: "1"`` artifact that
+#: declares it is a shape/version drift and fails closed — the declared "v2 adds
+#: startup_blockers" contract and the runtime shape stay in lock-step instead of the loader
+#: silently honoring a field the artifact's own version says it does not have. An explicit
+#: set (not a ``<`` comparison) so a future ``"10"`` cannot be mis-ordered against ``"2"``.
+_VERSIONS_WITHOUT_STARTUP_BLOCKERS: frozenset[str] = frozenset({"1"})
+#: The version a profile is nominally on when it may carry startup_blockers (for messages).
+_STARTUP_BLOCKERS_MIN_VERSION = "2"
+
+#: The version threaded to :meth:`AgentProviderProfile.from_record` when no config wrapper
+#: supplies one (a bare, context-free profile parse in a test). The newest supported
+#: version — a context-free parse is not artificially restricted; the artifact-level
+#: version gate is enforced by :meth:`AgentProviderProfileConfig.from_record`, which always
+#: passes the real declared version.
+_DEFAULT_PARSE_VERSION = "2"
 
 #: Wheel-packaged resource (a sibling of the registry module) shipping the built-in
 #: profiles. Read via ``importlib.resources`` in :mod:`.agent_provider_profile` — a
@@ -339,6 +390,11 @@ class AgentProviderProfile:
     process_names: tuple[str, ...] = ()
     capabilities: frozenset[AgentCapability] = field(default_factory=frozenset)
     managed_flags: tuple[tuple[ManagedFlagConcept, str], ...] = ()
+    #: Redmine #13760: the provider's pre-composer startup screens, in declaration
+    #: order (the order the classifier reports a first match in). Empty for a provider
+    #: with none declared — which admits every send, exactly as before this field
+    #: existed, so adding the field changes no provider that does not use it.
+    startup_blockers: tuple[StartupBlocker, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_id, str) or not self.provider_id.strip():
@@ -386,6 +442,25 @@ class AgentProviderProfile:
         # know a concept it cannot spell, or spell a flag it is not allowed to apply.
         # Fail closed rather than silently dropping the managed posture (a Claude
         # worker booting prompt-gated is exactly the #13360 stall).
+        for blocker in self.startup_blockers:
+            if not isinstance(blocker, StartupBlocker):
+                raise AgentProviderProfileError(
+                    f"agent provider profile {self.provider_id!r} startup blocker must "
+                    f"be a StartupBlocker, got {type(blocker).__name__}"
+                )
+        blocker_ids = [blocker.blocker_id for blocker in self.startup_blockers]
+        if len(blocker_ids) > MAX_STARTUP_BLOCKERS:
+            raise AgentProviderProfileError(
+                f"agent provider profile {self.provider_id!r} declares "
+                f"{len(blocker_ids)} startup blockers; the bound is "
+                f"{MAX_STARTUP_BLOCKERS}"
+            )
+        if len(set(blocker_ids)) != len(blocker_ids):
+            raise AgentProviderProfileError(
+                f"agent provider profile {self.provider_id!r} declares duplicate startup "
+                f"blocker id(s) {sorted(blocker_ids)}; a blocker id is the fixed token a "
+                f"zero-send outcome reports, so it must identify exactly one screen"
+            )
         concepts = {concept for concept, _ in self.managed_flags}
         has_permission_flag = ManagedFlagConcept.PERMISSION_MODE in concepts
         has_permission_cap = AgentCapability.MANAGED_PERMISSION_MODE in self.capabilities
@@ -427,13 +502,22 @@ class AgentProviderProfile:
         return capability in self.capabilities
 
     @classmethod
-    def from_record(cls, provider_id: object, record: object) -> "AgentProviderProfile":
+    def from_record(
+        cls,
+        provider_id: object,
+        record: object,
+        *,
+        schema_version: str = _DEFAULT_PARSE_VERSION,
+    ) -> "AgentProviderProfile":
         """Validate one already-parsed profile entry, failing closed.
 
         Rejects: a non-string / empty / authority-shaped ``provider_id``, a
         non-mapping entry, an unknown or missing entry key, an unknown protocol,
         an unknown capability, an unknown managed-flag concept, a non-flag-shaped
-        flag spelling, and every shape :class:`TrustedExecutable` refuses.
+        flag spelling, every shape :class:`TrustedExecutable` refuses, and — Redmine
+        #13760 review j#78529 finding 2 — a ``startup_blockers`` field on a
+        ``schema_version`` older than :data:`_STARTUP_BLOCKERS_MIN_VERSION` (the field
+        is the v2 addition, so a v1 record declaring it is a shape/version drift).
         """
         if not isinstance(provider_id, str) or not provider_id.strip():
             raise AgentProviderProfileError(
@@ -452,6 +536,15 @@ class AgentProviderProfile:
                 f"profile {provider_id!r}; allowed: {sorted(_PROFILE_ENTRY_KEYS)}. A "
                 f"profile never carries a workflow role, a binding, a topology, or a "
                 f"module path (Redmine #13441 j#76725)."
+            )
+        if "startup_blockers" in record and schema_version in _VERSIONS_WITHOUT_STARTUP_BLOCKERS:
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} declares 'startup_blockers' but "
+                f"the config schema version is {schema_version!r}; that field was added in "
+                f"version {_STARTUP_BLOCKERS_MIN_VERSION!r}. A version's declared shape and "
+                f"the fields the loader honors must not drift — bump the artifact to "
+                f"version {_STARTUP_BLOCKERS_MIN_VERSION!r} to use startup_blockers "
+                f"(Redmine #13760 j#78529)."
             )
         missing = {"protocol", "executable"} - set(record)
         if missing:
@@ -519,6 +612,17 @@ class AgentProviderProfile:
                 )
             managed.append((concept, flag))
 
+        raw_blockers = record.get("startup_blockers", []) or []
+        if isinstance(raw_blockers, (str, bytes)) or not isinstance(raw_blockers, Sequence):
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} 'startup_blockers' must be a "
+                f"list of {{id, all_of}} records, got {type(raw_blockers).__name__}"
+            )
+        startup_blockers = tuple(
+            StartupBlocker.from_record(entry, provider_id=provider_id)
+            for entry in raw_blockers
+        )
+
         return cls(
             provider_id=provider_id,
             protocol=protocol,
@@ -537,7 +641,23 @@ class AgentProviderProfile:
             ),
             capabilities=frozenset(capabilities),
             managed_flags=tuple(sorted(managed, key=lambda pair: pair[0].value)),
+            startup_blockers=startup_blockers,
         )
+
+    def match_startup_blocker(self, content: object) -> Optional[StartupBlocker]:
+        """The first declared blocker whose signatures ALL appear in ``content``.
+
+        The pure classifier the pre-send admission gate calls (Redmine #13760). Pure and
+        total: an unreadable / non-string / empty ``content`` matches nothing and is
+        reported as ``None`` — the CALLER must not read that as "startup clear" (an
+        unreadable pane is a transport failure and fails closed on its own path, j#77947
+        invariant 4). A provider with no declared blockers always returns ``None``, so
+        this is byte-invariant for a provider that declares none.
+        """
+        for blocker in self.startup_blockers:
+            if blocker.matches(content):
+                return blocker
+        return None
 
 
 class AgentProviderProfileRegistry:
@@ -704,6 +824,18 @@ class AgentProviderProfileConfig:
             raise AgentProviderProfileError(
                 "agent provider profile config 'version' must be a non-empty string"
             )
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
+            # Redmine #13760 review j#78481 finding 2: fail closed on a version this code
+            # does not understand rather than loading it on a hopeful best-effort. A newer
+            # artifact may carry a shape (or a semantic) this loader would silently
+            # misread; refusing is the same fail-closed posture the rest of the schema
+            # takes on an unknown key.
+            raise AgentProviderProfileError(
+                f"agent provider profile config declares unsupported schema version "
+                f"{version!r}; this build understands {sorted(SUPPORTED_SCHEMA_VERSIONS)}. "
+                f"A version bump is a deliberate schema change — teach the loader the new "
+                f"shape (SUPPORTED_SCHEMA_VERSIONS) before shipping an artifact that uses it."
+            )
         source = record.get("source")
         if not isinstance(source, str) or not source.strip():
             raise AgentProviderProfileError(
@@ -716,7 +848,7 @@ class AgentProviderProfileConfig:
                 "of provider id -> profile"
             )
         profiles = tuple(
-            AgentProviderProfile.from_record(pid, entry)
+            AgentProviderProfile.from_record(pid, entry, schema_version=version)
             for pid, entry in sorted(raw_profiles.items(), key=lambda kv: str(kv[0]))
         )
         return cls(version=version, source=source, profiles=profiles)
@@ -736,6 +868,12 @@ class AgentProviderProfileConfig:
 
 __all__ = (
     "AGENT_PROVIDER_PROFILE_RESOURCE",
+    "MAX_STARTUP_BLOCKERS",
+    "MAX_STARTUP_SIGNATURES",
+    "MAX_STARTUP_SIGNATURE_LEN",
+    "MIN_STARTUP_SIGNATURES",
+    "MIN_STARTUP_SIGNATURE_FOLDED_LEN",
+    "SUPPORTED_SCHEMA_VERSIONS",
     "RECEIVER_AGNOSTIC_PROCESSES",
     "RESERVED_IDENTITY_TOKENS",
     "AgentCapability",
@@ -746,5 +884,7 @@ __all__ = (
     "FORBIDDEN_PROFILE_TOKENS",
     "InteractionProtocol",
     "ManagedFlagConcept",
+    "StartupBlocker",
     "TrustedExecutable",
+    "fold_startup_text",
 )
