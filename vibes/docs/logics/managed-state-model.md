@@ -424,14 +424,23 @@ Table naming:
       の間に busy 化/pending/duplicate/recycled locator になった agent は **zero-close**。★**whole-unit post-close measure
       (review j#79320 R3)**: close 後に **lane unit 全体の expected pair を fresh inventory で測定**（`.absent` = 全 expected slot
       不在）。old pins 消失だけでは成功にせず、recycled/duplicate/foreign が any locator で live なら **success withhold**（terminal
-      retired + live newer pair の false success を排除）。★**no retired-branch close (review j#79320 R4)**: reconcile は
-      **retired row の pair を一切 close しない**（collision-proof marker 無しに自 owed close と ordinary #13809/#13810-bound retired
-      row を機械的に区別できないため）。retired+owns issue+positive absence → `already_reconciled` idempotent no-op（write/close なし、
-      無害）、retired+live pair → `live_pair_present` withhold（persisted retired は非稼働性を証明しない）。retire-first の crash 窓
-      （retire 済・pane close 未）は fail-closed withhold で、**ordinary `sublane retire --execute`（#13754）が retired+bound row を
-      attest→close→already_retired で recover**（非退行）。acceptance「**close済み** partial replay は positive absence + durable
-      owed state から再開」= close 後 = retired+absent → `already_reconciled`（idempotent, duplicate close せず）で満たす。
-      「hibernated + live pair 無し」は retire せず `live_pair_absent` で #13841 へ route。
+      retired + live newer pair の false success を排除）。★**collision-proof owed-close ledger + same-flow resume
+      (review j#79346 R5)**: reconcile は retire CAS の **前**に、isolated home-scoped durable component
+      `LaneReconcileOwedStore`（`lane-reconcile-owed.sqlite`、`rebuildable_cache`、schema mismatch/unwritable は record が
+      raise → caller は retire せず fail-closed、read は fail-open None）へ **owed-close entry `(lane_generation, retired_revision)`**
+      を記録（retire 後は必ず entry 存在。ledger 書込失敗時は retire しない＝unresumable owed close を作らない）。retire 済・pane
+      close 未の crash は **同一 reconcile authority で resume**: retired-branch が **ledger を read し `retired_revision==row.revision
+      ∧ lane_generation==row.lane_generation` の時のみ** owed-close と認定（collision-proof: ordinary #13809/#13810-bound retired row は
+      entry 無し→resume せず、review j#79320 R4 維持）、record.declared_pins へ **同じ close-time full re-verify + whole-unit measure**
+      を適用（recycled newer/busy/pending は zero-close）、close 成功で ledger clear。★**lane_lifecycle schema へ v6 column を
+      加えない**判断: provenance は共有 authority schema（#13810 済 test 横断）でなく isolated component に置く（state.sqlite と
+      同一 home ゆえ crash replay で共存、partial loss は fail-closed）＝格納場所の選択であり受入条件の弱化ではない。★**#13754 手動
+      fallback を撤去** (review j#79346 R5): #13754 ordinary close は name/provider-based で declared_slots generation pins を読まず
+      idle/composer/attestation gate も無いため recycled newer generation を close する→crash replay を委ねない。reconcile 自身の
+      retired-branch resume で **one replayable flow** を完結。acceptance「**close済み** partial replay は positive absence + durable
+      owed state から再開」= close 後 = retired + (ledger match) + absent → ledger clear + `already_reconciled`（idempotent, duplicate
+      close せず）で満たす。ledger 無し/mismatch の retired row は resume せず、absent → `already_reconciled`、live → `live_pair_present`
+      withhold。「hibernated + live pair 無し」は retire せず `live_pair_absent` で #13841 へ route。
       `--reconcile-hibernated-live` は `--execute` / `--migrate-hibernated-legacy` と競合する destructive intent ゆえ
       **2 つ以上の同時指定は command-time zero-write error**。process launch/resume・worktree/branch 削除・raw Herdr/tmux・
       origin/main・production は伴わない（唯一の process mutation は 自 lane の exact managed pair への pin-matched close）。

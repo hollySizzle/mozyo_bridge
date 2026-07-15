@@ -75,6 +75,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
 from mozyo_bridge.core.state.lane_reconcile_binding import (  # noqa: E402
     LaneReconcileBindingStore,
 )
+from mozyo_bridge.core.state.lane_reconcile_owed import (  # noqa: E402
+    LaneReconcileOwedError,
+    LaneReconcileOwedStore,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_herdr_projection,
     sublane_herdr_retire,
@@ -441,6 +445,57 @@ class ReconcileRebindCasMatrix(unittest.TestCase):
             )
 
 
+class ReconcileOwedLedgerTests(unittest.TestCase):
+    """``LaneReconcileOwedStore`` record / read / clear + provenance discipline (review j#79346 R5)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "owed.sqlite"
+        self.store = LaneReconcileOwedStore(path=self.path)
+
+    def test_record_read_roundtrip(self) -> None:
+        self.store.record(
+            workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5
+        )
+        rec = self.store.read(_WORKSPACE_ID, _LANE)
+        self.assertIsNotNone(rec)
+        self.assertEqual((rec.lane_generation, rec.retired_revision), (1, 5))
+
+    def test_record_is_snapshot_replace(self) -> None:
+        self.store.record(workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5)
+        self.store.record(workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=2, retired_revision=9)
+        rec = self.store.read(_WORKSPACE_ID, _LANE)
+        self.assertEqual((rec.lane_generation, rec.retired_revision), (2, 9))
+
+    def test_read_absent_is_none(self) -> None:
+        self.assertIsNone(self.store.read(_WORKSPACE_ID, _LANE))
+
+    def test_clear_is_revision_guarded(self) -> None:
+        self.store.record(workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5)
+        # A clear for a DIFFERENT revision (an older completion) does not delete the entry.
+        self.store.clear(workspace_id=_WORKSPACE_ID, lane_id=_LANE, retired_revision=4)
+        self.assertIsNotNone(self.store.read(_WORKSPACE_ID, _LANE))
+        # The matching revision clears it.
+        self.store.clear(workspace_id=_WORKSPACE_ID, lane_id=_LANE, retired_revision=5)
+        self.assertIsNone(self.store.read(_WORKSPACE_ID, _LANE))
+
+    def test_wrong_schema_version_fails_closed(self) -> None:
+        # A newer/foreign schema version is left untouched and read fails open to None (a record
+        # would raise so the caller fails closed).
+        import sqlite3
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+        conn.close()
+        self.assertIsNone(self.store.read(_WORKSPACE_ID, _LANE))
+        with self.assertRaises(LaneReconcileOwedError):
+            self.store.record(
+                workspace_id=_WORKSPACE_ID, lane_id=_LANE, lane_generation=1, retired_revision=5
+            )
+
+
 # ---------------------------------------------------------------------------
 # 2. The pure action-time pair decision (pure of the CLI + IO).
 # ---------------------------------------------------------------------------
@@ -790,9 +845,16 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
     def _retire_first(self, *, decision=None) -> None:
-        """Drive the retire-first CAS directly (retired + bound + pins), as a completed
-        retire whose pin-matched close is still owed (crash after the CAS, before the close)."""
+        """Simulate a real reconcile crash: record the owed-close ledger (as the reconcile does
+        BEFORE its retire CAS), then commit the retire-first CAS — leaving retired + bound + pins
+        with the pin-matched close still owed (crash after the CAS, before the close)."""
+        from mozyo_bridge.core.state.lane_reconcile_owed import LaneReconcileOwedStore
+
         rec = LaneLifecycleStore().get(self._key())
+        LaneReconcileOwedStore().record(
+            workspace_id=_WORKSPACE_ID, lane_id=_LANE,
+            lane_generation=rec.lane_generation, retired_revision=rec.revision + 1,
+        )
         LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
             self._key(),
             expected_revision=rec.revision,
@@ -802,19 +864,69 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             decision=decision if decision is not None else _decision(),
         )
 
-    def test_retired_with_live_pair_withholds_no_close(self) -> None:
-        # Review j#79320 R4: the reconcile NEVER closes a pair under a retired row (it cannot tell
-        # its own owed close from an ordinary bound retired row without a collision-proof marker).
-        # A crash after the retire CAS but before the close leaves retired + live pair -> the
-        # reconcile withholds (no close); recovery is via the ordinary #13754 retire.
+    def test_owed_close_resume_closes_recorded_pair(self) -> None:
+        # Review j#79346 R5: a crash after the retire CAS but before the pane close is resumed in
+        # the SAME reconcile authority (the owed-close ledger pins the exact generation). The
+        # retired-branch re-runs the full-conjunct close of exactly the recorded pins.
         self._seed_row()
-        self._retire_first()
+        self._retire_first()  # ledger recorded + retired; pair p3/p4 still live
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
         result = self._run()
+        self.assertEqual(result.state, RECONCILE_RECONCILED, result.detail)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        # The owed pair was closed on resume; the ledger was cleared.
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2"})
+        from mozyo_bridge.core.state.lane_reconcile_owed import LaneReconcileOwedStore
+        self.assertIsNone(LaneReconcileOwedStore().read(_WORKSPACE_ID, _LANE))
+
+    def test_owed_close_resume_recycled_newer_withholds(self) -> None:
+        # Review j#79346 R5 (the core): after the retire CAS, the live pair recycles to a NEWER
+        # generation (p3/p4 -> p6/p7). The reconcile's OWN resume re-verifies against the recorded
+        # pins (p3/p4) and refuses to close the newer p6/p7 — never the name-based #13754 close
+        # that WOULD close them. Zero-close, withheld.
+        self._seed_row()
+        self._retire_first()  # recorded p3/p4
+        self.rows = [
+            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
+            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
+            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p6"),
+            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p7"),
+        ]
+        result = self._run()
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        # The newer generation p6/p7 was NOT closed (no false recovery).
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p6", "w28:p7"})
+
+    def test_owed_close_resume_busy_withholds(self) -> None:
+        # Review j#79346 R5: a recorded pair that started working between the crash and the resume
+        # is not closed (the resume applies the full close-time conjunct).
+        self._seed_row()
+        self._retire_first()
+        ops = _FakeReconcileOps(lambda: self.rows, runtime=RUNTIME_BUSY)
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
+
+    def test_owed_ledger_generation_revision_mismatch_not_resumed(self) -> None:
+        # Review j#79346 R5 provenance discipline: a ledger whose (generation, retired_revision)
+        # does NOT match the live retired row (a stale entry from a reopened / different
+        # generation) is NOT reconcile-owned -> no resume-close (collision-proof).
+        self._seed_row()
+        rec = LaneLifecycleStore().get(self._key())
+        LaneReconcileOwedStore().record(
+            workspace_id=_WORKSPACE_ID, lane_id=_LANE,
+            lane_generation=rec.lane_generation, retired_revision=rec.revision + 99,  # mismatch
+        )
+        LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
+            self._key(), expected_revision=rec.revision, issue_id=_ISSUE,
+            worktree_identity=self._token(), declared_slots=_pins(), decision=_decision(),
+        )
+        result = self._run()  # pair p3/p4 live
         self.assertEqual(result.state, RECONCILE_BLOCKED)
         self.assertEqual(result.reason, RECON_LIVE_PAIR_PRESENT)
-        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
-        # NOT closed: the reconcile refuses to close a pair under a retired row.
         self.assertEqual({r["pane_id"] for r in self.rows}, {"w28:p1", "w28:p2", "w28:p3", "w28:p4"})
 
     def test_ordinary_retired_bound_row_live_pair_not_closed(self) -> None:
@@ -1134,26 +1246,6 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.state, RECONCILE_BLOCKED)
         self.assertEqual(result.reason, RECON_NOT_RECONCILABLE_STATE)
         self.assertEqual(self._disposition(), DISPOSITION_ACTIVE)
-
-    def test_retired_row_with_recycled_pair_withholds_success(self) -> None:
-        # A persisted retired row does not prove non-liveness (review j#79150 F2, applied to the
-        # reconcile): a RECYCLED generation (same names, DIFFERENT locators than the recorded
-        # owed-close pins) is not the reconcile's owed close, so the idempotent success is
-        # withheld — the reconcile never closes a generation it did not verify.
-        self._seed_row()
-        self._retire_first()  # retired + recorded pins at p3/p4, close still owed
-        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
-        # The recorded pair vanished and a recycled pair reappeared at DIFFERENT locators.
-        self.rows = [
-            _row(_WORKSPACE_ID, "codex", "", "w28:p1"),
-            _row(_WORKSPACE_ID, "claude", "", "w28:p2"),
-            _row(_WORKSPACE_ID, "codex", _LANE, "w28:p6"),
-            _row(_WORKSPACE_ID, "claude", _LANE, "w28:p7"),
-        ]
-        result = self._run()
-        self.assertEqual(result.state, RECONCILE_BLOCKED)
-        self.assertEqual(result.reason, RECON_LIVE_PAIR_PRESENT)
-        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
     def test_not_on_herdr_backend_returns_none(self) -> None:
         plain = Path(self._tmp.name) / "plain"

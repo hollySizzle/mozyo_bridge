@@ -28,19 +28,26 @@ unique, idle / turn-ended, settled, and generation-bound attested:
    ran after the close could not un-close a pair it already killed). Retire happens ONLY on a
    verified live pair, so there is no absence -> retire path a #13809 backfill row could collide
    with (review j#79282 R1);
-3. **exact-pair pin-matched close** — once retired the disposition is **terminal** (no
-   ``retired -> active`` edge), so the lane's generation can no longer change while the caller
-   closes the exact verified ``(assigned_name, locator)`` pins
-   (:func:`...sublane_process_release.pin_matched_close_plan`) — a duplicate / recycled newer
-   locator / foreign pin is zero-closed. The close runs under an immutable generation.
+3. **exact-pair pin-matched close under the full conjunct** — the close re-observes a fresh
+   inventory and re-runs the FULL pair decision (idle / turn-ended, no pending composer,
+   attestation, uniqueness, no foreign) and closes ONLY the exact verified
+   ``(assigned_name, locator)`` pins (:func:`...sublane_process_release.pin_matched_close_plan`)
+   when they still hold at the same locators — a duplicate / recycled newer generation / busy /
+   pending pair is zero-closed (review j#79320 R2). After the close it re-measures the WHOLE lane
+   unit's expected pair: success requires a positive absence at any locator (review j#79320 R3).
 
-Replayability (the "one replayable owed-state flow"): retire-first makes the ONLY durable owed
-state a **retired row whose ``declared_slots`` record the exact pair**. A crash after the retire
-CAS committed but before the pane close is resumed from that state — the retired-terminal branch
-re-runs the pin-matched close of exactly those recorded pins (never re-retiring, never a
-duplicate close). Once the pair is positively absent the replay is an idempotent
-``already_reconciled`` no-op. A hibernated row with no live pair is NOT an owed state (retire
-never happens on absence) — it routes to the #13841 live-zero migration.
+Replayability (the "one replayable owed-state flow", review j#79346 R5): before the retire CAS
+the reconcile records a collision-proof owed-close entry in the durable
+:class:`...lane_reconcile_owed.LaneReconcileOwedStore`, pinning the exact
+``(lane_generation, retired_revision)`` the CAS produces. A crash after the CAS but before the
+pane close is resumed **in this same reconcile authority** — the retired-terminal branch fires
+ONLY when the ledger matches this live retired row's ``(generation, revision)`` (an ordinary
+bound retired row has no entry and is never resumed, review j#79320 R4), and it re-runs the SAME
+full-conjunct close, so a recycled newer generation is never closed. A completed close (positive
+absence) clears the ledger and is an idempotent ``already_reconciled`` no-op. A hibernated row
+with no live pair is NOT an owed state (retire never happens on absence) — it routes to the
+#13841 live-zero migration. The reconcile resumes its OWN owed close; there is deliberately NO
+handoff to the name-based, ungated #13754 close (which would close a newer generation, R5).
 
 Boundary (Redmine #13842): NO process launch / resume, no worktree / branch removal, no raw
 Herdr / tmux, no origin/main, no production / tag / publish. The only process mutation is the
@@ -62,6 +69,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SlotObservation,
     STATE_BLOCKED,
     decide_pair_reconcile,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile_ops import (  # noqa: E501
+    LiveReconcileOps,
 )
 
 # -- reconcile verdict vocabulary --------------------------------------------
@@ -565,6 +575,18 @@ def run_hibernated_live_reconcile(
             managed_pairs=managed_pairs,
         )
 
+    def _read_owed(store_cls, ws, lane):
+        try:
+            return store_cls().read(ws, lane)
+        except Exception:  # noqa: BLE001 - an unreadable ledger fails closed (no resume)
+            return None
+
+    def _clear_owed(store_cls, ws, lane, rev):
+        try:
+            store_cls().clear(workspace_id=ws, lane_id=lane, retired_revision=rev)
+        except Exception:  # noqa: BLE001 - a clear failure is harmless (a later resume re-clears)
+            pass
+
     def _close_owed_pair(pins):
         """Re-verify the exact pair at close time, pin-match close it, confirm the WHOLE unit gone.
 
@@ -586,6 +608,10 @@ def run_hibernated_live_reconcile(
             return ((), False)
         obs2 = _observe(rows2)
         v2 = decide_pair_reconcile(obs2)
+        if v2.absent:
+            # The expected pair is positively gone (a same-flow replay after the close already
+            # ran, or the pair died): nothing to close, and the whole unit is clear -> success.
+            return ((), True)
         observed = sorted(s.locator for s in obs2.slots if s.present)
         if not (v2.green and observed == sorted(p.locator for p in pins)):
             # Not the exact verified pair at close time: busy / pending / foreign / duplicate, or
@@ -631,39 +657,95 @@ def run_hibernated_live_reconcile(
         )
 
     # Terminal (retire-first) branch: this reconcile OR an ordinary lifecycle path may have retired
-    # this row. The reconcile NEVER closes a pair under a retired row (Redmine #13842 review
-    # j#79320 R4): without a collision-proof reconcile-specific marker it cannot tell its own owed
-    # close apart from an ordinary #13809/#13810-bound retired row, so it refuses to close either.
-    # A positive absence is an idempotent no-op (a completed reconcile, or an ordinary retire —
-    # closing nothing is harmless); a live pair WITHHOLDS success (a persisted retired disposition
-    # does not prove non-liveness). A reconcile retire whose pane close crashed before completing
-    # is recovered by the ordinary ``sublane retire --execute`` (#13754), which attests the
-    # now-bound row and closes the pair — non-regressive.
+    # this row. The reconcile resumes its OWN owed close (a crash after the retire CAS committed
+    # but before the pane close) — in the SAME reconcile authority, at the EXACT generation it
+    # verified — ONLY when the durable owed-close ledger (:class:`LaneReconcileOwedStore`) carries
+    # a collision-proof entry matching this live retired row's ``(lane_generation, revision)``
+    # (Redmine #13842 review j#79346 R5). An ordinary #13809/#13810-bound retired row has NO
+    # ledger entry, so it is never resumed (review j#79320 R4 preserved). The resume applies the
+    # SAME full close-time re-verification + whole-unit measure as the forward close, so a
+    # recycled newer generation / busy / pending pair is zero-closed — never the name-based,
+    # ungated #13754 close R5 flagged.
+    from mozyo_bridge.core.state.lane_reconcile_owed import LaneReconcileOwedStore
+
     if record.lane_disposition == DISPOSITION_RETIRED and (
         record.issue_id or ""
     ).strip() == issue:
-        if verdict.absent:
-            return HibernatedLiveReconcileVerdict(
-                state=RECONCILE_ALREADY,
+        owed = _read_owed(LaneReconcileOwedStore, workspace_id, lane_label)
+        reconcile_owned = (
+            owed is not None
+            and owed.retired_revision == record.revision
+            and owed.lane_generation == record.lane_generation
+        )
+        if not reconcile_owned:
+            # No reconcile owed-close provenance for THIS generation: a completed reconcile
+            # (ledger cleared), or an ordinary bound retired row. A positive absence is a
+            # harmless idempotent no-op; a live pair withholds (a persisted retired disposition
+            # does not prove non-liveness, and the reconcile never closes a pair it cannot prove
+            # it owns — review j#79320 R4).
+            if verdict.absent:
+                return HibernatedLiveReconcileVerdict(
+                    state=RECONCILE_ALREADY,
+                    detail=(
+                        "the lane is already durably retired and no expected managed slot is "
+                        "live; reconcile is an idempotent no-op"
+                    ),
+                    workspace_id=workspace_id,
+                    lane_id=lane_label,
+                )
+            return _blocked(
+                RECON_LIVE_PAIR_PRESENT,
                 detail=(
-                    "the lane is already durably retired and no expected managed slot is "
-                    "live; reconcile is an idempotent no-op"
+                    "the lane is durably retired with no reconcile owed-close provenance for "
+                    "this generation but an expected managed pair is live; a persisted retired "
+                    "disposition does not prove non-liveness, and the reconcile never closes a "
+                    "pair it cannot prove it owns. Success withheld"
                 ),
                 workspace_id=workspace_id,
                 lane_id=lane_label,
             )
-        return _blocked(
-            RECON_LIVE_PAIR_PRESENT,
-            detail=(
-                "the lane is durably retired but an expected managed pair is live; the "
-                "reconcile does NOT close a pair under a retired row (it cannot tell its own "
-                "owed close apart from an ordinary bound retired row without a collision-proof "
-                "marker) — a persisted retired disposition does not prove non-liveness. Recover "
-                "an owed reconcile close via `sublane retire --execute` (#13754). Success withheld"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
+        # Reconcile-owned owed close: resume it in the same flow.
+        if verdict.absent:
+            # The pane close already completed (a completed reconcile whose ledger clear did not
+            # land): clear now and report the idempotent no-op.
+            _clear_owed(
+                LaneReconcileOwedStore, workspace_id, lane_label, record.revision
+            )
+            return HibernatedLiveReconcileVerdict(
+                state=RECONCILE_ALREADY,
+                detail=(
+                    "the reconcile-owned owed close is complete (the pair is positively gone); "
+                    "idempotent no-op"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        try:
+            recorded = list(record.declared_pins)
+        except (ProcessPinError, ValueError):
+            recorded = []
+        if not recorded:
+            return _blocked(
+                RECON_STORE_ERROR,
+                detail="the reconcile-retired row carries no readable declared pins to resume",
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        closed, ok = _close_owed_pair(recorded)
+        if not ok:
+            return _blocked(
+                RECON_CLOSE_FAILED,
+                detail=(
+                    "the reconcile-owned owed close did not complete under the full close-time "
+                    "re-verification (a busy / pending / duplicate / foreign / recycled "
+                    "generation, a failed close, or an unreadable inventory); the expected pair "
+                    "is still live (resumable — the reconcile re-runs its own owed close)"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        _clear_owed(LaneReconcileOwedStore, workspace_id, lane_label, record.revision)
+        return _reconciled(closed)
 
     # The reconcilable base signature (Redmine #13842 review j#79320 R1): hibernated + durably
     # released + settled replacement + issue binding + owns this exact issue + no project scope +
@@ -740,6 +822,34 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
+    # Record the owed-close ledger BEFORE the retire CAS (review j#79346 R5): an entry must be
+    # present whenever a row becomes reconcile-retired, so a crash after the CAS is resumable in
+    # this same reconcile authority. A ledger write failure fails closed here — the reconcile does
+    # NOT retire, because an unrecorded retire is an unresumable owed close. The ledger pins the
+    # generation + the revision the CAS will produce (record.revision + 1).
+    from mozyo_bridge.core.state.lane_reconcile_owed import (
+        LaneReconcileOwedError,
+        LaneReconcileOwedStore,
+    )
+
+    try:
+        LaneReconcileOwedStore().record(
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            lane_generation=record.lane_generation,
+            retired_revision=record.revision + 1,
+        )
+    except (LaneReconcileOwedError, OSError) as exc:
+        return _blocked(
+            RECON_STORE_ERROR,
+            detail=(
+                f"the reconcile owed-close ledger could not be recorded ({type(exc).__name__}); "
+                "the reconcile fails closed BEFORE retiring (an unrecorded retire would be an "
+                "unresumable owed close)"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
     try:
         outcome = LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
             key,
@@ -779,9 +889,9 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    # Durably retired under the exact verified generation (terminal — no rehydrate possible).
-    # Close the exact pinned pair, re-verifying the full conjunct at close time (R2) and measuring
-    # the whole unit afterwards (R3).
+    # Durably retired under the exact verified generation (terminal — no rehydrate possible), with
+    # the owed-close ledger recorded. Close the exact pinned pair, re-verifying the full conjunct
+    # at close time (R2) and measuring the whole unit afterwards (R3).
     closed, ok = _close_owed_pair(pins)
     if not ok:
         return _blocked(
@@ -790,89 +900,15 @@ def run_hibernated_live_reconcile(
                 "the lane was retired (retire-first) but the exact pinned pair could not be "
                 "closed under the full close-time re-verification (a busy / pending / duplicate / "
                 "foreign / recycled generation, a failed close, or an unreadable inventory); the "
-                "expected pair is still live. Recover the owed close via `sublane retire "
-                "--execute` (#13754)"
+                "expected pair is still live. The reconcile re-runs its own owed close (the "
+                "durable owed-close ledger persists) — no cross-surface handoff"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
+    # The owed close completed: clear the ledger (best-effort; a stale entry self-heals).
+    _clear_owed(LaneReconcileOwedStore, workspace_id, lane_label, outcome.revision)
     return _reconciled(closed)
-
-
-# ---------------------------------------------------------------------------
-# Live observation adapter (thin; reuses the established herdr readers).
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class LiveReconcileOps:
-    """The live :class:`ReconcileOps`: raw inventory + per-slot runtime / composer / attestation.
-
-    Reuses the same readers the #13763 quarantine inspection uses — the raw ``agent list``
-    inventory, the ``agent get`` runtime state, a content-free composer observation over
-    ``read_pane``, and the startup self-attestation store — so the reconcile and the quarantine
-    read one runtime the same way.
-    """
-
-    repo_root: Path
-    env: Optional[Mapping[str, str]] = None
-
-    def _environ(self) -> Mapping[str, str]:
-        return self.env if self.env is not None else os.environ
-
-    def agent_rows(self) -> Sequence[Mapping[str, object]]:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-            list_herdr_agent_rows,
-        )
-
-        return list_herdr_agent_rows(self._environ())
-
-    def read_attestation(self, assigned_name: str):
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-        )
-
-        try:
-            return HerdrIdentityAttestationStore().read(assigned_name)
-        except Exception:  # noqa: BLE001 - unreadable attestation fails closed (absent)
-            return None
-
-    def _reader(self):
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
-            _resolve_binary_or_die,
-        )
-
-        return _resolve_binary_or_die(self._environ())
-
-    def runtime_state(self, locator: str) -> str:
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (  # noqa: E501
-            HerdrCliAgentStateReader,
-        )
-
-        try:
-            binary = self._reader()
-            state = HerdrCliAgentStateReader(binary).read_agent_state(locator)
-            return state.state if state.ok else "unknown"
-        except Exception:  # noqa: BLE001 - a failed runtime read is fail-soft to unknown
-            return "unknown"
-
-    def observe_composer(self, locator: str) -> tuple[bool, Optional[bool]]:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
-            observe_composer_text,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
-            HerdrCliTransport,
-        )
-
-        try:
-            binary = self._reader()
-            read = HerdrCliTransport(binary).read_pane(locator, lines=80)
-            if not read.ok:
-                return (False, None)
-            observation = observe_composer_text(read.content)
-            return (observation.readable, observation.has_pending)
-        except Exception:  # noqa: BLE001 - a failed composer read is fail-soft to unreadable
-            return (False, None)
 
 
 def format_reconcile_text(result: HibernatedLiveReconcileVerdict) -> str:
