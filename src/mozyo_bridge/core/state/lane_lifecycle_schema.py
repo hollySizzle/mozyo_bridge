@@ -96,12 +96,6 @@ _COLUMNS = (
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity"
 )
 
-#: The exact column set each recognized version's table must carry — the shape a
-#: migration / current-verify classifies against (Redmine #13754 R5-F1, j#78778). A
-#: recorded-current store whose table is missing a required column, or a recorded-older
-#: store whose shape does not match its known predecessor, is a corrupt / partial /
-#: incompatible authority shape: it fails closed and is **never** silently re-created or
-#: default-repaired. v1 is the pre-#13689-R2 base; each later version ADDS its delta.
 _V1_COLUMNS = frozenset(
     {
         "repo_workspace_id",
@@ -123,18 +117,49 @@ _V3_ADDS = frozenset(
     {"replacement_state", "replacement_action_id", "replacement_pins"}  # #13763
 )
 _V4_ADDS = frozenset({"worktree_identity"})  # #13754 worktree binding
-#: The REQUIRED (floor) columns for each recorded version. v3 is the collision point where
-#: two branches diverge — the staging replacement-v3 (adds replacement_*) and the
-#: already-live #13754 worktree-v3 (adds worktree_identity) — so a recorded-v3 store may
-#: legitimately carry EITHER extra group. Its guaranteed floor is therefore the v2 shape;
-#: the forward migration adds whichever of {replacement_*, worktree_identity} is missing to
-#: converge on the full v4 shape. v4 is that convergence: BOTH groups are required, so a v4
-#: store missing any of them is corrupt and fails closed (R5-F1).
-_REQUIRED_COLUMNS_BY_VERSION = {
-    1: _V1_COLUMNS,
-    2: _V1_COLUMNS | _V2_ADDS,
-    3: _V1_COLUMNS | _V2_ADDS,  # v2 floor — the two v3 branches diverge above it
-    4: _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS,
+
+#: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
+#: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
+#: equality — no unknown extra columns, no missing columns), or it is a partial /
+#: incompatible authority shape and fails closed (never silently re-created, migrated, or
+#: re-stamped). v3 is the collision point where TWO branches legitimately exist — the
+#: staging replacement-v3 and the already-live #13754 worktree-v3 — so v3 allows exactly
+#: those two shapes and NOTHING ELSE (a pure-v2 shape recorded v3 is NOT a known v3).
+_SHAPE_V1 = _V1_COLUMNS
+_SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
+_SHAPE_V3_REPLACEMENT = _V1_COLUMNS | _V2_ADDS | _V3_ADDS
+_SHAPE_V3_WORKTREE = _V1_COLUMNS | _V2_ADDS | _V4_ADDS
+_SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
+_ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
+    1: (_SHAPE_V1,),
+    2: (_SHAPE_V2,),
+    3: (_SHAPE_V3_REPLACEMENT, _SHAPE_V3_WORKTREE),
+    4: (_SHAPE_V4,),
+}
+
+#: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
+#: pk_order)`` as ``PRAGMA table_info`` reports it. A same-named but re-typed / nullable /
+#: default-changed / PK-shifted column is NOT the current column — it fails closed rather
+#: than being read as authoritative (R6-F1). ``pk_order`` is the 1-based composite-PK
+#: position (0 for a non-PK column); ``default`` is the SQL literal ``table_info`` returns.
+_COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
+    "repo_workspace_id": ("TEXT", 1, None, 1),
+    "lane_id": ("TEXT", 1, None, 2),
+    "issue_id": ("TEXT", 1, "''", 0),
+    "lane_disposition": ("TEXT", 1, None, 0),
+    "process_release": ("TEXT", 1, None, 0),
+    "revision": ("INTEGER", 1, None, 0),
+    "release_action_id": ("TEXT", 1, "''", 0),
+    "release_pins": ("TEXT", 1, "''", 0),
+    "replacement_state": ("TEXT", 1, "'not_requested'", 0),
+    "replacement_action_id": ("TEXT", 1, "''", 0),
+    "replacement_pins": ("TEXT", 1, "''", 0),
+    "decision_source": ("TEXT", 1, "''", 0),
+    "decision_issue_id": ("TEXT", 1, "''", 0),
+    "decision_journal": ("TEXT", 1, "''", 0),
+    "created_at": ("TEXT", 1, None, 0),
+    "updated_at": ("TEXT", 1, None, 0),
+    "worktree_identity": ("TEXT", 1, "''", 0),
 }
 
 
@@ -288,6 +313,48 @@ def _table_present(conn: sqlite3.Connection, name: str) -> bool:
     )
 
 
+def _owner_index_present(conn: sqlite3.Connection) -> bool:
+    """Is the active-owner unique index present? (a critical authority constraint)."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (_OWNER_INDEX,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _schema_signature_matches(conn: sqlite3.Connection, recorded: int) -> bool:
+    """Does the live table EXACTLY match one of ``recorded``'s allowed signatures?
+
+    Redmine #13754 R6-F1 (j#78803): the classifier must accept only a *known* shape, not a
+    minimum column floor. This verifies, with no mutation:
+
+    - the table exists;
+    - its column-NAME set equals one of :data:`_ALLOWED_SHAPES_BY_VERSION` for ``recorded``
+      exactly (no unknown extra column, no missing column — a pure-v2 shape recorded v3 is
+      rejected, an extra column on a v4 store is rejected);
+    - every present column's authority-affecting definition (type / NOT NULL / default /
+      PK order) matches :data:`_COLUMN_DEFS` (a same-named but re-typed / nullable column
+      is not the current column);
+    - the active-owner unique index is present (a missing critical constraint is a corrupt
+      shape, not a current one).
+    """
+    if not _table_present(conn, _TABLE):
+        return False
+    info = {
+        row[1]: (row[2], row[3], row[4], row[5])  # name -> (type, notnull, dflt, pk)
+        for row in conn.execute(f"PRAGMA table_info({_TABLE})")
+    }
+    names = frozenset(info)
+    if names not in _ALLOWED_SHAPES_BY_VERSION.get(recorded, ()):
+        return False
+    for name, definition in info.items():
+        if _COLUMN_DEFS.get(name) != definition:
+            return False
+    return _owner_index_present(conn)
+
+
 def readonly_component_status(conn: sqlite3.Connection) -> str:
     """Classify this component for a NON-CREATING read (Redmine #13681 R3-F1, j#77307).
 
@@ -406,20 +473,17 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                 f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The store is left untouched "
                 f"(downgrade-safe); use a newer build."
             )
-        # Classify the recorded version AGAINST the actual table shape before any DDL/DML
-        # (Redmine #13754 R5-F1): the migration must never silently re-create a missing
-        # table or default-repair a missing authority column on a store that *claims* to be
-        # complete. ``CREATE TABLE IF NOT EXISTS`` + idempotent ``ALTER`` would do exactly
-        # that. Instead: a recognized recorded version must match its known shape, or the
-        # store is a corrupt / partial / incompatible authority and fails closed
-        # (``managed-state-model.md``: partial migration is never a success, an authoritative
-        # component is never silently overwritten, repair is an explicit path).
+        # Classify the recorded version against the EXACT live table signature before any
+        # DDL/DML (Redmine #13754 R5-F1 / R6-F1): the migration must never silently
+        # re-create a missing table, default-repair a missing / re-typed authority column,
+        # or adopt an unknown-shaped store as a known one. ``CREATE TABLE IF NOT EXISTS`` +
+        # idempotent ``ALTER`` + a subset check would do exactly that. Instead a recognized
+        # recorded version must match one of its version's ALLOWED signatures exactly
+        # (:func:`_schema_signature_matches`) — otherwise it is a corrupt / partial /
+        # incompatible authority shape and fails closed (``managed-state-model.md``: a
+        # partial migration is never a success, an authoritative component is never silently
+        # overwritten, repair is an explicit path).
         table_exists = _table_present(conn, _TABLE)
-        current_columns = (
-            {row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")}
-            if table_exists
-            else set()
-        )
         if recorded is None:
             # A component this build never registered. Only a genuinely fresh store (no
             # table) is a create; a table *without* its metadata row is a partial / unknown
@@ -432,32 +496,25 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             conn.execute(_TABLE_SQL)
             conn.execute(_OWNER_INDEX_SQL)
             _stamp_component_version(conn)
+        elif not _schema_signature_matches(conn, recorded):
+            # A recorded version whose live shape is NOT one of that version's known
+            # signatures: a missing table, a missing / extra / re-typed column, or a missing
+            # active-owner index. Never re-create / default-repair / re-stamp it.
+            raise LaneLifecycleError(
+                f"lane lifecycle records v{recorded} but its live table shape does not match "
+                f"a known v{recorded} signature (corrupt / partial / incompatible authority "
+                f"shape); fail closed (no silent repair). Restore from a backup."
+            )
         elif recorded == LANE_LIFECYCLE_SCHEMA_VERSION:
-            # A store that records the CURRENT version. It is a no-op only when its shape
-            # actually IS current; a missing table or a missing required column is a corrupt
-            # current store — fail closed, never re-create / default-repair / re-stamp it.
-            required = _REQUIRED_COLUMNS_BY_VERSION[LANE_LIFECYCLE_SCHEMA_VERSION]
-            if not table_exists or not required.issubset(current_columns):
-                raise LaneLifecycleError(
-                    f"lane lifecycle records v{LANE_LIFECYCLE_SCHEMA_VERSION} but its table "
-                    "is missing / lacks a required column (corrupt / partial current "
-                    "shape); fail closed (no silent repair). Restore from a backup."
-                )
-            # Intact current: nothing to write. Do NOT re-run DDL or re-stamp the metadata.
+            # Intact current: the signature already matches. Do NOT re-run DDL or re-stamp.
+            pass
         else:
-            # A recognized OLDER version (1/2/3). Migrate forward ONLY when its table matches
-            # that version's known predecessor shape; a shape mismatch (missing an older
-            # required column, or no table) is a corrupt / incompatible store — fail closed
-            # rather than migrate an unknown shape. This preserves BOTH v3 shapes: the
-            # staging replacement-v3 and the (already-live) #13754 worktree-v3 each carry
-            # their version's required columns and migrate additively to v4.
-            required = _REQUIRED_COLUMNS_BY_VERSION[recorded]
-            if not table_exists or not required.issubset(current_columns):
-                raise LaneLifecycleError(
-                    f"lane lifecycle records v{recorded} but its table is missing / lacks a "
-                    f"column that version requires (corrupt / incompatible predecessor "
-                    f"shape); fail closed (no silent repair)."
-                )
+            # A recognized OLDER version whose shape matches one of its KNOWN predecessor
+            # signatures (v1, v2, or either v3 branch). Migrate forward: back up first, then
+            # add only the columns that version legitimately lacks to converge on v4.
+            current_columns = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")
+            }
             # Backup-first (Redmine #13754 R3-F1): copy the DB under home BEFORE the first
             # ``ALTER``; a backup failure aborts with nothing written. Under the lock the DB
             # on disk is the committed pre-``ALTER`` state and no other writer can change it

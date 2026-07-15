@@ -1244,6 +1244,13 @@ class R2RegressionTest(unittest.TestCase):
                 "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
                 "PRIMARY KEY (repo_workspace_id, lane_id))"
             )
+            # A real v1 store carries the active-owner unique index (Redmine #13754 R6-F1:
+            # the strict shape check requires it — a missing critical constraint is corrupt).
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_lane_lifecycle_active_owner "
+                "ON lane_lifecycle_records (repo_workspace_id, issue_id) "
+                "WHERE lane_disposition = 'active' AND issue_id <> ''"
+            )
             conn.execute(
                 "INSERT INTO lane_lifecycle_records VALUES "
                 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1395,12 +1402,22 @@ class R3RegressionTest(unittest.TestCase):
             LaneLifecycleStore(home=self.home).records()
 
     def test_f1_a_known_v1_still_migrates(self) -> None:
-        # Fail-closed on *newer* must not break the supported v1 -> current path.
+        # Fail-closed on *newer* must not break the supported v1 -> current path. A REAL v1
+        # store is a v1-SHAPED table recorded v1 (Redmine #13754 R6-F1: a v4-shaped table
+        # merely re-stamped to v1 is an incompatible shape, not a v1 store).
         store = LaneLifecycleStore(home=self.home)
         store.ensure_schema()
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
+            for col in (
+                "decision_issue_id",
+                "replacement_state",
+                "replacement_action_id",
+                "replacement_pins",
+                "worktree_identity",
+            ):
+                conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 1 "
                 "WHERE component = ?",
@@ -1424,21 +1441,26 @@ class R3RegressionTest(unittest.TestCase):
     # -- R4-F1: a present-but-malformed version is not coerced to a known one --
 
     def _corrupt_v2_version(self, sql_literal: str) -> Path:
-        """A v2 store whose component version was overwritten with a raw SQL value."""
+        """A genuine v2-SHAPED store whose component version was overwritten with a raw SQL
+        value (Redmine #13754 R6-F1: a v2 recorded value must sit on a real v2 shape, so a
+        recognized value like ``2.0`` reaches the shape classifier on a valid store)."""
         store = LaneLifecycleStore(home=self.home)
         store.declare_active(self.key, decision=_decision(), issue_id=ISSUE)
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
+            for col in (
+                "replacement_state",
+                "replacement_action_id",
+                "replacement_pins",
+                "worktree_identity",
+            ):
+                conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = "
                 + sql_literal
                 + " WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
-            )
-            conn.execute(
-                "ALTER TABLE lane_lifecycle_records "
-                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'future'"
             )
             conn.commit()
         finally:
@@ -1470,7 +1492,8 @@ class R3RegressionTest(unittest.TestCase):
             conn.close()
         self.assertEqual(storage_class, "real")  # not re-stamped to integer 2
         self.assertEqual(value, 2.5)
-        self.assertIn("future_guard", columns)
+        # the v2 shape is untouched: no migration ran (worktree_identity was not added)
+        self.assertNotIn("worktree_identity", columns)
         self.assertEqual(rows, 1)
 
     def test_f1_malformed_versions_fail_closed(self) -> None:
@@ -2180,6 +2203,60 @@ class BackupFirstMigrationTest(unittest.TestCase):
             )
         finally:
             conn.close()
+
+    # -- R6-F1: only a KNOWN signature is accepted (not a minimum floor) ------------
+
+    def _no_mutation_fail_closed(self, corrupt) -> None:
+        """Assert ``ensure_schema`` fails closed and mutates nothing after ``corrupt``."""
+        self._v4_store_with_binding()
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            corrupt(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        before = path.read_bytes()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(path.read_bytes(), before)  # no re-create / repair / re-stamp
+        self.assertEqual(self._backups(), [])
+
+    def test_recorded_v3_with_pure_v2_shape_fails_closed(self) -> None:
+        # A pure v2 shape (NEITHER v3 branch's extra columns) recorded as v3 is NOT a known
+        # v3 signature — it must fail closed, never be migrated / re-stamped (R6-F1).
+        def corrupt(conn):
+            for col in (
+                "replacement_state",
+                "replacement_action_id",
+                "replacement_pins",
+                "worktree_identity",
+            ):
+                conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 3 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+
+        self._no_mutation_fail_closed(corrupt)
+        self.assertEqual(self._recorded(), 3)  # untouched
+        self.assertNotIn("worktree_identity", self._columns())
+
+    def test_recorded_current_with_unknown_extra_column_fails_closed(self) -> None:
+        # A v4 store carrying an unknown extra column is not the current signature — an
+        # exact-match classifier rejects it (a subset floor would silently accept it).
+        self._no_mutation_fail_closed(
+            lambda conn: conn.execute(
+                "ALTER TABLE lane_lifecycle_records ADD COLUMN bogus TEXT NOT NULL DEFAULT ''"
+            )
+        )
+
+    def test_recorded_current_with_missing_owner_index_fails_closed(self) -> None:
+        # The active-owner unique index is a critical authority constraint; a v4 store
+        # missing it is corrupt, not current.
+        self._no_mutation_fail_closed(
+            lambda conn: conn.execute("DROP INDEX idx_lane_lifecycle_active_owner")
+        )
 
 
 if __name__ == "__main__":
