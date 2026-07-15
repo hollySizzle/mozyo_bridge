@@ -16,6 +16,10 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
 from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
     DISPOSITION_ACTIVE,
     ProcessGenerationPin,
@@ -31,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_send import (  # noqa: E402
     ResumeHandoffSendPort,
     map_handoff_stdout_to_send_outcome,
+    resolve_execution_workdir,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (  # noqa: E402
     ResumeTargetResolver,
@@ -61,6 +66,7 @@ def _target(**overrides) -> GateTarget:
         target_role="implementation_worker",
         target_assigned_name="worker-a",
         provider_id="claude",
+        runtime_role="claude",
         agent_generation=3,
         lane_revision=1,
     )
@@ -142,6 +148,9 @@ class ResumeHandoffSendPortTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--target-repo") + 1], "/repo/root")
         self.assertEqual(argv[argv.index("--target-lane") + 1], "lane-alpha")
         self.assertNotIn("auto", argv)
+        # j#79405 §C — the gate's execution_root ('.') resolves to a --workdir at the repo root,
+        # so the envelope planner renders the portable `.` pointer (workdir == repo_root).
+        self.assertEqual(argv[argv.index("--workdir") + 1], "/repo/root")
 
     def test_runner_raises_is_unknown_never_started(self) -> None:
         def runner(argv):
@@ -196,7 +205,7 @@ class ResumeGateRecorderTests(unittest.TestCase):
         self.assertEqual(len(transport.posts), 1)
         issue, notes = transport.posts[0]
         self.assertEqual(issue, "13813")
-        self.assertIn("[mozyo:operator-startup-gate:v=2]", notes)
+        self.assertIn("[mozyo:operator-startup-gate:v=3]", notes)
         self.assertNotIn("/Users/", notes)
 
     def test_record_transport_failure_returns_false(self) -> None:
@@ -210,8 +219,11 @@ class ResumeTargetResolverTests(unittest.TestCase):
     _READY = "esc to interrupt\n> \nType your message and press enter"
 
     def _pin(self, locator="w1:p1"):
+        # Production shape (review j#79392 F1 / j#79405 §A): a declared ProcessGenerationPin's
+        # ``role`` is the RUNTIME role (== the provider token "claude"), NOT the workflow role
+        # ``implementation_worker``. stable_identity == ("claude", "claude", "worker-a").
         return ProcessGenerationPin(
-            role="implementation_worker",
+            role="claude",
             provider="claude",
             assigned_name="worker-a",
             locator=locator,
@@ -235,17 +247,22 @@ class ResumeTargetResolverTests(unittest.TestCase):
 
     _UNSET = object()
 
-    def _resolver(self, *, record=None, rows=None, workspace=_UNSET):
+    def _resolver(self, *, record=None, rows=None, workspace=_UNSET, binding="claude"):
         rows = rows if rows is not None else [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}]
         rec = record if record is not None else self._record()
         identity = self._identity() if workspace is self._UNSET else workspace
         return ResumeTargetResolver(
             env={},
+            repo_root="/repo/root",
             lifecycle_get=lambda ws, lane: rec,
             inventory=lambda env: rows,
             attestation_read=lambda name: SimpleNamespace(),
             capture=lambda loc, lines: self._READY,
-            workspace_resolve=lambda env: identity,
+            # workspace_resolve is (repo_root, env) — resolved from the EXPLICIT repo root, not the
+            # anchor-less sender identity (j#79405 §C). binding_resolve is (target_role, repo_root,
+            # env) — the workflow role must still bind to the pinned provider.
+            workspace_resolve=lambda repo_root, env: identity,
+            binding_resolve=lambda role, repo_root, env: binding,
         )
 
     def setUp(self) -> None:
@@ -322,9 +339,10 @@ class ResumeTargetResolverTests(unittest.TestCase):
         self.assertIsNone(self._resolver(rows=rows).resolve(_done_gate(), {}))
 
     def test_runtime_revision_drift_none(self) -> None:
-        # Declared pin runtime "declared-r1" vs a live row carrying runtime "live-r2".
+        # Declared pin runtime "declared-r1" vs a live row carrying runtime "live-r2". The pin's
+        # stable_identity matches (role="claude"); only the full match_key's runtime_revision drifts.
         pin = ProcessGenerationPin(
-            role="implementation_worker",
+            role="claude",
             provider="claude",
             assigned_name="worker-a",
             locator="w1:p1",
@@ -355,6 +373,93 @@ class ResumeTargetResolverTests(unittest.TestCase):
         r = self._resolver().resolve(_done_gate(), {})
         assert r is not None
         self.assertEqual(r.observed.target.lane_revision, 1)
+
+    # j#79405 §A — the action-time provider-binding consistency gate.
+    def test_binding_drift_none(self) -> None:
+        # The action-time binding resolves target_role to a DIFFERENT provider than pinned.
+        self.assertIsNone(self._resolver(binding="codex").resolve(_done_gate(), {}))
+
+    def test_binding_unresolved_none(self) -> None:
+        # An unbound workflow role (binding_resolve -> None) fails closed.
+        self.assertIsNone(self._resolver(binding=None).resolve(_done_gate(), {}))
+
+    def test_workflow_role_is_not_used_for_pin_matching(self) -> None:
+        # A pin whose role is the WORKFLOW role (not the runtime role) must NOT match: the resolver
+        # matches stable_identity on runtime_role, so a legacy-shaped pin is rejected (j#79405 §A).
+        wf_pin = ProcessGenerationPin(
+            role="implementation_worker", provider="claude", assigned_name="worker-a", locator="w1:p1"
+        )
+        self.assertIsNone(
+            self._resolver(record=self._record(pin=wf_pin)).resolve(_done_gate(), {})
+        )
+
+    def test_real_attestation_record_ok_resolves(self) -> None:
+        # Production-shape: a REAL IdentityAttestationRecord through the REAL evaluate_attestation
+        # (NOT the setUp stub) — expected_role is the runtime role "claude" (j#79405 §A/§D).
+        self._att.evaluate_attestation = self._orig_eval
+        record = IdentityAttestationRecord(
+            assigned_name="worker-a",
+            workspace_id="ws-alpha",
+            role="claude",
+            lane_id="lane-alpha",
+            locator="w1:p1",
+            verdict=VERDICT_PRESENT,
+        )
+        resolver = ResumeTargetResolver(
+            env={},
+            repo_root="/repo/root",
+            lifecycle_get=lambda ws, lane: self._record(),
+            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            attestation_read=lambda name: record,
+            capture=lambda loc, lines: self._READY,
+            workspace_resolve=lambda repo_root, env: self._identity(),
+            binding_resolve=lambda role, repo_root, env: "claude",
+        )
+        r = resolver.resolve(_done_gate(), {})
+        self.assertIsNotNone(r)
+
+    def test_real_attestation_role_conflict_none(self) -> None:
+        # A real record whose role is the WORKFLOW role conflicts against expected runtime_role.
+        self._att.evaluate_attestation = self._orig_eval
+        record = IdentityAttestationRecord(
+            assigned_name="worker-a",
+            workspace_id="ws-alpha",
+            role="implementation_worker",  # workflow role, not the runtime "claude" -> conflict
+            lane_id="lane-alpha",
+            locator="w1:p1",
+            verdict=VERDICT_PRESENT,
+        )
+        resolver = ResumeTargetResolver(
+            env={},
+            repo_root="/repo/root",
+            lifecycle_get=lambda ws, lane: self._record(),
+            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            attestation_read=lambda name: record,
+            capture=lambda loc, lines: self._READY,
+            workspace_resolve=lambda repo_root, env: self._identity(),
+            binding_resolve=lambda role, repo_root, env: "claude",
+        )
+        self.assertIsNone(resolver.resolve(_done_gate(), {}))
+
+
+class ResolveExecutionWorkdirTests(unittest.TestCase):
+    """Pure `--workdir` safe-resolution (j#79405 §C): repo-relative execution_root under repo_root."""
+
+    def test_dot_is_repo_root(self) -> None:
+        self.assertEqual(resolve_execution_workdir("/repo/root", "."), "/repo/root")
+        self.assertEqual(resolve_execution_workdir("/repo/root", ""), "/repo/root")
+
+    def test_subdir_joins_under_root(self) -> None:
+        self.assertEqual(
+            resolve_execution_workdir("/repo/root", "projects/x"), "/repo/root/projects/x"
+        )
+
+    def test_parent_escape_is_none(self) -> None:
+        self.assertIsNone(resolve_execution_workdir("/repo/root", "../evil"))
+        self.assertIsNone(resolve_execution_workdir("/repo/root", "a/../../evil"))
+
+    def test_absolute_is_none(self) -> None:
+        self.assertIsNone(resolve_execution_workdir("/repo/root", "/etc/passwd"))
 
 
 if __name__ == "__main__":

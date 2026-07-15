@@ -107,6 +107,15 @@ RESUME_NOT_RESUMABLE = "resume_not_resumable"
 #: the durable gate-transition writer is not available (write opt-in unset / no trusted
 #: base URL / no credential) at the pre-reserve preflight -> reserve/send 0 (j#79332 §5).
 RESUME_RECORDER_UNAVAILABLE = "resume_recorder_unavailable"
+#: the latest durable gate is a READABLE legacy (v1 / v2) record: it predates the v3
+#: runtime_role / lane_revision contract, so it cannot be resumed without fabricating an
+#: exact-revision approval. Fixed disposition, reserve/send 0 -> the operator must re-approve
+#: a fresh v3 gate (Design Answer j#79405 §B). Never promoted to corrupt or to current-v3.
+RESUME_LEGACY_REAPPROVAL_REQUIRED = "legacy_gate_reapproval_required"
+#: the gate's repo-relative ``execution_root`` did not safely resolve under the action-time
+#: repo root (escape / unresolved root) at the pre-reserve check -> reserve/send 0 (Design
+#: Answer j#79405 §C); a re-issue must never land outside the pinned execution root.
+RESUME_EXECUTION_ROOT_UNSAFE = "resume_execution_root_unsafe"
 
 #: All recognized resume results.
 RESUME_RESULTS: frozenset[str] = frozenset(
@@ -118,6 +127,8 @@ RESUME_RESULTS: frozenset[str] = frozenset(
         RESUME_NOT_CLEAR,
         RESUME_NOT_RESUMABLE,
         RESUME_RECORDER_UNAVAILABLE,
+        RESUME_LEGACY_REAPPROVAL_REQUIRED,
+        RESUME_EXECUTION_ROOT_UNSAFE,
     }
 )
 
@@ -478,6 +489,8 @@ __all__ = (
     "RESUME_NOT_CLEAR",
     "RESUME_NOT_RESUMABLE",
     "RESUME_RECORDER_UNAVAILABLE",
+    "RESUME_LEGACY_REAPPROVAL_REQUIRED",
+    "RESUME_EXECUTION_ROOT_UNSAFE",
     "RESUME_RESULTS",
     "StartupResumeError",
     "StartupResumeResult",

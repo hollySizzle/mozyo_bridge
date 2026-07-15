@@ -9,13 +9,16 @@ observation to the orchestrator -> zero-send) unless every check passes:
 1. the lane lifecycle record exists, is **active**, is bound to the gate's original issue,
    and its ``lane_generation`` equals the gate's pinned ``agent_generation`` (the exact
    generation gate; a recycled lane bumps ``lane_generation`` and fails closed);
-2. exactly one declared pin has the gate's ``(role, provider, assigned_name)``
-   ``stable_identity``;
+2. the repo's action-time provider binding still resolves the workflow ``target_role`` to the
+   gate's pinned ``provider_id`` slot (a binding drift / unbound role fails closed), and exactly
+   one declared pin has the gate's runtime identity ``(runtime_role, provider_id,
+   assigned_name)`` ``stable_identity`` — the pin's ``role`` is the runtime role, NOT the
+   workflow role (Design Answer j#79405 §A);
 3. exactly one live inventory row carries that ``assigned_name``, and its live locator
    equals the declared pin's ``locator`` (the ``ProcessGenerationPin`` live-generation
    discriminant) — missing / duplicate / foreign / recycled fail closed;
 4. the herdr identity self-attestation for that live locator is ``ok`` for the gate's
-   workspace / role / lane.
+   workspace / ``runtime_role`` / lane.
 
 Only then does it bind the #13760 visible read to the live locator and return the live
 :class:`GateTarget` (the gate's pinned identity with ``agent_generation = lane_generation``,
@@ -105,37 +108,65 @@ def _default_capture(locator: str, lines: int) -> object:
         return ""
 
 
-#: Re-resolve the live action-time repo identity: ``(workspace_id, repo_identity_digest,
-#: execution_root)``, or None (unresolved -> zero-send). Injectable.
-WorkspaceResolve = Callable[[Mapping[str, str]], Optional["tuple[str, str, str]"]]
+#: Re-resolve the live action-time repo identity from the explicit target repo root:
+#: ``(workspace_id, repo_identity_digest, execution_root)``, or None (unresolved -> zero-send).
+#: Injectable.
+WorkspaceResolve = Callable[[str, Mapping[str, str]], Optional["tuple[str, str, str]"]]
+#: Resolve the action-time runtime provider bound to a workflow ``target_role`` from the repo's
+#: current provider binding, or None if unbound (fail-soft zero-send). Injectable.
+BindingResolve = Callable[[str, str, Mapping[str, str]], Optional[str]]
 
 
-def _default_workspace_resolve(env: Mapping[str, str]) -> Optional["tuple[str, str, str]"]:
-    """Re-resolve the live action-time repo identity, or None (fail-soft zero-send).
+def _default_workspace_resolve(
+    repo_root: str, env: Mapping[str, str]
+) -> Optional["tuple[str, str, str]"]:
+    """Re-resolve the live action-time repo identity from ``repo_root``, or None (zero-send).
 
-    Resolves the live workspace id from the action-time sender identity (registry authority),
-    derives the pasteable ``repo_identity_digest`` over it (the documented convention — the
-    digest is over the registry workspace id, so it is re-derivable without a checkout path),
-    and reports the repo root ``execution_root`` ``"."``. Any resolution failure returns None
-    so the resolver zero-sends rather than trust the gate's own (possibly forged) identity.
+    Resolves the workspace id from the **explicit target repo root** via the registry / anchor
+    authority (read-only) — never the anchor-less sender identity, which is always ``missing_anchor``
+    and made the default resolver inert (review j#79392 F1). Derives the pasteable
+    ``repo_identity_digest`` over the registry workspace id (the documented convention — the digest
+    is over the workspace id, so it is re-derivable without a checkout path), and reports the repo
+    root ``execution_root`` ``"."``. Any unresolved workspace returns None so the resolver zero-sends
+    rather than trust the gate's own (possibly forged) identity (Design Answer j#79405 §C).
     """
     try:
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-            resolve_sender_identity,
-        )
+        from pathlib import Path
+
+        from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
             repo_identity_digest,
         )
 
-        res = resolve_sender_identity(env, anchor_workspace_id=None)
-        identity = getattr(res, "identity", None)
-        if not getattr(res, "ok", False) or identity is None:
+        if not str(repo_root).strip():
             return None
-        workspace_id = str(getattr(identity, "workspace_id", "")).strip()
+        resolved = resolve_canonical_session(Path(repo_root))
+        workspace_id = str(getattr(resolved, "workspace_id", "") or "").strip()
         if not workspace_id:
             return None
         return (workspace_id, repo_identity_digest(workspace_id), ".")
     except Exception:  # noqa: BLE001 - unresolved live identity -> None (zero-send)
+        return None
+
+
+def _default_binding_resolve(
+    target_role: str, repo_root: str, env: Mapping[str, str]
+) -> Optional[str]:
+    """The runtime provider the repo's action-time binding assigns to ``target_role``, or None.
+
+    Reads the repo-local ``provider_binding`` config from the explicit target repo root and
+    resolves the workflow role to its provider, fail-closed (an unbound role or a config-load
+    failure returns None -> the resolver zero-sends). This is the action-time consistency gate the
+    Design Answer (j#79405 §A) requires: the workflow ``target_role`` must still bind to the gate's
+    pinned ``provider_id`` slot, so a later binding change is caught rather than silently trusted.
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+            resolve_role_provider,
+        )
+
+        return resolve_role_provider(target_role, repo_root=str(repo_root) or None)
+    except Exception:  # noqa: BLE001 - unbound role / unreadable config -> None (zero-send)
         return None
 
 
@@ -161,11 +192,13 @@ class ResumeTargetResolver:
     """Resolves the action-time live target for a gate, or None (fail-soft zero-send)."""
 
     env: Mapping[str, str]
+    repo_root: str = ""
     lifecycle_get: LifecycleGet = field(default=_default_lifecycle_get)
     inventory: InventoryList = field(default=_default_inventory)
     attestation_read: AttestationRead = field(default=_default_attestation_read)
     capture: CaptureVisible = field(default=_default_capture)
     workspace_resolve: WorkspaceResolve = field(default=_default_workspace_resolve)
+    binding_resolve: BindingResolve = field(default=_default_binding_resolve)
     read_lines: int = RESUME_READ_LINES
 
     def resolve(self, gate: OperatorStartupGate, env: Mapping[str, str]) -> Optional[object]:
@@ -189,8 +222,19 @@ class ResumeTargetResolver:
         if getattr(record, "revision", None) != target.lane_revision:
             return None
 
-        # 2. Exactly one declared pin with the gate's (role, provider, assigned_name).
-        wanted = (target.target_role, target.provider_id, target.target_assigned_name)
+        # 2a. Action-time provider-binding consistency (Design Answer j#79405 §A): the repo's
+        #     current binding must still resolve the workflow ``target_role`` to the gate's pinned
+        #     ``provider_id`` slot. A binding drift (or an unbound role) fails closed — the workflow
+        #     role is NOT silently converted to a provider; the runtime_role / provider_id the gate
+        #     pinned are matched against the live pin below.
+        bound_provider = self.binding_resolve(target.target_role, self.repo_root, env)
+        if not bound_provider or bound_provider != target.provider_id:
+            return None
+
+        # 2b. Exactly one declared pin with the gate's runtime identity
+        #     ``(runtime_role, provider_id, assigned_name)``. The declared pin's ``role`` is the
+        #     runtime role (``ProcessGenerationPin.role``), NOT the workflow role (j#79405 §A).
+        wanted = (target.runtime_role, target.provider_id, target.target_assigned_name)
         try:
             pins = [
                 pin
@@ -220,7 +264,7 @@ class ResumeTargetResolver:
             return None
         try:
             live_pin = ProcessGenerationPin(
-                role=str(row.get("role") or target.target_role).strip(),
+                role=str(row.get("role") or target.runtime_role).strip(),
                 provider=str(row.get("provider") or target.provider_id).strip(),
                 assigned_name=target.target_assigned_name,
                 locator=live_locator,
@@ -239,7 +283,7 @@ class ResumeTargetResolver:
                 self.attestation_read(target.target_assigned_name),
                 live_locator=live_locator,
                 expected_workspace_id=target.workspace_id,
-                expected_role=target.target_role,
+                expected_role=target.runtime_role,
                 expected_lane=target.lane_id,
             )
         except Exception:  # noqa: BLE001 - attestation evaluation failure -> fail closed
@@ -247,10 +291,11 @@ class ResumeTargetResolver:
         if not getattr(join, "ok", False):
             return None
 
-        # 5. Re-resolve the live action-time repo identity and require it EXACTLY matches the
-        #    gate's workspace_id / repo_identity_digest / execution_root (review j#79366 F1 — a
-        #    wrong repo / execution root fails closed; the gate's own identity is not trusted).
-        live_identity = self.workspace_resolve(env)
+        # 5. Re-resolve the live action-time repo identity FROM THE EXPLICIT REPO ROOT (registry
+        #    authority, not the gate's own identity nor the anchor-less sender identity — j#79405
+        #    §C) and require it EXACTLY matches the gate's workspace_id / repo_identity_digest /
+        #    execution_root. A wrong repo / execution root fails closed.
+        live_identity = self.workspace_resolve(self.repo_root, env)
         if live_identity is None:
             return None
         live_workspace_id, live_digest, live_execution_root = live_identity
@@ -297,5 +342,6 @@ __all__ = (
     "AttestationRead",
     "CaptureVisible",
     "WorkspaceResolve",
+    "BindingResolve",
     "ResumeTargetResolver",
 )

@@ -41,22 +41,25 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
-#: The closed schema version. Bumped only by a deliberate, migration-aware change;
-#: an unrecognized version fails closed at :meth:`OperatorStartupGate.from_record`.
-#:
-#: **v2 (#13813 resume tranche).** #13812 v1 realized only the ``required`` state (a
-#: fresh, zero-write projection). #13813 realizes the full append-only transition
-#: lattice — ``owner_approved`` -> ``operator_reported_done`` -> ``verified_clear`` ->
-#: ``consumed`` (with ``superseded`` as the invalidation branch) — each with the
-#: owner-approval / resume invariants v1 deliberately deferred. The wire shape is
-#: unchanged (same ``state`` / ``approval`` / ``resume`` fields); what v2 adds is the
-#: set of *valid* ``(state, approval, resume)`` combinations. :meth:`from_record`
-#: stays migration-aware: it still reads a v1 record, which — because v1 only ever
-#: realized ``required`` — is admitted only in the ``required`` state and re-stamped v2.
-OPERATOR_STARTUP_GATE_SCHEMA_VERSION = 2
+#: The closed schema version; an unrecognized version fails closed at :meth:`from_record`.
+#: **v3 (#13813 j#79405)** adds a required ``runtime_role`` (the ``ProcessGenerationPin.role`` /
+#: attestation role — the runtime provider role ``claude`` / ``codex``), kept SEPARATE from the
+#: workflow ``target_role`` and the ``provider_id``. This is a wire-shape change, so the version
+#: and the journal marker (``v=3``) advance together, and :meth:`from_record` parses ONLY v3.
+#: A v1 (#13812, ``required`` only) / v2 (#13813 resume-lattice) record is readable *legacy* — not
+#: corrupt and not silently upgraded (an implicit runtime_role / revision backfill would fabricate
+#: an exact-generation approval); the read layer routes it to ``legacy_gate_reapproval_required``
+#: (reserve/send 0) and a fresh v3 gate is re-issued from a new owner approval that ``supersedes``
+#: the legacy journal.
+OPERATOR_STARTUP_GATE_SCHEMA_VERSION = 3
 
-#: The prior schema version #13812 wrote (``required`` gates only). Still readable.
+#: Prior schema versions, still READABLE as legacy (a fresh v3 reapproval supersedes them).
 OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1 = 1
+OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V2 = 2
+#: The pre-v3 legacy schema versions, as a set (the read layer routes these to reapproval).
+OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS: frozenset[int] = frozenset(
+    {OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1, OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V2}
+)
 
 # ---------------------------------------------------------------------------
 # Gate state (j#78409 schema ``state``). The design's full state lattice is an
@@ -81,26 +84,21 @@ OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1 = 1
 # - ``operator_reported_done``: approval present, default resume (the operator reports
 #                               they cleared the screen in the provider UI, but the agent
 #                               has not re-verified startup-clear yet).
-# - ``verified_clear``:         approval present, ``startup_clear_observed_at`` set, the
-#                               fence reserved-or-uncertain (a send was attempted but its
-#                               turn-start is not confirmed), no consumed delivery. This
-#                               is the reserve-but-not-delivered rung: it needs operator
-#                               reconcile, never a blind retry.
-# - ``consumed``:               approval present, ``startup_clear_observed_at`` set, the
-#                               fence ``delivered``, a ``consumed_delivery_record`` set.
-#                               The original request was re-issued exactly once. Terminal.
-# - ``superseded``:             the invalidation branch (a newer generation / a durable
-#                               supersede). It retains whatever approval / resume it was
-#                               invalidated from as audit history, so its resume fields
-#                               are only screened for shape, not constrained by rung.
-#                               Terminal.
+# - ``verified_clear``:         approval present, ``startup_clear_observed_at`` set, the fence
+#                               reserved-or-uncertain (send attempted, turn-start unconfirmed),
+#                               no consumed delivery — the reserve-but-not-delivered rung
+#                               (operator reconcile, never a blind retry).
+# - ``consumed``:               approval present, ``startup_clear_observed_at`` set, the fence
+#                               ``delivered``, a ``consumed_delivery_record`` set — re-issued
+#                               exactly once. Terminal.
+# - ``superseded``:             the invalidation branch (newer generation / durable supersede);
+#                               retains its prior approval / resume as audit history, screened
+#                               for shape only, not constrained by rung. Terminal.
 # ---------------------------------------------------------------------------
-#: An operator UI action is required; the projection is zero-write (no approval,
-#: default resume). The only state #13812 v1 realized.
+#: An operator UI action is required; zero-write projection (no approval). #13812 v1's only state.
 STATE_REQUIRED = "required"
 
-#: The owner approved the one-target/one-generation operator UI action (approval
-#: present); nothing observed clear yet, fence untouched.
+#: The owner approved the one-target/one-generation operator UI action; nothing clear yet.
 STATE_OWNER_APPROVED = "owner_approved"
 #: The operator reports they cleared the startup screen in the provider's own UI; the
 #: agent has not re-verified startup-clear yet. This is the resume precondition.
@@ -289,14 +287,11 @@ def _reject_non_digest(value: str, *, field_name: str) -> None:
 
 
 def repo_identity_digest(identity_token: str) -> str:
-    """Opaque ``sha256:<hex>`` digest of a canonical repository identity token.
+    """Opaque ``sha256:<hex>`` digest of an already-canonical repository identity token.
 
-    The caller supplies an already-canonical identity string (a registry workspace
-    id, a repo root token — resolved by the application layer, never a raw private
-    path passed through). Hashing it yields a stable, one-way, pasteable digest: the
-    same repository always projects the same digest, but the record carries no path.
-    A blank token fails closed rather than digesting the empty string into a
-    look-alike constant.
+    The caller supplies a canonical identity string (a registry workspace id / repo root
+    token — resolved by the application layer, never a raw private path). Hashing yields a
+    stable, one-way, pasteable digest carrying no path. A blank token fails closed.
     """
     if not isinstance(identity_token, str) or not identity_token.strip():
         raise OperatorStartupGateError(
@@ -304,6 +299,21 @@ def repo_identity_digest(identity_token: str) -> str:
         )
     digest = hashlib.sha256(identity_token.strip().encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def schema_version_of(record: object) -> Optional[int]:
+    """The ``schema_version`` of a gate record (a plain int), or None if unreadable.
+
+    A cheap peek the read layer uses to version-dispatch BEFORE a full parse (j#79405): legacy
+    v1/v2 routes to reapproval, v3 to :meth:`from_record`, anything else to corrupt. ``bool`` is
+    rejected (an ``int`` subclass) so ``True`` never reads as version ``1``.
+    """
+    if not isinstance(record, Mapping):
+        return None
+    value = record.get("schema_version")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _require_positive_generation(value: object, *, field_name: str) -> int:
@@ -388,17 +398,14 @@ class GateTarget:
     """The exact target the gate is pinned to (j#78409 schema ``target``).
 
     Every field is a stable identity token: ``workspace_id`` (registry authority),
-    ``repo_identity_digest`` (opaque; :func:`repo_identity_digest`), ``execution_root``
-    (repo-relative, ``"."`` at the root — never absolute), ``lane_id`` /
-    ``target_role`` / ``target_assigned_name`` (durable managed identity),
-    ``provider_id``, a positive ``agent_generation`` (the attested live generation), and a
-    positive ``lane_revision`` (the lane lifecycle record's CAS revision the gate was pinned
-    against). The gate is honored only against a live re-observation that matches THIS tuple
-    AND the exact ``agent_generation`` AND the exact ``lane_revision``; a blank / mismatched /
-    newer-generation / revision-drifted observation is stale and zero-actuation (review
-    j#79366 F1). ``repo_identity_digest`` is :func:`repo_identity_digest` over the
-    ``workspace_id`` (the registry-authority identity), so the resume can re-derive and
-    re-verify it at action time without a checkout path.
+    ``repo_identity_digest`` (:func:`repo_identity_digest` over ``workspace_id`` — re-derivable
+    at action time without a checkout path), ``execution_root`` (repo-relative, ``"."`` at the
+    root), ``lane_id`` / ``target_role`` (workflow role) / ``target_assigned_name``,
+    ``provider_id`` / ``runtime_role`` (the ``ProcessGenerationPin`` provider slot / role, j#79405),
+    a positive ``agent_generation`` (attested live generation) and ``lane_revision`` (the lane
+    record's CAS revision pinned against). The gate is honored only against a live re-observation
+    matching THIS tuple AND the exact generation AND revision; anything else is zero-actuation
+    (review j#79366 F1).
     """
 
     workspace_id: str
@@ -408,6 +415,7 @@ class GateTarget:
     target_role: str
     target_assigned_name: str
     provider_id: str
+    runtime_role: str
     agent_generation: int
     lane_revision: int
 
@@ -449,6 +457,11 @@ class GateTarget:
         )
         object.__setattr__(
             self,
+            "runtime_role",
+            _require_token(self.runtime_role, field_name="target.runtime_role"),
+        )
+        object.__setattr__(
+            self,
             "agent_generation",
             _require_positive_generation(
                 self.agent_generation, field_name="target.agent_generation"
@@ -464,12 +477,9 @@ class GateTarget:
 
     @property
     def identity_key(self) -> tuple[str, str, str, str, str, str]:
-        """The stable identity tuple, generation-independent.
-
-        Two observations of the *same* managed target across relaunches share this
-        key; they differ only in ``agent_generation``. The projection compares this
-        key for identity mismatch and the generation separately for staleness.
-        """
+        """The stable identity tuple, generation-independent (two relaunch observations of the
+        same target share it and differ only in ``agent_generation``; the projection compares
+        this for identity mismatch and the generation separately for staleness)."""
         return (
             self.workspace_id,
             self.repo_identity_digest,
@@ -482,9 +492,8 @@ class GateTarget:
     def same_identity(self, other: "GateTarget") -> bool:
         """True when ``other`` names the same managed target (ignoring generation).
 
-        ``provider_id`` is part of identity here even though it is not in
-        :attr:`identity_key`: a target that resolved to a *different provider* is not
-        the same target, so a provider change is a mismatch, not a generation bump.
+        ``provider_id`` is part of identity even though it is not in :attr:`identity_key`: a
+        different provider is a mismatch, not a generation bump.
         """
         return (
             self.identity_key == other.identity_key
@@ -500,6 +509,7 @@ class GateTarget:
             "target_role": self.target_role,
             "target_assigned_name": self.target_assigned_name,
             "provider_id": self.provider_id,
+            "runtime_role": self.runtime_role,
             "agent_generation": self.agent_generation,
             "lane_revision": self.lane_revision,
         }
@@ -515,6 +525,7 @@ class GateTarget:
             target_role=_get(record, "target_role"),
             target_assigned_name=_get(record, "target_assigned_name"),
             provider_id=_get(record, "provider_id"),
+            runtime_role=_get(record, "runtime_role"),
             agent_generation=record.get("agent_generation"),
             lane_revision=record.get("lane_revision"),
         )
@@ -805,38 +816,27 @@ class OperatorStartupGate:
             "resume": self.resume.to_record(),
         }
 
-    #: The durable record is already pasteable-safe, so the public projection IS the
-    #: record. Kept as a named method so a caller reads intent (project for a journal)
-    #: rather than reaching for ``to_record`` and wondering whether it redacts.
+    #: The durable record is already pasteable-safe, so the public projection IS the record;
+    #: kept as a named method so a caller reads intent (project for a journal).
     def public_projection(self) -> dict:
         return self.to_record()
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> "OperatorStartupGate":
-        """Rebuild a gate from a persisted record (inverse of :meth:`to_record`).
+        """Rebuild a v3 gate from a persisted record (inverse of :meth:`to_record`).
 
-        Migration-aware (schema v2): a current v2 record is read as-is, and a legacy v1
-        record — which #13812 only ever wrote in the ``required`` state — is still read,
-        admitted **only** in ``required`` and re-stamped v2. A v1 record naming any other
-        state is rejected: v1 never realized a transition-bearing state, so such a record
-        is malformed / forged rather than a genuine legacy gate. Any other version fails
-        closed.
+        Parses ONLY the current schema (v3); any non-v3 version fails closed. A legacy v1/v2
+        record is NOT parsed here (silently upgrading it would fabricate an exact-generation
+        approval — j#79405); the read layer (:func:`schema_version_of` + the leg's version-
+        dispatch) routes legacy to the ``legacy_gate_reapproval_required`` disposition.
         """
         _require_mapping(record, field_name="operator_startup_gate")
         version = record.get("schema_version", OPERATOR_STARTUP_GATE_SCHEMA_VERSION)
-        state = str(_get(record, "state"))
-        if version == OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1:
-            if state != STATE_REQUIRED:
-                raise OperatorStartupGateError(
-                    f"operator startup gate v1 record names state {state!r}; v1 only "
-                    f"ever realized {STATE_REQUIRED!r}, so a v1 record in any other "
-                    f"state is malformed"
-                )
-        elif version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
+        if version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
             raise OperatorStartupGateError(
-                f"operator startup gate schema_version {version!r} is unsupported; "
-                f"this build understands {OPERATOR_STARTUP_GATE_SCHEMA_VERSION} "
-                f"(and reads legacy {OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1})"
+                f"operator startup gate schema_version {version!r} is not the current "
+                f"{OPERATOR_STARTUP_GATE_SCHEMA_VERSION}; a legacy v1 / v2 record is read as "
+                f"legacy (reapproval-required), never parsed as a current gate"
             )
         approval_record = record.get("approval")
         resume_record = record.get("resume")
@@ -932,13 +932,10 @@ def _require_stripped(value: object, *, field_name: str) -> str:
 def _require_execution_root(value: object) -> str:
     """Coerce ``execution_root`` to a repo-relative token (reject absolute/secret).
 
-    ``execution_root`` is ``"."`` at the repository root or a repo-relative POSIX
-    path (``projects/x``). Unlike every other field it may carry an *interior*
-    forward slash — a repo-relative path is public-safe — but it must never be
-    absolute (leading ``/``), a home prefix, a Windows path (backslash / drive), a
-    URL, a parent-traversal (``..`` escapes the repo root), or carry a credential
-    token. That keeps a durable record free of private host topology while still
-    expressing a project sub-root.
+    ``"."`` at the repo root or a repo-relative POSIX path (``projects/x``). It may carry an
+    interior forward slash (a repo-relative path is public-safe) but never an absolute / home /
+    Windows / URL / ``..``-traversal path or a credential token — keeping the durable record
+    free of private host topology.
     """
     text = _require_stripped(value, field_name="target.execution_root")
     lowered = text.lower()
@@ -978,6 +975,8 @@ __all__ = (
     "FORBIDDEN_ACTIONS",
     "OPERATOR_STARTUP_GATE_SCHEMA_VERSION",
     "OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1",
+    "OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V2",
+    "OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS",
     "ORIGINAL_REQUEST_SOURCE_REDMINE",
     "STATE_REQUIRED",
     "STATE_OWNER_APPROVED",
@@ -996,4 +995,5 @@ __all__ = (
     "build_required_gate",
     "reject_path_or_secret_shaped",
     "repo_identity_digest",
+    "schema_version_of",
 )

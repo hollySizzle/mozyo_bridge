@@ -19,11 +19,32 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence  # noqa: E402
+from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    DISPOSITION_ACTIVE,
+    ProcessGenerationPin,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_record import (  # noqa: E402
+    ResumeGateRecorder,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_send import (  # noqa: E402
+    ResumeHandoffSendPort,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (  # noqa: E402
+    ResumeTargetResolver,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402
+    AGENT_KEY_NAME,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E402
     SendOutcome,
     TURN_START_STARTED,
@@ -37,16 +58,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume import (  # noqa: E402
     RESUME_DELIVERED,
+    RESUME_EXECUTION_ROOT_UNSAFE,
     RESUME_FENCE_UNAVAILABLE,
+    RESUME_LEGACY_REAPPROVAL_REQUIRED,
     RESUME_NOT_CLEAR,
     RESUME_NOT_RESUMABLE,
     RESUME_RECORDER_UNAVAILABLE,
     RESUME_SKIPPED,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402
+    operator_startup_resume_send as _resume_send,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (  # noqa: E402
     GATE_JOURNAL_MARKER,
+    GATE_JOURNAL_MARKER_PREFIX,
     GATE_READ_CORRUPT,
     GATE_READ_GATE,
+    GATE_READ_LEGACY,
     GATE_READ_NONE,
     LatestGateRead,
     ObservedTargetResolution,
@@ -88,6 +116,7 @@ def _target(**overrides) -> GateTarget:
         target_role="implementation_worker",
         target_assigned_name="worker-a",
         provider_id="claude",
+        runtime_role="claude",
         agent_generation=3,
         lane_revision=1,
     )
@@ -242,14 +271,45 @@ class GateJournalSerializationTests(unittest.TestCase):
         self.assertIsNone(read.gate)
 
     def test_newest_schema_invalid_gate_is_corrupt(self) -> None:
-        # A newest record whose JSON parses but fails the schema invariants is also corrupt.
-        bad = f"{GATE_JOURNAL_MARKER}\n" + '{"schema_version": 2, "state": "consumed"}'
+        # A newest CURRENT-version (v3) record whose JSON parses but fails the schema invariants
+        # is corrupt (fail-closed), NOT resumed.
+        bad = f"{GATE_JOURNAL_MARKER}\n" + '{"schema_version": 3, "state": "consumed"}'
         entries = [_Entry(render_gate_journal(_done_gate())), _Entry(bad)]
         self.assertEqual(parse_latest_gate(entries).status, GATE_READ_CORRUPT)
+
+    def test_newest_legacy_v2_gate_is_legacy_not_corrupt_not_gate(self) -> None:
+        # j#79405 §B: a readable legacy v2 record (marker v=2) is classified LEGACY — reapproval
+        # required — never CORRUPT and never parsed as a current gate, and never falls back to an
+        # older resumable gate. The legacy marker is still detected (version-agnostic prefix).
+        legacy = (
+            f"prior operator_reported_done\n{GATE_JOURNAL_MARKER_PREFIX}2]\n"
+            + '{"schema_version": 2, "state": "operator_reported_done"}'
+        )
+        entries = [_Entry(render_gate_journal(_done_gate())), _Entry(legacy)]
+        read = parse_latest_gate(entries)
+        self.assertEqual(read.status, GATE_READ_LEGACY)
+        self.assertIsNone(read.gate)
+
+    def test_legacy_v1_gate_is_legacy(self) -> None:
+        legacy = f"{GATE_JOURNAL_MARKER_PREFIX}1]\n" + '{"schema_version": 1, "state": "required"}'
+        self.assertEqual(parse_latest_gate([_Entry(legacy)]).status, GATE_READ_LEGACY)
+
+    def test_v2_to_v3_supersession_newest_v3_wins(self) -> None:
+        # A fresh v3 gate recorded AFTER a legacy v2 gate supersedes it: the newest (v3) record
+        # decides the read, so a re-approved v3 gate resumes normally.
+        v2 = f"{GATE_JOURNAL_MARKER_PREFIX}2]\n" + '{"schema_version": 2, "state": "operator_reported_done"}'
+        entries = [_Entry(v2), _Entry(render_gate_journal(_done_gate()))]
+        read = parse_latest_gate(entries)
+        self.assertEqual(read.status, GATE_READ_GATE)
+        self.assertEqual(read.gate, _done_gate())
 
     def test_malformed_payload_is_none(self) -> None:
         self.assertIsNone(parse_gate_from_note(f"header\n{GATE_JOURNAL_MARKER}\n{{not json"))
         self.assertIsNone(parse_gate_from_note("no marker at all"))
+        # A legacy v2 payload is not a CURRENT gate -> parse_gate_from_note returns None.
+        self.assertIsNone(
+            parse_gate_from_note(f"{GATE_JOURNAL_MARKER_PREFIX}2]\n" + '{"schema_version": 2}')
+        )
 
 
 class ResumeLegTests(unittest.TestCase):
@@ -407,6 +467,42 @@ class ResumeLegTests(unittest.TestCase):
         self.assertEqual(result.result, RESUME_NOT_CLEAR)
         self.assertEqual(result.projection_disposition, PROJECT_IDENTITY_UNRESOLVED)
 
+    def test_legacy_latest_gate_is_reapproval_required_zero_send(self) -> None:
+        # j#79405 §B: a readable legacy (v1/v2) latest gate routes to a fixed reapproval-required
+        # disposition — reserve/send 0, no resolve, no record — never a resume of a legacy gate.
+        rec = _Recorder()
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_LEGACY),
+            target_resolver=lambda gate, env: (_ for _ in ()).throw(
+                AssertionError("resolver must not run on a legacy gate")
+            ),
+            send_factory=_exploding_send_factory,
+            gate_recorder=rec,
+        )
+        self.assertEqual(result.result, RESUME_LEGACY_REAPPROVAL_REQUIRED)
+        self.assertFalse(result.sent)
+        self.assertEqual(len(rec.recorded), 0)
+
+    def test_unsafe_execution_root_is_zero_send_before_reserve(self) -> None:
+        # j#79405 §C: an execution_root that does not safely resolve under the action-time repo
+        # root fails closed BEFORE the reserve (defense-in-depth; the domain already rejects `..`).
+        rec = _Recorder()
+        send = _CountingSend()
+        orig = _resume_send.resolve_execution_workdir
+        _resume_send.resolve_execution_workdir = lambda repo_root, execution_root: None
+        try:
+            result = self._run(
+                gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
+                target_resolver=_resolver(_READY),
+                send_factory=send.factory,
+                gate_recorder=rec,
+            )
+        finally:
+            _resume_send.resolve_execution_workdir = orig
+        self.assertEqual(result.result, RESUME_EXECUTION_ROOT_UNSAFE)
+        self.assertEqual(send.calls, 0)
+        self.assertEqual(len(rec.recorded), 0)
+
     def test_lost_fence_is_fail_closed_no_send(self) -> None:
         # A store LOSS (sidecar remains, DB gone) must fail bootstrap closed with no send —
         # the leg never silently re-creates a fresh store that could re-send (deletion-safe).
@@ -425,6 +521,151 @@ class ResumeLegTests(unittest.TestCase):
             fence=lost,
         )
         self.assertEqual(result.result, RESUME_FENCE_UNAVAILABLE)
+
+
+class _Creds:
+    def __init__(self, base_url="https://redmine.example", api_key="k"):
+        self.base_url = base_url
+        self.api_key = api_key
+
+
+class _Transport:
+    def __init__(self):
+        self.posts = []
+
+    def post_issue_note(self, issue_id, notes):
+        self.posts.append((issue_id, notes))
+        return ""
+
+
+class ProductionCompositionTests(unittest.TestCase):
+    """Top-level `execute_startup_resume` driven through the REAL production composition —
+    the real ResumeTargetResolver (real evaluate_attestation, a production-shape declared
+    ProcessGenerationPin whose role is the runtime role "claude", a raw inventory row), the real
+    ResumeHandoffSendPort, and the real ResumeGateRecorder — with ONLY leaf sub-seams faked
+    (runner / ticket writer / lifecycle / inventory / attestation read / workspace / binding).
+    This is the composition the reviewer (j#79392 F1 / j#79405 §D) required: production-shape
+    inputs, positive send=1, no positive-stubbed attestation or workflow-role-shaped pin.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        self.fence = DispatchOutboxFence(home=self.home)
+        self.fence.bootstrap()
+        self.args = argparse.Namespace(repo=str(self.home))
+
+    def _production_resolver(self):
+        record = SimpleNamespace(
+            lane_disposition=DISPOSITION_ACTIVE,
+            issue_id="13760",
+            lane_generation=3,
+            revision=1,
+            declared_pins=(
+                # RUNTIME-role pin (role == provider token "claude"), NOT the workflow role.
+                ProcessGenerationPin(
+                    role="claude", provider="claude", assigned_name="worker-a", locator="w1:p1"
+                ),
+            ),
+        )
+        attestation = IdentityAttestationRecord(
+            assigned_name="worker-a",
+            workspace_id="ws-alpha",
+            role="claude",
+            lane_id="lane-alpha",
+            locator="w1:p1",
+            verdict=VERDICT_PRESENT,
+        )
+        t = _target()
+        return ResumeTargetResolver(
+            env={},
+            repo_root=str(self.home),
+            lifecycle_get=lambda ws, lane: record,
+            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            attestation_read=lambda name: attestation,  # REAL record -> REAL evaluate_attestation
+            capture=lambda loc, lines: _READY,
+            workspace_resolve=lambda repo_root, env: (
+                t.workspace_id, t.repo_identity_digest, t.execution_root
+            ),
+            binding_resolve=lambda role, repo_root, env: "claude",
+        )
+
+    def test_production_composition_delivers_once_workdir_and_records_consumed(self) -> None:
+        runner_calls = []
+
+        def _runner(argv):
+            runner_calls.append(list(argv))
+            return 0, '{"status": "sent", "reason": "ok"}'
+
+        transport = _Transport()
+        recorder = ResumeGateRecorder(
+            issue="13813",
+            env={},
+            transport_factory=lambda env: transport,
+            credentials_resolver=lambda env: _Creds(),
+        )
+        result = execute_startup_resume(
+            self.args,
+            "13813",
+            env={},
+            observed_at="2026-07-16T01:00:00Z",
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
+            target_resolver=self._production_resolver().resolve,
+            send_factory=lambda gate, locator, repo_root, env: ResumeHandoffSendPort(
+                locator=locator, runner=_runner
+            ).build(gate, repo_root, env),
+            gate_recorder=recorder,
+            fence=self.fence,
+        )
+        # positive send=1, exactly-once, gate advanced to consumed and durably recorded.
+        self.assertEqual(result.result, RESUME_DELIVERED)
+        self.assertTrue(result.sent)
+        self.assertEqual(len(runner_calls), 1)
+        argv = runner_calls[0]
+        # the exact repo/lane/workdir bind rode the single high-level send. repo_root is the
+        # arg-resolved root (symlinks resolved); workdir == repo_root for execution_root '.'.
+        resolved_root = str(Path(self.home).resolve())
+        self.assertEqual(argv[argv.index("--target-repo") + 1], resolved_root)
+        self.assertEqual(argv[argv.index("--target-lane") + 1], "lane-alpha")
+        self.assertEqual(argv[argv.index("--workdir") + 1], resolved_root)
+        self.assertEqual(
+            argv[argv.index("--workdir") + 1], argv[argv.index("--target-repo") + 1]
+        )
+        self.assertEqual(argv[argv.index("--target") + 1], "w1:p1")
+        # durable append-only transition recorded (consumed).
+        self.assertEqual(len(transport.posts), 1)
+        self.assertEqual(transport.posts[0][0], "13813")
+        self.assertIn(GATE_JOURNAL_MARKER, transport.posts[0][1])
+
+    def test_production_composition_rerun_sends_zero(self) -> None:
+        def _runner(argv):
+            return 0, '{"status": "sent", "reason": "ok"}'
+
+        def _run_once():
+            return execute_startup_resume(
+                self.args,
+                "13813",
+                env={},
+                observed_at="2026-07-16T01:00:00Z",
+                gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
+                target_resolver=self._production_resolver().resolve,
+                send_factory=lambda gate, locator, repo_root, env: ResumeHandoffSendPort(
+                    locator=locator, runner=_runner
+                ).build(gate, repo_root, env),
+                gate_recorder=ResumeGateRecorder(
+                    issue="13813",
+                    env={},
+                    transport_factory=lambda env: _Transport(),
+                    credentials_resolver=lambda env: _Creds(),
+                ),
+                fence=self.fence,
+            )
+
+        first = _run_once()
+        second = _run_once()
+        self.assertEqual(first.result, RESUME_DELIVERED)
+        self.assertEqual(second.result, RESUME_SKIPPED)  # fence refuses the re-reserve
 
 
 if __name__ == "__main__":

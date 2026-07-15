@@ -17,6 +17,7 @@ existing governed high-level rail.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
@@ -45,6 +46,29 @@ _TURN_START_STARTED_TOKEN = "started"
 def _default_runner(argv: Sequence[str]) -> "tuple[int, str]":
     proc = subprocess.run(list(argv), capture_output=True, text=True, check=False)
     return proc.returncode, proc.stdout
+
+
+def resolve_execution_workdir(repo_root: str, execution_root: str) -> Optional[str]:
+    """The absolute ``--workdir`` = gate ``execution_root`` safely resolved under ``repo_root``.
+
+    ``execution_root`` is the gate's repo-relative POSIX pointer (``.`` at the repo root, else
+    ``projects/x``). The joined path is normalized (``..`` collapsed) and must stay at or under
+    the normalized ``repo_root``; any escape returns ``None`` so the caller zero-sends BEFORE
+    reserving (Design Answer j#79405 §C). Pure — no filesystem access — so it is hermetic and
+    the leg's pre-reserve check and the send argv derive the identical value. The domain already
+    rejects absolute / ``..`` execution roots; this re-checks at action time against the freshly
+    resolved repo root (defense in depth).
+    """
+    root_norm = os.path.normpath(repo_root)
+    rel = (execution_root or "").strip()
+    if rel in ("", "."):
+        return root_norm
+    if os.path.isabs(rel):
+        return None
+    joined = os.path.normpath(os.path.join(root_norm, rel))
+    if joined == root_norm or joined.startswith(root_norm + os.sep):
+        return joined
+    return None
 
 
 def _last_json_object(stdout: str, *required_keys: str) -> Optional[dict]:
@@ -130,9 +154,12 @@ class ResumeHandoffSendPort:
         orig = gate.original_request
 
         def _send() -> SendOutcome:
-            # Exact target/lane/repo bind (review j#79366 F1): the explicit resolved repo root
-            # and lane label, NOT `--target-repo auto` inference, so the re-issue lands in the
-            # exact repo + lane context the gate was pinned against.
+            # Exact target/lane/repo/workdir bind (review j#79366 F1, j#79405 §C): the explicit
+            # resolved repo root, lane label, and the gate's execution_root safely resolved to an
+            # absolute `--workdir` under repo_root — NOT `--target-repo auto` inference and NOT
+            # the pane cwd — so the re-issue's envelope carries the exact `execution_root` the
+            # gate was pinned against (the planner renders the portable `.` pointer from it).
+            workdir = resolve_execution_workdir(repo_root, gate.target.execution_root) or repo_root
             argv = [
                 self.mozyo_bridge_bin,
                 "handoff",
@@ -155,6 +182,8 @@ class ResumeHandoffSendPort:
                 repo_root,
                 "--target-lane",
                 gate.target.lane_id,
+                "--workdir",
+                workdir,
                 "--record-format",
                 "json",
             ]
@@ -174,4 +203,5 @@ __all__ = (
     "Runner",
     "ResumeHandoffSendPort",
     "map_handoff_stdout_to_send_outcome",
+    "resolve_execution_workdir",
 )

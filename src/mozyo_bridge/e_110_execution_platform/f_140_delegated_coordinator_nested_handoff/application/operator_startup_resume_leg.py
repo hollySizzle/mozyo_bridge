@@ -52,24 +52,34 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ObservedStartupTarget,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume import (
+    RESUME_EXECUTION_ROOT_UNSAFE,
     RESUME_FENCE_UNAVAILABLE,
+    RESUME_LEGACY_REAPPROVAL_REQUIRED,
     RESUME_NOT_RESUMABLE,
     RESUME_RECORDER_UNAVAILABLE,
     StartupResumeResult,
     resume_startup_gate,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
+    OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS,
+    OPERATOR_STARTUP_GATE_SCHEMA_VERSION,
     STATE_REQUIRED,
     OperatorStartupGate,
     OperatorStartupGateError,
+    schema_version_of,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate_lattice import (
     operator_startup_gate_record_lines,
     operator_startup_resume_record_lines,
 )
 
-#: Sentinel line preceding the single-line gate JSON payload in a durable journal note.
-GATE_JOURNAL_MARKER = "[mozyo:operator-startup-gate:v=2]"
+#: Version-agnostic prefix of the sentinel line preceding the single-line gate JSON payload.
+#: The trailing ``<version>]`` varies by schema version; detection matches the prefix so a
+#: legacy ``v=2`` note is still recognized as a gate record (and classified as LEGACY via its
+#: ``schema_version`` field), never skipped as unrelated prose (Design Answer j#79405 §B).
+GATE_JOURNAL_MARKER_PREFIX = "[mozyo:operator-startup-gate:v="
+#: Sentinel line for a CURRENT (v3) gate record — the wire form new records are written with.
+GATE_JOURNAL_MARKER = f"{GATE_JOURNAL_MARKER_PREFIX}{OPERATOR_STARTUP_GATE_SCHEMA_VERSION}]"
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +109,12 @@ def render_gate_journal(gate: OperatorStartupGate) -> str:
     return "\n".join([*lines, "", GATE_JOURNAL_MARKER, payload])
 
 
-# Gate-read status (:class:`LatestGateRead`). A durable gate read is one of three: a
-# valid gate, no gate record at all, or a CORRUPT newest gate record (fail-closed).
-GATE_READ_GATE = "gate"  # a valid latest gate was read
+# Gate-read status (:class:`LatestGateRead`). A durable gate read is one of four: a valid
+# current (v3) gate, no gate record at all, a readable LEGACY (v1/v2) record (reapproval
+# required — never resumed), or a CORRUPT newest gate record (fail-closed).
+GATE_READ_GATE = "gate"  # a valid current (v3) gate was read
 GATE_READ_NONE = "no_gate"  # no gate-marker-bearing journal entry exists at all
+GATE_READ_LEGACY = "legacy"  # the NEWEST gate record is a readable legacy (v1/v2) schema
 GATE_READ_CORRUPT = "corrupt"  # the NEWEST gate-marker entry is malformed / schema-invalid
 
 
@@ -110,12 +122,14 @@ GATE_READ_CORRUPT = "corrupt"  # the NEWEST gate-marker entry is malformed / sch
 class LatestGateRead:
     """The typed result of reading the latest durable gate (Finding 3, review j#79309).
 
-    ``status`` is :data:`GATE_READ_GATE` (``gate`` present), :data:`GATE_READ_NONE`
-    (nothing to resume), or :data:`GATE_READ_CORRUPT` (the newest gate record could not be
-    parsed — fail closed, never fall back to an older gate). Distinguishing corrupt from
+    ``status`` is :data:`GATE_READ_GATE` (a current-v3 ``gate`` present), :data:`GATE_READ_NONE`
+    (nothing to resume), :data:`GATE_READ_LEGACY` (the newest gate record is a readable legacy
+    v1/v2 schema — it predates the runtime_role / lane_revision contract and routes to reapproval,
+    Design Answer j#79405 §B), or :data:`GATE_READ_CORRUPT` (the newest gate record could not be
+    parsed — fail closed, never fall back to an older gate). Distinguishing legacy / corrupt from
     absent is the whole point: a marker-absent journal entry is unrelated and skipped, but a
-    marker-PRESENT-but-invalid newest record must stop the resume, not silently resume from a
-    stale older gate.
+    marker-PRESENT newest record (legacy or invalid) must stop the resume, not silently resume
+    from a stale older gate.
     """
 
     status: str
@@ -123,23 +137,34 @@ class LatestGateRead:
 
 
 def note_has_gate_marker(notes: object) -> bool:
-    """True when a note carries the gate sentinel (i.e. it is a gate record entry)."""
-    return isinstance(notes, str) and GATE_JOURNAL_MARKER in notes
+    """True when a note carries a gate sentinel of ANY schema version (it is a gate record).
+
+    Matches the version-agnostic :data:`GATE_JOURNAL_MARKER_PREFIX` so a legacy ``v=2`` note is
+    still recognized as a gate record (and classified via its ``schema_version`` field), never
+    skipped as unrelated prose.
+    """
+    return isinstance(notes, str) and GATE_JOURNAL_MARKER_PREFIX in notes
 
 
-def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
-    """Parse the gate JSON payload from one gate-marker note, or None if malformed.
+def _gate_record_from_note(notes: str) -> Optional[dict]:
+    """The raw gate record ``dict`` from a gate-marker note, or None if unreadable.
 
-    Precondition: the note carries :data:`GATE_JOURNAL_MARKER` (check
-    :func:`note_has_gate_marker` first). Decodes the first non-empty line after the sentinel
-    with :meth:`OperatorStartupGate.from_record`. Malformed JSON or a record that fails the
-    schema invariants returns None — the caller treats a malformed newest record as CORRUPT
-    (fail-closed), never as "no gate".
+    Locates the marker line (any schema version) and decodes the first non-empty line after
+    it as JSON. Malformed JSON / a non-dict payload / a missing marker returns None — the
+    caller version-dispatches on the record's ``schema_version``.
     """
     if not note_has_gate_marker(notes):
         return None
-    after = notes.split(GATE_JOURNAL_MARKER, 1)[1]
-    for line in after.splitlines():
+    lines = notes.splitlines()
+    marker_index = -1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(GATE_JOURNAL_MARKER_PREFIX) and stripped.endswith("]"):
+            marker_index = index
+            break
+    if marker_index < 0:
+        return None
+    for line in lines[marker_index + 1:]:
         line = line.strip()
         if not line:
             continue
@@ -147,36 +172,66 @@ def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
             record = json.loads(line)
         except (ValueError, TypeError):
             return None
-        if not isinstance(record, dict):
-            return None
-        try:
-            return OperatorStartupGate.from_record(record)
-        except OperatorStartupGateError:
-            return None
+        return record if isinstance(record, dict) else None
     return None
 
 
+def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
+    """Parse a CURRENT (v3) gate from one gate-marker note, or None if legacy / malformed.
+
+    Precondition: the note carries a gate marker (check :func:`note_has_gate_marker` first).
+    Returns a parsed gate ONLY for a current-v3 record; a readable legacy (v1/v2) record or a
+    malformed / schema-invalid record returns None. The caller (:func:`parse_latest_gate`)
+    distinguishes legacy from corrupt via :func:`schema_version_of`.
+    """
+    record = _gate_record_from_note(notes)
+    if record is None:
+        return None
+    if schema_version_of(record) != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
+        return None
+    try:
+        return OperatorStartupGate.from_record(record)
+    except OperatorStartupGateError:
+        return None
+
+
 def parse_latest_gate(entries: Sequence[object]) -> LatestGateRead:
-    """Read the latest durable gate (newest-first), fail-closed on a corrupt newest record.
+    """Read the latest durable gate (newest-first), version-dispatching the newest record.
 
     ``entries`` is a sequence of objects exposing a ``.notes`` attribute (Redmine journal
     entries, chronological). Scans newest-first for the first *gate-marker-bearing* entry —
-    that is the current gate record (the transition chain is append-only). If it parses, the
-    result is :data:`GATE_READ_GATE`; if it is malformed / schema-invalid, the result is
-    :data:`GATE_READ_CORRUPT` — the read **stops there** and never falls back to an older,
-    stale gate (Finding 3, review j#79309: a corrupt supersede/consume record must not let a
-    stale ``operator_reported_done`` gate resume). Journal entries WITHOUT the marker are
-    unrelated and skipped; if none carry a marker, the result is :data:`GATE_READ_NONE`.
+    that is the current gate record (the transition chain is append-only). The NEWEST gate
+    record decides the read; there is **no fallback** past it to an older, stale gate
+    (Finding 3, review j#79309). It is classified by its ``schema_version`` (Design Answer
+    j#79405 §B):
+
+    * a current v3 record that parses -> :data:`GATE_READ_GATE`;
+    * a readable legacy v1/v2 record -> :data:`GATE_READ_LEGACY` (reapproval required — a
+      legacy gate is never resumed, but it is not corrupt either);
+    * any other version, unreadable JSON, or a v3 record that fails the schema invariants ->
+      :data:`GATE_READ_CORRUPT`.
+
+    Journal entries WITHOUT any gate marker are unrelated and skipped; if none carry a marker,
+    the result is :data:`GATE_READ_NONE`.
     """
     for entry in reversed(list(entries)):
         notes = getattr(entry, "notes", None)
         if not note_has_gate_marker(notes):
             continue  # unrelated journal entry — skip, keep scanning older entries.
         # This is the NEWEST gate record. It decides the read; no fallback past it.
-        gate = parse_gate_from_note(notes)
-        if gate is not None:
-            return LatestGateRead(status=GATE_READ_GATE, gate=gate)
-        return LatestGateRead(status=GATE_READ_CORRUPT)
+        record = _gate_record_from_note(notes)
+        if record is None:
+            return LatestGateRead(status=GATE_READ_CORRUPT)
+        version = schema_version_of(record)
+        if version in OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS:
+            return LatestGateRead(status=GATE_READ_LEGACY)
+        if version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
+            return LatestGateRead(status=GATE_READ_CORRUPT)
+        try:
+            gate = OperatorStartupGate.from_record(record)
+        except OperatorStartupGateError:
+            return LatestGateRead(status=GATE_READ_CORRUPT)
+        return LatestGateRead(status=GATE_READ_GATE, gate=gate)
     return LatestGateRead(status=GATE_READ_NONE)
 
 
@@ -284,6 +339,19 @@ def execute_startup_resume(
                 "(malformed / schema-invalid); fail-closed, no fallback to an older gate"
             ),
         )
+    if read.status == GATE_READ_LEGACY:
+        # The NEWEST gate record is a readable legacy (v1/v2) schema: it predates the v3
+        # runtime_role / lane_revision contract, so resuming it would fabricate an exact-revision
+        # approval (Design Answer j#79405 §B). Fixed disposition — reserve/send 0. The operator
+        # re-approves a fresh v3 gate; this is not corrupt and is never promoted to current-v3.
+        return StartupResumeResult(
+            result=RESUME_LEGACY_REAPPROVAL_REQUIRED,
+            detail=(
+                f"latest durable operator startup gate for issue {issue} is a legacy (v1/v2) "
+                "record predating the v3 runtime_role/lane_revision contract; reserve/send 0, "
+                "operator re-approval of a fresh v3 gate required (no implicit backfill)"
+            ),
+        )
     if read.status != GATE_READ_GATE or read.gate is None:
         return StartupResumeResult(
             result=RESUME_NOT_RESUMABLE,
@@ -291,9 +359,12 @@ def execute_startup_resume(
         )
     gate = read.gate
 
-    # 2. Re-resolve the exact live target + read primitive at action time.
-    resolver = target_resolver if target_resolver is not None else _default_target_resolver
-    resolution = resolver(gate, environ)
+    # 2. Re-resolve the exact live target + read primitive at action time. The default resolver
+    #    binds to the EXPLICIT repo root (registry + provider-binding authority, j#79405 §A/§C).
+    if target_resolver is not None:
+        resolution = target_resolver(gate, environ)
+    else:
+        resolution = _default_target_resolver(gate, environ, repo_root)
     if resolution is None:
         # Live target could not be resolved: hand the orchestrator an unresolved observation
         # so it zero-sends (identity_unresolved -> resume_not_clear), never a blind send.
@@ -314,6 +385,24 @@ def execute_startup_resume(
             detail=(
                 f"durable gate-transition writer unavailable for issue {issue} "
                 "(write opt-in / trusted base URL / credential unset); reserve/send 0"
+            ),
+        )
+
+    # 3b. Execution-root safety — BEFORE the reserve (Design Answer j#79405 §C). The gate's
+    #     repo-relative execution_root must resolve to a `--workdir` at or under the freshly
+    #     resolved repo root; an escape / unresolvable root fails closed with reserve/send 0 so a
+    #     re-issue can never land outside the pinned execution root. (The send port derives the
+    #     identical workdir from the same pure helper; this pre-checks it before touching the fence.)
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_send import (
+        resolve_execution_workdir,
+    )
+
+    if resolve_execution_workdir(repo_root, gate.target.execution_root) is None:
+        return StartupResumeResult(
+            result=RESUME_EXECUTION_ROOT_UNSAFE,
+            detail=(
+                f"gate execution_root {gate.target.execution_root!r} does not safely resolve "
+                f"under the action-time repo root for issue {issue}; reserve/send 0"
             ),
         )
 
@@ -397,18 +486,20 @@ def _default_gate_source(repo_root: str, env: Mapping[str, str]) -> GateSource:
 
 
 def _default_target_resolver(
-    gate: OperatorStartupGate, env: Mapping[str, str]
+    gate: OperatorStartupGate, env: Mapping[str, str], repo_root: str
 ) -> Optional[ObservedTargetResolution]:
-    """Default action-time target resolver: lifecycle + pins + inventory + attestation.
+    """Default action-time target resolver: lifecycle + binding + pins + inventory + attestation.
 
-    Delegates to :class:`ResumeTargetResolver` (its live reads are injectable sub-seams).
-    Returns None on any drift / mismatch so the leg zero-sends — never a blind send.
+    Delegates to :class:`ResumeTargetResolver`, bound to the EXPLICIT ``repo_root`` so its
+    provider-binding and registry-workspace re-resolution read the target repo's authority (not
+    the anchor-less sender identity — j#79405 §A/§C). Its live reads are injectable sub-seams;
+    it returns None on any drift / mismatch so the leg zero-sends — never a blind send.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (
         ResumeTargetResolver,
     )
 
-    return ResumeTargetResolver(env=env).resolve(gate, env)
+    return ResumeTargetResolver(env=env, repo_root=repo_root).resolve(gate, env)
 
 
 def _default_send_factory(
@@ -442,8 +533,10 @@ def _default_gate_recorder(issue: object, env: Mapping[str, str]) -> GateRecorde
 
 __all__ = (
     "GATE_JOURNAL_MARKER",
+    "GATE_JOURNAL_MARKER_PREFIX",
     "GATE_READ_GATE",
     "GATE_READ_NONE",
+    "GATE_READ_LEGACY",
     "GATE_READ_CORRUPT",
     "LatestGateRead",
     "ObservedTargetResolution",

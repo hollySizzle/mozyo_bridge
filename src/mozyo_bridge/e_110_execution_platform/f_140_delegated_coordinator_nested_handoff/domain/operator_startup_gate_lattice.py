@@ -298,7 +298,8 @@ def operator_startup_gate_record_lines(gate: OperatorStartupGate) -> list[str]:
             f"  target: workspace={gate.target.workspace_id} "
             f"repo={gate.target.repo_identity_digest} "
             f"execution_root={gate.target.execution_root} lane={gate.target.lane_id} "
-            f"role={gate.target.target_role} name={gate.target.target_assigned_name} "
+            f"role={gate.target.target_role} runtime_role={gate.target.runtime_role} "
+            f"name={gate.target.target_assigned_name} "
             f"agent_generation={gate.target.agent_generation}"
         ),
         (
@@ -356,7 +357,8 @@ def operator_startup_resume_record_lines(gate: OperatorStartupGate) -> list[str]
             f"  target: workspace={gate.target.workspace_id} "
             f"repo={gate.target.repo_identity_digest} "
             f"execution_root={gate.target.execution_root} lane={gate.target.lane_id} "
-            f"role={gate.target.target_role} name={gate.target.target_assigned_name} "
+            f"role={gate.target.target_role} runtime_role={gate.target.runtime_role} "
+            f"name={gate.target.target_assigned_name} "
             f"agent_generation={gate.target.agent_generation}"
         ),
         (

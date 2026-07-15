@@ -30,8 +30,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FENCE_RESERVED,
     FENCE_UNCERTAIN,
     FORBIDDEN_ACTIONS,
+    OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS,
     OPERATOR_STARTUP_GATE_SCHEMA_VERSION,
     OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1,
+    schema_version_of,
     STATE_CONSUMED,
     STATE_OPERATOR_REPORTED_DONE,
     STATE_OWNER_APPROVED,
@@ -69,6 +71,7 @@ def _target(**overrides) -> GateTarget:
         target_role="implementation_worker",
         target_assigned_name="worker-a",
         provider_id="claude",
+        runtime_role="claude",
         agent_generation=3,
         lane_revision=1,
     )
@@ -433,7 +436,11 @@ class LatticeTransitionTests(unittest.TestCase):
             GateResume(dispatch_fence_state="teleported")
 
 
-class V1MigrationTests(unittest.TestCase):
+class LegacySchemaRejectionTests(unittest.TestCase):
+    """v3 ``from_record`` parses ONLY the current schema — a legacy v1/v2 record is NOT silently
+    upgraded (that would fabricate an exact-revision approval — review j#79405 §B). The read
+    layer version-dispatches on ``schema_version`` and routes legacy to reapproval."""
+
     def _required(self) -> OperatorStartupGate:
         return build_required_gate(
             gate_id="gate-1",
@@ -443,20 +450,34 @@ class V1MigrationTests(unittest.TestCase):
             classification=_classification(),
         )
 
-    def test_v1_required_record_still_reads_and_restamps_v2(self) -> None:
-        record = self._required().to_record()
-        record["schema_version"] = OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1
-        gate = OperatorStartupGate.from_record(record)
-        self.assertEqual(gate.state, STATE_REQUIRED)
+    def test_v3_current_record_round_trips(self) -> None:
+        gate = self._required()
         self.assertEqual(gate.schema_version, OPERATOR_STARTUP_GATE_SCHEMA_VERSION)
+        self.assertEqual(OperatorStartupGate.from_record(gate.to_record()), gate)
 
-    def test_v1_record_naming_transition_state_rejected(self) -> None:
-        # v1 only ever wrote `required`; a v1 record in any other state is malformed.
+    def test_v1_record_is_rejected_not_upgraded(self) -> None:
         record = self._required().to_record()
         record["schema_version"] = OPERATOR_STARTUP_GATE_SCHEMA_VERSION_V1
-        record["state"] = STATE_CONSUMED
         with self.assertRaises(OperatorStartupGateError):
             OperatorStartupGate.from_record(record)
+
+    def test_v2_record_is_rejected_not_upgraded(self) -> None:
+        record = self._required().to_record()
+        record["schema_version"] = 2
+        with self.assertRaises(OperatorStartupGateError):
+            OperatorStartupGate.from_record(record)
+
+    def test_schema_version_of_dispatches_legacy_and_current(self) -> None:
+        self.assertEqual(schema_version_of(self._required().to_record()), 3)
+        self.assertEqual(schema_version_of({"schema_version": 2}), 2)
+        self.assertEqual(schema_version_of({"schema_version": 1}), 1)
+        # bool is an int subclass but must NOT read as version 1.
+        self.assertIsNone(schema_version_of({"schema_version": True}))
+        self.assertIsNone(schema_version_of({}))
+        self.assertIsNone(schema_version_of("not a mapping"))
+        self.assertIn(1, OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS)
+        self.assertIn(2, OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS)
+        self.assertNotIn(3, OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS)
 
 
 class ResumeRecordLinesTests(unittest.TestCase):

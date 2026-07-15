@@ -108,6 +108,7 @@ def _target(**overrides) -> GateTarget:
         target_role="implementation_worker",
         target_assigned_name="worker-a",
         provider_id="claude",
+        runtime_role="claude",
         agent_generation=3,
         lane_revision=1,
     )
