@@ -31,8 +31,14 @@
 # code; declaring an unknown `protocol` here fails closed rather than mis-driving
 # the pane.
 
-version: "1"
-source: "Redmine #13441 journal #76725 (Coordinator Design Answer, Increment 1)"
+# schema version "2" adds the optional `startup_blockers` block (#13760). "1" (the
+# #13441 shape) still loads — the field is optional and backward-compatible — but an
+# unknown version fails closed (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review j#78481 F2).
+version: "2"
+source: >-
+  Redmine #13441 journal #76725 (Coordinator Design Answer, Increment 1);
+  startup_blockers added by #13760 journal #77947 (Design Answer) with the schema
+  hardened per #13760 journal #78481 (Review Result).
 
 profiles:
   claude:

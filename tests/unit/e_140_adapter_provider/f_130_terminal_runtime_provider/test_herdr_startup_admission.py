@@ -131,6 +131,95 @@ class StartupBlockerClassifierTest(unittest.TestCase):
         self.assertEqual(matched.blocker_id, "first")
 
 
+class StartupBlockerTypeInvariantTest(unittest.TestCase):
+    """Review j#78481 finding 1: the typed object enforces the FULL invariant itself.
+
+    Before the fix, element validation lived only in `from_record`, so a directly-built
+    `StartupBlocker` could hold a malformed `all_of` — and because `fold_startup_text(None)`
+    / `fold_startup_text("")` is `""` and `"" in folded` is always true, the AND silently
+    degraded to a single-signature match (the exact false positive the AND exists to stop).
+    """
+
+    def test_direct_construction_with_none_element_is_rejected(self) -> None:
+        with self.assertRaises(AgentProviderProfileError):
+            StartupBlocker("trust", ("one generic phrase", None))
+
+    def test_direct_construction_with_blank_element_is_rejected(self) -> None:
+        for blank in ("", "   ", "\t\n"):
+            with self.subTest(blank=repr(blank)):
+                with self.assertRaises(AgentProviderProfileError):
+                    StartupBlocker("trust", ("one generic phrase", blank))
+
+    def test_and_no_longer_degrades_to_a_single_signature(self) -> None:
+        # The regression itself: a malformed 2-tuple must not match a composer that only
+        # contains the first (real) signature. Since construction now raises, the object
+        # that would have false-positived cannot exist.
+        with self.assertRaises(AgentProviderProfileError):
+            StartupBlocker("trust", ("one generic phrase", None)).matches(
+                "ready composer with one generic phrase inside"
+            )
+
+    def test_direct_construction_rejects_near_empty_duplicate_and_long(self) -> None:
+        cases = [
+            ("blocker id", ("> ?", "a real phrase here")),  # near-empty folded
+            ("blocker id", ("same phrase here", "same phrase here")),  # duplicate
+            ("blocker id", ("a real phrase here", "x" * 200)),  # over length bound
+            ("blocker id", ("only one signature",)),  # below AND arity
+            ("blocker id", "a bare string is iterated per char"),  # not a tuple
+            ("", ("phrase one here", "phrase two here")),  # blank id
+            ("coordinator", ("phrase one here", "phrase two here")),  # forbidden token id
+        ]
+        for blocker_id, all_of in cases:
+            with self.subTest(all_of=all_of):
+                with self.assertRaises(AgentProviderProfileError):
+                    StartupBlocker(blocker_id, all_of)
+
+    def test_valid_direct_construction_still_works_and_and_holds(self) -> None:
+        blocker = StartupBlocker("trust", ("phrase one here", "phrase two here"))
+        self.assertTrue(blocker.matches("phrase one here and phrase two here"))
+        self.assertFalse(blocker.matches("phrase one here only"))
+
+
+class ConfigSchemaVersionTest(unittest.TestCase):
+    """Review j#78481 finding 2: an unknown schema version fails closed at load."""
+
+    def _config(self, version):
+        record = {
+            "version": version,
+            "source": "test",
+            "profiles": {
+                "p": {
+                    "protocol": "interactive_cli_tui",
+                    "executable": {"command": "p", "env_override": "P_BIN"},
+                }
+            },
+        }
+        return AgentProviderProfileConfig.from_record(record)
+
+    def test_supported_versions_load(self) -> None:
+        for version in ("1", "2"):
+            with self.subTest(version=version):
+                self.assertEqual(self._config(version).version, version)
+
+    def test_unknown_version_fails_closed(self) -> None:
+        with self.assertRaises(AgentProviderProfileError) as ctx:
+            self._config("999-unknown")
+        self.assertIn("unsupported schema version", str(ctx.exception))
+
+    def test_packaged_artifact_declares_a_supported_version(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (  # noqa: E501
+            SUPPORTED_SCHEMA_VERSIONS,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (  # noqa: E501
+            load_agent_provider_config,
+        )
+
+        config = load_agent_provider_config()
+        self.assertIn(config.version, SUPPORTED_SCHEMA_VERSIONS)
+        # The packaged artifact actually USES the v2 startup_blockers, so it must declare v2.
+        self.assertEqual(config.version, "2")
+
+
 class StartupBlockerSchemaTest(unittest.TestCase):
     def test_single_signature_blocker_is_rejected(self) -> None:
         # The AND arity is enforced at LOAD, not left to reviewer discipline: a

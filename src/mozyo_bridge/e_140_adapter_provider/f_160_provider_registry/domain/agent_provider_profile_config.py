@@ -192,152 +192,32 @@ _PROFILE_ENTRY_KEYS: frozenset[str] = frozenset(
     }
 )
 
-#: Keys a ``startup_blockers`` entry may carry (Redmine #13760). Closed like every
-#: other profile block: an unknown key is rejected, so a blocker can never grow a
-#: field a future reader might honor as an action ("accept", "keys", "answer") — the
-#: profile describes a screen, it never authorises a response to one.
-_STARTUP_BLOCKER_KEYS: frozenset[str] = frozenset({"id", "all_of"})
+# The startup-blocker schema (`StartupBlocker` / `fold_startup_text` / the bounds)
+# lives in its own leaf module (module-health) and is imported back here so every
+# existing importer of these names is unchanged (Redmine #13760 review j#78481).
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_startup_blocker import (  # noqa: E501
+    MAX_STARTUP_BLOCKERS,
+    MAX_STARTUP_SIGNATURES,
+    MAX_STARTUP_SIGNATURE_LEN,
+    MIN_STARTUP_SIGNATURES,
+    MIN_STARTUP_SIGNATURE_FOLDED_LEN,
+    StartupBlocker,
+    fold_startup_text,
+)
 
-#: How many startup blockers one provider may declare. A provider has a handful of
-#: pre-composer screens; a large list is a data mistake (or an attempt to make the
-#: pre-send classifier scan an unbounded corpus on every send), not a real contract.
-MAX_STARTUP_BLOCKERS = 8
-
-#: The AND-arity bounds of one blocker's ``all_of``. The lower bound is the
-#: false-positive guard j#77947 requires: a single generic phrase ("Yes", "continue")
-#: could appear in a perfectly ready composer, so a blocker must be pinned by at
-#: least two co-located signatures from the SAME screen. The upper bound keeps a
-#: blocker falsifiable — a long AND chain is one re-word away from silently never
-#: matching (a fail-OPEN drift, which is the failure this whole gate exists to stop).
-MIN_STARTUP_SIGNATURES = 2
-MAX_STARTUP_SIGNATURES = 6
-
-#: Length bounds on one signature, measured on the *folded* form (the classifier's
-#: match key). A too-short signature matches too much; a too-long one is brittle
-#: against re-wording and pane truncation.
-MIN_STARTUP_SIGNATURE_FOLDED_LEN = 6
-MAX_STARTUP_SIGNATURE_LEN = 160
-
-
-def fold_startup_text(text: object) -> str:
-    """The classifier's match key: lowercased, alphanumerics only (pure, never raises).
-
-    Everything that is not alphanumeric is dropped — whitespace, punctuation, and the
-    box-drawing / border glyphs a TUI dialog frames its lines with. A rendered pane
-    hard-wraps a long line to the pane width (even mid-token) and may reprint a border
-    glyph at the wrap, so a raw substring test against the on-screen text is fragile in
-    exactly the way that would make this gate fail OPEN. Folding both sides to
-    alphanumerics makes the wrap, the frame, and the punctuation vanish, so a signature
-    matches however the TUI folded the screen. Unicode-aware (:meth:`str.isalnum`), so a
-    non-Latin provider UI folds the same way.
-
-    This is the same "normalise away the rendering, then substring-match" posture as the
-    turn-start rail's :func:`~...f_130_terminal_runtime_provider.domain.turn_start_rail.composer_retains_body`,
-    widened from whitespace to all non-alphanumerics because a dialog — unlike a composer
-    body — is framed.
-    """
-    if not isinstance(text, str):
-        return ""
-    return "".join(ch for ch in text.lower() if ch.isalnum())
-
-
-@dataclass(frozen=True)
-class StartupBlocker:
-    """One provider startup screen that cannot accept a handoff body (Redmine #13760).
-
-    A blocker is matched when **every** signature in ``all_of`` appears in the folded
-    visible pane content (:func:`fold_startup_text`) — an AND, never an any-match, so a
-    single generic phrase cannot classify a ready composer as blocked (j#77947
-    correction 1). ``blocker_id`` is a fixed token: it is the ONLY thing about the
-    screen that is allowed to reach a structured outcome / journal — the pane's own text
-    is never carried out of the classifier (j#77947 invariant 3).
-
-    Purely mechanical description. A blocker names a screen; it does not say what to do
-    about it, and it carries no keys, no answer, and no authority to dismiss it. Clearing
-    a trust / login prompt stays an operator action in the provider's own UI.
-    """
-
-    blocker_id: str
-    all_of: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.blocker_id, str) or not self.blocker_id.strip():
-            raise AgentProviderProfileError(
-                "startup blocker 'id' must be a non-empty string"
-            )
-        count = len(self.all_of)
-        if count < MIN_STARTUP_SIGNATURES or count > MAX_STARTUP_SIGNATURES:
-            raise AgentProviderProfileError(
-                f"startup blocker {self.blocker_id!r} must declare between "
-                f"{MIN_STARTUP_SIGNATURES} and {MAX_STARTUP_SIGNATURES} 'all_of' "
-                f"signatures, got {count}: one generic phrase would false-positive a "
-                f"ready composer, so a blocker is pinned by co-located signatures from "
-                f"the same screen (Redmine #13760 j#77947)"
-            )
-
-    def matches(self, content: object) -> bool:
-        """True iff every signature appears in ``content`` (pure; never raises)."""
-        folded = fold_startup_text(content)
-        if not folded:
-            return False
-        return all(fold_startup_text(sig) in folded for sig in self.all_of)
-
-    @classmethod
-    def from_record(cls, record: object, *, provider_id: str) -> "StartupBlocker":
-        """Validate one ``startup_blockers`` entry, failing closed on any bad shape."""
-        if not isinstance(record, Mapping):
-            raise AgentProviderProfileError(
-                f"agent provider profile {provider_id!r} 'startup_blockers' entries must "
-                f"be mappings, got {type(record).__name__}"
-            )
-        unknown = set(record) - _STARTUP_BLOCKER_KEYS
-        if unknown:
-            raise AgentProviderProfileError(
-                f"unknown 'startup_blockers' key(s) {sorted(map(repr, unknown))} in agent "
-                f"provider profile {provider_id!r}; allowed: "
-                f"{sorted(_STARTUP_BLOCKER_KEYS)}. A blocker describes a screen; it never "
-                f"carries an action, a key sequence, or an authority to dismiss it."
-            )
-        missing = _STARTUP_BLOCKER_KEYS - set(record)
-        if missing:
-            raise AgentProviderProfileError(
-                f"agent provider profile {provider_id!r} startup blocker is missing "
-                f"{sorted(missing)}"
-            )
-        blocker_id = record["id"]
-        if not isinstance(blocker_id, str) or not blocker_id.strip():
-            raise AgentProviderProfileError(
-                f"agent provider profile {provider_id!r} startup blocker 'id' must be a "
-                f"non-empty string, got {blocker_id!r}"
-            )
-        _reject_forbidden_token(
-            blocker_id, field="startup_blockers.id", provider_id=provider_id
-        )
-        signatures = _string_tuple(
-            record["all_of"],
-            field=f"startup_blockers[{blocker_id}].all_of",
-            provider_id=provider_id,
-        )
-        for signature in signatures:
-            if len(signature) > MAX_STARTUP_SIGNATURE_LEN:
-                raise AgentProviderProfileError(
-                    f"agent provider profile {provider_id!r} startup blocker "
-                    f"{blocker_id!r} signature is {len(signature)} chars; the bound is "
-                    f"{MAX_STARTUP_SIGNATURE_LEN} (a long signature is one re-word away "
-                    f"from silently never matching — a fail-open drift)"
-                )
-            folded = fold_startup_text(signature)
-            if len(folded) < MIN_STARTUP_SIGNATURE_FOLDED_LEN:
-                raise AgentProviderProfileError(
-                    f"agent provider profile {provider_id!r} startup blocker "
-                    f"{blocker_id!r} signature {signature!r} folds to {len(folded)} "
-                    f"alphanumeric char(s); at least {MIN_STARTUP_SIGNATURE_FOLDED_LEN} "
-                    f"are required so a punctuation-only / near-empty signature cannot "
-                    f"match every screen"
-                )
-        return cls(blocker_id=blocker_id, all_of=signatures)
 
 _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
+
+#: The agent-provider-profile schema versions this code understands (Redmine #13760
+#: review j#78481 finding 2). ``"1"`` is the #13441 shape (executable / protocol /
+#: discovery / capabilities / managed_flags); ``"2"`` adds the #13760 optional
+#: ``startup_blockers``. Both are still readable because ``startup_blockers`` is optional
+#: and backward-compatible, but an UNKNOWN version fails closed at load — a schema this
+#: code does not understand must never be run on a partially-understood provider contract
+#: (the design gate j#77947 Q1 required version to be fail-closed validated, not merely
+#: non-empty). Adding a version here is the deliberate, reviewable act of teaching the
+#: loader a new shape.
+SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2"})
 
 #: Wheel-packaged resource (a sibling of the registry module) shipping the built-in
 #: profiles. Read via ``importlib.resources`` in :mod:`.agent_provider_profile` — a
@@ -909,6 +789,18 @@ class AgentProviderProfileConfig:
             raise AgentProviderProfileError(
                 "agent provider profile config 'version' must be a non-empty string"
             )
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
+            # Redmine #13760 review j#78481 finding 2: fail closed on a version this code
+            # does not understand rather than loading it on a hopeful best-effort. A newer
+            # artifact may carry a shape (or a semantic) this loader would silently
+            # misread; refusing is the same fail-closed posture the rest of the schema
+            # takes on an unknown key.
+            raise AgentProviderProfileError(
+                f"agent provider profile config declares unsupported schema version "
+                f"{version!r}; this build understands {sorted(SUPPORTED_SCHEMA_VERSIONS)}. "
+                f"A version bump is a deliberate schema change — teach the loader the new "
+                f"shape (SUPPORTED_SCHEMA_VERSIONS) before shipping an artifact that uses it."
+            )
         source = record.get("source")
         if not isinstance(source, str) or not source.strip():
             raise AgentProviderProfileError(
@@ -946,6 +838,7 @@ __all__ = (
     "MAX_STARTUP_SIGNATURE_LEN",
     "MIN_STARTUP_SIGNATURES",
     "MIN_STARTUP_SIGNATURE_FOLDED_LEN",
+    "SUPPORTED_SCHEMA_VERSIONS",
     "RECEIVER_AGNOSTIC_PROCESSES",
     "RESERVED_IDENTITY_TOKENS",
     "AgentCapability",
