@@ -256,6 +256,31 @@ class ReconcileStateStore:
         finally:
             conn.close()
 
+    def touch_runtime(
+        self, key: ReconcileStateKey, runtime: str, *, now: Optional[str] = None
+    ) -> bool:
+        """Record the last-observed runtime for a lane WITHOUT a revision bump (best-effort).
+
+        The observed runtime (busy / turn_ended / ...) is an observation cache used only for
+        the next cycle's busy->turn_ended edge detection (Redmine #13758 review R3-F1), NOT
+        authority — so it updates in place and never bumps ``revision`` (a stale CAS caller is
+        unaffected). Returns whether a row was updated (``False`` when the row is absent). A
+        read/write failure is swallowed (the edge simply fails closed to no-edge next cycle).
+        """
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                f"UPDATE {_TABLE} SET last_observed_runtime = ?, updated_at = ? "
+                "WHERE workspace_id = ? AND lane_id = ? AND dispatch_anchor = ?",
+                (norm(runtime), stamp, *key.as_row()),
+            )
+            return cur.rowcount > 0
+        except sqlite3.DatabaseError:
+            return False
+        finally:
+            conn.close()
+
     def advance(
         self,
         key: ReconcileStateKey,

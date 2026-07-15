@@ -47,9 +47,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     facts_from_lifecycle_record,
     reconcile_facts_from_record,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_delivery_route import (
-    provider_for_role,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
     ANOMALY_NONE,
     ANOMALY_STAGED_NOT_SUBMITTED,
@@ -683,21 +680,20 @@ def _reconcile_more_relevant(candidate, incumbent) -> bool:
     return str(getattr(candidate, "updated_at", "")) > str(getattr(incumbent, "updated_at", ""))
 
 
-#: Role tokens for the authority projection (mirrors lane_lifecycle #13810 binding kinds).
-_ROLE_PROJECT_GATEWAY = "project_gateway"
-_ROLE_IMPLEMENTATION_WORKER = "implementation_worker"
-
-
 def authority_execution_index() -> dict:
     """``{issue_id: (AuthorityFacts, ExecutionSurfaceFacts)}`` from the lane lifecycle. (fail-open)
 
-    The NON-LIVE authority / execution-surface producer (Redmine #13758 review R2-F4): reads
-    the active lifecycle records (the non-creating readonly read) and projects each onto the
-    authority + execution-surface facts (active role from ``binding_kind``, the resolved
-    provider, the authority anchor / generation, the managed-sublane surface + verified
-    identity + revision + capacity). A store read failure degrades to an empty index (every
-    lane's group stays the fail-closed unknown facts). The live-pane dispatch states connect at
-    #13492 (see :func:`...glance_authority_projection.facts_from_lifecycle_record`).
+    The NON-LIVE authority / execution-surface producer (Redmine #13758 review R2-F4 / R3-F3):
+    reads the active lifecycle records (the non-creating readonly read) and projects each onto
+    the DURABLE authority + execution-surface provenance (authority anchor / generation, the
+    managed-sublane surface + verified identity + revision) — the live-actor facts stay
+    fail-closed (see :func:`...glance_authority_projection.facts_from_lifecycle_record`).
+
+    Workspace-scoped join safety (review R3-F3): an issue that maps to MORE THAN ONE active
+    lifecycle record — an original/recovery pair, or the same issue number in two workspaces —
+    is **ambiguous** and gets NO projection (fail-closed unknown), so a cross-workspace /
+    cross-lane record is never silently joined onto the wrong lane. A store read failure
+    degrades to an empty index (every lane's group stays the fail-closed unknown facts).
     """
     try:
         from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
@@ -705,22 +701,19 @@ def authority_execution_index() -> dict:
         records = load_lane_lifecycle_readonly()
     except Exception:  # noqa: BLE001 - a lifecycle read never raises out of the glance
         return {}
-    out: dict = {}
+    by_issue: dict = {}
     for rec in records or ():
         issue = str(getattr(rec, "issue_id", "") or "").strip()
         if not issue:
             continue
         if str(getattr(rec, "lane_disposition", "") or "").strip() != _DISPOSITION_ACTIVE:
             continue
-        binding_kind = str(getattr(rec, "binding_kind", "") or "").strip()
-        active_role = (
-            _ROLE_PROJECT_GATEWAY
-            if binding_kind == _ROLE_PROJECT_GATEWAY
-            else _ROLE_IMPLEMENTATION_WORKER
-        )
-        out[issue] = facts_from_lifecycle_record(
-            rec, active_provider=provider_for_role(active_role)
-        )
+        by_issue.setdefault(issue, []).append(rec)
+    out: dict = {}
+    for issue, recs in by_issue.items():
+        if len(recs) != 1:
+            continue  # ambiguous (original/recovery or cross-workspace) -> fail-closed unknown
+        out[issue] = facts_from_lifecycle_record(recs[0])
     return out
 
 

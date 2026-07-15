@@ -160,7 +160,7 @@ class WorkspaceCallbackSupervisor:
         lease_ttl_seconds: int = SUPERVISOR_LEASE_TTL_SECONDS,
         release_after: bool = True,
         callback_route: str = DEFAULT_CALLBACK_ROUTE,
-        reconcile_leg_fn: Optional[Callable[[str, str, object, bool], object]] = None,
+        reconcile_leg_fn: Optional[Callable[[str, str, object], object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -272,11 +272,6 @@ class WorkspaceCallbackSupervisor:
                     skipped_reason=SKIP_ROSTER_UNREADABLE,
                 )
             selection = select_supervised_issues(roster, mode=mode, wake_issues=wake_issues)
-            # The turn-end edge signal for the reconcile leg (Redmine #13758 R2-F1): an issue
-            # named by a local wake is a genuine edge; a bounded-reconciliation periodic re-read
-            # (an issue swept only because it is on the roster) is NOT an edge, so its reconcile
-            # cycle must not advance the self-heal counter.
-            wake_set = {str(i).strip() for i in wake_issues if str(i).strip()}
             if not selection.supervised:
                 return WorkspaceSupervisionOutcome(
                     workspace_id=wsid,
@@ -302,9 +297,7 @@ class WorkspaceCallbackSupervisor:
                 ):
                     lease_lost = True
                     break
-                issue_outcome = self._supervise_issue(
-                    wsid, issue, source, sender, binding, is_edge=issue in wake_set
-                )
+                issue_outcome = self._supervise_issue(wsid, issue, source, sender, binding)
                 issue_outcomes.append(issue_outcome)
                 if issue_outcome.error == ISSUE_LEASE_LOST:
                     # The send-boundary fence tripped mid-issue (a takeover during this issue's
@@ -337,7 +330,6 @@ class WorkspaceCallbackSupervisor:
         source: Optional[RedmineJournalSource],
         sender: Callable[[CallbackOutboxRow], str],
         binding: object,
-        is_edge: bool = False,
     ) -> IssueSupervisionOutcome:
         """Supply durable events + drain the callback outbox for one issue (fail-open per issue).
 
@@ -421,7 +413,7 @@ class WorkspaceCallbackSupervisor:
         # are observable via `workflow glance`. Disabled when no leg was wired.
         if self._reconcile_leg_fn is not None:
             try:
-                self._reconcile_leg_fn(workspace_id, issue, source, is_edge)
+                self._reconcile_leg_fn(workspace_id, issue, source)
             except Exception:  # noqa: BLE001 - a reconcile failure never breaks the sweep
                 pass
 
@@ -912,24 +904,38 @@ def build_supervisor(
             workspace_id, issue, binding, lifecycle_store=lifecycle_store
         )
 
-    def _lane_facts(workspace_id: str, issue: str) -> "tuple[str, int, str]":
-        """Resolve ``(lane_id, live_generation, lifecycle_disposition)`` for the reconcile leg.
+    def _lane_facts(
+        workspace_id: str, issue: str
+    ) -> "tuple[str, int, str, str, str]":
+        """Resolve ``(lane_id, generation, disposition, dispatch_anchor, runtime_state)``.
 
         The owning-lane authority (#13681/#13689) resolves the active lane; the lifecycle row's
-        ``lane_generation`` (#13810 incarnation) is the reconcile generation, and its
-        ``lane_disposition`` gates a terminal (hibernated / retired / superseded) close. An
-        unresolved / unreadable owner is a fail-closed blank lane (the leg then skips).
+        ``lane_generation`` (#13810 incarnation) is the reconcile generation, its
+        ``lane_disposition`` gates a terminal close, and its ``decision_journal`` is the exact
+        durable dispatch anchor (the initial-await baseline — review R3-F2). An unresolved /
+        unreadable owner is a fail-closed blank lane (the leg then skips).
+
+        ``runtime_state`` is the lane worker's live runtime (``busy`` / ``turn_ended`` / ...)
+        from which the leg derives the genuine ``busy -> turn_ended`` edge (review R3-F1). The
+        LIVE per-lane worker runtime read is the installed-artifact surface (#13492), so this
+        production wiring returns ``""`` (fail-closed: no edge without a real runtime
+        observation — never a fabricated wake-derived edge); the edge-detection logic +
+        persistence are wired and test-pinned with an injected runtime.
         """
         wsid, issue_s = str(workspace_id).strip(), str(issue).strip()
         owner = lifecycle_store.resolve_owner(wsid, issue_s)
         if not getattr(owner, "resolved", False):
-            return "", 0, ""
+            return "", 0, "", "", ""
         lane_id = str(getattr(owner, "lane_id", "") or "").strip()
         record = lifecycle_store.get(LaneLifecycleKey(wsid, lane_id))
         if record is None:
-            return lane_id, 0, ""
+            return lane_id, 0, "", "", ""
         generation = _int_field(record, "lane_generation")
-        return lane_id, generation, str(getattr(record, "lane_disposition", "") or "").strip()
+        disposition = str(getattr(record, "lane_disposition", "") or "").strip()
+        dispatch_anchor = str(getattr(record, "decision_journal", "") or "").strip()
+        # The live per-lane worker runtime feed is #13492 (see docstring): fail-closed no-edge.
+        runtime_state = ""
+        return lane_id, generation, disposition, dispatch_anchor, runtime_state
 
     reconcile_leg_fn = build_reconcile_leg_fn(
         reconcile_store=reconcile_store,

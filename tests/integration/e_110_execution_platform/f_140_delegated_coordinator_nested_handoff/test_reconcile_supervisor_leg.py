@@ -45,7 +45,17 @@ class ReconcileLegHarness(unittest.TestCase):
         self.store = ReconcileStateStore(path=self.tmp / "state.sqlite")
         self.outbox = CallbackOutbox(path=self.tmp / "workflow-runtime.sqlite")
 
-    def _leg(self, markers, *, live_generation=1, disposition="active", is_edge=True):
+    def _leg(
+        self,
+        markers,
+        *,
+        live_generation=1,
+        disposition="active",
+        runtime_state="turn_ended",
+        dispatch_anchor="79337",
+    ):
+        # runtime_state defaults to a genuine busy->turn_ended edge (a fresh record's prior
+        # runtime is blank), so a single leg call fires the self-heal (review R3-F1).
         return reconcile_leg_once(
             issue="13758",
             workspace_id="ws1",
@@ -55,7 +65,8 @@ class ReconcileLegHarness(unittest.TestCase):
             lifecycle_disposition=disposition,
             outbox=self.outbox,
             reconcile_store=self.store,
-            is_edge=is_edge,
+            runtime_state=runtime_state,
+            dispatch_anchor=dispatch_anchor,
         )
 
     def _rows(self):
@@ -76,8 +87,11 @@ class SelfHealFlow(ReconcileLegHarness):
         # review R2-F2: the delivery target_receiver is the worker PROVIDER (claude), a
         # resolver-matchable identity, not the raw role token.
         self.assertEqual(rows[0].target_receiver, "claude")
-        # review R2-F3: the record is anchored on issue + generation + dispatch baseline + gate.
-        key = ReconcileStateKey("ws1", "lane-a", "13758:g1:from0:await:implementation_done")
+        # review R3-F2: the initial-await record is anchored on issue + generation + the exact
+        # dispatch anchor (the lifecycle decision journal 79337), not a generic from0.
+        key = ReconcileStateKey(
+            "ws1", "lane-a", "13758:g1:from79337:await:implementation_done"
+        )
         self.assertIsNotNone(self.store.get(key))
 
     def test_review_request_position_self_heals_to_gateway(self):
@@ -85,11 +99,19 @@ class SelfHealFlow(ReconcileLegHarness):
         self.assertEqual(rep["action"], "self_heal")
         self.assertEqual(rep["route"], "implementation_gateway")
 
-    def test_non_edge_sweep_does_not_self_heal(self):
-        # review R2-F1: a bounded-reconciliation sweep (is_edge=False) does not self-heal.
-        rep = self._leg(markers=[], is_edge=False)
+    def test_non_edge_runtime_does_not_self_heal(self):
+        # review R3-F1: a non-turn-ended runtime (busy, no edge) does not self-heal.
+        rep = self._leg(markers=[], runtime_state="busy")
         self.assertEqual(rep["action"], "none")
         self.assertEqual(len(self._rows()), 0)
+
+    def test_persistent_turn_ended_is_not_a_repeated_edge(self):
+        # review R3-F1: a persistent turn_ended re-observed is one edge, not repeated ones.
+        self._leg(markers=[], runtime_state="turn_ended")  # edge -> self_heal 1
+        rep = self._leg(markers=[], runtime_state="turn_ended")  # persistent -> no new edge
+        self.assertEqual(rep["action"], "none")
+        rows = [r for r in self._rows() if r.normalized_gate == "self_heal_attempt_1"]
+        self.assertEqual(len(rows), 1)  # not double-sent
 
     def test_correction_loop_same_gate_new_round_is_a_distinct_record(self):
         # review R2-F3: changes_requested -> correction re-awaits implementation_done in a NEW
@@ -169,13 +191,10 @@ class SupervisorWiringTest(unittest.TestCase):
             roster_fn=lambda ws: (("13758",), ""),
             redmine_source_fn=lambda ws: None,
             sender_fn=lambda ws: (lambda row: "delivered"),
-            reconcile_leg_fn=lambda wsid, issue, source, is_edge: calls.append(
-                (wsid, issue, is_edge)
-            ),
+            reconcile_leg_fn=lambda wsid, issue, source: calls.append((wsid, issue)),
         )
-        # A local wake for the issue -> is_edge=True is threaded to the leg.
-        supervisor.run_once(mode="local_wake", wake_hints=[("ws1", "13758")])
-        self.assertIn(("ws1", "13758", True), calls)
+        supervisor.run_once()
+        self.assertIn(("ws1", "13758"), calls)
 
 
 if __name__ == "__main__":

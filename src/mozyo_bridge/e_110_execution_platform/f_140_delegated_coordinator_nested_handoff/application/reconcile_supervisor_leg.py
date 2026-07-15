@@ -55,6 +55,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ROUTE_RESOLVED,
     ReconcileObservation,
     ReconcileDecision,
+    is_turn_end_edge,
 )
 
 #: Lifecycle dispositions that terminally close a reconcile (no callback owed — §5 end).
@@ -111,14 +112,19 @@ def _self_heal_gate_for_phase(phase: str) -> str:
     return ""
 
 
-def _second_latest_journal(markers: Iterable[object], below: int) -> str:
-    """The highest gate journal strictly below ``below`` (the dispatch position before it)."""
+def _second_latest_journal(markers: Iterable[object], below: int, *, fallback: str = "0") -> str:
+    """The highest gate journal strictly below ``below`` (the dispatch position before it).
+
+    When there is no earlier gate (the latest is the FIRST gate), returns ``fallback`` — the
+    exact dispatch anchor — so the landed-await anchor matches the initial self-heal anchor,
+    which also baselined on the dispatch anchor (review R3-F2).
+    """
     best = -1
     for m in markers or ():
         j = _int(getattr(m, "journal", ""), default=-1)
         if best < j < below:
             best = j
-    return str(best) if best >= 0 else "0"
+    return str(best) if best >= 0 else str(fallback or "0")
 
 
 def _anchor(issue: str, generation: int, baseline_journal: str, gate: str) -> str:
@@ -144,7 +150,8 @@ def reconcile_leg_once(
     lifecycle_disposition: str,
     outbox: CallbackOutbox,
     reconcile_store: ReconcileStateStore,
-    is_edge: bool = False,
+    runtime_state: str = "",
+    dispatch_anchor: str = "",
     redmine_readable: bool = True,
     deadline: str = "",
     now: Optional[str] = None,
@@ -154,13 +161,17 @@ def reconcile_leg_once(
 
     Derives the awaited ``(expected_gate, expected_next_owner)`` from the lane's latest gate
     position (:func:`...reconcile_gate_chain.expected_next`); a position not attributable to a
-    same-lane owner (approved review awaiting owner close, blocked, etc.) yields ``None`` — no
-    reconcile (acceptance §6, fail-safe). Otherwise builds the fail-closed observation
-    (generation correlation, gate-advance detection vs the persisted baseline, the outbox
-    deliver / self-heal state, the lifecycle disposition, the deadline, the turn-end edge) and
-    runs :func:`reconcile_once`. ``is_edge`` is True only for a genuine turn-ended wake (a local
-    wake for this issue); a bounded-reconciliation sweep passes ``False`` so the self-heal
-    counter never grows without an edge (review R2-F1).
+    same-lane owner yields ``None`` — no reconcile (acceptance §6, fail-safe). Otherwise builds
+    the fail-closed observation and runs :func:`reconcile_once`, then persists the observed
+    runtime for the next cycle's edge detection.
+
+    ``runtime_state`` is the lane worker's CURRENT observed runtime (``busy`` / ``turn_ended`` /
+    ...) from the live inventory; the genuine ``busy -> turn_ended`` edge is derived by
+    comparing it to the record's persisted ``last_observed_runtime`` (review R3-F1: a local
+    wake is NOT a turn edge — the wake carries no runtime transition). A blank / unobservable
+    runtime yields no edge (fail-closed: no self-heal without a real turn end). ``dispatch_anchor``
+    is the exact durable dispatch identity (the lifecycle decision journal) used as the initial
+    await baseline so the freshly-dispatched anchor is not a generic ``from0`` (review R3-F2).
     """
     wsid, laneid, issue_s = (
         str(workspace_id).strip(),
@@ -168,6 +179,7 @@ def reconcile_leg_once(
         str(issue).strip(),
     )
     generation = int(live_generation) if live_generation > 0 else 0
+    dispatch = str(dispatch_anchor or "").strip() or "0"
     latest = _latest_gate_marker(markers)
     latest_gate = str(getattr(latest, "gate", "")).strip() if latest is not None else ""
     latest_journal = _int(getattr(latest, "journal", ""), default=0) if latest is not None else 0
@@ -180,9 +192,10 @@ def reconcile_leg_once(
     #     reconcile record — anchored on the gate BEFORE it (its dispatch baseline) — that await's
     #     gate has landed, so reconcile THAT record to deliver the coordinator callback and close,
     #     before opening the next await (the leg's deliver branch is reachable — F1 — keyed
-    #     byte-identically to discovery — F3).
+    #     byte-identically to discovery — F3). The gate BEFORE the latest is the second-latest
+    #     gate journal, or the exact dispatch anchor when the latest gate is the first one.
     if latest_gate:
-        landed_baseline = _second_latest_journal(markers, latest_journal)
+        landed_baseline = _second_latest_journal(markers, latest_journal, fallback=dispatch)
         landed_anchor = _anchor(issue_s, generation, landed_baseline, latest_gate)
         landed_key = ReconcileStateKey(wsid, laneid, landed_anchor)
         landed_record = reconcile_store.get(landed_key)
@@ -197,7 +210,7 @@ def reconcile_leg_once(
                 markers=markers,
                 live_generation=generation,
                 terminal=terminal,
-                is_edge=bool(is_edge),
+                runtime_state=runtime_state,
                 outbox=outbox,
                 reconcile_store=reconcile_store,
                 redmine_readable=bool(redmine_readable),
@@ -206,12 +219,14 @@ def reconcile_leg_once(
                 now_epoch=now_epoch,
             )
 
-    # (2) Otherwise open / continue the next await (the self-heal ladder).
+    # (2) Otherwise open / continue the next await (the self-heal ladder). The initial await
+    #     (no gate produced yet) baselines on the exact dispatch anchor (the lifecycle decision
+    #     journal), NOT a generic ``0`` — so a re-dispatch is a distinct record (review R3-F2).
     exp = expected_next(latest_gate, review_conclusion=conclusion)
     if exp is None:
         return None  # no same-lane-owed next gate -> nothing to reconcile
     expected_gate, expected_owner = exp
-    baseline_journal = str(latest_journal) if latest_journal > 0 else "0"
+    baseline_journal = str(latest_journal) if latest_journal > 0 else dispatch
     return _run_cycle(
         key=ReconcileStateKey(
             wsid, laneid, _anchor(issue_s, generation, baseline_journal, expected_gate)
@@ -224,7 +239,7 @@ def reconcile_leg_once(
         markers=markers,
         live_generation=generation,
         terminal=terminal,
-        is_edge=bool(is_edge),
+        runtime_state=runtime_state,
         outbox=outbox,
         reconcile_store=reconcile_store,
         redmine_readable=bool(redmine_readable),
@@ -245,7 +260,7 @@ def _run_cycle(
     markers: Iterable[object],
     live_generation: int,
     terminal: bool,
-    is_edge: bool,
+    runtime_state: str,
     outbox: CallbackOutbox,
     reconcile_store: ReconcileStateStore,
     redmine_readable: bool,
@@ -253,7 +268,15 @@ def _run_cycle(
     now: Optional[str],
     now_epoch: Optional[float],
 ) -> Optional[dict]:
-    """Build the observation for one anchored await and run :func:`reconcile_once`."""
+    """Build the observation for one anchored await and run :func:`reconcile_once`.
+
+    The turn-end edge is derived from the observed runtime vs the record's persisted
+    ``last_observed_runtime`` (review R3-F1). After the cycle, the observed runtime is persisted
+    (without a revision bump) so the NEXT cycle can detect a fresh busy->turn_ended transition —
+    including a busy->turn_ended after a prior turn_ended (a genuine new turn), which a
+    stored-only-on-advance model would miss.
+    """
+    observed_runtime = str(runtime_state or "").strip()
     cycle = ReconcileCycleInput(
         key=key,
         issue_id=issue,
@@ -298,6 +321,10 @@ def _run_cycle(
             heal_key = outbox_key_for(c, heal_decision)
             prior_uncertain = outbox.state_of(heal_key) == CALLBACK_UNCERTAIN
         deadline_exceeded = _deadline_exceeded(record.deadline, now_epoch)
+        # The genuine busy->turn_ended edge: the record's last-observed runtime was not
+        # turn_ended and the current observation is (review R3-F1). A blank observed runtime is
+        # not turn_ended -> no edge (fail-closed: no self-heal without a real turn end).
+        edge = is_turn_end_edge(record.last_observed_runtime, observed_runtime)
         return ReconcileObservation(
             redmine_readable=bool(redmine_readable),
             generation_status=_gen_status(record, int(live_generation)),
@@ -311,12 +338,18 @@ def _run_cycle(
             prior_send_uncertain=prior_uncertain,
             route_status=ROUTE_RESOLVED,
             expected_next_owner=expected_owner,
-            is_edge=bool(is_edge),
+            is_edge=edge,
         )
 
-    return _reconcile_once(
+    report = _reconcile_once(
         cycle, observe=observe, outbox=outbox, store=reconcile_store, now=now
     )
+    # Persist the observed runtime for the next cycle's edge detection (best-effort, no
+    # revision bump) — always, even on a non-edge no-op, so a later busy->turn_ended after a
+    # prior turn_ended is detected (review R3-F1).
+    if observed_runtime:
+        reconcile_store.touch_runtime(key, observed_runtime, now=now)
+    return report
 
 
 def _deadline_exceeded(deadline: str, now_epoch: Optional[float]) -> bool:
@@ -342,20 +375,21 @@ def build_reconcile_leg_fn(
 ) -> Callable[[str, str, object], Optional[dict]]:
     """Build the supervisor's ``reconcile_leg_fn`` closure.
 
-    ``lane_facts_fn(workspace_id, issue) -> (lane_id, live_generation, lifecycle_disposition)``
-    resolves the lane identity + generation + disposition from the lifecycle authority;
-    ``markers_fn(source, issue)`` reads the issue's structured gate markers (the ``workflow
-    watch`` intake). Returns a callable the supervisor invokes per issue **after** the callback
-    drain: ``reconcile_leg_fn(workspace_id, issue, source) -> report | None``. Any resolution /
-    read failure returns ``None`` (fail-open per issue — the reconcile is a bounded add-on and
-    never aborts the supervisor sweep).
+    ``lane_facts_fn(workspace_id, issue) -> (lane_id, live_generation, lifecycle_disposition,
+    dispatch_anchor, runtime_state)`` resolves the lane identity + generation + disposition +
+    the exact durable dispatch anchor (review R3-F2) + the live worker runtime (review R3-F1)
+    from the lifecycle authority + live inventory; ``markers_fn(source, issue)`` reads the
+    issue's structured gate markers (the ``workflow watch`` intake). Returns a callable the
+    supervisor invokes per issue **after** the callback drain:
+    ``reconcile_leg_fn(workspace_id, issue, source) -> report | None``. Any resolution / read
+    failure returns ``None`` (fail-open per issue — the reconcile is a bounded add-on and never
+    aborts the supervisor sweep).
     """
 
-    def _leg(
-        workspace_id: str, issue: str, source: object, is_edge: bool = False
-    ) -> Optional[dict]:
+    def _leg(workspace_id: str, issue: str, source: object) -> Optional[dict]:
         try:
-            lane_id, live_generation, disposition = lane_facts_fn(workspace_id, issue)
+            facts = lane_facts_fn(workspace_id, issue)
+            lane_id, live_generation, disposition, dispatch_anchor, runtime_state = facts
         except Exception:  # noqa: BLE001 - an unresolved lane is a fail-open skip (no reconcile)
             return None
         if not str(lane_id or "").strip():
@@ -377,7 +411,8 @@ def build_reconcile_leg_fn(
                 lifecycle_disposition=disposition,
                 outbox=outbox,
                 reconcile_store=reconcile_store,
-                is_edge=bool(is_edge),
+                runtime_state=str(runtime_state or ""),
+                dispatch_anchor=str(dispatch_anchor or ""),
                 redmine_readable=readable,
             )
         except Exception:  # noqa: BLE001 - a reconcile failure never breaks the supervisor sweep

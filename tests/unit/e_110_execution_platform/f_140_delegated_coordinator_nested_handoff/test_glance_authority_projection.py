@@ -185,35 +185,37 @@ class FactsFromLifecycleTest(unittest.TestCase):
         self.assertEqual(authority.active_provider, "unknown")
         self.assertEqual(execution.execution_surface, "unknown")
 
-    def test_issue_lane_projects_worker_authority_and_managed_sublane(self):
-        authority, execution = facts_from_lifecycle_record(
-            _FakeLifecycleRecord(), active_provider="claude"
-        )
-        self.assertEqual(authority.active_execution_role, "implementation_worker")
-        self.assertEqual(authority.active_provider, "claude")
+    def test_projects_durable_provenance_only_never_active_actor_facts(self):
+        # review R3-F3: the lifecycle record projects DURABLE provenance; the live-actor facts
+        # (role / provider / count / capacity) are NEVER promoted from ownership metadata.
+        authority, execution = facts_from_lifecycle_record(_FakeLifecycleRecord())
+        # durable provenance:
         self.assertEqual(authority.authority_anchor, "13758:79337")
         self.assertEqual(authority.authority_generation, "2")
-        self.assertEqual(authority.concurrent_actor_count, 1)
         self.assertEqual(execution.execution_surface, EXECUTION_SURFACE_MANAGED_SUBLANE)
         self.assertTrue(execution.managed_lane_identity_verified)  # worktree + slots present
         self.assertEqual(execution.lane_lifecycle_revision, "5")
-        self.assertTrue(execution.productive_capacity_eligible)
-        # live-only fields stay fail-closed (deferred to #13492).
+        # live-actor facts stay fail-closed (never fabricated from binding_kind ownership):
+        self.assertEqual(authority.active_execution_role, "unknown")
+        self.assertEqual(authority.active_provider, "unknown")
+        self.assertEqual(authority.concurrent_actor_count, 0)
+        self.assertFalse(execution.productive_capacity_eligible)  # needs live dispatch state
         self.assertEqual(execution.gateway_dispatch_state, DISPATCH_STATE_UNKNOWN)
         self.assertEqual(authority.superseded_authority_generation, "")
 
-    def test_incomplete_binding_is_unverified_and_not_capacity_eligible(self):
+    def test_incomplete_binding_is_unverified(self):
         _, execution = facts_from_lifecycle_record(
             _FakeLifecycleRecord(declared_slots="")  # pins-only gap -> not verified
         )
         self.assertFalse(execution.managed_lane_identity_verified)
         self.assertFalse(execution.productive_capacity_eligible)
 
-    def test_project_gateway_lane_projects_gateway_role(self):
+    def test_project_gateway_binding_does_not_fabricate_a_gateway_actor(self):
+        # binding_kind is ownership, not the active actor -> active role stays unknown.
         authority, _ = facts_from_lifecycle_record(
             _FakeLifecycleRecord(binding_kind="project_gateway")
         )
-        self.assertEqual(authority.active_execution_role, "project_gateway")
+        self.assertEqual(authority.active_execution_role, "unknown")
 
 
 class FoldJoinTest(unittest.TestCase):

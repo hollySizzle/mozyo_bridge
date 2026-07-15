@@ -194,6 +194,18 @@ class AdvanceCasTest(unittest.TestCase):
                 KEY, expected_revision=True, next_phase="closed", next_failure_count=0
             )
 
+    def test_touch_runtime_updates_without_revision_bump(self):
+        # review R3-F1: the observed runtime is a cache for edge detection, not authority.
+        before = self.store.get(KEY).revision
+        self.assertTrue(self.store.touch_runtime(KEY, "turn_ended"))
+        rec = self.store.get(KEY)
+        self.assertEqual(rec.last_observed_runtime, "turn_ended")
+        self.assertEqual(rec.revision, before)  # no revision bump
+
+    def test_touch_runtime_missing_row_is_false(self):
+        other = ReconcileStateKey(workspace_id="ws1", lane_id="none", dispatch_anchor="x")
+        self.assertFalse(self.store.touch_runtime(other, "busy"))
+
 
 class _TmpDir:
     """A tiny ``enterContext``-compatible temp dir (no external deps)."""
