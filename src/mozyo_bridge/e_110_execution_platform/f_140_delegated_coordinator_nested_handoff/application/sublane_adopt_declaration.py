@@ -448,13 +448,15 @@ def complete_owner_bound_or(
     """``already_owned`` only when ``lane`` owns ``issue`` with a COMPLETE, EXACT binding.
 
     The completeness-aware owner resolution for a gate failure / CAS refusal on a readable
-    inventory (review j#78975 F1). Unlike :func:`owner_bound_or`, owning the issue is not
-    enough: the state DB owner row must ALSO carry a non-empty ``worktree_identity`` equal to
-    the exact token this adopt resolved. That is what distinguishes a lane genuinely already
-    established as THIS exact lane (a completed create / adopt, or a recycled generation of
-    the same worktree — safe to dispatch, preserving Redmine #13810 R3-F1/R3-F3) from a
-    legacy INCOMPLETE row (empty worktree binding) or a DIFFERENT-worktree binding, both of
-    which keep ``reason`` so the caller fails closed before dispatch.
+    inventory (review j#78975 F1 / j#79015 F2). Unlike :func:`owner_bound_or`, owning the
+    issue is not enough: the state DB owner row must ALSO carry BOTH halves of a complete
+    binding — a non-empty ``worktree_identity`` equal to the exact token this adopt resolved,
+    AND a non-empty typed-pin snapshot with the gateway + worker roles. That is what
+    distinguishes a lane genuinely already established as THIS exact lane (a completed create /
+    adopt, or a recycled generation of the same worktree — safe to dispatch, preserving
+    Redmine #13810 R3-F1/R3-F3) from a legacy row incomplete on EITHER axis (an empty worktree
+    binding, or the v4->v5 pins-only gap) or a DIFFERENT-worktree binding, all of which keep
+    ``reason`` so the caller fails closed before dispatch.
 
     ``worktree_token`` is ``None`` when the lane's worktree could not be resolved; there is
     then no exact binding to confirm, so the row is never treated as complete (fail closed).
@@ -498,13 +500,20 @@ def _lane_owns_issue_with_binding(
     lane: str,
     worktree_token: str,
 ) -> bool:
-    """Does ``lane`` own ``issue`` AND carry the EXACT ``worktree_token`` binding? (fail-closed)
+    """Does ``lane`` own ``issue`` with a COMPLETE, EXACT binding? (fail-closed)
 
-    The completeness half of the owner check (review j#78975 F1). Reads the same state DB and
-    additionally requires the owner row's ``worktree_identity`` to be non-empty and equal to
-    ``worktree_token``. An empty token, an unreadable store, an owner that is a different / no
-    lane, or a row whose worktree binding is empty / different reads False — so a legacy
-    incomplete row (or a different-worktree row) is never treated as an established lane.
+    The completeness half of the owner check (review j#78975 F1 / j#79015 F2). Reads the same
+    state DB and additionally requires the owner row to carry BOTH halves of a complete binding:
+
+    - ``worktree_identity`` non-empty and equal to ``worktree_token`` (the exact worktree);
+    - a ``declared_slots`` snapshot that decodes valid and carries the gateway + worker
+      provider-role pins (a non-empty typed pin set).
+
+    An empty token, an unreadable store, an owner that is a different / no lane, a row whose
+    worktree binding is empty / different, OR a row whose typed pins are empty / undecodable /
+    missing a required role reads False — so a legacy row that is incomplete on EITHER axis
+    (empty worktree binding, or the v4->v5 pins-only gap) is never treated as an established
+    lane the caller may dispatch to on a gate / CAS failure.
     """
     if not worktree_token:
         return False
@@ -516,7 +525,25 @@ def _lane_owns_issue_with_binding(
         record = store.get(LaneLifecycleKey(workspace, lane))
     except (LaneLifecycleError, OSError, ValueError):
         return False
-    return record is not None and _norm(record.worktree_identity) == worktree_token
+    if record is None or _norm(record.worktree_identity) != worktree_token:
+        return False
+    return _binding_has_required_pins(record)
+
+
+def _binding_has_required_pins(record) -> bool:
+    """Does the row's declared-slot snapshot decode valid with both required roles? (fail-closed)
+
+    The typed-pins half of completeness (review j#79015 F2): a complete binding records the
+    provider-role slots this adopt path declares — the gateway and the worker. An empty
+    snapshot (the v4->v5 pins-only gap), an undecodable one (fail-closed by contract), or one
+    missing either required role is NOT complete, so the row is not an established lane.
+    """
+    try:
+        pins = record.declared_pins  # decode_declared_slots; raises on a corrupt snapshot
+    except ProcessPinError:
+        return False
+    roles = {pin.role for pin in pins}
+    return GATEWAY_ROLE in roles and WORKER_ROLE in roles
 
 
 __all__ = (

@@ -337,6 +337,56 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
             sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
         )
 
+    # -- v4->v5 pins-only gap: worktree bound but typed pins empty (j#79015 F2) --------
+
+    def _seed_worktree_only_row(self) -> str:
+        """A v4->v5 migrated row: worktree bound (== the adopt's resolved token) but the typed
+        pin snapshot empty (pre-v5). ``declare_lane`` sets the worktree, leaves slots empty."""
+        token = _worktree_token(self.coord, self.worktree, LANE)
+        out = LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+            worktree_identity=token,
+        )
+        self.assertTrue(out.applied)
+        row = self._row_for()
+        self.assertEqual(row.worktree_identity, token)
+        self.assertEqual(row.declared_pins, ())  # the pins-only gap
+        return token
+
+    def test_pins_only_gap_attested_pair_backfills_typed_pins(self) -> None:
+        # F2: an exact-worktree row whose typed pins are empty is NOT already complete — an
+        # attested pair fills the missing pins via the bounded CAS (the worktree is unchanged).
+        token = self._seed_worktree_only_row()
+        self._attest_pair()
+        self.assertEqual(self._call(_pair_rows()), ADOPT_DECL_BACKFILLED)
+        row = self._row_for()
+        self.assertEqual(row.worktree_identity, token)  # unchanged
+        self.assertEqual(
+            sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
+        )
+        self.assertTrue(all(p.attested_at == ATTESTED_AT for p in row.declared_pins))
+
+    def test_pins_only_gap_unattested_pair_fails_closed(self) -> None:
+        # F2 core: an exact-worktree + empty-pins row is incomplete on the typed-pin axis, so
+        # an unattested live pair FAILS CLOSED rather than collapsing to already_owned. The
+        # pins stay unfilled.
+        self._seed_worktree_only_row()
+        outcome = self._call(_pair_rows())  # no attestation seeded
+        self.assertEqual(outcome, ADOPT_DECL_UNATTESTED)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+        self.assertEqual(self._row_for().declared_pins, ())
+
+    def test_pins_only_gap_ambiguous_pair_fails_closed(self) -> None:
+        self._seed_worktree_only_row()
+        self._attest_pair()
+        rows = [_row("codex", "w1:pA"), _row("codex", "w1:pB"), _row("claude", WK_LOC)]
+        outcome = self._call(rows)
+        self.assertEqual(outcome, ADOPT_DECL_DUPLICATE_CANDIDATES)
+        self.assertIn(outcome, ADOPT_DECL_OWNER_UNBOUND)
+        self.assertEqual(self._row_for().declared_pins, ())
+
     def test_legacy_incomplete_row_unattested_pair_fails_closed(self) -> None:
         # review j#78975 F1: a legacy INCOMPLETE row (empty worktree binding) whose live pair
         # cannot self-attest must FAIL CLOSED — NOT collapse to already_owned. Owning the
@@ -486,6 +536,51 @@ class BackfillActiveBindingCasTest(unittest.TestCase):
         )
         self.assertEqual(row.lane_disposition, DISPOSITION_ACTIVE)  # untouched
         self.assertEqual(row.issue_id, ISSUE)
+
+    def test_fills_pins_only_gap_leaving_worktree(self) -> None:
+        # F2: a worktree-bound row whose declared_slots is empty (v4->v5) is completed — the
+        # typed pins are filled and the worktree binding is left unchanged.
+        out0 = self.store.declare_lane(
+            self.key, decision=self.decision, issue_id=ISSUE, worktree_identity=self.token
+        )
+        self.assertEqual(self._row().declared_pins, ())
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=out0.revision,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(),
+        )
+        self.assertTrue(out.applied)
+        self.assertEqual(out.revision, out0.revision + 1)
+        row = self._row()
+        self.assertEqual(row.worktree_identity, self.token)  # unchanged
+        self.assertEqual(
+            sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
+        )
+
+    def test_recycled_slot_snapshot_is_not_overwritten(self) -> None:
+        # A worktree-bound row WITH a non-empty slot snapshot is a complete generation: a
+        # DIFFERENT (recycled) snapshot on the same worktree is never overwritten.
+        out0 = self.store.declare_lane(
+            self.key,
+            decision=self.decision,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins(GW_LOC, WK_LOC),
+        )
+        out = self.store.backfill_active_binding(
+            self.key,
+            expected_revision=out0.revision,
+            issue_id=ISSUE,
+            worktree_identity=self.token,
+            declared_slots=self._pins("w9:p9", "w9:p8"),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
+        self.assertEqual(
+            sorted(p.locator for p in self._row().declared_pins), sorted([GW_LOC, WK_LOC])
+        )
 
     def test_exact_backfill_is_idempotent_no_op(self) -> None:
         rev = self._seed_legacy()
@@ -677,6 +772,38 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
         row = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
         self.assertEqual(row.worktree_identity, "")
+
+    def _seed_worktree_only_row(self) -> str:
+        token = _worktree_token(self.coord, self.worktree, LANE)
+        LaneDeclarationStore(home=self.home).declare_lane(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            issue_id=ISSUE,
+            worktree_identity=token,
+        )
+        return token
+
+    def test_official_path_pins_only_gap_unattested_blocks_dispatch(self) -> None:
+        # review j#79015 F2 at the official ops surface: an exact-worktree row with EMPTY typed
+        # pins + an unattested live pair returns an owner-unbound BLOCK token (dispatch=false),
+        # NOT already_owned — the pin snapshot stays empty.
+        self._seed_worktree_only_row()
+        out = self._drive(adopted=True, rows=_pair_rows())  # no attestation seeded
+        self.assertEqual(out, ADOPT_DECL_UNATTESTED)
+        self.assertIn(out, ADOPT_DECL_OWNER_UNBOUND)
+        row = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
+        self.assertEqual(row.declared_pins, ())
+
+    def test_official_path_pins_only_gap_attested_backfills(self) -> None:
+        token = self._seed_worktree_only_row()
+        self._attest_pair()
+        out = self._drive(adopted=True, rows=_pair_rows())
+        self.assertEqual(out, ADOPT_DECL_BACKFILLED)
+        row = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
+        self.assertEqual(row.worktree_identity, token)
+        self.assertEqual(
+            sorted(p.locator for p in row.declared_pins), sorted([GW_LOC, WK_LOC])
+        )
 
     def _drive_unreadable(self, *, workspace_segment) -> str:
         # R4-F3: the live inventory read RAISES at declaration time (herdr down). The ops

@@ -223,16 +223,22 @@ class LaneDeclarationStore:
         declared_slots: Sequence[ProcessGenerationPin] = (),
         now: Optional[str] = None,
     ) -> CasOutcome:
-        """Fill the MISSING binding of an existing ``active`` issue owner row (Redmine #13809).
+        """Fill the MISSING binding fields of an existing ``active`` issue owner row (#13809).
 
         The bounded residual companion to :meth:`declare_lane`, for the measured live-adopt
-        gap (j#78944 / j#78945): a **pre-#13754 legacy** owner row is already ``active`` and
-        already owns its issue, but its ``worktree_identity`` is empty — so ``declare_lane``
-        treats the live adopt as a *divergent* re-declare (worktree differs) and refuses
-        zero-write, and ``retire --execute`` stays permanently blocked on
-        ``worktree_binding_unverified``. This surface fills that one empty field (and the
-        empty ``declared_slots`` snapshot) via an exact ``expected_revision`` CAS, so the
-        gate-verified live worktree + typed pins land on the row the lane already owns.
+        gaps (j#78944 / j#78945, review j#79015 F2). A legacy owner row is already ``active``
+        and already owns its issue, but part of its binding is **empty** — so ``declare_lane``
+        treats the gate-verified live adopt as a *divergent* re-declare and refuses
+        zero-write, leaving ``retire --execute`` blocked on ``worktree_binding_unverified``
+        and the lane's typed pins never recorded. Two reachable gaps:
+
+        - a **pre-#13754** row with an empty ``worktree_identity`` (and empty ``declared_slots``);
+        - a **v4 → v5 migrated** row whose ``worktree_identity`` was set at #13754 but whose
+          ``declared_slots`` snapshot is empty (a pins-only gap).
+
+        This surface fills whichever binding field(s) are empty via an exact
+        ``expected_revision`` CAS, so the gate-verified live worktree + typed pins land on the
+        row the lane already owns.
 
         Deliberately **not** a relaxation of ``declare_lane``'s "a divergent re-declare must
         not overwrite" (the tombstone-reviving ``lane_metadata.upsert`` anti-pattern the
@@ -242,18 +248,19 @@ class LaneDeclarationStore:
           and owns no project scope — otherwise :data:`CAS_UNEXPECTED_STATE` (a non-active
           disposition, a different / project-gateway binding, or a *different issue* is
           zero-write, never coerced);
-        - its ``worktree_identity`` is **empty** (the gap). A row already bound to a
-          worktree is never overwritten: an exact match (same worktree + same slots) is an
-          idempotent no-op success, and any *non-empty* divergence is :data:`CAS_ALREADY_DECLARED`
-          zero-write. A non-empty ``declared_slots`` that differs is likewise refused — the
-          missing-field surface fills a gap, it never edits an existing snapshot;
+        - its ``worktree_identity`` is **empty or already equal** to the incoming token, AND
+          its ``declared_slots`` snapshot is **empty or already equal** to the incoming set.
+          An established binding is never overwritten: a *non-empty different* worktree, or a
+          *non-empty different* slot snapshot (a recycled generation whose live locators
+          differ), is :data:`CAS_ALREADY_DECLARED` zero-write. Both fields already exactly
+          present is an idempotent no-op success; otherwise the empty field(s) are filled;
         - the caller's ``expected_revision`` still matches — a concurrent write that moved
           the row loses :data:`CAS_STALE_REVISION` rather than clobbering the newer state.
 
         The lane's disposition / generation / release / replacement / decision anchor are
         untouched; only the empty binding fields are filled. ``issue_id`` and
         ``worktree_identity`` are required non-empty (this surface only backfills a bound
-        issue lane's worktree identity, never guesses one).
+        issue lane's binding, never guesses one).
         """
         issue = norm(issue_id)
         worktree = norm(worktree_identity)
@@ -296,17 +303,10 @@ class LaneDeclarationStore:
                     reason=CAS_UNEXPECTED_STATE,
                     revision=current.revision,
                 )
-            if current.worktree_identity:
-                # The row is already bound. Fill nothing: an exact match is an idempotent
-                # no-op, any non-empty divergence is a conflict declare_lane already refuses.
-                if (
-                    current.worktree_identity == worktree
-                    and current.declared_slots == encoded_slots
-                ):
-                    conn.execute("ROLLBACK")
-                    return CasOutcome(
-                        applied=True, reason=CAS_APPLIED, revision=current.revision
-                    )
+            if current.worktree_identity and current.worktree_identity != worktree:
+                # An established worktree binding is never overwritten by a different one —
+                # the divergence declare_lane already refuses; the missing-field surface fills
+                # a gap, it never edits an existing binding.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
@@ -314,14 +314,26 @@ class LaneDeclarationStore:
                     revision=current.revision,
                 )
             if current.declared_slots and current.declared_slots != encoded_slots:
-                # The worktree is missing but a divergent slot snapshot already exists: this
-                # is not a clean legacy gap, so it is not silently overwritten either.
+                # A non-empty slot snapshot that differs is a divergent (recycled) generation —
+                # its live locators differ — and is never silently overwritten either.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
                     reason=CAS_ALREADY_DECLARED,
                     revision=current.revision,
                 )
+            if (
+                current.worktree_identity == worktree
+                and current.declared_slots == encoded_slots
+            ):
+                # Nothing missing: both fields are already exactly present -> idempotent no-op.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=True, reason=CAS_APPLIED, revision=current.revision
+                )
+            # Fill the missing field(s): an empty worktree binding and/or an empty declared-
+            # slot snapshot (the pins-only v4->v5 gap, review j#79015 F2). A field already
+            # exactly present is rewritten to the same value.
             revision = current.revision + 1
             conn.execute(
                 f"UPDATE {_TABLE} SET worktree_identity = ?, declared_slots = ?, "
