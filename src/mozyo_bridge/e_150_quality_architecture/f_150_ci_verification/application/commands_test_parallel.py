@@ -236,6 +236,14 @@ def _shard_env(repo_root: Path, shard_home: Path) -> dict[str, str]:
     ``MOZYO_REPO`` is inherited (not pinned): repo resolution then follows the same
     cwd/env rules as the serial run, and pinning it broke tests that exercise
     divergent-cwd resolution.
+
+    ``PYTHONPATH`` is likewise inherited *verbatim* — never augmented. The shard's
+    own runtime is resolved in-process instead (see :func:`_shard_command`), because
+    ``PYTHONPATH`` is inherited by everything a test body spawns, and a source
+    ``src/`` entry leaking into a nested ``pip install <wheel>`` makes pip see the
+    same-version metadata already importable and skip the install (exit 0, no console
+    script) — a verdict divergence from serial that no per-shard isolation can undo
+    (Redmine #13733 / #13735 j#78390 F1).
     """
     env = dict(os.environ)
     home = shard_home / "home"
@@ -255,13 +263,6 @@ def _shard_env(repo_root: Path, shard_home: Path) -> dict[str, str]:
     env.update(_SHARD_GIT_IDENTITY)
     for key in STRIPPED_ENV_KEYS:
         env.pop(key, None)
-    # The shard subprocess runs with cwd=<target repo> and re-imports mozyo_bridge
-    # via `-m`; a relative `PYTHONPATH=src` dev setup or a foreign target cwd (the
-    # fixture tests) would otherwise fail to import the package. Pin the child's
-    # PYTHONPATH to the *absolute* mozyo_bridge package dir so the import resolves
-    # regardless of cwd (system site-packages are automatic; user-site is covered
-    # by PYTHONUSERBASE above).
-    env["PYTHONPATH"] = os.pathsep.join(_child_python_path(env.get("PYTHONPATH")))
     return env
 
 
@@ -279,28 +280,56 @@ def _user_base() -> str | None:
         return None
 
 
-def _child_python_path(existing: str | None) -> tuple[str, ...]:
-    """Absolute path entries a shard child needs to import mozyo_bridge.
+def _runtime_root() -> str:
+    """Absolute dir that makes the *parent's own* mozyo_bridge importable.
 
-    Puts the mozyo_bridge package dir first as an absolute path (so a foreign cwd
-    or a relative ``PYTHONPATH=src`` still resolves), then any inherited
-    ``PYTHONPATH``. Deliberately excludes any tests/ discovery dir — the worker
-    adds its own target's ``tests/`` via :func:`_shard_names_importable`, so
-    copying the parent's would cross-contaminate module resolution.
+    The parent may be running from a source checkout that is not installed in the
+    interpreter (``PYTHONPATH=src python -m mozyo_bridge``), so the child cannot be
+    trusted to import the same runtime by default — and it runs with
+    ``cwd=<target repo>``, which for the fixture tests is a foreign tree. Resolving
+    the package's own location gives the child an absolute entry that pins it to the
+    parent's runtime regardless of cwd or install mode.
     """
     import mozyo_bridge  # local import: avoid a package-load cycle at import time
 
-    entries: list[str] = [str(Path(mozyo_bridge.__file__).resolve().parent.parent)]
-    if existing:
-        entries.extend(p for p in existing.split(os.pathsep) if p)
+    return str(Path(mozyo_bridge.__file__).resolve().parent.parent)
 
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for entry in entries:
-        if entry and entry not in seen:
-            seen.add(entry)
-            ordered.append(entry)
-    return tuple(ordered)
+
+# The child is launched with `python -c <bootstrap>` rather than `python -m
+# mozyo_bridge` + PYTHONPATH: `sys.path` is process-local, so the runtime entry
+# reaches the shard worker WITHOUT being inherited by anything the test bodies
+# spawn. Injecting it via PYTHONPATH instead leaked `src/` into nested subprocesses
+# and broke serial/parallel verdict parity (Redmine #13735 j#78390 F1) — the shard
+# env must be the serial env, plus isolation, and nothing else.
+_SHARD_BOOTSTRAP = (
+    "import sys\n"
+    "sys.path.insert(0, {runtime!r})\n"
+    "from mozyo_bridge.application.cli import main\n"
+    "raise SystemExit(main(sys.argv[1:]))\n"
+)
+
+
+def _shard_command(
+    repo_root: Path, spec_path: Path, result_path: Path, runtime_root: str
+) -> list[str]:
+    """The shard worker's argv (runtime pinned in-process, not via the env)."""
+    return [
+        sys.executable,
+        "-c",
+        _SHARD_BOOTSTRAP.format(runtime=runtime_root),
+        "tests",
+        "_shard-worker",
+        # Pass the parent-resolved repo explicitly. resolve_repo_root gives an
+        # explicit --repo precedence over the (inherited, test-body-facing)
+        # MOZYO_REPO env, so a conflicting ambient MOZYO_REPO can never point the
+        # worker at the wrong tree (Redmine #13733 R2-F1).
+        "--repo",
+        str(repo_root),
+        "--spec",
+        str(spec_path),
+        "--result",
+        str(result_path),
+    ]
 
 
 def _replay_command(shard: Shard) -> str:
@@ -426,23 +455,7 @@ def _run_shard(
         ),
         encoding="utf-8",
     )
-    cmd = [
-        sys.executable,
-        "-m",
-        "mozyo_bridge",
-        "tests",
-        "_shard-worker",
-        # Pass the parent-resolved repo explicitly. resolve_repo_root gives an
-        # explicit --repo precedence over the (inherited, test-body-facing)
-        # MOZYO_REPO env, so a conflicting ambient MOZYO_REPO can never point the
-        # worker at the wrong tree (Redmine #13733 R2-F1).
-        "--repo",
-        str(repo_root),
-        "--spec",
-        str(spec_path),
-        "--result",
-        str(result_path),
-    ]
+    cmd = _shard_command(repo_root, spec_path, result_path, _runtime_root())
     env = _shard_env(repo_root, shard_home)
     started = time.perf_counter()
     timed_out = False

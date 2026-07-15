@@ -26,8 +26,8 @@
 #   MOZYO_LANE_ID / MOZYO_AGENT_ROLE), so tests that mutate cwd (os.chdir), HOME,
 #   or the home-scoped state store are isolated ACROSS PROCESSES. There is
 #   therefore no discovered module that is unsafe to run in its own process shard,
-#   so the serial bucket is empty; this is confirmed by dogfooding the full suite
-#   in parallel (same test set and green/red verdict as the serial run).
+#   so the serial bucket is empty; dogfooding the full suite in parallel discovers
+#   the same test set as the serial run.
 #
 # WHEN TO ADD AN ENTRY:
 #   Add a pattern here only with evidence that a module is unsafe even under
@@ -37,6 +37,20 @@
 #   Record the evidence in the owning Redmine issue. Example:
 #     serial_modules:
 #       - "unit.e_120_operations_cockpit.test_tmux_control_port"   # fixed port
+#
+# WHEN *NOT* TO ADD AN ENTRY — a verdict that differs from serial:
+#   The serial bucket separates shards from EACH OTHER; it does not change the
+#   shard environment. Every shard, parallel or serial, runs under the same
+#   `_shard_env`, so a module that fails in parallel but passes under
+#   `unittest discover` is NOT fixed by listing it here — moving it only hides
+#   which shard it ran in. That failure mode is an environment divergence between
+#   the runner and serial discovery, and it belongs in the runner (or in the test's
+#   own subprocess env), not in this file. Redmine #13735 j#78390 F1 is the worked
+#   example: the runner injected PYTHONPATH into every shard, a test's nested
+#   `pip install` inherited it, pip found the same version already importable and
+#   skipped the install (exit 0, no console script), and the test went red at
+#   --jobs 1. The fix was to stop injecting; a serial_modules entry would have
+#   changed nothing.
 serial_modules: []
 
 # Default number of concurrent shard workers when `--jobs` is not passed. Omit to
