@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3636
+    lines: 3342
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1084,6 +1084,15 @@ allowlist:
       record helper accepts an `argparse.Namespace`. The +43 is the explicit
       typed-scalar wiring at those call sites; the helper bodies did NOT move here
       (their logic stays in their own modules, drained one family per tranche).
+      Tightened 3636 -> 3342 for #13729 tranche 2 (Anchor/Profile Envelope Planner):
+      the early anchor build (Redmine/Asana/ticketless typed anchor + payloads) and
+      the pre-send envelope resolution (execution root / role profile / transition
+      role / workflow contract / notification body / landing marker) moved to the
+      new `f_130_handoff_routing/application/handoff_envelope_planner.py`
+      (`HandoffEnvelopePlanner.plan_anchor` / `plan_delivery_envelope`); the facade
+      keeps two thin try/except call sites that map `EnvelopePlanError` back to the
+      byte-identical blocked outcome. Net -294. Shared baseline change: reconcile at
+      integration if another tranche/lane also edits this file.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

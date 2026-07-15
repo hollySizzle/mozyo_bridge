@@ -126,7 +126,6 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
-    AnchorError,
     KIND_LABELS,
     MODE_PENDING,
     MODE_QUEUE_ENTER,
@@ -137,49 +136,19 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     SOURCES,
     SOURCE_TICKETLESS,
     TargetActivationOutcome,
-    TicketlessAnchor,
-    TicketlessConsultationAnchor,
-    TicketlessWorkIntakeAnchor,
-    build_execution_root,
     build_inactive_pane_fallback_command,
-    build_marker,
-    build_notification_body,
     evaluate_standard_target_admission,
     is_explicit_pane_target,
     make_outcome,
-    normalize_anchor,
     resolve_queue_enter_retry_policy,
     resolve_standard_target_admission_policy,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_command_input_adapter import (
     HandoffNamespaceAdapter,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (
-    resolve_handoff_profile_fields,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
-    RoleProfileError,
-    resolve_role_profile,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
-    TransitionRoleError,
-    resolve_transition_role,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
-    WorkflowContractError,
-    resolve_workflow_contract,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
-    TicketlessCallback,
-    TicketlessCallbackError,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
-    TicketlessConsultation,
-    TicketlessConsultationError,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
-    TicketlessWorkIntake,
-    TicketlessWorkIntakeError,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner import (
+    EnvelopePlanError,
+    HandoffEnvelopePlanner,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
@@ -1684,6 +1653,8 @@ def orchestrate_handoff(
         ticketless_consultation=ticketless_consultation,
         ticketless_work_intake=ticketless_work_intake,
     )
+    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner (design j#78394).
+    envelope_planner = HandoffEnvelopePlanner()
 
     # Redmine #13261 (increment 2): resolve the backend once and gate every tmux-only
     # step on it. Under herdr a pure session has no tmux server, so `require_tmux()`
@@ -1784,166 +1755,33 @@ def orchestrate_handoff(
 
     summary = inp.summary
 
-    # Redmine #12703: the structured ticketless callback result (return leg), built
-    # distinctly from the transport outcome. `None` for every anchored send/reply.
-    ticketless_callback_payload: TicketlessCallback | None = None
-    # Redmine #12740: the structured forward ticketless consultation (forward leg),
-    # built distinctly from the transport outcome and from the return-leg callback
-    # above. `None` unless `ticketless_consultation=True`.
-    ticketless_consultation_payload: TicketlessConsultation | None = None
-    # Redmine #12748: the structured forward ticketless work-intake (parent -> child
-    # forward leg), built distinctly from the transport outcome and from the
-    # grandparent->parent consultation / return callback above. `None` unless
-    # `ticketless_work_intake=True`.
-    ticketless_work_intake_payload: TicketlessWorkIntake | None = None
-
-    if inp.ticketless and inp.ticketless_work_intake:
-        # Redmine #12748: build the structured FORWARD work-intake payload, then
-        # derive the no-anchor `TicketlessWorkIntakeAnchor` from it. Construction
-        # fails closed (blocked / invalid_args) on an unknown token or an empty /
-        # unknown callback-method set. No anchor is fabricated (the child owns the
-        # anchor create/select/blocked decision) and the worker-dispatch anchor gate
-        # is not relaxed (a worker dispatch is not expressible on this work-intake
-        # rail; the payload restates the invariants for the child).
-        try:
-            ticketless_work_intake_payload = TicketlessWorkIntake(
-                work_shape=inp.work_shape,
-                callback_to_role=inp.callback_to_role,
-                callback_methods=inp.callback_methods,
-                read_contract=inp.read_contract,
-                # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
-                # so the child's returning callback echoes it to complete the exact generation.
-                forward_action_id=inp.forward_action_id or "",
-            )
-        except TicketlessWorkIntakeError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-        anchor = TicketlessWorkIntakeAnchor(
-            work_shape=ticketless_work_intake_payload.work_shape,
-            callback_to_role=ticketless_work_intake_payload.callback_to_role,
+    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner owns the typed
+    # anchor + ticketless payload build. On malformed input it raises with no extra
+    # outcome fields, matching the original early anchor block (target/anchor None).
+    try:
+        _anchor_plan = envelope_planner.plan_anchor(inp)
+    except EnvelopePlanError as exc:
+        _emit(
+            make_outcome(
+                status="blocked",
+                reason=exc.reason,
+                receiver=receiver,
+                target=None,
+                anchor=None,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
         )
-    elif inp.ticketless and inp.ticketless_consultation:
-        # Redmine #12740: build the structured FORWARD consultation payload, then
-        # derive the no-anchor `TicketlessConsultationAnchor` from it. Construction
-        # fails closed (blocked / invalid_args) on an unknown token or an empty /
-        # unknown callback-method set. No anchor is fabricated and the worker-dispatch
-        # anchor gate is not relaxed (a worker dispatch is not expressible on this
-        # consultation rail; the payload restates the invariant for the receiver).
-        try:
-            ticketless_consultation_payload = TicketlessConsultation(
-                consultation_kind=inp.consultation_kind,
-                callback_to_role=inp.callback_to_role,
-                callback_methods=inp.callback_methods,
-                read_contract=inp.read_contract,
-                # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
-                # so the gateway's returning callback echoes it to complete the exact generation.
-                forward_action_id=inp.forward_action_id or "",
-            )
-        except TicketlessConsultationError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-        anchor = TicketlessConsultationAnchor(
-            consultation_kind=ticketless_consultation_payload.consultation_kind,
-            callback_to_role=ticketless_consultation_payload.callback_to_role,
-        )
-    elif inp.ticketless:
-        # Build the structured callback result, then derive the no-anchor
-        # `TicketlessAnchor` from it. Construction fails closed (blocked /
-        # invalid_args) on an unknown token or — critically — on a dispatch
-        # decision that is an actual worker dispatch (which still requires a real
-        # Redmine anchor; the child -> grandchild boundary is not relaxed).
-        try:
-            ticketless_callback_payload = TicketlessCallback(
-                classification=inp.classification,
-                dispatch_decision=inp.dispatch_decision,
-                next_action_owner=inp.workflow_next_owner,
-                callback_reason=inp.callback_reason,
-                read_contract=inp.read_contract,
-                # Redmine #13583 R1-F1: echo the forward generation id the consultation/work-intake
-                # carried, so a positively-delivered callback completes the exact forward generation.
-                forward_action_id=inp.forward_action_id or "",
-            )
-        except TicketlessCallbackError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-        anchor = TicketlessAnchor(
-            classification=ticketless_callback_payload.classification,
-            dispatch_decision=ticketless_callback_payload.dispatch_decision,
-        )
-    else:
-        try:
-            anchor = normalize_anchor(
-                source,
-                task_id=inp.task_id,
-                comment_id=inp.comment_id,
-                anchor_url=inp.anchor_url,
-                issue=inp.issue,
-                journal=inp.journal,
-            )
-        except AnchorError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_anchor",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
+        die(exc.message)
+        raise AssertionError("unreachable")
+    anchor = _anchor_plan.anchor
+    ticketless_callback_payload = _anchor_plan.callback_payload
+    ticketless_consultation_payload = _anchor_plan.consultation_payload
+    ticketless_work_intake_payload = _anchor_plan.work_intake_payload
     if herdr_send:
         # Redmine #13261 (increment 2): pure-herdr target resolution. There is no
         # tmux pane to read, so resolve the receiver against the live herdr inventory
@@ -2801,161 +2639,30 @@ def orchestrate_handoff(
             )
             raise
 
-    # Target execution root / workdir propagation (Redmine #12098). When the
-    # operator asserts a `--workdir`, carry it as an explicit execution root so
-    # the receiver can recover a nested project root (distinct from the pane cwd
-    # / cross-workspace repo root) from the durable record instead of grepping
-    # pane scrollback. The relative pointer is computed against the strongest
-    # available repo anchor: an explicit `--target-repo` (already resolved from
-    # `auto` above when used), else the target pane's inferred repo root. This
-    # is wording/record-layer only — it does not gate pane selection and does
-    # not relax any cross-session / cross-lane boundary.
-    execution_root = None
-    workdir_arg = inp.workdir
-    if workdir_arg:
-        workdir_abs = str(Path(workdir_arg).expanduser().resolve())
-        repo_anchor = resolved_target_repo
-        if repo_anchor and repo_anchor != AUTO_TARGET_REPO:
-            repo_anchor_abs = str(Path(repo_anchor).expanduser().resolve())
-        else:
-            repo_anchor_abs = infer_repo_root(target_info.get("cwd") or "") or None
-        execution_root = build_execution_root(
-            workdir_abs, repo_root_abs=repo_anchor_abs
-        )
-
-    # Redmine #12388 / #13477: resolve the requested fixed role profile before
-    # any pane send. `resolve_handoff_profile_fields` parses `--profile-field`,
-    # auto-fills `durable_anchor` from the anchor, and (Redmine #13477)
-    # auto-resolves a `redmine_project` placeholder from the verified
-    # workspace-local Redmine default when the role needs it and no explicit
-    # value was given (explicit wins; missing/unverified fails closed). Fail
-    # closed (blocked / invalid_args) on an unknown role, a malformed
-    # `--profile-field`, or an unresolvable required default; omitting
-    # `--role-profile` is the explicit fallback of no profile expansion.
-    role_profile_resolution = None
-    role_profile_arg = inp.role_profile
-    if role_profile_arg:
-        try:
-            profile_fields = resolve_handoff_profile_fields(
-                role_profile_arg,
-                inp.profile_field,
-                anchor.human_pointer(),
-                repo_root,
-            )
-            role_profile_resolution = resolve_role_profile(
-                role_profile_arg, profile_fields
-            )
-        except RoleProfileError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                    execution_root=execution_root,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
-    role_profile_contract = (
-        role_profile_resolution.resolved_text if role_profile_resolution else None
-    )
-
-    # Redmine #12706: resolve the explicit transition role/action boundary before
-    # any pane send. The token is set programmatically by the routing command (the
-    # `project-gateway handoff` route injects `grandparent_coordinator` on a
-    # successful gateway resolution), never typed manually as product evidence.
-    # Fail closed (blocked / invalid_args) on an unknown token; omitting it is the
-    # explicit fallback of no role binding.
-    transition_role_boundary = None
-    transition_role_arg = inp.transition_role
-    if transition_role_arg:
-        try:
-            transition_role_boundary = resolve_transition_role(transition_role_arg)
-        except TransitionRoleError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                    execution_root=execution_root,
-                    role_profile=role_profile_resolution,
-                ),
-                record_format=record_format,
-                command=record_command,
-                role_profile_contract=role_profile_contract,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
-    # Redmine #12700: resolve the workflow-contract reference bundle before any
-    # pane send. The token is set programmatically by the routing command (the
-    # `project-gateway handoff` route injects the grandparent bundle on a
-    # successful gateway resolution), never typed manually. Fail closed (blocked /
-    # invalid_args) on an unknown token; omitting it is the explicit fallback of no
-    # contract binding. The bundle carries resolvable doc pointers (catalog ids +
-    # canonical + monorepo-nested paths), never doc bodies.
-    workflow_contract_bundle = None
-    workflow_contract_arg = inp.workflow_contract
-    if workflow_contract_arg:
-        try:
-            workflow_contract_bundle = resolve_workflow_contract(workflow_contract_arg)
-        except WorkflowContractError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                    execution_root=execution_root,
-                    role_profile=role_profile_resolution,
-                    transition_role=transition_role_boundary,
-                ),
-                record_format=record_format,
-                command=record_command,
-                role_profile_contract=role_profile_contract,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
+    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner resolves the
+    # pre-send envelope (execution root / role profile / transition role / workflow
+    # contract / notification body / landing marker). On malformed input it raises with
+    # the exact cumulative partial-state extras each original stage emitted; the facade
+    # merges them with its base context for a byte-identical blocked outcome + die.
     try:
-        body = build_notification_body(
-            anchor,
-            kind,
-            summary,
-            receiver,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
+        envelope = envelope_planner.plan_delivery_envelope(
+            inp,
+            anchor=anchor,
+            callback_payload=ticketless_callback_payload,
+            consultation_payload=ticketless_consultation_payload,
+            work_intake_payload=ticketless_work_intake_payload,
+            repo_root=repo_root,
+            resolved_target_repo=resolved_target_repo,
+            target_cwd=target_info.get("cwd") or "",
+            summary=summary,
+            receiver=receiver,
+            kind=kind,
         )
-    except AnchorError as exc:
+    except EnvelopePlanError as exc:
         _emit(
             make_outcome(
                 status="blocked",
-                reason="invalid_args",
+                reason=exc.reason,
                 receiver=receiver,
                 target=target,
                 anchor=anchor,
@@ -2963,22 +2670,21 @@ def orchestrate_handoff(
                 kind=kind,
                 notification_marker=None,
                 source=source,
-                execution_root=execution_root,
-                role_profile=role_profile_resolution,
-                transition_role=transition_role_boundary,
-                workflow_contract=workflow_contract_bundle,
-                ticketless_callback=ticketless_callback_payload,
-                ticketless_consultation=ticketless_consultation_payload,
-                ticketless_work_intake=ticketless_work_intake_payload,
+                **exc.outcome_extra,
             ),
             record_format=record_format,
             command=record_command,
-            role_profile_contract=role_profile_contract,
+            **exc.emit_extra,
         )
-        die(str(exc))
+        die(exc.message)
         raise AssertionError("unreachable")
-
-    marker = build_marker(anchor, kind, receiver)
+    execution_root = envelope.execution_root
+    role_profile_resolution = envelope.role_profile_resolution
+    role_profile_contract = envelope.role_profile_contract
+    transition_role_boundary = envelope.transition_role_boundary
+    workflow_contract_bundle = envelope.workflow_contract_bundle
+    body = envelope.body
+    marker = envelope.marker
 
     read_lines = int(inp.read_lines or 50)
     # Internal pane snapshot preflight (the standard path must not require callers to run
