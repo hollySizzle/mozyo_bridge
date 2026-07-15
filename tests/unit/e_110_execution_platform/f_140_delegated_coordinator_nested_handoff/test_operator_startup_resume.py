@@ -202,6 +202,51 @@ class _RaisingFence:
         raise DispatchOutboxFenceError("simulated corrupt fence")
 
 
+class _RowVanishesFence:
+    """Delegates reserve to a real fence, but the authoritative row is deleted right
+    before the outcome write, so ``mark_delivered`` / ``mark_uncertain`` return False
+    (``rowcount == 0``) — the reviewer's reserve-then-row-missing reproduction (j#79268)."""
+
+    def __init__(self, real: DispatchOutboxFence):
+        self.real = real
+        self.delivered_calls = 0
+
+    def reserve(self, key, *, now=None):
+        return self.real.reserve(key, now=now)
+
+    def _wipe(self):
+        import sqlite3
+
+        conn = sqlite3.connect(self.real.path)
+        conn.execute("DELETE FROM dispatch_outbox")
+        conn.commit()
+        conn.close()
+
+    def mark_delivered(self, key, *, detail="", now=None):
+        self.delivered_calls += 1
+        self._wipe()
+        return self.real.mark_delivered(key, detail=detail, now=now)  # -> False (row gone)
+
+    def mark_uncertain(self, key, *, detail="", now=None):
+        return self.real.mark_uncertain(key, detail=detail, now=now)
+
+
+class _RaiseOnWriteFence:
+    """Reserve succeeds, but every outcome write raises the fail-closed store error."""
+
+    def __init__(self, real: DispatchOutboxFence):
+        self.real = real
+
+    def reserve(self, key, *, now=None):
+        return self.real.reserve(key, now=now)
+
+    def mark_delivered(self, key, *, detail="", now=None):
+        raise DispatchOutboxFenceError("store corrupt at outcome write")
+
+    def mark_uncertain(self, key, *, detail="", now=None):
+        raise DispatchOutboxFenceError("store corrupt at outcome write")
+
+
 class _ResumeCase(unittest.TestCase):
     """Base with a real hermetic fence under a temp home."""
 
@@ -519,6 +564,79 @@ class UncertainFailClosedTests(_ResumeCase):
             send=_exploding_send(),
         )
         self.assertEqual(rerun.result, RESUME_SKIPPED)
+        self.assertFalse(rerun.sent)
+        self.assertTrue(rerun.needs_reconcile)
+
+
+class PostReserveOutcomeWriteFailClosedTests(_ResumeCase):
+    """Finding 2 (j#79268): an unconfirmable post-reserve outcome write must NOT report
+    delivered/consumed — it fails closed to uncertain so a re-run performs zero send."""
+
+    def test_delivered_write_row_missing_fails_closed_to_uncertain(self) -> None:
+        wrapper = _RowVanishesFence(self.fence)
+        result = self._resume(
+            gate=_done_gate(),
+            observed=_resolved(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=wrapper,
+            send=_CountingSend(outcome=SendOutcome(turn_start=TURN_START_STARTED)),
+        )
+        # The send's turn-start was confirmed, but the fence could not durably record it.
+        self.assertEqual(result.result, RESUME_UNCERTAIN)
+        self.assertNotEqual(result.result, RESUME_DELIVERED)
+        self.assertTrue(result.needs_reconcile)
+        self.assertEqual(result.fence_state, FENCE_UNCERTAIN)
+        assert result.advanced_gate is not None
+        self.assertEqual(result.advanced_gate.state, STATE_VERIFIED_CLEAR)
+        self.assertNotEqual(result.advanced_gate.state, STATE_CONSUMED)
+        self.assertEqual(wrapper.delivered_calls, 1)
+
+    def test_delivered_write_raises_fails_closed_without_propagating(self) -> None:
+        result = self._resume(
+            gate=_done_gate(),
+            observed=_resolved(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=_RaiseOnWriteFence(self.fence),
+            send=_CountingSend(outcome=SendOutcome(turn_start=TURN_START_STARTED)),
+        )
+        # A raised outcome write must not propagate out of a path that already sent once.
+        self.assertEqual(result.result, RESUME_UNCERTAIN)
+        self.assertTrue(result.needs_reconcile)
+        assert result.advanced_gate is not None
+        self.assertEqual(result.advanced_gate.state, STATE_VERIFIED_CLEAR)
+
+    def test_uncertain_write_raises_does_not_propagate(self) -> None:
+        # A non-started send whose uncertain write also raises must still return uncertain.
+        result = self._resume(
+            gate=_done_gate(),
+            observed=_resolved(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=_RaiseOnWriteFence(self.fence),
+            send=_CountingSend(outcome=SendOutcome(turn_start=TURN_START_ACK_ONLY)),
+        )
+        self.assertEqual(result.result, RESUME_UNCERTAIN)
+        self.assertTrue(result.needs_reconcile)
+
+    def test_rerun_after_failclosed_uncertain_sends_zero(self) -> None:
+        # The exactly-once guarantee is preserved at the GATE level: after the fail-closed
+        # uncertain outcome the durable gate is verified_clear, so a re-run is send 0.
+        first = self._resume(
+            gate=_done_gate(),
+            observed=_resolved(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=_RowVanishesFence(self.fence),
+            send=_CountingSend(outcome=SendOutcome(turn_start=TURN_START_STARTED)),
+        )
+        self.assertEqual(first.result, RESUME_UNCERTAIN)
+        assert first.advanced_gate is not None
+        rerun = self._resume(
+            gate=first.advanced_gate,  # durable gate is now verified_clear
+            observed=_resolved(),
+            read_visible=_exploding_read(),
+            fence=_ExplodingFence(),
+            send=_exploding_send(),
+        )
+        self.assertEqual(rerun.result, RESUME_NOT_RESUMABLE)
         self.assertFalse(rerun.sent)
         self.assertTrue(rerun.needs_reconcile)
 

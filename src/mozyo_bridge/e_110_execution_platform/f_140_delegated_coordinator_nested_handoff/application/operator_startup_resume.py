@@ -236,6 +236,27 @@ def _not_resumable(gate: OperatorStartupGate) -> Optional[StartupResumeResult]:
     )
 
 
+def _confirm_outcome_write(
+    mark: Callable[..., bool], key: FenceKey, *, detail: str, now: Optional[str]
+) -> bool:
+    """Attempt a fence outcome write; return True iff it was DURABLY confirmed.
+
+    ``mark`` is ``fence.mark_delivered`` / ``fence.mark_uncertain``. The write is
+    *confirmed* only when it updated the authoritative row (``rowcount > 0``). A row that
+    went missing / was replaced between the reserve and this write returns False
+    (``rowcount == 0``); a corrupt / lost / replaced store raises
+    :class:`DispatchOutboxFenceError`, caught here and reported as False. Either way the
+    caller must NOT claim a durably recorded delivered outcome (Finding 2, review
+    j#79268): an unconfirmable outcome write fails closed to uncertain, because the sole
+    authority can no longer prove the request was consumed and a blind re-run could
+    duplicate the send.
+    """
+    try:
+        return bool(mark(key, detail=detail, now=now))
+    except DispatchOutboxFenceError:
+        return False
+
+
 def resume_startup_gate(
     *,
     existing_gate: OperatorStartupGate,
@@ -327,8 +348,14 @@ def resume_startup_gate(
     try:
         outcome = send()
     except Exception as exc:  # noqa: BLE001 - the send may have landed; mark uncertain, never retry
-        fence.mark_uncertain(
-            key, detail=f"resume send raised {type(exc).__name__}; outcome unknown", now=now
+        # Best-effort uncertain write; a failed / raised outcome write must NOT propagate
+        # — the outcome is uncertain regardless, and a raised fence error here would else
+        # crash out of a path that already performed the single send (Finding 2).
+        _confirm_outcome_write(
+            fence.mark_uncertain,
+            key,
+            detail=f"resume send raised {type(exc).__name__}; outcome unknown",
+            now=now,
         )
         advanced = verify_clear_gate(
             existing_gate,
@@ -346,31 +373,70 @@ def resume_startup_gate(
         )
 
     if outcome.turn_start == TURN_START_STARTED:
-        fence.mark_delivered(
-            key, detail=outcome.detail or "resume turn-start confirmed", now=now
+        # A delivered outcome counts ONLY if the fence DURABLY records it. If the
+        # authoritative row went missing / was replaced / errored between the reserve and
+        # this write, the sole exactly-once authority can no longer prove the request was
+        # consumed — a stale re-run would reserve fresh and duplicate the send. So a
+        # delivered send with an unconfirmable outcome write fails closed to uncertain
+        # (operator reconcile), never `delivered` / `consumed` (Finding 2, review j#79268).
+        if _confirm_outcome_write(
+            fence.mark_delivered,
+            key,
+            detail=outcome.detail or "resume turn-start confirmed",
+            now=now,
+        ):
+            # required -> ... -> verified_clear -> consumed, continuing the same gate. The
+            # consumed pointer is the original request's delivery_id (a path-safe anchor).
+            cleared = verify_clear_gate(
+                existing_gate,
+                startup_clear_observed_at=observed_at,
+                dispatch_fence_state=FENCE_RESERVED,
+            )
+            consumed = consume_gate(
+                cleared, consumed_delivery_record=existing_gate.original_request.delivery_id
+            )
+            return StartupResumeResult(
+                result=RESUME_DELIVERED,
+                sent=True,
+                reserved=True,
+                fence_state=FENCE_DELIVERED,
+                advanced_gate=consumed,
+                detail=outcome.detail or "reserved, sent, turn-start confirmed; re-issued exactly once",
+            )
+        # The send's turn-start was confirmed, but the fence outcome write could not be
+        # durably recorded (row missing / replaced / store error). Fail closed to
+        # uncertain: the delivery is real but unrecordable, so it must be reconciled, not
+        # reported consumed. A best-effort uncertain write follows (also unconfirmable if
+        # the row is gone) — the RESULT is uncertain either way.
+        _confirm_outcome_write(
+            fence.mark_uncertain,
+            key,
+            detail="delivered outcome unrecordable; fence row missing/replaced/error",
+            now=now,
         )
-        # required -> ... -> verified_clear -> consumed, continuing the same gate. The
-        # consumed pointer is the original request's delivery_id (a path-safe anchor).
-        cleared = verify_clear_gate(
+        advanced = verify_clear_gate(
             existing_gate,
             startup_clear_observed_at=observed_at,
-            dispatch_fence_state=FENCE_RESERVED,
-        )
-        consumed = consume_gate(
-            cleared, consumed_delivery_record=existing_gate.original_request.delivery_id
+            dispatch_fence_state=FENCE_UNCERTAIN,
         )
         return StartupResumeResult(
-            result=RESUME_DELIVERED,
+            result=RESUME_UNCERTAIN,
             sent=True,
             reserved=True,
-            fence_state=FENCE_DELIVERED,
-            advanced_gate=consumed,
-            detail=outcome.detail or "reserved, sent, turn-start confirmed; re-issued exactly once",
+            fence_state=FENCE_UNCERTAIN,
+            needs_reconcile=True,
+            advanced_gate=advanced,
+            detail=(
+                "send turn-start confirmed but the fence outcome write could not be "
+                "durably recorded (row missing/replaced/error); reconcile -> not consumed"
+            ),
         )
 
     # Any non-``started`` turn-start (ack-only / not-started / timeout / unknown) -> the
     # send may have landed but the receiver's turn is not confirmed: uncertain, reconcile.
-    fence.mark_uncertain(
+    # The outcome write is best-effort; a failed / raised write must not propagate.
+    _confirm_outcome_write(
+        fence.mark_uncertain,
         key,
         detail=outcome.detail or f"resume turn-start {outcome.turn_start}; not confirmed started",
         now=now,
