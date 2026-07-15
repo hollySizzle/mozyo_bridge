@@ -1694,10 +1694,31 @@ an agent provider is a launchable CLI, not an adapter *category*.
 
 `provider_id`; trusted executable *metadata* (a command basename + the NAME of a
 trusted-env override variable); the interaction-protocol family; discovery / process
-aliases; closed mechanical capabilities; and the closed managed-flag **concept** map
+aliases; closed mechanical capabilities; the closed managed-flag **concept** map
 (concept → that provider's flag spelling, e.g. `permission_mode` → `--permission-mode`),
 which doubles as the reserved-flag vocabulary an operator's repo config may not
-re-specify.
+re-specify; and — schema version `2`, #13760 — the closed `startup_blockers[{id, all_of}]`
+list: the provider's pre-composer **startup screens** (a trust confirmation, a first-run
+theme picker, a login prompt) that render as a live pane but cannot accept a handoff body.
+Each blocker is an AND of co-located on-screen signatures (a lone generic phrase can never
+false-positive a ready composer), validated fail-closed at load — count, string / blank /
+length / folded-length / duplicate, and the same forbidden-token set as every other field —
+by the one validator every construction path runs (`StartupBlocker.__post_init__`, #13760
+review j#78481 F1). It is pure *description*: the pre-send admission gate
+(`f_130_handoff_routing/application/startup_admission_gate.py` +
+`f_130_terminal_runtime_provider/application/herdr_startup_admission.py`) reads it to
+**refuse** a send to a receiver still on such a screen (zero text / keys / Enter / ACK), so
+no provider-specific string lives in a transport or command module. A blocker carries no
+key, no answer, and no authority to dismiss the screen — clearing a trust / login prompt
+stays an operator action in the provider's own UI (mozyo never auto-accepts one).
+
+The config artifact itself carries `version` + `source` as durable contract pointers.
+An **unknown** version fails closed at load (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review
+j#78481 F2) rather than being read on a partially-understood schema, and the declared
+version **gates the accepted shape**: `startup_blockers` is the v2 addition, so a
+`version: "1"` record that carries it fails closed (#13760 review j#78529 F2). The "v2
+adds startup_blockers" claim and the fields the loader actually honors therefore cannot
+drift.
 
 ### What a profile may never own (enforced, not documented)
 

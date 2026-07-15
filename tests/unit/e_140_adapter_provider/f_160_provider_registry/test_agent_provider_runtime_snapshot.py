@@ -32,7 +32,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 def _registry_from(profiles: dict) -> object:
     """A synthetic registry from a profiles mapping (fake, explicit placeholder data)."""
     return AgentProviderProfileConfig.from_record(
-        {"version": "t", "source": "test-fixture", "profiles": profiles}
+        {"version": "1", "source": "test-fixture", "profiles": profiles}
     ).to_registry()
 
 

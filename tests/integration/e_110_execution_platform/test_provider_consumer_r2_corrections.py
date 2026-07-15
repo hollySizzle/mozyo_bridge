@@ -28,7 +28,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 def _snapshot(profiles: dict):
     return build_runtime_snapshot(
         AgentProviderProfileConfig.from_record(
-            {"version": "t", "source": "test-fixture", "profiles": profiles}
+            {"version": "1", "source": "test-fixture", "profiles": profiles}
         ).to_registry()
     )
 
