@@ -224,12 +224,15 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     )
 
     as_json = bool(getattr(args, "as_json", False))
-    home = _home_from_args(args)
+    # The supervisor CLI's ``--home`` is the **mozyo home** override (registry / store / credential
+    # root); the plist / log always live under the OS user home, which the service verbs resolve
+    # from ``Path.home()`` (never relocated by ``--home``) — j#79092 R2-F1.
+    mozyo_home = _home_from_args(args)
     definition = _service_definition(args)
 
     if verb == "service-status":
         status = supervisor_launchd.service_status(
-            home=home, interval_hint=definition.reconciliation_interval_seconds
+            mozyo_home=mozyo_home, interval_hint=definition.reconciliation_interval_seconds
         )
         payload = dict(status)
         payload["phase"] = "B1"
@@ -253,12 +256,12 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
 
     if verb == "install":
         result = supervisor_launchd.install(
-            home=home, interval_seconds=definition.reconciliation_interval_seconds
+            mozyo_home=mozyo_home, interval_seconds=definition.reconciliation_interval_seconds
         )
     elif verb == "restart":
-        result = supervisor_launchd.restart(home=home)
+        result = supervisor_launchd.restart(mozyo_home=mozyo_home)
     else:  # uninstall
-        result = supervisor_launchd.uninstall(home=home)
+        result = supervisor_launchd.uninstall()
 
     payload = dict(result)
     performed = bool(result.get("performed"))

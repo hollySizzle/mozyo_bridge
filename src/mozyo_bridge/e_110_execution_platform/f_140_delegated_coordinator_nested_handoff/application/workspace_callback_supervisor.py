@@ -482,15 +482,24 @@ def default_roster(ws: SupervisedWorkspace) -> tuple[tuple[str, ...], str]:
     return issues, (error or "")
 
 
-def default_redmine_source(ws: SupervisedWorkspace) -> Optional[RedmineJournalSource]:
-    """Build the live credential-gated Redmine journal source, or ``None`` when unconfigured."""
+def default_redmine_source(
+    ws: SupervisedWorkspace, *, home: Optional[Path] = None
+) -> Optional[RedmineJournalSource]:
+    """Build the live credential-gated Redmine journal source, or ``None`` when unconfigured.
+
+    ``home`` scopes the credential root exactly like the registry / store / lease, so the launchd
+    daemon (started with the ``--home`` the installer pinned) reads its Redmine credentials from the
+    same mozyo home the install preflight validated — not whatever ``mozyo_bridge_home()`` a
+    launchd process with no ``MOZYO_BRIDGE_HOME`` would re-derive (Redmine #13683 review j#79092
+    R2-F1).
+    """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
         LiveRedmineJournalError,
         LiveRedmineJournalSource,
     )
 
     try:
-        return LiveRedmineJournalSource.from_environment()
+        return LiveRedmineJournalSource.from_environment(home=home)
     except LiveRedmineJournalError:
         return None
 
@@ -850,7 +859,8 @@ def build_supervisor(
             transport=default_background_transport(ws),
             outbox=outbox,
             # R1-F1: re-verify the review round at the send edge against the live Redmine markers.
-            round_fence_fn=review_round_send_fence(lambda: default_redmine_source(ws)),
+            # home-scoped so the daemon reads credentials from the pinned mozyo home (j#79092 R2-F1).
+            round_fence_fn=review_round_send_fence(lambda: default_redmine_source(ws, home=home)),
         )
 
     def _owner_binding_fn(workspace_id: str, issue: str, binding: object) -> OwningLaneBinding:
@@ -865,7 +875,7 @@ def build_supervisor(
         outbox=outbox,
         workspaces_fn=lambda: default_workspaces(home=home),
         roster_fn=default_roster,
-        redmine_source_fn=default_redmine_source,
+        redmine_source_fn=lambda ws: default_redmine_source(ws, home=home),
         sender_fn=_sender_fn,
         binding_fn=default_binding,
         owner_binding_fn=_owner_binding_fn,

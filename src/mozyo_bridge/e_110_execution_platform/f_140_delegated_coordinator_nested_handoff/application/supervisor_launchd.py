@@ -54,9 +54,16 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
     resolve_redmine_credentials,
 )
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 # ---------------------------------------------------------------------------
 # Owned identity (a reverse-DNS label + owned plist/log paths; not operator-private).
+#
+# Two DISTINCT roots must never be conflated (review j#79092 R2-F1):
+#   - the **OS user home** (``Path.home()``) owns the plist + log under ``~/Library`` — this is
+#     where launchd looks for LaunchAgents, independent of any mozyo config;
+#   - the **mozyo home** (``mozyo_bridge_home()``: ``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``)
+#     owns the registry / store / credential root the supervisor reads at run time.
 # ---------------------------------------------------------------------------
 
 SUPERVISOR_LAUNCHD_LABEL = DEFAULT_SUPERVISOR_SERVICE_LABEL
@@ -65,8 +72,14 @@ LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor.log")
 
 #: The executable name resolved from PATH at install time (never a shell string).
 SUPERVISOR_EXECUTABLE_NAME = "mozyo-bridge"
-#: The structured argv tail the scheduled agent runs each tick (one bounded sweep, then exit).
+#: The structured argv tail the scheduled agent runs each tick (one bounded sweep, then exit). The
+#: resolved mozyo home is pinned onto this as ``--home <root>`` at install time (see
+#: :func:`resolve_supervisor_command`) so the launchd daemon reads the *same* credential / registry
+#: root the install preflight validated — launchd carries no ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1).
 SUPERVISOR_ARGV_TAIL = ("workflow", "supervisor", "--run-once")
+#: The structured flag that pins the mozyo home root onto the daemon argv (non-secret; a config
+#: directory, resolved by the supervisor CLI's ``--home``).
+SUPERVISOR_HOME_FLAG = "--home"
 
 # ---------------------------------------------------------------------------
 # Fixed-vocabulary reason tokens (machine-readable; secret-safe; UI-language-independent).
@@ -107,34 +120,56 @@ Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 # ---------------------------------------------------------------------------
 
 
-def plist_path(home: Optional[Path] = None) -> Path:
-    return (home or Path.home()) / PLIST_RELATIVE
+def plist_path(os_home: Optional[Path] = None) -> Path:
+    """The owned plist path under the **OS user home** (``~/Library/LaunchAgents``)."""
+    return (os_home or Path.home()) / PLIST_RELATIVE
 
 
-def log_path(home: Optional[Path] = None) -> Path:
-    return (home or Path.home()) / LOG_RELATIVE
+def log_path(os_home: Optional[Path] = None) -> Path:
+    """The owned log path under the **OS user home** (``~/Library/Logs``)."""
+    return (os_home or Path.home()) / LOG_RELATIVE
+
+
+def resolve_mozyo_home(mozyo_home: Optional[Path] = None) -> Path:
+    """Resolve the exact **mozyo home** root (credential / registry / store), absolute.
+
+    ``mozyo_home`` (the supervisor CLI's ``--home``) wins; otherwise the package's home contract
+    (:func:`mozyo_bridge_home`: ``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``). Resolved once at
+    install time and pinned onto the daemon argv so the daemon reads this exact root — it does not
+    re-derive it, because launchd carries no ``MOZYO_BRIDGE_HOME`` (j#79092 R2-F1).
+    """
+    return Path(mozyo_home) if mozyo_home is not None else mozyo_bridge_home()
 
 
 def resolve_supervisor_command(
-    *, which: Callable[[str], Optional[str]] = shutil.which
+    *,
+    mozyo_home: Optional[Path] = None,
+    which: Callable[[str], Optional[str]] = shutil.which,
 ) -> Optional[list[str]]:
     """The exact argv the agent runs, or ``None`` when the executable is not on PATH.
 
-    Resolved at install time via PATH so the plist survives shell-env differences. A missing
-    executable is a fail-closed condition the caller turns into a zero-mutation refusal (install
-    the package first) — never a shell string and never a guessed path.
+    The executable is PATH-resolved at install time (so the plist survives shell-env differences)
+    and the **resolved mozyo home** is pinned as ``--home <root>`` so the launchd daemon reads the
+    same credential / registry root the install preflight validated (j#79092 R2-F1). A missing
+    executable is a fail-closed condition the caller turns into a zero-mutation refusal (install the
+    package first) — never a shell string and never a guessed path.
     """
     executable = which(SUPERVISOR_EXECUTABLE_NAME)
     if not executable:
         return None
-    return [executable, *SUPERVISOR_ARGV_TAIL]
+    return [
+        executable,
+        *SUPERVISOR_ARGV_TAIL,
+        SUPERVISOR_HOME_FLAG,
+        str(resolve_mozyo_home(mozyo_home)),
+    ]
 
 
 def render_plist(
     command: Sequence[str],
     *,
     interval_seconds: int,
-    home: Optional[Path] = None,
+    os_home: Optional[Path] = None,
 ) -> bytes:
     """Render the LaunchAgent plist for the one-shot scheduled supervisor sweep.
 
@@ -144,15 +179,16 @@ def render_plist(
     - **No** ``KeepAlive`` key: the command is a bounded ``--run-once`` sweep that exits;
       ``RunAtLoad`` runs it once at load and ``StartInterval`` re-runs it every ``interval_seconds``.
       KeepAlive would be a tight restart loop for a one-shot command, so it is absent by design.
-    - ``ProgramArguments`` is the exact structured argv (PATH-resolved executable + fixed tail).
+    - ``ProgramArguments`` is the exact structured argv (PATH-resolved executable + fixed tail +
+      the pinned ``--home <mozyo root>``). The log lives under the OS user home (``os_home``).
     """
     payload = {
         "Label": SUPERVISOR_LAUNCHD_LABEL,
         "ProgramArguments": list(command),
         "RunAtLoad": True,
         "StartInterval": max(1, int(interval_seconds)),
-        "StandardOutPath": str(log_path(home)),
-        "StandardErrorPath": str(log_path(home)),
+        "StandardOutPath": str(log_path(os_home)),
+        "StandardErrorPath": str(log_path(os_home)),
         "ProcessType": "Background",
     }
     return plistlib.dumps(payload)
@@ -163,21 +199,26 @@ def render_plist(
 # ---------------------------------------------------------------------------
 
 
-def classify_credential_readiness(*, home: Optional[Path] = None) -> str:
+def classify_credential_readiness(*, mozyo_home: Optional[Path] = None) -> str:
     """Classify **daemon-effective** Redmine credential readiness into a fixed, secret-safe token.
 
     Judges what the *launchd-managed* supervisor will actually have at run time, not what the
-    installer's interactive shell happens to hold. By this module's own plist design the agent
-    carries **no** ``EnvironmentVariables`` and launchd inherits no shell environment, so the
-    daemon's only credential source is the home-scoped file (``resolve_redmine_credentials``'s file
-    path). Readiness therefore resolves with an **empty environ**: an installer's exported
-    ``MOZYO_REDMINE_*`` can never produce a false ``ready`` for a daemon that will not see it
-    (Redmine #13683 review j#79059 F1). Ready needs an api key **and** a normalizable base URL from
-    the home file; a present-but-unsafe / malformed file surfaces as :data:`CREDENTIAL_UNSAFE` (the
-    resolver refuses to read it and returns a redacted warning), so a fail-closed refusal is visibly
-    deliberate. Returns only a token — never the key, the URL, or the warning text.
+    installer's interactive shell happens to hold. Two independent leaks are closed:
+
+    - **shell key/URL** — the plist carries no ``EnvironmentVariables`` and launchd inherits no
+      shell environment, so readiness resolves with an **empty environ**: an installer's exported
+      ``MOZYO_REDMINE_*`` can never produce a false ``ready`` (Redmine #13683 review j#79059 F1).
+    - **shell home root** — the credential file's root is the resolved **mozyo home**
+      (:func:`resolve_mozyo_home`), the exact root pinned onto the daemon argv, not whatever
+      ``mozyo_bridge_home()`` a later launchd process (with no ``MOZYO_BRIDGE_HOME``) would
+      re-derive (j#79092 R2-F1).
+
+    Ready needs an api key **and** a normalizable base URL from that home file; a present-but-unsafe
+    / malformed file surfaces as :data:`CREDENTIAL_UNSAFE` (the resolver refuses to read it and
+    returns a redacted warning), so a fail-closed refusal is visibly deliberate. Returns only a
+    token — never the key, the URL, or the warning text.
     """
-    creds = resolve_redmine_credentials(home, environ={})
+    creds = resolve_redmine_credentials(resolve_mozyo_home(mozyo_home), environ={})
     if creds.warnings:
         return CREDENTIAL_UNSAFE
     has_key = bool(creds.api_key)
@@ -240,7 +281,8 @@ def _is_loaded(runner: Runner) -> tuple[bool, Optional[int]]:
 
 def install(
     *,
-    home: Optional[Path] = None,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
     interval_seconds: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
@@ -248,25 +290,29 @@ def install(
     """Write the owned plist and (re)bootstrap the agent. Idempotent; fail-closed zero-mutation.
 
     Refuses — before any filesystem write or launchctl call — on a non-darwin host, a missing
-    executable, or a non-ready **daemon-effective** Redmine credential (the home-scoped file the
-    launchd agent will actually see; an installer's shell env does not count). On success the plist
-    is rewritten idempotently and the agent is booted out (ignore-failure) then bootstrapped.
+    executable, or a non-ready **daemon-effective** Redmine credential (the mozyo-home file the
+    launchd agent will actually see; an installer's shell env / ``MOZYO_BRIDGE_HOME`` do not leak
+    in). The mozyo home is resolved **once** and used for both the readiness check and the pinned
+    ``--home`` argv, so the daemon reads the exact root the preflight validated. The plist / log
+    live under the OS user home (``os_home``). On success the plist is rewritten idempotently and
+    the agent is booted out (ignore-failure) then bootstrapped.
     """
     if not _running_on_darwin():
         return _refused("install", REASON_UNSUPPORTED_PLATFORM)
-    command = resolve_supervisor_command(which=which)
+    resolved_mozyo = resolve_mozyo_home(mozyo_home)
+    command = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which)
     if command is None:
         return _refused("install", REASON_EXECUTABLE_NOT_FOUND)
-    readiness = classify_credential_readiness(home=home)
+    readiness = classify_credential_readiness(mozyo_home=resolved_mozyo)
     if readiness != CREDENTIAL_READY:
         return _refused(
             "install", _CREDENTIAL_REFUSAL_REASON[readiness], credential_readiness=readiness
         )
 
-    target = plist_path(home)
+    target = plist_path(os_home)
     target.parent.mkdir(parents=True, exist_ok=True)
-    log_path(home).parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(render_plist(command, interval_seconds=interval_seconds, home=home))
+    log_path(os_home).parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(render_plist(command, interval_seconds=interval_seconds, os_home=os_home))
     # A previously loaded agent must be booted out before bootstrap or launchd rejects the
     # duplicate label; a not-loaded bootout is fine to ignore (idempotent install).
     _launchctl(runner, ["bootout", _service_target()])
@@ -289,21 +335,23 @@ def install(
 
 def restart(
     *,
-    home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
     """Kickstart (kill + relaunch) the *loaded* agent. Fail-closed zero-mutation.
 
     Refuses — before any launchctl mutation — on a non-darwin host, a missing executable, a
-    non-ready **daemon-effective** credential (home-scoped file, not shell env), or a service that
-    is not currently loaded (restart never bootstraps a fresh service; that is ``install``).
+    non-ready **daemon-effective** credential (the mozyo-home file, not shell env / shell
+    ``MOZYO_BRIDGE_HOME``), or a service that is not currently loaded (restart never bootstraps a
+    fresh service; that is ``install``).
     """
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM)
-    if resolve_supervisor_command(which=which) is None:
+    resolved_mozyo = resolve_mozyo_home(mozyo_home)
+    if resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which) is None:
         return _refused("restart", REASON_EXECUTABLE_NOT_FOUND)
-    readiness = classify_credential_readiness(home=home)
+    readiness = classify_credential_readiness(mozyo_home=resolved_mozyo)
     if readiness != CREDENTIAL_READY:
         return _refused(
             "restart", _CREDENTIAL_REFUSAL_REASON[readiness], credential_readiness=readiness
@@ -329,18 +377,19 @@ def restart(
 
 def uninstall(
     *,
-    home: Optional[Path] = None,
+    os_home: Optional[Path] = None,
     runner: Runner = _default_runner,
 ) -> dict:
     """Boot the agent out and remove exactly the owned plist. No credential required.
 
     Refuses only on a non-darwin host (there is no launchd to bootout). On darwin, tears down the
-    agent even when credentials are absent — you must be able to remove a service without them.
+    agent even when credentials are absent — you must be able to remove a service without them. The
+    plist lives under the OS user home (``os_home``); no mozyo home is needed to remove it.
     """
     if not _running_on_darwin():
         return _refused("uninstall", REASON_UNSUPPORTED_PLATFORM)
     _launchctl(runner, ["bootout", _service_target()])
-    target = plist_path(home)
+    target = plist_path(os_home)
     existed = target.exists()
     if existed:
         target.unlink()
@@ -354,20 +403,24 @@ def uninstall(
 
 def service_status(
     *,
-    home: Optional[Path] = None,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
     interval_hint: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
 ) -> dict:
     """A read-only, redacted projection of the host service state. Mutates nothing.
 
-    Reports plist existence, loaded/pid, the *scheduled* interval (read from the installed plist),
-    whether the installed executable still matches the PATH-resolved one, and **daemon-effective**
-    credential readiness (the home-scoped file the launchd agent will see, not the caller's shell
-    env) — as booleans / counts / fixed tokens only. Never emits a credential value, a request
-    header, a repo-local path, or pane text. Works on any platform and with no credential.
+    Reports plist existence (under the OS user home ``os_home``), loaded/pid, the *scheduled*
+    interval (read from the installed plist), whether the installed argv still matches the one an
+    install would write now (PATH-resolved executable + pinned mozyo-home ``--home``), and
+    **daemon-effective** credential readiness (the mozyo-home file the launchd agent will see, not
+    the caller's shell env / ``MOZYO_BRIDGE_HOME``) — as booleans / counts / fixed tokens only.
+    Never emits a credential value, a request header, a repo-local path, or pane text. Works on any
+    platform and with no credential.
     """
-    target = plist_path(home)
+    resolved_mozyo = resolve_mozyo_home(mozyo_home)
+    target = plist_path(os_home)
     plist_exists = target.exists()
     loaded, pid = _is_loaded(runner)
 
@@ -377,7 +430,7 @@ def service_status(
     keep_alive_present = ("KeepAlive" in installed) if installed else False
     no_environment_block = ("EnvironmentVariables" not in installed) if installed else True
 
-    resolved = resolve_supervisor_command(which=which)
+    resolved = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which)
     installed_argv = installed.get("ProgramArguments") if installed else None
     executable_matches = bool(
         resolved is not None
@@ -402,7 +455,7 @@ def service_status(
         "keep_alive_present": keep_alive_present,
         "no_environment_block": no_environment_block,
         "executable_matches": executable_matches,
-        "credential_readiness": classify_credential_readiness(home=home),
+        "credential_readiness": classify_credential_readiness(mozyo_home=resolved_mozyo),
     }
 
 
@@ -425,6 +478,7 @@ __all__ = (
     "SUPERVISOR_LAUNCHD_LABEL",
     "SUPERVISOR_EXECUTABLE_NAME",
     "SUPERVISOR_ARGV_TAIL",
+    "SUPERVISOR_HOME_FLAG",
     "REASON_UNSUPPORTED_PLATFORM",
     "REASON_EXECUTABLE_NOT_FOUND",
     "REASON_SERVICE_NOT_LOADED",
@@ -436,6 +490,7 @@ __all__ = (
     "CREDENTIAL_UNSAFE",
     "plist_path",
     "log_path",
+    "resolve_mozyo_home",
     "resolve_supervisor_command",
     "render_plist",
     "classify_credential_readiness",
