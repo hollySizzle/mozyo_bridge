@@ -40,6 +40,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_authority_projection import (
+    ReconcileFacts,
+    reconcile_facts_from_record,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
     ANOMALY_NONE,
     ANOMALY_STAGED_NOT_SUBMITTED,
@@ -633,7 +637,49 @@ def enumerate_lifecycle_diagnostic(repo_root=None) -> tuple:
     return rows, None
 
 
-def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=None) -> GlanceCollection:
+#: Reconcile phases that are terminal — a record here owes no further reconcile action, so
+#: an active (non-terminal) record for the same issue is preferred when projecting.
+_RECONCILE_TERMINAL_PHASES = frozenset({"notified", "closed"})
+
+
+def _reconcile_index(reconcile_store) -> dict[str, ReconcileFacts]:
+    """Index the reconcile-state store by issue -> the most relevant record's facts. (fail-open)
+
+    A store read failure or an unreadable component degrades to an empty index (every lane
+    projects the fail-closed empty reconcile facts — never a fabricated attempt count). Among
+    an issue's records, a non-terminal (active reconcile) record wins over a terminal one, and
+    among equals the most recently updated; so the projection surfaces the live self-heal
+    ladder rather than a stale closed cycle.
+    """
+    if reconcile_store is None:
+        return {}
+    try:
+        records = reconcile_store.records()
+    except Exception:  # noqa: BLE001 - the reconcile store is a rebuildable_cache; degrade
+        return {}
+    best: dict[str, object] = {}
+    for rec in records:
+        issue = str(getattr(rec, "issue_id", "") or "").strip()
+        if not issue:
+            continue
+        current = best.get(issue)
+        if current is None or _reconcile_more_relevant(rec, current):
+            best[issue] = rec
+    return {issue: reconcile_facts_from_record(rec) for issue, rec in best.items()}
+
+
+def _reconcile_more_relevant(candidate, incumbent) -> bool:
+    """Is ``candidate`` a better projection than ``incumbent`` for the same issue? (pure)"""
+    cand_active = str(getattr(candidate, "phase", "")).strip() not in _RECONCILE_TERMINAL_PHASES
+    inc_active = str(getattr(incumbent, "phase", "")).strip() not in _RECONCILE_TERMINAL_PHASES
+    if cand_active != inc_active:
+        return cand_active  # a live reconcile wins over a terminal one
+    return str(getattr(candidate, "updated_at", "")) > str(getattr(incumbent, "updated_at", ""))
+
+
+def active_lane_snapshots(
+    roster, *, redmine_source=None, store=None, ledger=None, reconcile_store=None
+) -> GlanceCollection:
     """Fold every active-lane roster entry into a snapshot (Redmine grammar + advisory store).
 
     ``roster`` is a sequence of ``(issue_id, lane_label)`` (the authoritative active-lane
@@ -653,6 +699,7 @@ def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=Non
     """
     notes: list = []
     store_index = _store_gate_index(store)
+    reconcile_index = _reconcile_index(reconcile_store)
     ordered_issues = [str(issue or "").strip() for issue, _ in roster]
     deliveries = _issue_deliveries([i for i in ordered_issues if i], ledger)
 
@@ -715,6 +762,7 @@ def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=Non
                 latest_gate_journal=gate_journal,
                 delivery=deliveries.get(issue, DeliveryObservation()),
                 durable_facts_available=not degraded,
+                reconcile=reconcile_index.get(issue, ReconcileFacts()),
             )
         )
     return GlanceCollection(snapshots=tuple(snaps), notes=tuple(notes))
