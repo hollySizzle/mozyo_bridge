@@ -741,11 +741,13 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     # a branch (still runbook per worktree-lifecycle-boundary.md); never touches a foreign
     # agent. The default (no --execute) path is byte-for-byte the preflight-only behaviour.
     #
-    # Redmine #13841: --migrate-hibernated-legacy is the mutually-exclusive metadata-only path
-    # for a hibernated / released LEGACY row (empty worktree binding) the guarded close can
-    # never retire (it blocks forever on worktree_binding_unverified) and #13809 backfill does
-    # not cover (active-row only). It launches / closes / resumes NO process — so it takes
-    # precedence over --execute and never runs the guarded close.
+    # Redmine #13841: --migrate-hibernated-legacy is the metadata-only path for a hibernated /
+    # released LEGACY row (empty worktree binding) the guarded close can never retire (it blocks
+    # forever on worktree_binding_unverified) and #13809 backfill does not cover (active-row
+    # only). It launches / closes / resumes NO process. It and --execute are conflicting
+    # destructive intents, so passing both is rejected up front (review j#79150 finding 3, the
+    # guard at the top of this handler) — the branch below runs the migration in the exclusive
+    # case where only --migrate-hibernated-legacy is set, and never the guarded close.
     close_result = None
     migration_result = None
     if getattr(args, "migrate_hibernated_legacy", False):

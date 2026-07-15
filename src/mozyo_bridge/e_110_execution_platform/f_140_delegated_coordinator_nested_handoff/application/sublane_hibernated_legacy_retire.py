@@ -270,9 +270,11 @@ def run_hibernated_legacy_retire_migration(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    # The lane unit the migration targets. Read the durable row FIRST so a duplicate replay
-    # of a completed migration (already ``retired``) is an idempotent no-op — resolved before
-    # the live-inventory read so a finished migration never depends on a readable inventory.
+    # The lane unit the migration targets. Read the durable row here, but do NOT decide the
+    # idempotent already-retired success yet: that is gated on the live-inventory zero read
+    # below (review j#79150 finding 2), so a persisted ``retired`` never reports success while
+    # a pair was relaunched under it. The row read is needed for both that idempotency check
+    # and the CAS; the success decision is deferred until after the live-zero read.
     from mozyo_bridge.core.state.lane_lifecycle import (
         DISPOSITION_RETIRED,
         LaneLifecycleError,
