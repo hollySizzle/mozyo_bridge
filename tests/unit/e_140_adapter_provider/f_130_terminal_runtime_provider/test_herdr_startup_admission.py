@@ -45,7 +45,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 TRUST_SCREEN = (
     "╭──────────────────────────────────────────────╮\n"
     "│ Accessing workspace:                         │\n"
-    "│ /Users/o/dev/lane_worktree                   │\n"
+    "│ /workspace/project-alpha/lane_worktree       │\n"
     "│ Quick safety check: Is this a project you    │\n"
     "│ created or one you trust? (Like your own c   │\n"
     "│ ode, a well-known open source project)       │\n"
@@ -498,7 +498,9 @@ class StartupAdmissionRecordTest(unittest.TestCase):
         self.assertIn("workspace_trust_confirmation", rendered)
         # The screen shows the absolute workspace path it is asking you to trust, and
         # this record is pasted verbatim into a durable journal (j#77947 invariant 3).
-        self.assertNotIn("/Users/", rendered)
+        # (The fixture uses a neutral synthetic workspace path — no home-path-shaped
+        # literal in the tracked tree, #13835 — so the canary keys on that path.)
+        self.assertNotIn("/workspace/", rendered)
         self.assertNotIn("Quick safety check", rendered)
         self.assertNotIn("Yes, proceed", rendered)
 
