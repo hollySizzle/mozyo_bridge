@@ -308,6 +308,57 @@ def markers_from_source(
     return extract_markers(source.read_entries(issue_id))
 
 
+#: The dispatch handoff kind whose exact source journal is the reconciler's dispatch anchor.
+DISPATCH_KIND_IMPLEMENTATION_REQUEST = "implementation_request"
+
+
+def latest_dispatch_journal_from_entries(
+    entries: "Iterable[RedmineJournalEntry]",
+    *,
+    dispatch_kind: str = DISPATCH_KIND_IMPLEMENTATION_REQUEST,
+) -> str:
+    """The journal id of the latest ``handoff`` marker naming ``dispatch_kind`` (pure).
+
+    The EXACT workflow dispatch anchor the reconcile identity needs (Redmine #13758 review
+    R4-F3): the gate reader filters ``implementation_request`` out as non-gate-bearing, and the
+    lifecycle ``decision_journal`` is the lane's *lifecycle* decision, not each dispatch — so a
+    same-lane-generation re-dispatch (a fresh ``implementation_request`` handoff) is
+    distinguished only by its own ``journal`` anchor. Scans the ``[mozyo:handoff:...]`` markers
+    (all kinds, unlike :func:`markers_from_source`) for the highest ``journal`` naming
+    ``dispatch_kind``; returns ``""`` when none is found (the caller then baselines fail-safe).
+    """
+    best_j = -1
+    best = ""
+    for entry in entries or ():
+        notes = getattr(entry, "notes", "") or ""
+        for match in _MARKER_RE.finditer(notes):
+            if match.group("channel") != MARKER_CHANNEL_HANDOFF:
+                continue
+            fields = _parse_marker_fields(match.group("body"))
+            if str(fields.get("kind", "")).strip() != str(dispatch_kind).strip():
+                continue
+            raw = str(fields.get("journal", "") or getattr(entry, "journal_id", "")).strip()
+            try:
+                jn = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if jn > best_j:
+                best_j, best = jn, raw
+    return best
+
+
+def latest_dispatch_journal(
+    source: RedmineJournalSource,
+    issue_id: str,
+    *,
+    dispatch_kind: str = DISPATCH_KIND_IMPLEMENTATION_REQUEST,
+) -> str:
+    """Read the issue's entries and return the latest dispatch-anchor journal (pure over ``source``)."""
+    return latest_dispatch_journal_from_entries(
+        source.read_entries(issue_id), dispatch_kind=dispatch_kind
+    )
+
+
 def render_workflow_event_marker(
     gate: str,
     *,

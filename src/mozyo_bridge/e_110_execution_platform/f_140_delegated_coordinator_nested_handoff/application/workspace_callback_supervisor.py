@@ -862,10 +862,14 @@ def build_supervisor(
 
     from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
     from mozyo_bridge.core.state.reconcile_state import ReconcileStateStore
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_live_source import (
+        lane_worker_runtime,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_supervisor_leg import (
         build_reconcile_leg_fn,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        latest_dispatch_journal,
         markers_from_source,
     )
 
@@ -904,44 +908,48 @@ def build_supervisor(
             workspace_id, issue, binding, lifecycle_store=lifecycle_store
         )
 
-    def _lane_facts(
-        workspace_id: str, issue: str
-    ) -> "tuple[str, int, str, str, str]":
-        """Resolve ``(lane_id, generation, disposition, dispatch_anchor, runtime_state)``.
+    def _lane_facts(workspace_id: str, issue: str) -> "tuple[str, int, str]":
+        """Resolve ``(lane_id, live_generation, lifecycle_disposition)`` for the reconcile leg.
 
         The owning-lane authority (#13681/#13689) resolves the active lane; the lifecycle row's
-        ``lane_generation`` (#13810 incarnation) is the reconcile generation, its
-        ``lane_disposition`` gates a terminal close, and its ``decision_journal`` is the exact
-        durable dispatch anchor (the initial-await baseline — review R3-F2). An unresolved /
-        unreadable owner is a fail-closed blank lane (the leg then skips).
-
-        ``runtime_state`` is the lane worker's live runtime (``busy`` / ``turn_ended`` / ...)
-        from which the leg derives the genuine ``busy -> turn_ended`` edge (review R3-F1). The
-        LIVE per-lane worker runtime read is the installed-artifact surface (#13492), so this
-        production wiring returns ``""`` (fail-closed: no edge without a real runtime
-        observation — never a fabricated wake-derived edge); the edge-detection logic +
-        persistence are wired and test-pinned with an injected runtime.
+        ``lane_generation`` (#13810 incarnation) is the reconcile generation and its
+        ``lane_disposition`` gates a terminal close. An unresolved / unreadable owner is a
+        fail-closed blank lane (the leg then skips). The exact dispatch anchor (review R4-F3)
+        and the live runtime (review R4-F1) are read by the separate source / inventory seams.
         """
         wsid, issue_s = str(workspace_id).strip(), str(issue).strip()
         owner = lifecycle_store.resolve_owner(wsid, issue_s)
         if not getattr(owner, "resolved", False):
-            return "", 0, "", "", ""
+            return "", 0, ""
         lane_id = str(getattr(owner, "lane_id", "") or "").strip()
         record = lifecycle_store.get(LaneLifecycleKey(wsid, lane_id))
         if record is None:
-            return lane_id, 0, "", "", ""
+            return lane_id, 0, ""
         generation = _int_field(record, "lane_generation")
         disposition = str(getattr(record, "lane_disposition", "") or "").strip()
-        dispatch_anchor = str(getattr(record, "decision_journal", "") or "").strip()
-        # The live per-lane worker runtime feed is #13492 (see docstring): fail-closed no-edge.
-        runtime_state = ""
-        return lane_id, generation, disposition, dispatch_anchor, runtime_state
+        return lane_id, generation, disposition
+
+    def _dispatch_anchor_fn(source: object, issue: str) -> str:
+        """The EXACT workflow dispatch anchor: the latest implementation_request handoff journal.
+
+        Read from the issue's raw handoff markers (review R4-F3) — the gate reader filters
+        implementation_request out, and the lifecycle decision journal is the lane's lifecycle
+        decision, not each dispatch. ``None`` / unreadable source -> blank (fail-safe baseline).
+        """
+        if source is None:
+            return ""
+        try:
+            return latest_dispatch_journal(source, str(issue).strip())
+        except Exception:  # noqa: BLE001 - an unreadable dispatch anchor baselines fail-safe
+            return ""
 
     reconcile_leg_fn = build_reconcile_leg_fn(
         reconcile_store=reconcile_store,
         outbox=outbox,
         lane_facts_fn=_lane_facts,
         markers_fn=markers_from_source,
+        dispatch_anchor_fn=_dispatch_anchor_fn,
+        runtime_fn=lane_worker_runtime,
     )
 
     return WorkspaceCallbackSupervisor(

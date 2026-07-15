@@ -150,7 +150,7 @@ def reconcile_leg_once(
     lifecycle_disposition: str,
     outbox: CallbackOutbox,
     reconcile_store: ReconcileStateStore,
-    runtime_state: str = "",
+    runtime_lookup: Optional[Callable[[str], str]] = None,
     dispatch_anchor: str = "",
     redmine_readable: bool = True,
     deadline: str = "",
@@ -165,13 +165,14 @@ def reconcile_leg_once(
     the fail-closed observation and runs :func:`reconcile_once`, then persists the observed
     runtime for the next cycle's edge detection.
 
-    ``runtime_state`` is the lane worker's CURRENT observed runtime (``busy`` / ``turn_ended`` /
-    ...) from the live inventory; the genuine ``busy -> turn_ended`` edge is derived by
-    comparing it to the record's persisted ``last_observed_runtime`` (review R3-F1: a local
-    wake is NOT a turn edge — the wake carries no runtime transition). A blank / unobservable
-    runtime yields no edge (fail-closed: no self-heal without a real turn end). ``dispatch_anchor``
-    is the exact durable dispatch identity (the lifecycle decision journal) used as the initial
-    await baseline so the freshly-dispatched anchor is not a generic ``from0`` (review R3-F2).
+    ``runtime_lookup(expected_owner_role) -> runtime_state`` reads the EXPECTED OWNER's current
+    live runtime (``busy`` / ``turn_ended`` / ...) from the herdr inventory (review R4-F1: the
+    source live-smoke feed — the worker for an implementation await, the gateway for a review
+    await); the genuine ``busy -> turn_ended`` edge is derived by comparing it to the record's
+    persisted ``last_observed_runtime`` and requires a positive prior active state (review R4-F2
+    via :func:`is_turn_end_edge`). A blank / unobservable runtime yields no edge (fail-closed).
+    ``dispatch_anchor`` is the EXACT workflow dispatch anchor (the latest implementation_request
+    handoff journal — review R4-F3) used as the initial await baseline.
     """
     wsid, laneid, issue_s = (
         str(workspace_id).strip(),
@@ -210,7 +211,7 @@ def reconcile_leg_once(
                 markers=markers,
                 live_generation=generation,
                 terminal=terminal,
-                runtime_state=runtime_state,
+                runtime_lookup=runtime_lookup,
                 outbox=outbox,
                 reconcile_store=reconcile_store,
                 redmine_readable=bool(redmine_readable),
@@ -239,7 +240,7 @@ def reconcile_leg_once(
         markers=markers,
         live_generation=generation,
         terminal=terminal,
-        runtime_state=runtime_state,
+        runtime_lookup=runtime_lookup,
         outbox=outbox,
         reconcile_store=reconcile_store,
         redmine_readable=bool(redmine_readable),
@@ -260,7 +261,7 @@ def _run_cycle(
     markers: Iterable[object],
     live_generation: int,
     terminal: bool,
-    runtime_state: str,
+    runtime_lookup: Optional[Callable[[str], str]],
     outbox: CallbackOutbox,
     reconcile_store: ReconcileStateStore,
     redmine_readable: bool,
@@ -276,7 +277,9 @@ def _run_cycle(
     including a busy->turn_ended after a prior turn_ended (a genuine new turn), which a
     stored-only-on-advance model would miss.
     """
-    observed_runtime = str(runtime_state or "").strip()
+    observed_runtime = (
+        str(runtime_lookup(expected_owner) or "").strip() if runtime_lookup else ""
+    )
     cycle = ReconcileCycleInput(
         key=key,
         issue_id=issue,
@@ -372,24 +375,28 @@ def build_reconcile_leg_fn(
     outbox: CallbackOutbox,
     lane_facts_fn: Callable[[str, str], "tuple[str, int, str]"],
     markers_fn: Callable[[object, str], Iterable[object]],
+    dispatch_anchor_fn: Optional[Callable[[object, str], str]] = None,
+    runtime_fn: Optional[Callable[[str, str, str], str]] = None,
 ) -> Callable[[str, str, object], Optional[dict]]:
     """Build the supervisor's ``reconcile_leg_fn`` closure.
 
-    ``lane_facts_fn(workspace_id, issue) -> (lane_id, live_generation, lifecycle_disposition,
-    dispatch_anchor, runtime_state)`` resolves the lane identity + generation + disposition +
-    the exact durable dispatch anchor (review R3-F2) + the live worker runtime (review R3-F1)
-    from the lifecycle authority + live inventory; ``markers_fn(source, issue)`` reads the
-    issue's structured gate markers (the ``workflow watch`` intake). Returns a callable the
-    supervisor invokes per issue **after** the callback drain:
+    - ``lane_facts_fn(workspace_id, issue) -> (lane_id, live_generation, lifecycle_disposition)``
+      resolves the lane identity + generation + disposition from the lifecycle authority;
+    - ``markers_fn(source, issue)`` reads the issue's structured gate markers;
+    - ``dispatch_anchor_fn(source, issue) -> str`` reads the EXACT workflow dispatch anchor (the
+      latest ``implementation_request`` handoff journal — review R4-F3); ``None`` -> blank;
+    - ``runtime_fn(workspace_id, lane_id, expected_owner_role) -> str`` reads the EXPECTED
+      OWNER's LIVE runtime from the herdr inventory (the source live-smoke edge feed — review
+      R4-F1); ``None`` -> blank (fail-closed no-edge).
+
+    Returns a callable the supervisor invokes per issue **after** the callback drain:
     ``reconcile_leg_fn(workspace_id, issue, source) -> report | None``. Any resolution / read
-    failure returns ``None`` (fail-open per issue — the reconcile is a bounded add-on and never
-    aborts the supervisor sweep).
+    failure returns ``None`` (fail-open per issue — never aborts the supervisor sweep).
     """
 
     def _leg(workspace_id: str, issue: str, source: object) -> Optional[dict]:
         try:
-            facts = lane_facts_fn(workspace_id, issue)
-            lane_id, live_generation, disposition, dispatch_anchor, runtime_state = facts
+            lane_id, live_generation, disposition = lane_facts_fn(workspace_id, issue)
         except Exception:  # noqa: BLE001 - an unresolved lane is a fail-open skip (no reconcile)
             return None
         if not str(lane_id or "").strip():
@@ -401,6 +408,19 @@ def build_reconcile_leg_fn(
             readable = False
         else:
             readable = True
+        dispatch_anchor = ""
+        if dispatch_anchor_fn is not None:
+            try:
+                dispatch_anchor = str(dispatch_anchor_fn(source, issue) or "")
+            except Exception:  # noqa: BLE001 - a dispatch-anchor read failure baselines fail-safe
+                dispatch_anchor = ""
+        runtime_lookup = None
+        if runtime_fn is not None:
+            def runtime_lookup(role, _ws=workspace_id, _lane=lane_id, _fn=runtime_fn):
+                try:
+                    return str(_fn(_ws, _lane, role) or "")
+                except Exception:  # noqa: BLE001 - an unreadable runtime is fail-closed no-edge
+                    return ""
         try:
             return reconcile_leg_once(
                 issue=issue,
@@ -411,8 +431,8 @@ def build_reconcile_leg_fn(
                 lifecycle_disposition=disposition,
                 outbox=outbox,
                 reconcile_store=reconcile_store,
-                runtime_state=str(runtime_state or ""),
-                dispatch_anchor=str(dispatch_anchor or ""),
+                runtime_lookup=runtime_lookup,
+                dispatch_anchor=dispatch_anchor,
                 redmine_readable=readable,
             )
         except Exception:  # noqa: BLE001 - a reconcile failure never breaks the supervisor sweep

@@ -45,17 +45,9 @@ class ReconcileLegHarness(unittest.TestCase):
         self.store = ReconcileStateStore(path=self.tmp / "state.sqlite")
         self.outbox = CallbackOutbox(path=self.tmp / "workflow-runtime.sqlite")
 
-    def _leg(
-        self,
-        markers,
-        *,
-        live_generation=1,
-        disposition="active",
-        runtime_state="turn_ended",
-        dispatch_anchor="79337",
-    ):
-        # runtime_state defaults to a genuine busy->turn_ended edge (a fresh record's prior
-        # runtime is blank), so a single leg call fires the self-heal (review R3-F1).
+    def _cycle(self, markers, *, runtime="turn_ended", live_generation=1, disposition="active",
+               dispatch_anchor="79337"):
+        """One reconcile cycle observing ``runtime`` (a constant per-role lookup)."""
         return reconcile_leg_once(
             issue="13758",
             workspace_id="ws1",
@@ -65,9 +57,18 @@ class ReconcileLegHarness(unittest.TestCase):
             lifecycle_disposition=disposition,
             outbox=self.outbox,
             reconcile_store=self.store,
-            runtime_state=runtime_state,
+            runtime_lookup=(lambda role, _r=runtime: _r),
             dispatch_anchor=dispatch_anchor,
         )
+
+    def _leg(self, markers, *, live_generation=1, disposition="active", dispatch_anchor="79337"):
+        # A genuine busy->turn_ended edge needs a POSITIVE prior active observation (review
+        # R4-F2): first observe the owner busy (seeds the record's prior runtime, no edge), then
+        # observe turn_ended (the edge -> self-heal). Returns the edge cycle's report.
+        self._cycle(markers, runtime="busy", live_generation=live_generation,
+                    disposition=disposition, dispatch_anchor=dispatch_anchor)
+        return self._cycle(markers, runtime="turn_ended", live_generation=live_generation,
+                           disposition=disposition, dispatch_anchor=dispatch_anchor)
 
     def _rows(self):
         return self.outbox.read()
@@ -100,15 +101,22 @@ class SelfHealFlow(ReconcileLegHarness):
         self.assertEqual(rep["route"], "implementation_gateway")
 
     def test_non_edge_runtime_does_not_self_heal(self):
-        # review R3-F1: a non-turn-ended runtime (busy, no edge) does not self-heal.
-        rep = self._leg(markers=[], runtime_state="busy")
+        # review R4-F1/F2: a busy runtime (no turn-end) does not self-heal.
+        rep = self._cycle(markers=[], runtime="busy")
+        self.assertEqual(rep["action"], "none")
+        self.assertEqual(len(self._rows()), 0)
+
+    def test_blank_runtime_at_fresh_record_is_not_an_edge(self):
+        # review R4-F2: a fresh record observing turn_ended with NO prior active observation is
+        # NOT an edge (restart / first-attach with a persistent-done worker -> no self-heal).
+        rep = self._cycle(markers=[], runtime="turn_ended")
         self.assertEqual(rep["action"], "none")
         self.assertEqual(len(self._rows()), 0)
 
     def test_persistent_turn_ended_is_not_a_repeated_edge(self):
-        # review R3-F1: a persistent turn_ended re-observed is one edge, not repeated ones.
-        self._leg(markers=[], runtime_state="turn_ended")  # edge -> self_heal 1
-        rep = self._leg(markers=[], runtime_state="turn_ended")  # persistent -> no new edge
+        # review R3-F1/R4-F2: busy->turn_ended is one edge; a persistent turn_ended is not another.
+        self._leg(markers=[])  # busy -> turn_ended edge -> self_heal 1
+        rep = self._cycle(markers=[], runtime="turn_ended")  # persistent -> no new edge
         self.assertEqual(rep["action"], "none")
         rows = [r for r in self._rows() if r.normalized_gate == "self_heal_attempt_1"]
         self.assertEqual(len(rows), 1)  # not double-sent

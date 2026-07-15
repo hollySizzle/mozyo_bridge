@@ -100,10 +100,12 @@ class TurnEndEdgeTest(unittest.TestCase):
     def test_awaiting_to_turn_ended_is_an_edge(self):
         self.assertTrue(is_turn_end_edge(TARGET_AWAITING_INPUT, TARGET_TURN_ENDED))
 
-    def test_first_observation_from_unknown_is_an_edge(self):
-        # A fresh reconciler with no prior observation sees the first turn_ended as an edge.
-        self.assertTrue(is_turn_end_edge("", TARGET_TURN_ENDED))
-        self.assertTrue(is_turn_end_edge("unknown", TARGET_TURN_ENDED))
+    def test_blank_or_unknown_prior_is_not_an_edge(self):
+        # review R4-F2: a fresh record / restart / first attach (no positive prior active
+        # observation) is NOT a turn edge — no evidence of a busy->turn_ended transition, so a
+        # persistent-done worker at restart does not fabricate a self-heal.
+        self.assertFalse(is_turn_end_edge("", TARGET_TURN_ENDED))
+        self.assertFalse(is_turn_end_edge("unknown", TARGET_TURN_ENDED))
 
     def test_persistent_done_reobservation_is_not_an_edge(self):
         # §7: a persistent turn_ended level re-observed on a later snapshot is not a new event.

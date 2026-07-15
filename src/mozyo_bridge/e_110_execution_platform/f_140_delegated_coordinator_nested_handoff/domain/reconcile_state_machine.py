@@ -42,8 +42,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authority import (
+    TARGET_AWAITING_INPUT,
+    TARGET_BLOCKED,
+    TARGET_BUSY,
     TARGET_TURN_ENDED,
 )
+
+#: The runtime states that are POSITIVE evidence a turn was in progress (Redmine #13758 review
+#: R4-F2). A ``busy -> turn_ended`` edge requires the prior runtime to be one of these — a
+#: blank / unknown prior is NOT evidence of a transition (a fresh reconcile record, a restart,
+#: or a first attach where the worker is already ``turn_ended`` must not read as a new edge).
+_ACTIVE_PRIOR_RUNTIMES = frozenset({TARGET_BUSY, TARGET_AWAITING_INPUT, TARGET_BLOCKED})
 
 # ---------------------------------------------------------------------------
 # Reconcile lifecycle phases (the persisted self-heal-ladder state).
@@ -179,22 +188,26 @@ def _norm(value: object) -> str:
 
 
 def is_turn_end_edge(prior_runtime: object, observed_runtime: object) -> bool:
-    """Is ``observed_runtime`` a real busy->turn_ended *edge*, not a persistent re-observation?
+    """Is ``observed_runtime`` a real busy->turn_ended *edge*, with POSITIVE prior evidence?
 
-    Policy §1 (issue description): the ``busy -> turn_ended`` transition is a wake hint, but
-    a persistent ``turn_ended`` (``done``) level re-observed on a later snapshot is NOT a new
-    event and must not increment any counter or re-trigger a reconcile cycle. The edge is:
-    the observed runtime is :data:`~...dispatch_authority.TARGET_TURN_ENDED` AND the prior
-    runtime was something else. When the prior runtime was already ``turn_ended`` (the level
-    persists until the next input), this returns ``False`` — the re-observation is folded.
+    Policy §1 / §7 / §9 (issue description) + review R4-F2: the ``busy -> turn_ended``
+    transition is the reconcile edge, but it must be a *genuine transition*, not just an
+    observation of ``turn_ended``. The edge requires BOTH:
 
-    A blank / unknown prior is treated as "not turn_ended", so the FIRST time a fresh
-    reconciler observes ``turn_ended`` it is an edge (there is a real transition into the
-    level from an unobserved prior). Duplicate-wake suppression for that first edge is the
-    application's job (the supervisor-wake PK coalescing), not this predicate's.
+    - the observed runtime is :data:`~...dispatch_authority.TARGET_TURN_ENDED`, AND
+    - the prior runtime was a POSITIVELY OBSERVED active state (:data:`_ACTIVE_PRIOR_RUNTIMES` —
+      busy / awaiting_input / blocked).
+
+    A blank / unknown / already-``turn_ended`` prior returns ``False`` (fail-closed): a fresh
+    reconcile record, a derived-state deletion, a service restart, or a first attach where the
+    worker is already ``turn_ended`` carries NO evidence of a new transition, so it must not send
+    a self-heal or grow the counter ("repeated done snapshots / restart replay で増殖なし",
+    "local derived state を削除しても安全に再構築"). A persistent ``turn_ended`` re-observed is
+    likewise not an edge. The ladder only advances after the worker is seen busy again (a real
+    new turn) and then ends it.
     """
     return _norm(observed_runtime) == TARGET_TURN_ENDED and (
-        _norm(prior_runtime) != TARGET_TURN_ENDED
+        _norm(prior_runtime) in _ACTIVE_PRIOR_RUNTIMES
     )
 
 
