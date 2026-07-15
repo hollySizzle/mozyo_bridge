@@ -44,6 +44,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     CAS_ALREADY_DECLARED,
     CAS_APPLIED,
     CAS_FORBIDDEN_TRANSITION,
+    CAS_GENERATION_MISMATCH,
     CAS_NOT_FOUND,
     CAS_STALE_REVISION,
     CAS_UNEXPECTED_STATE,
@@ -169,6 +170,74 @@ def transaction_transition_allowed(current: str, target: str) -> bool:
 def participant_transition_allowed(current: str, target: str) -> bool:
     """Is ``current -> target`` a legal participant-phase edge? (pure)"""
     return target in _PARTICIPANT_EDGES.get(norm(current), frozenset())
+
+
+# -- cross-axis ordering (Redmine #13806 R1-F1) ------------------------------
+#
+# The two axes are not independent counters: the design's fixed DAG (j#78384 §2 /
+# Verdict j#78406 "current coordinator は最後") means a transaction phase and its
+# participants' owed phases constrain each other. The store enforces these on the one
+# locked row so the durable state machine cannot represent an unsafe state — e.g.
+# ``completed`` while a participant is still ``close_owed``, or the self coordinator
+# replaced before the non-self participants.
+
+#: The only transaction phase during which a NON-self participant may be actuated
+#: (its replacement happens in step 2, "replace non-self"). Before it the plan is not
+#: yet claimed/started; after it the ``awaiting_self_turn_end`` gate has already
+#: asserted every non-self participant is ``replaced``.
+_NON_SELF_ACTUATION_PHASES = frozenset({PHASE_REPLACING_NONSELF})
+#: The transaction phases during which the SELF (current coordinator) participant may be
+#: actuated — only after its self-close is armed (steps 5–7). The self is replaced last.
+_SELF_ACTUATION_PHASES = frozenset(
+    {
+        PHASE_SELF_CLOSE_ARMED,
+        PHASE_FRESH_COORDINATOR_CLAIMED,
+        PHASE_DRAINING_CONTINUATION,
+    }
+)
+
+
+def _all_replaced(pins: Sequence["ParticipantPin"], *, non_self_only: bool) -> bool:
+    for pin in pins:
+        if non_self_only and pin.is_self:
+            continue
+        if pin.phase != PARTICIPANT_REPLACED:
+            return False
+    return True
+
+
+def transaction_phase_prerequisite_met(
+    participants: Sequence["ParticipantPin"], target: str
+) -> bool:
+    """Is the cross-axis participant prerequisite for a transaction target met? (pure)
+
+    - ``-> awaiting_self_turn_end``: every **non-self** participant must be ``replaced``
+      (the coordinator may not stop replacing non-self participants while any is unfinished).
+    - ``-> completed``: **every** participant, including the self coordinator, must be
+      ``replaced``.
+
+    All other edges carry no participant prerequisite. This is what makes ``completed``
+    with a ``close_owed`` participant — or a self-close before the non-self participants —
+    unrepresentable rather than merely discouraged (Redmine #13806 R1-F1).
+    """
+    if norm(target) == PHASE_AWAITING_SELF_TURN_END:
+        return _all_replaced(participants, non_self_only=True)
+    if norm(target) == PHASE_COMPLETED:
+        return _all_replaced(participants, non_self_only=False)
+    return True
+
+
+def participant_actuation_phase_allowed(is_self: bool, transaction_phase: str) -> bool:
+    """May a participant of this ``is_self`` kind be actuated in this phase? (pure)
+
+    A non-self participant is actuated only while the transaction is ``replacing_nonself``;
+    the self participant only once its self-close is armed (``self_close_armed`` onward), so
+    the current coordinator is always replaced last (j#78384 §2 / Verdict j#78406).
+    """
+    phase = norm(transaction_phase)
+    if is_self:
+        return phase in _SELF_ACTUATION_PHASES
+    return phase in _NON_SELF_ACTUATION_PHASES
 
 
 # -- continuation pointer ----------------------------------------------------
@@ -619,6 +688,7 @@ __all__ = (
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
     "CAS_FORBIDDEN_TRANSITION",
+    "CAS_GENERATION_MISMATCH",
     "CAS_LEASE_CONFLICT",
     "CAS_LEASE_NOT_HELD",
     "CAS_NOT_FOUND",
@@ -636,7 +706,9 @@ __all__ = (
     "ReplacementTransactionRecord",
     "decode_participants",
     "encode_participants",
+    "participant_actuation_phase_allowed",
     "participant_transition_allowed",
+    "transaction_phase_prerequisite_met",
     "transaction_transition_allowed",
     "validate_participants",
     "norm",

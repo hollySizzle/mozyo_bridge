@@ -1,19 +1,21 @@
 """Redmine #13806 tranche A — atomic self-replacement transaction core.
 
 The "1 action generation = 1 durable replacement transaction" substrate (Design Answer
-j#78384, Coordinator Verdict j#78406, Implementation Request j#78948): the session /
-workspace-scoped replacement transaction component that binds several participants + a
-post-self-close continuation into one owner-approved generation, WITHOUT pushing the
-default coordinator into an issue lane's #13810 lifecycle row. Pins:
+j#78384, Coordinator Verdict j#78406, Implementation Request j#78948, R1 review j#79000 /
+verdicts j#79007): the session / workspace-scoped replacement transaction component that
+binds several participants plus a post-self-close continuation into one owner-approved
+generation, WITHOUT pushing the default coordinator into an issue lane's #13810 lifecycle
+row. Pins:
 
 - the pure model: the transaction phase DAG, the participant owed progression, the
-  continuation-pointer / participant-manifest codecs and their fail-closed decoders;
-- the store: plan (immutable header, idempotent exact re-plan), the lease
-  (claim/renew/release with conflict / expiry / epoch), the phase + participant CAS with
-  lease-ownership and exact-revision guards, and partial-replay self-loops;
-- the schema: native-component registration on the shared ``state.sqlite``, coexistence
-  with the lifecycle component, the exact-shape classifier, and the downgrade fail-closed
-  guard;
+  cross-axis ordering guards (R1-F1), the continuation-pointer / participant-manifest
+  codecs and their fail-closed decoders;
+- the store: plan (pristine-only idempotent re-plan, R1-F5), the lease
+  (claim/renew/release with conflict / expiry / epoch / **live-holder renew**, R1-F4), the
+  phase + participant CAS guarded on exact revision + live lease ownership + immutable
+  action generation (R1-F2) + cross-axis ordering (R1-F1);
+- the schema: native-component registration, the exact-shape classifier, and the
+  downgrade fail-closed guard on BOTH the write and read paths (R1-F3);
 - the preservation planner: the pure, additive, fail-closed close fence.
 
 All state lives under an isolated home — never the shared ``$HOME/.mozyo_bridge``.
@@ -34,6 +36,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     CAS_ALREADY_DECLARED,
     CAS_APPLIED,
     CAS_FORBIDDEN_TRANSITION,
+    CAS_GENERATION_MISMATCH,
     CAS_LEASE_CONFLICT,
     CAS_LEASE_NOT_HELD,
     CAS_NOT_FOUND,
@@ -67,7 +70,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E40
     ReplacementTransactionKey,
     decode_participants,
     encode_participants,
+    participant_actuation_phase_allowed,
     participant_transition_allowed,
+    transaction_phase_prerequisite_met,
     transaction_transition_allowed,
     validate_participants,
 )
@@ -91,12 +96,12 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PRESERVE_RUNNING_PROCESS,
     PRESERVE_UNRECORDED_JOURNAL,
     PreservationObservation,
-    PreservationVerdict,
     assess_preservation,
     identity_observation_for,
 )
 
 FUTURE = "2099-01-01T00:00:00+00:00"
+GEN = 7  # the action generation used across the store cases
 
 
 def _decision(issue: str = "13806", journal: str = "78948") -> DecisionPointer:
@@ -146,7 +151,6 @@ class ModelEdgeTests(unittest.TestCase):
                 PHASE_DRAINING_CONTINUATION, PHASE_COMPLETED
             )
         )
-        # No skips, no self-loops, terminal is terminal.
         self.assertFalse(
             transaction_transition_allowed(PHASE_PLANNED, PHASE_REPLACING_NONSELF)
         )
@@ -169,7 +173,6 @@ class ModelEdgeTests(unittest.TestCase):
                 PARTICIPANT_VERIFY_OWED, PARTICIPANT_REPLACED
             )
         )
-        # close_owed does not self-loop; you cannot skip; replaced is terminal.
         self.assertFalse(
             participant_transition_allowed(
                 PARTICIPANT_CLOSE_OWED, PARTICIPANT_CLOSE_OWED
@@ -184,6 +187,55 @@ class ModelEdgeTests(unittest.TestCase):
             participant_transition_allowed(PARTICIPANT_REPLACED, PARTICIPANT_LAUNCH_OWED)
         )
 
+    def test_cross_axis_phase_prerequisite(self):
+        # -> awaiting_self_turn_end requires all NON-self replaced; -> completed requires ALL.
+        gw = _gateway()
+        wk = _worker()
+        sc = _self_coordinator()
+        all_close = (gw, wk, sc)
+        self.assertFalse(
+            transaction_phase_prerequisite_met(all_close, PHASE_AWAITING_SELF_TURN_END)
+        )
+        nonself_done = (
+            gw.with_phase(PARTICIPANT_REPLACED),
+            wk.with_phase(PARTICIPANT_REPLACED),
+            sc,  # self still close_owed
+        )
+        self.assertTrue(
+            transaction_phase_prerequisite_met(
+                nonself_done, PHASE_AWAITING_SELF_TURN_END
+            )
+        )
+        # self still un-replaced -> cannot complete
+        self.assertFalse(
+            transaction_phase_prerequisite_met(nonself_done, PHASE_COMPLETED)
+        )
+        all_done = tuple(p.with_phase(PARTICIPANT_REPLACED) for p in all_close)
+        self.assertTrue(transaction_phase_prerequisite_met(all_done, PHASE_COMPLETED))
+        # An edge with no participant prerequisite is always met.
+        self.assertTrue(
+            transaction_phase_prerequisite_met(all_close, PHASE_REPLACING_NONSELF)
+        )
+
+    def test_cross_axis_actuation_gate(self):
+        # non-self actuated only in replacing_nonself; self only from self_close_armed on.
+        self.assertTrue(
+            participant_actuation_phase_allowed(False, PHASE_REPLACING_NONSELF)
+        )
+        self.assertFalse(participant_actuation_phase_allowed(False, PHASE_CLAIMED))
+        self.assertFalse(
+            participant_actuation_phase_allowed(False, PHASE_SELF_CLOSE_ARMED)
+        )
+        self.assertTrue(
+            participant_actuation_phase_allowed(True, PHASE_SELF_CLOSE_ARMED)
+        )
+        self.assertTrue(
+            participant_actuation_phase_allowed(True, PHASE_DRAINING_CONTINUATION)
+        )
+        self.assertFalse(
+            participant_actuation_phase_allowed(True, PHASE_REPLACING_NONSELF)
+        )
+
 
 class ContinuationPointerTests(unittest.TestCase):
     def test_requires_readable_anchor_and_closed_tokens(self):
@@ -191,22 +243,22 @@ class ContinuationPointerTests(unittest.TestCase):
             ContinuationPointer(
                 source="redmine", issue_id="0", journal_id="1",
                 expected_gate="g", next_semantic_action="n",
-            )  # zero id
+            )
         with self.assertRaises(ContinuationPointerError):
             ContinuationPointer(
                 source="asana", issue_id="1", journal_id="1",
                 expected_gate="g", next_semantic_action="n",
-            )  # unknown source
+            )
         with self.assertRaises(ContinuationPointerError):
             ContinuationPointer(
                 source="redmine", issue_id="1", journal_id="1",
                 expected_gate="", next_semantic_action="n",
-            )  # empty gate
+            )
         with self.assertRaises(ContinuationPointerError):
             ContinuationPointer(
                 source="redmine", issue_id="1", journal_id="1",
                 expected_gate="g", next_semantic_action="",
-            )  # empty action
+            )
 
     def test_round_trip_payload(self):
         c = _continuation()
@@ -240,7 +292,6 @@ class ParticipantManifestTests(unittest.TestCase):
     def test_encode_decode_round_trip_is_deterministic(self):
         pins = validate_participants([_worker(), _gateway(), _self_coordinator()])
         encoded = encode_participants(pins)
-        # Stable across a re-encode of the decoded set (sorted by identity).
         self.assertEqual(encoded, encode_participants(decode_participants(encoded)))
         back = decode_participants(encoded)
         self.assertEqual(len(back), 3)
@@ -256,15 +307,12 @@ class ParticipantManifestTests(unittest.TestCase):
         with self.assertRaises(ParticipantPinError):
             decode_participants('["not", "an", "envelope"]')
         with self.assertRaises(ParticipantPinError):
-            # newer version -> fail closed, never drop fields
             decode_participants(
                 '{"version": %d, "participants": []}' % (PARTICIPANTS_VERSION + 1)
             )
         with self.assertRaises(ParticipantPinError):
-            # bool folds to 1 but is not an int version
             decode_participants('{"version": true, "participants": []}')
         with self.assertRaises(ParticipantPinError):
-            # float folds to 1 but is not an exact integer version
             decode_participants('{"version": 1.0, "participants": []}')
 
 
@@ -277,7 +325,7 @@ class _StoreCase(unittest.TestCase):
     def _plan(self, **kw):
         return self.store.plan_transaction(
             self.key,
-            action_generation=kw.get("action_generation", 7),
+            action_generation=kw.get("action_generation", GEN),
             decision=kw.get("decision", _decision()),
             continuation=kw.get("continuation", _continuation()),
             participants=kw.get(
@@ -285,12 +333,36 @@ class _StoreCase(unittest.TestCase):
             ),
         )
 
-    def _claim(self, holder="fresh-cx", rev=None):
+    def _rev(self):
+        return self.store.get(self.key).revision
+
+    def _claim(self, holder="fresh-cx", gen=GEN, rev=None):
         if rev is None:
-            rev = self.store.get(self.key).revision
+            rev = self._rev()
         return self.store.claim(
-            self.key, expected_revision=rev, holder=holder, lease_expires_at=FUTURE
+            self.key, expected_revision=rev, expected_action_generation=gen,
+            holder=holder, lease_expires_at=FUTURE,
         )
+
+    def _phase(self, target, holder="H", gen=GEN, now=None):
+        return self.store.transition_phase(
+            self.key, expected_revision=self._rev(),
+            expected_action_generation=gen, target=target, holder=holder, now=now,
+        )
+
+    def _participant(self, identity, target, holder="H", gen=GEN):
+        return self.store.transition_participant(
+            self.key, expected_revision=self._rev(),
+            expected_action_generation=gen, identity=identity, target=target,
+            holder=holder,
+        )
+
+    def _replace_participant(self, identity, holder="H"):
+        for tgt in (
+            PARTICIPANT_LAUNCH_OWED, PARTICIPANT_VERIFY_OWED, PARTICIPANT_REPLACED,
+        ):
+            out = self._participant(identity, tgt, holder=holder)
+            self.assertTrue(out.applied, f"{identity} -> {tgt}: {out}")
 
 
 class PlanTests(_StoreCase):
@@ -301,7 +373,7 @@ class PlanTests(_StoreCase):
         self.assertEqual(out.revision, 1)
         rec = self.store.get(self.key)
         self.assertEqual(rec.phase, PHASE_PLANNED)
-        self.assertEqual(rec.action_generation, 7)
+        self.assertEqual(rec.action_generation, GEN)
         self.assertEqual(len(rec.participants), 3)
         self.assertEqual(rec.decision, _decision())
         self.assertEqual(rec.continuation, _continuation())
@@ -310,36 +382,35 @@ class PlanTests(_StoreCase):
         for pin in rec.participants:
             self.assertEqual(pin.phase, PARTICIPANT_CLOSE_OWED)
 
-    def test_exact_replan_is_idempotent(self):
+    def test_exact_replan_of_pristine_row_is_idempotent(self):
         self._plan()
         out = self._plan()
         self.assertTrue(out.applied)
         self.assertEqual(out.reason, CAS_APPLIED)
-        self.assertEqual(out.revision, 1)  # not bumped
+        self.assertEqual(out.revision, 1)
 
     def test_divergent_replan_is_already_declared_zero_write(self):
         self._plan()
         out = self._plan(action_generation=8)
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
-        self.assertEqual(self.store.get(self.key).action_generation, 7)  # unchanged
+        self.assertEqual(self.store.get(self.key).action_generation, GEN)
 
-    def test_replan_after_participant_moved_is_conflict(self):
-        # An in-flight transaction's manifest has advanced phases, so a fresh
-        # planned manifest no longer matches -> a re-plan is refused (never revives).
+    def test_claim_only_advanced_replan_is_conflict(self):
+        # R1-F5: a claimed (but participant-unmoved) row is NOT a pristine re-plan.
+        self._plan()
+        self._claim()  # revision 2, lease held; participants still all close_owed
+        out = self._plan()
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
+
+    def test_participant_advanced_replan_is_conflict(self):
         self._plan()
         self._claim()
-        rec = self.store.get(self.key)
-        self.store.transition_phase(
-            self.key, expected_revision=rec.revision, target=PHASE_CLAIMED,
-            holder="fresh-cx",
-        )
-        rec = self.store.get(self.key)
-        self.store.transition_participant(
-            self.key, expected_revision=rec.revision, identity=_gateway().identity,
-            target=PARTICIPANT_LAUNCH_OWED, holder="fresh-cx",
-        )
-        out = self._plan()  # identical header, but manifest phases advanced
+        self._phase(PHASE_CLAIMED, holder="fresh-cx")
+        self._phase(PHASE_REPLACING_NONSELF, holder="fresh-cx")
+        self._participant(_gateway().identity, PARTICIPANT_LAUNCH_OWED, holder="fresh-cx")
+        out = self._plan()
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_ALREADY_DECLARED)
 
@@ -367,30 +438,28 @@ class LeaseTests(_StoreCase):
         self._claim(holder="A")
         rec = self.store.get(self.key)
         out = self.store.claim(
-            self.key, expected_revision=rec.revision, holder="B", lease_expires_at=FUTURE
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="B", lease_expires_at=FUTURE,
         )
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_LEASE_CONFLICT)
 
     def test_same_holder_reclaims_on_resume(self):
         self._claim(holder="A")
-        rec = self.store.get(self.key)
-        out = self.store.claim(
-            self.key, expected_revision=rec.revision, holder="A", lease_expires_at=FUTURE
-        )
+        out = self._claim(holder="A")
         self.assertTrue(out.applied)
         self.assertEqual(self.store.get(self.key).lease_epoch, 2)
 
     def test_expired_lease_is_reclaimable_by_new_holder(self):
         self.store.claim(
-            self.key, expected_revision=1, holder="A",
+            self.key, expected_revision=1, expected_action_generation=GEN, holder="A",
             lease_expires_at="2020-01-01T00:00:00+00:00",
             now="2019-01-01T00:00:00+00:00",
         )
         rec = self.store.get(self.key)
         out = self.store.claim(
-            self.key, expected_revision=rec.revision, holder="B",
-            lease_expires_at=FUTURE, now="2050-01-01T00:00:00+00:00",
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="B", lease_expires_at=FUTURE, now="2050-01-01T00:00:00+00:00",
         )
         self.assertTrue(out.applied)
         self.assertEqual(self.store.get(self.key).lease_holder, "B")
@@ -398,32 +467,68 @@ class LeaseTests(_StoreCase):
     def test_claim_stale_revision_refused(self):
         self._claim()
         out = self.store.claim(
-            self.key, expected_revision=1, holder="X", lease_expires_at=FUTURE
+            self.key, expected_revision=1, expected_action_generation=GEN,
+            holder="X", lease_expires_at=FUTURE,
         )
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_STALE_REVISION)
 
-    def test_renew_only_by_holder(self):
+    def test_claim_generation_mismatch_refused(self):
+        # R1-F2: a caller on a stale/recycled generation is zero-write.
+        out = self.store.claim(
+            self.key, expected_revision=1, expected_action_generation=GEN + 1,
+            holder="X", lease_expires_at=FUTURE,
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_GENERATION_MISMATCH)
+
+    def test_renew_only_by_live_holder(self):
         self._claim(holder="A")
         rec = self.store.get(self.key)
         bad = self.store.renew(
-            self.key, expected_revision=rec.revision, holder="B", lease_expires_at=FUTURE
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="B", lease_expires_at=FUTURE,
         )
         self.assertFalse(bad.applied)
         self.assertEqual(bad.reason, CAS_LEASE_NOT_HELD)
         ok = self.store.renew(
-            self.key, expected_revision=rec.revision, holder="A", lease_expires_at=FUTURE
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="A", lease_expires_at=FUTURE,
         )
         self.assertTrue(ok.applied)
         self.assertEqual(self.store.get(self.key).lease_epoch, 1)  # epoch unchanged
 
+    def test_expired_holder_cannot_renew(self):
+        # R1-F4: an expired holder must re-claim (epoch bump), never renew a lapsed lease.
+        self.store.claim(
+            self.key, expected_revision=1, expected_action_generation=GEN, holder="A",
+            lease_expires_at="2020-01-01T00:00:00+00:00",
+            now="2019-01-01T00:00:00+00:00",
+        )
+        rec = self.store.get(self.key)
+        out = self.store.renew(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="A", lease_expires_at="2060-01-01T00:00:00+00:00",
+            now="2050-01-01T00:00:00+00:00",
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_LEASE_NOT_HELD)
+        after = self.store.get(self.key)
+        self.assertEqual(after.lease_expires_at, "2020-01-01T00:00:00+00:00")  # unchanged
+
     def test_release_only_by_holder_and_clears_lease(self):
         self._claim(holder="A")
         rec = self.store.get(self.key)
-        bad = self.store.release(self.key, expected_revision=rec.revision, holder="B")
+        bad = self.store.release(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="B",
+        )
         self.assertFalse(bad.applied)
         self.assertEqual(bad.reason, CAS_LEASE_NOT_HELD)
-        ok = self.store.release(self.key, expected_revision=rec.revision, holder="A")
+        ok = self.store.release(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="A",
+        )
         self.assertTrue(ok.applied)
         after = self.store.get(self.key)
         self.assertEqual(after.lease_holder, "")
@@ -432,7 +537,8 @@ class LeaseTests(_StoreCase):
     def test_claim_missing_row_not_found(self):
         out = self.store.claim(
             ReplacementTransactionKey("ws1", "nope"),
-            expected_revision=1, holder="X", lease_expires_at=FUTURE,
+            expected_revision=1, expected_action_generation=GEN, holder="X",
+            lease_expires_at=FUTURE,
         )
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_NOT_FOUND)
@@ -445,70 +551,86 @@ class PhaseTransitionTests(_StoreCase):
         self._claim(holder="H")
 
     def test_phase_advances_under_live_holder(self):
-        rec = self.store.get(self.key)
-        out = self.store.transition_phase(
-            self.key, expected_revision=rec.revision, target=PHASE_CLAIMED, holder="H"
-        )
+        out = self._phase(PHASE_CLAIMED)
         self.assertTrue(out.applied)
         self.assertEqual(self.store.get(self.key).phase, PHASE_CLAIMED)
 
     def test_phase_requires_lease_holder(self):
-        rec = self.store.get(self.key)
-        out = self.store.transition_phase(
-            self.key, expected_revision=rec.revision, target=PHASE_CLAIMED,
-            holder="stranger",
-        )
+        out = self._phase(PHASE_CLAIMED, holder="stranger")
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_LEASE_NOT_HELD)
 
     def test_phase_requires_live_lease(self):
-        # Re-claim with an expiry in the past relative to the transition's `now`.
         rec = self.store.get(self.key)
         self.store.claim(
-            self.key, expected_revision=rec.revision, holder="H",
-            lease_expires_at="2020-01-01T00:00:00+00:00",
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="H", lease_expires_at="2020-01-01T00:00:00+00:00",
             now="2019-01-01T00:00:00+00:00",
         )
-        rec = self.store.get(self.key)
-        out = self.store.transition_phase(
-            self.key, expected_revision=rec.revision, target=PHASE_CLAIMED,
-            holder="H", now="2050-01-01T00:00:00+00:00",
-        )
+        out = self._phase(PHASE_CLAIMED, holder="H", now="2050-01-01T00:00:00+00:00")
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_LEASE_NOT_HELD)
 
+    def test_phase_generation_mismatch_refused(self):
+        out = self._phase(PHASE_CLAIMED, gen=GEN + 1)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_GENERATION_MISMATCH)
+
     def test_illegal_edge_refused(self):
-        rec = self.store.get(self.key)
-        out = self.store.transition_phase(
-            self.key, expected_revision=rec.revision,
-            target=PHASE_REPLACING_NONSELF, holder="H",
-        )
+        out = self._phase(PHASE_REPLACING_NONSELF)  # planned -> replacing_nonself skips claimed
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
 
-    def test_full_linear_walk_to_completed(self):
-        order = [
-            PHASE_CLAIMED,
-            PHASE_REPLACING_NONSELF,
-            PHASE_AWAITING_SELF_TURN_END,
-            PHASE_SELF_CLOSE_ARMED,
-            PHASE_FRESH_COORDINATOR_CLAIMED,
-            PHASE_DRAINING_CONTINUATION,
-            PHASE_COMPLETED,
-        ]
-        for target in order:
-            rec = self.store.get(self.key)
-            # Keep the lease live across the walk (renew is not needed; FUTURE holds).
-            out = self.store.transition_phase(
-                self.key, expected_revision=rec.revision, target=target, holder="H"
-            )
-            self.assertTrue(out.applied, f"{target}: {out}")
-        self.assertEqual(self.store.get(self.key).phase, PHASE_COMPLETED)
+    def test_cannot_leave_replacing_nonself_until_nonself_replaced(self):
+        # R1-F1: awaiting_self_turn_end requires all non-self participants replaced.
+        self._phase(PHASE_CLAIMED)
+        self._phase(PHASE_REPLACING_NONSELF)
+        out = self._phase(PHASE_AWAITING_SELF_TURN_END)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        # replace only ONE of the two non-self -> still blocked
+        self._replace_participant(_gateway().identity)
+        out = self._phase(PHASE_AWAITING_SELF_TURN_END)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        # replace the other -> now allowed
+        self._replace_participant(_worker().identity)
+        self.assertTrue(self._phase(PHASE_AWAITING_SELF_TURN_END).applied)
+
+    def test_cannot_complete_with_unreplaced_self(self):
+        # Walk to draining_continuation with self still un-replaced, then completed blocks.
+        self._phase(PHASE_CLAIMED)
+        self._phase(PHASE_REPLACING_NONSELF)
+        self._replace_participant(_gateway().identity)
+        self._replace_participant(_worker().identity)
+        self._phase(PHASE_AWAITING_SELF_TURN_END)
+        self._phase(PHASE_SELF_CLOSE_ARMED)
+        self._phase(PHASE_FRESH_COORDINATOR_CLAIMED)
+        self._phase(PHASE_DRAINING_CONTINUATION)
+        out = self._phase(PHASE_COMPLETED)  # self still close_owed
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+
+    def test_full_valid_choreography_to_completed(self):
+        self._phase(PHASE_CLAIMED)
+        self._phase(PHASE_REPLACING_NONSELF)
+        self._replace_participant(_gateway().identity)
+        self._replace_participant(_worker().identity)
+        self._phase(PHASE_AWAITING_SELF_TURN_END)
+        self._phase(PHASE_SELF_CLOSE_ARMED)
+        self._replace_participant(_self_coordinator().identity)  # self replaced last
+        self._phase(PHASE_FRESH_COORDINATOR_CLAIMED)
+        self._phase(PHASE_DRAINING_CONTINUATION)
+        self.assertTrue(self._phase(PHASE_COMPLETED).applied)
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.phase, PHASE_COMPLETED)
+        self.assertTrue(all(p.phase == PARTICIPANT_REPLACED for p in rec.participants))
 
     def test_unknown_phase_raises(self):
         with self.assertRaises(ValueError):
             self.store.transition_phase(
-                self.key, expected_revision=2, target="bogus", holder="H"
+                self.key, expected_revision=2, expected_action_generation=GEN,
+                target="bogus", holder="H",
             )
 
 
@@ -517,77 +639,89 @@ class ParticipantTransitionTests(_StoreCase):
         super().setUp()
         self._plan()
         self._claim(holder="H")
+        self._phase(PHASE_CLAIMED)
+        self._phase(PHASE_REPLACING_NONSELF)  # non-self participants may now be actuated
         self.tid = _gateway().identity
-
-    def _rev(self):
-        return self.store.get(self.key).revision
 
     def test_owed_progression_and_identity_preserved(self):
         for target in (
-            PARTICIPANT_LAUNCH_OWED,
-            PARTICIPANT_VERIFY_OWED,
-            PARTICIPANT_REPLACED,
+            PARTICIPANT_LAUNCH_OWED, PARTICIPANT_VERIFY_OWED, PARTICIPANT_REPLACED,
         ):
-            out = self.store.transition_participant(
-                self.key, expected_revision=self._rev(), identity=self.tid,
-                target=target, holder="H",
-            )
+            out = self._participant(self.tid, target)
             self.assertTrue(out.applied, f"{target}: {out}")
         rec = self.store.get(self.key)
         gw = rec.find_participant(self.tid)
         self.assertEqual(gw.phase, PARTICIPANT_REPLACED)
-        # Identity + evidence untouched by the phase moves.
         self.assertEqual(gw.old_locator, "w28:p1")
         self.assertEqual(gw.identity, self.tid)
-        # The other participants are untouched.
         self.assertEqual(
             rec.find_participant(_worker().identity).phase, PARTICIPANT_CLOSE_OWED
         )
 
     def test_launch_owed_self_loop_is_replay_safe(self):
-        self.store.transition_participant(
-            self.key, expected_revision=self._rev(), identity=self.tid,
-            target=PARTICIPANT_LAUNCH_OWED, holder="H",
-        )
-        out = self.store.transition_participant(
-            self.key, expected_revision=self._rev(), identity=self.tid,
-            target=PARTICIPANT_LAUNCH_OWED, holder="H",
-        )
+        self._participant(self.tid, PARTICIPANT_LAUNCH_OWED)
+        out = self._participant(self.tid, PARTICIPANT_LAUNCH_OWED)
         self.assertTrue(out.applied)
 
     def test_illegal_skip_refused(self):
-        out = self.store.transition_participant(
-            self.key, expected_revision=self._rev(), identity=self.tid,
-            target=PARTICIPANT_REPLACED, holder="H",
-        )
+        out = self._participant(self.tid, PARTICIPANT_REPLACED)
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
 
     def test_unknown_participant_not_found(self):
-        out = self.store.transition_participant(
-            self.key, expected_revision=self._rev(), identity=("a", "b", "c", "d"),
-            target=PARTICIPANT_LAUNCH_OWED, holder="H",
-        )
+        out = self._participant(("a", "b", "c", "d"), PARTICIPANT_LAUNCH_OWED)
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_PARTICIPANT_NOT_FOUND)
 
     def test_participant_move_requires_lease_holder(self):
-        out = self.store.transition_participant(
-            self.key, expected_revision=self._rev(), identity=self.tid,
-            target=PARTICIPANT_LAUNCH_OWED, holder="stranger",
-        )
+        out = self._participant(self.tid, PARTICIPANT_LAUNCH_OWED, holder="stranger")
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_LEASE_NOT_HELD)
 
+    def test_participant_generation_mismatch_refused(self):
+        out = self._participant(self.tid, PARTICIPANT_LAUNCH_OWED, gen=GEN + 1)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_GENERATION_MISMATCH)
+
+    def test_self_participant_cannot_move_before_self_close_armed(self):
+        # R1-F1: the self coordinator is replaced last; it cannot move in replacing_nonself.
+        out = self._participant(_self_coordinator().identity, PARTICIPANT_LAUNCH_OWED)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+
+    def test_nonself_participant_cannot_move_before_replacing_nonself(self):
+        # R1-F1: a non-self participant may be actuated only while in `replacing_nonself`.
+        # Build a fresh transaction stopped at `claimed` to isolate the actuation gate from
+        # the participant edge (gateway is still at close_owed, a legal owed edge).
+        key = ReplacementTransactionKey("ws1", "act:other")
+        self.store.plan_transaction(
+            key, action_generation=GEN, decision=_decision(),
+            continuation=_continuation(),
+            participants=[_gateway(), _worker(), _self_coordinator()],
+        )
+        self.store.claim(
+            key, expected_revision=1, expected_action_generation=GEN, holder="H",
+            lease_expires_at=FUTURE,
+        )
+        rev = self.store.get(key).revision
+        self.store.transition_phase(
+            key, expected_revision=rev, expected_action_generation=GEN,
+            target=PHASE_CLAIMED, holder="H",
+        )
+        rev = self.store.get(key).revision
+        out = self.store.transition_participant(  # phase is `claimed`, not replacing_nonself
+            key, expected_revision=rev, expected_action_generation=GEN,
+            identity=_gateway().identity, target=PARTICIPANT_LAUNCH_OWED, holder="H",
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+
     def test_stale_revision_refused(self):
         first = self._rev()
-        self.store.transition_participant(
-            self.key, expected_revision=first, identity=self.tid,
-            target=PARTICIPANT_LAUNCH_OWED, holder="H",
-        )
+        self._participant(self.tid, PARTICIPANT_LAUNCH_OWED)
         out = self.store.transition_participant(
-            self.key, expected_revision=first, identity=self.tid,
-            target=PARTICIPANT_VERIFY_OWED, holder="H",
+            self.key, expected_revision=first, expected_action_generation=GEN,
+            identity=self.tid, target=PARTICIPANT_VERIFY_OWED, holder="H",
         )
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_STALE_REVISION)
@@ -632,7 +766,6 @@ class SchemaRegistrationTests(unittest.TestCase):
         self.assertIsNone(row[0])
 
     def test_coexists_with_lifecycle_component_on_one_container(self):
-        # The lifecycle store and this store share the one state.sqlite container.
         from mozyo_bridge.core.state.lane_lifecycle import (
             LANE_LIFECYCLE_COMPONENT,
             LaneLifecycleStore,
@@ -646,7 +779,7 @@ class SchemaRegistrationTests(unittest.TestCase):
 
     def test_idempotent_ensure(self):
         ensure_replacement_transaction_schema(self.path)
-        ensure_replacement_transaction_schema(self.path)  # no raise, no duplicate
+        ensure_replacement_transaction_schema(self.path)
         self.assertEqual(
             self._components()[REPLACEMENT_TRANSACTION_COMPONENT][0],
             REPLACEMENT_TRANSACTION_SCHEMA_VERSION,
@@ -676,12 +809,11 @@ class SchemaDowngradeGuardTests(unittest.TestCase):
             ensure_replacement_transaction_schema(self.path)
 
     def test_malformed_version_fails_closed(self):
-        self._set_recorded_version(2.5)  # a REAL, not an exact integer
+        self._set_recorded_version(2.5)
         with self.assertRaises(ReplacementTransactionError):
             ensure_replacement_transaction_schema(self.path)
 
     def test_table_without_metadata_fails_closed(self):
-        # Drop the component metadata row but leave the table -> partial/unknown state.
         conn = sqlite3.connect(self.path)
         try:
             conn.execute(
@@ -713,7 +845,6 @@ class ReadonlyStatusTests(unittest.TestCase):
         self.path = replacement_transaction_path(self.home)
 
     def test_absent_when_no_state_file(self):
-        # A non-creating read of an absent store yields () (nothing created).
         self.assertEqual(load_replacement_transactions_readonly(home=self.home), ())
         self.assertFalse(self.path.exists())
 
@@ -728,7 +859,6 @@ class ReadonlyStatusTests(unittest.TestCase):
             conn.close()
 
     def test_absent_status_on_bare_container(self):
-        # A container with the components registry but no replacement component/table.
         from mozyo_bridge.core.state.state_store import connect_state_container_rw
 
         connect_state_container_rw(self.path).close()
@@ -760,6 +890,27 @@ class ReadonlyStatusTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_readonly_exact_shape_mismatch_is_unsupported(self):
+        # R1-F3: the read path must reject a foreign/partial shape the write path rejects.
+        ensure_replacement_transaction_schema(self.path)
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                f"ALTER TABLE {REPLACEMENT_TABLE} ADD COLUMN bogus TEXT NOT NULL DEFAULT ''"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        try:
+            self.assertEqual(
+                readonly_component_status(conn), READONLY_COMPONENT_UNSUPPORTED
+            )
+        finally:
+            conn.close()
+        # and the read-only loader fails closed (None), never reads authority rows.
+        self.assertIsNone(load_replacement_transactions_readonly(home=self.home))
+
     def test_readonly_load_fails_closed_on_unsupported(self):
         ensure_replacement_transaction_schema(self.path)
         conn = sqlite3.connect(self.path)
@@ -785,7 +936,6 @@ class ModuleLevelReadTests(_StoreCase):
 
     def test_isolated_home_never_touches_default(self):
         self._plan()
-        # The store path is strictly under the isolated home.
         self.assertTrue(
             str(replacement_transaction_path(self.home)).startswith(str(self.home))
         )
@@ -850,7 +1000,6 @@ class PreservationPlannerTests(unittest.TestCase):
             )
         )
         self.assertEqual(v.reasons, (PRESERVE_DIRTY_DIFF, PRESERVE_PENDING_APPROVAL))
-        # deterministic PRESERVATION_REASONS order
         self.assertEqual(
             v.reasons, tuple(r for r in PRESERVATION_REASONS if r in v.reasons)
         )
@@ -865,7 +1014,6 @@ class PreservationPlannerTests(unittest.TestCase):
                 observed_lane_generation="2",
             )
         )
-        # a diverged lifecycle revision fails the fence
         self.assertFalse(
             identity_observation_for(
                 wk, observed_lane_id="lane_a", observed_role="worker",
@@ -874,7 +1022,6 @@ class PreservationPlannerTests(unittest.TestCase):
                 observed_lane_generation="2",
             )
         )
-        # a diverged locator fails the fence
         self.assertFalse(
             identity_observation_for(
                 wk, observed_lane_id="lane_a", observed_role="worker",
@@ -885,7 +1032,6 @@ class PreservationPlannerTests(unittest.TestCase):
         )
 
     def test_identity_helper_ignores_lifecycle_when_pin_unbound(self):
-        # The self coordinator carries no lifecycle pin, so it does not constrain those.
         gw = _gateway()
         self.assertTrue(
             identity_observation_for(

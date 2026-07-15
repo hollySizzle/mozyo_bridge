@@ -36,6 +36,7 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_ALREADY_DECLARED,
     CAS_APPLIED,
     CAS_FORBIDDEN_TRANSITION,
+    CAS_GENERATION_MISMATCH,
     CAS_LEASE_CONFLICT,
     CAS_LEASE_NOT_HELD,
     CAS_NOT_FOUND,
@@ -53,7 +54,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     decode_participants,
     encode_participants,
     norm,
+    participant_actuation_phase_allowed,
     participant_transition_allowed,
+    transaction_phase_prerequisite_met,
     transaction_transition_allowed,
     validate_participants,
 )
@@ -118,7 +121,7 @@ def _rollback(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _header_matches(
+def _is_pristine_replan(
     existing: ReplacementTransactionRecord,
     *,
     action_generation: int,
@@ -126,14 +129,19 @@ def _header_matches(
     continuation: ContinuationPointer,
     participants_manifest: str,
 ) -> bool:
-    """Is ``existing`` an exact-header duplicate of this plan? (the idempotency test)
+    """Is ``existing`` a *genuinely untouched* exact-header duplicate? (the idempotency test)
 
-    Compares the immutable header AND the encoded participant manifest. The manifest
-    encodes each participant's phase, so a transaction whose participants have advanced
-    (an in-flight one) never matches a fresh planned manifest — only a genuinely untouched
-    re-plan of the identical transaction is idempotent; anything else is a conflict.
+    Idempotent no-op requires BOTH an exact header/manifest match AND a pristine row
+    (Redmine #13806 R1-F5): the row is still at :data:`PHASE_PLANNED`, at its initial
+    revision 1, and holds no lease (``lease_holder`` empty, ``lease_epoch`` 0). The manifest
+    match already asserts every participant is ``close_owed`` (a fresh plan's manifest is
+    all-``close_owed``); the pristine gate additionally excludes a row that has been
+    **claimed or phase-advanced** without moving a participant. Reporting an in-flight,
+    lease-held authority row as an ``applied`` re-plan would let a caller mistake a claimed
+    transaction for a fresh, untouched one — so anything short of pristine is
+    :data:`CAS_ALREADY_DECLARED`, never a silent success.
     """
-    return (
+    header_matches = (
         existing.action_generation == action_generation
         and existing.decision_source == decision.source
         and existing.decision_issue_id == decision.issue_id
@@ -145,6 +153,13 @@ def _header_matches(
         and existing.continuation_next_action == continuation.next_semantic_action
         and existing.participants_manifest == participants_manifest
     )
+    pristine = (
+        existing.phase == PHASE_PLANNED
+        and existing.revision == 1
+        and existing.lease_holder == ""
+        and existing.lease_epoch == 0
+    )
+    return header_matches and pristine
 
 
 # -- store -------------------------------------------------------------------
@@ -223,12 +238,14 @@ class ReplacementTransactionStore:
         participant identities — is fixed here and never mutated again (j#78384 §1). Every
         participant lands at :data:`PARTICIPANT_CLOSE_OWED`.
 
-        Idempotent by exact header (the ``declare_lane`` precedent, the #13806 duplicate-
-        invocation requirement): re-planning the **exact** same transaction — same
-        generation, decision, continuation, and untouched participant manifest — is a no-op
-        success. A row at the same key whose header **differs**, or whose participants have
-        already advanced, is :data:`CAS_ALREADY_DECLARED` — a re-plan never silently
-        overwrites an in-flight authority row. Every refusal is zero-write.
+        Idempotent by exact header on a **pristine** row (the ``declare_lane`` precedent, the
+        #13806 duplicate-invocation requirement, R1-F5): re-planning the exact same
+        transaction — same generation, decision, continuation, untouched manifest — is a
+        no-op success ONLY while the row is still pristine (phase ``planned``, revision 1, no
+        lease). A row whose header **differs**, or which has been claimed / phase-advanced /
+        participant-advanced, is :data:`CAS_ALREADY_DECLARED` — a re-plan never silently
+        overwrites, nor reports as fresh, an in-flight authority row. Every refusal is
+        zero-write.
         """
         if not isinstance(action_generation, int) or isinstance(
             action_generation, bool
@@ -246,7 +263,7 @@ class ReplacementTransactionStore:
             conn.execute("BEGIN IMMEDIATE")
             existing = _locked_row(conn, key)
             if existing is not None:
-                if _header_matches(
+                if _is_pristine_replan(
                     existing,
                     action_generation=action_generation,
                     decision=decision,
@@ -305,6 +322,7 @@ class ReplacementTransactionStore:
         key: ReplacementTransactionKey,
         *,
         expected_revision: int,
+        expected_action_generation: int,
         holder: str,
         lease_expires_at: str,
         now: Optional[str] = None,
@@ -318,6 +336,12 @@ class ReplacementTransactionStore:
         :data:`CAS_LEASE_CONFLICT` with no write. ``holder`` is an action-bound identity
         token (the fresh coordinator's attested name); tranche A stores it, and the
         actuator that mints it is tranche C.
+
+        ``expected_action_generation`` pins the immutable approval generation (R1-F2): a
+        caller acting on a stale / recycled action generation is refused
+        :data:`CAS_GENERATION_MISMATCH`, zero-write. The row's generation never moves, so
+        this proves the caller and the row agree on *which* approved action they are on —
+        the concurrency ``revision`` cannot express that.
         """
         who = norm(holder)
         if not who:
@@ -333,6 +357,13 @@ class ReplacementTransactionStore:
             if current is None:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.action_generation != expected_action_generation:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_GENERATION_MISMATCH,
+                    revision=current.revision,
+                )
             if current.revision != expected_revision:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -383,15 +414,20 @@ class ReplacementTransactionStore:
         key: ReplacementTransactionKey,
         *,
         expected_revision: int,
+        expected_action_generation: int,
         holder: str,
         lease_expires_at: str,
         now: Optional[str] = None,
     ) -> CasOutcome:
-        """Extend the lease expiry — only the current holder may renew.
+        """Extend the lease expiry — only the current, **live** holder may renew.
 
-        A caller that is not the current ``lease_holder`` is refused
-        :data:`CAS_LEASE_NOT_HELD` (never silently re-acquires); the epoch is unchanged (a
-        renewal is not a fresh acquisition).
+        A renewal *extends a lease the caller still holds*; it is not a fresh acquisition
+        (R1-F4). So a caller that is not the current ``lease_holder``, OR whose lease has
+        already **expired**, is refused :data:`CAS_LEASE_NOT_HELD` — an expired holder must
+        go through :meth:`claim` (which bumps the epoch and can be contested by a new
+        holder), never resurrect a lapsed lease and thereby skip the epoch fence. The epoch
+        is unchanged on a successful renew. ``expected_action_generation`` pins the immutable
+        generation (R1-F2), refusing a stale-generation caller :data:`CAS_GENERATION_MISMATCH`.
         """
         who = norm(holder)
         expires = norm(lease_expires_at)
@@ -405,6 +441,13 @@ class ReplacementTransactionStore:
             if current is None:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.action_generation != expected_action_generation:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_GENERATION_MISMATCH,
+                    revision=current.revision,
+                )
             if current.revision != expected_revision:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -412,7 +455,13 @@ class ReplacementTransactionStore:
                     reason=CAS_STALE_REVISION,
                     revision=current.revision,
                 )
-            if not who or current.lease_holder != who:
+            if (
+                not who
+                or current.lease_holder != who
+                or not current.lease_is_live(stamp)
+            ):
+                # An expired holder must re-``claim`` (epoch bump), never renew a lapsed
+                # lease — that would revive side-effect authority behind the epoch fence.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
@@ -449,13 +498,17 @@ class ReplacementTransactionStore:
         key: ReplacementTransactionKey,
         *,
         expected_revision: int,
+        expected_action_generation: int,
         holder: str,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Release the lease — only the current holder may release.
 
         Clears the holder + expiry (keeping the epoch, so a later claim still moves it
-        forward). A non-holder is refused :data:`CAS_LEASE_NOT_HELD`, zero-write.
+        forward). A non-holder is refused :data:`CAS_LEASE_NOT_HELD`, zero-write. Releasing a
+        lease is giving up authority, so it is allowed for the recorded holder even after
+        expiry (it never revives authority). ``expected_action_generation`` pins the immutable
+        generation (R1-F2).
         """
         who = norm(holder)
         stamp = now or _utc_now()
@@ -466,6 +519,13 @@ class ReplacementTransactionStore:
             if current is None:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.action_generation != expected_action_generation:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_GENERATION_MISMATCH,
+                    revision=current.revision,
+                )
             if current.revision != expected_revision:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -511,6 +571,7 @@ class ReplacementTransactionStore:
         key: ReplacementTransactionKey,
         *,
         expected_revision: int,
+        expected_action_generation: int,
         target: str,
         holder: str,
         now: Optional[str] = None,
@@ -522,6 +583,14 @@ class ReplacementTransactionStore:
         :data:`CAS_LEASE_NOT_HELD`, and an illegal edge (:func:`transaction_transition_allowed`)
         is :data:`CAS_FORBIDDEN_TRANSITION`. A duplicate transition simply fails the exact
         expected-revision guard, so a resuming holder re-reads the phase and continues.
+
+        It also enforces the **cross-axis prerequisite** (R1-F1,
+        :func:`transaction_phase_prerequisite_met`): the transaction may not leave
+        ``replacing_nonself`` until every non-self participant is ``replaced``, nor reach
+        ``completed`` until *all* participants are — so ``completed`` with an unfinished
+        participant, or a self-close before the non-self participants, is unrepresentable.
+        A prerequisite miss is :data:`CAS_FORBIDDEN_TRANSITION`, zero-write.
+        ``expected_action_generation`` pins the immutable generation (R1-F2).
         """
         if target not in TRANSACTION_PHASES:
             raise ValueError(f"unknown transaction phase {target!r}")
@@ -534,6 +603,13 @@ class ReplacementTransactionStore:
             if current is None:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.action_generation != expected_action_generation:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_GENERATION_MISMATCH,
+                    revision=current.revision,
+                )
             if current.revision != expected_revision:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -549,6 +625,14 @@ class ReplacementTransactionStore:
                     revision=current.revision,
                 )
             if not transaction_transition_allowed(current.phase, target):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
+            if not transaction_phase_prerequisite_met(current.participants, target):
+                # Cross-axis ordering: e.g. -> completed while a participant is un-replaced.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
@@ -584,6 +668,7 @@ class ReplacementTransactionStore:
         key: ReplacementTransactionKey,
         *,
         expected_revision: int,
+        expected_action_generation: int,
         identity: tuple[str, str, str, str],
         target: str,
         holder: str,
@@ -598,9 +683,18 @@ class ReplacementTransactionStore:
         moves — its identity manifest is preserved byte-for-byte, so a transition can never
         re-identify a participant.
 
+        It also enforces the **cross-axis actuation gate** (R1-F1,
+        :func:`participant_actuation_phase_allowed`): a non-self participant may be actuated
+        only while the transaction is ``replacing_nonself``, and the self (current
+        coordinator) participant only once its self-close is armed
+        (``self_close_armed`` onward) — so the current coordinator is always replaced last.
+        A move outside the participant's allowed transaction phase is
+        :data:`CAS_FORBIDDEN_TRANSITION`, zero-write.
+
         Refusals are zero-write: a non-holder / expired lease is :data:`CAS_LEASE_NOT_HELD`,
-        an unknown participant is :data:`CAS_PARTICIPANT_NOT_FOUND`, an illegal edge is
-        :data:`CAS_FORBIDDEN_TRANSITION`, and a stale caller is :data:`CAS_STALE_REVISION`.
+        a stale generation is :data:`CAS_GENERATION_MISMATCH` (R1-F2), an unknown participant
+        is :data:`CAS_PARTICIPANT_NOT_FOUND`, an illegal owed edge or a wrong-phase actuation
+        is :data:`CAS_FORBIDDEN_TRANSITION`, and a stale caller is :data:`CAS_STALE_REVISION`.
         """
         if target not in PARTICIPANT_PHASES:
             raise ValueError(f"unknown participant phase {target!r}")
@@ -614,6 +708,13 @@ class ReplacementTransactionStore:
             if current is None:
                 conn.execute("ROLLBACK")
                 return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.action_generation != expected_action_generation:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_GENERATION_MISMATCH,
+                    revision=current.revision,
+                )
             if current.revision != expected_revision:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
@@ -638,6 +739,15 @@ class ReplacementTransactionStore:
                     revision=current.revision,
                 )
             if not participant_transition_allowed(match.phase, target):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_FORBIDDEN_TRANSITION,
+                    revision=current.revision,
+                )
+            if not participant_actuation_phase_allowed(match.is_self, current.phase):
+                # Cross-axis ordering: a non-self participant may move only in
+                # ``replacing_nonself``; the self participant only once self-close is armed.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
@@ -733,6 +843,7 @@ __all__ = (
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
     "CAS_FORBIDDEN_TRANSITION",
+    "CAS_GENERATION_MISMATCH",
     "CAS_LEASE_CONFLICT",
     "CAS_LEASE_NOT_HELD",
     "CAS_NOT_FOUND",
@@ -746,7 +857,9 @@ __all__ = (
     "ReplacementTransactionRecord",
     "decode_participants",
     "encode_participants",
+    "participant_actuation_phase_allowed",
     "participant_transition_allowed",
+    "transaction_phase_prerequisite_met",
     "transaction_transition_allowed",
     "validate_participants",
 )

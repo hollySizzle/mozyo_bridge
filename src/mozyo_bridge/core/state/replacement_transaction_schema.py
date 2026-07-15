@@ -302,7 +302,15 @@ def readonly_component_status(conn: sqlite3.Connection) -> str:
     version this build understands + the table present), or
     :data:`READONLY_COMPONENT_UNSUPPORTED` (a newer / unknown container version, an unknown
     / newer / malformed component version, a metadata row without its table, a table
-    without metadata, or a query failure).
+    without metadata, a **live shape that does not exactly match the recorded version's
+    signature**, or a query failure).
+
+    The read-side must agree with the write-side downgrade guard (Redmine #13806 R1-F3): a
+    recognized recorded version whose live table shape is NOT one of that version's exact
+    signatures — an extra / re-typed / missing column — is a partial / foreign authority
+    shape and is :data:`READONLY_COMPONENT_UNSUPPORTED`, never ``recognized``. Otherwise a
+    read-only projection could read authority rows from a shape the write path rejects,
+    degrading the fail-closed read into a fail-open "no transactions" absence.
     """
     try:
         container_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -330,9 +338,16 @@ def readonly_component_status(conn: sqlite3.Connection) -> str:
         )
     if recorded not in _RECOGNIZED_SCHEMA_VERSIONS:
         return READONLY_COMPONENT_UNSUPPORTED
-    return (
-        READONLY_COMPONENT_RECOGNIZED if has_table else READONLY_COMPONENT_UNSUPPORTED
-    )
+    if not has_table:
+        return READONLY_COMPONENT_UNSUPPORTED
+    try:
+        # The write path rejects a shape that is not an exact signature; the read path must
+        # too (R1-F3), or a foreign / partial authority table reads as "recognized".
+        if not _schema_signature_matches(conn, recorded):
+            return READONLY_COMPONENT_UNSUPPORTED
+    except sqlite3.DatabaseError:
+        return READONLY_COMPONENT_UNSUPPORTED
+    return READONLY_COMPONENT_RECOGNIZED
 
 
 def ensure_replacement_transaction_schema(path: Path) -> None:
