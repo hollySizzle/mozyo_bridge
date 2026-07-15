@@ -604,7 +604,12 @@ def run_hibernated_live_reconcile(
         **positive absence** of the expected pair at ANY locator — a recycled / duplicate /
         foreign slot still live withholds (never a false success off "the old pins are gone").
         Returns ``(closed, ok)``; ``ok`` False means the owed close did not complete and the caller
-        withholds success (resumable via the ordinary #13754 retire).
+        withholds success. Recovery is the SAME reconcile flow re-run: the retired row's
+        ``reconcile_phase`` provenance lets a later invocation resume from the positive-absence
+        replay above under this reconcile authority alone. There is deliberately NO handoff to the
+        ordinary #13754 retire (Redmine #13842 review j#79346 R5): #13754 lacks the declared
+        generation pins / idle / composer / attestation gates and would close a recycled newer
+        generation, so it must never be advertised as the resume path.
         """
         try:
             rows2 = live_ops.agent_rows()

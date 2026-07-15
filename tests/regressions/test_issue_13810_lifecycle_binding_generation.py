@@ -638,6 +638,68 @@ class SchemaV5MigrationTest(unittest.TestCase):
         self.assertEqual(rec.worktree_identity, "wt_bound01")  # v4 binding preserved
         self.assertIn("idx_lane_lifecycle_active_project_owner", self._indexes())
 
+    def _rewind_to_v5(self) -> Path:
+        """A healthy current store rewound to a recorded v5 shape (a real pre-#13842 store).
+
+        Faithful to the DIRECT predecessor: both owner indexes and every v5 binding/generation
+        column stay intact and the existing row is preserved — ONLY the v6 ``reconcile_phase``
+        column is absent and the component version is 5. This is the exact allowed-shape branch
+        (``_SHAPE_V5`` recorded at version 5) that the v6 migration must upgrade additively.
+        """
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(
+            self.key, decision=_issue_decision(), issue_id=ISSUE,
+            worktree_identity="wt_bound05",
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            # Drop ONLY the v6 reconcile_phase column; keep the v5 columns and BOTH owner
+            # indexes so the rewound shape is a genuine v5 signature, not a v4 one.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_v5_migrates_additively_backup_first_preserving_binding(self) -> None:
+        # Redmine #13842 R8 (review j#79379): the direct predecessor v5 -> v6 migration must be
+        # pinned as a regression, not only exercised transitively via v4 or v2/v3 fixtures.
+        path = self._rewind_to_v5()
+        before = path.read_bytes()
+        cols = self._columns()
+        self.assertNotIn("reconcile_phase", cols)  # precondition: exact v5 shape
+        self.assertIn("binding_kind", cols)  # v5 columns intact (not a v4 rewind)
+        self.assertIn("declared_slots", cols)
+        self.assertEqual(self._recorded(), 5)
+        # both v5 owner indexes are present before the migration
+        self.assertIn("idx_lane_lifecycle_active_owner", self._indexes())
+        self.assertIn("idx_lane_lifecycle_active_project_owner", self._indexes())
+
+        LaneLifecycleStore(home=self.home).ensure_schema()
+
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 6)
+        # the pre-migration snapshot was preserved before the first write (backup-first)
+        backups = sorted((self.home / "backups").glob("state-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        # the v6 column was added additively on the existing row with the neutral default
+        self.assertIn("reconcile_phase", self._columns())
+        rec = LaneLifecycleStore(home=self.home).get(self.key)
+        self.assertEqual(rec.reconcile_phase, "")  # additive default, never guessed
+        # every v5 field/value on the existing row survived the migration untouched
+        self.assertEqual(rec.binding_kind, BINDING_KIND_ISSUE)
+        self.assertEqual(rec.lane_generation, 1)
+        self.assertEqual(rec.worktree_identity, "wt_bound05")
+        # both owner indexes survived
+        self.assertIn("idx_lane_lifecycle_active_owner", self._indexes())
+        self.assertIn("idx_lane_lifecycle_active_project_owner", self._indexes())
+
     def test_newer_v6_component_fails_closed_byte_unchanged(self) -> None:
         LaneLifecycleStore(home=self.home).declare_active(
             self.key, decision=_issue_decision(), issue_id=ISSUE
