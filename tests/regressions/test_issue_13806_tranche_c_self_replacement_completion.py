@@ -113,11 +113,13 @@ class FakeActuatorPort:
         self.old = {}
         self.closed = []
         self.launched = []
+        self.preservation_calls = 0
 
     def observe_old_slot(self, pin):
         return self.old.get(pin.identity, OLD_SLOT_PRESENT)
 
     def observe_preservation(self, pin):
+        self.preservation_calls += 1
         return PreservationObservation(identity_matches=True, attestation_fresh=True)
 
     def close_exact_generation(self, pin):
@@ -318,6 +320,37 @@ class SelfCloseExecutorTests(_TrancheCCase):
         self.assertEqual(self._phase_of(self.sc), PARTICIPANT_CLOSE_OWED)  # owed unchanged
         # the seal was re-observed at the close boundary (more than the one fast-fail check)
         self.assertGreater(flipping.calls, 1)
+
+    def test_seal_regresses_after_generic_preservation_still_blocks_close(self):
+        # R2-F1: a self seal that stays green through the fast-fail AND the tranche B generic
+        # preservation observation, then regresses in the window before the close (the exact
+        # window the earlier `observe_preservation`-position guard left open), must STILL be
+        # caught at the close boundary — the guard is re-checked immediately before the close,
+        # after the lease re-auth.
+        self._arm()
+
+        class PostPreservationSeal:
+            def __init__(self, act_port):
+                self.act_port = act_port
+
+            def observe_self_close_seals(self, record, self_pin):
+                # A pending composer appears once the actuator's generic preservation has
+                # been observed (i.e. after the earlier guard position, before the close).
+                if self.act_port.preservation_calls > 0:
+                    return _all_seals(no_pending_composer=False)
+                return _all_seals()
+
+        executor = SelfCloseExecutorUseCase(
+            self.store, self.act_port, PostPreservationSeal(self.act_port),
+            clock=lambda: FIXED,
+        )
+        result = executor.run(self.key, holder="EXEC", expected_action_generation=GEN)
+        self.assertEqual(result.status, SELF_CLOSE_BLOCKED)
+        self.assertEqual(result.blocked_reason, SELF_BLOCK_PENDING_COMPOSER)
+        self.assertNotIn(self.sc.identity, self.act_port.closed)  # zero close
+        self.assertEqual(self._phase_of(self.sc), PARTICIPANT_CLOSE_OWED)
+        # the generic preservation WAS observed (so the seal had regressed by the close)
+        self.assertGreater(self.act_port.preservation_calls, 0)
 
     def test_self_close_then_crash_replays(self):
         # First run replaces the self; a re-run is idempotent (self already replaced) and

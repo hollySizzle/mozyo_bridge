@@ -51,7 +51,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ACTUATION_ARMED,
-    ACTUATION_PRESERVATION_BLOCKED,
+    CLOSE_ERROR,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.session_replacement_reconcile import (  # noqa: E501
     SELF_CLOSE_MAY_PROCEED,
@@ -91,13 +91,16 @@ class _SelfSealAwareActuatorPort:
     """Wraps an :class:`ExactGenerationActuatorPort` to re-verify the self seals at close.
 
     Every method delegates to the wrapped ``inner`` port EXCEPT the self participant's
-    :meth:`observe_preservation` — the last observation the tranche B ``_step_close_owed``
-    makes immediately before a new close. For the self participant it re-reads the durable
-    row and re-runs :func:`decide_self_close`; a regressed seal returns a fail-closed
-    :class:`PreservationObservation` (no positive evidence → blocked), so the tranche B
-    preservation gate yields zero close and the participant stays ``close_owed`` (R1-F1). The
-    failing seal is captured in :attr:`last_seal_block` for the durable record. Non-self
-    participants (there are none in a self-drive, but defensively) are unaffected.
+    :meth:`close_exact_generation` — the exact destructive-close call site, reached by the
+    tranche B ``_step_close_owed`` AFTER its ``observe_preservation`` and ``_reauth_before_effect``
+    (lease re-auth). For the self participant it re-reads the durable row and re-runs
+    :func:`decide_self_close` immediately before delegating to the inner close; a regressed
+    seal REFUSES the close (returns :data:`CLOSE_ERROR`), so the tranche B close path leaves
+    the participant ``close_owed`` with zero close (Redmine #13806 R2-F1 — the guard must be
+    at the close boundary, after the lease re-auth, not at ``observe_preservation`` which
+    leaves the observe→close window open). The failing seal is captured in
+    :attr:`last_seal_block` for the durable record. Non-self participants (there are none in
+    a self-drive, but defensively) are unaffected.
     """
 
     def __init__(
@@ -119,7 +122,13 @@ class _SelfSealAwareActuatorPort:
         return self._inner.observe_old_slot(pin)
 
     def observe_preservation(self, pin: ParticipantPin) -> PreservationObservation:
+        return self._inner.observe_preservation(pin)
+
+    def close_exact_generation(self, pin: ParticipantPin) -> str:
         if pin.identity == self._self_identity:
+            # Re-verify the self seals HERE — the exact close call site, after the tranche B
+            # lease re-auth — so a seal regressing anywhere between the earlier
+            # observations and this point still blocks the destructive close (R2-F1).
             record = self._store.get(self._key)
             self_pin = (
                 record.find_participant(self._self_identity)
@@ -128,18 +137,15 @@ class _SelfSealAwareActuatorPort:
             )
             if record is None or self_pin is None:
                 self.last_seal_block = "record_or_participant_missing"
-                return PreservationObservation()  # fail closed
+                return CLOSE_ERROR
             verdict = decide_self_close(
                 self._seal_port.observe_self_close_seals(record, self_pin)
             )
             if verdict != SELF_CLOSE_MAY_PROCEED:
-                # A self seal regressed between the executor's initial check and this close
-                # boundary — block the close fail-closed.
+                # A self seal regressed by the close boundary — refuse the close. Tranche B
+                # then leaves the participant ``close_owed`` (effect_failed), zero close.
                 self.last_seal_block = verdict
-                return PreservationObservation()
-        return self._inner.observe_preservation(pin)
-
-    def close_exact_generation(self, pin: ParticipantPin) -> str:
+                return CLOSE_ERROR
         return self._inner.close_exact_generation(pin)
 
     def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
@@ -239,22 +245,21 @@ class SelfCloseExecutorUseCase:
             key, holder=holder, expected_action_generation=expected_action_generation
         )
         after = self._store.get(key)
-        if outcome.status == ACTUATION_ARMED:
-            return SelfCloseResult(
-                status=SELF_CLOSE_REPLACED,
-                phase=after.phase if after else "",
-                revision=after.revision if after else 0,
-            )
-        if (
-            outcome.status == ACTUATION_PRESERVATION_BLOCKED
-            and wrapped.last_seal_block
-        ):
-            # A self seal regressed at the close boundary — surfaced as a blocked self-close.
+        if wrapped.last_seal_block:
+            # A self seal regressed at the close boundary — the wrapper refused the close, so
+            # the drive stopped fail-closed with zero close. Surface it as a blocked self-close
+            # with the exact failing seal (takes precedence over the generic actuation status).
             return SelfCloseResult(
                 status=SELF_CLOSE_BLOCKED,
                 phase=after.phase if after else "",
                 revision=after.revision if after else 0,
                 blocked_reason=wrapped.last_seal_block,
+            )
+        if outcome.status == ACTUATION_ARMED:
+            return SelfCloseResult(
+                status=SELF_CLOSE_REPLACED,
+                phase=after.phase if after else "",
+                revision=after.revision if after else 0,
             )
         return SelfCloseResult(
             status=SELF_CLOSE_ACTUATION_STOPPED,
