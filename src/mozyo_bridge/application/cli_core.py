@@ -754,6 +754,17 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         required=True,
         help="Redmine journal id that authorizes the hibernate (durable anchor)",
     )
+    sublane_hibernate.add_argument(
+        "--project-scope",
+        dest="project_scope",
+        default="",
+        help=(
+            "Redmine #13811: the canonical full project scope of a PROJECT-GATEWAY lane "
+            "(binding_kind=project_gateway, no issue). When set, the lane is identified by "
+            "this scope and --issue names only the decision anchor's issue. Omit for an "
+            "issue-owned lane (the default, unchanged)."
+        ),
+    )
     # Durable-record invariants the operator asserts from the Redmine record (each
     # defaults to unsatisfied so an omitted flag fails closed).
     for _opt, _dest, _help in (

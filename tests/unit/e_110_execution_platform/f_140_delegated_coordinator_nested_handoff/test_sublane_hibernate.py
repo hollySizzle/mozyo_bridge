@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.lane_lifecycle import (
+    BINDING_KIND_PROJECT_GATEWAY,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     RELEASE_NOT_REQUESTED,
@@ -29,8 +30,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessGenerationPin,
     load_lane_lifecycle_readonly,
 )
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
     HerdrRetireCloseResult,
 )
@@ -578,6 +581,196 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
             ):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
+
+
+SCOPE = "giken-cloud-drive/project-x"
+LANE_GW = "pgwv1_projectx"
+# A project-gateway lane owns no issue, but the journal that authorizes each of its state
+# changes is still filed on a real issue (the decision-anchor rule, R2-F1).
+GW_ANCHOR_ISSUE = "13780"
+GW_JOURNAL = "79226"
+
+
+class ProjectGatewayHibernateTest(unittest.TestCase):
+    """Redmine #13811: hibernate identifies a PROJECT-GATEWAY lane by its scope binding.
+
+    A project-gateway lane's ``issue_id`` is empty and its ``binding_kind`` is
+    ``project_gateway``, so the pre-#13811 ``rec.issue_id == issue`` check could never match
+    it (its identity was always "unknown"). Threaded through ``record_matches_binding`` with
+    ``--project-scope``, the SAME preflight / disposition CAS / tombstone-free release now
+    acts on the lane the request names — while an issue-owned lane's verdict is unchanged
+    (no ``project_scope`` -> the byte-identical issue path).
+    """
+
+    def _store(self, tmp) -> LaneLifecycleStore:
+        return LaneLifecycleStore(home=Path(tmp))
+
+    def _gw_decision(self) -> DecisionPointer:
+        return DecisionPointer(
+            source="redmine", issue_id=GW_ANCHOR_ISSUE, journal_id=GW_JOURNAL
+        )
+
+    def _slots(self) -> tuple[ProcessGenerationPin, ...]:
+        return (
+            ProcessGenerationPin(
+                role="codex", provider="codex", assigned_name=LANE_GW, locator=f"{WS}:p2"
+            ),
+            ProcessGenerationPin(
+                role="claude", provider="claude", assigned_name=LANE_GW,
+                locator=f"{WS}:p3",
+            ),
+        )
+
+    def _declare_gateway(self, tmp) -> None:
+        out = LaneDeclarationStore(home=Path(tmp)).declare_lane(
+            LaneLifecycleKey(WS, LANE_GW),
+            decision=self._gw_decision(),
+            binding_kind=BINDING_KIND_PROJECT_GATEWAY,
+            project_scope=SCOPE,
+            declared_slots=self._slots(),
+        )
+        self.assertTrue(out.applied)
+
+    def _gw_request(self, **kw) -> HibernateRequest:
+        return HibernateRequest(
+            issue=kw.get("issue", GW_ANCHOR_ISSUE),
+            lane=kw.get("lane", LANE_GW),
+            journal=kw.get("journal", GW_JOURNAL),
+            project_scope=kw.get("project_scope", SCOPE),
+            assertions=kw.get("assertions", _all_gates()),
+        )
+
+    def _gw_ops(self, **kw) -> _FakeOps:
+        rows = [
+            _row("codex", LANE_GW, f"{WS}:p2"),
+            _row("claude", LANE_GW, f"{WS}:p3"),
+        ]
+        return _FakeOps(rows=rows, **kw)
+
+    def test_project_gateway_lane_hibernates_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            ops = self._gw_ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._gw_request(), execute=True
+            )
+
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.transition.applied)
+            self.assertEqual(outcome.project_scope, SCOPE)
+            rec = store.get(LaneLifecycleKey(WS, LANE_GW))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+            # The scope binding is preserved; the lane still owns no issue.
+            self.assertEqual(rec.binding_kind, BINDING_KIND_PROJECT_GATEWAY)
+            self.assertEqual(rec.project_scope, SCOPE)
+            self.assertEqual(rec.issue_id, "")
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            self.assertEqual(
+                {loc for _, loc in outcome.release.closed}, {f"{WS}:p2", f"{WS}:p3"}
+            )
+
+    def test_project_gateway_preflight_only_does_not_mutate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            outcome = SublaneHibernateUseCase(ops=self._gw_ops(), store=store).run(
+                self._gw_request(), execute=False
+            )
+            self.assertTrue(outcome.preflight.may_hibernate)
+            self.assertFalse(outcome.is_blocked)
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_wrong_scope_is_identity_unknown_fail_closed(self) -> None:
+        # A caller naming a DIFFERENT scope does not name this lane: identity unknown,
+        # zero mutation, no close (never coerced onto the resident gateway lane).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            ops = self._gw_ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._gw_request(project_scope="giken-cloud-drive/other"), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_ORIGINAL_IDENTITY, outcome.preflight.blocked_reasons)
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_issue_scope_on_a_gateway_lane_never_matches(self) -> None:
+        # Omitting --project-scope puts the request on the ISSUE path; the anchor issue can
+        # never match a gateway lane's empty issue binding -> identity unknown, fail closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            outcome = SublaneHibernateUseCase(ops=self._gw_ops(), store=store).run(
+                self._gw_request(project_scope=""), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_ORIGINAL_IDENTITY, outcome.preflight.blocked_reasons)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_project_scope_on_an_issue_lane_never_matches(self) -> None:
+        # The mirror non-regression: an ISSUE-owned lane addressed with a --project-scope is
+        # a wrong-kind request. The issue lane is never matched by a project-gateway verdict.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            ops = SublaneHibernateTest()._live_ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                HibernateRequest(
+                    issue=ISSUE, lane=LANE, journal=JOURNAL,
+                    project_scope=SCOPE, assertions=_all_gates(),
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_ORIGINAL_IDENTITY, outcome.preflight.blocked_reasons)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_partial_release_resumes_by_scope_idempotently(self) -> None:
+        # The already-hibernated redrive path is also scope-identified: a partial release
+        # resumes the SAME generation on the gateway lane named by its scope.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_gateway(tmp)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS,
+                lane_id=LANE_GW,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            first = SublaneHibernateUseCase(
+                ops=self._gw_ops(close_result=partial), store=store
+            ).run(self._gw_request(), execute=True)
+            self.assertTrue(first.transition.applied)
+            self.assertEqual(first.release.process_release, RELEASE_PARTIAL)
+
+            resume = SublaneHibernateUseCase(ops=self._gw_ops(), store=store).run(
+                self._gw_request(), execute=True
+            )
+            self.assertTrue(resume.already_hibernated)
+            self.assertFalse(resume.is_blocked)
+            self.assertEqual(resume.release.process_release, RELEASE_RELEASED)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE_GW)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
 
 
 if __name__ == "__main__":

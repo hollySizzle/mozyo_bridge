@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
+from mozyo_bridge.core.state.lane_binding import record_matches_binding
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -231,6 +232,7 @@ class HibernateOutcome:
     preflight: HibernatePreflight
     issue: str
     lane: str
+    project_scope: str = ""
     already_hibernated: bool = False
     redrive_blocked: bool = False
     transition: Optional[CasOutcome] = None
@@ -256,6 +258,7 @@ class HibernateOutcome:
             "executed": self.executed,
             "issue": self.issue,
             "lane": self.lane,
+            "project_scope": self.project_scope,
             "already_hibernated": self.already_hibernated,
             "redrive_blocked": self.redrive_blocked,
             "is_blocked": self.is_blocked,
@@ -340,6 +343,12 @@ class HibernateRequest:
     lane: str
     journal: str
     assertions: HibernateAssertions
+    #: A project-gateway lane's canonical full project scope (Redmine #13811). When
+    #: non-empty the lane is identified by its ``project_gateway`` owner binding (scope +
+    #: empty issue), not by ``issue`` — which then names only the durable decision anchor
+    #: the ``--journal`` is filed on, exactly as for an issue lane. Empty for an issue lane
+    #: (the byte-identical pre-#13811 issue-owned path).
+    project_scope: str = ""
 
 
 @dataclass
@@ -362,9 +371,14 @@ class SublaneHibernateUseCase:
     def run(self, request: HibernateRequest, *, execute: bool) -> HibernateOutcome:
         issue = _norm(request.issue)
         lane = _norm(request.lane)
+        project_scope = _norm(request.project_scope)
         workspace_id = _norm(self.ops.workspace_id())
 
         # A malformed identity / anchor can address nothing — fail closed before any read.
+        # The decision anchor is required (and issue-addressable) for BOTH binding kinds:
+        # a project-gateway lane owns a scope, but the journal that authorizes this
+        # hibernate is still filed on a real issue (R2-F1). ``project_scope`` selects WHICH
+        # lane the anchor may act on; it never replaces the anchor.
         decision = self._decision(request)
         if not issue or not lane or not workspace_id or decision is None:
             preflight = HibernatePreflight(
@@ -380,6 +394,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 detail="incomplete hibernate identity or decision anchor",
             )
 
@@ -401,6 +416,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 detail="lifecycle store unreadable; fail closed",
             )
 
@@ -419,7 +435,9 @@ class SublaneHibernateUseCase:
         already_hibernated = (
             rec is not None
             and rec.lane_disposition == DISPOSITION_HIBERNATED
-            and rec.issue_id == issue
+            and record_matches_binding(
+                rec, issue_id=issue, project_scope=project_scope
+            )
         )
         if already_hibernated:
             redrive_ok = (
@@ -442,6 +460,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 already_hibernated=True,
                 redrive_blocked=execute and not redrive_ok,
                 release=release,
@@ -456,7 +475,9 @@ class SublaneHibernateUseCase:
         original_identity_known = (
             rec is not None
             and rec.lane_disposition == DISPOSITION_ACTIVE
-            and rec.issue_id == issue
+            and record_matches_binding(
+                rec, issue_id=issue, project_scope=project_scope
+            )
         )
         preflight = HibernatePreflight(
             original_identity_known=original_identity_known,
@@ -473,6 +494,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 detail=(
                     "preflight only (no --execute)"
                     if preflight.may_hibernate
@@ -498,6 +520,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 transition=transition,
                 detail=f"hibernate commit refused ({transition.reason})",
             )
@@ -511,6 +534,7 @@ class SublaneHibernateUseCase:
             transition=transition,
             release=release,
             detail="lane hibernated; managed processes released",
+            project_scope=project_scope,
         )
 
     def _drive_release(
@@ -545,8 +569,15 @@ class SublaneHibernateUseCase:
 
 
 def format_hibernate_text(outcome: HibernateOutcome) -> str:
+    # A project-gateway lane owns a scope, not an issue: name the scope it is bound to
+    # (the ``issue`` shown is then only the decision anchor's issue).
+    owner = (
+        f"project_scope {outcome.project_scope}"
+        if outcome.project_scope
+        else f"issue {outcome.issue}"
+    )
     lines = [
-        f"sublane hibernate: {outcome.lane} (issue {outcome.issue})",
+        f"sublane hibernate: {outcome.lane} ({owner})",
         f"  may_hibernate: {outcome.preflight.may_hibernate} executed: {outcome.executed}",
     ]
     if outcome.already_hibernated:
@@ -582,6 +613,7 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
         issue=getattr(args, "issue", "") or "",
         lane=getattr(args, "lane", "") or "",
         journal=getattr(args, "journal", "") or "",
+        project_scope=getattr(args, "project_scope", "") or "",
         assertions=HibernateAssertions(
             explicitly_parked=bool(getattr(args, "explicitly_parked", False)),
             callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
