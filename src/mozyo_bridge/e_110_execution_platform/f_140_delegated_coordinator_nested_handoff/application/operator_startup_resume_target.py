@@ -108,43 +108,51 @@ def _default_capture(locator: str, lines: int) -> object:
         return ""
 
 
-#: Re-resolve the live action-time repo identity from the explicit target repo root:
-#: ``(workspace_id, repo_identity_digest, execution_root)``, or None (unresolved -> zero-send).
-#: Injectable.
-WorkspaceResolve = Callable[[str, Mapping[str, str]], Optional["tuple[str, str, str]"]]
+#: Re-resolve the live action-time repo identity from the explicit target repo root + the gate's
+#: repo-relative ``execution_root``: ``(workspace_id, repo_identity_digest, execution_root)``, or
+#: None (unresolved / execution_root escapes the repo -> zero-send). Injectable.
+WorkspaceResolve = Callable[[str, str, Mapping[str, str]], Optional["tuple[str, str, str]"]]
 #: Resolve the action-time runtime provider bound to a workflow ``target_role`` from the repo's
 #: current provider binding, or None if unbound (fail-soft zero-send). Injectable.
 BindingResolve = Callable[[str, str, Mapping[str, str]], Optional[str]]
 
 
 def _default_workspace_resolve(
-    repo_root: str, env: Mapping[str, str]
+    repo_root: str, execution_root: str, env: Mapping[str, str]
 ) -> Optional["tuple[str, str, str]"]:
     """Re-resolve the live action-time repo identity from ``repo_root``, or None (zero-send).
 
     Resolves the workspace id from the **explicit target repo root** via the registry / anchor
     authority (read-only) — never the anchor-less sender identity, which is always ``missing_anchor``
     and made the default resolver inert (review j#79392 F1). Derives the pasteable
-    ``repo_identity_digest`` over the registry workspace id (the documented convention — the digest
-    is over the workspace id, so it is re-derivable without a checkout path), and reports the repo
-    root ``execution_root`` ``"."``. Any unresolved workspace returns None so the resolver zero-sends
-    rather than trust the gate's own (possibly forged) identity (Design Answer j#79405 §C).
+    ``repo_identity_digest`` over the registry workspace id (re-derivable without a checkout path).
+
+    The execution root is **re-derived, not forced to** ``"."`` (review j#79481 F3): the gate's
+    repo-relative ``execution_root`` is confined under the live repo root with symlink-aware
+    :func:`resolve_execution_workdir`, and the confined pointer is returned. A nested
+    ``projects/x`` that resolves under the repo is honored; an unresolved workspace or an
+    execution_root that escapes the repo (``..`` or symlink) returns None (Design Answer j#79405 §C).
     """
     try:
         from pathlib import Path
 
         from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_send import (
+            resolve_execution_workdir,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
             repo_identity_digest,
         )
 
         if not str(repo_root).strip():
             return None
+        if resolve_execution_workdir(repo_root, execution_root) is None:
+            return None  # execution_root escapes the repo (traversal / symlink) -> zero-send.
         resolved = resolve_canonical_session(Path(repo_root))
         workspace_id = str(getattr(resolved, "workspace_id", "") or "").strip()
         if not workspace_id:
             return None
-        return (workspace_id, repo_identity_digest(workspace_id), ".")
+        return (workspace_id, repo_identity_digest(workspace_id), execution_root)
     except Exception:  # noqa: BLE001 - unresolved live identity -> None (zero-send)
         return None
 
@@ -294,8 +302,9 @@ class ResumeTargetResolver:
         # 5. Re-resolve the live action-time repo identity FROM THE EXPLICIT REPO ROOT (registry
         #    authority, not the gate's own identity nor the anchor-less sender identity — j#79405
         #    §C) and require it EXACTLY matches the gate's workspace_id / repo_identity_digest /
-        #    execution_root. A wrong repo / execution root fails closed.
-        live_identity = self.workspace_resolve(self.repo_root, env)
+        #    execution_root. The gate's execution_root is re-derived + symlink-confined under the
+        #    live repo root (review j#79481 F3); a wrong repo / escaping root fails closed.
+        live_identity = self.workspace_resolve(self.repo_root, target.execution_root, env)
         if live_identity is None:
             return None
         live_workspace_id, live_digest, live_execution_root = live_identity

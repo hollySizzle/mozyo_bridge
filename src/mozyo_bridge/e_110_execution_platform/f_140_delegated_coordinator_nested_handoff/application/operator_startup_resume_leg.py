@@ -176,6 +176,45 @@ def _gate_record_from_note(notes: str) -> Optional[dict]:
     return None
 
 
+def _legacy_record_is_readable(record: object) -> bool:
+    """True when a legacy (v1/v2) record is a structurally well-formed gate (readable, not corrupt).
+
+    A readable legacy record carries the core gate skeleton — ``gate_id``, a ``state``, and the
+    ``original_request`` / ``target`` / ``classification`` child objects with their core identity
+    keys — so it can be identified as a real prior gate and routed to reapproval (review j#79481 F1).
+    A bare ``{"schema_version": 2}`` fragment has none of that and is corrupt, not legacy. The check
+    is structural only (it does NOT require the v3 ``runtime_role`` / ``lane_revision`` a legacy
+    record legitimately lacks).
+    """
+    if not isinstance(record, Mapping):
+        return False
+    if not str(record.get("gate_id") or "").strip():
+        return False
+    if not str(record.get("state") or "").strip():
+        return False
+    target = record.get("target")
+    original = record.get("original_request")
+    classification = record.get("classification")
+    if not (
+        isinstance(target, Mapping)
+        and isinstance(original, Mapping)
+        and isinstance(classification, Mapping)
+    ):
+        return False
+    target_keys = (
+        "workspace_id",
+        "repo_identity_digest",
+        "execution_root",
+        "lane_id",
+        "target_role",
+        "target_assigned_name",
+        "provider_id",
+        "agent_generation",
+    )
+    original_keys = ("source", "issue", "journal", "delivery_id")
+    return all(k in target for k in target_keys) and all(k in original for k in original_keys)
+
+
 def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
     """Parse a CURRENT (v3) gate from one gate-marker note, or None if legacy / malformed.
 
@@ -206,10 +245,11 @@ def parse_latest_gate(entries: Sequence[object]) -> LatestGateRead:
     j#79405 §B):
 
     * a current v3 record that parses -> :data:`GATE_READ_GATE`;
-    * a readable legacy v1/v2 record -> :data:`GATE_READ_LEGACY` (reapproval required — a
-      legacy gate is never resumed, but it is not corrupt either);
-    * any other version, unreadable JSON, or a v3 record that fails the schema invariants ->
-      :data:`GATE_READ_CORRUPT`.
+    * a STRUCTURALLY READABLE legacy v1/v2 record -> :data:`GATE_READ_LEGACY` (reapproval required
+      — a legacy gate is never resumed, but it is not corrupt either);
+    * any other version, unreadable JSON, a v3 record that fails the schema invariants, OR a legacy
+      version whose payload is a malformed fragment (e.g. a bare ``{"schema_version": 2}``) ->
+      :data:`GATE_READ_CORRUPT` (review j#79481 F1: readable-legacy is distinct from corrupt).
 
     Journal entries WITHOUT any gate marker are unrelated and skipped; if none carry a marker,
     the result is :data:`GATE_READ_NONE`.
@@ -224,7 +264,10 @@ def parse_latest_gate(entries: Sequence[object]) -> LatestGateRead:
             return LatestGateRead(status=GATE_READ_CORRUPT)
         version = schema_version_of(record)
         if version in OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS:
-            return LatestGateRead(status=GATE_READ_LEGACY)
+            # A readable legacy record -> reapproval; a malformed legacy fragment -> corrupt.
+            if _legacy_record_is_readable(record):
+                return LatestGateRead(status=GATE_READ_LEGACY)
+            return LatestGateRead(status=GATE_READ_CORRUPT)
         if version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
             return LatestGateRead(status=GATE_READ_CORRUPT)
         try:

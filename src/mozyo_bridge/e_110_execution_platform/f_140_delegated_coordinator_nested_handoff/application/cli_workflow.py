@@ -417,12 +417,19 @@ def _maybe_operator_startup_resume_outcome(
 ) -> "WorkflowStepOutcome | None":
     """A resume-primitive outcome iff a durable startup gate awaits resume (#13813), else None.
 
-    Reads the latest durable operator startup gate for the step's issue at action time. When it
-    is in the resumable ``operator_reported_done`` state, this returns a copy of ``outcome`` with
-    the :data:`PRIMITIVE_OPERATOR_STARTUP_RESUME` primitive so the step routes to the exactly-once
-    resume leg (which re-reads and re-resolves authoritatively). Any other state — no gate, a
-    corrupt gate, a pre-clear / terminal / in-flight gate — leaves the normal outcome unchanged
-    (returns None); the read is fail-soft (an unreadable ticket provider never forces a resume).
+    Reads the latest durable operator startup gate for the step's issue at action time. It routes
+    to the exactly-once resume leg (:data:`PRIMITIVE_OPERATOR_STARTUP_RESUME`, which re-reads and
+    re-resolves authoritatively) in two cases so NO other primitive runs while a startup gate is
+    outstanding:
+
+    * a resumable ``operator_reported_done`` v3 gate -> the leg reserves + re-issues exactly once;
+    * a READABLE legacy v1/v2 gate (:data:`GATE_READ_LEGACY`) -> the leg runs the fixed
+      ``legacy_gate_reapproval_required`` disposition (reserve/send 0) and guides reapproval
+      (review j#79481 F1 — a legacy latest must not let a normal primitive execute).
+
+    Any other state — no gate, a corrupt gate, a pre-clear / terminal / in-flight v3 gate — leaves
+    the normal outcome unchanged (returns None); the read is fail-soft (an unreadable ticket
+    provider never forces a resume).
     """
     issue = (_anchor_issue_of(outcome.durable_anchor) or "").strip()
     if not issue:
@@ -435,6 +442,7 @@ def _maybe_operator_startup_resume_outcome(
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
             GATE_READ_GATE,
+            GATE_READ_LEGACY,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
             STATE_OPERATOR_REPORTED_DONE,
@@ -444,13 +452,18 @@ def _maybe_operator_startup_resume_outcome(
         read = _default_gate_source("", os.environ)(issue)
     except Exception:  # noqa: BLE001 - unreadable ticket provider -> never force a resume
         return None
-    if read.status != GATE_READ_GATE or read.gate is None:
-        return None
-    if read.gate.state != STATE_OPERATOR_REPORTED_DONE:
+    if read.status == GATE_READ_LEGACY:
+        # Readable legacy latest: route to the leg (fixed reapproval disposition), no gate parsed.
+        journal_fallback = ""
+    elif read.status == GATE_READ_GATE and read.gate is not None:
+        if read.gate.state != STATE_OPERATOR_REPORTED_DONE:
+            return None
+        journal_fallback = read.gate.original_request.journal
+    else:
         return None
     anchor = outcome.durable_anchor
     if not anchor or anchor == "none":
-        journal = (getattr(args, "journal", None) or read.gate.original_request.journal or "").strip()
+        journal = (getattr(args, "journal", None) or journal_fallback or "").strip()
         anchor = f"redmine:issue={issue}:journal={journal}"
     return dataclasses.replace(
         outcome,

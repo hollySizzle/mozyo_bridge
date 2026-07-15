@@ -33,6 +33,9 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
     DISPOSITION_ACTIVE,
     ProcessGenerationPin,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_gate_producer import (  # noqa: E402
+    build_v3_required_gate_from_observation,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_record import (  # noqa: E402
     ResumeGateRecorder,
 )
@@ -152,6 +155,18 @@ def _done_gate():
             approval=GateApproval(source_journal="78412"),
         )
     )
+
+
+def _legacy_note(version: int) -> str:
+    """A STRUCTURALLY READABLE legacy (v1/v2) gate note: the v3 record shape minus ``runtime_role``
+    (which legacy predates), stamped with the legacy schema_version + marker."""
+    import json
+
+    record = _done_gate().to_record()
+    record["schema_version"] = version
+    record["target"].pop("runtime_role", None)
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    return f"prior legacy gate\n{GATE_JOURNAL_MARKER_PREFIX}{version}]\n{payload}"
 
 
 class _Entry:
@@ -277,28 +292,28 @@ class GateJournalSerializationTests(unittest.TestCase):
         entries = [_Entry(render_gate_journal(_done_gate())), _Entry(bad)]
         self.assertEqual(parse_latest_gate(entries).status, GATE_READ_CORRUPT)
 
-    def test_newest_legacy_v2_gate_is_legacy_not_corrupt_not_gate(self) -> None:
-        # j#79405 §B: a readable legacy v2 record (marker v=2) is classified LEGACY — reapproval
-        # required — never CORRUPT and never parsed as a current gate, and never falls back to an
-        # older resumable gate. The legacy marker is still detected (version-agnostic prefix).
-        legacy = (
-            f"prior operator_reported_done\n{GATE_JOURNAL_MARKER_PREFIX}2]\n"
-            + '{"schema_version": 2, "state": "operator_reported_done"}'
-        )
-        entries = [_Entry(render_gate_journal(_done_gate())), _Entry(legacy)]
+    def test_newest_readable_legacy_v2_gate_is_legacy_not_corrupt_not_gate(self) -> None:
+        # j#79405 §B / j#79481 F1: a STRUCTURALLY READABLE legacy v2 record (marker v=2) is
+        # classified LEGACY — reapproval required — never CORRUPT, never parsed as a current gate,
+        # and never falls back to an older resumable gate (version-agnostic prefix still detects it).
+        entries = [_Entry(render_gate_journal(_done_gate())), _Entry(_legacy_note(2))]
         read = parse_latest_gate(entries)
         self.assertEqual(read.status, GATE_READ_LEGACY)
         self.assertIsNone(read.gate)
 
-    def test_legacy_v1_gate_is_legacy(self) -> None:
-        legacy = f"{GATE_JOURNAL_MARKER_PREFIX}1]\n" + '{"schema_version": 1, "state": "required"}'
-        self.assertEqual(parse_latest_gate([_Entry(legacy)]).status, GATE_READ_LEGACY)
+    def test_readable_legacy_v1_gate_is_legacy(self) -> None:
+        self.assertEqual(parse_latest_gate([_Entry(_legacy_note(1))]).status, GATE_READ_LEGACY)
+
+    def test_malformed_legacy_fragment_is_corrupt_not_legacy(self) -> None:
+        # j#79481 F1: a bare {"schema_version": 2} fragment is NOT a readable legacy record — it is
+        # corrupt (fail-closed), distinct from a real legacy gate.
+        bare = f"{GATE_JOURNAL_MARKER_PREFIX}2]\n" + '{"schema_version": 2, "state": "required"}'
+        self.assertEqual(parse_latest_gate([_Entry(bare)]).status, GATE_READ_CORRUPT)
 
     def test_v2_to_v3_supersession_newest_v3_wins(self) -> None:
         # A fresh v3 gate recorded AFTER a legacy v2 gate supersedes it: the newest (v3) record
         # decides the read, so a re-approved v3 gate resumes normally.
-        v2 = f"{GATE_JOURNAL_MARKER_PREFIX}2]\n" + '{"schema_version": 2, "state": "operator_reported_done"}'
-        entries = [_Entry(v2), _Entry(render_gate_journal(_done_gate()))]
+        entries = [_Entry(_legacy_note(2)), _Entry(render_gate_journal(_done_gate()))]
         read = parse_latest_gate(entries)
         self.assertEqual(read.status, GATE_READ_GATE)
         self.assertEqual(read.gate, _done_gate())
@@ -585,7 +600,7 @@ class ProductionCompositionTests(unittest.TestCase):
             inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
             attestation_read=lambda name: attestation,  # REAL record -> REAL evaluate_attestation
             capture=lambda loc, lines: _READY,
-            workspace_resolve=lambda repo_root, env: (
+            workspace_resolve=lambda repo_root, execution_root, env: (
                 t.workspace_id, t.repo_identity_digest, t.execution_root
             ),
             binding_resolve=lambda role, repo_root, env: "claude",
@@ -637,6 +652,87 @@ class ProductionCompositionTests(unittest.TestCase):
         self.assertEqual(len(transport.posts), 1)
         self.assertEqual(transport.posts[0][0], "13813")
         self.assertIn(GATE_JOURNAL_MARKER, transport.posts[0][1])
+
+    def test_producer_to_journal_to_resume_delivers_once(self) -> None:
+        # F2 (j#79481): the authoritative producer builds a v3 gate from ONE lifecycle observation;
+        # that gate round-trips through the journal and the SAME observation resolves the live
+        # target -> send=1. Proves producer -> journal -> resume end-to-end (no hand-assembled target).
+        class _Binding:
+            def provider_for(self, role):
+                return {"implementation_worker": "claude"}.get(role)
+
+        record = SimpleNamespace(
+            repo_workspace_id="ws-alpha",
+            lane_id="lane-alpha",
+            lane_generation=3,
+            revision=1,
+            lane_disposition=DISPOSITION_ACTIVE,
+            issue_id="13760",
+            declared_pins=(
+                ProcessGenerationPin(
+                    role="claude", provider="claude", assigned_name="worker-a", locator="w1:p1"
+                ),
+            ),
+        )
+        produced = build_v3_required_gate_from_observation(
+            record=record,
+            binding=_Binding(),
+            workflow_role="implementation_worker",
+            execution_root=".",
+            gate_id="gate-prod",
+            action_generation=1,
+            original_request=_original(),
+            classification=_classification(),
+        )
+        # Owner approves + operator reports done -> the resumable durable gate.
+        done = report_operator_done(
+            approve_gate(produced, approval=GateApproval(source_journal="78412"))
+        )
+        # Round-trip through the durable journal.
+        read = parse_latest_gate([_Entry(render_gate_journal(done))])
+        self.assertEqual(read.status, GATE_READ_GATE)
+        self.assertEqual(read.gate, done)
+
+        attestation = IdentityAttestationRecord(
+            assigned_name="worker-a",
+            workspace_id="ws-alpha",
+            role="claude",
+            lane_id="lane-alpha",
+            locator="w1:p1",
+            verdict=VERDICT_PRESENT,
+        )
+        resolver = ResumeTargetResolver(
+            env={},
+            repo_root=str(self.home),
+            lifecycle_get=lambda ws, lane: record,
+            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            attestation_read=lambda name: attestation,
+            capture=lambda loc, lines: _READY,
+            workspace_resolve=lambda repo_root, execution_root, env: (
+                done.target.workspace_id, done.target.repo_identity_digest, done.target.execution_root
+            ),
+            binding_resolve=lambda role, repo_root, env: "claude",
+        )
+        result = execute_startup_resume(
+            self.args,
+            "13813",
+            env={},
+            observed_at="2026-07-16T01:00:00Z",
+            gate_source=lambda issue: read,
+            target_resolver=resolver.resolve,
+            send_factory=lambda gate, locator, repo_root, env: ResumeHandoffSendPort(
+                locator=locator, runner=lambda argv: (0, '{"status": "sent", "reason": "ok"}')
+            ).build(gate, repo_root, env),
+            gate_recorder=ResumeGateRecorder(
+                issue="13813",
+                env={},
+                transport_factory=lambda env: _Transport(),
+                credentials_resolver=lambda env: _Creds(),
+            ),
+            fence=self.fence,
+        )
+        self.assertEqual(result.result, RESUME_DELIVERED)
+        self.assertTrue(result.sent)
 
     def test_production_composition_rerun_sends_zero(self) -> None:
         def _runner(argv):

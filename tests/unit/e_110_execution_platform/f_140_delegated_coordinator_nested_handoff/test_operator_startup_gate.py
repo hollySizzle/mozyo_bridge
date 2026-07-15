@@ -173,6 +173,10 @@ class GateTargetTests(unittest.TestCase):
     def test_same_identity_false_on_provider_change(self) -> None:
         self.assertFalse(_target().same_identity(_target(provider_id="codex")))
 
+    def test_same_identity_false_on_runtime_role_only_drift(self) -> None:
+        # review j#79481 F2: a runtime-role-only drift is a mismatch, not a generation bump.
+        self.assertFalse(_target(runtime_role="claude").same_identity(_target(runtime_role="codex")))
+
 
 class OriginalRequestTests(unittest.TestCase):
     def test_non_redmine_source_rejected(self) -> None:

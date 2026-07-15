@@ -492,12 +492,13 @@ class GateTarget:
     def same_identity(self, other: "GateTarget") -> bool:
         """True when ``other`` names the same managed target (ignoring generation).
 
-        ``provider_id`` is part of identity even though it is not in :attr:`identity_key`: a
-        different provider is a mismatch, not a generation bump.
+        ``provider_id`` and ``runtime_role`` are identity even though not in :attr:`identity_key`:
+        a provider OR runtime-role drift is a mismatch, not a generation bump (j#79481 F2).
         """
         return (
             self.identity_key == other.identity_key
             and self.provider_id == other.provider_id
+            and self.runtime_role == other.runtime_role
         )
 
     def to_record(self) -> dict:

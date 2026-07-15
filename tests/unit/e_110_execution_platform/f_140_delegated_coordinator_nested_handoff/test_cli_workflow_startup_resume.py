@@ -23,6 +23,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (  # noqa: E402
     GATE_READ_CORRUPT,
     GATE_READ_GATE,
+    GATE_READ_LEGACY,
     GATE_READ_NONE,
     LatestGateRead,
 )
@@ -138,6 +139,20 @@ class MaybeResumeOutcomeTests(unittest.TestCase):
         self.assertIsNone(
             cli_workflow._maybe_operator_startup_resume_outcome(argparse.Namespace(), _outcome())
         )
+
+    def test_legacy_gate_routes_to_resume_reapproval(self) -> None:
+        # review j#79481 F1: a readable legacy latest gate MUST route to the resume leg (so the leg
+        # runs the fixed reapproval disposition, reserve/send 0) — it must NOT leave the normal
+        # outcome to execute another primitive.
+        self._patch_gate(LatestGateRead(GATE_READ_LEGACY))
+        result = cli_workflow._maybe_operator_startup_resume_outcome(
+            argparse.Namespace(), _outcome()
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.primitive, PRIMITIVE_OPERATOR_STARTUP_RESUME)
+        self.assertEqual(result.execution, EXECUTION_READY)
+        self.assertTrue(cli_workflow._is_startup_resume_leg(result))
 
     def test_unreadable_source_is_fail_soft(self) -> None:
         def _raises(repo_root, env):

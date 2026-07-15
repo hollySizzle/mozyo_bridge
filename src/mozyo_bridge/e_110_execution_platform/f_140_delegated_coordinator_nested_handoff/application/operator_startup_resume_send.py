@@ -52,22 +52,21 @@ def resolve_execution_workdir(repo_root: str, execution_root: str) -> Optional[s
     """The absolute ``--workdir`` = gate ``execution_root`` safely resolved under ``repo_root``.
 
     ``execution_root`` is the gate's repo-relative POSIX pointer (``.`` at the repo root, else
-    ``projects/x``). The joined path is normalized (``..`` collapsed) and must stay at or under
-    the normalized ``repo_root``; any escape returns ``None`` so the caller zero-sends BEFORE
-    reserving (Design Answer j#79405 §C). Pure — no filesystem access — so it is hermetic and
-    the leg's pre-reserve check and the send argv derive the identical value. The domain already
-    rejects absolute / ``..`` execution roots; this re-checks at action time against the freshly
-    resolved repo root (defense in depth).
+    ``projects/x``). The joined path is resolved with :func:`os.path.realpath` — collapsing ``..``
+    AND following symlinks — and the result must stay at or under the realpath of ``repo_root``;
+    ANY escape (a ``..`` traversal OR a symlink that points outside the repo) returns ``None`` so
+    the caller zero-sends BEFORE reserving (Design Answer j#79405 §C, review j#79481 F3). The
+    domain already rejects absolute / ``..`` roots; this re-checks at action time with symlink
+    resolution (a string-prefix check alone would miss a repo-internal symlink escaping the repo).
     """
-    root_norm = os.path.normpath(repo_root)
     rel = (execution_root or "").strip()
-    if rel in ("", "."):
-        return root_norm
     if os.path.isabs(rel):
         return None
-    joined = os.path.normpath(os.path.join(root_norm, rel))
-    if joined == root_norm or joined.startswith(root_norm + os.sep):
-        return joined
+    root_real = os.path.realpath(repo_root)
+    joined = root_real if rel in ("", ".") else os.path.join(root_real, rel)
+    real = os.path.realpath(joined)
+    if real == root_real or real.startswith(root_real + os.sep):
+        return real
     return None
 
 

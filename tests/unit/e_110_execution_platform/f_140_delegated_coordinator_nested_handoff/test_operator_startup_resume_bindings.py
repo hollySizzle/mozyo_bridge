@@ -258,10 +258,10 @@ class ResumeTargetResolverTests(unittest.TestCase):
             inventory=lambda env: rows,
             attestation_read=lambda name: SimpleNamespace(),
             capture=lambda loc, lines: self._READY,
-            # workspace_resolve is (repo_root, env) — resolved from the EXPLICIT repo root, not the
-            # anchor-less sender identity (j#79405 §C). binding_resolve is (target_role, repo_root,
-            # env) — the workflow role must still bind to the pinned provider.
-            workspace_resolve=lambda repo_root, env: identity,
+            # workspace_resolve is (repo_root, execution_root, env) — resolved from the EXPLICIT
+            # repo root + the gate's execution_root (re-derived + confined, j#79481 F3), not the
+            # anchor-less sender identity. binding_resolve is (target_role, repo_root, env).
+            workspace_resolve=lambda repo_root, execution_root, env: identity,
             binding_resolve=lambda role, repo_root, env: binding,
         )
 
@@ -412,7 +412,7 @@ class ResumeTargetResolverTests(unittest.TestCase):
             inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
             attestation_read=lambda name: record,
             capture=lambda loc, lines: self._READY,
-            workspace_resolve=lambda repo_root, env: self._identity(),
+            workspace_resolve=lambda repo_root, execution_root, env: self._identity(),
             binding_resolve=lambda role, repo_root, env: "claude",
         )
         r = resolver.resolve(_done_gate(), {})
@@ -436,7 +436,7 @@ class ResumeTargetResolverTests(unittest.TestCase):
             inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
             attestation_read=lambda name: record,
             capture=lambda loc, lines: self._READY,
-            workspace_resolve=lambda repo_root, env: self._identity(),
+            workspace_resolve=lambda repo_root, execution_root, env: self._identity(),
             binding_resolve=lambda role, repo_root, env: "claude",
         )
         self.assertIsNone(resolver.resolve(_done_gate(), {}))
@@ -460,6 +460,52 @@ class ResolveExecutionWorkdirTests(unittest.TestCase):
 
     def test_absolute_is_none(self) -> None:
         self.assertIsNone(resolve_execution_workdir("/repo/root", "/etc/passwd"))
+
+    def test_symlink_escape_is_none(self) -> None:
+        # j#79481 F3: a repo-internal symlink pointing OUTSIDE the repo must be caught by realpath
+        # (a string-prefix check alone would accept the repo-internal path).
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            os.symlink(outside, os.path.join(repo, "escape"))
+            self.assertIsNone(resolve_execution_workdir(repo, "escape"))
+
+    def test_symlink_inside_repo_is_confined(self) -> None:
+        # A symlink that stays INSIDE the repo resolves and is honored.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo:
+            os.mkdir(os.path.join(repo, "real"))
+            os.symlink(os.path.join(repo, "real"), os.path.join(repo, "link"))
+            wd = resolve_execution_workdir(repo, "link")
+            self.assertIsNotNone(wd)
+            self.assertEqual(os.path.realpath(wd), os.path.realpath(os.path.join(repo, "real")))
+
+    def test_nested_positive_resolves(self) -> None:
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo:
+            wd = resolve_execution_workdir(repo, "projects/x")
+            self.assertIsNotNone(wd)
+            root_real = os.path.realpath(repo)
+            self.assertTrue(wd == root_real or wd.startswith(root_real + os.sep))
+
+    def test_default_workspace_resolve_rejects_symlink_escape_before_registry(self) -> None:
+        # j#79481 F3: the DEFAULT workspace resolver wires the confinement — an execution_root that
+        # escapes the repo via a symlink returns None (before any registry read).
+        import os
+        import tempfile
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (
+            _default_workspace_resolve,
+        )
+
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            os.symlink(outside, os.path.join(repo, "escape"))
+            self.assertIsNone(_default_workspace_resolve(repo, "escape", {}))
 
 
 if __name__ == "__main__":
