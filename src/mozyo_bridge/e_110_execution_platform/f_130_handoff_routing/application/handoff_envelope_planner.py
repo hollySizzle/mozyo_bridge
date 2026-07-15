@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Iterable, Mapping, Protocol, cast
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
@@ -161,7 +161,7 @@ class EnvelopePlannerOps(Protocol):
     def build_notification_body(
         self,
         anchor: NormalizedAnchor,
-        kind: str | None,
+        kind: str,
         summary: str | None,
         receiver: str,
         *,
@@ -175,7 +175,7 @@ class EnvelopePlannerOps(Protocol):
     ) -> str: ...
 
     def build_marker(
-        self, anchor: NormalizedAnchor, kind: str | None, receiver: str
+        self, anchor: NormalizedAnchor, kind: str, receiver: str
     ) -> str: ...
 
 
@@ -188,13 +188,24 @@ class LiveEnvelopePlannerOps:
     """
 
     @staticmethod
-    def normalize_anchor(source, *, task_id, comment_id, anchor_url, issue, journal):
+    def normalize_anchor(
+        source: str | None,
+        *,
+        task_id: str | None,
+        comment_id: str | None,
+        anchor_url: str | None,
+        issue: str | None,
+        journal: str | None,
+    ) -> NormalizedAnchor:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             normalize_anchor,
         )
 
+        # `source` is validated against `SOURCES` (non-None) by the facade before the
+        # anchored branch is reached; `normalize_anchor` itself fails closed on any
+        # value outside `SOURCES`, so a stray None would still raise `AnchorError`.
         return normalize_anchor(
-            source,
+            source or "",
             task_id=task_id,
             comment_id=comment_id,
             anchor_url=anchor_url,
@@ -203,7 +214,9 @@ class LiveEnvelopePlannerOps:
         )
 
     @staticmethod
-    def build_execution_root(workdir_abs, *, repo_root_abs):
+    def build_execution_root(
+        workdir_abs: str, *, repo_root_abs: str | None
+    ) -> ExecutionRoot:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             build_execution_root,
         )
@@ -211,7 +224,7 @@ class LiveEnvelopePlannerOps:
         return build_execution_root(workdir_abs, repo_root_abs=repo_root_abs)
 
     @staticmethod
-    def infer_repo_root(cwd):
+    def infer_repo_root(cwd: str) -> str | None:
         from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             infer_repo_root,
         )
@@ -219,7 +232,12 @@ class LiveEnvelopePlannerOps:
         return infer_repo_root(cwd)
 
     @staticmethod
-    def resolve_handoff_profile_fields(role_profile, profile_field, human_pointer, repo_root):
+    def resolve_handoff_profile_fields(
+        role_profile: str,
+        profile_field: Iterable[str] | None,
+        human_pointer: str,
+        repo_root: Path,
+    ) -> dict[str, str]:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (
             resolve_handoff_profile_fields,
         )
@@ -229,7 +247,9 @@ class LiveEnvelopePlannerOps:
         )
 
     @staticmethod
-    def resolve_role_profile(role_profile, profile_fields):
+    def resolve_role_profile(
+        role_profile: str, profile_fields: Mapping[str, str] | None
+    ) -> RoleProfileResolution:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
             resolve_role_profile,
         )
@@ -237,7 +257,7 @@ class LiveEnvelopePlannerOps:
         return resolve_role_profile(role_profile, profile_fields)
 
     @staticmethod
-    def resolve_transition_role(transition_role):
+    def resolve_transition_role(transition_role: str) -> TransitionRoleBoundary:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
             resolve_transition_role,
         )
@@ -245,7 +265,7 @@ class LiveEnvelopePlannerOps:
         return resolve_transition_role(transition_role)
 
     @staticmethod
-    def resolve_workflow_contract(workflow_contract):
+    def resolve_workflow_contract(workflow_contract: str) -> WorkflowContractBundle:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
             resolve_workflow_contract,
         )
@@ -254,19 +274,19 @@ class LiveEnvelopePlannerOps:
 
     @staticmethod
     def build_notification_body(
-        anchor,
-        kind,
-        summary,
-        receiver,
+        anchor: NormalizedAnchor,
+        kind: str,
+        summary: str | None,
+        receiver: str,
         *,
-        execution_root,
-        role_profile,
-        transition_role,
-        workflow_contract,
-        ticketless_callback,
-        ticketless_consultation,
-        ticketless_work_intake,
-    ):
+        execution_root: ExecutionRoot | None,
+        role_profile: RoleProfileResolution | None,
+        transition_role: TransitionRoleBoundary | None,
+        workflow_contract: WorkflowContractBundle | None,
+        ticketless_callback: TicketlessCallback | None,
+        ticketless_consultation: TicketlessConsultation | None,
+        ticketless_work_intake: TicketlessWorkIntake | None,
+    ) -> str:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             build_notification_body,
         )
@@ -286,7 +306,9 @@ class LiveEnvelopePlannerOps:
         )
 
     @staticmethod
-    def build_marker(anchor, kind, receiver):
+    def build_marker(
+        anchor: NormalizedAnchor, kind: str, receiver: str
+    ) -> str:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             build_marker,
         )
@@ -308,57 +330,68 @@ class HandoffEnvelopePlanner:
         outcome fields, matching the original early anchor block (target/anchor are still
         ``None`` there).
         """
+        # The typed input keeps every ticketless field Optional (any `--flag` may be
+        # omitted); the value-object constructors declare `str` and *fail closed* on a
+        # missing / unknown value (`Ticketless*Error`). `cast` hands the raw optional to
+        # that fail-closed validator unchanged — behaviour-preserving, and the derived
+        # anchor is inlined into the return so the `anchor` local's union type stays clean.
         if inp.ticketless and inp.ticketless_work_intake:
             try:
                 work_intake_payload = TicketlessWorkIntake(
-                    work_shape=inp.work_shape,
-                    callback_to_role=inp.callback_to_role,
-                    callback_methods=inp.callback_methods,
-                    read_contract=inp.read_contract,
+                    work_shape=cast(str, inp.work_shape),
+                    callback_to_role=cast(str, inp.callback_to_role),
+                    callback_methods=cast("tuple[str, ...]", inp.callback_methods),
+                    read_contract=cast(str, inp.read_contract),
                     forward_action_id=inp.forward_action_id or "",
                 )
             except TicketlessWorkIntakeError as exc:
                 raise EnvelopePlanError("invalid_args", str(exc))
-            anchor = TicketlessWorkIntakeAnchor(
-                work_shape=work_intake_payload.work_shape,
-                callback_to_role=work_intake_payload.callback_to_role,
+            return AnchorPlan(
+                anchor=TicketlessWorkIntakeAnchor(
+                    work_shape=work_intake_payload.work_shape,
+                    callback_to_role=work_intake_payload.callback_to_role,
+                ),
+                work_intake_payload=work_intake_payload,
             )
-            return AnchorPlan(anchor=anchor, work_intake_payload=work_intake_payload)
 
         if inp.ticketless and inp.ticketless_consultation:
             try:
                 consultation_payload = TicketlessConsultation(
-                    consultation_kind=inp.consultation_kind,
-                    callback_to_role=inp.callback_to_role,
-                    callback_methods=inp.callback_methods,
-                    read_contract=inp.read_contract,
+                    consultation_kind=cast(str, inp.consultation_kind),
+                    callback_to_role=cast(str, inp.callback_to_role),
+                    callback_methods=cast("tuple[str, ...]", inp.callback_methods),
+                    read_contract=cast(str, inp.read_contract),
                     forward_action_id=inp.forward_action_id or "",
                 )
             except TicketlessConsultationError as exc:
                 raise EnvelopePlanError("invalid_args", str(exc))
-            anchor = TicketlessConsultationAnchor(
-                consultation_kind=consultation_payload.consultation_kind,
-                callback_to_role=consultation_payload.callback_to_role,
+            return AnchorPlan(
+                anchor=TicketlessConsultationAnchor(
+                    consultation_kind=consultation_payload.consultation_kind,
+                    callback_to_role=consultation_payload.callback_to_role,
+                ),
+                consultation_payload=consultation_payload,
             )
-            return AnchorPlan(anchor=anchor, consultation_payload=consultation_payload)
 
         if inp.ticketless:
             try:
                 callback_payload = TicketlessCallback(
-                    classification=inp.classification,
-                    dispatch_decision=inp.dispatch_decision,
-                    next_action_owner=inp.workflow_next_owner,
-                    callback_reason=inp.callback_reason,
-                    read_contract=inp.read_contract,
+                    classification=cast(str, inp.classification),
+                    dispatch_decision=cast(str, inp.dispatch_decision),
+                    next_action_owner=cast(str, inp.workflow_next_owner),
+                    callback_reason=cast(str, inp.callback_reason),
+                    read_contract=cast(str, inp.read_contract),
                     forward_action_id=inp.forward_action_id or "",
                 )
             except TicketlessCallbackError as exc:
                 raise EnvelopePlanError("invalid_args", str(exc))
-            anchor = TicketlessAnchor(
-                classification=callback_payload.classification,
-                dispatch_decision=callback_payload.dispatch_decision,
+            return AnchorPlan(
+                anchor=TicketlessAnchor(
+                    classification=callback_payload.classification,
+                    dispatch_decision=callback_payload.dispatch_decision,
+                ),
+                callback_payload=callback_payload,
             )
-            return AnchorPlan(anchor=anchor, callback_payload=callback_payload)
 
         try:
             anchor = self._ops.normalize_anchor(
@@ -386,7 +419,7 @@ class HandoffEnvelopePlanner:
         target_cwd: str,
         summary: str | None,
         receiver: str,
-        kind: str | None,
+        kind: str,
     ) -> HandoffEnvelope:
         """Resolve the pre-send envelope (execution root / profile / contract / body / marker).
 
@@ -397,6 +430,7 @@ class HandoffEnvelopePlanner:
         execution_root = None
         if inp.workdir:
             workdir_abs = str(Path(inp.workdir).expanduser().resolve())
+            repo_anchor_abs: str | None
             if resolved_target_repo and resolved_target_repo != AUTO_TARGET_REPO:
                 repo_anchor_abs = str(Path(resolved_target_repo).expanduser().resolve())
             else:
