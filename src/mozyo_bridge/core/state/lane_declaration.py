@@ -485,7 +485,8 @@ class LaneDeclarationStore:
                     f"UPDATE {_TABLE} SET lane_disposition = ?, lane_generation = ?, "
                     "process_release = ?, release_action_id = ?, release_pins = ?, "
                     "replacement_state = ?, replacement_action_id = ?, "
-                    "replacement_pins = ?, declared_slots = ?, revision = ?, "
+                    "replacement_pins = ?, declared_slots = ?, reconcile_phase = ?, "
+                    "revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -499,6 +500,10 @@ class LaneDeclarationStore:
                         "",
                         "",
                         encoded_slots,
+                        # v6 (Redmine #13842): a re-incarnated generation is a fresh active lane,
+                        # NOT a reconcile-retired one — clear any stale reconcile owed-close phase
+                        # so an old generation's provenance never authorizes a new one.
+                        "",
                         revision,
                         decision.source,
                         decision.issue_id,

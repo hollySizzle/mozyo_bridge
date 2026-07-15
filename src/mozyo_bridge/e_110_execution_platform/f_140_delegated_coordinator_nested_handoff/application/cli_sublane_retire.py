@@ -161,6 +161,24 @@ def register_sublane_retire(
             "zero-write error (the migration never closes a pane)."
         ),
     )
+    sublane_retire.add_argument(
+        "--reconcile-hibernated-live",
+        dest="reconcile_hibernated_live",
+        action="store_true",
+        help=(
+            "Redmine #13842: reconcile a hibernated / released LEGACY owner row (empty "
+            "worktree binding) whose exact managed pair is nonetheless observed LIVE — the "
+            "#13756 j#79188 contradiction the #13841 live-zero migration, the #13754 guarded "
+            "close, and the #13809 backfill all leave with no convergence path. Only when the "
+            "preflight permits retirement AND the exact live pair is unique + idle/turn-ended "
+            "+ settled + generation-bound attested AND --branch is integrated, it re-establishes "
+            "the missing worktree + process binding via a bounded CAS, then hands off to the "
+            "#13754 guarded close to close the pair and record the terminal `retired` "
+            "disposition (one replayable flow). Launches / resumes NO process; removes no "
+            "worktree / branch. Mutually exclusive with --execute and "
+            "--migrate-hibernated-legacy (passing more than one is a zero-write error)."
+        ),
+    )
     add_repo_option(sublane_retire)
     add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)
