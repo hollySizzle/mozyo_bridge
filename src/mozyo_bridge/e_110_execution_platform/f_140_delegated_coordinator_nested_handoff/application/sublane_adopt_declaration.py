@@ -100,17 +100,18 @@ ADOPT_DECL_ALREADY_OWNED = "already_owned"
 ADOPT_DECL_OWNER_CONFLICT = "owner_conflict"
 ADOPT_DECL_DECLARE_ERROR = "declare_error"
 
-#: The outcomes that BLOCK the adopted lane before dispatch (Redmine #13810 R3-F3): the
-#: adopt had a usable anchor and a resolvable unit but the owner declaration was refused by
-#: a fail-closed condition (an ambiguous / stale / unattested / recycled live pair, an owner
-#: conflict, or a store error) AND the lane is not already the active owner — so dispatching
-#: would report a false success while the ``original_identity_unknown`` hibernate blocker
-#: (#13809) stays in place. Every OTHER outcome proceeds: a fresh / idempotent ``declared``,
-#: an ``already_owned`` lane (a prior create / adopt bound it), a non-gated ``not_adopted``
-#: create, or an owner-unbound-BY-DESIGN path (``no_exact_anchor`` — a journal-less adopt,
-#: which the create path also declares nothing for; ``unresolved_unit`` / ``unreadable`` —
-#: an inventory-resolution gap the confirm steps already fail closed on). Blocking those
-#: last would refuse legitimate journal-less create/adopt flows, not close the #13809 gap.
+#: The outcomes that BLOCK the adopted lane before dispatch (Redmine #13810 R3-F3 / R4-F3):
+#: the adopt did not end owner-bound — the owner declaration was refused by a fail-closed
+#: condition (an ambiguous / stale / unattested / recycled live pair, an owner conflict, a
+#: store error) OR the unit could not be read / resolved (``unreadable`` / ``unresolved_unit``,
+#: an inventory that failed AFTER the lane was confirmed) — AND the lane is not already the
+#: active owner (an ``already_owned`` re-check that reads the state DB, never inference). So
+#: dispatching would report a false success while the ``original_identity_unknown`` hibernate
+#: blocker (#13809) stays in place. Every OTHER outcome proceeds: a fresh / idempotent
+#: ``declared``, an ``already_owned`` lane (a prior create / adopt bound it), a non-gated
+#: ``not_adopted`` create, or the owner-unbound-BY-DESIGN ``no_exact_anchor`` (a journal-less
+#: adopt, which the create path also declares nothing for — blocking it would refuse
+#: legitimate journal-less create/adopt flows, not close the #13809 gap).
 ADOPT_DECL_OWNER_UNBOUND = frozenset(
     {
         ADOPT_DECL_UNREADABLE,
@@ -128,10 +129,13 @@ ADOPT_DECL_OWNER_UNBOUND = frozenset(
 )
 
 #: The zero-write outcomes: no owner row was written (fail-closed), for any reason other
-#: than a successful declaration or a store error surfaced to the caller.
+#: than a successful declaration (``declared`` / ``already_owned``) or a ``declare_error``
+#: store failure surfaced to the caller. ``unreadable`` is included: an inventory that could
+#: not be read wrote no owner row.
 ADOPT_DECL_ZERO_WRITE = frozenset(
     {
         ADOPT_DECL_NO_ANCHOR,
+        ADOPT_DECL_UNREADABLE,
         ADOPT_DECL_UNRESOLVED_UNIT,
         ADOPT_DECL_INCOMPLETE_PAIR,
         ADOPT_DECL_DUPLICATE_CANDIDATES,

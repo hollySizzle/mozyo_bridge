@@ -353,5 +353,40 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         self.assertNotIn(out, ADOPT_DECL_OWNER_UNBOUND)
 
 
+class PublicContractRegistryTest(unittest.TestCase):
+    """R4-F1 (review j#78926): the owner-unbound public vocabulary is self-consistent."""
+
+    def test_reason_adopt_owner_unbound_is_registered_and_exported(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+            sublane_actuation as actuation,
+        )
+
+        self.assertIn(actuation.REASON_ADOPT_OWNER_UNBOUND, actuation.BLOCKED_REASONS)
+        self.assertIn("REASON_ADOPT_OWNER_UNBOUND", actuation.__all__)
+
+    def test_unreadable_is_both_owner_unbound_and_zero_write(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_UNREADABLE,
+            ADOPT_DECL_ZERO_WRITE,
+        )
+
+        # UNREADABLE fails closed (blocks dispatch) AND writes no owner row.
+        self.assertIn(ADOPT_DECL_UNREADABLE, ADOPT_DECL_OWNER_UNBOUND)
+        self.assertIn(ADOPT_DECL_UNREADABLE, ADOPT_DECL_ZERO_WRITE)
+
+    def test_every_blocking_outcome_except_declare_error_is_zero_write(self) -> None:
+        # A blocking adopt outcome wrote no owner row — except ``declare_error``, which is a
+        # store failure surfaced to the caller, not a clean zero-write refusal.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARE_ERROR,
+            ADOPT_DECL_ZERO_WRITE,
+        )
+
+        self.assertEqual(
+            ADOPT_DECL_OWNER_UNBOUND - {ADOPT_DECL_DECLARE_ERROR},
+            (ADOPT_DECL_OWNER_UNBOUND - {ADOPT_DECL_DECLARE_ERROR}) & ADOPT_DECL_ZERO_WRITE,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
