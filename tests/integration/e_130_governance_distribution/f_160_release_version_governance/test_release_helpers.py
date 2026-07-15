@@ -309,6 +309,134 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: blocker", output)
             self.assertIn(slash_secret, output)
 
+    def test_call_terminated_literal_secret_still_blocks(self) -> None:
+        # Redmine #13695: a real credential literal passed as the final call
+        # argument leaves a call-closing `)` glued to the captured value. The
+        # tree scan must separate that punctuation and still flag the leaked
+        # literal instead of misreading the `)` as an expression and returning
+        # clean (the pre-fix blind spot that let the canary through).
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        secret_key = "sup" + "er-secret-key123"
+        leak_line = 'cache = RedmineContextCache(api_key="' + secret_key + '")'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "config.py", leak_line + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("result: blocker", output)
+            self.assertIn(secret_key, output)
+
+    def test_underscore_and_dict_env_key_literals_still_block(self) -> None:
+        # Redmine #13716: the first-stage grep anchored the credential keyword
+        # on a bare word boundary, so a leading-underscore identifier
+        # (`_API_KEY = ...`) and an ENV-name dict key (`API_KEY_ENV: ...`) never
+        # surfaced as candidates and a real literal in either shape returned
+        # clean. Both must now block. Key/separator are split so this test
+        # source never carries a contiguous matchable assignment token.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "sk" + "-live-abc123def456"
+        underscore_line = "_API" + "_KEY = \"" + token + "\""
+        dict_env_line = "environ = {" + "API" + "_KEY_ENV: \"" + token + "\"}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(
+                root, "leaky.py", underscore_line + "\n" + dict_env_line + "\n"
+            )
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("result: blocker", output)
+            # Both leaked shapes are reported.
+            self.assertEqual(2, output.count(token))
+
+    def test_r1_segment_bounded_scan_end_to_end(self) -> None:
+        # Redmine #13716 R1: end-to-end through the POSIX-ERE grep first stage.
+        # F1 — a real UPPER_SNAKE credential under a non-`*_ENV` key must block
+        # (the env-name exemption is key-scoped, not value-global). F2 — glued
+        # substrings of a credential keyword must NOT surface as candidates.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        real_secret = "REAL" + "_SECRET_123"
+        leak_line = "API" + "_KEY = \"" + real_secret + "\""
+        glued = "\n".join(
+            (
+                "password" + "_length = 16",
+                "password" + "less = \"" + "ab" + "c123\"",
+                "access" + "_tokenizer = \"" + "ab" + "c123\"",
+                # Allowlisted env-var name definition (exempt).
+                "API" + "_KEY_ENV = \"" + "MOZYO_REDMINE" + "_API_KEY\"",
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "leak.py", leak_line + "\n")
+            self._commit_file(root, "safe.py", glued + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn(real_secret, output)
+            # The glued-substring / allowlisted env-name lines are not reported.
+            self.assertNotIn("password_length", output)
+            self.assertNotIn("passwordless", output)
+            self.assertNotIn("access_tokenizer", output)
+            self.assertNotIn("MOZYO_REDMINE_API_KEY", output)
+
+    def test_r2_tree_artifact_parity(self) -> None:
+        # Redmine #13716 R2/R3: the first-stage grep and the shared second-stage
+        # classifier use the same segment-bounded grammar, so a line's tree and
+        # artifact verdicts always agree. R3-F1: a `*_ENV` key exempts only a
+        # value in the known env-name allowlist; any other literal (`REAL_..._123`)
+        # under a `*_ENV` key still blocks. R2-F2: a glued provider prefix
+        # (`mygithub_token`) is a candidate in neither scan.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        env_key = "API" + "_KEY_ENV"
+        # The allowlisted production env-var name (kept safe); split so this test
+        # source carries no contiguous credential-shaped assignment.
+        known_env_name = "MOZYO_REDMINE" + "_API_KEY"
+        self.assertIn(known_env_name, release_mod._KNOWN_CREDENTIAL_ENV_NAMES)
+        cases = (
+            (env_key + " = \"" + "REAL" + "_API_KEY_123\"", True),  # secret under *_ENV
+            (env_key + " = \"" + known_env_name + "\"", False),     # allowlisted env-name
+            ("mygithub" + "_token = \"" + "ab" + "c123\"", False),  # glued provider prefix
+        )
+        personal_pattern = re.compile("|".join(release_mod._PERSONAL_PATH_PATTERNS))
+        for line, expect_block in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._init_repo(root)
+                self._commit_file(root, "f.py", line + "\n")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = release_mod.cmd_release_check_tree(
+                        argparse.Namespace(repo=str(root))
+                    )
+                tree_block = rc == release_mod.EXIT_BLOCKER
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "f.py").write_text(line + "\n", encoding="utf-8")
+                artifact_block = bool(
+                    release_mod._grep_artifact_tree(root, personal_pattern)
+                )
+            self.assertEqual(
+                tree_block, artifact_block,
+                msg=f"tree/artifact parity broken for {line!r}",
+            )
+            self.assertEqual(
+                expect_block, tree_block, msg=f"unexpected verdict for {line!r}"
+            )
+
 
 class SecretValueClassifierTest(unittest.TestCase):
     """Redmine #12175: pin the second-stage credential-value classifier that
@@ -375,6 +503,48 @@ class SecretValueClassifierTest(unittest.TestCase):
                 msg=f"expected real token secret: {value!r}",
             )
 
+    def test_accepts_call_terminated_literals_and_still_rejects_expressions(
+        self,
+    ) -> None:
+        # Redmine #13695: a real credential literal passed as the final call
+        # argument, the last list/dict element, or a trailing-comma assignment
+        # leaves a closing `)` `]` `}` or separator `,` `;` glued to the captured
+        # value. That punctuation is enclosing syntax, not part of the secret, so
+        # it must be separated before classification — quoted and unquoted alike.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "ab" + "c123"
+        accept_values = (
+            '"' + token + '")',  # quoted literal, call-closing paren
+            "'" + token + "')",  # single-quoted, call-closing paren
+            '"' + token + '"]',  # quoted literal, list-closing bracket
+            '"' + token + '"}',  # quoted literal, dict/set-closing brace
+            '"' + token + '");',  # quoted literal, call close + semicolon
+            token + ")",  # unquoted token, call-closing paren
+            token + "],",  # unquoted token, list close + comma
+        )
+        for value in accept_values:
+            self.assertTrue(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected real call-terminated secret: {value!r}",
+            )
+
+        # Separating trailing closers must not re-admit a genuine expression
+        # that merely ends in one: its unmatched *opening* bracket survives the
+        # strip and still marks it as code structure, not a literal.
+        reject_values = (
+            "get_key()",  # call expression as last arg
+            "os.environ[API_KEY])",  # index expression ending in a closer
+            'config["API_KEY"])',  # subscript expression
+            "build({key})",  # nested call / dict expression
+            "factory(make())",  # nested call
+        )
+        for value in reject_values:
+            self.assertFalse(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected non-secret expression: {value!r}",
+            )
+
     def test_assignment_classifier_pins_request_cases(self) -> None:
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
@@ -406,6 +576,123 @@ class SecretValueClassifierTest(unittest.TestCase):
             self.assertTrue(
                 release_mod._secret_assignment_is_real(line),
                 msg=f"expected unsafe line: {line!r}",
+            )
+
+    def test_13716_underscore_and_dict_env_key_shapes(self) -> None:
+        # Redmine #13716: the credential keyword must be caught inside a wider
+        # identifier — a leading underscore / name prefix, and a trailing ENV
+        # segment used as a dict key — while the value classifier still rejects
+        # the widened key when its value is a reference / keyword / placeholder.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "ab" + "c123"
+        # Real literals in the newly covered identifier shapes must be flagged.
+        real_lines = (
+            "_API" + "_KEY = \"" + token + "\"",          # leading underscore
+            "OPENAI" + "_API_KEY = " + token,             # name prefix
+            "_GITHUB" + "_TOKEN = '" + token + "'",       # provider, leading _
+            "environ = {" + "API" + "_KEY_ENV: \"" + token + "\"}",  # dict ENV key
+            "GITHUB" + "_TOKEN_ENV = \"" + token + "\"",  # provider, trailing seg
+        )
+        for line in real_lines:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected real credential literal: {line!r}",
+            )
+
+        # The widened key with a non-literal value stays safe: an env read, a
+        # bare identifier reference, a type annotation, or a None default.
+        safe_lines = (
+            "_API" + "_KEY = os.environ.get(" + "API" + "_KEY_ENV)",
+            "_api" + "_key: str | None = None",
+            "environ = {" + "API" + "_KEY_ENV: " + "API_KEY" + "}",
+            "environ = {" + "API" + "_KEY_ENV: None}",
+        )
+        for line in safe_lines:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected safe widened-key line: {line!r}",
+            )
+
+    def test_13716_r1f1_env_name_exemption_is_key_scoped(self) -> None:
+        # Redmine #13716 R1-F1: the env-var-name exemption must be scoped to the
+        # key context (`*_ENV` key + UPPER_SNAKE value), NOT applied to every
+        # UPPER_SNAKE value. A real credential shaped as an underscore-joined
+        # uppercase literal must still block; only the `*_ENV` name-constant is
+        # safe, and a non-name value under a `*_ENV` key still blocks.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        # Key/value split so the test source carries no contiguous assignment.
+        real_secret = "REAL" + "_SECRET_123"  # UPPER_SNAKE real credential value
+        blocks = (
+            "API" + "_KEY = \"" + real_secret + "\"",              # non-ENV key -> real
+            "API" + "_KEY_ENV = \"" + "sk" + "-live-x9\"",        # ENV key, non-name value
+        )
+        for line in blocks:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected real credential to block: {line!r}",
+            )
+        # `*_ENV` key bound to an allowlisted env-var name is a reference.
+        env_name_defs = (
+            "API" + "_KEY_ENV = \"" + "MOZYO_REDMINE" + "_API_KEY\"",
+        )
+        for line in env_name_defs:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected env-name definition to be safe: {line!r}",
+            )
+        # The value classifier alone no longer treats UPPER_SNAKE as safe: the
+        # exemption lives in the key-aware assignment classifier.
+        self.assertTrue(release_mod._secret_value_is_real("REAL" + "_SECRET_123"))
+
+    def test_13716_r1f2_segment_bounded_no_glued_substring(self) -> None:
+        # Redmine #13716 R1-F2: the identifier grammar is segment-bounded, so a
+        # credential keyword that is merely a glued substring of an unrelated
+        # identifier must NOT be flagged.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        token = "ab" + "c123"
+        non_credentials = (
+            "password" + "_length = 16",           # `password` + non-ENV suffix
+            "password" + "less = \"" + token + "\"",  # glued suffix, no boundary
+            "access" + "_tokenizer = \"" + token + "\"",  # `access_token` + glued
+        )
+        for line in non_credentials:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected non-credential identifier to be safe: {line!r}",
+            )
+
+    def test_13716_r3f1_env_name_exemption_is_allowlist_not_shape(self) -> None:
+        # Redmine #13716 R3-F1: the `*_ENV` exemption is an explicit allowlist of
+        # known env-var names, NOT a value-shape rule. Only an allowlisted name is
+        # safe; any other literal under a `*_ENV` key — even one that is
+        # UPPER_SNAKE and carries a credential keyword (`REAL_API_KEY_123`) —
+        # still blocks, because shape cannot separate an env-name from a secret.
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        env_key = "API" + "_KEY_ENV"
+        blocks = (
+            env_key + " = \"" + "REAL" + "_API_KEY_123\"",   # UPPER_SNAKE + keyword, not listed
+            env_key + " = \"" + "UPPER" + "_SNAKE_SECRET\"",  # UPPER_SNAKE, not listed
+            env_key + " = \"" + "REDMINE" + "_API_KEY\"",     # env-name shape, not listed
+        )
+        for line in blocks:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected non-allowlisted literal under *_ENV to block: {line!r}",
+            )
+        # Only the allowlisted production env-var name is safe.
+        known = "MOZYO_REDMINE" + "_API_KEY"
+        self.assertIn(known, release_mod._KNOWN_CREDENTIAL_ENV_NAMES)
+        env_names = (
+            env_key + " = \"" + known + "\"",
+        )
+        for line in env_names:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected allowlisted env-var name to be safe: {line!r}",
             )
 
     def test_12693_field_name_false_positives_are_safe(self) -> None:
@@ -646,6 +933,7 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
         runs = [
             {
                 "databaseId": 1,
+                "name": "TestPyPI exact 0.10.0 @ deadbeef (nonce abc123)",
                 "createdAt": "2026-05-14T00:00:00Z",
                 "status": "completed",
                 "conclusion": "success",
@@ -654,6 +942,7 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
             },
             {
                 "databaseId": 2,
+                "name": "TestPyPI dev (auto main-CI)",
                 "createdAt": "2026-05-14T01:00:00Z",
                 "status": "in_progress",
                 "conclusion": None,
@@ -672,9 +961,22 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
                     )
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
         text = out.getvalue()
-        self.assertIn("RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL", text)
-        self.assertIn("1\t2026-05-14T00:00:00Z\tcompleted\tsuccess\tabc\thttps://example/1", text)
-        self.assertIn("2\t2026-05-14T01:00:00Z\tin_progress\t\tdef\thttps://example/2", text)
+        # The RUN_NAME column carries the run-name (with the dispatch nonce) so
+        # operators can correlate a dispatch to its run deterministically.
+        self.assertIn(
+            "RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL\tRUN_NAME",
+            text,
+        )
+        self.assertIn(
+            "1\t2026-05-14T00:00:00Z\tcompleted\tsuccess\tabc\thttps://example/1\t"
+            "TestPyPI exact 0.10.0 @ deadbeef (nonce abc123)",
+            text,
+        )
+        self.assertIn(
+            "2\t2026-05-14T01:00:00Z\tin_progress\t\tdef\thttps://example/2\t"
+            "TestPyPI dev (auto main-CI)",
+            text,
+        )
 
 
 class ReleaseWorkflowWaitTest(unittest.TestCase):
@@ -780,12 +1082,32 @@ class ReleaseBumpPublishParserTest(unittest.TestCase):
                 self.parse("release", "publish", "--testpypi", "--pypi")
 
     def test_release_publish_testpypi(self) -> None:
+        # Exact-candidate dispatch (Redmine #13601): source-sha / expected-version
+        # / source-ref parse through; the legacy --version alias still parses.
+        args = self.parse(
+            "release",
+            "publish",
+            "--testpypi",
+            "--source-sha",
+            "a" * 40,
+            "--expected-version",
+            "0.10.0",
+            "--source-ref",
+            "int_13472_session_continuity",
+        )
+        self.assertTrue(args.testpypi)
+        self.assertEqual("a" * 40, args.source_sha)
+        self.assertEqual("0.10.0", args.expected_version)
+        self.assertEqual("int_13472_session_continuity", args.source_ref)
+        self.assertFalse(args.execute)
+
+    def test_release_publish_testpypi_version_alias(self) -> None:
         args = self.parse(
             "release", "publish", "--testpypi", "--version", "0.3.0a1"
         )
         self.assertTrue(args.testpypi)
         self.assertEqual("0.3.0a1", args.version)
-        self.assertFalse(args.execute)
+        self.assertIsNone(args.expected_version)
 
     def test_release_publish_pypi_dryrun(self) -> None:
         args = self.parse(
@@ -1196,27 +1518,57 @@ class ReleasePublishTest(unittest.TestCase):
                         )
                     )
 
-    def test_testpypi_dispatch_validates_version_without_workflow_input(self) -> None:
+    # Exact-candidate dispatch inputs (Redmine #13601).
+    SOURCE_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+    NONCE = "deadbeefcafef00d"
+
+    def _testpypi_namespace(self, **overrides) -> argparse.Namespace:
+        base = dict(
+            testpypi=True,
+            pypi=False,
+            plan=False,
+            tag=None,
+            notes_file=None,
+            execute=False,
+            source_sha=self.SOURCE_SHA,
+            expected_version="0.10.0",
+            source_ref="int_13472_session_continuity",
+            version=None,
+            repo=None,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_testpypi_dispatch_passes_exact_inputs_and_correlates_by_nonce(self) -> None:
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
-        dispatch_call = []
+        calls = []
 
         def fake_run(argv, cwd=None, check=False, env=None):
-            dispatch_call.append(list(argv))
+            calls.append(list(argv))
             if "workflow" in argv and "run" in argv:
                 return subprocess.CompletedProcess(
                     args=argv, returncode=0, stdout="", stderr=""
                 )
-            # gh run list response
+            # gh run list: one run whose run-name carries the nonce.
             payload = json.dumps(
                 [
                     {
                         "databaseId": 9999,
+                        "name": f"TestPyPI exact 0.10.0 @ {self.SOURCE_SHA} (nonce {self.NONCE})",
                         "url": "https://example/run/9999",
                         "createdAt": "2026-05-14T11:00:00Z",
-                        "headSha": "abc",
+                        "headSha": "mainhead",
                         "status": "queued",
-                    }
+                    },
+                    {
+                        "databaseId": 8888,
+                        "name": "TestPyPI dev (auto main-CI)",
+                        "url": "https://example/run/8888",
+                        "createdAt": "2026-05-14T10:00:00Z",
+                        "headSha": "otherhead",
+                        "status": "completed",
+                    },
                 ]
             )
             return subprocess.CompletedProcess(
@@ -1225,23 +1577,14 @@ class ReleasePublishTest(unittest.TestCase):
 
         with patch.object(release_mod, "_run", side_effect=fake_run):
             with patch.object(release_mod, "_require_command"):
-                with patch.object(release_mod.time, "sleep"):
-                    with contextlib.redirect_stdout(io.StringIO()) as out:
-                        rc = release_mod.cmd_release_publish(
-                            argparse.Namespace(
-                                testpypi=True,
-                                pypi=False,
-                                plan=False,
-                                tag=None,
-                                notes_file=None,
-                                execute=False,
-                                version="0.3.0a1",
-                                repo=None,
+                with patch.object(release_mod, "_new_dispatch_nonce", return_value=self.NONCE):
+                    with patch.object(release_mod.time, "sleep"):
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            rc = release_mod.cmd_release_publish(
+                                self._testpypi_namespace()
                             )
-                        )
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
-        self.assertEqual(2, len(dispatch_call))
-        dispatch_argv = dispatch_call[0]
+        dispatch_argv = calls[0]
         self.assertEqual(
             dispatch_argv,
             [
@@ -1251,9 +1594,121 @@ class ReleasePublishTest(unittest.TestCase):
                 "testpypi.yml",
                 "--ref",
                 "main",
+                "-f",
+                f"source_sha={self.SOURCE_SHA}",
+                "-f",
+                "expected_version=0.10.0",
+                "-f",
+                "source_ref=int_13472_session_continuity",
+                "-f",
+                f"dispatch_nonce={self.NONCE}",
             ],
         )
-        self.assertIn("9999", out.getvalue())
+        text = out.getvalue()
+        # Correlated deterministically to the nonce-matching run, not the latest.
+        self.assertIn("run_id: 9999", text)
+        self.assertIn(self.NONCE, text)
+
+    def test_testpypi_dispatch_fail_closed_when_no_nonce_match(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            if "workflow" in argv and "run" in argv:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+            # No run carries the nonce -> must NOT fall back to latest-one.
+            payload = json.dumps(
+                [
+                    {
+                        "databaseId": 8888,
+                        "name": "TestPyPI dev (auto main-CI)",
+                        "url": "https://example/run/8888",
+                        "createdAt": "2026-05-14T10:00:00Z",
+                        "headSha": "otherhead",
+                        "status": "completed",
+                    }
+                ]
+            )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=payload, stderr=""
+            )
+
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod, "_new_dispatch_nonce", return_value=self.NONCE):
+                    with patch.object(release_mod.time, "sleep"):
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            rc = release_mod.cmd_release_publish(
+                                self._testpypi_namespace()
+                            )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+        text = out.getvalue()
+        self.assertIn("not deterministically correlated", text)
+        self.assertNotIn("run_id: 8888", text)
+
+    def test_testpypi_dispatch_fail_closed_when_multiple_nonce_matches(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            if "workflow" in argv and "run" in argv:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+            payload = json.dumps(
+                [
+                    {"databaseId": 1, "name": f"a nonce {self.NONCE}", "status": "queued"},
+                    {"databaseId": 2, "name": f"b nonce {self.NONCE}", "status": "queued"},
+                ]
+            )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=payload, stderr=""
+            )
+
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod, "_new_dispatch_nonce", return_value=self.NONCE):
+                    with patch.object(release_mod.time, "sleep"):
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            rc = release_mod.cmd_release_publish(
+                                self._testpypi_namespace()
+                            )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+        self.assertIn("multiple runs matched", out.getvalue())
+
+    def test_testpypi_requires_source_sha_expected_version_and_ref(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        for missing in ("source_sha", "expected_version", "source_ref"):
+            with self.subTest(missing=missing):
+                ns = self._testpypi_namespace(**{missing: None})
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        release_mod.cmd_release_publish(ns)
+
+    def test_testpypi_version_alias_supplies_expected_version(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        captured = {}
+
+        def fake_dispatch(source_sha, expected_version, source_ref, nonce):
+            captured["expected_version"] = expected_version
+            return {"match": "one", "run_id": "77", "name": "", "url": "", "head_sha": "", "status": ""}
+
+        ns = self._testpypi_namespace(expected_version=None, version="0.10.0")
+        with patch.object(release_mod, "_gh_dispatch_testpypi", side_effect=fake_dispatch):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = release_mod.cmd_release_publish(ns)
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertEqual("0.10.0", captured["expected_version"])
+
+    def test_testpypi_rejects_non_hex_source_sha(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        ns = self._testpypi_namespace(source_sha="not-a-sha")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                release_mod.cmd_release_publish(ns)
 
 
 class ReleaseCheckDriftTest(unittest.TestCase):

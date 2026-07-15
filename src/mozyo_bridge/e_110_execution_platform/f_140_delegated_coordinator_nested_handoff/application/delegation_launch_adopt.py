@@ -42,7 +42,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OUTCOME_LAUNCH,
     PURPOSE_DELEGATION_PARENT,
     REASON_DELEGATION_DISABLED,
-    ROLE_CODEX,
     resolve_launch_adopt,
     validate_callback_targets,
 )
@@ -136,7 +135,11 @@ def _recommended_command(
         "handoff",
         "send",
         "--to",
-        "codex",
+        # The route lands at the binding-resolved gateway provider the decision was
+        # required to reach (Redmine #13569 R1-F2), not a literal `codex`, so a rebound
+        # gateway provider yields a correct replayable command. Default `codex`,
+        # byte-identical.
+        decision.required_role,
         "--target",
         decision.selected.pane_id,
         "--target-repo",
@@ -299,14 +302,28 @@ def cmd_handoff_delegate_launch_adopt(args: argparse.Namespace) -> int:
     targets = _agents_target_candidates(args)
     candidates = [_candidate_from_target(t) for t in targets]
 
+    # The child gateway landing role is the binding-resolved gateway/coordinator provider
+    # (Redmine #13569 Increment 2B), default ``codex`` (byte-identical). An unbound gateway
+    # role fails closed rather than defaulting to a literal (j#76969 correction 4).
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_gateway_provider,
+    )
+
+    try:
+        gateway_provider = resolve_gateway_provider()
+    except WorkflowProviderUnresolved as exc:
+        die(str(exc))
+
     try:
         decision = resolve_launch_adopt(
             mode=args.launch_adopt_mode,
             candidates=candidates,
             target_repo_identity=args.target_repo,
-            required_role=ROLE_CODEX,
+            required_role=gateway_provider,
             excluded_lane_ids=tuple(getattr(args, "excluded_lane", None) or ()),
             child_project=getattr(args, "child_project", None),
+            gateway_provider=gateway_provider,
         )
     except DelegationLaunchAdoptError as exc:
         die(str(exc))

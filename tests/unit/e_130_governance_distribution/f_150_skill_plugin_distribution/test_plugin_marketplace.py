@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -294,6 +296,164 @@ class PluginMarketplaceTest(unittest.TestCase):
                     "is the rewrite path, not --check."
                 ),
             )
+
+    def _stage_sync_repo(self, stage: Path) -> None:
+        """Copy the sync script, canonical source, and plugin mirror into a
+        throwaway repo layout so `--check` can be exercised against a
+        mutable tree without touching the real worktree."""
+        (stage / "scripts").mkdir()
+        shutil.copy(self.SYNC_SCRIPT_PATH, stage / "scripts" / "sync_plugin_skill.sh")
+        (stage / "scripts" / "sync_plugin_skill.sh").chmod(0o755)
+        shutil.copytree(self.canonical_skill_dir, stage / "skills" / "mozyo-bridge-agent")
+        shutil.copytree(
+            self.plugin_skill_dir,
+            stage / "plugins" / "mozyo-bridge-agent" / "skills" / "mozyo-bridge-agent",
+        )
+
+    def test_sync_script_check_mode_ignores_mtime_only_differences(self) -> None:
+        """`--check` must exit 0 when the mirror is byte-identical even if
+        file and directory mtimes differ.
+
+        Redmine #13580: the previous rsync `--itemize-changes` dry-run
+        preserved mtime, so checkout-induced timestamp-only differences
+        (`>f..t......` / `.d..t......`) were reported as drift. That made
+        the CI gate depend on the runner clock and fail non-deterministically
+        even though every byte matched. Touching canonical files (and their
+        parent directories) without changing content must not be drift.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            self._stage_sync_repo(stage)
+
+            canonical = stage / "skills" / "mozyo-bridge-agent"
+            # Skew every file and directory mtime on the canonical side into
+            # the past, leaving content untouched. A byte-only comparison
+            # must still see the trees as identical.
+            skewed = (2001, 1, 1, 0, 0, 0, 0, 0, -1)
+            past = time.mktime(skewed)
+            for path in sorted(canonical.rglob("*")):
+                os.utime(path, (past, past))
+            os.utime(canonical, (past, past))
+
+            result = subprocess.run(
+                ["sh", str(stage / "scripts" / "sync_plugin_skill.sh"), "--check"],
+                cwd=str(stage),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                result.returncode,
+                msg=(
+                    f"mtime-only difference was treated as drift; "
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}"
+                ),
+            )
+            self.assertIn("up to date", result.stdout)
+
+    def test_sync_script_check_mode_detects_same_size_byte_mutation(self) -> None:
+        """`--check` must still flag content drift that leaves file size
+        unchanged. A same-size mutation is exactly what `--size-only` would
+        miss, so the content comparison must catch it (Redmine #13580)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            self._stage_sync_repo(stage)
+
+            mirror_skill = (
+                stage
+                / "plugins"
+                / "mozyo-bridge-agent"
+                / "skills"
+                / "mozyo-bridge-agent"
+                / "SKILL.md"
+            )
+            original = mirror_skill.read_bytes()
+            # Flip the final byte to a different byte of equal length so the
+            # file size is preserved but the content differs.
+            last = original[-1:]
+            replacement = b"X" if last != b"X" else b"Y"
+            mutated = original[:-1] + replacement
+            self.assertEqual(len(original), len(mutated))
+            mirror_skill.write_bytes(mutated)
+
+            result = subprocess.run(
+                ["sh", str(stage / "scripts" / "sync_plugin_skill.sh"), "--check"],
+                cwd=str(stage),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                1,
+                result.returncode,
+                msg=(
+                    f"same-size byte mutation was not flagged as drift; "
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}"
+                ),
+            )
+            self.assertIn("plugin skill mirror drift detected", result.stderr)
+            self.assertIn("SKILL.md", result.stderr)
+            self.assertIn("scripts/sync_plugin_skill.sh", result.stderr)
+            self.assertIn("from the repo root", result.stderr)
+
+    def test_sync_script_check_mode_detects_extra_mirror_file(self) -> None:
+        """`--check` must flag a file present in the mirror but absent from
+        canonical (extra), naming the path (Redmine #13580)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            self._stage_sync_repo(stage)
+
+            extra = (
+                stage
+                / "plugins"
+                / "mozyo-bridge-agent"
+                / "skills"
+                / "mozyo-bridge-agent"
+                / "references"
+                / "STRAY.md"
+            )
+            extra.write_text("stray mirror-only file\n", encoding="utf-8")
+
+            result = subprocess.run(
+                ["sh", str(stage / "scripts" / "sync_plugin_skill.sh"), "--check"],
+                cwd=str(stage),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, result.returncode)
+            self.assertIn("plugin skill mirror drift detected", result.stderr)
+            self.assertIn("STRAY.md", result.stderr)
+
+    def test_sync_script_check_mode_ignores_mtime_is_read_only(self) -> None:
+        """The mtime-skew path must not rewrite the mirror; `--check` stays
+        read-only regardless of timestamp skew (Redmine #13580)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            self._stage_sync_repo(stage)
+
+            canonical = stage / "skills" / "mozyo-bridge-agent"
+            past = time.mktime((2001, 1, 1, 0, 0, 0, 0, 0, -1))
+            for path in sorted(canonical.rglob("*")):
+                os.utime(path, (past, past))
+            os.utime(canonical, (past, past))
+
+            mirror_skill = (
+                stage
+                / "plugins"
+                / "mozyo-bridge-agent"
+                / "skills"
+                / "mozyo-bridge-agent"
+                / "SKILL.md"
+            )
+            before = mirror_skill.read_bytes()
+
+            subprocess.run(
+                ["sh", str(stage / "scripts" / "sync_plugin_skill.sh"), "--check"],
+                cwd=str(stage),
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(before, mirror_skill.read_bytes())
 
     def test_sync_script_rejects_unknown_flag(self) -> None:
         """Reject typos to avoid silently running the wrong mode."""

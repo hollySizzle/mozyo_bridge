@@ -1,0 +1,128 @@
+# Built-in agent provider profiles (Redmine #13441, Design Answer j#76725).
+#
+# The runtime source of truth for what the agent-launch layer knows about each
+# interactive-CLI LLM provider. Validated by `agent_provider_profile_config.py`
+# and loaded (via importlib.resources) by `agent_provider_profile.py` — a
+# package-anchored resource, never a cwd / worktree path walk, so a hostile repo
+# checkout cannot shadow it.
+#
+# WHAT CHANGES HERE INSTEAD OF IN SOURCE:
+#   - a provider renames a CLI flag        -> edit its `managed_flags` spelling
+#   - a provider's binary is named anew    -> edit its `executable.command`
+#   - a new interactive-CLI (same protocol) -> add one `profiles:` entry
+#   - a provider re-words / adds a startup screen -> edit its `startup_blockers`
+#     (#13760: the pre-send admission classifier is provider-neutral and reads this
+#     data; a provider-specific string never belongs in a transport / consumer module)
+#
+# WHAT THIS FILE MAY NEVER CARRY (fail-closed in the schema, not just convention):
+#   - a host executable path / argv / module path / entry point / callable.
+#     `executable` is metadata only: a bare command basename plus the NAME of the
+#     trusted-env variable an operator may set to an absolute path. The binary is
+#     resolved from the trusted environment at launch (#13245 boundary).
+#   - a workflow role, a provider binding, a route, or a default pair. Adding a
+#     profile makes a provider EXPRESSIBLE, never LAUNCHED — default launch
+#     topology is a separate contract (`herdr_launch_command.LAUNCH_PROVIDERS`).
+#   - a model / effort semantic schema. Those stay opaque operator-owned
+#     `launch_argv` tokens (#13425, corrected in j#75397).
+#
+# HONEST LIMIT (#13441 description): a data profile absorbs a provider of an
+# EXISTING `protocol` family. A provider with a genuinely different interaction
+# protocol (different TUI, status semantics, turn-start behavior) needs adapter
+# code; declaring an unknown `protocol` here fails closed rather than mis-driving
+# the pane.
+
+# schema version "2" adds the optional `startup_blockers` block (#13760). "1" (the
+# #13441 shape) still loads — the field is optional and backward-compatible — but an
+# unknown version fails closed (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review j#78481 F2).
+version: "2"
+source: >-
+  Redmine #13441 journal #76725 (Coordinator Design Answer, Increment 1);
+  startup_blockers added by #13760 journal #77947 (Design Answer) with the schema
+  hardened per #13760 journal #78481 (Review Result).
+
+profiles:
+  claude:
+    protocol: interactive_cli_tui
+    executable:
+      command: claude
+      env_override: MOZYO_AGENT_CLAUDE_BINARY
+    discovery_aliases:
+      - claude
+    process_names:
+      - claude
+    capabilities:
+      - interactive_tui
+      - launch_argv_override
+      - managed_permission_mode
+    # The managed permission posture (#11925 / #13360): without this flag a
+    # managed Claude worker boots prompt-gated and stalls on its first gated
+    # command. The concept is mozyo policy; only the SPELLING lives here.
+    managed_flags:
+      permission_mode: "--permission-mode"
+    # Pre-composer startup screens (Redmine #13760, Design Answer j#77947). A fresh
+    # worktree's managed Claude worker renders one of these INSTEAD OF a request
+    # composer, but it is a live pane with non-blank content — so every readiness /
+    # status projection called it agent-ready, queue-enter typed the Implementation
+    # Request into a screen that has no composer, and the Enter accepted the dialog's
+    # default instead of submitting a turn (the request body was lost while the
+    # transport recorded `sent`; #13582 j#77917 / j#77937).
+    #
+    # Each blocker is an AND of signatures CO-LOCATED ON ONE SCREEN, so a lone generic
+    # phrase cannot false-positive a ready composer. The signatures below are the
+    # literal rendered strings of Claude Code 2.1.209 (read from the shipped binary,
+    # not from memory); the ids are what a zero-send outcome reports — the pane's own
+    # text never leaves the classifier.
+    #
+    # Declaring a screen NEVER authorises answering it: mozyo refuses to send and hands
+    # the lane back to the operator, who clears trust / theme / login in the provider's
+    # own UI. Auto-accepting a trust prompt is explicitly out of scope (#13760 境界).
+    startup_blockers:
+      # `onboarding_trust_dialog` — a workspace Claude has not been trusted in yet.
+      # This is the exact screen #13760 was raised on.
+      - id: workspace_trust_confirmation
+        all_of:
+          - "Is this a project you created or one you trust"
+          - "be able to read, edit, and execute files here"
+      # The session-scoped variant of the same trust boundary (a directory the running
+      # session has not worked in before).
+      - id: directory_trust_confirmation
+        all_of:
+          - "Is this a directory you created or one you trust"
+          - "be able to read, edit, and execute files here"
+      # First-run theme picker (#13760 j#78082): the fresh-startup screen that precedes
+      # the composer even when the workspace is already trusted.
+      - id: first_run_theme
+        all_of:
+          - "get started"
+          - "Choose the text style that looks best with your terminal"
+      # Interactive login (#13760 j#78082). Distinct from the theme picker because it is
+      # a credential/auth boundary: the operator must resolve it, and `claude -p`
+      # succeeding is NOT evidence the interactive TUI is past it.
+      - id: login_required
+        all_of:
+          - "Select login method"
+          - "Claude account with subscription"
+
+  codex:
+    protocol: interactive_cli_tui
+    executable:
+      command: codex
+      env_override: MOZYO_AGENT_CODEX_BINARY
+    discovery_aliases:
+      - codex
+    process_names:
+      - codex
+    capabilities:
+      - interactive_tui
+      - launch_argv_override
+      # Codex applies its own env policy to spawned tool shells, so the attested
+      # identity is re-expressed as `-c` overrides at launch (#13614).
+      - tool_shell_env_overrides
+    managed_flags: {}
+    # No `startup_blockers`: the #13760 pre-send admission gate is provider-neutral and
+    # reads this data, so an absent list means "no startup screen is DECLARED for this
+    # provider" — every send is admitted exactly as before. That is a statement about the
+    # evidence, not about Codex: no Codex startup screen has been observed on a managed
+    # lane and no literal has been verified against the shipped binary, and a guessed
+    # signature is worse than none (it either never fires, or it blocks a ready pane).
+    # Observe one, verify its rendered strings, and it becomes a data edit here.

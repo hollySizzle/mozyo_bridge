@@ -52,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CALLBACK_NONE,
     CALLBACK_STATES,
     GATE_KINDS,
+    GATE_OWNER_CLOSE_APPROVAL,
     GATE_REVIEW,
     REVIEW_APPROVED,
     REVIEW_CHANGES_REQUESTED,
@@ -113,8 +114,12 @@ def redmine_event_id(issue: str, journal: str) -> str:
 
 #: Marker-facing gate name -> runtime gate kind. Only the names that differ are listed;
 #: an unlisted name is used as-is (and rejected if not in :data:`GATE_KINDS`).
+#: ``owner_close_approval_waiting`` is the callback-facing state name (a child is waiting for
+#: owner close approval — workflow.md ``### coordinator callback を要する state``); it maps onto
+#: the runtime ``owner_close_approval`` gate (#13520 review F5).
 MARKER_GATE_ALIASES: dict[str, str] = {
     "review_result": GATE_REVIEW,
+    "owner_close_approval_waiting": GATE_OWNER_CLOSE_APPROVAL,
 }
 
 

@@ -43,6 +43,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (  # noqa: E402
     LANE_KIND_IMPLEMENTATION,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (  # noqa: E402
+    InventoryUnit,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import DelegationPolicy  # noqa: E402
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_read_boundary import (  # noqa: E402
     ReadAccess,
@@ -132,9 +135,33 @@ def realized_grandchild_rows(
     *,
     unit_id: str = GRANDCHILD_UNIT,
     parent: str = DELEGATED_COORDINATOR_UNIT,
-) -> list[tuple[str, str, Optional[int], str, str]]:
-    """A discovery row set in which a depth-2 implementation grandchild is realized."""
-    return [(unit_id, LANE_KIND_IMPLEMENTATION, 2, parent, "derived")]
+    repo_identity: Optional[str] = CHILD_REPO_IDENTITY,
+    has_codex_gateway: bool = True,
+    ambiguous: bool = False,
+    lane_kind: str = LANE_KIND_IMPLEMENTATION,
+    delegation_depth: object = 2,
+) -> list[InventoryUnit]:
+    """A live-inventory unit set in which a depth-2 implementation grandchild is realized.
+
+    Typed :class:`InventoryUnit` (not a bare tuple): a positive realization
+    requires a re-resolved codex gateway (``has_codex_gateway``) and a canonical
+    ``repo_identity`` so the dispatch-selected target re-verifies end to end
+    (Redmine #13571 j#75473 F2). A bare tuple can never realize. ``lane_kind`` /
+    ``delegation_depth`` override the live shape so a test can align the live unit
+    to a non-grandchild shape (Redmine #13571 j#75494 R5-F1).
+    """
+    return [
+        InventoryUnit(
+            unit_id=unit_id,
+            lane_kind=lane_kind,
+            delegation_depth=delegation_depth,  # type: ignore[arg-type]
+            delegation_parent=parent,
+            status="derived",
+            repo_identity=repo_identity,
+            has_codex_gateway=has_codex_gateway,
+            ambiguous=ambiguous,
+        )
+    ]
 
 
 def base_request(**overrides: object) -> RoutePlanRequest:

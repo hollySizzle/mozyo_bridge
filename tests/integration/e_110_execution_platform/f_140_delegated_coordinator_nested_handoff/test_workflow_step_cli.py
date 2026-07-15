@@ -363,5 +363,74 @@ class ExecuteCallbackTest(unittest.TestCase):
         self.assertIn("caller_missing", text)
 
 
+class HerdrForwardLegCliTest(unittest.TestCase):
+    """The Increment-3 herdr coordinator-forward leg is fired only on a non-dry-run step (#13583).
+
+    Under the herdr backend the preflight resolves a coordinator lane to a ready forward outcome.
+    ``cmd_workflow_step`` must dispatch the dedicated forward leg exactly once on execute, and NEVER
+    on ``--dry-run`` (dry-run purity, safety-contract point 6): a dry-run resolves the route/result
+    and touches no fence / send.
+    """
+
+    def _forward_outcome(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+            EXECUTION_READY,
+            OWNER_PARENT,
+            STATE_GRANDPARENT_CONSULTATION,
+            WorkflowStepOutcome,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+            PRIMITIVE_HERDR_FORWARD_CONSULT,
+            REASON_HERDR_FORWARD_CONSULT_READY,
+        )
+
+        return WorkflowStepOutcome(
+            state=STATE_GRANDPARENT_CONSULTATION,
+            next_action="forward a single ticketless consultation to the single live gateway",
+            execution=EXECUTION_READY,
+            reason=REASON_HERDR_FORWARD_CONSULT_READY,
+            next_owner=OWNER_PARENT,
+            primitive=PRIMITIVE_HERDR_FORWARD_CONSULT,
+            caller_role="grandparent_coordinator",
+            repo_root=REPO,
+            durable_anchor="none",
+        )
+
+    def _run_forward(self, args, *, leg_result):
+        out = io.StringIO()
+        with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: self._forward_outcome()
+        ), patch.object(
+            cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
+        ), patch.object(
+            cli_workflow, "_execute_herdr_forward_leg", return_value=leg_result
+        ) as leg_mock, contextlib.redirect_stdout(out):
+            rc = cli_workflow.cmd_workflow_step(args)
+        return rc, out.getvalue(), leg_mock
+
+    def test_dry_run_never_fires_the_forward_leg(self):
+        rc, text, leg_mock = self._run_forward(_args(dry_run=True), leg_result=(0, ""))
+        leg_mock.assert_not_called()  # dry-run: zero fence / send
+        self.assertEqual(rc, 0)
+        self.assertIn("execution: dry_run", text)
+        self.assertIn("herdr_forward_consultation_ready", text)
+
+    def test_execute_fires_the_forward_leg_once(self):
+        rc, text, leg_mock = self._run_forward(
+            _args(dry_run=False), leg_result=(0, "forward_result: sent")
+        )
+        self.assertEqual(leg_mock.call_count, 1)
+        self.assertEqual(rc, 0)
+        self.assertIn("execution: executed", text)
+
+    def test_forward_leg_rc_is_surfaced(self):
+        # A fence-unavailable / uncertain leg returns rc 1; the step surfaces the real outcome.
+        rc, _text, leg_mock = self._run_forward(
+            _args(dry_run=False), leg_result=(1, "forward_result: zero_send")
+        )
+        self.assertEqual(leg_mock.call_count, 1)
+        self.assertEqual(rc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

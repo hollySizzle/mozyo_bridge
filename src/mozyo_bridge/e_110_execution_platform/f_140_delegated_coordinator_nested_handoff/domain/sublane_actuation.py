@@ -110,6 +110,24 @@ REASON_HANDOFF_FAILED = "handoff_failed"
 #: The #13002 work-unit granularity gate refused: an ``epic`` / ``feature`` unit was
 #: requested without an explicit owner / operator decision anchor (durable journal id).
 REASON_WORK_UNIT_BLOCKED = "work_unit_blocked"
+#: The action-time sender-attestation preflight refused a live dispatch (#13518 j#75671 / review
+#: R2-F3): the coordinator sender identity was not attested, so actuating would create a lane /
+#: worktree and THEN fail the governed dispatch on an unattested sender (a partial launch that
+#: forces raw-input recovery). Fail closed BEFORE any worktree / launch side effect, with a
+#: replayable resume plan (re-attest the sender, then re-run create).
+REASON_SENDER_UNATTESTED = "sender_unattested"
+#: The existing lane's gateway/worker pair is split across tabs / workspaces
+#: (Redmine #13705): ``read_lane`` reports ``pair_split`` (both panes live but not
+#: co-located). A same-tab-contract lane admits only ``active`` for adopt / dispatch,
+#: so a split pair fails closed with zero append / dispatch — an actionable degraded
+#: state recovered by retire + recreate, never adopted or healed over.
+REASON_PAIR_SPLIT = "pair_split"
+#: The action-time runtime fingerprint gate refused before any mutation (Redmine
+#: #13705): the active runtime surface is missing placement behavior the repo-local
+#: source ships (a source/installed skew — the exact class that split the pair). The
+#: official mutating front door goes zero-write, so an incompatible / stale runtime
+#: cannot actuate a lane it would place incorrectly.
+REASON_RUNTIME_FINGERPRINT = "runtime_fingerprint"
 #: The #13290 dispatch admission gate refused: the caller-supplied fill decision
 #: resolved to a concrete stop and no explicit override was supplied. Defined in
 #: :mod:`...domain.sublane_dispatch_admission`; re-exported here so the actuator's
@@ -127,6 +145,9 @@ BLOCKED_REASONS = frozenset(
         REASON_LANE_MISMATCH,
         REASON_HANDOFF_FAILED,
         REASON_WORK_UNIT_BLOCKED,
+        REASON_SENDER_UNATTESTED,
+        REASON_PAIR_SPLIT,
+        REASON_RUNTIME_FINGERPRINT,
         REASON_FILL_STOP,
     }
 )
@@ -270,7 +291,7 @@ class SublaneActuationOutcome:
         return self.dispatch_result == DISPATCH_WORKER_DISPATCHED
 
     def as_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "status": self.status,
             "execute": self.execute,
             "reason": self.reason,
@@ -292,6 +313,19 @@ class SublaneActuationOutcome:
             "fill_override_reason": self.fill_override_reason,
             "gateway_ready": self.gateway_ready,
         }
+        if self.is_blocked and "sender_attestation" in self.blocked_reasons:
+            payload["next_action"] = {
+                "action": "restore_attested_coordinator_shell",
+                "allowed_methods": [
+                    "relaunch_from_fixed_session_start",
+                    "verified_high_level_coordinator_proxy",
+                ],
+                "forbidden_methods": [
+                    "manual_mozyo_env_injection",
+                    "raw_herdr_send",
+                ],
+            }
+        return payload
 
 
 def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
@@ -349,9 +383,16 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         lines.append(f"- gateway_ready: {str(outcome.gateway_ready).lower()}")
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
-        lines.append(
-            "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
-        )
+        if "sender_attestation" in outcome.blocked_reasons:
+            lines.append(
+                "- next_action: restore an attested coordinator shell by relaunching "
+                "from fixed session-start, or use a verified high-level coordinator "
+                "proxy; do not inject MOZYO env manually or use raw herdr send"
+            )
+        else:
+            lines.append(
+                "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
+            )
     else:
         lines.append("- next_action: " + _next_action(outcome))
     return "\n".join(lines)
@@ -402,6 +443,7 @@ __all__ = (
     "ACTUATE_READY",
     "ACTUATE_BLOCKED",
     "ACTUATE_STATES",
+    "REASON_SENDER_UNATTESTED",
     "REASON_MISSING_IDENTITY",
     "REASON_LAUNCH_BLOCKED",
     "REASON_ANCHOR_REQUIRED",
@@ -411,6 +453,8 @@ __all__ = (
     "REASON_LANE_MISMATCH",
     "REASON_HANDOFF_FAILED",
     "REASON_WORK_UNIT_BLOCKED",
+    "REASON_PAIR_SPLIT",
+    "REASON_RUNTIME_FINGERPRINT",
     "REASON_FILL_STOP",
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",

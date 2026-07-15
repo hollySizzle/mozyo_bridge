@@ -270,6 +270,44 @@ Table naming:
   させない。`state_schema_components` へは `migrated_from` NULL で自己登録する (native component の
   登録形)。native component のみが載る `state.sqlite` は「partial migration」ではない (doctor は
   native-only を ok と分類し、legacy import の未実行は operator の選択として案内する)。
+- `lane_lifecycle_records` — 2 つ目の **native component** の table (#13689、Design Answer j#76741)。
+  component 名は **`lane_lifecycle`**、owner module は `core/state/lane_lifecycle.py`。lane unit
+  `(repo_workspace_id, lane_id)` の **desired lifecycle** — `lane_disposition`
+  (`active|superseded|hibernated|retired`) と `process_release`
+  (`not_requested|requested|partial|released`) — を持つ。recovery policy は `operator_current_state`
+  (coordinator の supersede / hibernate 判断は event から再構成できず、復旧は Redmine durable pointer
+  からの explicit re-declare)。`migrated_from` NULL で自己登録する。
+  - **`lane_metadata` とは別 component である**。`lane_metadata` は display join であり、その `upsert`
+    は tombstone を意図的に revive し、CAS を持たない。lifecycle authority をそこへ載せると
+    out-of-order な write が supersede / hibernate を黙って上書きする。両者の drift は **診断対象**で
+    あり、片方から他方を暗黙修復しない。
+  - 読み手は `lane_metadata` と異なり **fail-closed** する: 不読 / 不在は `unknown` であって `active`
+    ではない (推定 active は superseded lane への send を再認可してしまう)。
+  - write は CAS (`BEGIN IMMEDIATE` + expected state + exact revision + exact release action id)。
+    container guard の接続は default-isolation なので、`acquire_generation_lease` と同型に自前の
+    autocommit 接続で `BEGIN IMMEDIATE` を駆動する。
+  - active owner は partial unique index `(repo_workspace_id, issue_id) WHERE
+    lane_disposition='active' AND issue_id <> ''` で **workspace scope** に固定する。home-global な
+    unique は、同じ issue 番号を正当に持つ別 project と衝突する。
+  - `released` は command outcome / desired state であり **live absence の正本ではない**。process
+    presence は従来どおり live inventory (`observed_liveness`) を読む。
+  - **owner binding と decision anchor は別 field である** (schema v2、#13689 R2-F1)。`issue_id` は
+    「この lane がどの issue を所有しているか」(unbound lane では **空**)、`decision_source` /
+    `decision_issue_id` / `decision_journal` は「現在の state をどの durable record が決めたか」で
+    **常に完全**である。Redmine の journal は issue 経由 (`/issues/<id>.json`) でしか addressing
+    できないため、issue を欠く anchor は何も指さず、`operator_current_state` の復旧 (explicit
+    re-declare) が成立しない。両者を 1 field に畳むと、unbound lane が再読不能な anchor を持てて
+    しまう。`DecisionPointer` は source 語彙と **positive decimal な issue/journal id** を要求する。
+    v1 row の anchor は issue を欠くため `decision` が `None` (再読不能) として **可視化**され、
+    推測で back-fill しない。id validation は **ASCII decimal** で行う (`str.isdigit()` は `²` /
+    全角 `１` / Arabic-Indic `١` を True にするため使わない)。
+  - **container guard は component guard ではない** (#13689 R3-F1)。本 component は DDL/DML の前に
+    自分の `state_schema_components.schema_version` を読み、**未知の newer version なら
+    `LaneLifecycleError` で fail-closed** し、table / metadata / rows を一切変更しない (`### backup /
+    downgrade / partial migration` の「古い CLI が新しい container **または component schema** を見たら
+    unsupported として DB を書き換えない」の実装)。rows は lifecycle authority であり、metadata を
+    v2 へ書き戻すと **newer semantics を知らない code が authority を更新できてしまう**。read/write は
+    `unknown` / `None` / error へ落ち、active を推定しない。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
 
 Ownership rules:

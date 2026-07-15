@@ -55,10 +55,22 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 `.github/workflows/testpypi.yml` は、`main` で `Test` workflow が成功した後に、一意な TestPyPI dev artifact を自動で publish する (Redmine #12756)。これにより、source-runtime や `PYTHONPATH=src` に依存する代わりに、実 smoke 作業 (例: #12709) 向けに、通常 PATH で install 可能な artifact を `main` に整合させ続ける。
 
 - Trigger: `Test` に対する `workflow_run` (`completed`, `branches: [main]`)。job は `workflow_run.conclusion == 'success'` のときにのみ publish する。
-- Version: job は `scripts/compute_testpypi_dev_version.py` を実行し、commit 済みの `pyproject.toml` version に PEP 440 の `.dev<N>` segment を付加する。`N` は UTC timestamp と、トリガーとなった `Test` run の globally-unique な id を連結したものであり (例: `0.9.2.dev20260628090000123456789`)、同一秒に完了した 2 つの `Test` run でも異なる version を生成し、TestPyPI 上で決して衝突しない。この書き換えは CI checkout 内の一時的なもので決して commit されないため、commit 済みの release version には触れない。
-- Auth: GitHub Actions Trusted Publishing / OIDC (`environment: testpypi`, `id-token: write`)。自動経路は manual dispatch と同じ `testpypi.yml` workflow file に置かれ、既存の TestPyPI pending publisher (workflow `testpypi.yml`) がそのまま authorize し続ける。local の PyPI token は使わない。
-- 手動の `workflow_dispatch` は不変である: exact-version の release-candidate 検証のために、commit 済みの (static な) release version を build する。
-- Evidence: dev-publish job は `version` と `commit` SHA (加えて source CI run の URL) を workflow run の job summary に書き込む。対応関係はそこで読む。
+- Version: job は `scripts/compute_testpypi_dev_version.py --write` を実行し、commit 済みの release version に PEP 440 の `.dev<N>` segment を付加する。書き換え対象は canonical release-version mirror set 全体 (`pyproject.toml` の `[project].version` と `src/mozyo_bridge/__init__.py` の `__version__`) であり、両 file を同一の exact dev version へ揃える。これにより wheel METADATA と runtime `__version__` (ひいては `mozyo-bridge --version` / `mozyo --version`) が一致する (Redmine #13586。以前は `pyproject.toml` だけ書き換えたため両者が食い違っていた)。mirror set は hardcode せず `vibes/docs/logics/release-helper-contract.md` から読み、`mozyo-bridge release bump` と同じ stdlib-only primitive (release version-governance Feature package の `version_mirror` module: `src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/version_mirror.py`) を再利用する。shared kernel は凍結 (Redmine #12640) のため `shared/` には置かない。`N` は UTC timestamp と、トリガーとなった `Test` run の globally-unique な id を連結したものであり (例: `0.9.2.dev20260628090000123456789`)、同一秒に完了した 2 つの `Test` run でも異なる version を生成し、TestPyPI 上で決して衝突しない。書き換えは pre-write validation 後にのみ全 file を更新する two-phase であり (base が mirror 間で不一致、または literal 欠落なら両 file 不変で fail)、CI checkout 内の一時的なもので決して commit されないため、commit 済みの release version には触れない。
+- Auth: GitHub Actions Trusted Publishing / OIDC。`testpypi.yml` は build job と publish job に分離され (Redmine #13601)、`id-token: write` + `environment: testpypi` を持つのは publish job だけである。publish job は build job が上げた artifact を download して upload するだけで、checkout / build / verify は trusted な build job 側 (OIDC credential なし) に閉じる。既存の TestPyPI pending publisher (workflow `testpypi.yml`) がそのまま authorize し続ける。local の PyPI token は使わない。
+- Evidence: dev-publish (自動) path は `version` と `commit` SHA (加えて source CI run の URL) を workflow run の job summary に書き込む。対応関係はそこで読む。exact-candidate (手動) path も `version` / `source_sha` / `source_ref` を job summary に書く。
+
+## TestPyPI exact-candidate 手動配布 (internal beta, Redmine #13601)
+
+内部 beta の手動配布は `origin/main` promotion や Redmine Version close を先に要求しない。`Version close → origin/main → TestPyPI → #13528/#13527 → Version close` の循環を壊すため、exact reviewed integration head を **main 固定の workflow 定義** から直接 publish する非循環 gate を使う。
+
+- workflow の定義 / event ref は `main` 固定である。任意の staging ref を workflow authority として実行しない (それを許すと staging ref の workflow 定義が OIDC を要求できてしまう)。
+- artifact authority は exact `source_sha`、release approval authority は Redmine gate + 外部 `testpypi` environment protection (owner required reviewer + main-only deployment branch policy) であり、3 者を分離する。
+- 手動 `workflow_dispatch` は required inputs を取る: exact 40-hex `source_sha`、`expected_version`、approved origin ref の `source_ref` (action-time に exact `source_sha` へ解決すること。ancestor-only / local-only SHA は不可)、correlation 用の `dispatch_nonce`。
+- trusted な build job が dispatch 前/実行内で fail-closed 照合する: HEAD == `source_sha`、`source_ref` が origin 上で **exact 1 件** の named ref に解決しその tip == `source_sha` (glob/refspec metacharacter は reject、ancestor-only/local-only 不可)、2-file version mirror == `expected_version`、candidate `.github/workflows/test.yml` が **trusted `origin/main` の test.yml と byte 一致** (candidate が自 Test workflow を弱めて green を偽装するのを防ぐ。#13601 j#76006 F1)、同 SHA の `Test` workflow (`test.yml`) が `completed` + `success`、`expected_version` が TestPyPI 未使用 (`releases` object schema を満たさない応答 / lookup 不能は fail-closed)。
+- helper: `mozyo-bridge release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin ref>` が `gh workflow run testpypi.yml --ref main -f source_sha=... -f expected_version=... -f source_ref=... -f dispatch_nonce=...` を構成し、run-name 中の nonce で dispatch と run を決定的に相関する (latest-one 推測はしない。exact 1 件以外は fail-closed)。
+- 順序: #13528「TestPyPI publish」→ #13527「exact install QA」。exact install QA は publish 後に `scripts/install_testpypi_dev.sh <exact version>` で行い、`origin/main` promotion / Version close を前提にしない。
+- automatic main-CI dev publish path は後方互換に維持する (owner 承認済みの `testpypi` required reviewer 導入後は automatic path も deployment approval 待ちになる — これは意図的な OIDC protection 優先の変更)。
+- 外部 environment 変更 (required reviewer / deployment branch policy) と実際の dispatch は、implementation review green 後に owner action として分離する。
 
 production PyPI は分離されたままである。この workflow は production PyPI へ publish せず、tag も打たず、GitHub Release も決して作成しない (production の `publish.yml` は `release: published` で走る)。
 
@@ -75,7 +87,7 @@ scripts/install_testpypi_dev.sh 0.9.2.dev20260628090000123456789
 
 script は pip backend で install し (`mozyo-bridge` は TestPyPI、依存関係は PyPI、`--pre`、`--force`)、install された surface を検証する:
 
-- `mozyo-bridge --version` と `mozyo --version` (必須)
+- `mozyo-bridge --version` と `mozyo --version` (必須)。両 CLI が報告する version は、pin した exact dev version と **厳密一致** を assert する。どちらかが不一致なら script は nonzero で停止する (install された artifact が pin した build でないため、smoke 証跡を誤って別 build に結び付けない — Redmine #13586)。
 - `mozyo-bridge project-gateway consult --help` (必須)
 - `mozyo-bridge workflow step --help` (将来の #12755 — それが出荷される前に build された artifact に対しては PENDING として報告され、failure ではない)
 

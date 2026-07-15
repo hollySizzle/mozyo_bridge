@@ -55,10 +55,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Protocol, runtime_checkable
 
-from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
-    AGENT_COMMANDS,
-    AGENT_LABELS,
-)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import DEFAULT_EXPECTED_AGENTS  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application import agent_provider_executable as _agent_exe
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
     InvalidPermissionMode,
@@ -152,7 +150,7 @@ def build_mozyo_json_payload(
         "cwd": cwd,
         "created": list(created),
         "windows": windows,
-        "ready": AGENT_LABELS.issubset(present),
+        "ready": set(DEFAULT_EXPECTED_AGENTS).issubset(present),
         "attach": attach_command,
         "attach_target": session,
         "attached": False,
@@ -767,8 +765,12 @@ def _agent_launch_command(
 
     ``claude_model`` (#13155) is the repo-configured Claude launch model token;
     when set for a Claude pane it appends ``--model <token>`` after the
-    permission-mode flag. ``None`` (the default) appends nothing, so an
-    unconfigured launch is byte-for-byte the historical command.
+    permission-mode flag. ``None`` (the default) appends nothing.
+
+    argv[0] is the provider's **verified absolute executable**, resolved from the
+    trusted environment (Redmine #13441, j#76725 Q1) instead of the bare name the
+    exec-time ``PATH`` used to resolve. It is the one token exempted from
+    byte-invariance; an unresolvable / ambiguous binary fails closed before tmux runs.
     """
     from mozyo_bridge.application import commands
 
@@ -779,7 +781,7 @@ def _agent_launch_command(
         )
     )
     return (
-        f"env {env_pairs} {AGENT_COMMANDS[agent]}"
+        f"env {env_pairs} {shlex.quote(_agent_exe.resolve_agent_argv0(agent))}"
         f"{_claude_permission_mode_flag(agent, policy_default=permission_mode_default)}"
         f"{_claude_model_flag(agent, claude_model)}"
     )

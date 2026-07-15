@@ -104,6 +104,13 @@ mozyo_bridge = [
     # template bodies + version/source pointers ship as this packaged artifact,
     # loaded via importlib.resources by f_130 role_profile.py at import.
     "e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml",
+    # Agent provider profiles (Redmine #13441). The built-in claude/codex launch
+    # profiles (executable metadata, protocol family, discovery aliases,
+    # capabilities, managed-flag spellings) ship as this packaged artifact, loaded
+    # via importlib.resources by f_160 agent_provider_profile.py at import. Without
+    # it an installed wheel cannot resolve ANY agent provider and every launch
+    # fails closed, so it must travel with the package, not just the repo.
+    "e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profiles.yaml",
 ]
 
 [tool.pytest.ini_options]

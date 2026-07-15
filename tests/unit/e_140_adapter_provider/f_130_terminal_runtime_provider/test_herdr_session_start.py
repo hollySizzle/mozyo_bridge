@@ -8,8 +8,10 @@ unconfigured binary, and self-identity env injection into the launched agent.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,6 +27,11 @@ if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
 from support.herdr_fake import FakeHerdr
+from support.agent_provider_binaries import (
+    DEFAULT_PROVIDER_COMMANDS,
+    FakeAgentBinaries,
+    neutralized_overrides,
+)
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
@@ -34,12 +41,106 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SLOT_ADOPTED,
     SLOT_LAUNCHED,
     SLOT_PLANNED,
+    SLOT_STALE,
+    SLOT_UNATTESTED,
     HerdrSessionStartError,
     herdr_workspace_segment,
     prepare_session,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+    LanePlacementConfig,
+)
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
+
+# Since #13441 a launch renders argv[0] as the provider's verified absolute executable,
+# resolved from the launch env's trusted PATH. These tests must never resolve the host's
+# real `claude` / `codex` (that would make the suite machine-dependent, and `codex` is
+# often not installed at all), so one hermetic bin directory of real executable stubs is
+# shared by the module and put on every launch env's PATH. `PROVIDER_BINS.path("claude")`
+# is then the exact absolute argv[0] each assertion pins.
+PROVIDER_BINS = FakeAgentBinaries(Path(tempfile.mkdtemp(prefix="mzb-provider-bins-")))
+atexit.register(shutil.rmtree, PROVIDER_BINS.bin_dir.parent, True)
+
+
+def _launch_env(binpath, **extra):
+    """The trusted launch env: the herdr binary plus a PATH of hermetic provider stubs.
+
+    The provider trusted-override vars are blanked (empty == unset): a scenario that
+    merges this into `os.environ` with `clear=False` would otherwise inherit an ambient
+    override, which BEATS PATH and would resolve someone else's binary. Same isolation
+    reason as the `MOZYO_CLAUDE_PERMISSION_MODE` pop below (review j#74373), applied to
+    the #13441 executable rail.
+    """
+    return {
+        HERDR_ENV: str(binpath),
+        "PATH": str(PROVIDER_BINS.bin_dir),
+        **neutralized_overrides(),
+        **extra,
+    }
+
+
+def _launched_provider(start_argv):
+    """The provider id a launched `agent start` argv runs, from its absolute argv[0].
+
+    argv[0] is no longer the provider label (#13441), so a test that needs to know
+    which provider an argv launched maps the resolved executable back to its id
+    instead of reading the label out of the argv.
+    """
+    argv0 = start_argv[start_argv.index("--") + 1]
+    for provider in DEFAULT_PROVIDER_COMMANDS:
+        if argv0 == PROVIDER_BINS.path(provider):
+            return provider
+    raise AssertionError(f"argv[0] is not a known provider executable: {argv0!r}")
+
+
+def _env_flags(start_argv):
+    """The `--env KEY=VALUE` pairs of a launched `agent start` argv, as a dict."""
+    flags = {}
+    for i, tok in enumerate(start_argv):
+        if tok == "--env" and i + 1 < len(start_argv) and "=" in start_argv[i + 1]:
+            key, value = start_argv[i + 1].split("=", 1)
+            flags[key] = value
+    return flags
+
+
+def _present_attestation_reader(ws, role, lane, locator):
+    """A reader that returns a generation-matched ``present`` record for this slot.
+
+    The #13637 adopt gate adopts a live name-match only when a ``present`` startup
+    self-attestation is bound to the live locator; a test exercising the (unchanged)
+    adopt behaviour injects this so a live agent that WAS launched with attestation
+    still adopts.
+    """
+    name = encode_assigned_name(ws, role, lane)
+    record = IdentityAttestationRecord(
+        assigned_name=name,
+        workspace_id=ws,
+        role=role,
+        lane_id=lane,
+        locator=locator,
+        verdict=VERDICT_PRESENT,
+        observed_at="2026-07-12T00:00:00+00:00",
+    )
+    return lambda queried: record if queried == name else None
+
+
+def _fingerprint(paths):
+    """(bytes, mtime_ns) per path — a strong purity probe for a --dry-run.
+
+    Comparing content AND mtime catches both a byte rewrite and a
+    content-identical touch that only advances the timestamp (the exact
+    `updated_at` / `last_seen` / anchor mtime mutation reported for #13595).
+    """
+    fp = {}
+    for p in paths:
+        st = p.stat()
+        fp[str(p)] = (p.read_bytes(), st.st_mtime_ns)
+    return fp
 
 
 class _Herdr:
@@ -68,7 +169,15 @@ class _Herdr:
         start_tab=None,
         start_fails=False,
         close_fails=False,
+        attest_capable=True,
     ):
+        # Redmine #13748: whether the resolved launcher's CLI can run the wrapper
+        # subcommand. `True` (default) makes `<launcher> herdr agent-attest --help`
+        # exit 0 (a released / source-capable launcher), keeping the pre-#13748 wrap
+        # tests byte-invariant; `False` models the installed-launcher-lags-source skew
+        # (argparse `invalid choice` / exit 2) the capability preflight must catch.
+        self.attest_capable = attest_capable
+        self.attest_probes: list = []
         self.existing_rows = existing_rows or []
         # By default the launched agent lands in the workspace it was told to via
         # `--workspace` (the realistic herdr behaviour). An explicit `start_locator`
@@ -97,6 +206,25 @@ class _Herdr:
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
         self.calls.append(rest)
+        # Redmine #13748 launcher capability probe: argv[0] is the LAUNCHER (not the
+        # herdr binary) and the tail is the wrapper subcommand — the only invocation
+        # whose tail begins with "herdr". Distinguish it from real herdr calls (whose
+        # tail is ["agent", ...] / ["workspace", ...] / ...) and answer with the
+        # configured capability verdict.
+        if rest[:2] == ["herdr", "agent-attest"]:
+            self.attest_probes.append(list(argv))
+            if self.attest_capable:
+                # Capable => exit 0 AND the wrapper-contract marker in the help output
+                # (Redmine #13748 R1: exit 0 alone is not proof of capability).
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout="usage: mozyo-bridge herdr agent-attest [-h] --assigned-name ...",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                argv, 2, stdout="", stderr="invalid choice: 'agent-attest'"
+            )
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self.existing_rows}), stderr=""
@@ -213,7 +341,13 @@ class SessionStartTest(unittest.TestCase):
         binpath = Path(tmp) / "fake-herdr"
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        env = {HERDR_ENV: str(binpath)}
+        # Since #13441 argv[0] is the provider's verified absolute executable resolved
+        # from the launch env's trusted PATH. Install hermetic provider binaries and
+        # point PATH at them, so these tests never resolve (or depend on) the host's
+        # real `claude` / `codex` — and so `PROVIDER_BINS.path(...)` is the exact
+        # argv[0] each assertion pins.
+        self.binaries = PROVIDER_BINS
+        env = _launch_env(binpath)
         if extra_env:
             env.update(extra_env)
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
@@ -230,6 +364,215 @@ class SessionStartTest(unittest.TestCase):
             anchor = read_anchor(repo)
         return result, anchor, repo
 
+    def _fake_launcher_env(self, tmp):
+        # A resolvable absolute `mozyo-bridge` on the launch env PATH, so the #13637
+        # self-check wrapper is applied to the launch. This PATH is passed as
+        # `extra_env` and therefore REPLACES the default launch PATH, so it must also
+        # carry the #13441 provider stubs — otherwise argv[0] would not resolve and the
+        # launch would fail closed before the wrapper is ever exercised. Both components
+        # are absolute (the resolver refuses a relative one), and only this dir holds
+        # `mozyo-bridge` while only the shared dir holds the providers, so neither
+        # lookup is ambiguous.
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir(exist_ok=True)
+        launcher = bindir / "mozyo-bridge"
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        path = os.pathsep.join([str(bindir), str(PROVIDER_BINS.bin_dir)])
+        return {"PATH": path}, str(launcher)
+
+    def test_launch_wraps_provider_in_self_attest_when_launcher_resolves(self) -> None:
+        # Redmine #13637: a launch execs the provider THROUGH `mozyo-bridge herdr
+        # agent-attest`, passing the expected identity, so the agent self-attests before
+        # exec. The provider is still the first element after the LAST `--`.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            result, anchor, _ = self._prepare(
+                tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env
+            )
+            ws = anchor["workspace_id"]
+        start = herdr.start_argvs[0]
+        # herdr `--` is followed by the resolved launcher, then the wrapper subcommand.
+        first_sep = start.index("--")
+        self.assertEqual(start[first_sep + 1], launcher)
+        self.assertIn("agent-attest", start)
+        self.assertIn("--assigned-name", start)
+        self.assertIn(encode_assigned_name(ws, "claude", "lane-1"), start)
+        self.assertIn("--role", start)
+        self.assertIn("claude", start)
+        # The provider is after the LAST `--` (the wrapper's own separator).
+        last_sep = len(start) - 1 - start[::-1].index("--")
+        self.assertEqual(start[last_sep + 1], PROVIDER_BINS.path("claude"))
+        # The injected identity env is unchanged (still on herdr --env flags).
+        self.assertIn(f"MOZYO_WORKSPACE_ID={ws}", start)
+
+    def test_launch_is_byte_invariant_when_launcher_unresolvable(self) -> None:
+        # No resolvable mozyo-bridge on the launch env PATH -> no wrapper, byte-invariant
+        # pre-#13637 launch (`-- <provider>`), the safe fallback. No MOZYO_BRIDGE_HOME
+        # is injected in the unwrapped case (review j#76492 Finding 1).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
+        start = herdr.start_argvs[0]
+        self.assertNotIn("agent-attest", start)
+        self.assertNotIn("MOZYO_BRIDGE_HOME", "".join(start))
+        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
+
+    # --- Launcher command-capability preflight: feature behavior (Redmine #13748) ---
+    # The DEFECT regression pins (incapable launcher must fail closed with zero
+    # actuation, via PATH fallback and explicit override, including the R1 success-exit
+    # false positive) live in `tests/regressions/test_issue_13748_launcher_capability_preflight.py`
+    # per `tests-placement-discovery-policy.md` (fixed-defect pin -> tests/regressions).
+    # The tests below are new-feature behavior / byte-invariance guarantees, which the
+    # same policy keeps out of regressions.
+
+    def _assert_zero_herdr_actuation(self, herdr) -> None:
+        """No workspace / tab / agent / pane write happened (fail-closed boundary)."""
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertEqual(herdr.start_argvs, [])
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_capable_launcher_is_probed_then_launches(self) -> None:
+        # Redmine #13748: "単なる実行可能ファイル確認だけでcompatibleと見なさない" — a capable
+        # launcher is actually PROBED (not just stat-checked), and only then does the
+        # wrapped launch proceed. Guards acceptance 6 (the capable path is not regressed).
+        herdr = _Herdr(attest_capable=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            result, _, _ = self._prepare(
+                tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env
+            )
+        # The probe ran with the shared wrapper subcommand + `--help`.
+        self.assertEqual(
+            herdr.attest_probes[0], [launcher, "herdr", "agent-attest", "--help"]
+        )
+        # And the launch proceeded, wrapped through the same launcher.
+        start = herdr.start_argvs[0]
+        self.assertEqual(start[start.index("--") + 1], launcher)
+        self.assertIn("agent-attest", start)
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
+    def test_unresolvable_launcher_skips_capability_probe(self) -> None:
+        # Redmine #13748 / #13637: no resolvable launcher -> `attest_launcher == ""`
+        # (wrapping disabled, byte-invariant fallback). The capability probe must not run
+        # at all (there is no wrapper to verify), and the launch proceeds unwrapped.
+        herdr = _Herdr()  # default PATH has no `mozyo-bridge`
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
+        self.assertEqual(herdr.attest_probes, [])
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
+    def test_incapable_launcher_does_not_block_adopt_only_session(self) -> None:
+        # Redmine #13748: the preflight is gated on an actual launch plan. An adopt-only
+        # session starts NO wrapped process, so an incapable installed launcher on PATH
+        # must not block it (no wrapper runs -> nothing to verify -> never probed).
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    attest_capable=False,
+                    existing_rows=[
+                        {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w1:pOLD"}
+                    ],
+                )
+                binpath = Path(tmp) / "fake-herdr"
+                binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+                env = _launch_env(binpath)
+                env.update(launcher_env)
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex"],
+                    lane_id="lane-1",
+                    env=env,
+                    runner=herdr.run,
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w1:pOLD"
+                    ),
+                )
+        self.assertEqual(result.slots[0].outcome, SLOT_ADOPTED)
+        # Never probed: an adopt-only run has no wrapper to verify.
+        self.assertEqual(herdr.attest_probes, [])
+        self._assert_zero_herdr_actuation(herdr)
+
+    def test_wrapped_launch_injects_store_home_matching_reader(self) -> None:
+        # Finding 1 (review j#76492): the wrapped launch injects
+        # `--env MOZYO_BRIDGE_HOME=<launcher home>` so the herdr-spawned wrapper (which
+        # does NOT inherit the client's home) writes to the SAME store the adopt reader
+        # uses. `_prepare` patches os.environ MOZYO_BRIDGE_HOME to `<tmp>/home`, so the
+        # injected value is that home resolved (the same `mozyo_bridge_home()` the reader
+        # resolves inside the run).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            self._prepare(tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env)
+            injected = _env_flags(herdr.start_argvs[0])
+            expected_home = str((Path(tmp) / "home").resolve())
+            self.assertEqual(injected.get("MOZYO_BRIDGE_HOME"), expected_home)
+
+    def test_wrapper_record_in_resolved_home_is_adopted_without_injected_reader(self) -> None:
+        # Finding 1 end-to-end: with NO injected reader, the adopt gate reads the store
+        # at the resolved home (mozyo_bridge_home) — the same home the launcher injects
+        # onto the wrapper — so a wrapper-written present record is adopted.
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                name = encode_assigned_name(ws, "codex", "lane-1")
+                # The wrapper wrote its present record into the RESOLVED home, locator w9:pX.
+                HerdrIdentityAttestationStore(home=home).upsert(
+                    IdentityAttestationRecord(
+                        assigned_name=name,
+                        workspace_id=ws,
+                        role="codex",
+                        lane_id="lane-1",
+                        locator="w9:pX",
+                        verdict=VERDICT_PRESENT,
+                    )
+                )
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": name,
+                            "pane_id": "w9:pX",
+                            "agent": "codex",
+                            "agent_status": "idle",
+                        }
+                    ]
+                )
+                binpath = Path(tmp) / "fake-herdr"
+                binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex"],
+                    lane_id="lane-1",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                )  # NO attestation_reader -> default reader resolves the same home
+        self.assertEqual(result.slots[0].outcome, SLOT_ADOPTED)
+
     def test_launch_mints_names_at_start_no_rename(self) -> None:
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
@@ -245,8 +588,10 @@ class SessionStartTest(unittest.TestCase):
             # The durable name is applied AT START (positional), never via rename.
             self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
             for argv in herdr.start_argvs:
-                # argv = ["agent", "start", <NAME>, "--cwd", ...]
-                self.assertEqual(argv[2], names[argv[-1]])  # -- <provider> is argv[-1]
+                # argv = ["agent", "start", <NAME>, "--cwd", ...]; argv[0] of the run
+                # command is now the resolved absolute executable, so map it back.
+                provider = _launched_provider(argv)
+                self.assertEqual(argv[2], names[provider])
 
     def test_launch_injects_self_identity_via_env_flags(self) -> None:
         herdr = _Herdr()
@@ -267,7 +612,58 @@ class SessionStartTest(unittest.TestCase):
         self.assertIn("MOZYO_AGENT_ROLE=claude", start)
         self.assertIn("MOZYO_LANE_ID=lane-1", start)
         # `-- <provider>` terminates the argv.
-        self.assertEqual(start[-2:], ["--", "claude"])
+        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
+
+    def test_codex_launch_propagates_identity_to_tool_shell_policy(self) -> None:
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            _, anchor, _ = self._prepare(
+                tmp, providers=["codex"], herdr=herdr
+            )
+            ws = anchor["workspace_id"]
+
+        start = herdr.start_argvs[0]
+        separator = start.index("--")
+        self.assertEqual(start[separator + 1], PROVIDER_BINS.path("codex"))
+        self.assertEqual(
+            start[separator + 2 :],
+            [
+                "-c",
+                f'shell_environment_policy.set.MOZYO_WORKSPACE_ID="{ws}"',
+                "-c",
+                'shell_environment_policy.set.MOZYO_AGENT_ROLE="codex"',
+                "-c",
+                'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"',
+            ],
+        )
+
+    def test_codex_managed_identity_overrides_follow_config_launch_argv(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+            AgentLaunchConfig,
+        )
+
+        herdr = _Herdr()
+        cfg = AgentLaunchConfig.from_record(
+            {"launch_argv": {"codex": {"sublane": ["-c", 'model="test"']}}}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["codex"],
+                herdr=herdr,
+                agent_launch=cfg,
+            )
+
+        start = herdr.start_argvs[0]
+        separator = start.index("--")
+        self.assertEqual(
+            start[separator + 1 : separator + 4],
+            [PROVIDER_BINS.path("codex"), "-c", 'model="test"'],
+        )
+        self.assertEqual(
+            start[-2:],
+            ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"'],
+        )
 
     def test_launch_injects_herdr_binary_env(self) -> None:
         # Redmine #13331 j#73312 scope addition #1: the launched agent is itself a
@@ -278,14 +674,52 @@ class SessionStartTest(unittest.TestCase):
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(tmp, providers=["codex"], herdr=herdr)
-            # `_resolve_binary` returns a path-shaped trusted value verbatim (an
-            # existing executable), so the injected value is exactly what `_prepare`
-            # put in the env — no symlink resolution.
+            # `resolve_herdr_binary` returns the resolved ABSOLUTE path; the trusted
+            # env value here is already an absolute (non-symlink) executable, so the
+            # injected value is byte-for-byte what `_prepare` put in the env.
             binpath = str(Path(tmp) / "fake-herdr")
         start = herdr.start_argvs[0]
         self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
         # It rides on an `--env` flag (server-spawned agent path), never widened to a
         # repo-local binary — the value is the launcher's trusted resolved binary.
+        idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
+        self.assertEqual(start[idx - 1], "--env")
+
+    def test_launch_resolves_trusted_path_herdr_without_env(self) -> None:
+        # Redmine #13500 end-to-end: a launcher whose trusted env has NO
+        # MOZYO_HERDR_BINARY but an executable `herdr` on its trusted PATH still
+        # launches, and injects the PATH-resolved ABSOLUTE binary into the agent's
+        # `--env` — parity with the explicit-env launch above.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            binpath = bindir / "herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(
+                binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                prepare_session(
+                    repo_root=repo,
+                    providers=["codex"],
+                    lane_id="lane-1",
+                    # This PATH intentionally omits MOZYO_HERDR_BINARY (herdr must
+                    # resolve from PATH); it also carries the #13441 provider stubs so
+                    # argv[0] resolves.
+                    env={
+                        "PATH": os.pathsep.join(
+                            [str(bindir), str(PROVIDER_BINS.bin_dir)]
+                        )
+                    },
+                    runner=herdr.run,
+                )
+        start = herdr.start_argvs[0]
+        self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
         idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
         self.assertEqual(start[idx - 1], "--env")
 
@@ -303,8 +737,7 @@ class SessionStartTest(unittest.TestCase):
             )
         by_provider = {}
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
-            by_provider[provider] = argv
+            by_provider[_launched_provider(argv)] = argv
         claude = by_provider["claude"]
         idx = claude.index("--permission-mode")
         self.assertEqual(claude[idx + 1], "auto")
@@ -342,18 +775,30 @@ class SessionStartTest(unittest.TestCase):
             )
         by_provider = {}
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
-            by_provider[provider] = argv
+            by_provider[_launched_provider(argv)] = argv
         claude = by_provider["claude"]
-        # `-- claude --permission-mode auto --model claude-opus-4-8` (Q4 order).
+        # `-- <abs claude> --permission-mode auto --model claude-opus-4-8` (Q4 order).
+        # argv[0] is the resolved absolute executable (#13441 j#76725 Q1); the flag
+        # tokens and their order are byte-invariant.
         self.assertEqual(
             claude[claude.index("--"):],
-            ["--", "claude", "--permission-mode", "auto", "--model", "claude-opus-4-8"],
+            [
+                "--",
+                PROVIDER_BINS.path("claude"),
+                "--permission-mode",
+                "auto",
+                "--model",
+                "claude-opus-4-8",
+            ],
         )
         codex = by_provider["codex"]
         self.assertEqual(
-            codex[codex.index("--"):],
-            ["--", "codex", "--config", "model_reasoning_effort=high"],
+            codex[codex.index("--") : codex.index("--") + 4],
+            ["--", PROVIDER_BINS.path("codex"), "--config", "model_reasoning_effort=high"],
+        )
+        self.assertEqual(
+            codex[-2:],
+            ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="issue_x"'],
         )
 
     def test_launch_argv_config_uses_default_lane_class_for_no_lane(self) -> None:
@@ -384,21 +829,33 @@ class SessionStartTest(unittest.TestCase):
             )
         codex = herdr.start_argvs[0]
         self.assertEqual(
-            codex[codex.index("--"):],
-            ["--", "codex", "--config", "model_reasoning_effort=xhigh"],
+            codex[codex.index("--") : codex.index("--") + 4],
+            ["--", PROVIDER_BINS.path("codex"), "--config", "model_reasoning_effort=xhigh"],
+        )
+        self.assertEqual(
+            codex[-2:],
+            ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="default"'],
         )
 
-    def test_launch_argv_none_config_is_byte_invariant(self) -> None:
-        # No config (agent_launch=None) appends nothing — byte-for-byte the pre-#13425
-        # launch, so an unconfigured launch site is unaffected.
+    def test_launch_argv_none_config_keeps_claude_byte_invariant(self) -> None:
+        # No repo config still leaves Claude byte-invariant. Codex receives only the
+        # managed identity policy required by #13614.
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(
                 tmp, providers=["claude", "codex"], herdr=herdr, agent_launch=None
             )
         for argv in herdr.start_argvs:
-            provider = argv[argv.index("--") + 1]
-            self.assertEqual(argv[-2:], ["--", provider])
+            provider = _launched_provider(argv)
+            if provider == "claude":
+                # argv[0] is the resolved absolute executable; every other token of the
+                # unconfigured Claude launch is byte-invariant (j#76725 Q1).
+                self.assertEqual(argv[-2:], ["--", PROVIDER_BINS.path("claude")])
+            else:
+                self.assertEqual(
+                    argv[-2:],
+                    ["-c", 'shell_environment_policy.set.MOZYO_LANE_ID="lane-1"'],
+                )
 
     def test_launch_without_policy_default_is_flagless(self) -> None:
         # No default and no env override: the historical bare `-- claude` launch is
@@ -408,7 +865,7 @@ class SessionStartTest(unittest.TestCase):
             self._prepare(tmp, providers=["claude"], herdr=herdr)
         start = herdr.start_argvs[0]
         self.assertNotIn("--permission-mode", start)
-        self.assertEqual(start[-2:], ["--", "claude"])
+        self.assertEqual(start[-2:], ["--", PROVIDER_BINS.path("claude")])
 
     def test_launch_env_override_wins_over_policy_default(self) -> None:
         # MOZYO_CLAUDE_PERMISSION_MODE stays the explicit override rail (#11857):
@@ -491,8 +948,14 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
+                    # The live agent WAS launched with attestation: a present record
+                    # generation-bound to its live locator lets the adopt gate adopt it
+                    # (Redmine #13637; without this it is surfaced `unattested`).
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w1:pOLD"
+                    ),
                 )
         slot = result.slots[0]
         self.assertEqual(slot.outcome, SLOT_ADOPTED)
@@ -500,6 +963,181 @@ class SessionStartTest(unittest.TestCase):
         # No launch / rename occurred.
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
+
+    def _prepare_with_rows(
+        self, tmp, *, existing, providers, lane, attestation_reader=None
+    ):
+        """Register a temp workspace and run prepare_session against ``existing`` rows.
+
+        ``existing`` is built from the resolved ``workspace_id`` (a callable ``ws -> rows``) so
+        the seeded durable names match what the run mints. ``attestation_reader`` is
+        forwarded so an adopt scenario can inject a matching self-attestation record
+        (Redmine #13637); by default there is no record, so a live name-match is
+        surfaced ``unattested`` rather than adopted.
+        """
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            herdr = _Herdr(existing_rows=existing(ws))
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                attestation_reader=(
+                    attestation_reader(ws) if attestation_reader else None
+                ),
+            )
+        return result, herdr
+
+    def test_reboot_shell_residue_is_stale_not_adopted(self) -> None:
+        # Host-restart residue (Redmine #13518 j#75329): the durable name survives on a bare
+        # `-zsh` pane with no detected agent. The reconciler must NOT blind-adopt it (that would
+        # route a handoff into a shell) and must NOT launch over the still-taken name.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w19:p3",
+                        "agent_status": "unknown",
+                    }
+                ],
+                providers=["codex"],
+                lane="lane-1",
+            )
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_STALE)
+        self.assertEqual(slot.locator, "w19:p3")  # the residue pane, for owner-gated recovery
+        # Never adopted, never launched over, never a destructive close in this read-only pass.
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["pane", "close"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["workspace", "create"]])
+
+    def test_null_detected_agent_row_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=lambda ws: [
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w19:p3", "agent": None}
+                ],
+                providers=["codex"],
+                lane="lane-1",
+            )
+        self.assertEqual(result.slots[0].outcome, SLOT_STALE)
+
+    def test_live_detected_agent_still_adopts(self) -> None:
+        # A row with a positively detected provider agent is a live agent and still adopts —
+        # the composite check only refuses shell residue, never a genuinely live slot.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w19:pC",
+                        "agent": "codex",
+                        "agent_status": "idle",
+                    }
+                ],
+                providers=["codex"],
+                lane="lane-1",
+                attestation_reader=lambda ws: _present_attestation_reader(
+                    ws, "codex", "lane-1", "w19:pC"
+                ),
+            )
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_ADOPTED)
+        self.assertEqual(slot.locator, "w19:pC")
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def _live_codex_row(self, ws):
+        return [
+            {
+                "name": encode_assigned_name(ws, "codex", "lane-1"),
+                "pane_id": "w19:pC",
+                "agent": "codex",
+                "agent_status": "idle",
+            }
+        ]
+
+    def _assert_unattested_readonly(self, result, herdr) -> None:
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_UNATTESTED)
+        self.assertEqual(slot.locator, "w19:pC")  # live locator, for owner-gated recovery
+        self.assertIn("owner-approved", slot.detail)
+        # Read-only: never launched over, never a destructive close.
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["pane", "close"]])
+
+    def test_live_agent_without_attestation_record_is_unattested(self) -> None:
+        # Redmine #13637: a live name-match with NO startup self-attestation record (a
+        # legacy / pre-feature slot — the exact observed default-worker case) is not
+        # blind-adopted; it is surfaced read-only as unattested.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=self._live_codex_row,
+                providers=["codex"],
+                lane="lane-1",
+            )  # default: no attestation record
+        self._assert_unattested_readonly(result, herdr)
+
+    def test_live_agent_with_stale_locator_record_is_unattested(self) -> None:
+        # A present record from an earlier generation (its recorded locator no longer
+        # matches the live locator) is never re-used as this process's attestation.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=self._live_codex_row,
+                providers=["codex"],
+                lane="lane-1",
+                attestation_reader=lambda ws: _present_attestation_reader(
+                    ws, "codex", "lane-1", "w1:pOLD"  # stale locator != live w19:pC
+                ),
+            )
+        self._assert_unattested_readonly(result, herdr)
+
+    def test_live_agent_with_missing_verdict_record_is_unattested(self) -> None:
+        # The agent booted without its identity triplet (self-attestation = missing).
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            IdentityAttestationRecord,
+            VERDICT_MISSING,
+        )
+
+        def _missing_reader(ws):
+            name = encode_assigned_name(ws, "codex", "lane-1")
+            rec = IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=ws,
+                role="codex",
+                lane_id="lane-1",
+                locator="w19:pC",
+                verdict=VERDICT_MISSING,
+                observed_at="2026-07-12T00:00:00+00:00",
+            )
+            return lambda q: rec if q == name else None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._prepare_with_rows(
+                tmp,
+                existing=self._live_codex_row,
+                providers=["codex"],
+                lane="lane-1",
+                attestation_reader=_missing_reader,
+            )
+        self._assert_unattested_readonly(result, herdr)
 
     def test_duplicate_name_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -527,23 +1165,212 @@ class SessionStartTest(unittest.TestCase):
                         repo_root=repo,
                         providers=["codex"],
                         lane_id="lane-1",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
 
+    def _run_dry_run(self, repo, home, binpath, herdr, *, providers=("claude",), lane="lane-1"):
+        """Run a --dry-run under the given HOME; return the result."""
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            return prepare_session(
+                repo_root=repo,
+                providers=list(providers),
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                dry_run=True,
+            )
+
     def test_dry_run_plans_without_side_effects(self) -> None:
+        # Redmine #13595: a --dry-run on a REGISTERED repo returns the planned slot
+        # read-only and mutates NOTHING — registry + anchor bytes AND mtimes are
+        # byte-for-byte unchanged (the reported defect bumped `updated_at` /
+        # `last_seen` / anchor bytes), and no herdr launch / workspace create fires.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
-            result, anchor, repo = self._prepare(
-                tmp, providers=["claude"], herdr=herdr, dry_run=True
-            )
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                before = _fingerprint([registry_path(home), anchor_path(repo)])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home), anchor_path(repo)])
         self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(result.workspace_id, ws)  # read-only preview of the real id
+        # Registry + anchor untouched: identical bytes and identical mtimes.
+        self.assertEqual(before, after)
+        # No herdr side effect: no launch, no workspace create, no base pane reclaim.
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
-        # A dry-run plans nothing to launch, so no workspace is created and no base
-        # pane is reclaimed (Redmine #13330).
         self.assertEqual(herdr.workspace_creates, [])
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.base_pane_id, "")
+
+    def test_dry_run_unregistered_repo_fails_closed_without_registering(self) -> None:
+        # Redmine #13595 core: a --dry-run on an UNREGISTERED repo must NOT create
+        # the registry / anchor (the exact defect) and must fail closed with
+        # actionable guidance rather than mint a fake assigned identity. The failure
+        # is BEFORE any herdr call.
+        from mozyo_bridge.core.state.workspace_registry import anchor_path, registry_path
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._run_dry_run(repo, home, binpath, herdr)
+            reg = registry_path(home)
+            anc = anchor_path(repo)
+            self.assertFalse(reg.exists())  # registry NOT created by the dry-run
+            self.assertFalse(anc.exists())  # anchor NOT created by the dry-run
+        self.assertIn("workspace register", str(ctx.exception))
+        self.assertEqual(herdr.calls, [])  # fails before any inventory read / launch
+
+    def test_dry_run_registry_only_resolves_from_row_without_rewriting_anchor(self) -> None:
+        # Matrix: registry row present, anchor deleted. A --dry-run resolves the id
+        # from the registry row read-only and does NOT recreate the anchor.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                anchor_path(repo).unlink()
+                before = _fingerprint([registry_path(home)])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home)])
+            self.assertFalse(anchor_path(repo).exists())  # NOT recreated
+        self.assertEqual(result.workspace_id, ws)
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)  # registry untouched
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_dry_run_anchor_only_resolves_without_recreating_registry(self) -> None:
+        # Matrix: anchor present, registry file removed. A --dry-run resolves from
+        # the anchor read-only and does NOT recreate the registry.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                registry_path(home).unlink()
+                before = _fingerprint([anchor_path(repo)])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([anchor_path(repo)])
+            self.assertFalse(registry_path(home).exists())  # NOT recreated
+        self.assertEqual(result.workspace_id, ws)
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)  # anchor untouched
+
+    def test_dry_run_anchor_registry_mismatch_prefers_anchor(self) -> None:
+        # Matrix: anchor and registry disagree on workspace_id. A --dry-run mirrors
+        # `register_workspace`'s precedence (the anchor pins the id) and mutates
+        # nothing.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            other_id = "f" * 32
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                anc = anchor_path(repo)
+                data = json.loads(anc.read_text(encoding="utf-8"))
+                self.assertNotEqual(data["workspace_id"], other_id)
+                data["workspace_id"] = other_id
+                anc.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                before = _fingerprint([registry_path(home), anc])
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home), anchor_path(repo)])
+        self.assertEqual(result.workspace_id, other_id)  # anchor wins
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)
+
+    def test_dry_run_dual_anchor_fails_closed_without_mutation(self) -> None:
+        # Matrix: both the new and legacy anchor names exist — the same ambiguity
+        # `register_workspace` refuses. A --dry-run fails closed (never guesses)
+        # and mutates nothing.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            legacy_anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                legacy = legacy_anchor_path(repo)
+                legacy.write_text(anchor_path(repo).read_text(encoding="utf-8"), encoding="utf-8")
+                before = _fingerprint([registry_path(home), anchor_path(repo), legacy])
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._run_dry_run(repo, home, binpath, herdr)
+            after = _fingerprint([registry_path(home), anchor_path(repo), legacy])
+        self.assertIn("workspace.json", str(ctx.exception))
+        self.assertEqual(before, after)  # nothing mutated
+        self.assertEqual(herdr.calls, [])
 
     def test_cold_start_creates_workspace_launches_with_flag_and_reclaims(self) -> None:
         # Redmine #13330: a pure cold start explicitly creates the workspace, launches
@@ -604,7 +1431,7 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["claude", "codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
@@ -676,7 +1503,7 @@ class SessionStartTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["claude", "codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
@@ -800,7 +1627,7 @@ class SessionStartTest(unittest.TestCase):
                         repo_root=repo,
                         providers=["claude", "claude"],
                         lane_id="lane-1",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
         # No side effect: not even `agent list` ran (the guard precedes binary
@@ -845,7 +1672,7 @@ class SessionStartCliTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["claude", "codex"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(
@@ -878,7 +1705,7 @@ class SessionStartCliTest(unittest.TestCase):
         def _prepare_with_fake_runner(**kwargs):
             return real_prepare(runner=herdr.run, **kwargs)
 
-        env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+        env = _launch_env(binpath, MOZYO_BRIDGE_HOME=str(home))
         if extra_env:
             env.update(extra_env)
         with patch.dict(os.environ, env, clear=False), patch.object(
@@ -895,7 +1722,18 @@ class SessionStartCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         by_provider = {}
         for argv in herdr.start_argvs:
-            by_provider[argv[argv.index("--") + 1]] = argv
+            # The provider is the first element after the LAST `--`: the #13637
+            # self-attestation wrapper (present when `mozyo-bridge` resolves on the
+            # launch env PATH) inserts its own `-- <provider>` after the herdr
+            # `agent start ... --`, so keying on the last separator finds the provider
+            # whether or not the launch was wrapped.
+            last_sep = len(argv) - 1 - argv[::-1].index("--")
+            argv0 = argv[last_sep + 1]
+            provider = next(
+                (c for c in DEFAULT_PROVIDER_COMMANDS if argv0 == PROVIDER_BINS.path(c)),
+                argv0,
+            )
+            by_provider[provider] = argv
         return by_provider
 
     def test_cli_session_start_threads_auto_permission_default(self) -> None:
@@ -995,7 +1833,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex", "claude"],
                     lane_id="issue_13377_x",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
                 # The shared resolver agrees with what was minted (mint == resolve):
@@ -1037,6 +1875,199 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
             [["pane", "close", "wH:p1"], ["pane", "close", "wH:t1-root"]],
         )
 
+    def test_dry_run_on_linked_worktree_is_read_only_preview(self) -> None:
+        # Redmine #13595 matrix (linked-worktree): a --dry-run from a lane worktree
+        # inherits the MAIN checkout's identity read-only (as the execute path does)
+        # and mutates nothing — the main registry + anchor are byte/mtime invariant,
+        # no worktree anchor is created, and no herdr launch fires.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            self._init_repo(main)
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13595_dry")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = self._binpath(Path(tmp))
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                before = _fingerprint([registry_path(home), anchor_path(main)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex", "claude"],
+                    lane_id="issue_13595_dry",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+                after = _fingerprint([registry_path(home), anchor_path(main)])
+                wt_anchor_exists = anchor_path(wt).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # inherited, read-only
+        self.assertEqual(
+            {s.outcome for s in result.slots}, {SLOT_PLANNED}
+        )
+        self.assertEqual(before, after)  # main registry + anchor untouched
+        self.assertFalse(wt_anchor_exists)  # no worktree anchor written
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.tab_creates, [])
+
+    def _linked_fixture(self, tmp, *, lane="issue_13595_m"):
+        """A registered main + a linked lane worktree + isolated home / fake binary."""
+        main = Path(tmp) / "main"
+        self._init_repo(main)
+        wt = Path(tmp) / "lane"
+        self._git(main, "worktree", "add", str(wt), "-b", lane)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = self._binpath(Path(tmp))
+        return main, wt, home, binpath
+
+    def test_dry_run_linked_worktree_registry_only_main_inherits_read_only(self) -> None:
+        # Redmine #13595 R1-F1: a linked-worktree dry-run whose MAIN is registry-only
+        # (anchor deleted, registry row kept — a real state, anchors are untracked)
+        # must inherit the main's id read-only, matching the canonical worktree
+        # inheritance (`_inherited_worktree_result`, #13152), NOT fail closed. The
+        # main registry stays byte/mtime invariant, no main anchor is recreated, and
+        # no herdr write fires.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                anchor_path(main).unlink()  # registry-only main
+                before = _fingerprint([registry_path(home)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex", "claude"],
+                    lane_id="issue_13595_m",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+                after = _fingerprint([registry_path(home)])
+                main_anchor_absent = not anchor_path(main).exists()
+                wt_anchor_absent = not anchor_path(wt).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # inherited from the registry row
+        self.assertEqual({s.outcome for s in result.slots}, {SLOT_PLANNED})
+        self.assertEqual(before, after)  # main registry untouched
+        self.assertTrue(main_anchor_absent)  # NOT recreated
+        self.assertTrue(wt_anchor_absent)  # no worktree anchor written
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_dry_run_linked_worktree_anchor_only_main_inherits_read_only(self) -> None:
+        # Matrix: linked-worktree dry-run whose MAIN is anchor-only (registry file
+        # removed, anchor kept). Inherits from the main anchor, read-only, no herdr
+        # write, main anchor byte/mtime invariant.
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                registry_path(home).unlink()  # anchor-only main
+                before = _fingerprint([anchor_path(main)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex"],
+                    lane_id="issue_13595_m",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    dry_run=True,
+                )
+                after = _fingerprint([anchor_path(main)])
+                registry_absent = not registry_path(home).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # inherited from the anchor
+        self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
+        self.assertEqual(before, after)  # main anchor untouched
+        self.assertTrue(registry_absent)  # NOT recreated
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def test_dry_run_linked_worktree_unregistered_main_fails_closed(self) -> None:
+        # Matrix: linked-worktree dry-run whose MAIN has neither a registry row nor
+        # an anchor. No identity to inherit -> fail closed (no fake id, no write).
+        from mozyo_bridge.core.state.workspace_registry import anchor_path, registry_path
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError) as ctx:
+                    prepare_session(
+                        repo_root=wt,
+                        providers=["codex"],
+                        lane_id="issue_13595_m",
+                        env=_launch_env(binpath),
+                        runner=herdr.run,
+                        dry_run=True,
+                    )
+                reg_absent = not registry_path(home).exists()
+                main_anchor_absent = not anchor_path(main).exists()
+                wt_anchor_absent = not anchor_path(wt).exists()
+        self.assertIn("main checkout", str(ctx.exception))
+        self.assertTrue(reg_absent)
+        self.assertTrue(main_anchor_absent)
+        self.assertTrue(wt_anchor_absent)
+        self.assertEqual(herdr.calls, [])
+
+    def test_execute_linked_worktree_registry_only_main_mints_inherited_id(self) -> None:
+        # mint == resolve (Redmine #13595 R1-F1): the SAME registry-first inheritance
+        # the dry-run preview uses is what the execute launch mints under. A
+        # registry-only main is inherited (not fail-closed) and no main registry /
+        # anchor write occurs (the launch is a herdr-side effect only).
+        from mozyo_bridge.core.state.workspace_registry import (
+            anchor_path,
+            register_workspace,
+            registry_path,
+        )
+
+        herdr = _Herdr(created_workspace="wH")
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt, home, binpath = self._linked_fixture(tmp)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                anchor_path(main).unlink()  # registry-only main
+                before = _fingerprint([registry_path(home)])
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex"],
+                    lane_id="issue_13595_m",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                )
+                after = _fingerprint([registry_path(home)])
+                main_anchor_absent = not anchor_path(main).exists()
+        self.assertEqual(result.workspace_id, main_ws)  # mint under the inherited id
+        names = {s.provider: s.assigned_name for s in result.slots}
+        self.assertEqual(
+            names["codex"], encode_assigned_name(main_ws, "codex", "issue_13595_m")
+        )
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+        self.assertEqual(before, after)  # no main registry write from the launch
+        self.assertTrue(main_anchor_absent)  # main anchor not recreated
+
     def test_prepare_session_linked_worktree_joins_live_host_workspace(self) -> None:
         """A second lane joins the sublane host the first lane's slots occupy —
         no new workspace, and never the coordinator's (Redmine #13380)."""
@@ -1071,7 +2102,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex", "claude"],
                     lane_id="issue_13380_b",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
@@ -1109,7 +2140,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                         repo_root=wt,
                         providers=["codex"],
                         lane_id="issue_13377_y",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
         self.assertIn("main checkout has no registered workspace identity", str(ctx.exception))
@@ -1135,7 +2166,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                         repo_root=wt,
                         providers=["codex", "claude"],
                         lane_id="",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=herdr.run,
                     )
         self.assertIn("requires an explicit lane id", str(ctx.exception))
@@ -1168,7 +2199,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     repo_root=wt,
                     providers=["codex"],
                     lane_id="",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(result.lane_id, "issue_13377_w")
@@ -1200,7 +2231,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
             )
             ws = read_anchor(repo)["workspace_id"]
@@ -1286,7 +2317,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex", "claude"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         # codex adopts; claude launches into the adopted tab with --split right.
@@ -1329,7 +2360,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                     repo_root=repo,
                     providers=["codex", "claude"],
                     lane_id="lane-1",
-                    env={HERDR_ENV: str(binpath)},
+                    env=_launch_env(binpath),
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.tab_creates, [])
@@ -1385,7 +2416,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                 repo_root=repo,
                 providers=providers,
                 lane_id=lane,
-                env={HERDR_ENV: str(binpath)},
+                env=_launch_env(binpath),
                 runner=herdr.run,
             )
         return result, herdr
@@ -1487,7 +2518,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
             binpath = Path(tmp) / "fake-herdr"
             binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-            env = {HERDR_ENV: str(binpath)}
+            env = _launch_env(binpath)
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 a = prepare_session(
                     repo_root=repo, providers=["codex", "claude"],
@@ -1532,7 +2563,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                         repo_root=repo,
                         providers=["codex", "claude"],
                         lane_id="lane-a",
-                        env={HERDR_ENV: str(binpath)},
+                        env=_launch_env(binpath),
                         runner=fake.run,
                     )
         self.assertIn("--tab", str(ctx.exception))
@@ -1569,6 +2600,836 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         ]
         with self.assertRaises(HerdrSessionStartError):
             _tab_target_for_lane(split, ws, "w8", "lane-a")
+
+
+class ResolveAttestLauncherTest(unittest.TestCase):
+    """The #13637 self-check launcher resolver (review j#76492 Finding 2): BOTH the
+    explicit override and the PATH branch require an absolute path to an existing
+    executable; anything else falls back to `""` (disables the wrapper, no dead pane)."""
+
+    def _exe(self, tmp, name="mozyo-bridge"):
+        p = Path(tmp) / name
+        p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return p
+
+    def test_valid_absolute_executable_override_resolves(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            self.assertEqual(
+                resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": str(exe)}), str(exe)
+            )
+
+    def test_nonexistent_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        # A config typo (absolute but missing) must NOT be launched (dead-pane risk).
+        self.assertEqual(
+            resolve_attest_launcher(
+                {"MOZYO_BRIDGE_LAUNCHER": "/definitely/missing/mozyo-bridge"}
+            ),
+            "",
+        )
+
+    def test_directory_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": tmp}), ""
+            )
+
+    def test_non_executable_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "mozyo-bridge"
+            plain.write_text("not executable", encoding="utf-8")
+            plain.chmod(0o644)
+            self.assertEqual(
+                resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": str(plain)}), ""
+            )
+
+    def test_relative_override_falls_back(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        self.assertEqual(
+            resolve_attest_launcher({"MOZYO_BRIDGE_LAUNCHER": "mozyo-bridge"}), ""
+        )
+
+    def test_path_resolution_requires_executable(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+            resolve_attest_launcher,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            self.assertEqual(
+                resolve_attest_launcher({"PATH": tmp}), str(exe)
+            )
+            # A PATH with no mozyo-bridge resolves to "".
+            with tempfile.TemporaryDirectory() as empty:
+                self.assertEqual(resolve_attest_launcher({"PATH": empty}), "")
+
+
+class _LayoutHerdr(_Herdr):
+    """A herdr fake that models the LAYOUT semantics, not just the argv (Redmine #13646).
+
+    The argv-only fake cannot catch R1-F1 (review j#76613): it accepts any ``--split`` and
+    reports success, so a launch sequence that renders the right flags but produces the
+    WRONG final layout still passes. This fake reproduces the three live-measured herdr
+    behaviours that together caused the defect (scratch probe j#76622):
+
+    1. **A split targets the container's ACTIVE pane** — ``agent start`` has no pane-target
+       flag, so ``--split <dir>`` splits whatever pane is active in that container.
+    2. **A launch with no ``--split`` still splits**, using herdr's own default direction
+       (live-measured ``right``) against the active pane.
+    3. **``--focus`` makes the new pane active**; ``--no-focus`` leaves the active pane
+       where it was (so a fresh container's empty ROOT pane stays the split target).
+    4. **Closing a pane collapses its split node** into the sibling subtree — which is what
+       silently discarded the configured direction when the root was reclaimed.
+
+    The layout is a binary tree per container (a tab, or the workspace's default tab):
+    ``Leaf(pane)`` or ``Split(direction, first, second)``. :meth:`direction_between` then
+    reports the direction of the split node that actually separates two panes — the thing
+    the operator sees, and the thing the close condition is stated in.
+    """
+
+    #: herdr's own default split direction when a launch passes no `--split` (live-measured).
+    DEFAULT_SPLIT = "right"
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        # container key -> {"tree": node, "active": pane_id}. A node is
+        # ("leaf", pane_id) or ("split", direction, first_node, second_node).
+        self.containers: dict = {}
+
+    # -- layout model ------------------------------------------------------------
+
+    def _container_of(self, pane_id):
+        for key, c in self.containers.items():
+            if pane_id in self._panes(c["tree"]):
+                return key
+        return None
+
+    def _panes(self, node):
+        if node is None:
+            return []
+        if node[0] == "leaf":
+            return [node[1]]
+        return self._panes(node[2]) + self._panes(node[3])
+
+    def _open_container(self, key, root_pane):
+        self.containers[key] = {"tree": ("leaf", root_pane), "active": root_pane}
+
+    def _split_at(self, node, target, direction, new_pane):
+        if node[0] == "leaf":
+            if node[1] != target:
+                return node
+            return ("split", direction, ("leaf", target), ("leaf", new_pane))
+        return (
+            "split",
+            node[1],
+            self._split_at(node[2], target, direction, new_pane),
+            self._split_at(node[3], target, direction, new_pane),
+        )
+
+    def _close_at(self, node, pane):
+        """Remove ``pane``; a split with one surviving child collapses into it."""
+        if node[0] == "leaf":
+            return None if node[1] == pane else node
+        first = self._close_at(node[2], pane)
+        second = self._close_at(node[3], pane)
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return ("split", node[1], first, second)
+
+    def direction_between(self, a, b):
+        """Direction of the split node separating ``a`` and ``b`` (``""`` if none)."""
+        for c in self.containers.values():
+            found = self._dir_between(c["tree"], a, b)
+            if found:
+                return found
+        return ""
+
+    def _dir_between(self, node, a, b):
+        if node is None or node[0] == "leaf":
+            return ""
+        left, right = self._panes(node[2]), self._panes(node[3])
+        if (a in left and b in right) or (b in left and a in right):
+            return node[1]
+        return self._dir_between(node[2], a, b) or self._dir_between(node[3], a, b)
+
+    # -- herdr command interception ---------------------------------------------
+
+    def run(self, argv, **kw):
+        completed = super().run(argv, **kw)
+        rest = list(argv[1:])
+        if rest[:2] == ["workspace", "create"] and completed.returncode == 0:
+            wid = self.created_workspace
+            self._open_container(f"{wid}:default", f"{wid}:p1")
+        elif rest[:2] == ["tab", "create"] and completed.returncode == 0:
+            wid = rest[rest.index("--workspace") + 1]
+            tab_id = self.created_tab or f"{wid}:t1"
+            self._open_container(tab_id, f"{tab_id}-root")
+        elif rest[:2] == ["agent", "start"] and completed.returncode == 0:
+            payload = json.loads(completed.stdout)
+            pane = payload["result"]["agent"]["pane_id"]
+            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else ""
+            key = rest[rest.index("--tab") + 1] if "--tab" in rest else f"{wid}:default"
+            if key not in self.containers:
+                # A heal joins a container that already holds the live sibling; seed it.
+                self._open_container(key, f"{key}-seed")
+            c = self.containers[key]
+            direction = (
+                rest[rest.index("--split") + 1]
+                if "--split" in rest
+                else self.DEFAULT_SPLIT
+            )
+            c["tree"] = self._split_at(c["tree"], c["active"], direction, pane)
+            if "--focus" in rest:
+                c["active"] = pane
+        elif rest[:2] == ["pane", "close"] and completed.returncode == 0:
+            pane = rest[2]
+            key = self._container_of(pane)
+            if key is not None:
+                c = self.containers[key]
+                c["tree"] = self._close_at(c["tree"], pane)
+                if c["active"] == pane:
+                    remaining = self._panes(c["tree"])
+                    c["active"] = remaining[0] if remaining else ""
+        return completed
+
+
+class LanePlacementLayoutTest(unittest.TestCase):
+    """The final LAYOUT a configured pair lands in (Redmine #13646 R1-F1, j#76613/j#76616).
+
+    The regression the argv-only tests could not express: with every launch ``--no-focus``,
+    the container's empty root pane stays the split target, so the second slot splits the
+    ROOT — and reclaiming the root (after all launches, #13330) collapses that split away,
+    leaving only the outer default ``right`` split. The configured direction silently never
+    applied. Focusing the first launch of a fresh, explicitly-placed pair fixes it.
+    """
+
+    def _run(self, tmp, *, herdr, providers, lane, lane_placement=None, rows=None):
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            if rows is not None:
+                herdr.existing_rows = rows(ws)
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                lane_placement=lane_placement,
+            )
+        panes = {s.provider: s.locator for s in result.slots}
+        return result, ws, panes
+
+    def test_fake_reproduces_the_r1_f1_collapse_without_focus(self) -> None:
+        # The fake must be able to EXPRESS the original defect, else it proves nothing.
+        # Drive the pre-fix sequence by hand (first launch --no-focus) and confirm the
+        # configured `down` collapses to `right` once the root pane is reclaimed.
+        herdr = _LayoutHerdr(created_workspace="wZ")
+
+        def call(*tail):
+            herdr.run(["/fake-herdr", *tail], capture_output=True, text=True, timeout=5, env={})
+
+        call("workspace", "create", "--cwd", "/x", "--no-focus")
+        call("agent", "start", "a1", "--workspace", "wZ", "--no-focus", "--", "claude")
+        call("agent", "start", "a2", "--workspace", "wZ", "--split", "down", "--no-focus", "--", "codex")
+        root, a1, a2 = "wZ:p1", "wZ:p2", "wZ:p3"
+        # The `down` split landed against the still-active ROOT pane — not against the
+        # first agent — exactly as live-measured (j#76613 / j#76622).
+        self.assertEqual(herdr.direction_between(root, a2), "down")
+        self.assertEqual(herdr.direction_between(a1, a2), "right")
+        call("pane", "close", root)  # production reclaims the root pane after all launches
+        self.assertEqual(
+            herdr.direction_between(a1, a2),
+            "right",
+            "the un-focused sequence must collapse to the outer default split (R1-F1)",
+        )
+
+    def test_configured_default_pair_lands_down_after_root_reclaim(self) -> None:
+        # The close condition: a fresh, explicitly-placed default pair really ends up
+        # split `down` — AFTER the root pane reclaim, which is what used to erase it.
+        herdr = _LayoutHerdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"default": {"split": "down"}}
+                ),
+            )
+        self.assertTrue(herdr.pane_closes, "the root pane must still be reclaimed")
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "down"
+        )
+
+    def test_configured_sublane_pair_lands_down_after_tab_root_reclaim(self) -> None:
+        # The same defect existed in the lane tab (j#76622): the tab root was the split
+        # target, so a configured `down` collapsed to `right` on reclaim.
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"sublane": {"split": "down"}}
+                ),
+            )
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "down"
+        )
+
+    def test_configured_right_lands_right(self) -> None:
+        # An explicitly configured `right` is genuinely applied (it now splits the AGENT),
+        # and still presents as `right` — same observable layout as the legacy default.
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"sublane": {"split": "right"}}
+                ),
+            )
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "right"
+        )
+
+    def test_unset_sublane_layout_is_unchanged(self) -> None:
+        # Byte-invariance is also LAYOUT-invariance: an unset lane class keeps its
+        # historical (coincidentally `right`) result and gains no --focus.
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        for argv in herdr.start_argvs:
+            self.assertIn("--no-focus", argv)
+            self.assertNotIn("--focus", argv)
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "right"
+        )
+
+
+class LanePlacementLaunchTest(unittest.TestCase):
+    """Config-driven pane-pair placement (Redmine #13646, Design Answer j#76564).
+
+    ``lane_placement.{default,sublane}.{split,order}`` decides the herdr split
+    direction and which provider occupies the container first. Unset is byte-for-byte
+    the pre-#13646 launch; a configured lane class changes only its own fields. The
+    config is a FUTURE launch policy: it never moves an already-live pane.
+    """
+
+    @staticmethod
+    def _placement(**classes):
+        """A `LanePlacementConfig` from a `{lane_class: {split, order}}` mapping."""
+        return LanePlacementConfig.from_record(classes)
+
+    def _prepare(self, tmp, *, herdr, providers, lane, lane_placement=None, rows=None):
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            if rows is not None:
+                herdr.existing_rows = rows(ws)
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                lane_placement=lane_placement,
+            )
+        return result, ws
+
+    # --- unset: byte-invariant (Design Answer Q3) --------------------------------
+
+    def test_unset_default_pair_emits_no_split_flag(self) -> None:
+        # An unset `lane_placement` leaves the coordinator pair delegating to the herdr
+        # server default: no `--tab`, no `--split`, requested provider order preserved.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane=""
+            )
+        for argv in herdr.start_argvs:
+            self.assertNotIn("--tab", argv)
+            self.assertNotIn("--split", argv)
+        self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
+
+    def test_unset_sublane_keeps_legacy_split_right(self) -> None:
+        # An unset `lane_placement` keeps the pre-#13646 literal: 1st slot occupies the
+        # tab, 2nd splits `right`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1")
+        first, second = herdr.start_argvs
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    def test_empty_class_object_is_a_noop(self) -> None:
+        # A present-but-empty lane-class object configures neither field, so both
+        # inherit the legacy discipline (an empty `{}` never changes the launch).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={}),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    # --- configured fresh pairs ---------------------------------------------------
+
+    def test_configured_default_pair_splits_down_without_a_tab(self) -> None:
+        # The primary close condition: `lane_placement.default.split: down` makes the
+        # tab-less coordinator pair split vertically — the 1st slot occupies (no flag),
+        # the 2nd carries `--split down`. `--split` is emitted independently of `--tab`
+        # (herdr 0.7.1 accepts them as independent optional flags).
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="",
+                lane_placement=self._placement(default={"split": "down"}),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--tab", first)
+        self.assertNotIn("--split", first)
+        self.assertNotIn("--tab", second)
+        self.assertEqual(second[second.index("--split") + 1], "down")
+        # The flag sits right after `--workspace <id>`, before the `-- provider` tail.
+        at = second.index("--workspace")
+        self.assertEqual(second[at : at + 4], ["--workspace", "wZ", "--split", "down"])
+
+    def test_configured_sublane_split_down_overrides_legacy_right(self) -> None:
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+            )
+        second = herdr.start_argvs[1]
+        self.assertEqual(second[second.index("--tab") + 1], "wZ:t1")
+        self.assertEqual(second[second.index("--split") + 1], "down")
+
+    def test_configured_order_reorders_the_launch_sequence(self) -> None:
+        # `order: [claude, codex]` makes claude the OCCUPANT (launched first, no split)
+        # and codex the splitter — the inverse of the requested `[codex, claude]`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, ws = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["claude", "codex"]}
+                ),
+            )
+        first, second = herdr.start_argvs
+        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
+        self.assertEqual(second[second.index("--split") + 1], "right")
+        self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
+
+    def test_order_alone_leaves_the_legacy_split_direction(self) -> None:
+        # A partial object (order only) reorders but keeps the legacy `right`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
+            )
+        second = herdr.start_argvs[1]
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    def test_other_lane_class_is_untouched(self) -> None:
+        # Configuring `default` never changes the `sublane` launch (and vice versa).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    default={"split": "down", "order": ["claude", "codex"]}
+                ),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "right")
+
+    # --- single-provider / heal ----------------------------------------------------
+
+    def test_single_provider_request_gains_no_implicit_peer(self) -> None:
+        # `order` names both providers, but a single-provider request stays single: the
+        # order never launches an unrequested peer (Design Answer Q2).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "down", "order": ["codex", "claude"]}
+                ),
+            )
+        self.assertEqual(len(herdr.start_argvs), 1)
+        self.assertEqual([s.provider for s in result.slots], ["claude"])
+        # It is the tab's first occupant, so it does not split.
+        self.assertNotIn("--split", herdr.start_argvs[0])
+
+    def test_tabbed_heal_uses_the_configured_split_direction(self) -> None:
+        # A heal beside a live tabbed sibling splits in the CONFIGURED direction.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        self.assertEqual(herdr.tab_creates, [])
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--tab") + 1], "w5:t3")
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+
+    def test_default_lane_heal_splits_beside_the_live_sibling(self) -> None:
+        # The default-lane analogue: a live coordinator slot occupies the project
+        # workspace, so the healing launch splits beside it in the configured direction
+        # (no tab involved).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="",
+                lane_placement=self._placement(default={"split": "down"}),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", ""),
+                        "pane_id": "w5:pC",
+                    }
+                ],
+            )
+        argv = herdr.start_argvs[0]
+        self.assertNotIn("--tab", argv)
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+
+    def test_heal_of_configured_primary_reports_order_deferred(self) -> None:
+        # The configured primary (`order[0]` = codex) died while claude stayed live.
+        # herdr `agent start` has no pane-target flag, so codex can only be placed as a
+        # split beside the live claude — the physical order cannot be satisfied without
+        # moving a live pane (forbidden). The slot detail says so rather than silently
+        # claiming the order was applied; no swap/bounce is issued.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["codex", "claude"]}
+                ),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "claude", "lane-1"),
+                        "pane_id": "w5:pL",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        codex_slot = next(s for s in result.slots if s.provider == "codex")
+        self.assertEqual(codex_slot.outcome, SLOT_LAUNCHED)
+        self.assertIn("order_deferred_until_full_relaunch", codex_slot.detail)
+        # It still launches, in the configured direction, and moves nothing.
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--split") + 1], "right")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_heal_of_non_primary_does_not_report_order_deferred(self) -> None:
+        # The configured primary (codex) is the live occupant, so healing the SECOND
+        # provider satisfies the order exactly — no deferral marker.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["codex", "claude"]}
+                ),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        claude_slot = next(s for s in result.slots if s.provider == "claude")
+        self.assertNotIn("order_deferred_until_full_relaunch", claude_slot.detail)
+
+    def test_fresh_configured_pair_reports_no_order_deferral(self) -> None:
+        # A full fresh relaunch realizes the configured order physically, so neither
+        # slot carries the deferral marker.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    sublane={"split": "right", "order": ["codex", "claude"]}
+                ),
+            )
+        for slot in result.slots:
+            self.assertNotIn("order_deferred_until_full_relaunch", slot.detail)
+
+    # --- focus policy scope (R1-F1 fix, j#76616) -----------------------------------
+
+    def _focus_flags(self, herdr):
+        """(`--focus` present?) per launched slot, in launch order."""
+        return [("--focus" in argv) for argv in herdr.start_argvs]
+
+    def test_configured_fresh_pair_focuses_only_the_first_launch(self) -> None:
+        # The narrow fix: the FIRST launch of a fresh, explicitly-placed full pair carries
+        # --focus (pinning the container's split target to it); the splitter does not.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+            )
+        self.assertEqual(self._focus_flags(herdr), [True, False])
+
+    def test_order_alone_also_triggers_the_focus_policy(self) -> None:
+        # `order` without `split` is still an explicit placement: the pair's geometry is
+        # being declared, so the first launch must own the split target.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
+            )
+        self.assertEqual(self._focus_flags(herdr), [True, False])
+
+    def test_unset_lane_class_never_focuses(self) -> None:
+        # Byte-invariance: an unset lane class keeps `--no-focus` on every launch, even
+        # though its effective split direction is the legacy `right`.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        self.assertEqual(self._focus_flags(herdr), [False, False])
+
+    def test_single_provider_request_never_focuses(self) -> None:
+        # No second slot to place -> the focus policy does not fire.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+            )
+        self.assertEqual(self._focus_flags(herdr), [False])
+
+    def test_heal_never_focuses_even_when_configured(self) -> None:
+        # A heal joins a container whose only pane is the LIVE sibling — already the split
+        # target. Focusing (or moving) a live pane is forbidden, so no --focus is emitted.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-1",
+                lane_placement=self._placement(sublane={"split": "down"}),
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+            )
+        self.assertEqual(self._focus_flags(herdr), [False])
+        # It still splits in the configured direction, beside the untouched sibling.
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_mixed_adopt_never_focuses(self) -> None:
+        # One slot adopts a live sibling, the other launches: the container is already
+        # occupied, so this is a heal — no --focus, and the live pane is never touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "codex", "lane-1"),
+                            "pane_id": "w5:pC",
+                            "tab_id": "w5:t3",
+                        }
+                    ]
+                )
+                prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="lane-1",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    lane_placement=self._placement(sublane={"split": "down"}),
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w5:pC"
+                    ),
+                )
+        # Only claude launched (codex adopted) -> a single launch, unfocused.
+        self.assertEqual(self._focus_flags(herdr), [False])
+        self.assertEqual(herdr.pane_closes, [])
+
+    # --- no live mutation ----------------------------------------------------------
+
+    def test_config_read_never_moves_a_live_pair(self) -> None:
+        # Reading a `lane_placement` that disagrees with the live layout adopts the live
+        # slots and issues ZERO placement mutations (no pane close / swap / move): the
+        # config is a future-launch policy, never a live-layout authority.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "codex", "lane-1"),
+                            "pane_id": "w5:pC",
+                            "tab_id": "w5:t3",
+                        },
+                        {
+                            "name": encode_assigned_name(ws, "claude", "lane-1"),
+                            "pane_id": "w5:pL",
+                            "tab_id": "w5:t3",
+                        },
+                    ]
+                )
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="lane-1",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    lane_placement=self._placement(
+                        sublane={"split": "down", "order": ["claude", "codex"]}
+                    ),
+                    attestation_reader=_present_attestation_reader(
+                        ws, "codex", "lane-1", "w5:pC"
+                    ),
+                )
+        # Nothing launched, nothing created, nothing closed — the live pair is untouched.
+        self.assertEqual(herdr.start_argvs, [])
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertEqual({s.outcome for s in result.slots} - {SLOT_ADOPTED}, {SLOT_UNATTESTED})
 
 
 if __name__ == "__main__":  # pragma: no cover

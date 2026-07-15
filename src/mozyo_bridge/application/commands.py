@@ -150,9 +150,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     resolve_queue_enter_retry_policy,
     resolve_standard_target_admission_policy,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (
+    resolve_handoff_profile_fields,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileError,
-    parse_profile_fields,
     resolve_role_profile,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
@@ -269,21 +271,20 @@ def load_tmux_conf_for(args: argparse.Namespace) -> bool:
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
-    Thin wrapper: the discovery orchestration was extracted to
-    :class:`mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`,
-    which depends on the injected
-    :class:`mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
-    instead of the four naked external reads (live discovery / canonical session /
-    git checkout probe / project scope) — the OOP-first read-discovery tranche
-    (Redmine #12749 / #12638 / #12785). This wrapper keeps the public name so the
-    ``agents targets`` / attention handlers and the delegated-coordinator /
-    project-gateway callers that ``from ...commands import _agents_target_candidates``
-    (and the tests that patch ``commands._agents_target_candidates``) are unchanged.
-    Behavior-preserving.
+    Thin wrapper over :class:`~mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`
+    (over the injected :class:`~mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
+    — the #12749 / #12638 / #12785 OOP-first read tranche); keeps the public name so the
+    ``agents targets`` / attention handlers and the delegated-coordinator / project-gateway
+    callers (and tests) that import ``commands._agents_target_candidates`` are unchanged. The
+    composition-injected ``args.snapshot`` (Redmine #13569 R2-F1) is threaded into the discovery
+    adapter and the use-case validation so the runtime read uses the SAME provider vocabulary
+    the CLI choices came from; ``None`` uses the built-in providers.
     """
-    return ResolveAgentTargetsUseCase(LiveAgentDiscovery()).resolve(
+    _s = getattr(args, "snapshot", None)
+    return ResolveAgentTargetsUseCase(LiveAgentDiscovery(snapshot=_s)).resolve(
         agent_filter=getattr(args, "agent", None),
         session_filter=getattr(args, "session", None),
+        snapshot=_s,
     )
 
 
@@ -1617,6 +1618,14 @@ def _maybe_restore_previous_active(
     )
 
 
+# Redmine #13583 R2-F2 positive-delivery gate (rc 0 is NOT proof of delivery). The predicate +
+# terminal-path publisher live in `f_130_.../application/delivery_outcome_gate.py`; re-exported.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E402,E501
+    delivery_was_positive,
+    make_publishing_emitter as _make_publishing_emitter,
+)
+
+
 @bind_runtime_transport
 def orchestrate_handoff(
     args: argparse.Namespace,
@@ -1663,6 +1672,8 @@ def orchestrate_handoff(
     # (and the tmux gates below) must not run; the target is resolved herdr-natively.
     # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
     # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
+    # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
+    _emit = _make_publishing_emitter(args, _emit_outcome)
     herdr_send = herdr_effective_backend_selected(args)
     if not herdr_send:
         require_tmux()
@@ -1696,7 +1707,7 @@ def orchestrate_handoff(
         # stricter than strict `standard`: `--force` cannot be used to bypass
         # non-agent target checks under this rail. The rail only makes sense
         # for Claude/Codex agent panes whose prompt queue accepts Enter.
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -1718,7 +1729,7 @@ def orchestrate_handoff(
         )
 
     if kind not in KIND_LABELS:
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -1764,9 +1775,12 @@ def orchestrate_handoff(
                 callback_to_role=getattr(args, "callback_to_role", None),
                 callback_methods=getattr(args, "callback_methods", None),
                 read_contract=getattr(args, "read_contract", None),
+                # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
+                # so the child's returning callback echoes it to complete the exact generation.
+                forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessWorkIntakeError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -1800,9 +1814,12 @@ def orchestrate_handoff(
                 callback_to_role=getattr(args, "callback_to_role", None),
                 callback_methods=getattr(args, "callback_methods", None),
                 read_contract=getattr(args, "read_contract", None),
+                # Redmine #13583 R1-F1: an opaque forward generation id (herdr forward only; "" else)
+                # so the gateway's returning callback echoes it to complete the exact generation.
+                forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessConsultationError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -1836,9 +1853,12 @@ def orchestrate_handoff(
                 next_action_owner=getattr(args, "workflow_next_owner", None),
                 callback_reason=getattr(args, "callback_reason", None),
                 read_contract=getattr(args, "read_contract", None),
+                # Redmine #13583 R1-F1: echo the forward generation id the consultation/work-intake
+                # carried, so a positively-delivered callback completes the exact forward generation.
+                forward_action_id=getattr(args, "forward_action_id", "") or "",
             )
         except TicketlessCallbackError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -1870,7 +1890,7 @@ def orchestrate_handoff(
                 journal=getattr(args, "journal", None),
             )
         except AnchorError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_anchor",
@@ -1899,7 +1919,7 @@ def orchestrate_handoff(
         try:
             target_info = resolve_herdr_send_target(args, receiver=receiver)
         except HerdrSendEntryError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_unavailable",
@@ -1921,7 +1941,7 @@ def orchestrate_handoff(
         try:
             target_info = pane_info(target_arg)
         except SystemExit:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_unavailable",
@@ -2024,7 +2044,7 @@ def orchestrate_handoff(
     elif getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
         raw_target = getattr(args, "target", None)
         if not is_explicit_pane_target(raw_target):
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2060,7 +2080,7 @@ def orchestrate_handoff(
 
         auto_root = _resolve_workspace_root(auto_cwd)
         if not auto_root:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_repo_mismatch",
@@ -2124,7 +2144,7 @@ def orchestrate_handoff(
     if main_lane_guard_blocked(
         args, receiver=receiver, kind=kind, preflight_target=preflight_target
     ):
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="main_lane_implementation_blocked",
@@ -2176,7 +2196,7 @@ def orchestrate_handoff(
         # under a `to=codex` marker.
         observed_window = preflight_target.window_name or "<unknown>"
         observed_role = preflight_target.pane_option_role or "<none>"
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -2250,7 +2270,7 @@ def orchestrate_handoff(
                 both_sessions_known and explicit_target and has_target_repo
             )
             if not cross_session_admitted:
-                _emit_outcome(
+                _emit(
                     make_outcome(
                         status="blocked",
                         reason="invalid_args",
@@ -2311,7 +2331,7 @@ def orchestrate_handoff(
         and sender_session_xw != target_session_xw
         and receiver == "claude"
     ):
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="cross_session_claude",
@@ -2399,7 +2419,7 @@ def orchestrate_handoff(
         target=target,
         record_format=record_format,
         record_command=record_command,
-        emit=_emit_outcome,
+        emit=_emit,
         sender_lane_unit=herdr_sender_lane_unit,
     )
 
@@ -2423,7 +2443,7 @@ def orchestrate_handoff(
         if observed_repo is None or normalize_path_unicode(
             observed_repo
         ) != normalize_path_unicode(expected_resolved):
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_repo_mismatch",
@@ -2485,7 +2505,7 @@ def orchestrate_handoff(
         # the sole identity gate. `--target-repo` has already been validated above
         # when present.
         if not expected_target_repo:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2552,7 +2572,7 @@ def orchestrate_handoff(
             observed_path = None
 
         if observed_scope != expected_project:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_project_mismatch",
@@ -2630,7 +2650,7 @@ def orchestrate_handoff(
                 target=target,
                 anchor=anchor,
             )
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2693,7 +2713,7 @@ def orchestrate_handoff(
         pane_command = target_info.get("command") or ""
         if not is_receiver_agent_process(pane_command, receiver):
             observed_command = Path(pane_command).name or "<none>"
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_not_agent",
@@ -2719,7 +2739,7 @@ def orchestrate_handoff(
         try:
             ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
         except SystemExit:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="target_not_agent",
@@ -2758,22 +2778,30 @@ def orchestrate_handoff(
             workdir_abs, repo_root_abs=repo_anchor_abs
         )
 
-    # Redmine #12388: resolve the requested fixed role profile before any pane
-    # send. Auto-fill `durable_anchor` from the anchor so the most common
-    # placeholder needs no `--profile-field`. Fail closed (blocked /
-    # invalid_args) on an unknown role or a malformed `--profile-field`; omitting
+    # Redmine #12388 / #13477: resolve the requested fixed role profile before
+    # any pane send. `resolve_handoff_profile_fields` parses `--profile-field`,
+    # auto-fills `durable_anchor` from the anchor, and (Redmine #13477)
+    # auto-resolves a `redmine_project` placeholder from the verified
+    # workspace-local Redmine default when the role needs it and no explicit
+    # value was given (explicit wins; missing/unverified fails closed). Fail
+    # closed (blocked / invalid_args) on an unknown role, a malformed
+    # `--profile-field`, or an unresolvable required default; omitting
     # `--role-profile` is the explicit fallback of no profile expansion.
     role_profile_resolution = None
     role_profile_arg = getattr(args, "role_profile", None)
     if role_profile_arg:
         try:
-            profile_fields = parse_profile_fields(getattr(args, "profile_field", None))
-            profile_fields.setdefault("durable_anchor", anchor.human_pointer())
+            profile_fields = resolve_handoff_profile_fields(
+                role_profile_arg,
+                getattr(args, "profile_field", None),
+                anchor.human_pointer(),
+                repo_root_from_args(args),
+            )
             role_profile_resolution = resolve_role_profile(
                 role_profile_arg, profile_fields
             )
         except RoleProfileError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2808,7 +2836,7 @@ def orchestrate_handoff(
         try:
             transition_role_boundary = resolve_transition_role(transition_role_arg)
         except TransitionRoleError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2842,7 +2870,7 @@ def orchestrate_handoff(
         try:
             workflow_contract_bundle = resolve_workflow_contract(workflow_contract_arg)
         except WorkflowContractError as exc:
-            _emit_outcome(
+            _emit(
                 make_outcome(
                     status="blocked",
                     reason="invalid_args",
@@ -2879,7 +2907,7 @@ def orchestrate_handoff(
             ticketless_work_intake=ticketless_work_intake_payload,
         )
     except AnchorError as exc:
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -2908,9 +2936,35 @@ def orchestrate_handoff(
     marker = build_marker(anchor, kind, receiver)
 
     read_lines = int(getattr(args, "read_lines", 50) or 50)
-    # Internal pane snapshot preflight. The standard path must not require
-    # callers to run `mozyo-bridge read` first.
-    capture_pane(target, read_lines)
+    # Internal pane snapshot preflight (the standard path must not require callers to run
+    # `mozyo-bridge read` first) AND — under herdr — the Redmine #13760 pre-send startup
+    # admission: the same single action-time read is classified against the receiver
+    # provider's declared startup screens, and a trust / first-run / login screen refuses
+    # the send with ZERO bytes typed. The gate body lives in the f_130 seam (module-health;
+    # and it keeps every provider-specific string in profile DATA, out of this module).
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (
+        admit_receiver_startup_or_die,
+    )
+
+    admit_receiver_startup_or_die(
+        args,
+        herdr_send=herdr_send,
+        receiver=receiver,
+        target=target,
+        read_lines=read_lines,
+        capture_pane=capture_pane,
+        emit=_emit,
+        record_format=record_format,
+        record_command=record_command,
+        anchor=anchor,
+        mode=mode,
+        kind=kind,
+        source=source,
+        execution_root=execution_root,
+        role_profile_contract=role_profile_contract,
+        duplicate_lane_panes=duplicate_lane_panes,
+        ledger=_record_herdr_send_ledger,
+    )
 
     # Redmine #12597: activate an admitted inactive split now — after every
     # die-able gate above — so we never steal the operator's focus for a send
@@ -2971,7 +3025,7 @@ def orchestrate_handoff(
             ticketless_work_intake=ticketless_work_intake_payload,
             turn_start_outcome=turn_start_telemetry,
         )
-        _emit_outcome(
+        _emit(
             outcome,
             record_format=record_format,
             command=record_command,
@@ -3022,7 +3076,7 @@ def orchestrate_handoff(
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
         )
-        _emit_outcome(
+        _emit(
             outcome,
             record_format=record_format,
             command=record_command,
@@ -3061,7 +3115,7 @@ def orchestrate_handoff(
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
         )
-        _emit_outcome(
+        _emit(
             outcome,
             record_format=record_format,
             command=record_command,
@@ -3168,7 +3222,7 @@ def orchestrate_handoff(
                 ticketless_consultation=ticketless_consultation_payload,
                 ticketless_work_intake=ticketless_work_intake_payload,
             )
-            _emit_outcome(
+            _emit(
                 outcome,
                 record_format=record_format,
                 command=record_command,
@@ -3272,7 +3326,7 @@ def orchestrate_handoff(
         target_activation,
         restore_previous_active=admission_policy.restore_previous_active,
     )
-    _emit_outcome(
+    _emit(
         outcome,
         record_format=record_format,
         command=record_command,
@@ -3331,15 +3385,23 @@ def cmd_handoff_reply(args: argparse.Namespace) -> int:
 
 
 def cmd_handoff_ticketless_callback(args: argparse.Namespace) -> int:
-    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``."""
+    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``.
+
+    Redmine #13583 R1-F1: on a positively-delivered callback that echoes a ``forward_action_id``,
+    complete the correlated forward generation (best-effort; never alters the callback's own rc).
+    """
     from mozyo_bridge.application.handoff_command import (
         HandoffCommandUseCase,
         LiveHandoffCommandOps,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (
+        complete_forward_generation_on_callback,
+    )
 
-    return HandoffCommandUseCase(
-        LiveHandoffCommandOps()
-    ).run_ticketless_callback(args)
+    rc = HandoffCommandUseCase(LiveHandoffCommandOps()).run_ticketless_callback(args)
+    # R2-F2: gate on the transport's structured `sent`/`ok`, never on rc (see delivery_outcome_gate).
+    complete_forward_generation_on_callback(args, delivered=delivery_was_positive(args))
+    return rc
 
 
 def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:

@@ -28,7 +28,20 @@ Redmine #12396 / US #12388 / Feature #12386 (`Delegated Coordinator / Nested Han
 - **template missing は fail-closed**: 未知 role token は `RoleProfileError`。CLI では argparse `choices` で弾き、orchestrator では `blocked` / `invalid_args` を emit して停止する。pane send は一切行わない。
 - **不正な `--profile-field` は fail-closed**: `=` を含まない、または key が空の pair は `RoleProfileError`。
 - **明示 fallback**: `--role-profile` を渡さない場合は profile 展開なし (`role_profile=None` を record)。path 推測による暗黙解決は行わない。
-- **placeholder 部分未充足は明示 fallback**: 値が無い placeholder は literal `<name>` のまま残し、`unresolved_placeholders` に列挙する。黙って欠落させない。
+- **placeholder 部分未充足は明示 fallback**: 値が無い placeholder は literal `<name>` のまま残し、`unresolved_placeholders` に列挙する。黙って欠落させない。この fallback は send-time auto-fill 源を持たない placeholder (例: `lane` / `parent_project`) に適用する。auto-fill 源を持つ `redmine_project` は下記 send-time field resolver が別扱いする。
+
+## send-time field resolver と `redmine_project` 自動解決 (Redmine #13477)
+
+pure template resolver (`role_profile.py`) は IO-free を保つ (cwd / worktree の path 探索も defaults file 読取もしない)。send-time に runtime context を要する field auto-fill は application-layer の send-time field resolver `f_130_handoff_routing/application/role_profile_field_resolution.py` (`resolve_handoff_profile_fields`) が担い、`handoff send` 配線 (`orchestrate_handoff`) から呼ばれる。この resolver が唯一 filesystem を読む seam である (`core.state.workspace_defaults.resolve_default_project` 経由)。
+
+- **`durable_anchor`**: anchor pointer から自動補完する (Redmine #12388、上記のとおり)。
+- **`redmine_project`** (`coordinator` / `delegated_coordinator` template のみが持つ placeholder): 次の優先順位で解決する。
+  1. **valid な非空 explicit 値 > verified default**: `--profile-field redmine_project=<id>` に strip 後非空の値があれば、それを優先し default へ fallback しない。
+  2. **explicit 省略時は verified workspace-local default で補完**: `redmine_project` が未指定なら、repo root の固定 defaults path (`<repo>/.mozyo-bridge/project-defaults.yaml`、legacy `workspace-defaults.yaml` は fallback) の **verified** default project identifier を補完する。読取は fixed path であり cwd / worktree の探索ではない。
+  3. **fail-closed** (`RoleProfileError` → 配線側で `blocked` / `invalid_args`、pane send せず): explicit の空/空白値 (有効な identifier ではない)、および explicit 省略時に default が missing / unverified / conflict (new+legacy 両在) のとき。missing/unverified を fact として黙って送らない (workspace default-project resolution 契約と整合。`skills/mozyo-bridge-agent/references/workflow.md` `### Default project 解決`)。
+  4. **placeholder を持たない role は default を読まない**: `implementation_gateway` / `implementation_worker` は `redmine_project` を持たないため defaults 読取をせず、この gate も適用しない (missing default で send が壊れない)。
+
+runtime 実装詳細 (関数分割・error message 文言) は doc に複製しない。正本は上記 module と unit/integration test。
 
 ## 受信側への展開と durable record
 

@@ -30,9 +30,9 @@ def _skill_view(
     *,
     present: bool,
     references_missing: list[str],
-    home: str = "/home/op/.codex",
-    skill_dir: str = "/home/op/.codex/skills/mozyo-bridge-agent",
-    skill_md: str = "/home/op/.codex/skills/mozyo-bridge-agent/SKILL.md",
+    home: str = "/workspace/agent/.codex",
+    skill_dir: str = "/workspace/agent/.codex/skills/mozyo-bridge-agent",
+    skill_md: str = "/workspace/agent/.codex/skills/mozyo-bridge-agent/SKILL.md",
     install_hint: str = _INSTALL_HINT,
 ) -> dict[str, Any]:
     return {

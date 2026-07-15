@@ -65,6 +65,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveSublaneActuatorOps,
     resolve_dispatch_admission_args,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    WorkflowProviderUnresolved,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
@@ -180,6 +183,21 @@ class LiveWorkerDispatchOps:
     def _actuator_ops(self) -> LiveSublaneActuatorOps:
         return LiveSublaneActuatorOps(repo_root=self.repo_root)
 
+    def worker_provider(self) -> str:
+        """The runtime provider bound to the implementer (worker) role (Redmine #13569).
+
+        Resolved from the repo-local ``RoleProviderBinding`` (default ``claude``,
+        byte-identical) so the forward keys on the role, not a literal — a rebound worker
+        provider moves the ``--to`` receiver and the readiness probe with no source edit.
+        An unbound worker role raises :class:`WorkflowProviderUnresolved`, which the drive
+        turns into a fail-closed zero-send.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_worker_provider,
+        )
+
+        return resolve_worker_provider(str(self.repo_root))
+
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         return self._actuator_ops().read_lane(worktree_path)
 
@@ -201,8 +219,9 @@ class LiveWorkerDispatchOps:
         )
 
         try:
+            worker_provider = self.worker_provider()
             info = pane_info(worker_pane)
-            if not is_receiver_agent_process(info.get("command", ""), "claude"):
+            if not is_receiver_agent_process(info.get("command", ""), worker_provider):
                 return False
             rendered = capture_pane(worker_pane, WORKER_READY_CAPTURE_LINES)
         except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the drive.
@@ -228,6 +247,7 @@ class LiveWorkerDispatchOps:
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            worker_provider=self.worker_provider(),
         )
         return _drive_worker_send_argv(argv)
 
@@ -285,6 +305,8 @@ def _worker_dispatch_argv(
     target_repo: str,
     allow_direct_worker: bool = False,
     repo_root: Optional[str] = None,
+    target_lane: Optional[str] = None,
+    worker_provider: str = "claude",
 ) -> list[str]:
     """The same-lane worker forward as the gateway would type it (pure).
 
@@ -306,8 +328,9 @@ def _worker_dispatch_argv(
     ``sublane dispatch-worker`` already selected — not from the driving process's
     cwd. Under ``terminal_transport.backend: herdr`` the send-path backend predicate
     (``herdr_effective_backend_selected`` → ``load_repo_local_config(repo_root_from_args(args))``)
-    reads the config at ``repo_root_from_args``, which defaults to a marker walk from
-    cwd. In-project (``mozyo_bridge``) the herdr selection is a *committed* config, so
+    reads the config at ``repo_root_from_args``, which defaults to a Git-root-first
+    resolve from cwd (Redmine #13641: a reachable Git root wins, else the marker
+    walk). In-project (``mozyo_bridge``) the herdr selection is a *committed* config, so
     every checkout / lane worktree carries it and cwd resolution happens to agree; in
     an **external** adopted project the herdr selection lives only at the adopted root,
     so a drive whose cwd resolves elsewhere re-derived ``backend: tmux`` and validated
@@ -316,6 +339,23 @@ def _worker_dispatch_argv(
     root makes the inner backend match the outer selection. ``None`` (the tmux
     :class:`LiveWorkerDispatchOps` default) omits the flag, so the tmux argv stays
     byte-for-byte the pre-#13397 shape.
+
+    ``target_lane`` (Redmine #13485) pins the explicit ``--target-lane`` so the inner
+    herdr send resolves the worker by its **stable ``(workspace_id, lane_id, role)``
+    identity** — the ``lane_label`` the ``read_lane`` inventory decode confirmed — and
+    NOT by re-deriving the lane from the *sender's* identity (``derive_target_lane``
+    tier-2 sender-same-lane). Without the pin the herdr rail discards the resolved
+    worker locator and re-resolves ``(sender.workspace_id, sender.lane_id, claude)``:
+    when the sender's launch-time lane attestation diverges from the worker's lane —
+    a coordinator / cross-lane stall-drive, or a legacy / mis-attested gateway — that
+    derives a DIFFERENT (or stale) ``claude`` slot, so the send delivery-ACKs (exit 0)
+    on the wrong agent while the real lane worker stays idle (the #13483 j#74570 live
+    divergence). Pinning the lane makes the ACK measure submit-completion to the
+    intended worker, exactly as the coordinator→gateway leg already pins
+    ``--target-lane`` (``sublane_actuator_herdr_ops.dispatch_argv``). ``None`` (the
+    tmux :class:`LiveWorkerDispatchOps` default) omits the flag: the tmux worker
+    addresses an explicit ``%pane`` and never rides the lane-derivation rail, so the
+    tmux argv stays byte-for-byte the pre-#13485 shape.
     """
     argv: list[str] = []
     if repo_root:
@@ -325,7 +365,7 @@ def _worker_dispatch_argv(
         "handoff",
         "send",
         "--to",
-        "claude",
+        worker_provider,
         "--source",
         "redmine",
         "--issue",
@@ -338,6 +378,12 @@ def _worker_dispatch_argv(
         worker_pane,
         "--target-repo",
         target_repo,
+    ]
+    if target_lane:
+        # Redmine #13485: explicit lane authority (mirrors the gateway dispatch's
+        # `--target-lane`). Placed with the other target coordinates, before `--mode`.
+        argv += ["--target-lane", target_lane]
+    argv += [
         "--mode",
         "queue-enter",
         "--role-profile",
@@ -364,7 +410,23 @@ def _replayable_command(
     gateway_callback_target: Optional[str],
     target_repo: str,
     allow_direct_worker: bool = False,
+    target_lane: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    worker_provider: str = "claude",
 ) -> str:
+    """The replayable retry command surfaced on the outcome / durable journal.
+
+    Redmine #13485 review F1: the outcome's ``command`` is documented as a *replayable
+    retry command* (:func:`render_worker_dispatch_journal`), so on the herdr rail it MUST
+    carry the same stable-lane authority the actual dispatch pins — ``--target-lane`` (the
+    lane the ``read_lane`` decode confirmed) and the #13397 ``--repo`` backend pin — or
+    replaying the printed command would drop back to the sender-lane re-derivation this US
+    fixes (a cross-lane replay would false-positive ACK on the wrong lane again). The pins
+    ride the same ``target_lane`` / ``repo_root`` params ``_worker_dispatch_argv`` uses, so
+    the printed command is byte-identical to the argv the herdr adapter actually drove. The
+    tmux path passes neither (both ``None``), so its command stays byte-for-byte the prior
+    shape.
+    """
     return "mozyo-bridge " + " ".join(
         _worker_dispatch_argv(
             issue=issue,
@@ -374,6 +436,9 @@ def _replayable_command(
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            target_lane=target_lane,
+            repo_root=repo_root,
+            worker_provider=worker_provider,
         )
     )
 
@@ -424,6 +489,36 @@ class WorkerDispatchUseCase:
             if attempt + 1 < probes:
                 self.sleep(self.worker_ready_interval_seconds)
         return False
+
+    def _command_pins(self) -> dict:
+        """Backend-specific replay-authority pins for the durable / dry-run command.
+
+        Redmine #13485 review F1: the outcome ``command`` is a replayable retry command,
+        so the herdr adapter supplies the ``--target-lane`` / ``--repo`` authority its
+        actual dispatch pins (:meth:`HerdrWorkerDispatchOps.command_authority_pins`) and
+        the command reproduces the true argv. An optional port capability read through
+        ``getattr`` — the tmux :class:`LiveWorkerDispatchOps` does not define it, so its
+        command stays byte-for-byte the pre-#13485 shape (no pins).
+        """
+        getter = getattr(self.ops, "command_authority_pins", None)
+        return getter() if callable(getter) else {}
+
+    def _display_worker_provider(self) -> str:
+        """The worker provider for the *display* / replay command (Redmine #13569).
+
+        Optional port capability read through ``getattr`` — a fake ops (or one that does
+        not resolve a binding) keeps the byte-identical ``claude`` default. An unbound role
+        also degrades to the default here: this is the display string only; the actuation
+        path resolves the same provider and fails closed separately, so a rebound worker's
+        command reads correctly while an unresolved binding never fabricates a send.
+        """
+        getter = getattr(self.ops, "worker_provider", None)
+        if not callable(getter):
+            return "claude"
+        try:
+            return getter()
+        except WorkflowProviderUnresolved:
+            return "claude"
 
     def run(
         self,
@@ -541,6 +636,7 @@ class WorkerDispatchUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
+        pins = self._command_pins()
         command = _replayable_command(
             issue=request.issue,
             journal=request.journal,
@@ -549,6 +645,9 @@ class WorkerDispatchUseCase:
             gateway_callback_target=lane.gateway_pane,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            target_lane=pins.get("target_lane"),
+            repo_root=pins.get("repo_root"),
+            worker_provider=self._display_worker_provider(),
         )
 
         # 6. Dry-run: preview the resolved transfer; perform nothing.
@@ -686,6 +785,12 @@ class WorkerDispatchUseCase:
                 lane_label=request.lane_label,
                 gateway_callback_target=gateway_pane,
                 target_repo=target_repo,
+                worker_provider=self._display_worker_provider(),
+                **{
+                    k: v
+                    for k, v in self._command_pins().items()
+                    if k in ("target_lane", "repo_root")
+                },
             ),
             blocked_reasons=reasons,
             fill_decision=fill_decision,

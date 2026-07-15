@@ -1668,6 +1668,323 @@ reads the selection fresh per process and holds no state.
   into the send — that rail integration was **split out of #13253 into the
   follow-up #13255** (j#72361).
 
+## Implemented Agent Provider Profile Registry (Redmine #13441, Increment 1)
+
+Extends this boundary to the **agent-launch layer**. Before #13441, knowledge of the
+LLM providers mozyo launches (`claude` / `codex`) was hard-coded as closed sets in
+several modules — `pane_resolver.AGENT_COMMANDS`, `agent_launch_argv.LAUNCH_ARGV_PROVIDERS`
+/ `RESERVED_MANAGED_FLAGS`, `herdr_target_resolution.AGENT_PROVIDERS`,
+`agent_discovery.AGENT_KINDS` — so a CLI flag rename or a new CLI-shaped LLM meant
+editing source in several places. Those sets are now **projections of a data registry**.
+
+### Where it lives
+
+- `e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profile_config.py`
+  — the pure schema (`AgentProviderProfile`, `TrustedExecutable`, `InteractionProtocol`,
+  `ManagedFlagConcept`, `AgentCapability`, `AgentProviderProfileRegistry`). No IO.
+- `.../domain/agent_provider_profiles.yaml` — the wheel-packaged built-in profiles.
+- `.../domain/agent_provider_profile.py` — the `importlib.resources` load + the seeded
+  `AGENT_PROVIDER_PROFILES` singleton and the derived vocabulary accessors.
+- `.../application/agent_provider_executable.py` — the trusted executable resolver.
+
+It is a **typed sibling** of `BuiltinProviderRegistry` (#12035), not an extension of it:
+an agent provider is a launchable CLI, not an adapter *category*.
+
+### What a profile owns
+
+`provider_id`; trusted executable *metadata* (a command basename + the NAME of a
+trusted-env override variable); the interaction-protocol family; discovery / process
+aliases; closed mechanical capabilities; the closed managed-flag **concept** map
+(concept → that provider's flag spelling, e.g. `permission_mode` → `--permission-mode`),
+which doubles as the reserved-flag vocabulary an operator's repo config may not
+re-specify; and — schema version `2`, #13760 — the closed `startup_blockers[{id, all_of}]`
+list: the provider's pre-composer **startup screens** (a trust confirmation, a first-run
+theme picker, a login prompt) that render as a live pane but cannot accept a handoff body.
+Each blocker is an AND of co-located on-screen signatures (a lone generic phrase can never
+false-positive a ready composer), validated fail-closed at load — count, string / blank /
+length / folded-length / duplicate, and the same forbidden-token set as every other field —
+by the one validator every construction path runs (`StartupBlocker.__post_init__`, #13760
+review j#78481 F1). It is pure *description*: the pre-send admission gate
+(`f_130_handoff_routing/application/startup_admission_gate.py` +
+`f_130_terminal_runtime_provider/application/herdr_startup_admission.py`) reads it to
+**refuse** a send to a receiver still on such a screen (zero text / keys / Enter / ACK), so
+no provider-specific string lives in a transport or command module. A blocker carries no
+key, no answer, and no authority to dismiss the screen — clearing a trust / login prompt
+stays an operator action in the provider's own UI (mozyo never auto-accepts one).
+
+The config artifact itself carries `version` + `source` as durable contract pointers.
+An **unknown** version fails closed at load (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review
+j#78481 F2) rather than being read on a partially-understood schema, and the declared
+version **gates the accepted shape**: `startup_blockers` is the v2 addition, so a
+`version: "1"` record that carries it fails closed (#13760 review j#78529 F2). The "v2
+adds startup_blockers" claim and the fields the loader actually honors therefore cannot
+drift.
+
+### What a profile may never own (enforced, not documented)
+
+A workflow role, a `provider_binding`, any routing / gate / approval authority, a
+default pair / launch topology, an arbitrary callable / module path / entry point, a
+host executable path, or a model / effort *semantic* schema (those stay opaque
+operator-owned `launch_argv` tokens, #13425). Registering a profile makes a provider
+**expressible**, never **launched** — `herdr_launch_command.LAUNCH_PROVIDERS` (the
+default topology) is deliberately NOT derived from the registry.
+
+### Executable trust boundary (supersedes the bare-name argv[0])
+
+The launch chokepoints previously rendered a bare `claude` / `codex` as `argv[0]`,
+leaving provider identity to the exec-time `PATH`. They now render the **verified
+absolute realpath** resolved from the trusted environment (explicit env override →
+trusted `PATH`; unsafe `PATH`, relative override, non-executable, missing, or ambiguous
+all fail closed *before* a pane exists). A committed profile can never name the binary
+that runs (#13245 hostile-checkout boundary).
+
+**Compatibility carve-out (Design Answer j#76725 Q1).** Trusted resolution and a
+byte-invariant built-in argv cannot both hold — re-emitting the bare name after
+resolving would reintroduce the TOCTOU / PATH-substitution hole. The trust boundary
+wins: byte-invariance is narrowed to **every argv token except `argv[0]`**, plus default
+topology, provider order, CLI output, and behavior. Tests pin the *injected* resolver's
+absolute `argv[0]` plus the argv suffix, never a host path literal.
+
+### Honest limit
+
+A data profile absorbs a provider of an **existing** `protocol` family (the claude/codex
+interactive CLI-TUI shape). A provider with a genuinely different interaction protocol
+(different TUI, status semantics, turn-start behavior) still needs adapter code; the
+closed `InteractionProtocol` enum makes that boundary explicit, and an unknown protocol
+fails closed rather than mis-driving a pane. This is the same "Why Not Arbitrary Code
+Plugin Yet" posture as the rest of this document: no external plugin API, no third-party
+module load, no arbitrary script as a trusted provider.
+
+### Whole-plan preflight (the fail-closed boundary)
+
+Resolution is **not** lazy. `preflight_launch_providers` resolves EVERY provider that a
+run will launch — profile, protocol, capability, trusted executable, managed policy —
+before the first side effect (`workspace create` / `tab create` / `agent start`). Only
+`launch` plans are preflighted, so an adopt-only or dry-run session still needs no
+provider binary (byte-invariant).
+
+This is a hard requirement, not a nicety, and it was violated in the first cut (review
+R1-F1): resolving inside each slot's builder meant a `(codex, claude)` pair created the
+workspace, created the tab, and **started codex** before discovering claude's binary was
+missing — leaving a live agent in a partial lane. The permission-mode policy already held
+this invariant (j#73404); executable resolution now holds it too. The argv builder is pure
+and takes a pre-resolved `ResolvedProviderLaunch`, so it *cannot* fail after a sibling has
+started.
+
+**One snapshot, or the preflight is not whole (review R2-F1).** The `ResolvedProviderLaunch`
+must pin *everything* the builder consumes — the executable, the managed-policy tokens, AND
+every capability (e.g. `tool_shell_env_overrides`) — from the **same registry** the
+executable was resolved from. The first R1-F1 cut threaded the injected registry into
+executable resolution only; the managed policy (`permission_mode_argv`) and the builder's
+capability check re-read the *global* `AGENT_PROVIDER_PROFILES`. So a provider present only
+in an injected registry resolved an empty managed argv and then made the "pure" builder
+*raise* `unknown agent provider` — the builder was neither pure nor snapshot-consistent. A
+partial snapshot is not a whole-plan preflight: it silently works for built-ins (one global
+registry) and fails exactly for the data-only added provider the feature exists to support.
+The fix threads an optional `registry` through the policy resolvers and pins the capability
+on `ResolvedProviderLaunch`; the builder reads only `resolved`. A launch plan with no
+matching resolved entry, or an identity mismatch, fails closed at the composition root
+before the first side effect — never deferred to the builder. The regression that pins this
+passes **only** the injected registry (no global monkeypatch); patching both globals is what
+hid the split.
+
+### Managed flags are spelled by data, at every chokepoint
+
+The managed-flag concept (`permission_mode`) is core-owned; its **spelling** is profile
+data. Both launch chokepoints — the tmux command string and the herdr argv builder —
+resolve the spelling and the provider's applicability from the profile
+(`managed_permission_mode` capability), so renaming a flag in the packaged YAML moves
+every renderer with no source edit, and a capable new provider gets its own flag.
+
+The first cut only converted the herdr builder and left the tmux path with a literal
+`--permission-mode` and an `agent != "claude"` gate (review R1-F2), which meant a data
+rename silently moved one path and not the other. A partial conversion is worse than none:
+it makes the data *look* authoritative while the real launch ignores it.
+
+### Identity vocabulary is fail-closed
+
+A profile may not claim the core sentinel `unknown` (the resolvers' "no provider
+identified" outcome) as a `provider_id` or `discovery_alias`, may not claim a
+receiver-agnostic host process (`node` — both CLIs are Node programs, so it names a
+runtime, not a provider), and process names are **exact-one** across providers (a
+duplicate is a load-time error, like discovery aliases — otherwise the consumer map
+silently resolves last-wins). The built-in data happened to satisfy all three; that was a
+coincidence of the data, not an invariant, so it is enforced (review R1-F3).
+
+### Tests must not depend on a host provider binary
+
+Provider resolution reads the trusted environment, so a test that does not inject one
+resolves the *developer's* binary. That made the first cut's "full suite green" a
+host-dependent result while CI — which has no `claude` at all — was red on every matrix
+(review R1-F4). Every launch test now injects a hermetic executable + `PATH` (and blanks
+the trusted overrides, which beat `PATH`) via `tests/support/agent_provider_binaries.py`.
+The standing gate is: the suite must pass with **no provider binary on `PATH`** and with
+the trusted overrides poisoned.
+
+### Increment 1 scope
+
+In scope: the schema / packaged built-ins / loader / validator, the trusted executable
+resolver, the whole-plan preflight, and the bounded consumers (launch argv, managed
+reserved concepts, discovery vocabulary). Out of scope (a later increment): the handoff /
+status / doctor / retire consumer sweep, the `workflow_step_herdr` role-authority redesign
+(that stays #13583 `provider_binding` authority — a role is never derived from a provider
+profile), and default pair / topology assignment.
+
+### Increment 2A — the injected runtime snapshot (Redmine #13569)
+
+The Increment 1 consumers still each reached provider knowledge through the *global*
+built-in singleton (an import-time `agent_provider_ids()` call or a hard-coded
+`{"claude", "codex"}` literal). Increment 2A adds the seam the whole-plan-preflight lesson
+(R2-F1) demands one level up: a single injected value all consumers share.
+
+- **`AgentProviderRuntimeSnapshot`** (`e_110.../f_120_agent_discovery_pane_resolution/domain/`)
+  is a core-owned, frozen projection of ONE registry's *mechanical* vocabulary — provider
+  ids, command basenames, discovery-alias / process-owner maps, and the mechanical
+  launchability (protocol + interactive-TUI capability, the exact `require_launchable`
+  predicate). It carries no role, no `provider_binding`, no route, and no default topology.
+- **`build_runtime_snapshot(registry=…)`** (`e_140.../f_160_provider_registry/application/`)
+  is the one place that reads a registry and projects it, so the execution-platform
+  consumers never import the registry singleton. `BUILTIN_AGENT_PROVIDER_SNAPSHOT` is seeded
+  once from the packaged profiles and is every consumer's default.
+- The consumers — CLI `--agent` / `--to` / `--select-role` choices, `agent_discovery`,
+  `pane_resolver` (including the per-receiver strong-identity check), `target_selector`,
+  the handoff receiver vocabulary, and `herdr_target_resolution` — take an optional
+  injected `snapshot` (default `None` → built-in, byte-identical). A synthetic same-protocol
+  provider present only in an injected snapshot is recognized by all of them with **no
+  provider literal added to any consumer source and no global monkeypatch**.
+
+**Known vs expected (the split).** Registering a profile makes a provider *known /
+recognizable*, never *expected*. `status` / `doctor` / `launch` now classify observed
+windows against the **known** snapshot but judge *missing* / *ready* against the
+**expected** topology — the separate, deliberately literal default-pair contract
+(`default_agent_topology.DEFAULT_EXPECTED_AGENTS`, the single source `LAUNCH_PROVIDERS` and
+the tmux status/doctor "expected" judgment both reference). So a profile-only provider is
+recognizable yet never reported missing. For the built-in pair known == expected, so the
+split is byte-identical for the shipped providers.
+
+Still out of scope for 2A (Increment 2B): the `provider_binding`-aware project-gateway /
+delegated-route / sublane launch-dispatch-retire sweep. Unchanged in both increments: the
+`workflow_step_herdr` / `grandchild_stamp` durable role authority and the default topology
+(a role / default pair is never derived from a provider profile).
+
+### Increment 2B — binding-resolved runtime provider at the actuation sites (Redmine #13569)
+
+2A gave the consumers one *mechanical* snapshot. 2B rebinds the *runtime provider* the
+delegated-route / gateway / sublane actuation sites key on from a hard-coded literal onto
+the workflow role's `RoleProviderBinding` (#12673 / #13157) — the implementer (worker)
+role's provider, the coordinator (gateway) role's provider — so a rebind moves every
+actuation with no consumer literal, while the "gateway-via, worker-never-cross-boundary-direct"
+invariant is expressed in the *resolved* provider rather than the literal `claude`.
+
+The one rule (Coordinator Answer j#76969 correction 4), encoded once in
+`f_140.../application/workflow_provider_resolution.py`: no site writes
+`binding.provider_for(role) or PROVIDER_CLAUDE`. The default is carried by
+`RoleProviderBinding.default()`, so a `None` is a *genuinely unbound* role — an
+actuation-time fail-closed (`WorkflowProviderUnresolved` → zero-send), never a guessed
+literal. The built-in binding binds every role, so every default path is byte-identical.
+
+Binding-resolved sites: `main_lane_guard_gate` / `gateway_route_gate` (the worker-direct
+authority; silent fallback removed, unresolved → fail-closed), `sublane_worker_dispatcher`
++ its herdr ops (the `--to` receiver and readiness probe), `sublane_herdr_retire` (managed
+retire targets — `managed_providers` = the binding's gateway/worker pair), the
+`delegation_route_planner` route heads + the cross-boundary worker-direct guard,
+`route_identity_ledger` / `backend_neutral_resolver` / `delegation_route_executor` (the
+route re-resolution `expected_roles`), `delegation_launch_adopt` (the child-gateway landing
+role), and `target_selector` (the cross-workspace worker-direct refusal). Each takes the
+resolved provider as an explicit input with a built-in default.
+
+Deliberately NOT rebound (fence): the `sublane_lifecycle.GATEWAY_ROLE` / `WORKER_ROLE`
+slot-identity constants are shared with the `workflow_step_herdr` **durable role authority**
+(a role is never derived from a provider) and name the *launched* topology (fenced default
+`codex`/`claude`); the binding-*expected* provider is checked at the actuation sites above,
+so a binding whose worker ≠ the launched pane surfaces a `provider_mismatch` fail-closed
+rather than a silent rebind of the durable authority. The f_120 project-gateway `--to codex`
+machine-token gates stay as a compatibility layer (the binding authority is enforced in the
+f_140 layer, avoiding an f_120 → f_140 dependency inversion). `grandchild_stamp`,
+`workflow_step_herdr`, the default topology, provider-specific Claude/Codex policy, and the
+public notify aliases are unchanged.
+
+**R1 corrections (Redmine #13569 j#77142 / j#77145).** The first 2B cut built the
+binding-parameterizable *seams* but did not wire them end to end. The corrections:
+
+- *Composition-root single injection* — `build_parser` now builds ONE snapshot and threads
+  it through `compose_parser` to every provider-vocabulary registrar (a registrar opts in by
+  declaring a `snapshot` keyword), so the whole CLI surface's `--agent` / `--to` /
+  `--select-role` choices come from one injected snapshot; `status`'s known-provider
+  recognition takes an injected `known_providers` snapshot. The acceptance drives the *real*
+  parser composition with an injected registry — no global monkeypatch.
+- *Gateway-via keys on the exact gateway provider* — with the receiver vocabulary opened
+  (2A), "not the worker" no longer implies "the gateway", so `decide_gateway_route` allows the
+  governed head only for `receiver == gateway_provider` and blocks a third provider
+  (`governed_route_non_gateway_receiver`); `gateway_route_gate` threads the binding-resolved
+  gateway provider.
+- *Sublane launch is binding-aware and fails closed* — `cmd_sublane_start` preflights the
+  bound gateway/worker providers for launchability (unbound / unknown / non-launchable →
+  zero-start before any actuation); the coordinator → gateway dispatch and readiness probe
+  key on the binding gateway provider; the herdr lane launches the binding's provider slots
+  (not the fixed pair); the adopt replayable command uses the decision's gateway provider.
+- *Retire is pair-atomic* — a provider *substitution* at the lane's position (an expected
+  managed role missing while an unexpected provider is present) fails the whole retire closed
+  (zero close targets), never a partial close; a benign extra slot or partial liveness still
+  closes the surviving expected pair.
+- *Live callers thread the binding* — `select_semantic_target` resolves the worker provider
+  and passes it to `select_target`, so the cross-workspace worker-direct refusal keys on the
+  binding provider rather than the pure default.
+
+**R2 corrections (Redmine #13569 j#77190 / j#77200).** R1 wired the seams to the parser
+choices and leaf helpers, but not through to the runtime handlers, the herdr read-back, or
+the *target* repo's binding. The R2 corrections make the composition end-to-end and
+target-repo-authoritative:
+
+- *Snapshot reaches the runtime discovery, not only the parser* — the composition
+  `set_defaults(snapshot=…)` on the `agents` subparsers so the handler receives it via
+  `args.snapshot`; `commands_agents` / `ResolveAgentTargetsUseCase` / `LiveAgentDiscovery`
+  thread it into `discover_agents` (which classifies each pane by the injected vocabulary).
+  `agent_discovery` / `pane_resolver` no longer freeze an import-time vocabulary or import the
+  `e_140` registry at module level — the built-in fallback is read through the new
+  `agent_provider_vocab` leaf, and `AGENT_KINDS` / `AGENT_LABELS` are PEP-562 lazy module
+  attributes. (R2 still reached the registry from that leaf through five function-local reads;
+  R3-F2 below removes that dependency entirely.)
+- *Herdr read-back / projection recognize the launched pair* — `HerdrSublaneActuatorOps`'s
+  `_lane_slots` / `read_lane` and `project_herdr_sublanes` roster the binding-resolved
+  (gateway, worker) pair (the same pair `_launch_providers` launches), so a rebound lane is
+  read back by its own providers instead of being judged "no lane" against a fixed pair.
+- *Target-repo authority* — the gateway gate resolves the binding from `preflight_target.repo_root`
+  (the receiver's workspace), the semantic target selector resolves the worker provider from the
+  target `expected_repo`, and the launch preflight uses the composition-injected snapshot — so a
+  provider rebound in the TARGET workspace is the exact authority, and a cross-workspace third
+  provider cannot slip through on the sender's (default) binding.
+- *Retire is launchability-gated and per-unit* — the retire command boundary refuses to close
+  a lane whose bound provider is unknown / unlaunchable (zero-actuation), and the substitution
+  attestation is computed within the shared unit and the legacy twin SEPARATELY, so a provider
+  present in one unit can never mask a substitution in the other.
+- *No silent planner default reduction* — `delegation_route_planner.RouteRequest`'s gateway /
+  worker providers are required (keyword-only, no literal default), so a route plan can never
+  silently reduce to the built-in pair when a caller omits the binding.
+
+**R3 corrections (Redmine #13569 j#77298).** R2 was still entrance-only in two places:
+
+- *The sublane launch preflight now receives the injected snapshot from the REAL parser* —
+  R2-F2b taught `_sublane_start_provider_preflight_blocked` to key on an injected snapshot,
+  but the `sublane create` subparser only `set_defaults(func=…)`, never `snapshot=`, so
+  `cmd_sublane_start` always saw `args.snapshot is None` and fell back to the built-in
+  snapshot. `register_lifecycle` now `set_defaults(func=…, snapshot=snapshot)` on that
+  subparser (mirroring the `agents` subparsers), so a provider rebound only in the injected
+  registry is recognized as launchable instead of being misjudged unknown and zero-started.
+- *The e_110 discovery / pane-resolution domain no longer depends on the e_140 registry at
+  all* — the R2 `agent_provider_vocab` leaf moved the registry read from module level to five
+  *function-local* imports, which is still an `e_110 domain -> e_140 registry` edge and still
+  five separate caches. R3-F2 removes it: the leaf holds ONE core-owned
+  `AgentProviderRuntimeSnapshot` supplied by the composition. The `e_140` provider-registry
+  factory (the one place that reads the registry) calls `agent_provider_vocab.set_default_snapshot`
+  at its import — an `e_140 -> e_110` edge, the sanctioned direction — and the package
+  bootstrap (`mozyo_bridge/__init__`) imports that factory so the default is registered before
+  any consumer (even a module-level `from pane_resolver import AGENT_COMMANDS` frozen at
+  import) reaches the fallback. The `builtin_*` accessors are thin projections of that one
+  snapshot, so all fallback consumers share exactly the vocabulary the composition built. A
+  full-AST test pins that NO `e_140` import (module OR function-local) exists anywhere in the
+  `f_120` subtree.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

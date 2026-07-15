@@ -279,9 +279,9 @@ class CreateUseCaseTests(unittest.TestCase):
 class RetireUseCaseTests(unittest.TestCase):
     def _all_true(self):
         return RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True,
-            target_identity_known=True,
+            target_identity_known=True, latest_generation_admissible=True,
         )
 
     def test_clean_all_invariants_retire_ok(self):
@@ -302,6 +302,33 @@ class RetireUseCaseTests(unittest.TestCase):
         self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
         self.assertIn("dirty_worktree", outcome.preflight.decision.blocked_reasons)
 
+    def test_inadmissible_latest_generation_blocks_the_actual_retire(self):
+        # #13518 R3-F2: the ACTUAL CLI retire path (SublaneRetireUseCase -> decide_retire_integration)
+        # fences a stale/unclean latest review generation. Every other invariant satisfied, only the
+        # generation fence unsatisfied -> the retire integration is blocked (no default-True bypass).
+        assertions = RetireAssertions(
+            issue_closed=True, callbacks_drained=True,
+            verification_passed=True, durable_record_recorded=True, target_identity_known=True,
+            latest_generation_admissible=False,
+        )
+        outcome = SublaneRetireUseCase(FakeOps(git=True, dirty=False)).run(
+            issue="12955", lane_label="issue_12955_x", worktree_path="/wt",
+            branch="b", integration_branch=None, assertions=assertions,
+        )
+        self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
+        self.assertIn("stale_review_generation", outcome.preflight.decision.blocked_reasons)
+        self.assertFalse(outcome.preflight.may_retire)
+
+    def test_default_assertions_fail_closed_on_generation_fence(self):
+        # A retire with NO asserted generation admissibility fails closed on this fence too (the
+        # default RetireAssertions() is fully unsatisfied — the stale-generation reason is present).
+        outcome = SublaneRetireUseCase(FakeOps(git=True, dirty=False)).run(
+            issue="12955", lane_label="issue_12955_x", worktree_path="/wt",
+            branch="b", integration_branch=None, assertions=RetireAssertions(),
+        )
+        self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
+        self.assertIn("stale_review_generation", outcome.preflight.decision.blocked_reasons)
+
     def test_missing_invariants_block_fail_closed(self):
         outcome = SublaneRetireUseCase(FakeOps(git=True)).run(
             issue="12955", lane_label="issue_12955_x", worktree_path="/wt",
@@ -320,9 +347,9 @@ class RecordPathRedactionTests(unittest.TestCase):
 
     def _all_true(self):
         return RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True,
-            target_identity_known=True,
+            target_identity_known=True, latest_generation_admissible=True,
         )
 
     def test_list_text_shows_basename_json_keeps_abs(self):
@@ -371,6 +398,68 @@ class RecordPathRedactionTests(unittest.TestCase):
             if s["command"]
         ]
         self.assertTrue(any(_WT in c for c in commands))
+
+
+class LatestGenerationAdmissibleResolutionTest(unittest.TestCase):
+    """#13518 R3-F2: latest-generation admissibility for a retire is MEASURED at action-time from a
+    durable review observation (fence), else the operator assertion, else fail-closed."""
+
+    def _resolve(self, **over):
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            _resolve_latest_generation_admissible,
+        )
+
+        base = dict(review_generation_json=None, latest_generation_admissible=False)
+        base.update(over)
+        return _resolve_latest_generation_admissible(argparse.Namespace(**base))
+
+    def _write_obs(self, tmp, decisions):
+        import json
+
+        p = Path(tmp) / "reviewgen.json"
+        p.write_text(json.dumps({
+            "issue": "13518", "review_request_journal": "76004", "target_head": "0f548b7",
+            "decisions": decisions,
+        }), encoding="utf-8")
+        return str(p)
+
+    def test_no_source_and_no_flag_fails_closed(self):
+        self.assertFalse(self._resolve())
+
+    def test_operator_flag_asserts_when_no_source(self):
+        self.assertTrue(self._resolve(latest_generation_admissible=True))
+
+    def test_measured_admissible_from_clean_approved_generation(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._write_obs(t, [{"kind": "approval", "seq": 5}])
+            # The measurement OVERRIDES a False flag (measured beats asserted).
+            self.assertTrue(self._resolve(review_generation_json=obs, latest_generation_admissible=False))
+
+    def test_measured_inadmissible_when_unresolved_blocking_finding(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._write_obs(t, [
+                {"kind": "approval", "seq": 5},
+                {"kind": "finding", "seq": 6, "blocking": True, "disposition": "unresolved"},
+            ])
+            # Even with a True flag, the measured unclean latest generation fails closed.
+            self.assertFalse(self._resolve(review_generation_json=obs, latest_generation_admissible=True))
+
+    def test_measured_inadmissible_when_no_approval(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._write_obs(t, [{"kind": "finding", "seq": 6, "blocking": False}])
+            self.assertFalse(self._resolve(review_generation_json=obs))
+
+    def test_unreadable_source_fails_closed(self):
+        self.assertFalse(self._resolve(review_generation_json="/nonexistent/reviewgen.json",
+                                       latest_generation_admissible=True))
 
 
 if __name__ == "__main__":

@@ -45,6 +45,26 @@ completion criteria for beta and production distribution live here.
 - A stable-looking version such as `0.1.4` on TestPyPI is still an internal beta
   artifact unless production PyPI publish has explicitly been requested and
   completed.
+- Internal beta publication must not require promoting public history first.
+  The manual TestPyPI dispatch builds an exact reviewed candidate `source_sha`
+  from a `main`-fixed workflow and does NOT require an `origin/main` push or a
+  Redmine Version close as a precondition (Redmine #13601). This breaks the
+  `Version close -> origin/main -> TestPyPI -> #13528/#13527 -> Version close`
+  cycle: the `main`-only publication checkpoint still gates public-history
+  promotion, but internal beta distribution is decoupled from it.
+- The manual dispatch is gated fail-closed on the exact candidate: the 40-hex
+  `source_sha`, its `expected_version` mirror match, a candidate
+  `.github/workflows/test.yml` byte-identical to trusted `origin/main` (so a
+  candidate cannot weaken its own Test workflow to fake a green run), a
+  successful `Test` CI run for that SHA, an unused TestPyPI version (a payload
+  lacking the `releases` object or an unreachable lookup fails closed), and an
+  origin `source_ref` that resolves to exactly one named ref whose tip is the
+  SHA. Trusted Publishing credentials (`id-token: write` + `environment:
+  testpypi`) live only in the artifact-download+publish job, separate from
+  checkout/build/verify.
+- Order the internal-beta steps as #13528 (TestPyPI publish) then #13527 (exact
+  install QA); the install QA runs against the published exact version, not a
+  floating `main` install.
 
 ## Production Distribution
 

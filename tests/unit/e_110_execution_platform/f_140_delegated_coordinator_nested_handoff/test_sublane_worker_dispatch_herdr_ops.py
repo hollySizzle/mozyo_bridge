@@ -35,7 +35,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveWorkerDispatchOps,
     WorkerDispatchOps,
     WorkerDispatchUseCase,
+    _replayable_command,
     _resolve_worker_dispatch_ops,
+    _worker_dispatch_argv,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     ACTUATE_BLOCKED,
@@ -48,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     lane_identity_matches,
 )
 
+from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
 from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_sublane_actuator_herdr_ops import (  # noqa: E501
     HERDR_ENV,
     _fake_binary,
@@ -68,7 +71,7 @@ class _HerdrLaneFixture:
         self.worktree = Path(tmp) / "lane-wt"
         self.worktree.mkdir(exist_ok=True)
         binpath = _fake_binary(tmp)
-        self.env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(self.home)}
+        self.env = with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(self.home)})
 
     def stand_up_lane(self) -> None:
         actuator = HerdrSublaneActuatorOps(
@@ -200,6 +203,12 @@ class DispatchContainmentTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--target") + 1], "wC:p3")
         self.assertFalse(argv[argv.index("--target") + 1].startswith("%"))
         self.assertEqual(argv[argv.index("--target-repo") + 1], "auto")
+        # Redmine #13485: the herdr worker dispatch pins the explicit lane authority so
+        # the route authority resolves the stable `(workspace, lane_label, claude)`
+        # identity, not the sender-derived lane. Placed with the target coordinates,
+        # before `--mode` (mirrors the gateway dispatch's `--target-lane`).
+        self.assertEqual(argv[argv.index("--target-lane") + 1], LANE_LABEL)
+        self.assertLess(argv.index("--target-lane"), argv.index("--mode"))
         self.assertEqual(argv[argv.index("--mode") + 1], "queue-enter")
         self.assertEqual(
             argv[argv.index("--role-profile") + 1], "implementation_worker"
@@ -224,6 +233,126 @@ class DispatchContainmentTests(unittest.TestCase):
         )
         self.assertEqual(rc, 1)
         self.assertEqual(out, "")
+
+
+class TargetLanePinArgvTests(unittest.TestCase):
+    """Redmine #13485: `--target-lane` pins the worker's stable lane identity on the
+    herdr rail; the tmux path (no `target_lane`) stays byte-for-byte the prior shape."""
+
+    _BASE = dict(
+        issue=ISSUE,
+        journal="73381",
+        worker_pane="wC:p3",
+        lane_label=LANE_LABEL,
+        gateway_callback_target="wC:p2",
+        target_repo="auto",
+    )
+
+    def test_tmux_argv_omits_target_lane_byte_invariant(self):
+        # The tmux `LiveWorkerDispatchOps` default (`target_lane=None`) must never emit
+        # `--target-lane`: the tmux worker addresses an explicit `%pane` and never rides
+        # the herdr lane-derivation rail.
+        argv = _worker_dispatch_argv(**self._BASE)
+        self.assertNotIn("--target-lane", argv)
+        # The exact pre-#13485 tmux shape (also the `repo_root=None` tmux default).
+        self.assertEqual(
+            argv,
+            [
+                "handoff", "send",
+                "--to", "claude",
+                "--source", "redmine",
+                "--issue", ISSUE,
+                "--journal", "73381",
+                "--kind", "implementation_request",
+                "--target", "wC:p3",
+                "--target-repo", "auto",
+                "--mode", "queue-enter",
+                "--role-profile", "implementation_worker",
+                "--profile-field", f"lane={LANE_LABEL}",
+                "--profile-field", "gateway_callback_target=wC:p2",
+            ],
+        )
+
+    def test_target_lane_pins_explicit_lane_before_mode(self):
+        argv = _worker_dispatch_argv(**self._BASE, target_lane=LANE_LABEL)
+        self.assertEqual(argv[argv.index("--target-lane") + 1], LANE_LABEL)
+        # Grouped with the target coordinates: after `--target-repo`, before `--mode`.
+        self.assertLess(argv.index("--target-repo"), argv.index("--target-lane"))
+        self.assertLess(argv.index("--target-lane"), argv.index("--mode"))
+
+    def test_empty_target_lane_is_omitted(self):
+        # A blank/None lane is never emitted as an empty `--target-lane` token.
+        self.assertNotIn("--target-lane", _worker_dispatch_argv(**self._BASE, target_lane=""))
+        self.assertNotIn(
+            "--target-lane", _worker_dispatch_argv(**self._BASE, target_lane=None)
+        )
+
+
+class ReplayCommandAuthorityTests(unittest.TestCase):
+    """Redmine #13485 review F1: the outcome / dry-run `command` (a *replayable* retry
+    command) must carry the same stable-lane authority the actual herdr dispatch pins, so
+    replaying it re-resolves the stable slot — never the sender-derived lane. tmux
+    unchanged."""
+
+    _BASE = dict(
+        issue=ISSUE,
+        journal="73381",
+        worker_pane="wC:p3",
+        lane_label=LANE_LABEL,
+        gateway_callback_target="wC:p2",
+        target_repo="auto",
+    )
+
+    def test_tmux_replay_command_carries_no_pins(self):
+        # No pins (tmux `LiveWorkerDispatchOps` default) -> byte-for-byte the prior command.
+        cmd = _replayable_command(**self._BASE)
+        self.assertNotIn("--target-lane", cmd)
+        self.assertNotIn("--repo", cmd)
+        self.assertTrue(cmd.startswith("mozyo-bridge handoff send "))
+
+    def test_herdr_replay_command_carries_lane_and_repo_pins(self):
+        cmd = _replayable_command(
+            **self._BASE, target_lane=LANE_LABEL, repo_root="/wt/13485"
+        )
+        self.assertIn(f"--target-lane {LANE_LABEL}", cmd)
+        # The #13397 `--repo` pin precedes the `handoff` subcommand.
+        self.assertTrue(cmd.startswith("mozyo-bridge --repo /wt/13485 handoff send "))
+
+    def test_herdr_ops_supplies_lane_and_repo_pins(self):
+        ops = HerdrWorkerDispatchOps(
+            repo_root=Path("/wt/13485"), lane_label=LANE_LABEL, issue=ISSUE
+        )
+        pins = ops.command_authority_pins()
+        self.assertEqual(pins["target_lane"], LANE_LABEL)
+        self.assertEqual(pins["repo_root"], "/wt/13485")
+
+    def test_tmux_ops_has_no_pins_capability(self):
+        # The optional capability is absent on the tmux adapter, so the use case reads {}.
+        self.assertFalse(
+            hasattr(LiveWorkerDispatchOps(repo_root=Path(".")), "command_authority_pins")
+        )
+
+    def test_herdr_dry_run_outcome_command_carries_pins_end_to_end(self):
+        # The true wiring: use case -> ops.command_authority_pins() -> outcome.command.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _HerdrLaneFixture(tmp)
+            request = WorkerDispatchRequest(
+                issue=ISSUE,
+                lane_label=LANE_LABEL,
+                worktree_path=str(fx.worktree),
+                journal="73381",
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(fx.home)}, clear=False
+            ):
+                fx.stand_up_lane()
+                outcome = WorkerDispatchUseCase(
+                    fx.ops(), worker_ready_probes=0
+                ).run(request, execute=False)
+        self.assertIn(f"--target-lane {LANE_LABEL}", outcome.command)
+        self.assertIn("--repo", outcome.command)
+        # And the replayed command's argv is exactly what the herdr adapter drives.
+        self.assertIn("handoff send", outcome.command)
 
 
 class BackendSelectorTests(unittest.TestCase):

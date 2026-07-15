@@ -32,6 +32,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     BLOCKED_DIRTY_WORKTREE,
+    BLOCKED_DURABLE_RECORD_MISSING,
+    INTEGRATION_STALE_REVIEW_GENERATION,
     BLOCKED_MERGE_CONFLICT,
     INTEGRATION_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
@@ -89,9 +91,9 @@ def _ok_invariants() -> RetireInvariants:
         target_identity_known=True,
         verification_passed=True,
         issue_closed=True,
-        owner_approval_present=True,
         callbacks_drained=True,
         durable_record_recorded=True,
+        latest_generation_admissible=True,  # R4-F3: fail-closed default -> must assert explicitly
     )
 
 
@@ -151,6 +153,49 @@ class RetireUseCaseTest(unittest.TestCase):
         self.assertTrue(decision.merge_performed)
         self.assertTrue(ops.merge_called)
 
+    def test_stale_review_generation_blocks_integration_before_merge(self) -> None:
+        # #13518 review R2-F7: an inadmissible latest review generation (a stale approval / an
+        # unresolved blocking finding) fences integration BEFORE any git probe or merge.
+        ops = FakeGitOperations(git=True)
+        use_case = SublaneIntegrationUseCase(
+            operations=ops, policy=SublaneIntegrationPolicy.default()
+        )
+        invariants = RetireInvariants(
+            target_identity_known=True, verification_passed=True, issue_closed=True,
+            callbacks_drained=True, durable_record_recorded=True,
+            latest_generation_admissible=False,
+        )
+        decision = use_case.evaluate_retire(invariants=invariants)
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
+        self.assertFalse(ops.merge_called)  # no merge on a stale generation
+
+    def test_omitted_generation_invariant_blocks_fail_closed(self) -> None:
+        # #13518 R4-F3: the programmatic use case's RetireInvariants defaults the generation fence to
+        # UNSATISFIED (fail-closed) — a caller that omits it (every other invariant satisfied) is
+        # blocked, never default-admitted. No merge is attempted on the stale generation.
+        ops = FakeGitOperations(git=True)
+        use_case = SublaneIntegrationUseCase(
+            operations=ops, policy=SublaneIntegrationPolicy.default()
+        )
+        invariants = RetireInvariants(
+            target_identity_known=True, verification_passed=True, issue_closed=True,
+            callbacks_drained=True, durable_record_recorded=True,
+            # latest_generation_admissible omitted -> fail-closed default
+        )
+        decision = use_case.evaluate_retire(invariants=invariants)
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(INTEGRATION_STALE_REVIEW_GENERATION, decision.blocked_reasons)
+        self.assertFalse(ops.merge_called)
+
+    def test_explicit_admissible_generation_retires_ok(self) -> None:
+        # With the generation invariant explicitly asserted True (and all others), retire is OK.
+        ops = FakeGitOperations(git=True)
+        use_case = SublaneIntegrationUseCase(
+            operations=ops, policy=SublaneIntegrationPolicy.default()
+        )
+        self.assertEqual(use_case.evaluate_retire(invariants=_ok_invariants()).state, RETIRE_OK)
+
     def test_dirty_worktree_blocks_before_merge(self) -> None:
         ops = FakeGitOperations(git=True, dirty=True)
         use_case = SublaneIntegrationUseCase(
@@ -168,15 +213,16 @@ class RetireUseCaseTest(unittest.TestCase):
             target_identity_known=True,
             verification_passed=True,
             issue_closed=True,
-            owner_approval_present=False,  # owner approval missing
             callbacks_drained=True,
-            durable_record_recorded=True,
+            durable_record_recorded=False,  # a config-undisableable invariant is missing
+            latest_generation_admissible=True,
         )
         use_case = SublaneIntegrationUseCase(
             operations=ops, policy=SublaneIntegrationPolicy.default()
         )
         decision = use_case.evaluate_retire(invariants=invariants)
         self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(BLOCKED_DURABLE_RECORD_MISSING, decision.blocked_reasons)
         self.assertFalse(ops.merge_called)
 
     def test_merge_conflict_redecides_to_blocked(self) -> None:

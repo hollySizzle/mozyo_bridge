@@ -35,12 +35,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_GATEWAY_NOTIFIED,
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
+    REASON_PAIR_SPLIT,
     REASON_PANE_CREATE_FAILED,
     STEP_BLOCKED,
     STEP_EXECUTED,
     STEP_SKIPPED,
     ActuationStep,
     SublaneActuationOutcome,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+    SUBLANE_STATE_PAIR_SPLIT,
 )
 
 
@@ -141,6 +145,37 @@ def heal_and_retry_dispatch(
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
         )
+    # Redmine #13705 R1-F2: a healed lane whose pair is split across tabs / workspaces
+    # is not operable. The herdr `heal_lane_column` same-tab postcondition already fails
+    # closed on a split relaunch (so this is defense-in-depth for read-backs the adapter
+    # cannot itself verify), but never dispatch to a `pair_split` healed lane.
+    if healed_lane.state == SUBLANE_STATE_PAIR_SPLIT:
+        steps.append(
+            ActuationStep(
+                order=6,
+                title="relaunch lane column (self-heal)",
+                status=STEP_BLOCKED,
+                detail=f"healed lane gateway {healed_lane.gateway_pane} and worker "
+                f"{healed_lane.worker_pane} are split across tabs / workspaces "
+                "(state=pair_split); refusing to dispatch to a non-operable pair",
+                command=None,
+            )
+        )
+        return use_case._blocked(
+            request,
+            launch_action=launch.action,
+            reason="healed lane is a split gateway/worker pair (pair_split); "
+            "fail-closed before the dispatch retry (retire + recreate, no heal-over)",
+            reasons=(REASON_HANDOFF_FAILED, REASON_PAIR_SPLIT),
+            dispatch=dispatch,
+            steps=tuple(steps),
+            gateway_pane=healed_lane.gateway_pane,
+            worker_pane=healed_lane.worker_pane,
+            adopted=adopted,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+            gateway_ready=gateway_ready,
+        )
     if not use_case._identity_matches(healed_lane, request):
         steps.append(
             ActuationStep(
@@ -218,7 +253,7 @@ def heal_and_retry_dispatch(
             journal=(request.journal or ""),
             gateway_pane=gateway_pane or "",
             lane_label=request.lane_label,
-            upstream_coordinator=request.upstream_coordinator,
+            upstream_coordinator=request.resolved_upstream_coordinator(),
             target_repo=target_repo,
         )
     except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.

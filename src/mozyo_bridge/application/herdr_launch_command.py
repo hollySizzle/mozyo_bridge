@@ -65,9 +65,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-    PROVIDER_CLAUDE,
-    PROVIDER_CODEX,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import (
+    DEFAULT_EXPECTED_AGENTS,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
@@ -82,8 +81,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 # --- Pure policy: attach hint, ready flag, JSON payload, text block. ----------
 
 #: The provider slots bare ``mozyo`` prepares — one herdr agent per provider,
-#: matching the tmux path's ``claude`` + ``codex`` windows.
-LAUNCH_PROVIDERS: tuple[str, ...] = (PROVIDER_CLAUDE, PROVIDER_CODEX)
+#: matching the tmux path's ``claude`` + ``codex`` windows. Sourced from the single
+#: canonical default-topology contract (Redmine #13569) so the herdr launch pair and
+#: the tmux status/doctor "expected" judgment can never drift.
+LAUNCH_PROVIDERS: tuple[str, ...] = DEFAULT_EXPECTED_AGENTS
 
 
 def herdr_attach_command_line(binary: str) -> str:
@@ -255,14 +256,20 @@ class LiveHerdrLaunchOps:
             load_repo_local_config,
         )
 
-        agent_launch = load_repo_local_config(repo_root).agent_launch
+        # Config-driven pane placement (Redmine #13646): the bare `mozyo` coordinator pair
+        # is the `default` lane_class, so the config's `lane_placement.default` split /
+        # order decides the pair's geometry (e.g. `split: down` for the owner's vertical
+        # main window) and which provider occupies first. Unconfigured repos keep the herdr
+        # server default placement and the requested provider order, byte-for-byte.
+        repo_config = load_repo_local_config(repo_root)
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
             lane_id="",
             env=self._env,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-            agent_launch=agent_launch,
+            agent_launch=repo_config.agent_launch,
+            lane_placement=repo_config.lane_placement,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:

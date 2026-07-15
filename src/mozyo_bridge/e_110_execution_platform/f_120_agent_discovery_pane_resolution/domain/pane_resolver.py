@@ -15,6 +15,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     infer_repo_root,
     resolve_agent_role,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     pane_lines,
@@ -26,12 +29,31 @@ from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import READ_MARK_PREFIX, normalize_path_unicode
 
 
-AGENT_PROCESSES = {"claude", "codex", "node"}
-AGENT_COMMANDS = {
-    "claude": "claude",
-    "codex": "codex",
-}
-AGENT_LABELS = frozenset(AGENT_COMMANDS)
+# Provider vocabulary is read LAZILY through `agent_provider_vocab`, never frozen at import
+# and never a module-level `e_110 domain -> e_140 registry` edge (Redmine #13569 R2-F1 — both
+# forbidden by j#76969). `AGENT_COMMANDS` maps a provider label to its command *basename*
+# (the executable a launch execs is the verified absolute realpath resolved at the launch
+# chokepoint, never this basename). `node` stays a receiver-agnostic host runtime (both CLIs
+# are node-based) — process detection, not the registry (handled by the vocab accessor).
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_vocab import (  # noqa: E402
+    builtin_agent_commands as _builtin_agent_commands,
+    builtin_agent_processes as _builtin_agent_processes,
+    builtin_process_owners as _builtin_process_owners,
+)
+
+
+def __getattr__(name: str):
+    """Lazy module attributes (PEP 562, Redmine #13569 R2-F1): ``AGENT_COMMANDS`` /
+    ``AGENT_LABELS`` / ``AGENT_PROCESSES`` are the built-in vocabulary computed on first
+    access rather than frozen at import — existing importers get the same values, with no
+    import-time freeze and no module-level ``e_140`` import."""
+    if name == "AGENT_COMMANDS":
+        return _builtin_agent_commands()
+    if name == "AGENT_LABELS":
+        return frozenset(_builtin_agent_commands())
+    if name == "AGENT_PROCESSES":
+        return _builtin_agent_processes()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 # Pseudo-target label (Redmine #12015): resolves to the sender workspace's main
 # coordinator Codex (the default-lane Codex), so a sublane can call back the
 # coordinator without hand-picking its `%pane`. Not an `AGENT_LABELS` member —
@@ -388,7 +410,7 @@ def same_lane_receiver_duplicates(
     Codex gateway pane (role=codex) is not mistaken for a duplicate Claude
     receiver.
     """
-    if receiver not in AGENT_LABELS:
+    if receiver not in _builtin_agent_commands():
         return []
     target_id = target.get("id")
     target_identity = _pane_lane_identity(target)
@@ -737,7 +759,9 @@ def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | Non
     return find_agent_window(agent, session)
 
 
-def resolve_target(target: str) -> str:
+def resolve_target(
+    target: str, *, snapshot: AgentProviderRuntimeSnapshot | None = None
+) -> str:
     """Resolve a CLI ``--target`` to a tmux pane id (`%n`).
 
     Every branch returns a pane id: downstream consumers (notably
@@ -784,11 +808,12 @@ def resolve_target(target: str) -> str:
             )
         )
         raise AssertionError("unreachable")
-    if target not in AGENT_LABELS:
+    labels = frozenset(_builtin_agent_commands()) if snapshot is None else snapshot.provider_ids
+    if target not in labels:
         die(
             f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
             "location (`session:window.pane`), an agent label "
-            f"({', '.join(sorted(AGENT_LABELS))}), or `{COORDINATOR_LABEL}` "
+            f"({', '.join(sorted(labels))}), or `{COORDINATOR_LABEL}` "
             "(the sender workspace's main coordinator pane)."
         )
     session = current_session_name()
@@ -817,12 +842,21 @@ def pane_info(target: str) -> dict[str, str]:
     raise AssertionError("unreachable")
 
 
-def is_agent_process(command: str) -> bool:
+def is_agent_process(
+    command: str, *, snapshot: AgentProviderRuntimeSnapshot | None = None
+) -> bool:
     name = Path(command or "").name
-    return name in AGENT_PROCESSES or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
+    known = _builtin_agent_processes() if snapshot is None else None
+    is_known = name in known if known is not None else snapshot.is_agent_process(name)
+    return is_known or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
 
 
-def is_receiver_agent_process(command: str, receiver: str) -> bool:
+def is_receiver_agent_process(
+    command: str,
+    receiver: str,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> bool:
     """Per-receiver foreground process check for the relaxed `queue-enter` rail.
 
     Stricter than :func:`is_agent_process`. The contract
@@ -852,9 +886,15 @@ def is_receiver_agent_process(command: str, receiver: str) -> bool:
     name = Path(command or "").name
     if not name:
         return False
-    if receiver == "claude" and name == "claude":
-        return True
-    if receiver == "codex" and name == "codex":
+    # Strong identity: the foreground basename is a provider-owned process AND its
+    # owning provider IS the named receiver. Registry/snapshot-derived (Redmine
+    # #13569 Increment 2A) rather than a hard-coded `claude`/`codex` pair, so a
+    # synthetic same-protocol provider is recognized and cross-binding stays fully
+    # detectable (a `codex` process for receiver=`claude` still returns False). For
+    # the built-in providers the process basename equals the provider id, so this is
+    # byte-identical to the previous literal check.
+    owners = _builtin_process_owners() if snapshot is None else snapshot.process_owners()
+    if owners.get(name) == receiver:
         return True
     # Weak identity branch: `node` literal and versioned native binary
     # basenames are receiver-agnostic. See docstring; do not pretend either

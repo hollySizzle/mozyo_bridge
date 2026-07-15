@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 from support.herdr_fake import FakeHerdr  # noqa: E402
+from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
@@ -58,7 +59,7 @@ class SharedFakeDrivesSublaneOpsTest(unittest.TestCase):
         coord = Path(tmp) / "coord"
         coord.mkdir(exist_ok=True)
         binpath = _fake_binary(tmp)
-        env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+        env = with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)})
         ops = HerdrSublaneActuatorOps(
             repo_root=coord,
             lane_label="issue_13407_x",
@@ -109,7 +110,12 @@ class SharedFakeDrivesSublaneOpsTest(unittest.TestCase):
                 ops.append_lane_column(str(worktree))
         by_provider = {}
         for argv in fake.start_argvs:
-            provider = argv[argv.index("--") + 1]
+            # argv[0] is the resolved absolute executable (#13441), not the label.
+            argv0 = argv[argv.index("--") + 1]
+            provider = next(
+                (p for p in ("claude", "codex") if argv0 == provider_bin_path(p)),
+                argv0,
+            )
             by_provider[provider] = argv
         self.assertIn("--permission-mode", by_provider["claude"])
         self.assertEqual(

@@ -53,8 +53,10 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
-    AGENT_LABELS,
     is_agent_process,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import (
+    DEFAULT_EXPECTED_AGENTS,
 )
 
 
@@ -135,7 +137,12 @@ def evaluate_tmux_section(view: dict[str, Any]) -> dict[str, Any]:
         else []
     )
 
-    for agent in sorted(AGENT_LABELS):
+    # Judge the EXPECTED topology, not the full registry (Redmine #13569 known-vs-
+    # expected split): doctor verifies each agent the session is expected to run has a
+    # healthy window; a profile-only provider that is recognizable but not part of the
+    # default launch pair is never flagged missing. Built-in expected == known, so this
+    # is byte-identical for the shipped providers.
+    for agent in sorted(DEFAULT_EXPECTED_AGENTS):
         window_panes = [pane for pane in session_panes if pane.get("window_name") == agent]
         window_indexes = {
             (pane.get("location") or "").split(":", 1)[1].split(".", 1)[0]

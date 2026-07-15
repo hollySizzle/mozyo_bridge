@@ -36,16 +36,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     main_lane_implementation_request_blocked,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
-    load_workflow_binding,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
-    PROVIDER_CLAUDE,
-    PROVIDER_CODEX,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
-    ROLE_COORDINATOR,
-    ROLE_IMPLEMENTER,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    resolve_gateway_provider,
+    resolve_worker_provider,
 )
 
 
@@ -54,28 +47,25 @@ def resolve_implementer_provider(repo_root: Optional[str] = None) -> str:
 
     Loads the repo-local role->provider binding (a missing config / block is the
     behavior-preserving default codex/claude map) and returns the provider bound to the
-    implementer role. Under the default binding this is ``claude``; a broken config
-    fails closed through the loader's ``RepoLocalConfigError``. Falls back to
-    :data:`PROVIDER_CLAUDE` only in the impossible case of an unbound implementer (the
-    default always binds it), so the guard never keys on an empty provider.
+    implementer role. Under the default binding this is ``claude``. A broken config fails
+    closed through the loader's ``RepoLocalConfigError``; a genuinely unbound implementer
+    raises :class:`~...workflow_provider_resolution.WorkflowProviderUnresolved` rather than
+    silently defaulting to a literal (Redmine #13569 j#76969 correction 4).
     """
-    binding, _warnings = load_workflow_binding(repo_root)
-    return binding.provider_for(ROLE_IMPLEMENTER) or PROVIDER_CLAUDE
+    return resolve_worker_provider(repo_root)
 
 
 def resolve_coordinator_provider(repo_root: Optional[str] = None) -> str:
     """The runtime provider bound to the coordinator role for ``repo_root`` (fail-closed).
 
     The `coordinator` pseudo-target / callback resolution counterpart of
-    :func:`resolve_implementer_provider` (Redmine #13174 j#72023): loads the repo-local
-    role->provider binding and returns the provider bound to the coordinator role.
-    Under the default binding this is ``codex`` — byte-identical to the pre-#13174
-    resolution — and a broken config fails closed through the loader's
-    ``RepoLocalConfigError``. Falls back to :data:`PROVIDER_CODEX` only in the
-    impossible case of an unbound coordinator (the default always binds it).
+    :func:`resolve_implementer_provider` (Redmine #13174 j#72023). Under the default
+    binding this is ``codex`` — byte-identical to the pre-#13174 resolution. A broken
+    config fails closed through the loader's ``RepoLocalConfigError``; a genuinely unbound
+    coordinator raises :class:`~...workflow_provider_resolution.WorkflowProviderUnresolved`
+    rather than silently defaulting to a literal (Redmine #13569 j#76969 correction 4).
     """
-    binding, _warnings = load_workflow_binding(repo_root)
-    return binding.provider_for(ROLE_COORDINATOR) or PROVIDER_CODEX
+    return resolve_gateway_provider(repo_root)
 
 
 def main_lane_guard_blocked(

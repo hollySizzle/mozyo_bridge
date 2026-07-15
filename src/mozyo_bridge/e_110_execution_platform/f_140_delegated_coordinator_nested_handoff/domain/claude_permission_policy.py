@@ -32,6 +32,15 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    provider_managed_flag,
+    provider_supports,
+)
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
+    AgentCapability,
+    ManagedFlagConcept,
+)
+
 # The #11857 opt-in / override env var. Kept as a compatibility + explicit
 # override rail, NOT the only source of truth (#11924 owner decision j#58208).
 CLAUDE_PERMISSION_MODE_ENV = "MOZYO_CLAUDE_PERMISSION_MODE"
@@ -73,6 +82,7 @@ def resolve_claude_permission_mode(
     *,
     policy_default: str | None = None,
     env: Mapping[str, str] | None = None,
+    registry=None,
 ) -> str | None:
     """Resolve the effective Claude permission mode for a launch, or ``None``.
 
@@ -81,8 +91,20 @@ def resolve_claude_permission_mode(
 
     Raises :class:`InvalidPermissionMode` when the env override or the
     supplied ``policy_default`` is a non-empty, unrecognized value.
+
+    Applicability is **data-driven** (Redmine #13441 R1-F2): a provider gets a mode
+    iff its profile declares the ``managed_permission_mode`` capability — not because
+    it is literally named ``claude``. An unregistered label declares nothing, so it
+    resolves to ``None`` exactly as a non-Claude agent did before.
+
+    ``registry`` overrides the global built-in profile set (Redmine #13441 R2-F1): the
+    launch preflight passes its snapshot so a provider present only in an injected
+    registry resolves its mode from the SAME registry the executable came from. Every
+    other caller (the tmux chokepoint, ``doctor``) passes ``None`` and reads the global.
     """
-    if agent != "claude":
+    if not provider_supports(
+        agent, AgentCapability.MANAGED_PERMISSION_MODE, registry=registry
+    ):
         return None
 
     if env is None:
@@ -111,24 +133,60 @@ def resolve_claude_permission_mode(
     return policy_default
 
 
+def permission_mode_argv(
+    agent: str,
+    *,
+    policy_default: str | None = None,
+    env: Mapping[str, str] | None = None,
+    registry=None,
+) -> tuple[str, ...]:
+    """The managed permission-mode argv tokens for ``agent``, or ``()``.
+
+    The **flag spelling comes from the provider's profile** (Redmine #13441 R1-F2),
+    so renaming it in the packaged data moves every renderer — the tmux chokepoint and
+    the herdr builder alike — with no source edit. Previously this module hard-coded the
+    literal ``--permission-mode``, which meant a data rename silently moved only the
+    herdr path and left tmux launching the old flag.
+
+    ``registry`` overrides the global built-in profile set (Redmine #13441 R2-F1): the
+    launch preflight passes its snapshot so BOTH the applicability check and the flag
+    spelling read the same registry the executable was resolved from — otherwise a
+    provider present only in an injected registry resolves an empty managed argv.
+
+    Returns ``()`` when the provider declares no managed permission concept, when no
+    mode resolves, or when the provider is unregistered.
+    """
+    mode = resolve_claude_permission_mode(
+        agent, policy_default=policy_default, env=env, registry=registry
+    )
+    if not mode:
+        return ()
+    flag = provider_managed_flag(
+        agent, ManagedFlagConcept.PERMISSION_MODE, registry=registry
+    )
+    if not flag:
+        # Capability without a spelling is rejected at profile load, so this is
+        # unreachable for a registered provider; stay defensive rather than render a
+        # flagless mode token that would be parsed as a positional argument.
+        return ()
+    return (flag, mode)
+
+
 def permission_mode_flag(
     agent: str,
     *,
     policy_default: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """`` --permission-mode <mode>`` suffix for a managed pane, or ``""``.
+    """The managed permission-mode suffix (leading space) for a shell command, or ``""``.
 
-    Thin wrapper over :func:`resolve_claude_permission_mode` that renders the
-    flag (with a leading space) so the launch chokepoint can concatenate it
-    directly onto the agent command.
+    The shell-string rendering of :func:`permission_mode_argv`, for the tmux launch
+    chokepoint which concatenates a command string. The flag spelling is profile data.
     """
-    mode = resolve_claude_permission_mode(
-        agent, policy_default=policy_default, env=env
-    )
-    if not mode:
+    tokens = permission_mode_argv(agent, policy_default=policy_default, env=env)
+    if not tokens:
         return ""
-    return f" --permission-mode {mode}"
+    return " " + " ".join(tokens)
 
 
 def describe_launch_policy(

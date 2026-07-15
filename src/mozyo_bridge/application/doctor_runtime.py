@@ -78,7 +78,19 @@ SOURCE_PROBE_MARKERS = {
     # Redmine #12597: the queue-enter opt-out flag on `handoff send`. Anchored on
     # the quoted flag literal as it appears in the `add_argument` registration.
     "no_target_activation": '"--no-target-activation"',
+    # Redmine #13411 / #13705: the herdr same-tab lane-placement heal contract.
+    # Anchored on the tab-target resolver definition. An installed runtime lacking
+    # this behavior (the measured 0.10.0 skew) would split a lane's gateway/worker
+    # pair; the mutation front door reads this probe to refuse a placement action
+    # from a runtime the repo-local source has out-drifted (see
+    # `evaluate_mutation_placement_gate`).
+    "same_tab_pair_placement": "def _tab_target_for_lane",
 }
+
+#: The feature probe key naming the herdr same-tab lane-placement heal contract
+#: (Redmine #13411). The mutating `sublane start/heal` front door blocks when the
+#: active runtime lacks this behavior the repo-local source ships (Redmine #13705).
+PLACEMENT_PROBE_KEY = "same_tab_pair_placement"
 
 # The diagnostic module's own filename, excluded from the source scan so its
 # marker definitions cannot self-satisfy the source probe (Redmine #12612 j#65856).
@@ -191,12 +203,62 @@ def _probe_active_no_target_activation() -> bool:
     return "--no-target-activation" in options
 
 
+def _probe_active_same_tab_pair() -> bool:
+    """Live probe: does the loaded package expose the #13411 same-tab placement contract.
+
+    True when the herdr lane-topology module carries ``_tab_target_for_lane`` — the
+    resolver that rejoins a heal to the surviving slot's tab (Redmine #13411). A stale
+    installed runtime that predates #13411 (the measured 0.10.0 skew) answers False.
+    """
+    try:
+        module = importlib.import_module(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_lane_topology"
+        )
+    except Exception:
+        return False
+    return hasattr(module, "_tab_target_for_lane")
+
+
 def _active_feature_probes() -> dict[str, bool]:
     """Probe the *active* loaded package for each gate-critical behavior."""
     return {
         "standard_target_admission": _probe_active_standard_target_admission(),
         "no_target_activation": _probe_active_no_target_activation(),
+        "same_tab_pair_placement": _probe_active_same_tab_pair(),
     }
+
+
+def evaluate_mutation_placement_gate(fingerprint: dict[str, Any]) -> tuple[bool, str]:
+    """Whether a mutating placement action may proceed under this runtime fingerprint.
+
+    The action-time front-door gate for ``sublane start/heal`` (Redmine #13705). It reads
+    a :func:`run_runtime_fingerprint` result and blocks ONLY when the active runtime is
+    missing the :data:`PLACEMENT_PROBE_KEY` behavior the repo-local source ships — the
+    exact source/installed skew that split the #13441 lane's pair across tabs. Every other
+    verdict allows: ``ok`` / ``active-is-source`` / ``no-source`` (no repo-local source to
+    compare) / a path-only warning with matching probes. A benign drift must not block a
+    legitimate mutation, and a bare installed run with no source present is simply
+    unverifiable here (the #13524 reinstall fingerprint gate covers that case).
+
+    Returns ``(ok, detail)``: ``ok=False`` fails the mutation closed with the fingerprint
+    summary as the actionable detail.
+    """
+    from mozyo_bridge.application.doctor import REPO_LOCAL_INVOCATION
+
+    for mismatch in fingerprint.get("probe_mismatch") or ():
+        if isinstance(mismatch, dict) and mismatch.get("probe") == PLACEMENT_PROBE_KEY:
+            summary = fingerprint.get("summary") or (
+                "the active runtime is missing the same-tab lane-placement behavior "
+                "the repo-local source ships"
+            )
+            return False, (
+                f"runtime placement drift: {summary}; refuse to actuate a lane from a "
+                "runtime that would place the gateway/worker pair incorrectly "
+                "(source/installed skew — Redmine #13705). Run the repo-local CLI "
+                f"({REPO_LOCAL_INVOCATION}) or reinstall to match the source"
+            )
+    return True, "active runtime placement behavior matches the repo-local source (or no source to compare)"
 
 
 def _source_feature_probes(source_pkg: Path) -> dict[str, bool] | None:

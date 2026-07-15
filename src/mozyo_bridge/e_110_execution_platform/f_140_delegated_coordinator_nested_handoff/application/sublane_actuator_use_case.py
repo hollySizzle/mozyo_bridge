@@ -7,10 +7,9 @@ the facade re-exports this class, so the public import surface is unchanged).
 The use case holds the fail-closed decision flow and never touches IO: it drives the
 injected :class:`...application.sublane_actuator_ops.SublaneActuatorOps` port, consults the
 pure :func:`decide_worktree_launch` launch policy and the #13290
-:func:`evaluate_dispatch_admission` gate (whose concrete stop vocabulary stays the single
-#12855 fill-decision authority — never re-implemented here), and assembles the typed,
-replayable :class:`SublaneActuationOutcome`. The concrete side effects live behind the
-port in :mod:`...application.sublane_actuator_ops`.
+:func:`evaluate_dispatch_admission` gate (the single #12855 fill-decision authority), and
+assembles the replayable :class:`SublaneActuationOutcome`. Concrete side effects live
+behind the port.
 """
 
 from __future__ import annotations
@@ -71,6 +70,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_create_identity,
     resolve_lane_runtime_root,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
+    pair_split_admission,
+    runtime_placement_gate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +85,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 class SublaneActuateUseCase:
     """Drive the fail-closed creation-side actuation over :class:`SublaneActuatorOps`.
 
-    The runtime preflight is the final authority (the #12604 acceptance style): the use
-    case probes git through the port, asks the pure :func:`decide_worktree_launch`, and — in
-    a live ``--execute`` run — performs only the additive side effects the plan authorizes,
-    **stopping at the first failure and reporting the partial state** rather than a partial
-    success. A dry-run resolves the plan and performs nothing.
+    The runtime preflight is the final authority (#12604 acceptance style): probe git
+    through the port, ask the pure :func:`decide_worktree_launch`, and — in a live
+    ``--execute`` run — perform only the additive side effects the plan authorizes,
+    **stopping at the first failure and reporting the partial state**. A dry-run
+    resolves the plan and performs nothing.
     """
 
     ops: SublaneActuatorOps
@@ -103,15 +106,11 @@ class SublaneActuateUseCase:
         """Bounded, non-fatal pre-dispatch readiness wait (#13293).
 
         Polls :meth:`SublaneActuatorOps.probe_gateway_ready` up to
-        ``gateway_ready_probes`` times, ``gateway_ready_interval_seconds`` apart, so a
-        freshly-launched gateway TUI has time to boot before the queue-enter dispatch.
-        Returns ``(ready, probes_run)``. ``ready`` is ``None`` when the wait is disabled
-        (``probes<=0``) or no gateway pane resolved — nothing was probed. Otherwise it is
-        ``True`` on the first ready observation or ``False`` when the window elapses
-        unconfirmed. It NEVER raises and NEVER blocks the dispatch: an unconfirmed
-        ``False`` degrades to a recorded observation and the caller dispatches anyway
-        (the queue-enter rail never hard-blocks; the handoff Enter-only retry is the
-        landing safety net).
+        ``gateway_ready_probes`` times, ``gateway_ready_interval_seconds`` apart. Returns
+        ``(ready, probes_run)``: ``ready`` is ``None`` when disabled (``probes<=0``) or no
+        gateway pane resolved, ``True`` on the first ready observation, else ``False`` when
+        the window elapses. NEVER raises / blocks — an unconfirmed ``False`` degrades to a
+        recorded observation and the caller dispatches anyway (Enter-only retry is the net).
         """
         probes = self.gateway_ready_probes
         if probes <= 0 or not gateway_pane:
@@ -129,13 +128,10 @@ class SublaneActuateUseCase:
     ) -> bool:
         """True iff the resolved ``lane`` is the requested target (pure).
 
-        The lane's ``lane_label`` must equal the requested label, and its issue must
-        match the requested issue. The lane's ``issue`` is parsed from its label by
-        :func:`project_sublanes`; ``parse_issue_from_lane_label`` is used as the fallback
-        so a lane whose ``issue`` field was not pre-populated is still validated by re-
-        parsing its label. A blank requested label / issue, a mismatched label, or a
-        mismatched issue all fail closed — this is the guard that stops a repo-root /
-        basename collision from misdelivering to the wrong gateway (Review j#70250).
+        The lane's ``lane_label`` must equal the requested label and its issue the
+        requested issue (falling back to ``parse_issue_from_lane_label`` when the ``issue``
+        field was not pre-populated). A blank / mismatched label or issue fails closed —
+        the guard that stops a repo-root / basename collision misdelivering (j#70250).
         """
         want_label = (request.lane_label or "").strip()
         got_label = (lane.lane_label or "").strip()
@@ -197,15 +193,9 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3b. Dispatch admission gate (#13290, live-dispatch path only): consult the
-        # caller-supplied fill decision (the single #12855 authority) and fail closed
-        # on a concrete stop unless an explicit override reason is supplied. When no
-        # fill context is supplied the gate is not armed and this is a no-op, keeping
-        # the #12973 live-actuation contract byte-for-byte back-compatible. Scoped to
-        # ``execute and dispatch`` (same as the anchor gate above): #13290 gates the
-        # ``--execute`` *dispatch*, while ``--no-dispatch`` is a create/adopt-only
-        # surface that dispatches no worker and so has nothing to gate. A dry-run
-        # (``execute=False``) likewise performs nothing to gate (Review j#72744 #2).
+        # 3b. Dispatch admission gate (#13290, live-dispatch only): consult the fill
+        # decision (#12855 authority) and fail closed on a concrete stop unless overridden.
+        # Unarmed without fill context; scoped to ``execute and dispatch`` (j#72744 #2).
         fill_decision_token: Optional[str] = None
         fill_override_reason: Optional[str] = None
         if execute and dispatch:
@@ -225,6 +215,23 @@ class SublaneActuateUseCase:
             fill_decision_token = admission.fill_decision
             fill_override_reason = admission.override_reason
 
+            # #13613: optional herdr sender attestation must fail before mutation;
+            # absence preserves tmux and existing test-port compatibility.
+            sender_preflight = getattr(self.ops, "preflight_dispatch_sender", None)
+            if callable(sender_preflight):
+                sender_ok, sender_detail = sender_preflight()
+                if not sender_ok:
+                    return self._blocked(
+                        request,
+                        launch_action=None,
+                        reason="dispatch sender attestation failed before actuation; "
+                        f"{sender_detail}",
+                        reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
+                        dispatch=dispatch,
+                        fill_decision=fill_decision_token,
+                        fill_override_reason=fill_override_reason,
+                    )
+
         # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
         # identity field present (step 1 passed) the pure decision does not currently
         # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
@@ -237,6 +244,16 @@ class SublaneActuateUseCase:
                 reasons=(REASON_LAUNCH_BLOCKED,),
                 dispatch=dispatch,
             )
+
+        # 4b. Redmine #13705 R1-F1: action-time runtime fingerprint front door (in
+        # ``sublane_actuator_gates``). ``execute`` scope fences ``--no-dispatch`` too.
+        if execute:
+            gate_outcome = runtime_placement_gate(
+                self, request, launch_action=launch.action, dispatch=dispatch,
+                fill_decision=fill_decision_token, fill_override_reason=fill_override_reason,
+            )
+            if gate_outcome is not None:
+                return gate_outcome
 
         # 5. Dry-run: resolve the plan; perform nothing.
         if not execute:
@@ -444,10 +461,8 @@ class SublaneActuateUseCase:
                     order=1,
                     title="create worktree",
                     status=STEP_EXECUTED,
-                    # #13368: prose detail is pasteable; name the portable sibling
-                    # basename, not the host-local absolute path (the replayable
-                    # `git worktree add` command below keeps the absolute path for
-                    # local replay, redacted only in the human-readable text render).
+                    # #13368: pasteable prose names the portable sibling basename, not
+                    # the absolute path (the replay command below keeps the abs path).
                     detail=f"created worktree {portable_worktree_label(request.worktree_path)} "
                     f"on branch {request.branch}"
                     + (
@@ -480,12 +495,10 @@ class SublaneActuateUseCase:
                 )
             )
 
-        # Step 2 — append (or adopt) the cockpit lane column. A lane that already resolves
-        # for this worktree MUST match the requested identity before we adopt or dispatch
-        # to it: a repo-root / basename collision with a different (or stale) lane is an
-        # ambiguous target and fails closed here. Never adopt / append onto — nor later
-        # dispatch to — a lane whose lane_label / issue does not match the request, which
-        # would misdeliver the implementation_request to the wrong gateway (Review j#70250).
+        # Step 2 — append (or adopt) the cockpit lane column. A lane already resolving for
+        # this worktree MUST match the requested identity before adopt / dispatch: a
+        # repo-root / basename collision with a different / stale lane is an ambiguous
+        # target and fails closed here, never misdelivering to the wrong gateway (j#70250).
         existing = self.ops.read_lane(lane_runtime_root)
         if existing is not None and not self._identity_matches(existing, request):
             steps.append(
@@ -582,6 +595,17 @@ class SublaneActuateUseCase:
                     command=None,
                 )
             )
+
+        # Redmine #13705 R1-F2: admit ONLY an operable same-tab pair — a `pair_split`
+        # lane is a degraded state the adopt path would otherwise dispatch to (gate in
+        # ``sublane_actuator_gates``; covers both read-back sites).
+        split_outcome = pair_split_admission(
+            self, request, lane, launch_action=launch.action, dispatch=dispatch,
+            adopted=adopted, steps=steps, fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+        if split_outcome is not None:
+            return split_outcome
 
         # Step 3 — confirm the identity stamps landed on the resolved lane.
         if not lane or not lane.repo_root:
@@ -686,14 +710,10 @@ class SublaneActuateUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
-        # Step 4 — pre-dispatch gateway readiness wait (#13293). Give a freshly-launched
-        # gateway TUI time to boot before the queue-enter dispatch so the input lands on
-        # a live composer instead of vanishing into a still-booting one (the j#72677 /
-        # 5-example, 100%-reproduction dispatch-loss failure mode). This NEVER hard-blocks
-        # the queue-enter rail (#13262/#13255): an unconfirmed readiness degrades to a
-        # recorded ``gateway_ready=false`` and the dispatch proceeds anyway — the handoff
-        # Enter-only retry (#12580/#12581) is the landing safety net and the coordinator
-        # watches for a no-progress lane.
+        # Step 4 — pre-dispatch gateway readiness wait (#13293): let a freshly-launched
+        # gateway TUI boot so queue-enter lands on a live composer (j#72677). NEVER
+        # hard-blocks — unconfirmed degrades to ``gateway_ready=false`` and dispatches
+        # anyway (Enter-only retry #12580 is the net).
         gateway_ready, ready_probes = self._wait_gateway_ready(gateway_pane)
         if gateway_ready is None:
             readiness_detail = (
@@ -731,7 +751,7 @@ class SublaneActuateUseCase:
                 journal=(request.journal or ""),
                 gateway_pane=gateway_pane or "",
                 lane_label=request.lane_label,
-                upstream_coordinator=request.upstream_coordinator,
+                upstream_coordinator=request.resolved_upstream_coordinator(),
                 target_repo=target_repo,
             )
         except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.
@@ -740,11 +760,9 @@ class SublaneActuateUseCase:
         else:
             dispatch_detail = f"handoff send to gateway {gateway_pane} exit={rc}"
         if rc != 0:
-            # Redmine #13378: a failed dispatch whose gateway slot is GONE on
-            # read-back is the measured vanish mode (an idle pre-session gateway
-            # killed by a host-level agent-CLI update) — self-heal once and retry,
-            # when the ops adapter offers the capability. Any other failure keeps
-            # the plain fail-closed block below, byte-for-byte.
+            # Redmine #13378: a failed dispatch whose gateway slot is GONE on read-back
+            # is the measured vanish mode — self-heal once and retry when the ops adapter
+            # offers the capability; any other failure keeps the plain block below.
             healed_outcome = self._heal_and_retry_dispatch(
                 request,
                 launch,
@@ -803,10 +821,8 @@ class SublaneActuateUseCase:
             gateway_pane=gateway_pane,
             worker_pane=worker_pane,
             dispatch_target=gateway_pane,
-            # Redmine #12986: a gateway `handoff send` exit 0 proves gateway
-            # notification only, never that the same-lane worker was dispatched or
-            # started. Record it honestly as `gateway_notified` (not `sent`) so a
-            # gateway-notified-but-quiet lane is never read as worker-started.
+            # Redmine #12986: a gateway send exit 0 is gateway notification only — record
+            # `gateway_notified` (not `sent`) so a quiet lane is not read as worker-started.
             dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
             adopted=adopted,
             steps=tuple(steps),
@@ -969,7 +985,7 @@ class SublaneActuateUseCase:
 
     def _dispatch_command(self, request: SublaneCreateRequest) -> str:
         journal = request.journal or "<journal>"
-        coordinator = request.upstream_coordinator or "<coordinator-pane>"
+        coordinator = request.resolved_upstream_coordinator()
         return (
             "mozyo-bridge handoff send --to codex --source redmine "
             f"--issue {request.issue} --journal {journal} "

@@ -30,12 +30,14 @@ and route authority are unchanged; only the herdr placement subdivides.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.workspace_registry import (
     _is_linked_worktree,
     _main_worktree_root,
+    load_workspace_by_path,
     read_anchor,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -67,26 +69,45 @@ def herdr_workspace_segment(repo_root: Path, *, home: Optional[Path] = None) -> 
     read-back) always agree:
 
     - a **linked git worktree** (a sublane lane checkout) → the **main checkout's**
-      registry / anchor ``workspace_id`` (#13152 identity inheritance). Under the
-      shared project workspace model (#13377 Opt3, superseding the per-lane
-      ``wt_<hash>`` workspace of #13331 j#73357) a lane's agents live in the
-      project workspace as ``mzb1_<project-ws>_<role>_<lane>`` slots, so the
-      ``workspace`` segment is the project identity and the *lane* segment is the
-      discriminant. The legacy per-lane token (:func:`derive_lane_workspace_token`)
-      is no longer minted for new slots; it survives only as the compatibility key
-      for pre-#13377 rows (legacy resolve / retire) and as the lane metadata
-      record's stable per-worktree join key;
+      ``workspace_id``, inherited with the SAME precedence as the canonical
+      worktree inheritance (:func:`workspace_registry._inherited_worktree_result` /
+      :func:`resolve_canonical_session`, #13152): the main **registry row** first,
+      then the main **anchor**. Reading only the anchor (the pre-#13595 shape)
+      missed a *registry-only* main — anchor absent (anchors are untracked), row
+      present — where the identity still inherits; a ``--dry-run`` there fell
+      fail-closed while the canonical execute path inherited it, and (this being the
+      single mint==resolve resolver) send / retire / projection missed it too
+      (Redmine #13595 R1-F1). Under the shared project workspace model (#13377 Opt3,
+      superseding the per-lane ``wt_<hash>`` workspace of #13331 j#73357) a lane's
+      agents live in the project workspace as ``mzb1_<project-ws>_<role>_<lane>``
+      slots, so the ``workspace`` segment is the project identity and the *lane*
+      segment is the discriminant. The legacy per-lane token
+      (:func:`derive_lane_workspace_token`) is no longer minted for new slots; it
+      survives only as the compatibility key for pre-#13377 rows (legacy resolve /
+      retire) and as the lane metadata record's stable per-worktree join key;
     - otherwise (**standalone / main checkout**) → the registry / anchor
       ``workspace_id``, read-only (no registration), byte-for-byte the prior
       behaviour. ``""`` when no anchor resolves (the caller decides whether that is
       fatal — :func:`prepare_session` fails closed; the resolve sites treat ``""``
       as "not a resolvable workspace").
+
+    Read-only in every branch (no registration / anchor / ``last_seen`` write). The
+    inheritance change is monotonic: a main with a row + agreeing anchor and an
+    anchor-only main are byte-for-byte unchanged; only a registry-only main flips
+    ``""`` -> the canonically-inherited id (the same value
+    :func:`register_workspace` would produce), so no consumer's non-empty result
+    changes — a previously fail-closed registry-only main now resolves correctly.
     """
     resolved = Path(repo_root).expanduser().resolve()
     if _is_linked_worktree(resolved):
         main_root = _main_worktree_root(resolved)
         if main_root is None:
             return ""
+        record = load_workspace_by_path(main_root, home=home)
+        if record is not None:
+            workspace_id = _norm(record.workspace_id)
+            if workspace_id:
+                return workspace_id
         anchor = read_anchor(main_root)
         return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
     anchor = read_anchor(resolved)
@@ -292,6 +313,240 @@ def _tab_target_for_lane(
     return next(iter(own_tabs)) if own_tabs else ""
 
 
+def resolve_launch_order(
+    providers: Sequence[str], config_order: Optional[Sequence[str]]
+) -> list:
+    """The requested providers, reordered by the configured launch order (pure).
+
+    Config-driven placement (Redmine #13646, Design Answer j#76564 Q2): ``config_order`` is
+    a full provider permutation naming who occupies the container FIRST (and therefore who
+    splits beside them). Reordering the REQUESTED providers is the only way to realize a
+    role order, because herdr ``agent start`` has no pane-target flag — order is launch
+    order (live ``--help`` characterization j#76559).
+
+    It never grows the request: a single-provider heal stays a single provider (an ``order``
+    naming both providers must not launch an unrequested peer). ``None`` returns the
+    requested sequence unchanged (byte-invariant).
+    """
+    if config_order is None:
+        return list(providers)
+    rank = {provider: index for index, provider in enumerate(config_order)}
+    return sorted(providers, key=lambda provider: rank.get(provider, len(rank)))
+
+
+def resolve_split_direction(lane_class: str, config_split: Optional[str]) -> str:
+    """The ``--split`` direction a splitting slot of ``lane_class`` uses (``""`` = none).
+
+    Config-driven placement (Redmine #13646, Design Answer j#76564 Q3): a configured
+    ``split`` wins; otherwise the legacy discipline applies — ``right`` for a ``sublane``
+    slot (byte-for-byte the pre-#13646 literal) and NO split for the ``default``
+    (coordinator) pair, which delegates to the herdr server default unless explicitly
+    configured. ``""`` means the caller emits no ``--split`` flag at all.
+    """
+    if config_split is not None:
+        return config_split
+    return "right" if lane_class == "sublane" else ""
+
+
+def initial_container_occupancy(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    target_workspace: str,
+    lane_id: str,
+    *,
+    lane_class: str,
+    target_tab: str,
+    lane_slot_tabs: Sequence[str],
+    count_default_lane: bool,
+) -> int:
+    """How many of this lane's slots already occupy the container a launch splits into.
+
+    The container differs by lane class (Redmine #13411 tab axis + #13646 default axis):
+
+    - a ``sublane``'s container is its dedicated lane TAB, so only same-lane live slots
+      ALREADY IN ``target_tab`` count. Read from the whole live inventory, not this run's
+      requested plans (review j#74433 finding 1): a single-provider heal requests one
+      provider, so the lane's OTHER live slot is in the inventory but never in ``plans`` —
+      counting requested adopts alone would drop the split a heal beside a live tabbed
+      sibling needs. A freshly minted tab starts empty (0), so its first launch occupies
+      and its second splits. A loose (pre-#13411, tab-less) heal has no ``target_tab`` and
+      counts 0, so it stays loose — byte-invariant.
+    - the ``default`` lane has no tab, so its container is the project WORKSPACE itself:
+      the coordinator pair's own live slots in ``target_workspace``. This is what makes a
+      fresh pair's 2nd slot split beside the 1st and a heal split beside the live sibling.
+      ``count_default_lane`` is False when nothing launches or no split is configured, so
+      an unset default lane never reads it and stays byte-for-byte the pre-#13646 launch.
+
+    Live slots count regardless of how this run classified them (adopt / unattested /
+    stale): they occupy a pane either way, and a launch must split beside a live pane.
+    """
+    if lane_class == "sublane":
+        return sum(1 for tab in lane_slot_tabs if tab == target_tab) if target_tab else 0
+    if not count_default_lane:
+        return 0
+    return len(_lane_live_slot_tabs(rows, workspace_id, target_workspace, lane_id))
+
+
+def resolve_placement_policy(
+    lane_placement: object, lane_class: str
+) -> "tuple[Optional[str], Optional[tuple[str, ...]]]":
+    """The lane class's configured ``(split, order)``, or ``(None, None)`` when unset.
+
+    The one adapter between the repo-local ``lane_placement`` config record (Redmine
+    #13646) and the pure placement decisions below, so the session-start composition root
+    holds no config-shape knowledge and this module keeps no config import (it only calls
+    ``.resolve(lane_class)``). ``None`` config — or a lane class the config omits — yields
+    ``(None, None)``: inherit the legacy launch discipline everywhere (byte-invariant).
+    """
+    if lane_placement is None:
+        return None, None
+    resolved = lane_placement.resolve(lane_class)  # type: ignore[attr-defined]
+    return resolved.split, resolved.order
+
+
+def resolve_focus_first_launch(
+    *,
+    config_split: Optional[str],
+    config_order: Optional[Sequence[str]],
+    launch_count: int,
+    container_occupancy: int,
+) -> bool:
+    """True iff this run's FIRST launch must carry ``--focus`` (pure).
+
+    The R1-F1 fix (review j#76613, Design Answer R1 j#76616). herdr splits a container's
+    ACTIVE pane and ``agent start`` has no pane-target flag, so when every launch is
+    ``--no-focus`` the container's empty ROOT pane stays active: the second slot's
+    ``--split <dir>`` splits the root rather than the first agent, and reclaiming the root
+    (after all launches, #13330) collapses that split away — leaving only the outer default
+    ``right`` split the first agent implicitly created. The configured direction silently
+    never applies (live-measured on BOTH the tab-less default pair and the lane tab: the
+    pre-#13646 ``--split right`` literal only *looked* correct because it coincides with
+    herdr's default direction, j#76622). Focusing the first launch pins the container's
+    split target to that agent, so the second slot splits the AGENT and the direction
+    survives the reclaim.
+
+    Deliberately narrow (j#76616), so nothing else changes shape:
+
+    - ``container_occupancy == 0`` — a FRESH container. A heal / mixed adopt joins a
+      container whose only pane is the live sibling, which is therefore already the split
+      target; a live pane is never focused / moved / swapped.
+    - ``launch_count >= 2`` — a full pair. A single-provider request has no second slot to
+      place, so the focus policy never fires.
+    - explicit placement (``config_split`` or ``config_order`` set) — an UNSET lane class
+      keeps ``--no-focus`` on every launch and stays byte-for-byte the pre-#13646 argv.
+      (An unset sublane therefore keeps its historical — coincidentally correct — ``right``
+      layout; only an explicitly configured lane class opts into the corrected placement.)
+
+    Note this keys on the CONFIG being explicit, not on the effective split direction: an
+    unset ``sublane`` still resolves ``split_direction == "right"`` by legacy default, and
+    must NOT gain a ``--focus`` it never had.
+    """
+    if container_occupancy != 0 or launch_count < 2:
+        return False
+    return config_split is not None or config_order is not None
+
+
+@dataclass(frozen=True)
+class ContainerPlan:
+    """How this run places its launches inside the target container (pure value).
+
+    - :attr:`split_direction` — the ``--split`` value a splitting slot uses (``""`` = none).
+    - :attr:`occupancy` — how many of the lane's slots already occupy the container, so the
+      first launch into a fresh one occupies and the rest split beside it.
+    - :attr:`focus_first` — whether the first launch must carry ``--focus`` to own the
+      container's split target (the R1-F1 fix).
+    """
+
+    split_direction: str
+    occupancy: int
+    focus_first: bool
+
+
+def resolve_container_plan(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    target_workspace: str,
+    lane_id: str,
+    *,
+    lane_class: str,
+    target_tab: str,
+    lane_slot_tabs: Sequence[str],
+    config_split: Optional[str],
+    config_order: Optional[Sequence[str]],
+    launch_count: int,
+) -> ContainerPlan:
+    """The whole container placement plan for this run (pure; the single entry point).
+
+    Composes the three decisions the session-start composition root needs — the effective
+    split direction (:func:`resolve_split_direction`), the container's initial occupancy
+    (:func:`initial_container_occupancy`), and whether the first launch must own the split
+    target (:func:`resolve_focus_first_launch`) — so the orchestrator makes ONE call and
+    holds no placement logic of its own.
+
+    The default-lane occupancy is only counted when a split direction is configured, so an
+    unset default lane never reads the inventory and stays byte-for-byte the pre-#13646 launch.
+    """
+    split_direction = resolve_split_direction(lane_class, config_split)
+    occupancy = initial_container_occupancy(
+        rows,
+        workspace_id,
+        target_workspace,
+        lane_id,
+        lane_class=lane_class,
+        target_tab=target_tab,
+        lane_slot_tabs=lane_slot_tabs,
+        count_default_lane=bool(
+            launch_count and target_workspace and config_split is not None
+        ),
+    )
+    focus_first = resolve_focus_first_launch(
+        config_split=config_split,
+        config_order=config_order,
+        launch_count=launch_count,
+        container_occupancy=occupancy,
+    )
+    return ContainerPlan(
+        split_direction=split_direction, occupancy=occupancy, focus_first=focus_first
+    )
+
+
+def slot_placement(
+    kind: str,
+    provider: str,
+    *,
+    split_direction: str,
+    occupancy: int,
+    config_order: Optional[Sequence[str]],
+    focus_first: bool = False,
+) -> "tuple[str, bool, bool]":
+    """One slot's ``(--split value, focus, order_deferred)`` decision (pure).
+
+    A slot splits only when it actually LAUNCHES into an already-occupied container; the
+    container's first launch occupies it and emits no ``--split``. Adopted / planned /
+    stale / unattested slots launch nothing, so they never carry a placement flag.
+
+    ``focus`` is set on the FIRST launch into a fresh container when ``focus_first`` applies
+    (see :func:`resolve_focus_first_launch`): that pins the container's split target to the
+    first agent so the later slots split the AGENT, not the empty root pane that would be
+    reclaimed out from under the split (R1-F1, j#76613 / j#76616). Only the first launch is
+    ever focused — a splitting slot never is.
+
+    ``order_deferred`` (Design Answer j#76564 Q2) flags the one case the configured order
+    cannot be satisfied physically: the configured PRIMARY (``config_order[0]`` — the
+    provider that should occupy the container) is launching as a split beside a sibling
+    that is already live. herdr ``agent start`` has no pane-target flag and moving a live
+    pane is forbidden (no live relayout), so the launch proceeds in the configured
+    direction and the caller records ``order_deferred_until_full_relaunch`` instead of
+    silently claiming the order was applied. A full relaunch of the pair realizes it.
+    """
+    if kind != "launch":
+        return "", False, False
+    if occupancy <= 0:
+        return "", bool(focus_first), False
+    deferred = bool(config_order is not None and provider == config_order[0])
+    return split_direction, False, deferred
+
+
 def _host_workspace_label(repo_root: Path) -> str:
     """Operator-readable label for a minted sublane host workspace (cosmetic only).
 
@@ -436,6 +691,14 @@ __all__ = (
     "_host_workspace_label",
     "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "ContainerPlan",
+    "initial_container_occupancy",
+    "resolve_container_plan",
+    "resolve_focus_first_launch",
+    "resolve_launch_order",
+    "resolve_placement_policy",
+    "resolve_split_direction",
+    "slot_placement",
     "_parse_started_agent",
     "_parse_tab_created",
     "_parse_workspace_created",

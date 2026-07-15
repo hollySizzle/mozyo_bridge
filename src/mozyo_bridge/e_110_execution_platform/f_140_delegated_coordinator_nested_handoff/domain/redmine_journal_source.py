@@ -70,12 +70,27 @@ _RECOGNIZED_CHANNELS = frozenset(
     {MARKER_CHANNEL_HANDOFF, MARKER_CHANNEL_WORKFLOW_EVENT}
 )
 
-#: The gate-bearing kinds a marker may name (mirrors the adapter's core-owned
-#: ``WORKFLOW_GATE_KINDS``; kept local so this domain stays inside its bounded context and
-#: does not import the e_140 adapter). A non-gate kind (``implementation_request`` /
-#: ``design_consultation`` / ``reply`` / ``start`` / ``close`` …) is skipped, never guessed.
+#: The **callback-required** gate kinds a marker may name — the states that must wake the
+#: coordinator (``skills/mozyo-bridge-agent/references/workflow.md`` ``### coordinator callback
+#: を要する state``: ``implementation_done | review_request | review_result |
+#: owner_close_approval_waiting | blocked``). #13520 review F5: this is DELIBERATELY broader than
+#: the provider review-gate vocabulary ``WORKFLOW_GATE_KINDS`` (which excludes owner-close because
+#: "close approval is satisfied" is a core decision, not a provider-observable fact) — a callback
+#: only *wakes the coordinator to read the journal*, it authorizes nothing, so ``blocked`` and
+#: ``owner_close_approval_waiting`` legitimately trigger a callback. Kept local so this domain
+#: stays inside its bounded context and does not import the e_140 adapter. A non-gate kind
+#: (``implementation_request`` / ``design_consultation`` / ``reply`` / ``start`` / ``close`` …)
+#: is skipped, never guessed. ``review_result`` / ``owner_close_approval_waiting`` are the
+#: marker-facing names; :data:`...redmine_event_intake.MARKER_GATE_ALIASES` maps them onto the
+#: runtime ``review`` / ``owner_close_approval`` gates.
 GATE_BEARING_KINDS: frozenset[str] = frozenset(
-    {"implementation_done", "review_request", "review_result"}
+    {
+        "implementation_done",
+        "review_request",
+        "review_result",
+        "owner_close_approval_waiting",
+        "blocked",
+    }
 )
 
 #: ``[mozyo:<channel>:<body>]`` — the body is the ':'-separated key=value field list.
@@ -293,6 +308,66 @@ def markers_from_source(
     return extract_markers(source.read_entries(issue_id))
 
 
+def render_workflow_event_marker(
+    gate: str,
+    *,
+    conclusion: str | None = None,
+    callback: str | None = None,
+    commit_bearing: bool | None = None,
+    integration_recorded: bool | None = None,
+    issue_open: bool | None = None,
+    blocker_recorded: bool | None = None,
+) -> str:
+    """Render the structured ``[mozyo:workflow-event:...]`` gate marker for a gate journal (pure).
+
+    This is the **producer** inverse of :func:`extract_markers_from_note` (#13520 review F1-R1):
+    an agent recording a handoff-worthy gate journal (implementation_done / review_request /
+    review_result) embeds the returned token in the journal notes so the callback watcher can
+    **discover** the gate structurally later — the watcher reads the machine token, never the
+    surrounding prose. Only the fields that are set are emitted (a bare marker carries just the
+    gate). ``gate`` must be a gate-bearing kind (:data:`GATE_BEARING_KINDS`); anything else is a
+    programming error and raises. The output round-trips through
+    :func:`extract_markers_from_note` back to the same :class:`JournalMarker`.
+    """
+    gate_s = str(gate).strip()
+    if gate_s not in GATE_BEARING_KINDS:
+        raise ValueError(
+            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, "
+            f"got {gate!r}"
+        )
+    fields = [f"gate={gate_s}"]
+    if conclusion is not None:
+        fields.append(f"conclusion={str(conclusion).strip()}")
+    if callback is not None:
+        fields.append(f"callback={str(callback).strip()}")
+    for key, value in (
+        ("commit", commit_bearing),
+        ("integrated", integration_recorded),
+        ("open", issue_open),
+        ("blocker", blocker_recorded),
+    ):
+        if value is not None:
+            fields.append(f"{key}={'1' if value else '0'}")
+    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
+
+
+def render_gate_note(gate: str, *, body: str = "", **marker_fields: object) -> str:
+    """Render a **canonical gate-record note**: prose body + the embedded gate marker (pure).
+
+    The single canonical renderer for a callback-required gate journal (#13520 review F1a): a gate
+    recorded through this path always carries the structured
+    :func:`render_workflow_event_marker` token, so the callback watcher can **discover** it
+    (:func:`markers_from_source`) instead of relying on a hand-written fixture marker or prose. The
+    marker is appended after the human-readable ``body`` (blank body -> just the marker). ``gate``
+    must be a callback-required kind (:data:`GATE_BEARING_KINDS`); ``marker_fields`` are forwarded
+    to :func:`render_workflow_event_marker` (conclusion / callback / commit_bearing / …). Pure;
+    the caller (the application writer) posts the returned text as a Redmine journal note.
+    """
+    marker = render_workflow_event_marker(gate, **marker_fields)  # type: ignore[arg-type]
+    body_s = str(body or "").rstrip()
+    return f"{body_s}\n\n{marker}" if body_s else marker
+
+
 __all__ = (
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
@@ -304,4 +379,6 @@ __all__ = (
     "RedmineJournalSource",
     "MappingRedmineJournalSource",
     "markers_from_source",
+    "render_workflow_event_marker",
+    "render_gate_note",
 )

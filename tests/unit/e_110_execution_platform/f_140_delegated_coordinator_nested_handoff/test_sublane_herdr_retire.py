@@ -212,7 +212,6 @@ class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
 
         all_true = RetireAssertions(
             issue_closed=True,
-            owner_approval_present=True,
             callbacks_drained=True,
             verification_passed=True,
             durable_record_recorded=True,
@@ -258,11 +257,12 @@ class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
             branch="issue_13331_x",
             integration_branch=None,
             issue_closed=True,
-            owner_approved=True,
             callbacks_drained=True,
             verified=True,
             durable_record=True,
             target_identity_known=True,
+            latest_generation_admissible=True,  # #13518 R3-F2 fail-closed invariant asserted
+            review_generation_json=None,
             execute=execute,
             repo=str(repo),
             json=True,

@@ -246,6 +246,14 @@ class RouteRequest:
     output_mode: str = OUTPUT_EXECUTE
     #: Optional capability the route is for (echoed into the decision record).
     capability: Optional[str] = None
+    #: The runtime providers the gateway / worker route heads target (Redmine #13569
+    #: Increment 2B / R2-F3). REQUIRED (keyword-only, no literal default): the caller must
+    #: resolve them from the repo-local ``RoleProviderBinding`` and thread them, so a route
+    #: plan can never silently reduce to the built-in ``codex`` / ``claude`` pair when a
+    #: caller omits the binding. The "gateway-via, worker-never-cross-boundary-direct"
+    #: invariant keys on the resolved worker provider, never a literal.
+    gateway_provider: str = field(kw_only=True)
+    worker_provider: str = field(kw_only=True)
     # --- role-profile template fields (all optional; unresolved -> reported) ---
     parent_project: str = ""
     parent_issue: str = ""
@@ -625,7 +633,7 @@ def _build_steps(
     steps.append(
         _handoff_step(
             kind=STEP_CHILD_HANDOFF,
-            to_role="codex",
+            to_role=request.gateway_provider,
             cross_boundary=request.cross_project,
             description=(
                 f"handoff to child Codex gateway ({_realization_verb(child_real)} "
@@ -634,6 +642,7 @@ def _build_steps(
             route_target=TARGET_CHILD_GATEWAY,
             role_profile=child_profile,
             realization=child_real,
+            worker_provider=request.worker_provider,
         )
     )
     chain.append(ROLE_DELEGATED_COORDINATOR)
@@ -662,12 +671,13 @@ def _build_steps(
         steps.append(
             _handoff_step(
                 kind=STEP_WORKER_HANDOFF,
-                to_role="codex",
+                to_role=request.gateway_provider,
                 cross_boundary=True,
                 description="handoff to grandchild Codex gateway",
                 route_target=TARGET_GRANDCHILD_GATEWAY,
                 role_profile=gateway_profile,
                 realization=grandchild_real,
+                worker_provider=request.worker_provider,
             )
         )
         chain.append(ROLE_IMPLEMENTATION_GATEWAY)
@@ -685,12 +695,13 @@ def _build_steps(
         steps.append(
             _handoff_step(
                 kind=STEP_WORKER_HANDOFF,
-                to_role="claude",
+                to_role=request.worker_provider,
                 cross_boundary=False,
                 description="grandchild gateway routes to same-lane Claude worker",
                 route_target=TARGET_SAME_LANE_WORKER,
                 role_profile=worker_profile,
                 realization=REALIZE_ADOPT,
+                worker_provider=request.worker_provider,
             )
         )
         chain.append(ROLE_IMPLEMENTATION_WORKER)
@@ -717,18 +728,22 @@ def _handoff_step(
     route_target: str,
     role_profile: RoleProfileResolution,
     realization: str,
+    worker_provider: str,
 ) -> PlannedStep:
-    """Build a handoff step, failing closed on a forbidden cross-boundary Claude send.
+    """Build a handoff step, failing closed on a forbidden cross-boundary worker send.
 
-    Defense-in-depth for Required behavior #4: even if classification were
-    bypassed, constructing a cross-project/cross-lane ``--to claude`` step raises
-    rather than emitting it. The only permitted Claude target is a same-lane
-    (non-cross-boundary) worker handoff.
+    Defense-in-depth for Required behavior #4: even if classification were bypassed,
+    constructing a cross-project/cross-lane direct-to-worker step raises rather than
+    emitting it. The only permitted worker target is a same-lane (non-cross-boundary)
+    worker handoff. The forbidden target keys on the binding-resolved ``worker_provider``
+    (Redmine #13569 j#76969 correction 3), not the literal ``claude`` — a rebound worker
+    provider does not weaken the gateway-via invariant. Default ``claude`` is
+    byte-identical.
     """
-    if to_role == "claude" and cross_boundary:
+    if to_role == worker_provider and cross_boundary:
         raise DelegationRoutePlanError(
-            "cross-project/cross-lane Claude direct send may never be planned; "
-            "route via the Codex gateway"
+            "cross-project/cross-lane worker direct send may never be planned; "
+            "route via the gateway"
         )
     return PlannedStep(
         kind=kind,

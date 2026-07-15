@@ -44,7 +44,7 @@ repo の **現在 authoritative な release-version mirror set** を 1 つの ve
 
 publish workflow の dispatch / 状態確認に専念する helper。version 文字列の整合・gate 判定・release notes は扱わない。
 
-- `release publish --testpypi --version <X.Y.Z>` — `gh workflow run testpypi.yml --ref main` 相当の dispatch を実行する (workflow input は渡さない。`testpypi.yml` の `workflow_dispatch` は input を取らず、`main` の commit 済み `pyproject.toml` version を build するため、version bump は事前に commit / push しておく)。`--version` は期待 version の validate / 記録用であり dispatch input ではない。dispatch 後の run-id を active ticket に貼れる shape で stdout に出す。workflow 完了の polling はこの subcommand では行わず、`release check workflow --run-id <id>` に明示的に委ねる。
+- `release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin ref>` — exact-candidate 内部 beta dispatch (Redmine #13601)。`gh workflow run testpypi.yml --ref main -f source_sha=... -f expected_version=... -f source_ref=... -f dispatch_nonce=...` を構成する。workflow の定義 / event ref は `main` 固定 (artifact authority は SHA、workflow authority は main)。3 input は必須で、`source_sha` は exact 40-hex に validate、`expected_version` は PEP 440 shape に validate、`source_ref` は origin 上で action-time に `source_sha` へ解決すべき approved ref。`--version` は `--expected-version` の後方互換 alias。dispatch は run-name 中の unique `dispatch_nonce` で決定的に相関し (latest-one 推測禁止)、exact 1 件以外は fail-closed で `result: blocker` を返す。相関した run-id を active ticket に貼れる shape で stdout に出す。fail-closed 照合そのもの (HEAD==SHA / version mirror / candidate test.yml が trusted origin/main と byte 一致 / Test CI success / version 未使用 schema fail-closed / source_ref が exact 1 件の named origin ref。#13601 j#76006 F1-F3) は trusted な main-defined workflow build job の inline gate 内で行い、helper は dispatch と相関のみを担う。workflow 完了 polling は `release workflow wait` に委ねる。
 - `release publish --pypi --tag vX.Y.Z` — production publish の trigger を組み立てる。具体的には `gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file <path>` のドライランを出力し、release notes file path と tag が揃っていることを assert する。`--execute` flag が明示的に渡された場合のみ `gh release create` を実行する。
 - `release publish --plan` — TestPyPI / PyPI それぞれで、現在の git ref / pyproject version / 最新の `Test` workflow conclusion / TestPyPI 既存 version の有無を読み取り、operator が次に取りうる選択肢を列挙する。判定はしない。
 
@@ -122,7 +122,7 @@ helper が触ってよい層と触ってはいけない層を明示する。
 | `Canonical Renderer / Plugin Mirror Drift` | `release check drift` | strict-fail 検査として実行 |
 | `Release Ref Consistency` (pyproject version / tag / install ref) | `release bump --check` + `release check workflow` | read-only の参照情報を表示。mirror set 内 version 不一致は exit non-zero |
 | `Version Bump` (release-version mirror set の書き換え + 単独 commit) | `release bump --to <version>` | mirror set 全 file (現状: `pyproject.toml` + `src/mozyo_bridge/__init__.py`) を worktree に書き換えるだけ |
-| TestPyPI publish workflow の dispatch | `release publish --testpypi --version <X.Y.Z>` | workflow dispatch のみ |
+| TestPyPI publish workflow の dispatch | `release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin ref>` | main-fixed exact-candidate workflow dispatch + nonce 相関のみ (Redmine #13601) |
 | `Test` / `Publish to TestPyPI` / `Publish to PyPI` workflow の green 確認 | `release check workflow` / `release workflow wait` | run status / conclusion 取得のみ |
 | Fresh install smoke (`pipx install ...`) | (helper 化しない) | tester 環境依存のため operator が実行 |
 | GitHub Release 作成 (`gh release create`) | `release publish --pypi --tag vX.Y.Z` | default dry-run / `--execute` で実行 |

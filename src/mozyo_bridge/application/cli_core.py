@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import argparse
 
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    agent_provider_ids,
+)
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.application.commands import (
     cmd_doctor,
@@ -53,12 +56,27 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_sublane_list,
     cmd_sublane_retire,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_supersede import (
+    cmd_sublane_supersede,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (
+    cmd_sublane_hibernate,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (
+    register_sublane_resume_parser,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (
+    register_sublane_quarantine_parser,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     cmd_herdr_session_start,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (
+    cmd_herdr_agent_attest,
 )
 
 
@@ -131,8 +149,16 @@ def register_keys(sub) -> None:
     keys.set_defaults(func=cmd_keys)
 
 
-def register_lifecycle(sub) -> None:
-    """Register the `init` / `doctor` / `sublane` lifecycle commands onto ``sub``."""
+def register_lifecycle(sub, *, snapshot=None) -> None:
+    """Register the `init` / `doctor` / `sublane` lifecycle commands onto ``sub``.
+
+    ``snapshot`` (Redmine #13569 R1-F1) supplies the ``init`` / ``herdr session-start``
+    ``--agent`` choice vocabulary from the composition root's single injected snapshot;
+    ``None`` uses the built-in provider ids (byte-identical).
+    """
+    agent_choices = (
+        sorted(snapshot.provider_ids) if snapshot is not None else sorted(agent_provider_ids())
+    )
     init = sub.add_parser(
         "init",
         help=(
@@ -146,7 +172,7 @@ def register_lifecycle(sub) -> None:
             "to the current pane when no target is given."
         ),
     )
-    init.add_argument("agent", choices=["claude", "codex"])
+    init.add_argument("agent", choices=agent_choices)
     init.add_argument("target", nargs="?")
     init.add_argument(
         "--window-only",
@@ -427,7 +453,9 @@ def register_lifecycle(sub) -> None:
         "--upstream-coordinator",
         dest="upstream_coordinator",
         default=None,
-        help="Coordinator pane the gateway calls back to",
+        help="Coordinator route the gateway calls back to (default: the stable "
+        "`coordinator` route token, resolved workspace-scoped and fail-closed; "
+        "pass an explicit pane/route to override)",
     )
     # Governed work-unit granularity (Redmine #13002): the standard dispatch unit
     # is one UserStory (1US=1作業単位). `leaf_issue` is the task-level-exception
@@ -499,7 +527,13 @@ def register_lifecycle(sub) -> None:
     _add_dispatch_admission_flags(sublane_create)
     add_repo_option(sublane_create)
     _add_lifecycle_json(sublane_create)
-    sublane_create.set_defaults(func=cmd_sublane_start)
+    # Redmine #13569 R3-F1: carry the SAME composition-injected snapshot onto the parsed
+    # namespace so `cmd_sublane_start`'s launchability preflight resolves against the
+    # injected registry (not the built-in fallback). Without this `set_defaults`,
+    # `args.snapshot` is absent in the real parser path and a rebound provider that exists
+    # only in the injected snapshot is misjudged unknown -> zero-start (the R2-F2b bug,
+    # unresolved in real composition because only the agents subparser was wired).
+    sublane_create.set_defaults(func=cmd_sublane_start, snapshot=snapshot)
 
     # Worker-dispatch ack drive (Redmine #12988): the lane gateway forwards the
     # anchored implementation_request to its same-lane worker and records the
@@ -652,13 +686,14 @@ def register_lifecycle(sub) -> None:
         "--issue-closed",
         dest="issue_closed",
         action="store_true",
-        help="The lane's Redmine issue is durably closed.",
-    )
-    sublane_retire.add_argument(
-        "--owner-approved",
-        dest="owner_approved",
-        action="store_true",
-        help="The owner close-approval journal exists.",
+        help=(
+            "The lane's Redmine issue is durably closed under the close contract that "
+            "applies to its issue type (a child Task/Test/Bug via task_close; a US / "
+            "standalone issue via an owner_close_approval-backed close). Redmine #13602 "
+            "(Option A): routine green-preflight retirement is coordinator authority and "
+            "takes no separate --owner-approved flag regardless of which close contract "
+            "applied — retire actuation never re-collects the owner close approval."
+        ),
     )
     sublane_retire.add_argument(
         "--callbacks-drained",
@@ -685,6 +720,28 @@ def register_lifecycle(sub) -> None:
         help="The lane / worktree / pane target is positively resolved.",
     )
     sublane_retire.add_argument(
+        "--latest-generation-admissible",
+        dest="latest_generation_admissible",
+        action="store_true",
+        help=(
+            "#13518 R2-F7 / R3-F2: assert (from the durable review journals) that the LATEST review "
+            "generation is approved AND carries no unresolved blocking finding. Fail-closed when "
+            "unset: the actual retire/integration no longer default-admits a stale approval. Ignored "
+            "when --review-generation-json is supplied (that MEASURES it at action-time)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--review-generation-json",
+        dest="review_generation_json",
+        default=None,
+        help=(
+            "#13518 R3-F2: path to a coordinator-produced durable review observation "
+            "{issue, review_request_journal, target_head, decisions:[{kind,seq,blocking,disposition,"
+            "journal_id}]}. When supplied, latest-generation admissibility is MEASURED at action-time "
+            "via the review-generation fence (an unreadable / malformed file fails closed)."
+        ),
+    )
+    sublane_retire.add_argument(
         "--execute",
         dest="execute",
         action="store_true",
@@ -698,6 +755,139 @@ def register_lifecycle(sub) -> None:
     add_repo_option(sublane_retire)
     _add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)
+
+    sublane_supersede = sublane_sub.add_parser(
+        "supersede",
+        help=(
+            "Redmine #13681: hand an issue's ownership from a superseded lane to its "
+            "recovery successor, then release the superseded lane's managed processes "
+            "(tombstone-free — never removes a worktree, deletes a branch, or closes "
+            "the issue). Fail-closed preflight (both identities known, successor "
+            "attested, same issue, original idle). Default is preflight only; "
+            "--execute performs the handover. Exits non-zero when blocked."
+        ),
+    )
+    sublane_supersede.add_argument(
+        "--issue", required=True, help="Redmine issue id whose ownership moves"
+    )
+    sublane_supersede.add_argument(
+        "--original-lane",
+        dest="original_lane",
+        required=True,
+        help="Lane label being superseded (e.g. issue_<id>_<slug>)",
+    )
+    sublane_supersede.add_argument(
+        "--recovery-lane",
+        dest="recovery_lane",
+        required=True,
+        help="Recovery successor lane label taking ownership",
+    )
+    sublane_supersede.add_argument(
+        "--journal",
+        required=True,
+        help="Redmine journal id that authorizes the handover (durable anchor)",
+    )
+    # Durable-record invariants the operator asserts the original lane is idle under
+    # (each defaults to unsatisfied so an omitted flag fails closed).
+    sublane_supersede.add_argument(
+        "--callbacks-drained",
+        dest="callbacks_drained",
+        action="store_true",
+        help="The original lane owes no outstanding coordinator callback.",
+    )
+    sublane_supersede.add_argument(
+        "--no-pending-prompt",
+        dest="no_pending_prompt",
+        action="store_true",
+        help="The original lane has no composer input pending.",
+    )
+    sublane_supersede.add_argument(
+        "--not-working",
+        dest="not_working",
+        action="store_true",
+        help="The original lane has no work in flight.",
+    )
+    sublane_supersede.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Perform the handover: CAS the ownership move (original active->superseded, "
+            "recovery->active owner) and release the original's managed processes. "
+            "Without it this is preflight only (no mutation)."
+        ),
+    )
+    add_repo_option(sublane_supersede)
+    _add_lifecycle_json(sublane_supersede)
+    sublane_supersede.set_defaults(func=cmd_sublane_supersede)
+
+    sublane_hibernate = sublane_sub.add_parser(
+        "hibernate",
+        help=(
+            "Redmine #13682: release an OPEN lane's managed gateway/worker processes "
+            "while preserving its worktree / branch / unpublished commits / lane metadata "
+            "/ durable callback route (tombstone-free — never closes the issue, removes a "
+            "worktree, or deletes a branch). Fail-closed preflight (lane actively owns the "
+            "issue; issue explicitly parked; no callback/review/owner/integration due; no "
+            "pending composer; no work in flight; a dirty worktree needs a boundary "
+            "journal). Not an idle-timeout kill. Default is preflight only; --execute "
+            "performs the hibernate. Exits non-zero when blocked. Resume with "
+            "`sublane resume`."
+        ),
+    )
+    sublane_hibernate.add_argument(
+        "--issue", required=True, help="Redmine issue id the lane owns (stays open)"
+    )
+    sublane_hibernate.add_argument(
+        "--lane",
+        required=True,
+        help="Lane label to hibernate (e.g. issue_<id>_<slug>)",
+    )
+    sublane_hibernate.add_argument(
+        "--journal",
+        required=True,
+        help="Redmine journal id that authorizes the hibernate (durable anchor)",
+    )
+    # Durable-record invariants the operator asserts from the Redmine record (each
+    # defaults to unsatisfied so an omitted flag fails closed).
+    for _opt, _dest, _help in (
+        ("--explicitly-parked", "explicitly_parked",
+         "The issue is open and explicitly parked/blocked (not merely idle)."),
+        ("--callbacks-drained", "callbacks_drained",
+         "The lane owes no outstanding coordinator callback."),
+        ("--no-review-pending", "no_review_pending",
+         "The lane has no review awaiting a result."),
+        ("--no-owner-approval-pending", "no_owner_approval_pending",
+         "The lane has no owner close approval pending."),
+        ("--no-integration-pending", "no_integration_pending",
+         "The lane has no integration disposition pending."),
+        ("--no-pending-prompt", "no_pending_prompt",
+         "The lane has no composer input pending."),
+        ("--not-working", "not_working", "The lane has no work in flight."),
+        ("--worktree-clean", "worktree_clean",
+         "The lane's worktree has no uncommitted diff (no boundary journal needed)."),
+        ("--boundary-recorded", "boundary_recorded",
+         "A boundary journal capturing the dirty worktree's diff / resume next-action "
+         "is recorded (required when the worktree is not clean)."),
+    ):
+        sublane_hibernate.add_argument(
+            _opt, dest=_dest, action="store_true", help=_help
+        )
+    sublane_hibernate.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Perform the hibernate: CAS the disposition (active->hibernated) and release "
+            "the lane's managed processes. Without it this is preflight only (no mutation)."
+        ),
+    )
+    add_repo_option(sublane_hibernate)
+    _add_lifecycle_json(sublane_hibernate)
+    sublane_hibernate.set_defaults(func=cmd_sublane_hibernate)
+
+    register_sublane_resume_parser(sublane_sub)
+    register_sublane_quarantine_parser(sublane_sub)
 
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
     # is the opt-in write side: it mints durable herdr assigned names for the
@@ -729,7 +919,7 @@ def register_lifecycle(sub) -> None:
         "--agent",
         dest="agent",
         action="append",
-        choices=["claude", "codex"],
+        choices=agent_choices,
         help="Provider agent to prepare (repeatable). Default: both claude and codex.",
     )
     herdr_session_start.add_argument(
@@ -743,8 +933,34 @@ def register_lifecycle(sub) -> None:
         dest="dry_run",
         action="store_true",
         help="Plan only: report which slots would launch / adopt without any side "
-        "effect (no launch, no rename).",
+        "effect — no launch, no rename, and no workspace registration / anchor write "
+        "(Redmine #13595). An unregistered workspace fails closed with actionable "
+        "guidance rather than being registered.",
     )
     add_repo_option(herdr_session_start)
     _add_lifecycle_json(herdr_session_start)
     herdr_session_start.set_defaults(func=cmd_herdr_session_start)
+
+    # `agent-attest` is the managed-launch wrapper (Redmine #13637): the launch
+    # execs the provider THROUGH this command so the agent's own process can
+    # self-inspect its injected identity env before `exec`ing the provider, and
+    # record a generation-bound startup self-attestation. It is not an operator
+    # command — it is the wrapper the launch argv points at.
+    herdr_agent_attest = herdr_sub.add_parser(
+        "agent-attest",
+        help=(
+            "Managed-launch internal wrapper (Redmine #13637): self-inspect this "
+            "agent's injected identity env, record a generation-bound startup "
+            "self-attestation, then exec the provider given after `--`."
+        ),
+    )
+    herdr_agent_attest.add_argument("--assigned-name", dest="assigned_name", default="")
+    herdr_agent_attest.add_argument("--workspace-id", dest="workspace_id", default="")
+    herdr_agent_attest.add_argument("--role", dest="role", default="")
+    herdr_agent_attest.add_argument("--lane", dest="lane", default="")
+    herdr_agent_attest.add_argument(
+        "provider_argv",
+        nargs=argparse.REMAINDER,
+        help="The provider command to exec, after a `--` separator.",
+    )
+    herdr_agent_attest.set_defaults(func=cmd_herdr_agent_attest)

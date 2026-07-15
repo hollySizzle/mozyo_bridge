@@ -217,14 +217,27 @@ class RetireAssertions:
     These mirror the #12604 :class:`RetireInvariants`: facts no probe can infer, supplied
     by the coordinator from the Redmine issue / journal state. Every default is the
     unsatisfied (safe-failing) value, so a caller that omits a flag fails closed.
+
+    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
+    ``owner_approval_present`` assertion / ``--owner-approved`` flag — routine
+    green-preflight retirement is coordinator authority. ``issue_closed`` abstracts over the
+    close contract that applied to the issue type (a child Task/Test/Bug via ``task_close``
+    with no owner_close_approval; a US / standalone issue via an owner_close_approval-backed
+    close — central preset ``US-Level Audit Model``); retire never re-collects the owner
+    close approval. An outstanding owner-approval-waiting still blocks via
+    ``callbacks_drained``.
     """
 
     issue_closed: bool = False
-    owner_approval_present: bool = False
     callbacks_drained: bool = False
     verification_passed: bool = False
     durable_record_recorded: bool = False
     target_identity_known: bool = False
+    #: The latest review generation is admissible for integration (#13518 review R2-F7 / R3-F2).
+    #: FAIL-CLOSED default: the actual `sublane retire` integration decision no longer default-admits
+    #: a stale last-write-wins approval — the coordinator must positively assert (from the durable
+    #: review journals) OR the CLI must measure it via `evaluate_integration_admissible`.
+    latest_generation_admissible: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +416,9 @@ class SublaneRetireUseCase:
             target_identity_known=assertions.target_identity_known,
             verification_passed=assertions.verification_passed,
             issue_closed=assertions.issue_closed,
-            owner_approval_present=assertions.owner_approval_present,
             callbacks_drained=assertions.callbacks_drained,
             durable_record_recorded=assertions.durable_record_recorded,
+            latest_generation_admissible=assertions.latest_generation_admissible,
         )
         decision = decide_retire_integration(policy, preflight)
         result = preflight_sublane_retire(
@@ -621,14 +634,68 @@ def cmd_sublane_create(args: argparse.Namespace) -> int:
     return 1 if outcome.plan.status == CREATE_BLOCKED else 0
 
 
+def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
+    """Resolve the latest-generation integration admissibility for a retire (#13518 R3-F2).
+
+    Priority: (1) a coordinator-supplied durable review observation (``--review-generation-json``)
+    is MEASURED at action-time through the pure review-generation fence
+    (:func:`...review_generation.evaluate_integration_admissible`) — an unreadable / malformed file
+    or an inadmissible latest generation fails closed. (2) Otherwise the operator's durable-record
+    assertion (``--latest-generation-admissible``). (3) Absent both, ``False`` (fail-closed) — the
+    actual integration decision never default-admits a stale last-write-wins approval.
+    """
+    path = (getattr(args, "review_generation_json", None) or "").strip()
+    if path:
+        try:
+            import json
+
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (  # noqa: E501
+                ReviewDecision,
+                ReviewGeneration,
+                evaluate_integration_admissible,
+            )
+
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            gen = ReviewGeneration(
+                issue=str(raw.get("issue", "")),
+                review_request_journal=str(raw.get("review_request_journal", "")),
+                target_head=str(raw.get("target_head", "")),
+            )
+            decisions = [
+                ReviewDecision(
+                    generation=ReviewGeneration(
+                        issue=str(d.get("issue", raw.get("issue", ""))),
+                        review_request_journal=str(
+                            d.get("review_request_journal", raw.get("review_request_journal", ""))
+                        ),
+                        target_head=str(d.get("target_head", raw.get("target_head", ""))),
+                    ),
+                    kind=str(d.get("kind", "")),
+                    seq=int(d.get("seq", 0)),
+                    blocking=bool(d.get("blocking", False)),
+                    disposition=str(d.get("disposition", "unresolved")),
+                    journal_id=str(d.get("journal_id", "")),
+                )
+                for d in (raw.get("decisions") or [])
+            ]
+            return bool(evaluate_integration_admissible(gen, decisions).admissible)
+        except Exception:  # noqa: BLE001 - unreadable / malformed durable observation -> fail closed
+            return False
+    return bool(getattr(args, "latest_generation_admissible", False))
+
+
 def cmd_sublane_retire(args: argparse.Namespace) -> int:
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
-        owner_approval_present=bool(getattr(args, "owner_approved", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
         verification_passed=bool(getattr(args, "verified", False)),
         durable_record_recorded=bool(getattr(args, "durable_record", False)),
         target_identity_known=bool(getattr(args, "target_identity_known", False)),
+        # #13518 R3-F2: when a durable review observation is supplied, MEASURE latest-generation
+        # admissibility at action-time via the review-generation fence (unreadable / malformed ->
+        # fail-closed). Otherwise fall back to the operator's durable-record assertion. Absent both
+        # the fence stays fail-closed (False), so the actual integration never default-admits.
+        latest_generation_admissible=_resolve_latest_generation_admissible(args),
     )
     repo_root = _repo_root(args)
     # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the
@@ -696,6 +763,11 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         execute_herdr_retire_close,
         plan_herdr_retire_close,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_gateway_provider,
+        resolve_worker_provider,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
         herdr_workspace_segment,
@@ -741,11 +813,34 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         rows = list_herdr_agent_rows(os.environ)
     except HerdrSessionStartError:
         return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
+    # The managed slots to retire are the providers the repo-local binding assigns to the
+    # lane's gateway / worker roles (Redmine #13569 Increment 2B): default (codex, claude),
+    # byte-identical. A rebound lane retires ITS slots, and a provider the binding does not
+    # assign is never a retire target. An unbound role (impossible under the default) fails
+    # closed to zero-actuation rather than closing a guessed pane.
+    try:
+        managed_roles = (
+            resolve_gateway_provider(str(repo_root)),
+            resolve_worker_provider(str(repo_root)),
+        )
+    except WorkflowProviderUnresolved:
+        return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
+    # Launchability gate (Redmine #13569 R2-F4b): a managed provider that is unknown or not
+    # mechanically launchable is not a lane this retire can trust to identify — a binding to a
+    # non-existent provider must never close a guessed pane. Fail closed to zero-actuation
+    # before planning. Built-in codex/claude are always launchable, so this is byte-identical.
+    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
+        BUILTIN_AGENT_PROVIDER_SNAPSHOT,
+    )
+
+    if not all(BUILTIN_AGENT_PROVIDER_SNAPSHOT.is_launchable(p) for p in managed_roles):
+        return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
     plan = plan_herdr_retire_close(
         rows,
         workspace_id=workspace_id,
         lane_id=lane_label,
         legacy_workspace_id=legacy_token,
+        managed_roles=managed_roles,
     )
     result = execute_herdr_retire_close(plan)
     # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire

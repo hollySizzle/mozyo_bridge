@@ -28,14 +28,41 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_vocab import (
+    builtin_discovery_aliases as _builtin_discovery_aliases,
+    builtin_process_owners as _builtin_process_owners,
+    builtin_provider_ids as _builtin_provider_ids,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import pane_lines
 from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS
 
 
 AGENT_KIND_CLAUDE = "claude"
 AGENT_KIND_CODEX = "codex"
+# The `unknown` sentinel is a resolver *outcome*, never a provider (a profile may not register
+# it, R1-F3). The built-in vocabulary is read lazily through `agent_provider_vocab` — never
+# frozen at import, never a module-level e_110->e_140 edge (Redmine #13569 R2-F1 / j#76969).
 AGENT_KIND_UNKNOWN = "unknown"
-AGENT_KINDS = frozenset({AGENT_KIND_CLAUDE, AGENT_KIND_CODEX, AGENT_KIND_UNKNOWN})
+
+
+def agent_kinds(snapshot: AgentProviderRuntimeSnapshot | None = None) -> frozenset[str]:
+    """The known agent kinds — provider ids plus the ``unknown`` sentinel. ``snapshot``
+    resolves from an injected snapshot; ``None`` reads the built-in providers lazily (Redmine
+    #13569 R2-F1 — never an import-time global / no global patch needed to compose synthetic).
+    """
+    ids = _builtin_provider_ids() if snapshot is None else snapshot.provider_ids
+    return frozenset(ids) | {AGENT_KIND_UNKNOWN}
+
+
+def __getattr__(name: str):
+    """Lazy ``AGENT_KINDS`` (PEP 562, Redmine #13569 R2-F1) — computed on first access, not
+    frozen at import; importers get the same value with no import-time ``e_140`` edge."""
+    if name == "AGENT_KINDS":
+        return agent_kinds()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Role identity model (Redmine #11822). Agent role is not the window name nor a
 # single pane option — it is the *output of a resolver* over the pane's runtime
@@ -64,11 +91,11 @@ CONFIDENCE_NONE = "none"
 VIEW_KIND_COCKPIT_PANE = "cockpit_pane"
 VIEW_KIND_NORMAL_WINDOW = "normal_window"
 
-# Foreground process basenames that *weakly* hint a role. `node` / versioned
-# native binaries are receiver-agnostic (both CLIs are node-based), so they are
-# deliberately NOT here — a weak hint must still name the role to be usable, and
-# automatic handoff never targets on a weak hint regardless.
-_PROCESS_ROLE_HINTS = {AGENT_KIND_CLAUDE: AGENT_KIND_CLAUDE, AGENT_KIND_CODEX: AGENT_KIND_CODEX}
+# Foreground process basenames that *weakly* hint a role are the profiles' declared
+# `process_names` (Redmine #13441), read lazily through `_builtin_process_owners()` on the
+# no-injected-snapshot path. `node` / versioned native binaries are receiver-agnostic (both
+# CLIs are node-based), so they are deliberately NOT here — a weak hint must still name the
+# role to be usable, and automatic handoff never targets on a weak hint regardless.
 
 
 @dataclass(frozen=True)
@@ -201,12 +228,20 @@ def infer_repo_root(cwd: str) -> str | None:
     return None
 
 
-def classify_agent_kind(window_name: str) -> str:
-    if window_name == AGENT_KIND_CLAUDE:
-        return AGENT_KIND_CLAUDE
-    if window_name == AGENT_KIND_CODEX:
-        return AGENT_KIND_CODEX
-    return AGENT_KIND_UNKNOWN
+def classify_agent_kind(
+    window_name: str,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> str:
+    """The provider a window name names, or ``unknown`` (Redmine #13441).
+
+    Resolves through the profiles' declared discovery aliases, so a new same-protocol
+    provider is recognized by adding a profile entry rather than a branch here. ``snapshot``
+    (#13569) resolves against an injected vocabulary; ``None`` keeps the built-in alias map.
+    """
+    if snapshot is not None:
+        return snapshot.provider_for_alias(window_name) or AGENT_KIND_UNKNOWN
+    return _builtin_discovery_aliases().get(window_name, AGENT_KIND_UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -229,14 +264,15 @@ class RoleResolution:
     evidence: tuple[str, ...] = ()
 
 
-def _normalize_role(value: str | None) -> str:
-    """Map a raw role-ish string to a known agent kind, else ``unknown``."""
+def _normalize_role(value: str | None, provider_ids: "frozenset[str] | set[str]") -> str:
+    """Map a raw role-ish string to a registered provider id, else ``unknown``.
+
+    The pane option carries a *provider* token checked against the registered vocabulary
+    (Redmine #13441) rather than a hard-coded pair; an unregistered token stays ``unknown``.
+    ``provider_ids`` is the vocabulary — the built-in set, or an injected snapshot's ids.
+    """
     text = (value or "").strip()
-    if text == AGENT_KIND_CLAUDE:
-        return AGENT_KIND_CLAUDE
-    if text == AGENT_KIND_CODEX:
-        return AGENT_KIND_CODEX
-    return AGENT_KIND_UNKNOWN
+    return text if text in provider_ids else AGENT_KIND_UNKNOWN
 
 
 def resolve_agent_role(
@@ -244,6 +280,7 @@ def resolve_agent_role(
     pane_option_role: str | None = None,
     window_name: str | None = None,
     process: str | None = None,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
 ) -> RoleResolution:
     """Resolve a pane's agent role from its runtime facts (pure, Redmine #11822).
 
@@ -265,9 +302,18 @@ def resolve_agent_role(
     panes carry no option). Live tmux state remains the liveness / preflight
     source of truth (#11698) — this resolver decides *identity*, never liveness.
     """
-    option_role = _normalize_role(pane_option_role)
-    window_role = _normalize_role(window_name)
-    process_role = _PROCESS_ROLE_HINTS.get((process or "").strip(), AGENT_KIND_UNKNOWN)
+    if snapshot is not None:
+        provider_ids: "frozenset[str] | set[str]" = snapshot.provider_ids
+        process_role = (
+            snapshot.provider_for_process((process or "").strip()) or AGENT_KIND_UNKNOWN
+        )
+    else:
+        provider_ids = _builtin_provider_ids()
+        process_role = _builtin_process_owners().get(
+            (process or "").strip(), AGENT_KIND_UNKNOWN
+        )
+    option_role = _normalize_role(pane_option_role, provider_ids)
+    window_role = _normalize_role(window_name, provider_ids)
     evidence = (
         f"option={(pane_option_role or '').strip() or '-'}",
         f"window={(window_name or '').strip() or '-'}",
@@ -321,8 +367,16 @@ def parse_location(location: str) -> tuple[str, str, str]:
     return session, window_index, pane_index
 
 
-def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[AgentRecord]:
+def discover_agents(
+    panes: Iterable[dict[str, str]] | None = None,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> list[AgentRecord]:
     """Enumerate every tmux pane and classify by window-name agent rail.
+
+    ``snapshot`` (Redmine #13569 R2-F1) is the injected provider vocabulary the composition
+    threads (the same one the CLI choices came from), so a synthetic provider's panes classify
+    in the runtime handler; ``None`` uses the built-in providers.
 
     ``ambiguous`` flags panes whose ``(session, window_name)`` pair spans
     more than one distinct window index in the same session — the same
@@ -364,6 +418,7 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
             pane_option_role=pane.get("agent_role"),
             window_name=window_name,
             process=pane.get("command"),
+            snapshot=snapshot,
         )
         # Duplicate `(session, window_name)` only makes a pane ambiguous when the
         # window name *is* the role-identity authority (the legacy `window_name`
@@ -907,7 +962,11 @@ class PreflightTarget:
         )
 
 
-def project_preflight_target(pane: dict[str, str]) -> PreflightTarget:
+def project_preflight_target(
+    pane: dict[str, str],
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> PreflightTarget:
     """Project a resolved pane dict onto the canonical preflight ``TargetRecord``.
 
     Pure over the fields :func:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.pane_lines`
@@ -924,6 +983,7 @@ def project_preflight_target(pane: dict[str, str]) -> PreflightTarget:
         pane_option_role=pane.get("agent_role"),
         window_name=pane.get("window_name"),
         process=pane.get("command"),
+        snapshot=snapshot,
     )
     return PreflightTarget(
         pane_id=pane.get("id") or "",

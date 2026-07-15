@@ -66,7 +66,25 @@ WORKFLOW_RUNTIME_STORE_FILENAME = "workflow-runtime.sqlite"
 
 #: Schema version stamped into ``PRAGMA user_version``. Bump only with a migration; an
 #: unrecognized version fails closed rather than dropping the runtime state.
-WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION = 1
+#:
+#: - v1 (#12671): ``workflow_events`` / ``workflow_route_identities`` /
+#:   ``workflow_runtime_meta``.
+#: - v2 (#13520): adds the **callback outbox** (``callback_outbox`` + ``callback_cursor``)
+#:   for the zero-wait callback delivery bounded context. The v1->v2 migration is additive
+#:   and explicit (:meth:`WorkflowRuntimeStore._connect_rw`): it creates the new tables and
+#:   preserves every existing event / route / meta row. A downgraded build that only knows
+#:   an older version fails closed rather than dropping the newer state.
+#: - v3 (#13520 review R2-F5): adds ``workspace_id`` to the callback outbox and widens the UNIQUE
+#:   key to include it, so a shared home DB partitions callback rows / claims by workspace (a
+#:   watcher never claims another workspace's rows). The v2->v3 migration recreates the callback
+#:   table preserving existing rows (``workspace_id=''``).
+WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION = 3
+
+#: The recognized schema versions this build can read. A write always migrates up to the
+#: current version; a read tolerates any recognized version (a v1 DB is still readable for
+#: its legacy tables, and its callback reads simply return empty until the first callback
+#: write migrates it). Anything else (a newer / foreign version) fails closed.
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 #: The recognized advisory meta keys (the scalar inputs to the admission decision).
 META_READY_INDEPENDENT = "ready_independent_work"
@@ -137,6 +155,168 @@ CREATE TABLE IF NOT EXISTS workflow_runtime_meta (
     updated_at TEXT NOT NULL
 )
 """
+
+# ---------------------------------------------------------------------------
+# Callback outbox (schema v2, Redmine #13520). The zero-wait callback delivery
+# bounded context: a handoff-worthy durable gate transition becomes a callback to
+# fire exactly once (a coordinator new-turn trigger), idempotency-fenced so a
+# watcher restart / duplicate herdr-or-Redmine event / concurrent claimer can never
+# produce a duplicate delivery. Deliberately a **separate bounded context** from the
+# dispatch outbox fence (:mod:`...dispatch_outbox_fence`): different DB / table / key,
+# because worker send authority and callback delivery are distinct concerns
+# (#13520 design answer j#75098 Q3). What is reused is the *pattern* — ``BEGIN
+# IMMEDIATE`` reserve, a UNIQUE idempotency key, a closed state vocabulary, and a
+# fail-closed migration — not the fence's store.
+# ---------------------------------------------------------------------------
+
+#: The closed callback-outbox state vocabulary (#13520 design answer j#75098 Q3).
+CALLBACK_PENDING = "pending"  # classified + enqueued; awaiting a delivery claim
+CALLBACK_INFLIGHT = "inflight"  # claimed by a processor; ``send_attempted`` tracks the send edge
+CALLBACK_DELIVERED = "delivered"  # the one send was positively delivered
+CALLBACK_UNCERTAIN = "uncertain"  # send outcome unknown (ACK-only / crash-after-send) -> no auto-retry
+CALLBACK_DEAD_LETTER = "dead_letter"  # unclassified, or retries exhausted -> fresh-turn sweep + diagnostic
+CALLBACK_ABSENT = "absent"  # sentinel: no row for the key (never persisted)
+
+CALLBACK_STATES = frozenset(
+    {
+        CALLBACK_PENDING,
+        CALLBACK_INFLIGHT,
+        CALLBACK_DELIVERED,
+        CALLBACK_UNCERTAIN,
+        CALLBACK_DEAD_LETTER,
+    }
+)
+
+#: The default bounded retry budget for a *deterministic not-sent* delivery failure. Only a
+#: pre-injection / known-not-sent failure consumes an attempt; an ACK-only / uncertain
+#: outcome never auto-retries (it goes straight to :data:`CALLBACK_UNCERTAIN`).
+CALLBACK_DEFAULT_MAX_ATTEMPTS = 3
+
+_CALLBACK_OUTBOX_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS callback_outbox (
+    source              TEXT NOT NULL,
+    issue               TEXT NOT NULL,
+    journal             TEXT NOT NULL,
+    normalized_gate     TEXT NOT NULL,
+    callback_route      TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    max_attempts        INTEGER NOT NULL DEFAULT 3,
+    send_attempted      INTEGER NOT NULL DEFAULT 0,
+    claim_token         TEXT NOT NULL DEFAULT '',
+    claimed_at          TEXT NOT NULL DEFAULT '',
+    notification_kind   TEXT NOT NULL DEFAULT '',
+    notification_summary TEXT NOT NULL DEFAULT '',
+    gate_mismatch       INTEGER NOT NULL DEFAULT 0,
+    detail              TEXT NOT NULL DEFAULT '',
+    payload             TEXT NOT NULL DEFAULT '',
+    workspace_id        TEXT NOT NULL DEFAULT '',
+    target_lane         TEXT NOT NULL DEFAULT '',
+    target_receiver     TEXT NOT NULL DEFAULT '',
+    target_generation   TEXT NOT NULL DEFAULT '',
+    seq                 INTEGER NOT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    UNIQUE(workspace_id, source, issue, journal, normalized_gate, callback_route)
+)
+"""
+
+
+def _migrate_callback_outbox_workspace(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: add ``workspace_id`` to the callback outbox + widen the UNIQUE key (#13520 R2-F5).
+
+    A callback outbox created before the review-R2-F5 fix keys rows on
+    ``(source, issue, journal, normalized_gate, callback_route)`` with NO workspace authority, so a
+    shared home DB lets one workspace's watcher claim / collide with another's rows. Widening the
+    UNIQUE key to include ``workspace_id`` requires recreating the table (SQLite cannot alter a
+    table-level UNIQUE). Data-preserving: existing rows copy across with ``workspace_id=''`` (they
+    were unique on the old sub-key, so they stay unique under the widened key). Idempotent — a no-op
+    once ``workspace_id`` is present.
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()]
+    if not cols or "workspace_id" in cols:
+        return  # table absent (created fresh by the caller) or already migrated
+    conn.execute("ALTER TABLE callback_outbox RENAME TO _callback_outbox_pre_v3")
+    conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)  # new table: workspace_id + widened UNIQUE
+    shared = ", ".join(cols)  # every old column exists in the new table (a superset)
+    conn.execute(
+        f"INSERT INTO callback_outbox ({shared}) SELECT {shared} FROM _callback_outbox_pre_v3"
+    )
+    conn.execute("DROP TABLE _callback_outbox_pre_v3")
+
+#: The callback-outbox ownership columns (Redmine #13520 review F2). A ``claim_token`` +
+#: ``claimed_at`` lease fences a claim so a concurrent processor cannot reclaim an actively
+#: worked row and double-send. Added defensively to a callback table that predates them.
+_CALLBACK_OWNERSHIP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("claim_token", "TEXT NOT NULL DEFAULT ''"),
+    ("claimed_at", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _ensure_callback_ownership_columns(conn: sqlite3.Connection) -> None:
+    """Add the F2 ownership columns to a callback table that lacks them (idempotent).
+
+    A callback outbox created before the #13520 review-F2 fix has no ``claim_token`` /
+    ``claimed_at``. ``ALTER TABLE ADD COLUMN`` is additive and preserves rows; it is a no-op
+    once present. Guarded by ``PRAGMA table_info`` so it never errors on an already-migrated DB.
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+    for name, decl in _CALLBACK_OWNERSHIP_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
+
+
+#: The callback-outbox durable target-tuple columns (Redmine #13683 review R4-F2). The row holds
+#: the intended target ``lane`` / ``receiver`` (binding-resolved provider) and a ``generation`` /
+#: correlation seam, so the background_service delivery authority binds the re-resolved live target
+#: to the row's durable expectation (a wrong lane / receiver / unknown generation fails closed).
+#: ``target_generation`` is the seam #13684's correlated review-result routing populates; #13683
+#: fixes the field so the dependency does not invert (j#77069). Added defensively (additive).
+_CALLBACK_TARGET_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("target_lane", "TEXT NOT NULL DEFAULT ''"),
+    ("target_receiver", "TEXT NOT NULL DEFAULT ''"),
+    ("target_generation", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _ensure_callback_target_columns(conn: sqlite3.Connection) -> None:
+    """Add the R4-F2 durable target-tuple columns to a callback table that lacks them (idempotent).
+
+    ``ALTER TABLE ADD COLUMN`` is additive and preserves rows; a no-op once present. An older build
+    that does not read these columns is unaffected (they simply default ``''``), so the change is
+    backward / forward compatible without a container version bump (same posture as the ownership
+    columns).
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+    for name, decl in _CALLBACK_TARGET_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
+
+_CALLBACK_CURSOR_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS callback_cursor (
+    source     TEXT PRIMARY KEY,
+    cursor     TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+#: The columns a persisted callback outbox row carries.
+CALLBACK_COLUMNS: tuple[str, ...] = (
+    "source",
+    "issue",
+    "journal",
+    "normalized_gate",
+    "callback_route",
+    "state",
+    "attempts",
+    "max_attempts",
+    "send_attempted",
+    "notification_kind",
+    "notification_summary",
+    "gate_mismatch",
+    "detail",
+    "payload",
+)
 
 
 class WorkflowRuntimeStoreError(RuntimeError):
@@ -250,21 +430,50 @@ class WorkflowRuntimeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
         conn.execute("PRAGMA busy_timeout = 2000")
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         if version == 0:
+            # Fresh file: create the full v2 schema (all tables) and stamp the version.
             conn.execute(_EVENTS_TABLE_SQL)
             conn.execute(_ROUTE_TABLE_SQL)
             conn.execute(_META_TABLE_SQL)
+            conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
+            conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
             conn.execute(
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
             )
             conn.commit()
-        elif version != WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
+        elif version in (1, 2):
+            # v1 -> v3 (#13520): a v1 DB has no callback tables — create them fresh (the current
+            # SQL already carries workspace_id + the widened UNIQUE). A v2 DB has the callback
+            # table without workspace_id — recreate it preserving rows (workspace migration). Both
+            # leave event / route / meta rows untouched (data preservation) and re-stamp the
+            # version. `CREATE TABLE IF NOT EXISTS` is a no-op for a table already present.
+            conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
+            conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
+            _ensure_callback_ownership_columns(conn)
+            _ensure_callback_target_columns(conn)
+            _migrate_callback_outbox_workspace(conn)
+            conn.execute(
+                f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
+            )
+            conn.commit()
+        elif version == WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
+            # Already current; the tables exist. A defensive IF-NOT-EXISTS keeps a DB that
+            # somehow lost a table self-healing without touching data; the F2 ownership columns
+            # and the R2-F5 workspace_id migration are idempotently applied if this DB predates
+            # them (the version guard alone cannot distinguish a partially-migrated file).
+            conn.execute(_CALLBACK_OUTBOX_TABLE_SQL)
+            conn.execute(_CALLBACK_CURSOR_TABLE_SQL)
+            _ensure_callback_ownership_columns(conn)
+            _ensure_callback_target_columns(conn)
+            _migrate_callback_outbox_workspace(conn)
+            conn.commit()
+        else:
             conn.close()
             raise WorkflowRuntimeStoreError(
                 f"workflow runtime store {self.path} has unsupported schema version "
                 f"{version}; this build understands "
-                f"{WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}. The DB is left untouched "
+                f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The DB is left untouched "
                 f"(downgrade-safe); migrate with a newer build or move it aside."
             )
         return conn
@@ -285,12 +494,12 @@ class WorkflowRuntimeStore:
             raise WorkflowRuntimeStoreError(
                 f"workflow runtime store {self.path} is unreadable: {exc}"
             ) from exc
-        if version != WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION:
+        if version not in _RECOGNIZED_SCHEMA_VERSIONS:
             conn.close()
             raise WorkflowRuntimeStoreError(
                 f"workflow runtime store {self.path} has unsupported schema version "
                 f"{version}; this build understands "
-                f"{WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}."
+                f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}."
             )
         return conn
 
@@ -521,8 +730,66 @@ class WorkflowRuntimeStore:
         finally:
             conn.close()
 
+    #: Reserved ``workflow_runtime_meta`` key prefix for durable review-generation leases (#13518
+    #: review R3-F2). Kept out of the advisory meta vocabulary so the review-generation lease and
+    #: the runtime scalars never collide.
+    _GENERATION_LEASE_PREFIX = "genlease:"
+
+    def acquire_generation_lease(self, key: str, holder: str, *, now: Optional[str] = None) -> bool:
+        """Atomically CAS-acquire a durable single-consumer review-generation lease (#13518 R3-F2).
+
+        ``BEGIN IMMEDIATE`` serializes concurrent acquirers over the shared
+        ``workflow-runtime.sqlite``: the lease under ``key`` is granted iff it is unheld OR already
+        held by the same ``holder`` (idempotent re-acquire); a DIFFERENT holder is refused. This is
+        the durable review-decision-commit fence — at most one consumer ever commits a given review
+        generation's approval — complementing the callback-transport outbox fence. Returns True iff
+        this ``holder`` now holds the lease.
+        """
+        h = str(holder or "").strip()
+        if not h:
+            return False
+        self.ensure_schema()
+        stamp = now or _utc_now()
+        row_key = f"{self._GENERATION_LEASE_PREFIX}{key}"
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 2000")
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "SELECT value FROM workflow_runtime_meta WHERE key=?", (row_key,)
+            ).fetchone()
+            if cur is None:
+                conn.execute(
+                    "INSERT INTO workflow_runtime_meta (key, value, updated_at) VALUES (?, ?, ?)",
+                    (row_key, h, stamp),
+                )
+                conn.execute("COMMIT")
+                return True
+            conn.execute("ROLLBACK")
+            return str(cur[0]) == h
+        finally:
+            conn.close()
+
+    def generation_lease_holder(self, key: str) -> Optional[str]:
+        """Return the current durable review-generation lease holder for ``key`` (or ``None``)."""
+        row_key = f"{self._GENERATION_LEASE_PREFIX}{key}"
+        conn = self._connect_ro()
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT value FROM workflow_runtime_meta WHERE key=?", (row_key,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return str(row[0]) if row is not None else None
+
     def read_meta(self) -> dict[str, str]:
-        """Return the persisted advisory meta as ``{key: value}``; empty if absent."""
+        """Return the persisted advisory meta as ``{key: value}``; empty if absent.
+
+        The reserved review-generation lease rows (``genlease:`` prefix, #13518 R3-F2) are excluded
+        so they never leak into the advisory runtime meta vocabulary.
+        """
         conn = self._connect_ro()
         if conn is None:
             return {}
@@ -532,7 +799,19 @@ class WorkflowRuntimeStore:
             ).fetchall()
         finally:
             conn.close()
-        return {r[0]: r[1] for r in rows}
+        return {
+            r[0]: r[1] for r in rows if not str(r[0]).startswith(self._GENERATION_LEASE_PREFIX)
+        }
+
+    def ensure_schema(self) -> None:
+        """Create / migrate the container to the current schema version (idempotent).
+
+        Public so the sibling callback-outbox bounded context
+        (:mod:`mozyo_bridge.core.state.callback_outbox`), which shares this same
+        ``workflow-runtime.sqlite`` file, can drive the v1->v2 migration through the one
+        schema authority before opening its own manual-transaction connection.
+        """
+        self._connect_rw().close()
 
 
 __all__ = (
@@ -544,6 +823,15 @@ __all__ = (
     "META_OWNER_OR_RELEASE_GATE",
     "EVENT_COLUMNS",
     "ROUTE_COLUMNS",
+    "CALLBACK_COLUMNS",
+    "CALLBACK_PENDING",
+    "CALLBACK_INFLIGHT",
+    "CALLBACK_DELIVERED",
+    "CALLBACK_UNCERTAIN",
+    "CALLBACK_DEAD_LETTER",
+    "CALLBACK_ABSENT",
+    "CALLBACK_STATES",
+    "CALLBACK_DEFAULT_MAX_ATTEMPTS",
     "WorkflowRuntimeStoreError",
     "workflow_runtime_store_path",
     "WorkflowEventRow",

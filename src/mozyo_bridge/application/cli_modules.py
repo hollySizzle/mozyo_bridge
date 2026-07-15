@@ -38,6 +38,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import cli_handoff
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import cli_observability
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application import cli_state
+from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application import (
+    cli_onboarding,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application import cli_cockpit
 from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application import cli_presentation
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application import cli_docs_scaffold
@@ -206,6 +209,13 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
     ),
     (
         CliFamily(
+            name="onboarding",
+            summary="deterministic project onboarding inspect/plan/apply/resume family.",
+        ),
+        cli_onboarding.register,
+    ),
+    (
+        CliFamily(
             name="observability",
             summary="events/otel observability family.",
         ),
@@ -259,10 +269,11 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
         CliFamily(
             name="tests",
             summary=(
-                "test verification helpers family (Redmine #12752 / #12754): "
-                "module-to-test impact resolver (`tests resolve`) and test "
-                "runtime profiling against the slow-test budget (`tests profile`) "
-                "for local/CI reuse. Read-only; no routing, approval, or close "
+                "test verification helpers family (Redmine #12752 / #12754 / "
+                "#13733): module-to-test impact resolver (`tests resolve`), test "
+                "runtime profiling against the slow-test budget (`tests profile`), "
+                "and the isolated-shard parallel runner (`tests parallel`) for "
+                "local/CI reuse. Read-only; no routing, approval, or close "
                 "authority."
             ),
         ),
@@ -325,7 +336,7 @@ def load_composition_config(
     return config
 
 
-def compose_parser(sub, config: Optional[CliCompositionConfig] = None) -> None:
+def compose_parser(sub, config: Optional[CliCompositionConfig] = None, *, snapshot=None) -> None:
     """Compose the top-level subparsers from the registry, in order.
 
     Walks :data:`BUILTIN_CLI_MODULE_REGISTRY` in registration order, resolving
@@ -336,9 +347,23 @@ def compose_parser(sub, config: Optional[CliCompositionConfig] = None) -> None:
     ``config`` may only select/deselect non-mandatory families; the registry
     rejects a config that tries to disable a mandatory (core / authority-bearing)
     family, so owner approval / review / close / send safety stay non-configurable.
+
+    ``snapshot`` (Redmine #13569 R1-F1) is the single agent-provider runtime snapshot the
+    composition root built. It is threaded to every registrar whose signature declares a
+    ``snapshot`` keyword — the provider-vocabulary registrars (``agents`` / ``handoff`` /
+    lifecycle ``init`` + ``herdr`` choices) — so their ``--agent`` / ``--to`` choices come
+    from the ONE injected snapshot rather than each reading an import-time global. A
+    registrar that does not take ``snapshot`` is called unchanged, so this is byte-identical
+    for every non-provider family.
     """
+    import inspect
+
     for name in BUILTIN_CLI_MODULE_REGISTRY.resolve_enabled(config):
-        _REGISTRARS[name](sub)
+        registrar = _REGISTRARS[name]
+        if snapshot is not None and "snapshot" in inspect.signature(registrar).parameters:
+            registrar(sub, snapshot=snapshot)
+        else:
+            registrar(sub)
 
 
 __all__ = (

@@ -15,6 +15,17 @@ backend=herdr の workspace では、旧 tmux-era の semantic selection / pane 
   - `agents targets`: backend=herdr で tmux-era primitive/debug 面である旨を stderr note で明示 (listing 自体は read-only で維持)。
 - tmux backend の workspace では上記 guard は一切発火せず、出力は byte-invariant。
 
+## routable lane state の確認と runtime fingerprint (次 action 前, #13543)
+
+session 移行 bundle や journal の `target lane` label を、live で routable な herdr lane と同一視しない。lane に dispatch / handoff / retire の next-action を取る前に、次を **別 state** として確認する (契約正本: `spec-session-continuity-user-harness` `### Routable lane state の区別` / `### Runtime fingerprint gate (backend=herdr)`)。
+
+1. **Git branch/worktree**: `git branch --list issue_<id>_<slug>` / worktree の存在。branch/worktree が在っても routable lane を意味しない。
+2. **registered lane metadata**: `sublane list --lane <label> --json` の `sublanes`。非空なら registered、`sublanes: []` なら **lane-unregistered** (branch が在れば branch-only)。この空振りを「dispatch 送達失敗」と誤帰着しない。
+3. **live routable runtime**: gateway/worker の live slot 実測 (`herdr agent read <pane>` / lane metadata の pane id)。metadata registered でも live slot が無ければ **runtime-unavailable**。
+4. **runtime fingerprint**: `mozyo-bridge doctor runtime` を read-only 実行。installed CLI が source checkout の herdr preflight 等を欠く (`status: drifted` / probe mismatch) なら、skew を durable record に fail-closed 記録し、installed CLI surface の出力を next-action の根拠にしない。以降の lane discovery / dispatch は repo-local source CLI (`PYTHONPATH=src python3 -m mozyo_bridge <args>`) で行う (installed CLI upgrade は owner-gated)。
+
+再発事例 (#13543 / #13535 j#75183): installed `mozyo-bridge 0.10.0` が #13446 herdr preflight を欠き、backend=herdr でも `agents targets` を通常面のように tmux 候補列挙した。coordinator が runtime fingerprint を照合せず、その空振りを handoff blocker 理由にした。正しくは `sublane list --lane issue_13535_session_transition --json` = `sublanes: []` (lane-unregistered / branch-only) であり、tmux candidate 空振りではない。
+
 ## 前提
 
 - 実行 CLI: **installed CLI (pipx の `mozyo-bridge` / `mozyo`) が標準** (#13167 で herdr lane 世代へ追いつき済み、#13379 で installed CLI のみでの lane 運用完結を確認)。installed CLI が最新 origin/main と版ズレしている間に限り、fallback として **repo-local CLI** を使う。fallback の標準形は package 直の module 実行 (`src/mozyo_bridge/__main__.py` 経由):
@@ -31,6 +42,17 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 - lane の**配置** (**#13380 dedicated sublane host workspace**): lane slot は coordinator pair の project workspace ではなく、**専用 sublane host workspace** に着地する。herdr workspace 数は「project 1 + sublane host 1」の定数 (lane 数に比例しない)。host は最初の lane 作成時に on demand で mint され (operator 可読 label `<main-checkout名>_sublanes`、cosmetic のみ)、lane ゼロで herdr が自動 close する (残骸 husk は生じない)。#13380 以前に作成された coordinator workspace 同居 lane は heal では同居のまま (pair 不分裂優先)、retire で自然 drain する。
 - lane の**細分化** (**#13411 lane=tab / gateway+worker=split**): sublane host workspace 内で、非 default lane ごとに専用 herdr tab を割り当て、gateway + worker を同 tab 内 split pair として並置する。7 lane = 14 loose pane ではなく 7 tab に整理される (owner intent #13377 j#73654 の密度懸念に対応)。tab join は live inventory の `tab_id` のみが authority (label は cosmetic、lane key 由来)。fresh lane は `herdr tab create` で tab を mint、heal / 混在 adopt+launch は生存 slot の `tab_id` を読んで**同一 tab へ復帰** (pair 不分裂)。tab root pane は base pane と同型で全 launch 成功後に reclaim、tab 内最終 pane close で herdr が tab を自動消滅させる。retire は assigned-name の `pane close` のままで tab 配置に非依存 (最終 pane close で tab / host が自動消滅)。identity / route / projection は不変。pre-#13411 に loose pane で起動された legacy lane は heal でも loose のまま、full relaunch で tab へ移行する。owner は display knob (#12391 範疇) としていつでも override 可。
 - **legacy lane (pre-#13377)**: 旧 model の lane は独自 herdr workspace (`wt_<hash>` segment, default lane) を持つ。読み (list / status / dispatch-worker) と retire は互換対応済み。新規 create は常に shared model。legacy lane への coordinator dispatch は互換対象外 — 生かしたまま運用せず、順次 retire する。
+
+## `sublane list` の metadata / runtime 読み分け
+
+`sublane list --lane <label> --json` は lane metadata store と live Herdr inventory の read-only projectionであり、`sublanes` が非空という事実だけでは metadata record の存在を証明しない。shared-model lane は metadata record がなくても live assigned-name rowから表示される。
+
+- row の `stale_hints` が `lane_record_missing` を含む: metadata record は absent。gateway / worker locatorがあれば live slotは別軸で presentになり得る。この組合せのprimary verdictは `lane-unregistered` とし、runtime stateを別途併記する。
+- `lane_slots_missing` を含む: active metadata recordは presentだが、対応するlive managed slotは absent (`runtime-unavailable`)。
+- `sublanes: []`: 対象laneのmetadata recordもlive rowもprojectionに現れていない。Git branch/worktreeの有無はGitから別に測る。
+- store / projectionがunreadable、またはrecord-backedか判別不能: metadataは`unknown`としてfail-closedにする。
+
+dispatch / handoff / retire可否は、Git branch/worktree、metadata record、gateway+workerのlive routabilityを独立して記録してから判断する。完全なstate / verdict語彙は [[spec-session-continuity-user-harness]] `### Routable lane state の区別` を正本とする。
 
 ## lane 作成 (標準形)
 
@@ -65,10 +87,22 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 - relaunch した worker は「⏵⏵ auto mode on」footer を確認 (permission parity #13360)。旧 pane は先に `herdr pane close`。
 - relaunch 後、gateway に worker route の再駆動を指示 (worker の pane id は変わるが解決は assigned name 経由で自動追従)。
 
+## Host reboot recovery (#13518)
+
+host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit するが、`herdr agent list` の durable assigned-name row は残る (foreground は `-zsh` のみ、detected agent 無し)。**複数正本を照合する fail-closed recovery reconciler** を使い、DB 単独を authority にしない (設計正本: #13520 j#75276)。
+
+- **state を混同しない (authority matrix, #13520 j#75276)**: Redmine issue/journal = workflow gate と durable anchor / Git worktree・ref・diff = code と dirty state / `registry.sqlite` + repo-local anchor = workspace identity / `state.sqlite` = lane metadata・callback outbox の復元材料 (workflow truth ではない) / herdr assigned-name + live inventory = runtime liveness / launch-time sender env = 再 attest する process-local input (永続 authority にしない)。
+- **composite liveness で false-positive adopt を防ぐ (#13518 j#75329)**: `herdr session-start` の adopt 判定は assigned `name` 一致だけでは不十分。`agent list` row を `classify_named_slot` (`domain/herdr_slot_liveness.py`) で複合判定し、detected agent 不在 + `agent_status=unknown` の **shell residue** は `stale_named_slot` として outcome `stale` で surface する (blind adopt しない / 名前が残っているため launch も上書きしない)。detected agent が名指しされた live slot は従来どおり adopt、liveness signal を一切持たない minimal row も従来どおり adopt (self-heal 不変)。
+- **dirty worktree を never-clobber**: recovery 中に lane worktree を reset / stash / delete / recreate しない。未 commit 成果は保全して同一 durable anchor から resume する (12-file dirty diff を SHA-256 で preflight/post-check して不変を確認した実例: #13518 j#75331/j#75334)。
+- **stale pane の close + same-slot relaunch は destructive** ゆえ **owner-approved recovery gate** を要求する (replayable に journal 記録: #13518 j#75331)。承認後は old pane を `herdr pane close` → 同一 lane/worktree へ `herdr session-start` で relaunch (adopt でなく launched になる)。
+- **projection cache を authority にしない**: `sublane status` の `panes=[]` は stale projection でありうる。live assigned-name inventory と矛盾する場合は同じ reconciler で fail-closed に扱い、runtime 不在と即断しない。
+- **env 欠落に注意**: reboot 後に adopt された既存 process は launch-time `MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID` を欠くことがある (session-start adopt は retroactive 注入しない)。正規 dispatch が `missing_sender_env` で fail-closed した場合、registry/anchor/live assigned-name から検証した値を **その 1 回の** high-level dispatch child process にだけ再注入する (env spoof / 別 role 偽装はしない)。Herdr backend では tmux 専用の `mozyo-bridge init` hint は無効 (`TMUX_PANE is not set`)。
+- **fail-closed 条件**: workspace mismatch / missing・unreadable journal / ambiguous live slot / DB と Redmine・Git の矛盾は停止。implementation/close/integration/publish を自動承認しない。
+
 ## lane retire (guarded close)
 
 1. lane worktree の dirty を確認・復元: `git -C <worktree> checkout -- .claude/settings.local.json` (agent harness が触る唯一の常連 dirt)。**dirty のままだと retire は `dirty_worktree` で fail-closed する** (正常動作、#13331 j#73339 guard)。
-2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --owner-approved --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
+2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
 3. worktree / local branch の除去は **統合後** (`git worktree remove` + `git branch -d|-D`)。remote branch は削除しない。
 
 ## 統合 (integration disposition)
@@ -81,6 +115,17 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 
 - **coordinator 宛の handoff callback は coordinator が busy だと `precondition_not_idle` で不達になりがち。durable record (Redmine journal) の poll が正** — stall 判定は必ず journal 再取得 → 結果なし確認 → pane 実測 (`herdr agent read`) → 再送、の順。
 - `blocked` 表示の agent_status は permission prompt / 一時状態の場合がある。pane read で実体確認してから介入する。
+
+### recovery classification（再送・relaunch前）
+
+| observed state | classification | next action | 禁止 |
+| --- | --- | --- | --- |
+| permission prompt / approval wait | `permission_wait` | durable gateと要求権限を照合し、正規approval経路へ | agent死としてrelaunchしない |
+| logout / `authentication required` / process終了 | `agent_auth_unavailable` | credentialを記録せずre-authまたはfresh agent relaunch | routing bug扱い、blind resend |
+| agentはliveだが実command shellに`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`が無い/不整合 | `sender_identity_missing_or_conflict` | dispatchを止め、runtime propagation/proxy gapをdurable化 | 手動env注入、raw Herdr send |
+| assigned-name/lane slotが無い、または複数 | `route_runtime_unavailable` | lane metadata + live inventoryを再取得し、standard relaunch/preflightへ | tmux-era candidate空振りだけで断定 |
+
+`sublane create --execute`がlaunch後にdispatchだけfailした場合は、起動済みslot、未配送anchor、失敗理由をjournalに残す。partial laneを成功扱いせず、同じcommandをblind replayしない (Redmine #13613)。
 
 ## live smoke の原則
 

@@ -240,6 +240,7 @@ class DeliveryRecordUseCase:
         activation: TargetActivationOutcome | None = None,
         submit_lines: list[str] | None = None,
         turn_start_lines: list[str] | None = None,
+        startup_admission_lines: list[str] | None = None,
     ) -> None:
         """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -271,6 +272,7 @@ class DeliveryRecordUseCase:
                     activation=activation,
                     submit_lines=submit_lines,
                     turn_start_lines=turn_start_lines,
+                    startup_admission_lines=startup_admission_lines,
                 )
             )
             if record_format == RECORD_FORMAT_BOTH:
@@ -465,6 +467,7 @@ def deliver_outcome(
     activation: TargetActivationOutcome | None = None,
     submit_lines: list[str] | None = None,
     turn_start_lines: list[str] | None = None,
+    startup_admission_lines: list[str] | None = None,
 ) -> None:
     """Live :meth:`DeliveryRecordUseCase.emit_outcome` (was ``commands._emit_outcome``)."""
     DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_outcome(
@@ -478,6 +481,7 @@ def deliver_outcome(
         activation=activation,
         submit_lines=submit_lines,
         turn_start_lines=turn_start_lines,
+        startup_admission_lines=startup_admission_lines,
     )
 
 

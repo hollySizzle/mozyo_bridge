@@ -24,16 +24,25 @@ posture as the Redmine note transport (#12347) using the documented HTTP API.
 
 Trusted-environment binary boundary
 -----------------------------------
-The herdr executable path comes **only** from the trusted environment
-(:data:`HERDR_BINARY_ENV`), never a repo-local file. Running an arbitrary binary
-is a code-execution vector, so — exactly like the delivery-write credentials
+The herdr executable path comes **only** from the trusted environment, never a
+repo-local file or the current working directory. Running an arbitrary binary is
+a code-execution vector, so — exactly like the delivery-write credentials
 (#12347) — the executable a checkout can cause mozyo to spawn is pinned by the
 daemon environment, not by ``.mozyo-bridge/config.yaml``. The repo-local config
-only *selects* the herdr backend; it can never say *which* binary runs. When
-herdr is selected but the binary is unset or unresolvable,
-:func:`resolve_terminal_transport` fails closed
-(``binary_unconfigured`` / ``binary_not_found``) with **no silent fallback** to
-tmux.
+only *selects* the herdr backend; it can never say *which* binary runs.
+
+The resolution order is the explicit :data:`HERDR_BINARY_ENV` value, then an
+executable ``herdr`` on the trusted ``PATH`` (Redmine #13496 / #13500 — a normal
+owner shell no longer has to export ``MOZYO_HERDR_BINARY`` on every run). If the
+trusted ``PATH`` carries any empty or relative component (a shell would resolve it
+against the cwd) the whole PATH is rejected — never silently skipped — so an
+unsafe trusted environment can never resolve; only an all-absolute PATH is
+searched. The executable bit is verified against the symlink-resolved realpath,
+and more than one *distinct* real executable fails closed rather than guessing.
+When nothing resolves, :func:`resolve_herdr_binary` (and thus
+:func:`resolve_terminal_transport`) fails closed (``binary_unconfigured`` /
+``binary_not_found`` / ``binary_unsafe_path`` / ``binary_ambiguous``) with **no
+silent fallback** to tmux.
 
 Scope (staged seam)
 -------------------
@@ -51,19 +60,23 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from typing import Callable, Mapping, Optional
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
+    BINARY_SOURCE_ENV,
+    BINARY_SOURCE_PATH,
     DEFAULT_PANE_READ_SOURCE,
     PANE_READ_SOURCES,
+    REASON_BINARY_AMBIGUOUS,
     REASON_BINARY_NOT_FOUND,
     REASON_BINARY_UNCONFIGURED,
+    REASON_BINARY_UNSAFE_PATH,
     REASON_INVALID_SOURCE,
     REASON_INVALID_TARGET,
     REASON_TRANSPORT_ERROR,
+    HerdrBinaryResolution,
     PaneReadResult,
     TerminalTransportConfig,
     TerminalTransportError,
@@ -75,6 +88,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: path or a ``PATH``-resolvable name). Read at resolution time; a repo-local
 #: file can never supply it.
 HERDR_BINARY_ENV = "MOZYO_HERDR_BINARY"
+
+#: The bare herdr executable name resolved on the trusted ``PATH`` when the
+#: explicit :data:`HERDR_BINARY_ENV` value is absent (Redmine #13496 resolution
+#: order step 2). The name is fixed — only the *trusted* ``PATH`` decides which
+#: file it is, never a repo-local config.
+HERDR_PATH_NAME = "herdr"
 
 #: How long a single herdr CLI invocation may block before it is treated as a
 #: transport error. Kept short so an unresponsive herdr fails closed quickly.
@@ -326,62 +345,209 @@ def resolve_terminal_transport(
 
     - the default / tmux backend returns ``None`` — herdr transport is off and
       the existing tmux path is untouched;
-    - the herdr backend with no :data:`HERDR_BINARY_ENV` in the trusted
-      environment raises :class:`TerminalTransportError` (``binary_unconfigured``);
-    - the herdr backend with a configured but unresolvable binary (not an
-      executable file and not on ``PATH``) raises
-      :class:`TerminalTransportError` (``binary_not_found``);
+    - the herdr backend resolves the binary via :func:`resolve_herdr_binary`
+      (explicit :data:`HERDR_BINARY_ENV` then trusted ``PATH`` ``herdr``); an
+      unresolvable binary raises :class:`TerminalTransportError`
+      (``binary_unconfigured`` / ``binary_not_found``);
     - the herdr backend with a resolvable binary returns a
-      :class:`HerdrCliTransport` bound to the resolved path.
+      :class:`HerdrCliTransport` bound to the resolved absolute path.
     """
     if config is None:
         config = TerminalTransportConfig.default()
     if not config.herdr_enabled:
         return None
     source_env = env if env is not None else os.environ
+    resolution = resolve_herdr_binary(source_env)
+    return HerdrCliTransport(resolution.path, runner=runner)
+
+
+def resolve_herdr_binary(source_env: Mapping[str, str]) -> HerdrBinaryResolution:
+    """Resolve the herdr executable from the **trusted environment** (fail-closed).
+
+    This is the single trusted-environment resolver every herdr surface shares
+    (transport / discovery / state / turn-start / session-start), so the resolved
+    binary, its provenance, and the fail-closed vocabulary can never drift between
+    them (Redmine #13496). Resolution order:
+
+    1. the explicit :data:`HERDR_BINARY_ENV` value — a path-shaped value must be an
+       existing **absolute** executable file (a relative path-shaped value is
+       cwd-dependent and refused); a bare name is resolved on the trusted ``PATH``;
+    2. an executable :data:`HERDR_PATH_NAME` on the trusted ``PATH`` (Redmine
+       #13500: a normal owner shell that already has ``herdr`` on its ``PATH`` no
+       longer has to export ``MOZYO_HERDR_BINARY`` on every run).
+
+    The repo-local config / cwd is **never** a source (#13502). If the trusted
+    ``PATH`` carries *any* empty or relative component (a shell would resolve it
+    against the cwd) the whole trusted PATH is rejected — the resolver does not
+    silently skip it and search the rest (Redmine #13496 review j#74773). Only an
+    all-absolute PATH is searched. The resolved path is made absolute before it is
+    returned for injection into a launch agent, and the executable bit is verified
+    against the symlink-resolved ``realpath`` so a dangling or non-executable
+    symlink fails closed rather than resolving. Returns a
+    :class:`HerdrBinaryResolution` carrying the absolute path, its realpath, and the
+    source provenance. Raises :class:`TerminalTransportError` with **no** silent
+    fallback to tmux:
+
+    - ``binary_not_found`` — an explicit :data:`HERDR_BINARY_ENV` value that does
+      not resolve to a verified executable;
+    - ``binary_unconfigured`` — no explicit value AND no executable ``herdr`` on the
+      trusted ``PATH`` (nothing to resolve from either trusted source);
+    - ``binary_unsafe_path`` — the trusted PATH (or a path-shaped explicit value)
+      carries an empty / relative, cwd-dependent component (review j#74773);
+    - ``binary_ambiguous`` — more than one *distinct* real executable resolved from
+      the trusted PATH (Redmine #13496 review F2: the resolver never guesses).
+    """
     raw = source_env.get(HERDR_BINARY_ENV)
     binary = raw.strip() if isinstance(raw, str) else ""
-    if not binary:
+    if binary:
+        resolved = _resolve_binary_verbose(binary, source_env)
+        if resolved is None:
+            raise TerminalTransportError(
+                f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as "
+                f"an absolute executable file or on the trusted environment PATH; "
+                f"refusing to fall back to tmux",
+                reason=REASON_BINARY_NOT_FOUND,
+            )
+        path, realpath = resolved
+        return HerdrBinaryResolution(
+            path=path, realpath=realpath, source=BINARY_SOURCE_ENV
+        )
+    # Step 2 (Redmine #13496 / bug #13500): no explicit trusted value — fall back to
+    # an executable ``herdr`` on the *trusted* PATH. The trusted env's ``PATH`` is the
+    # authority (an entry present only on the ambient PATH is never picked up); an env
+    # with no ``PATH`` key (or only empty / relative components) has no absolute search
+    # dir, so ``env={}`` still fails closed as ``binary_unconfigured``.
+    resolved = _search_trusted_path(HERDR_PATH_NAME, source_env)
+    if resolved is None:
         raise TerminalTransportError(
-            f"terminal transport backend 'herdr' is selected but no herdr binary "
-            f"is configured in the trusted environment ({HERDR_BINARY_ENV}); refusing "
+            f"terminal transport backend 'herdr' is selected but no herdr binary is "
+            f"configured in the trusted environment ({HERDR_BINARY_ENV}) and no "
+            f"executable {HERDR_PATH_NAME!r} was found on the trusted PATH; refusing "
             f"to fall back to tmux",
             reason=REASON_BINARY_UNCONFIGURED,
         )
-    resolved = _resolve_binary(binary, source_env)
-    if resolved is None:
+    path, realpath = resolved
+    return HerdrBinaryResolution(
+        path=path, realpath=realpath, source=BINARY_SOURCE_PATH
+    )
+
+
+def _verify_executable(candidate: str) -> Optional[tuple[str, str]]:
+    """Return ``(abspath, realpath)`` iff ``candidate``'s real target is executable.
+
+    The absolute path (:func:`os.path.abspath`, symlink-preserving) is what gets
+    injected into a launch agent (#13496 — never a cwd-relative token); the
+    ``realpath`` (symlinks resolved) is what the executable bit is verified
+    against, so a dangling or non-executable symlink fails closed. ``None`` when
+    the real target is not an existing regular file with the executable bit.
+    """
+    real = os.path.realpath(candidate)
+    if os.path.isfile(real) and os.access(real, os.X_OK):
+        return os.path.abspath(candidate), real
+    return None
+
+
+def _trusted_path_dirs(source_env: Mapping[str, str]) -> list[str]:
+    """The trusted ``PATH``'s components, fail-closed on any unsafe one.
+
+    A supplied env with no ``PATH`` key (or an empty ``PATH`` string) has no search
+    directory and yields ``[]`` — a bare name simply does not resolve (it never
+    falls back to the ambient process ``PATH``). Otherwise **every** component must
+    be a non-empty absolute directory: if *any* component is empty or relative (a
+    shell would resolve it against the cwd) the whole trusted PATH is rejected with
+    ``binary_unsafe_path`` (Redmine #13496 review j#74773). The resolver does not
+    silently drop the unsafe component and search the rest — that would quietly
+    rewrite the caller's PATH semantics and let an unsafe trusted environment
+    resolve. Absolute components are returned order-preserving and de-duplicated.
+    """
+    raw = source_env.get("PATH", "")
+    if not isinstance(raw, str) or raw == "":
+        return []
+    components = raw.split(os.pathsep)
+    unsafe = [comp for comp in components if comp == "" or not os.path.isabs(comp)]
+    if unsafe:
         raise TerminalTransportError(
-            f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as an "
-            f"executable file or on the trusted environment PATH; refusing to fall "
-            f"back to tmux",
-            reason=REASON_BINARY_NOT_FOUND,
+            f"trusted PATH contains {len(unsafe)} unsafe (empty or relative) "
+            f"component(s) {unsafe!r} that a shell would resolve against the current "
+            f"working directory; refusing to resolve herdr from an unsafe PATH (and "
+            f"refusing to fall back to tmux)",
+            reason=REASON_BINARY_UNSAFE_PATH,
         )
-    return HerdrCliTransport(resolved, runner=runner)
+    dirs: list[str] = []
+    for comp in components:
+        if comp not in dirs:
+            dirs.append(comp)
+    return dirs
 
 
-def _resolve_binary(binary: str, source_env: Mapping[str, str]) -> Optional[str]:
-    """Resolve ``binary`` to an executable path, or ``None`` if unresolvable.
+def _search_trusted_path(
+    name: str, source_env: Mapping[str, str]
+) -> Optional[tuple[str, str]]:
+    """Find ``name`` across the trusted PATH's absolute components (fail-closed).
 
-    A path-shaped value (containing a separator) must be an existing executable
-    file; a bare name is resolved on the **trusted environment's** ``PATH`` (the
-    same env the binary token itself came from), not the ambient process ``PATH``
-    — so a supplied trusted env fully determines resolution and an entry present
-    only on the ambient PATH is not silently picked up. A supplied trusted env
-    that carries no ``PATH`` key resolves against an empty path (``''``), so a
-    bare name is unresolvable — it does **not** fall back to the ambient
-    ``PATH``. When ``source_env`` is the ambient ``os.environ`` (the default),
-    this is byte-for-byte the previous behaviour.
+    Enumerates every ``PATH`` component (:func:`_trusted_path_dirs`, which raises
+    ``binary_unsafe_path`` if any component is empty / relative), verifies each
+    candidate against its realpath + executable bit, and de-duplicates by realpath.
+    Returns ``(abspath, realpath)`` for a unique match, ``None`` when nothing
+    matches, and raises ``binary_ambiguous`` when more than one **distinct** real
+    executable is found (Redmine #13496 review F2) rather than silently taking the
+    first. Duplicate PATH entries pointing at the SAME realpath (a symlink or a
+    repeated dir) collapse to one and are not ambiguous.
+    """
+    matches: list[tuple[str, str]] = []  # (abspath, realpath), unique by realpath
+    seen_real: set[str] = set()
+    for directory in _trusted_path_dirs(source_env):
+        verified = _verify_executable(os.path.join(directory, name))
+        if verified is None:
+            continue
+        _abspath, real = verified
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        matches.append(verified)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise TerminalTransportError(
+            f"{len(matches)} distinct executable {name!r} binaries resolved from the "
+            f"trusted PATH ({', '.join(real for _abs, real in matches)}); refusing to "
+            f"guess which one to run",
+            reason=REASON_BINARY_AMBIGUOUS,
+        )
+    return matches[0]
+
+
+def _resolve_binary_verbose(
+    binary: str, source_env: Mapping[str, str]
+) -> Optional[tuple[str, str]]:
+    """Resolve ``binary`` to ``(abspath, realpath)``, or ``None`` if unresolvable.
+
+    A path-shaped value (containing a separator) must be an existing **absolute**
+    executable file — a relative path-shaped value is cwd-dependent and fails
+    closed with ``binary_unsafe_path`` (Redmine #13496 review j#74773). A bare name
+    is resolved on the **trusted environment's** ``PATH``
+    (:func:`_search_trusted_path`), not the ambient process ``PATH``, and may raise
+    ``binary_unsafe_path`` (an unsafe PATH component) or ``binary_ambiguous`` (more
+    than one distinct real executable on the trusted PATH).
     """
     if os.sep in binary or (os.altsep and os.altsep in binary):
-        if os.path.isfile(binary) and os.access(binary, os.X_OK):
-            return binary
-        return None
-    return shutil.which(binary, path=source_env.get("PATH", ""))
+        if not os.path.isabs(binary):
+            raise TerminalTransportError(
+                f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) is a relative "
+                f"path that a shell would resolve against the current working "
+                f"directory; the trusted herdr binary must be an absolute path; "
+                f"refusing to fall back to tmux",
+                reason=REASON_BINARY_UNSAFE_PATH,
+            )
+        return _verify_executable(binary)
+    return _search_trusted_path(binary, source_env)
 
 
 __all__ = (
     "COMMAND_TIMEOUT_SECONDS",
     "HERDR_BINARY_ENV",
+    "HERDR_PATH_NAME",
     "HerdrCliTransport",
+    "resolve_herdr_binary",
     "resolve_terminal_transport",
 )

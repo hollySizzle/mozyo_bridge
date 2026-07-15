@@ -29,14 +29,14 @@ def _row(preset: str, status: str) -> dict[str, str]:
         "status": status,
         "installed": "1.0.0" if status == "ok" else "-",
         "packaged": "1.0.0",
-        "path": f"/home/op/.mozyo_bridge/rules/presets/{preset}/agent-workflow.md",
+        "path": f"/workspace/agent/.mozyo_bridge/rules/presets/{preset}/agent-workflow.md",
     }
 
 
 def _rules_view(
     *,
     presets: list[dict[str, str]],
-    home: str = "/home/op/.mozyo_bridge",
+    home: str = "/workspace/agent/.mozyo_bridge",
     install_command: str = RULES_INSTALL_COMMAND,
 ) -> dict[str, Any]:
     return {

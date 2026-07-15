@@ -50,12 +50,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneIntegrationPolicy,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+    DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
     SublaneCreateRequest,
     SublaneLaneView,
 )
 
 
-def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973"):
+def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973", state="active"):
     return SublaneLaneView(
         workspace_id="ws",
         lane_id="l1",
@@ -65,8 +66,17 @@ def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973"):
         repo_root=repo_root,
         gateway_pane=gateway,
         worker_pane=worker,
-        state="active",
+        state=state,
     )
+
+
+def _split_lane(**kw):
+    """A lane whose gateway/worker pair is split across tabs (Redmine #13705)."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+        SUBLANE_STATE_PAIR_SPLIT,
+    )
+
+    return _lane(state=SUBLANE_STATE_PAIR_SPLIT, **kw)
 
 
 class FakeActuatorOps:
@@ -303,6 +313,57 @@ class MissingIdentityTests(unittest.TestCase):
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
 
 
+class SenderAttestationPreflightTests(unittest.TestCase):
+    """#13518 R3-F4a → #13613: the single sender-attestation authority is the ops-level
+    ``preflight_dispatch_sender`` (which compares the sender identity to the workspace anchor /
+    registry / coordinator provider), NOT a presence-only ``sender_attested`` boolean derived from
+    a merely non-empty MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE. A wrong-but-nonempty env therefore no
+    longer passes as attested. No presence-only second authority is retained on the use case."""
+
+    def test_failing_ops_preflight_blocks_before_actuation(self):
+        # A resolved-but-mismatched sender identity fails the ops preflight and blocks BEFORE any
+        # worktree side effect (a wrong-nonempty env would have passed the old presence-only path).
+        class MismatchedSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return False, "sender_workspace_mismatch: resolved != anchor"
+
+        ops = MismatchedSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertIn("sender_workspace_mismatch", outcome.reason)
+        self.assertFalse([c for c in ops.calls if isinstance(c, tuple) and c[0] == "create_worktree"])
+
+    def test_absent_ops_preflight_is_backcompat_no_op(self):
+        # An ops port without preflight_dispatch_sender (tmux / legacy) is not gated — the #13613
+        # attestation is opt-in per the backend port, keeping existing callers byte-for-byte.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        self.assertFalse(hasattr(ops, "preflight_dispatch_sender"))
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_passing_ops_preflight_proceeds(self):
+        class AttestedSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return True, "sender_attested"
+
+        ops = AttestedSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_no_dispatch_is_not_gated_by_sender(self):
+        # --no-dispatch creates/adopts but dispatches no worker, so the sender gate does not arm.
+        class ExplodingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                raise AssertionError("create-only must not inspect dispatch sender")
+
+        ops = ExplodingSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(journal=None), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+
 class WorkUnitGateTests(unittest.TestCase):
     """#13002: epic / feature units never actuate without an explicit decision."""
 
@@ -426,6 +487,29 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertEqual(append_paths, ["/wt/12973"])
         dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
         self.assertEqual(dispatch["target_repo"], "auto")
+
+    def test_execute_defaults_omitted_upstream_coordinator_to_stable_route(self):
+        # #13476: the live dispatch resolves an omitted --upstream-coordinator to the
+        # stable `coordinator` route token (never drops the field, never a literal).
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator=None), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(
+            dispatch["upstream_coordinator"], DEFAULT_UPSTREAM_COORDINATOR_ROUTE
+        )
+
+    def test_execute_prefers_explicit_upstream_coordinator(self):
+        # #13476: an explicit value flows through the live dispatch unchanged.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator="%9"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["upstream_coordinator"], "%9")
 
     def test_no_dispatch_stops_after_panes(self):
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
@@ -687,6 +771,44 @@ class DispatchSelfHealTests(unittest.TestCase):
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
         self.assertNotIn("heal_lane_column", ops._names())
+
+    def test_healed_pair_split_lane_blocks_before_retry(self):
+        # Redmine #13705 R1-F2: a healed lane whose pair is split across tabs is not
+        # operable — the dispatch retry must not fire, fail closed on pair_split.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            REASON_PAIR_SPLIT,
+        )
+
+        ops = self._healable(
+            lanes=[None, _lane(), _lane(gateway=None), _split_lane(gateway="%130")],
+            dispatch_rcs=(1,),
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_PAIR_SPLIT, outcome.blocked_reasons)
+        # Healed once, but the retry dispatch never fired to the split lane.
+        self.assertEqual(ops._names().count("heal_lane_column"), 1)
+        self.assertEqual(ops._names().count("dispatch"), 1)
+
+
+class PairSplitAdmissionTests(unittest.TestCase):
+    """Redmine #13705 R1-F2: a `pair_split` lane is not adopted / dispatched."""
+
+    def test_existing_pair_split_lane_is_not_adopted_or_dispatched(self):
+        # Pre-fix regression: an already-split #13441-type lane (both panes present but
+        # in different tabs) was adopted as a healthy pair and dispatched. It must now
+        # fail closed with zero append / dispatch.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            REASON_PAIR_SPLIT,
+        )
+
+        ops = FakeActuatorOps(git=True, lanes=[_split_lane()], dispatch_rc=0)
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_PAIR_SPLIT, outcome.blocked_reasons)
+        names = ops._names()
+        self.assertNotIn("append_lane_column", names)
+        self.assertNotIn("dispatch", names)
 
 
 class RenderTests(unittest.TestCase):

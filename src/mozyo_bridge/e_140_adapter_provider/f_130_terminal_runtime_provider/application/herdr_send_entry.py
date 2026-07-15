@@ -56,6 +56,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     MOZYO_WORKSPACE_ID_ENV,
     REASON_MISSING_SENDER_ENV,
+    RECEIVER_COORDINATOR,
     resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
@@ -293,9 +294,29 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     target_workspace_id = _explicit_target_workspace_id(args)
     cross_workspace = bool(target_workspace_id) and target_workspace_id != sender.workspace_id
     explicit_lane = getattr(args, "target_lane", None)
+    # Redmine #13476 (Design Consultation Answer j#74599, Option A): the sublane->parent
+    # coordinator callback keeps the backend-neutral documented form
+    # `--to codex --target coordinator`. `--target coordinator` is a semantic pseudo-target
+    # (the same `coordinator` route identity the tmux pane resolver consumes as
+    # `COORDINATOR_LABEL`), NOT a live herdr locator, so the herdr rail translates it here
+    # into the coordinator route authority instead of routing by the `--to` receiver.
+    # Resolving with the `coordinator` receiver makes `resolve_target_role` bind the
+    # configured coordinator provider and `derive_target_lane` derive the workspace DEFAULT
+    # lane (tier 3 — the parent coordinator), NOT the sublane sender's own lane (the tier-2
+    # same-lane a bare `--to codex` derives, Review j#74511 Finding 1). An explicit
+    # `--target-lane` still wins (tier-1 explicit lane in `derive_target_lane`), so an
+    # intentional lane override is never ignored. The outward `receiver` (marker `to=codex`
+    # / the `binds_receiver` process gate) is unchanged — the coordinator IS a codex, so the
+    # role the route resolves (coordinator provider) matches the `--to codex` binding, and
+    # `--to` public choices stay `claude|codex` (this is an internal, semantic translation).
+    route_receiver = (
+        RECEIVER_COORDINATOR
+        if _norm(getattr(args, "target", None)) == RECEIVER_COORDINATOR
+        else receiver
+    )
     if cross_workspace:
         resolution = resolve_herdr_cross_workspace_target(
-            receiver,
+            route_receiver,
             target_workspace_id,
             rows,
             coordinator_provider=coordinator_provider,
@@ -311,7 +332,7 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         # (Redmine #13377) is the explicit-lane field a coordinator→lane-gateway
         # dispatch passes under the shared project workspace model.
         resolution = resolve_herdr_route_target(
-            receiver,
+            route_receiver,
             sender,
             rows,
             coordinator_provider=coordinator_provider,

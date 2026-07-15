@@ -103,6 +103,21 @@ DEFAULT_PANE_READ_SOURCE = SOURCE_VISIBLE
 REASON_BACKEND_DISABLED = "backend_disabled"
 REASON_BINARY_UNCONFIGURED = "binary_unconfigured"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
+# More than one *distinct* herdr executable (by realpath) resolved from the
+# trusted sources — e.g. a different `herdr` on two trusted PATH entries. The
+# resolver refuses to guess which one the operator meant and fails closed rather
+# than silently picking the first (Redmine #13496 acceptance: ambiguous is
+# fail-closed). Duplicate PATH entries pointing at the SAME realpath are not
+# ambiguous.
+REASON_BINARY_AMBIGUOUS = "binary_ambiguous"
+# The trusted PATH (or a path-shaped explicit MOZYO_HERDR_BINARY) carries an
+# unsafe component — an empty component or a relative directory, both of which a
+# shell would resolve against the current working directory. The resolver does
+# NOT silently skip it and search the remaining absolute components: an unsafe
+# trusted environment fails closed as a whole so the caller's PATH semantics are
+# never quietly rewritten (Redmine #13496 review j#74773). Only an all-absolute
+# PATH is searched.
+REASON_BINARY_UNSAFE_PATH = "binary_unsafe_path"
 REASON_INVALID_TARGET = "invalid_target"
 REASON_INVALID_SOURCE = "invalid_source"
 # The provider's command ran but returned a payload that could not be recognised
@@ -119,11 +134,35 @@ TRANSPORT_FAILURE_REASONS: frozenset[str] = frozenset(
         REASON_BACKEND_DISABLED,
         REASON_BINARY_UNCONFIGURED,
         REASON_BINARY_NOT_FOUND,
+        REASON_BINARY_AMBIGUOUS,
+        REASON_BINARY_UNSAFE_PATH,
         REASON_INVALID_TARGET,
         REASON_INVALID_SOURCE,
         REASON_INVALID_PAYLOAD,
         REASON_TRANSPORT_ERROR,
     }
+)
+
+# --- herdr binary resolution provenance (core-owned) -------------------------
+# Which trusted source supplied the resolved herdr executable (Redmine #13496).
+# The binary is resolved ONLY from the trusted environment — the explicit
+# ``MOZYO_HERDR_BINARY`` value first (``env``), then an executable ``herdr`` on
+# the trusted ``PATH`` (``path``). A repo-local config / cwd is never a source
+# (#13502). ``none`` labels the fail-closed outcome (nothing to resolve from
+# either trusted source), so a caller can branch on the provenance the same way
+# it branches on a failure reason.
+BINARY_SOURCE_ENV = "env"
+BINARY_SOURCE_PATH = "path"
+BINARY_SOURCE_NONE = "none"
+
+BINARY_SOURCES: frozenset[str] = frozenset(
+    {BINARY_SOURCE_ENV, BINARY_SOURCE_PATH, BINARY_SOURCE_NONE}
+)
+
+#: The trusted sources a *successfully resolved* binary can carry — never
+#: ``none`` (a resolution that found nothing fails closed before a record exists).
+_RESOLVED_BINARY_SOURCES: frozenset[str] = frozenset(
+    {BINARY_SOURCE_ENV, BINARY_SOURCE_PATH}
 )
 
 #: The permitted shape of a target handle (a herdr ``window:pane`` locator or a
@@ -234,6 +273,49 @@ def _check_result_reason(ok: object, reason: object) -> None:
             f"a failed transport result must carry a reason from "
             f"{sorted(TRANSPORT_FAILURE_REASONS)}, got {reason!r}"
         )
+
+
+@dataclass(frozen=True)
+class HerdrBinaryResolution:
+    """The structured outcome of resolving the herdr executable (success only).
+
+    Carries the trusted-environment resolution the launch / send / read paths all
+    share (Redmine #13496):
+
+    - ``path`` — the resolved **absolute** herdr executable path. This is the value
+      injected into a launch agent's ``--env`` (never a repo-local or cwd-relative
+      token), so a launched worker inherits an unambiguous binary regardless of its
+      own cwd.
+    - ``realpath`` — ``path`` with symlinks resolved: the file whose executable bit
+      was actually verified, so a dangling / non-executable symlink can never pass
+      as resolved.
+    - ``source`` — the provenance, one of :data:`BINARY_SOURCE_ENV` (the explicit
+      ``MOZYO_HERDR_BINARY`` value) or :data:`BINARY_SOURCE_PATH` (an executable
+      ``herdr`` found on the trusted ``PATH``).
+
+    Only constructed for a *successful* resolution — a missing / non-executable
+    binary fails closed with :class:`TerminalTransportError` before any record is
+    built, so a resolution never carries :data:`BINARY_SOURCE_NONE`.
+    """
+
+    path: str
+    realpath: str
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.source not in _RESOLVED_BINARY_SOURCES:
+            raise TerminalTransportError(
+                f"a resolved herdr binary source must be one of "
+                f"{sorted(_RESOLVED_BINARY_SOURCES)}, got {self.source!r}"
+            )
+        if not isinstance(self.path, str) or not self.path:
+            raise TerminalTransportError(
+                "a resolved herdr binary path must be a non-empty string"
+            )
+        if not isinstance(self.realpath, str) or not self.realpath:
+            raise TerminalTransportError(
+                "a resolved herdr binary realpath must be a non-empty string"
+            )
 
 
 @runtime_checkable
@@ -371,12 +453,18 @@ class TerminalTransportConfig:
 __all__ = (
     "BACKEND_HERDR",
     "BACKEND_TMUX",
+    "BINARY_SOURCE_ENV",
+    "BINARY_SOURCE_NONE",
+    "BINARY_SOURCE_PATH",
+    "BINARY_SOURCES",
     "DEFAULT_PANE_READ_SOURCE",
     "DEFAULT_TERMINAL_BACKEND",
     "PANE_READ_SOURCES",
     "REASON_BACKEND_DISABLED",
+    "REASON_BINARY_AMBIGUOUS",
     "REASON_BINARY_NOT_FOUND",
     "REASON_BINARY_UNCONFIGURED",
+    "REASON_BINARY_UNSAFE_PATH",
     "REASON_INVALID_PAYLOAD",
     "REASON_INVALID_SOURCE",
     "REASON_INVALID_TARGET",
@@ -387,6 +475,7 @@ __all__ = (
     "TERMINAL_TRANSPORT_BACKENDS",
     "TERMINAL_TRANSPORT_KEYS",
     "TRANSPORT_FAILURE_REASONS",
+    "HerdrBinaryResolution",
     "PaneReadResult",
     "TerminalTransportConfig",
     "TerminalTransportError",

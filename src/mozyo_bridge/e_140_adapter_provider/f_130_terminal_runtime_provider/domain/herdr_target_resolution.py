@@ -37,6 +37,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional, Protocol, runtime_checkable
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (
+    agent_provider_ids,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
@@ -66,8 +72,13 @@ PROVIDER_CLAUDE: str = "claude"
 PROVIDER_CODEX: str = "codex"
 RECEIVER_COORDINATOR: str = "coordinator"
 
-#: The provider tokens a launched agent (and thus a mzb1 identity slot) may carry.
-AGENT_PROVIDERS: frozenset[str] = frozenset({PROVIDER_CLAUDE, PROVIDER_CODEX})
+#: The provider tokens a launched agent (and thus a mzb1 identity slot) may carry,
+#: derived from the agent provider profile registry (Redmine #13441) rather than a
+#: hard-coded pair, so a new same-protocol provider joins this vocabulary by adding a
+#: profile entry. This is *identity* vocabulary only: it says which provider tokens are
+#: recognized, never which providers get launched (default topology) nor which workflow
+#: role a provider may hold (that stays `provider_binding` authority, #12673 / #13583).
+AGENT_PROVIDERS: frozenset[str] = agent_provider_ids()
 
 # ---------------------------------------------------------------------------
 # Fail-closed reason vocabulary (core-owned, closed set).
@@ -160,7 +171,10 @@ class SenderIdentityResolution:
 
 
 def resolve_sender_identity(
-    env: Mapping[str, str], *, anchor_workspace_id: Optional[str]
+    env: Mapping[str, str],
+    *,
+    anchor_workspace_id: Optional[str],
+    snapshot: Optional[AgentProviderRuntimeSnapshot] = None,
 ) -> SenderIdentityResolution:
     """Resolve the sender's identity from launch env + the repo anchor (fail-closed).
 
@@ -184,10 +198,11 @@ def resolve_sender_identity(
             REASON_MISSING_SENDER_ENV,
             f"{MOZYO_WORKSPACE_ID_ENV} and {MOZYO_AGENT_ROLE_ENV} must both be set",
         )
-    if role not in AGENT_PROVIDERS:
+    providers = AGENT_PROVIDERS if snapshot is None else snapshot.provider_ids
+    if role not in providers:
         return SenderIdentityResolution.failure(
             REASON_INVALID_SENDER_ROLE,
-            f"sender role {role!r} is not a known provider ({sorted(AGENT_PROVIDERS)})",
+            f"sender role {role!r} is not a known provider ({sorted(providers)})",
         )
     anchor_ws = _norm(anchor_workspace_id)
     if not anchor_ws:
@@ -219,7 +234,10 @@ class TargetRoleResolution:
 
 
 def resolve_target_role(
-    receiver: object, *, coordinator_provider: Optional[str]
+    receiver: object,
+    *,
+    coordinator_provider: Optional[str],
+    snapshot: Optional[AgentProviderRuntimeSnapshot] = None,
 ) -> TargetRoleResolution:
     """Map a handoff ``receiver`` label to the target's provider role (fail-closed).
 
@@ -239,7 +257,8 @@ def resolve_target_role(
                 detail="coordinator role is not bound to any runtime provider",
             )
         return TargetRoleResolution(ok=True, role=provider)
-    if label in AGENT_PROVIDERS:
+    providers = AGENT_PROVIDERS if snapshot is None else snapshot.provider_ids
+    if label in providers:
         return TargetRoleResolution(ok=True, role=label)
     return TargetRoleResolution(
         ok=False,
@@ -308,7 +327,11 @@ class LaneDerivation:
 
 
 def derive_target_lane(
-    receiver: object, sender: SenderIdentity, *, explicit_lane: object = None
+    receiver: object,
+    sender: SenderIdentity,
+    *,
+    explicit_lane: object = None,
+    snapshot: Optional[AgentProviderRuntimeSnapshot] = None,
 ) -> LaneDerivation:
     """Derive the single target lane for a herdr send, fail-closed on ambiguity later.
 
@@ -333,7 +356,8 @@ def derive_target_lane(
         return LaneDerivation(
             lane=DEFAULT_LANE, basis=LANE_BASIS_COORDINATOR_DEFAULT
         )
-    if label in AGENT_PROVIDERS:
+    providers = AGENT_PROVIDERS if snapshot is None else snapshot.provider_ids
+    if label in providers:
         lane = sender.lane_id or DEFAULT_LANE
         basis = (
             LANE_BASIS_SENDER_SAME_LANE
@@ -428,6 +452,7 @@ def resolve_herdr_target(
     rows: Sequence[Mapping[str, object]],
     *,
     coordinator_provider: Optional[str],
+    snapshot: Optional[AgentProviderRuntimeSnapshot] = None,
 ) -> HerdrTargetResolution:
     """Resolve a receiver label to a live herdr agent, scoped to the sender's workspace.
 
@@ -451,7 +476,9 @@ def resolve_herdr_target(
     - one candidate whose row carries no usable pane locator ->
       :data:`REASON_MISSING_LOCATOR` (refuse to send to a blank target).
     """
-    role_res = resolve_target_role(receiver, coordinator_provider=coordinator_provider)
+    role_res = resolve_target_role(
+        receiver, coordinator_provider=coordinator_provider, snapshot=snapshot
+    )
     if not role_res.ok:
         assert role_res.reason is not None
         return HerdrTargetResolution.failure(role_res.reason, role_res.detail)

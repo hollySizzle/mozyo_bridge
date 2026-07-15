@@ -52,17 +52,22 @@ Boundaries (the same non-authoritative contract the #12465/#12466 layer pins):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (
     LANE_KIND_IMPLEMENTATION,
+    LANE_KINDS,
     OPTION_DELEGATION_PARENT,
     OPTION_LANE_KIND,
     DelegationProjection,
     DelegationProjectionError,
     DelegationSource,
     derive_delegation_tree,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
+    repo_identity_matches,
 )
 
 #: A newly created grandchild worktree/lane/window (the caller performs the
@@ -193,6 +198,38 @@ def resolve_grandchild_stamp_plan(
     if not declared_lanes:
         raise GrandchildStampError("no declared lanes; cannot stamp a delegation tree")
 
+    # Every declared unit id, every non-root parent pointer, and the grandchild
+    # unit must be a stable ``<workspace_id>/<lane_id>`` pointer BEFORE any plan /
+    # side effect — the stamp producer must not turn a path-like (e.g. absolute
+    # host path) breadcrumb into a success record or a live ``@mozyo_delegation_parent``
+    # tmux write, and the error must not leak the raw value. This is the same
+    # stable-unit contract the realization gate consumer enforces, so producer and
+    # consumer agree (Redmine #13571 j#75515 R8-F1).
+    for lane in declared_lanes:
+        if not _is_stable_unit(lane.unit_id):
+            raise GrandchildStampError(
+                f"declared lane unit {redact_unit_token(lane.unit_id)} must be a "
+                "stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
+        if lane.delegation_parent is not None and not _is_stable_unit(lane.delegation_parent):
+            raise GrandchildStampError(
+                f"declared lane parent {redact_unit_token(lane.delegation_parent)} must "
+                "be a stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
+        # Validate the KIND against the allowed set here (generic, no raw echo) so
+        # a path-like / secret-shaped kind never reaches derive_delegation_tree's
+        # raw-value error (Redmine #13571 j#75577 R10-F4).
+        if lane.lane_kind not in LANE_KINDS:
+            raise GrandchildStampError(
+                "declared lane kind is not a valid delegation kind; expected one "
+                f"of {sorted(LANE_KINDS)}"
+            )
+    if not _is_stable_unit(grandchild_unit):
+        raise GrandchildStampError(
+            f"grandchild_unit {redact_unit_token(grandchild_unit)} must be a stable "
+            "<workspace_id>/<lane_id> pointer (not a path)"
+        )
+
     sources = [
         DelegationSource(
             unit_id=lane.unit_id,
@@ -317,30 +354,508 @@ class RealizationGateResult:
         return self.verdict == GATE_REALIZED
 
 
-def find_realized_grandchild_unit(
-    units: Sequence[tuple[str, str, Optional[int], str, str]],
+# --- dispatch-selected grandchild identity binding (Redmine #13571 / #12454) --
+# US #12454 review j#75444 finding 1: the realization gate must bind to the
+# EXACT grandchild unit the dispatch selected / created / adopted, not to "the
+# first depth-2 implementation lane under the delegated coordinator". A stale or
+# unrelated sibling that happens to share the coordinator parent, depth, and
+# kind could otherwise be treated as ``realized`` — a false PASS whose outcome
+# depended on the inventory scan order. The binding re-verifies the exact target
+# identity (workspace/lane, role, repo, parent, depth) against the live
+# inventory and fails closed on a missing / mismatched / ambiguous identity.
+
+#: The exact target unit is present in the inventory and every identity fact
+#: (display KIND, agent gateway ROLE, depth, parent, repo, derived status)
+#: re-verifies: the grandchild is realized and route-bound.
+BINDING_REALIZED = "realized"
+#: The exact target unit is not present in the inventory at all (the dispatched
+#: grandchild lane is not visible / not stamped yet). Fail closed.
+BINDING_MISSING = "missing"
+#: The exact target unit is present but one or more identity facts disagree with
+#: the dispatch-selected identity (wrong KIND / gateway ROLE / depth / parent /
+#: repo, or an untrusted status). Fail closed rather than trust a half-formed lane.
+BINDING_MISMATCH = "identity_mismatch"
+#: The target unit's live inventory could not be resolved to a single trusted
+#: identity: more than one inventory row carries the exact unit id, or the folded
+#: unit carries conflicting candidate panes. Fail closed.
+BINDING_AMBIGUOUS = "ambiguous_identity"
+#: No dispatch-selected target identity was supplied (or it is not bindable —
+#: missing workspace/lane component, parent, or repo), so the gate cannot bind to
+#: an exact grandchild. A same-lane worker handoff must never be treated as
+#: acceptance without a bound target. Fail closed.
+BINDING_UNBOUND = "unbound"
+
+#: The agent role a route-bound grandchild lane must expose to be realized: the
+#: route lands at the grandchild's **Codex gateway**, never the grandchild Claude
+#: directly, so a realized grandchild unit must carry a live codex gateway pane.
+#: A depth-2 ``implementation`` lane whose codex gateway has vanished (a
+#: Claude-only remnant that still carries the stamped display KIND) is NOT
+#: route-bound and must fail closed (Redmine #13571 / #12454 j#75444 F2 (a)).
+GRANDCHILD_GATEWAY_ROLE = "codex"
+
+
+def _split_workspace_lane(unit_id: str) -> tuple[str, str]:
+    """Split a ``<workspace_id>/<lane_id>`` unit into its two components.
+
+    Returns ``("", "")`` when either component is empty (``"/"``, ``"ws/"``,
+    ``"/lane"``, or a value with no ``/``), so a malformed unit id fails the
+    component validation rather than binding on a half-identity (Redmine #13571
+    F2 (d)).
+    """
+    workspace, sep, lane = (unit_id or "").partition("/")
+    if not sep:
+        return "", ""
+    return workspace.strip(), lane.strip()
+
+
+#: The placeholder a non-single-line-printable repo basename is redacted to.
+REDACTED_REPO_TOKEN = "<redacted-repo>"
+
+
+def _repo_token(path: Optional[str]) -> str:
+    """Portable, redacted repo token for durable/pasteable records (F3 (b)).
+
+    Returns the checkout basename only (a portable project identity), never the
+    raw absolute host path, so a mismatch reason that reaches the Redmine journal
+    / JSON surface cannot leak a private directory chain (public/private
+    durable-record boundary). Handles POSIX (``/``), Windows (``\\``), and UNC
+    separators so a Windows path is basenamed rather than returned whole (Redmine
+    #13571 j#75577 R10-F3). ``none`` when no repo is set.
+    """
+    if not path:
+        return "none"
+    # Trim ONLY trailing separators (never whitespace / control): a ``.strip()``
+    # here would drop a trailing control char before the printable check, so a
+    # ``repo\n`` basename would surface as a clean ``repo`` token instead of the
+    # fixed redaction (Redmine #13571 j#75596 R12-F2).
+    norm = str(path).rstrip("/\\")
+    if not norm:
+        return "none"
+    # Split on both separators; the last non-empty segment is the RAW basename.
+    segments = [seg for seg in re.split(r"[/\\]", norm) if seg]
+    if not segments:
+        return "none"
+    token = segments[-1]
+    # The RAW basename must itself be a single-line printable portable token; a
+    # basename carrying a newline / tab / control / non-printable char would still
+    # leak into (and split) the durable diagnostic, so it falls to a fixed
+    # redacted token (Redmine #13571 j#75589 R11-F3 / j#75596 R12-F2).
+    if not token.isprintable():
+        return REDACTED_REPO_TOKEN
+    return token
+
+
+#: The placeholder a malformed (non-stable) unit id is redacted to.
+REDACTED_UNIT_TOKEN = "<redacted-unit>"
+
+
+def _is_stable_unit(unit_id: Optional[object]) -> bool:
+    """Whether ``unit_id`` is a portable stable ``<workspace_id>/<lane_id>`` pointer.
+
+    A stable unit has exactly one ``/`` with both components non-empty and is not
+    path-like. Rejected as path-like: a leading ``/`` / ``~`` / ``.``, any
+    backslash (a Windows path), a drive-letter prefix such as ``C:`` / ``C:/``
+    (a forward-slash Windows drive-root/relative path — platform independent), and
+    any ``.`` / ``..`` component. So an operator typo such as an absolute
+    ``/Users/...`` / ``/home/...`` path, a ``~`` home reference, ``C:/private``,
+    or ``ws/..`` is NOT a stable identity (Redmine #13571 R6-F1 / R7-F1).
+    """
+    if unit_id is None:
+        return False
+    # Validate the RAW value — never canonicalize / strip first. A validator that
+    # stripped would accept a leading/trailing newline / tab / Unicode-whitespace
+    # padded value as stable, while the raw padded value is what downstream plans /
+    # records / breadcrumbs actually use (Redmine #13571 j#75589 R11-F1). The
+    # ``isspace`` scan below rejects leading, trailing, AND embedded whitespace.
+    s = str(unit_id)
+    if not s or s.startswith(("/", "~", ".")) or "\\" in s:
+        return False
+    # No whitespace / control / non-printable character anywhere: a stable unit is
+    # a single-line, printable identity, so a newline / tab / control char cannot
+    # inject into a durable record field boundary or a live breadcrumb (Redmine
+    # #13571 j#75577 R10-F1). ``isprintable`` is False for any control /
+    # non-printable char (space is printable, so ``isspace`` rejects it too).
+    if not s.isprintable() or any(ch.isspace() for ch in s):
+        return False
+    # Windows drive-root / drive-relative (``C:`` / ``C:/x`` / ``C:x``), independent
+    # of the running platform's separator.
+    if len(s) >= 2 and s[0].isalpha() and s[1] == ":":
+        return False
+    parts = s.split("/")
+    if len(parts) != 2 or not all(parts):
+        return False
+    return not any(part in (".", "..") for part in parts)
+
+
+def redact_unit_token(unit_id: Optional[object]) -> str:
+    """Durable-safe projection of a unit id for reasons / records (Redmine #13571 R6-F1).
+
+    A valid stable ``<workspace_id>/<lane_id>`` unit (:func:`_is_stable_unit`) is
+    safe to show. Any other value — an absolute ``/Users/...`` / ``/home/...``
+    path, a ``~`` home reference, a Windows path, or a multi-segment path — is
+    redacted to :data:`REDACTED_UNIT_TOKEN` so a private host path can never reach
+    the durable JSON / pasteable gate record even on a fail-closed verdict
+    (public/private durable-record boundary). ``none`` for an empty value.
+    """
+    if unit_id is None:
+        return "none"
+    s = str(unit_id)
+    if not s.strip():
+        return "none"
+    # Validate the RAW value (not a stripped copy): a padded value is not stable,
+    # so it redacts rather than surfacing its raw form (Redmine #13571 R11-F1).
+    return s if _is_stable_unit(s) else REDACTED_UNIT_TOKEN
+
+
+@dataclass(frozen=True)
+class GrandchildTargetIdentity:
+    """The exact grandchild lane identity the dispatch selected/created/adopted.
+
+    Read from the durable dispatch record (the #12458 dispatch decision's
+    selected Codex-gateway candidate for an adopt, or the created/adopted lane's
+    stable identity for a launch) — never "whatever depth-2 sibling appears
+    first". The realization gate binds to *this* identity and re-verifies it
+    against the live inventory, so an unrelated / stale sibling can never be
+    treated as the realized grandchild (Redmine #13571 / #12454 j#75444 F1/F2).
+
+    ``unit_id`` is the stable ``<workspace_id>/<lane_id>`` pointer — both
+    components must be non-empty to bind. ``delegation_parent`` is the delegated
+    coordinator unit the grandchild must descend from. ``lane_kind`` /
+    ``delegation_depth`` carry the **fixed** grandchild acceptance shape
+    (:data:`LANE_KIND_IMPLEMENTATION` at :data:`GRANDCHILD_DEPTH`); they are NOT a
+    caller-tunable expectation — a target that does not carry the canonical shape
+    is not bindable, and the live re-verification compares against the canonical
+    constants, never against caller values (Redmine #13571 j#75487 R4-F1). The
+    route-bound agent gateway ROLE (:data:`GRANDCHILD_GATEWAY_ROLE`) is verified
+    separately against the live inventory. ``repo_identity`` is the canonical
+    child repo identity from the mandatory ``--target-repo`` gate and is
+    **required** to bind — the matched inventory row's repo must equal it (fail
+    closed on a repo mismatch).
+    """
+
+    unit_id: str
+    delegation_parent: str
+    lane_kind: str = LANE_KIND_IMPLEMENTATION
+    delegation_depth: int = GRANDCHILD_DEPTH
+    repo_identity: Optional[str] = None
+
+    def bindability_problems(self) -> list[str]:
+        """The specific conditions this identity fails for binding, in order.
+
+        Empty when :attr:`is_bindable`. Each entry names one unmet requirement so
+        the durable :data:`BINDING_UNBOUND` reason explains *why* a target could
+        not bind — including the canonical grandchild-shape conditions, so a
+        non-grandchild target (a coordinator, a delegated coordinator, or a
+        depth-1 lane) that otherwise carries a unit / parent / repo is not
+        misdiagnosed as merely "missing a field" (Redmine #13571 j#75494 R5-F2).
+        """
+        problems: list[str] = []
+        if not _is_stable_unit(self.unit_id):
+            # Redact the offending value: a non-stable unit is often an absolute
+            # host path / home reference typo, which must not reach the durable
+            # reason (Redmine #13571 R6-F1).
+            problems.append(
+                f"unit_id {redact_unit_token(self.unit_id)} must be a stable "
+                "<workspace_id>/<lane_id> pointer (not a path)"
+            )
+        if not (self.delegation_parent or "").strip():
+            problems.append("delegation_parent (the delegated coordinator unit) is required")
+        elif not _is_stable_unit(self.delegation_parent):
+            # The parent is also a stable-unit pointer, never a path — a path-like
+            # parent must not bind (routing safety) nor leak (Redmine #13571 R7-F2).
+            problems.append(
+                f"delegation_parent {redact_unit_token(self.delegation_parent)} must "
+                "be a stable <workspace_id>/<lane_id> pointer (not a path)"
+            )
+        if not (self.repo_identity or "").strip():
+            problems.append("a canonical repo identity (the --target-repo gate) is required")
+        if self.lane_kind != LANE_KIND_IMPLEMENTATION:
+            problems.append(
+                f"KIND={self.lane_kind!r} is not the fixed grandchild acceptance "
+                f"shape (must be {LANE_KIND_IMPLEMENTATION!r})"
+            )
+        if not (type(self.delegation_depth) is int and self.delegation_depth == GRANDCHILD_DEPTH):
+            problems.append(
+                f"DEPTH={self.delegation_depth!r} is not the fixed grandchild depth "
+                f"(must be the plain int {GRANDCHILD_DEPTH})"
+            )
+        return problems
+
+    @property
+    def is_bindable(self) -> bool:
+        """True only for a fully-specified, exactly-bindable grandchild identity.
+
+        Requires a non-empty parent, a canonical repo identity (the mandatory
+        ``--target-repo`` gate value), a ``unit_id`` whose workspace **and** lane
+        components are both non-empty, AND the fixed grandchild acceptance shape:
+        ``lane_kind == LANE_KIND_IMPLEMENTATION`` and a plain-int
+        ``delegation_depth == GRANDCHILD_DEPTH`` (a ``bool`` is not a valid depth).
+        A caller cannot relax the KIND / depth to bind a non-grandchild lane (a
+        coordinator, a delegated coordinator, or a depth-1 same-lane worker); such
+        a target fails closed to :data:`BINDING_UNBOUND`
+        (Redmine #13571 F2 (b)/(d), j#75487 R4-F1). See
+        :meth:`bindability_problems` for the per-condition breakdown.
+        """
+        return not self.bindability_problems()
+
+
+@dataclass(frozen=True)
+class InventoryUnit:
+    """One folded delegation-tree unit re-resolved from the live inventory.
+
+    The realization gate re-verifies the dispatch-selected identity against these
+    facts (Redmine #13571 / #12454 j#75444 F2). Beyond the display breadcrumb
+    (``lane_kind`` KIND / ``delegation_depth`` / ``delegation_parent`` /
+    ``status``) and the per-lane ``repo_identity``, it carries two live-resolution
+    facts the display columns alone cannot express:
+
+    - ``has_codex_gateway``: a live codex gateway pane is present for the unit, so
+      the lane is route-bound (the route lands at the codex gateway, never the
+      grandchild Claude). A Claude-only remnant fails closed.
+    - ``ambiguous``: the folded unit carried conflicting / weakly-identified
+      candidate panes (different repo/parent/kind, or a weak candidate), so the
+      raw candidate ambiguity is preserved instead of being silently collapsed by
+      the per-unit fold (F2 (c)).
+
+    ``has_codex_gateway`` and ``ambiguous`` are **required** (no default): a
+    positive realization must carry explicit live gateway / ambiguity evidence, so
+    switching a caller's container from a bare tuple to this dataclass can never
+    silently re-introduce a fail-open (Redmine #13571 j#75480 F3).
+    """
+
+    unit_id: str
+    lane_kind: str
+    delegation_depth: Optional[int]
+    delegation_parent: str
+    status: str
+    has_codex_gateway: bool
+    ambiguous: bool
+    repo_identity: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GrandchildBinding:
+    """The verdict of binding the realization gate to the exact target identity."""
+
+    outcome: str
+    matched_unit: Optional[str]
+    reason: str
+
+    @property
+    def is_realized(self) -> bool:
+        return self.outcome == BINDING_REALIZED
+
+
+def _coerce_unit(row: object) -> InventoryUnit:
+    """Coerce an inventory row into an :class:`InventoryUnit`.
+
+    Accepts an :class:`InventoryUnit` as-is, or a positional row
+    ``(unit_id, lane_kind, delegation_depth, delegation_parent, status[,
+    repo_identity])``. A positional row **cannot** express the live gateway /
+    ambiguity facts, so it is coerced with ``has_codex_gateway=False`` — a legacy
+    tuple therefore never yields a positive realization on its own (it fails
+    closed on the gateway ROLE re-match). Only a typed :class:`InventoryUnit`
+    built by the live discovery path (with an explicitly resolved codex gateway)
+    can realize (Redmine #13571 j#75473 F2: no fail-open on tuple defaults).
+    """
+    if isinstance(row, InventoryUnit):
+        return row
+    seq = tuple(row)  # type: ignore[arg-type]
+    repo = str(seq[5]) if len(seq) >= 6 and seq[5] is not None else None
+    return InventoryUnit(
+        unit_id=str(seq[0]),
+        lane_kind=str(seq[1]),
+        delegation_depth=seq[2],  # type: ignore[arg-type]
+        delegation_parent=str(seq[3]),
+        status=str(seq[4]),
+        repo_identity=repo,
+        has_codex_gateway=False,
+        ambiguous=False,
+    )
+
+
+def resolve_realized_grandchild_binding(
+    units: Sequence[object],
     *,
+    target: Optional[GrandchildTargetIdentity],
+    delegated_coordinator_unit: str,
+) -> GrandchildBinding:
+    """Bind the realization gate to the exact dispatch-selected grandchild.
+
+    ``units`` is a sequence of :class:`InventoryUnit` (or positional
+    ``(unit_id, lane_kind, delegation_depth, delegation_parent, status[,
+    repo_identity])`` rows) — one per discovered lane unit, re-resolved by the
+    caller from the live inventory. Instead of returning the first depth-2
+    implementation lane under the coordinator, this looks up **exactly**
+    ``target.unit_id`` and re-verifies every identity fact against the live
+    inventory:
+
+    - **unbound** (:data:`BINDING_UNBOUND`): no bindable target (missing
+      workspace/lane component, parent, or repo).
+    - **missing** (:data:`BINDING_MISSING`): no row carries ``target.unit_id``.
+    - **ambiguous** (:data:`BINDING_AMBIGUOUS`): more than one row carries the
+      unit id, or the folded unit carried conflicting candidate panes.
+    - **identity_mismatch** (:data:`BINDING_MISMATCH`): the row is present but its
+      display KIND / gateway ROLE / depth / parent / repo disagrees with the
+      dispatch-selected identity, or its status is not ``derived``.
+
+    Only :data:`BINDING_REALIZED` yields a ``matched_unit``. Pure and
+    order-independent: unrelated / stale siblings before or after the target in
+    ``units`` never change the verdict, because the match is keyed on the exact
+    ``unit_id`` (Redmine #13571 / #12454 j#75444 F1/F2). Repo comparison reuses
+    the shared canonical :func:`repo_identity_matches` helper, and any repo named
+    in a reason is redacted to its basename (F3).
+    """
+    # The gate's own delegated-coordinator context must be a stable-unit pointer,
+    # never a path — a malformed context fails closed and is redacted, so a
+    # path-like coordinator can neither open the gate nor leak (Redmine #13571
+    # R7-F2).
+    if not _is_stable_unit(delegated_coordinator_unit):
+        return GrandchildBinding(
+            outcome=BINDING_UNBOUND,
+            matched_unit=None,
+            reason=(
+                "delegated coordinator context "
+                f"{redact_unit_token(delegated_coordinator_unit)} is not a stable "
+                "<workspace_id>/<lane_id> unit; the gate cannot bind a grandchild "
+                "under a malformed coordinator context."
+            ),
+        )
+    if target is None or not target.is_bindable:
+        detail = (
+            "no target supplied"
+            if target is None
+            else "; ".join(target.bindability_problems())
+        )
+        return GrandchildBinding(
+            outcome=BINDING_UNBOUND,
+            matched_unit=None,
+            reason=(
+                "no bindable dispatch-selected grandchild target identity "
+                f"({detail}); the gate cannot bind to an exact grandchild lane "
+                "(a same-lane worker handoff is never acceptance without a bound "
+                "target)."
+            ),
+        )
+    # The target's declared parent must be the coordinator this gate runs under;
+    # a target whose parent is a different coordinator is a caller inconsistency.
+    if target.delegation_parent != delegated_coordinator_unit:
+        return GrandchildBinding(
+            outcome=BINDING_MISMATCH,
+            matched_unit=None,
+            reason=(
+                f"target grandchild {redact_unit_token(target.unit_id)} declares parent "
+                f"{redact_unit_token(target.delegation_parent)}, but the gate binds "
+                f"under delegated coordinator {redact_unit_token(delegated_coordinator_unit)}."
+            ),
+        )
+
+    coerced = [_coerce_unit(row) for row in units]
+    matches = [unit for unit in coerced if unit.unit_id == target.unit_id]
+    if not matches:
+        return GrandchildBinding(
+            outcome=BINDING_MISSING,
+            matched_unit=None,
+            reason=(
+                f"dispatch-selected grandchild {target.unit_id!r} is not visible in "
+                "the live inventory (not created/adopted/stamped yet)."
+            ),
+        )
+    if len(matches) > 1:
+        return GrandchildBinding(
+            outcome=BINDING_AMBIGUOUS,
+            matched_unit=None,
+            reason=(
+                f"{len(matches)} inventory rows carry the target unit "
+                f"{target.unit_id!r}; the realized grandchild identity is ambiguous."
+            ),
+        )
+
+    unit = matches[0]
+    # Raw candidate ambiguity is preserved by the discovery layer and honored
+    # here before any positive verdict (F2 (c)): a unit folded from conflicting /
+    # weak candidate panes cannot be a trusted single realization.
+    if unit.ambiguous:
+        return GrandchildBinding(
+            outcome=BINDING_AMBIGUOUS,
+            matched_unit=None,
+            reason=(
+                f"grandchild {unit.unit_id!r} folds conflicting / weakly-identified "
+                "candidate panes; the realized identity is ambiguous."
+            ),
+        )
+    # The grandchild acceptance shape is re-verified against the CANONICAL
+    # constants (implementation lane at depth 2), never against caller-supplied
+    # target values — a target cannot relax the KIND / depth to open the gate on a
+    # non-grandchild lane (Redmine #13571 j#75487 R4-F1). ``is_bindable`` already
+    # rejects a non-canonical target, so this is defense in depth on the live row.
+    problems: list[str] = []
+    if unit.status != "derived":
+        problems.append(f"status={unit.status!r} (not a trusted derived breadcrumb)")
+    if unit.lane_kind != LANE_KIND_IMPLEMENTATION:
+        problems.append(
+            f"kind={unit.lane_kind!r} (expected {LANE_KIND_IMPLEMENTATION!r})"
+        )
+    if not unit.has_codex_gateway:
+        problems.append(
+            f"gateway_role missing (expected a live {GRANDCHILD_GATEWAY_ROLE!r} "
+            "gateway pane; the route lands at the grandchild gateway, not Claude)"
+        )
+    if not (type(unit.delegation_depth) is int and unit.delegation_depth == GRANDCHILD_DEPTH):
+        problems.append(
+            f"depth={unit.delegation_depth!r} (expected {GRANDCHILD_DEPTH})"
+        )
+    if unit.delegation_parent != delegated_coordinator_unit:
+        problems.append(
+            f"parent={redact_unit_token(unit.delegation_parent)} "
+            f"(expected {redact_unit_token(delegated_coordinator_unit)})"
+        )
+    if not repo_identity_matches(unit.repo_identity, target.repo_identity):
+        problems.append(
+            f"repo basename={_repo_token(unit.repo_identity)!r} "
+            f"(expected {_repo_token(target.repo_identity)!r})"
+        )
+    if problems:
+        return GrandchildBinding(
+            outcome=BINDING_MISMATCH,
+            matched_unit=None,
+            reason=(
+                f"grandchild {unit.unit_id!r} live identity does not re-verify: "
+                + "; ".join(problems)
+            ),
+        )
+    return GrandchildBinding(
+        outcome=BINDING_REALIZED,
+        matched_unit=unit.unit_id,
+        reason=(
+            f"grandchild {unit.unit_id!r} re-verifies as a route-bound depth-"
+            f"{GRANDCHILD_DEPTH} {LANE_KIND_IMPLEMENTATION} lane (live "
+            f"{GRANDCHILD_GATEWAY_ROLE} gateway present) under "
+            f"{delegated_coordinator_unit!r}."
+        ),
+    )
+
+
+def find_realized_grandchild_unit(
+    units: Sequence[object],
+    *,
+    target: Optional[GrandchildTargetIdentity],
     delegated_coordinator_unit: str,
 ) -> Optional[str]:
-    """Return the unit_id of a route-bound, realized grandchild lane, or ``None``.
+    """Return the exact dispatch-selected realized grandchild unit, or ``None``.
 
-    ``units`` is a sequence of ``(unit_id, lane_kind, delegation_depth,
-    delegation_parent, status)`` rows — one per discovered lane unit, derived by
-    the caller from ``delegation_display.derive_targets_delegation``. A *realized*
-    grandchild is a ``derived`` (not diagnostic / none) depth-:data:`GRANDCHILD_DEPTH`
-    :data:`LANE_KIND_IMPLEMENTATION` lane whose ``delegation_parent`` is
-    ``delegated_coordinator_unit``. Pure; the first match wins (the route is
-    one-grandchild-per-delegated-coordinator under the shallow-delegation model).
+    Thin convenience wrapper over :func:`resolve_realized_grandchild_binding`:
+    returns the matched unit id only when the binding re-verifies as
+    :data:`BINDING_REALIZED`, else ``None`` (missing / mismatch / ambiguous /
+    unbound all fail closed to ``None``). Binds to ``target.unit_id`` exactly, so
+    a stale / unrelated sibling never wins on scan order (Redmine #13571).
     """
-    for unit_id, lane_kind, depth, parent, status in units:
-        if (
-            status == "derived"
-            and lane_kind == LANE_KIND_IMPLEMENTATION
-            and depth == GRANDCHILD_DEPTH
-            and parent == delegated_coordinator_unit
-        ):
-            return unit_id
-    return None
+    binding = resolve_realized_grandchild_binding(
+        units,
+        target=target,
+        delegated_coordinator_unit=delegated_coordinator_unit,
+    )
+    return binding.matched_unit
 
 
 def evaluate_grandchild_realization_gate(
@@ -410,6 +925,18 @@ __all__ = (
     "GATE_BLOCKED",
     "GATE_SAME_LANE_OK",
     "RealizationGateResult",
+    "BINDING_REALIZED",
+    "BINDING_MISSING",
+    "BINDING_MISMATCH",
+    "BINDING_AMBIGUOUS",
+    "BINDING_UNBOUND",
+    "GRANDCHILD_GATEWAY_ROLE",
+    "REDACTED_UNIT_TOKEN",
+    "redact_unit_token",
+    "GrandchildTargetIdentity",
+    "InventoryUnit",
+    "GrandchildBinding",
+    "resolve_realized_grandchild_binding",
     "find_realized_grandchild_unit",
     "evaluate_grandchild_realization_gate",
 )

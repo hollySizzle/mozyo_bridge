@@ -261,6 +261,12 @@ class ExecutionContext:
     insufficient_read: bool = False
     cross_project: bool = True
     backend: str = BACKEND_TMUX
+    #: The per-target expected-role map for route re-resolution (Redmine #13569
+    #: Increment 2B). ``None`` uses the built-in binding (gateway codex / worker claude),
+    #: byte-identical; an application caller supplies the binding-resolved map (via
+    #: ``route_identity_ledger.expected_roles_for``) so a rebound provider re-resolves
+    #: against ITS pane rather than being refused by the role-mismatch guard.
+    expected_roles: "Optional[Mapping[str, str]]" = None
 
 
 @dataclass(frozen=True)
@@ -562,6 +568,7 @@ class _Run:
                 inventory,
                 backend=self.context.backend,
                 cross_project=self.context.cross_project,
+                expected_roles=self.context.expected_roles,
             )
         except DelegationRoutePlanError as exc:
             # A role mismatch on a gateway/coordinator target is a malformed
@@ -607,6 +614,7 @@ class _Run:
                 inventory,
                 backend=self.context.backend,
                 cross_project=worker_cross_project,
+                expected_roles=self.context.expected_roles,
             )
         except DelegationRoutePlanError as exc:
             self.invariant_violation = True

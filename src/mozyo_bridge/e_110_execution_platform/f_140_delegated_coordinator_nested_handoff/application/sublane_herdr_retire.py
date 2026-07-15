@@ -33,8 +33,10 @@ import subprocess
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _close_base_pane,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     _resolve_binary_or_die,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -51,7 +53,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     Runner,
 )
 
-#: The two managed provider roles a lane unit's slots carry.
+#: The two managed provider roles a lane unit's slots carry, under the DEFAULT binding
+#: (gateway=codex, worker=claude). This is the built-in default; the actuation caller
+#: passes the binding-resolved ``managed_roles`` (Redmine #13569 Increment 2B) so a lane
+#: whose worker/gateway provider was rebound retires ITS slots, and a provider the binding
+#: does not assign is never a retire target.
 _MANAGED_ROLES = ("codex", "claude")
 
 
@@ -107,6 +113,7 @@ def plan_herdr_retire_close(
     workspace_id: str,
     lane_id: str = "",
     legacy_workspace_id: str = "",
+    managed_roles: Sequence[str] = _MANAGED_ROLES,
 ) -> HerdrRetireClosePlan:
     """Decide which managed slots to close for the lane (pure, fail-closed).
 
@@ -125,6 +132,7 @@ def plan_herdr_retire_close(
     (never closed). Every other row (other lanes, the coordinator pair, other
     workspaces, undecodable rows) is ignored. Empty inputs match nothing.
     """
+    managed = tuple(managed_roles)
     ws = _norm(workspace_id)
     lane = _norm_lane(lane_id) if _norm(lane_id) else ""
     legacy_ws = _norm(legacy_workspace_id)
@@ -140,6 +148,27 @@ def plan_herdr_retire_close(
     unit_lane = lane if ws and lane and lane != DEFAULT_LANE else ""
     close_targets: list[tuple[str, str]] = []
     foreign: list[str] = []
+    # Pair-atomic attestation (Redmine #13569 R1-F4): the retire must never partially
+    # close a lane whose live providers do not match the binding-expected pair. The
+    # mismatch signal is a *substitution* at the lane's own position (workspace + lane
+    # match): an expected ``managed_roles`` slot is MISSING while an unexpected (non-
+    # managed) slot is PRESENT — i.e. a wrong-provider agent stands where a bound provider
+    # should. When that holds, no slot is closed (zero-close); the matching half is never
+    # closed while the wrong-provider half stays live. Distinguished from the benign cases:
+    #   - an EXTRA non-managed slot alongside the full expected pair (both present) is not a
+    #     substitution — the pair closes, the extra is recorded foreign;
+    #   - partial liveness (an expected slot already gone, nothing unexpected in its place)
+    #     is not a substitution — the surviving expected slot(s) still close.
+    # For the built-in pair (live == expected) this is byte-identical. The attestation is
+    # PER UNIT (Redmine #13569 R2-F4b): a substitution is detected within the shared unit or
+    # within the legacy twin SEPARATELY — a provider present in the legacy twin must never
+    # mask a substitution in the shared unit (or vice versa), so the two units' present /
+    # unexpected sets are tracked independently.
+    expected = set(managed)
+    shared_present: set[str] = set()
+    shared_unexpected = False
+    legacy_present: set[str] = set()
+    legacy_unexpected = False
     if not ws and not legacy_ws:
         return HerdrRetireClosePlan(workspace_id=ws, lane_id=lane)
     for row in rows:
@@ -155,22 +184,34 @@ def plan_herdr_retire_close(
             # Legacy per-lane workspace: its default-lane managed pair closes; any
             # other occupant is recorded (the workspace will not disappear while
             # they live) and never closed.
-            if row_lane == DEFAULT_LANE and identity.role in _MANAGED_ROLES:
+            if row_lane == DEFAULT_LANE and identity.role in managed:
+                legacy_present.add(identity.role)
                 locator = _agent_locator(row)
                 if locator:
                     close_targets.append((identity.role, locator))
                 continue
+            if row_lane == DEFAULT_LANE:
+                # An unexpected provider AT the legacy lane's own position.
+                legacy_unexpected = True
             foreign.append(_norm(name))
             continue
         if ws and unit_lane and identity.workspace_id == ws and row_lane == unit_lane:
-            if identity.role in _MANAGED_ROLES:
+            if identity.role in managed:
+                shared_present.add(identity.role)
                 locator = _agent_locator(row)
                 if locator:
                     close_targets.append((identity.role, locator))
                 continue
-            # A managed-scheme agent inside the targeted lane unit that is not a
-            # gateway / worker slot: record it, never close it (guarded).
+            # An unexpected provider AT the targeted lane unit's own position.
+            shared_unexpected = True
             foreign.append(_norm(name))
+    # Substitution in EITHER unit (an expected provider missing there while an unexpected one
+    # is live in that same unit) fails the WHOLE plan closed — never a partial close of a
+    # mis-identified lane (the unexpected slot is already recorded in ``foreign``).
+    shared_substitution = bool(expected - shared_present) and shared_unexpected
+    legacy_substitution = bool(expected - legacy_present) and legacy_unexpected
+    if shared_substitution or legacy_substitution:
+        close_targets = []
     return HerdrRetireClosePlan(
         # Echo the caller-visible unit: a legacy-only close reports its token.
         workspace_id=ws or legacy_ws,

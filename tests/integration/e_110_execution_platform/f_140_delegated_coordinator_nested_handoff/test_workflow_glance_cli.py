@@ -272,5 +272,84 @@ class ActiveLanesStoreAdvisoryTest(unittest.TestCase):
         self.assertEqual(rows["13425"]["delivery_anomaly"], "none")
 
 
+class LifecycleDiagnosticTest(unittest.TestCase):
+    """R1 F4 (j#77247): a superseded lane's authority stays operator-visible in glance."""
+
+    def _hss(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as hss,
+        )
+
+        return hss
+
+    def test_superseded_lane_appears_in_lifecycle_diagnostic(self):
+        import os
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DISPOSITION_ACTIVE,
+            DISPOSITION_SUPERSEDED,
+            DecisionPointer,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = LaneLifecycleStore(home=home)
+            key = LaneLifecycleKey("wProj", "issue_13583_x")
+            dec = DecisionPointer(
+                source="redmine", issue_id="13583", journal_id="76630"
+            )
+            store.declare_active(key, decision=dec, issue_id="13583")
+            store.transition_disposition(
+                key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=1,
+                target=DISPOSITION_SUPERSEDED,
+                decision=dec,
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch.object(
+                self._hss(), "herdr_workspace_segment", return_value="wProj"
+            ):
+                rc, out = _run(["workflow", "glance", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        diag = payload.get("lifecycle_diagnostic", [])
+        entry = next((d for d in diag if d["lane"] == "issue_13583_x"), None)
+        self.assertIsNotNone(entry, f"superseded lane missing from diagnostic: {diag}")
+        self.assertEqual(entry["lane_disposition"], "superseded")
+        self.assertEqual(entry["issue"], "13583")
+        # And it is NOT resurfaced into the active roster (capacity excludes it).
+        active_issues = {r.get("issue_id") for r in payload.get("rows", [])}
+        self.assertNotIn("13583", active_issues)
+
+    def test_snapshot_json_glance_does_not_create_state_store(self):
+        # R2-F2 (j#77292): a read-only --snapshot-json glance must not create state.sqlite
+        # just to fold the lifecycle diagnostic (the command's store-free contract).
+        import os
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.lane_lifecycle import lane_lifecycle_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            snap = home / "snap.json"
+            _write_snapshot(snap, [])
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                rc, _ = _run(
+                    ["workflow", "glance", "--snapshot-json", str(snap), "--json"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertFalse(
+                lane_lifecycle_path(home).exists(),
+                "read-only glance created the lifecycle state store",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

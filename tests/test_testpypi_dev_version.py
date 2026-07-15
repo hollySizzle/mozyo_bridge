@@ -1,12 +1,19 @@
 """Unit tests for scripts/compute_testpypi_dev_version.py.
 
 The script is the only piece of automated-TestPyPI-dev-publish logic
-(Redmine #12756) that has branching behaviour, so it is pinned here. It lives
-under scripts/ (not src/) because it must run dependency-free in a fresh CI
-checkout before the package is installed.
+(Redmine #12756 / #13586) that has branching behaviour, so it is pinned here.
+It lives under scripts/ (not src/) because it must run dependency-free in a
+fresh CI checkout before the package is installed; it reuses the stdlib-only
+canonical mirror primitives (the ``version_mirror`` module in the release
+version-governance Feature package) so the
+wheel METADATA and the runtime ``__version__`` are rewritten to the SAME exact
+dev version.
 """
 
+import contextlib
 import importlib.util
+import io
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,21 +26,43 @@ assert _spec.loader is not None
 _spec.loader.exec_module(mod)
 
 
-_SAMPLE_PYPROJECT = (
-    "[project]\n"
-    'name = "mozyo-bridge"\n'
-    'version = "0.9.2"\n'
-    'description = "x"\n'
+# A minimal fake repo carrying the two mirror files plus the contract doc that
+# declares them. Mirrors the shape used by the release-helper integration
+# tests so both consumers of the mirror primitive exercise the same layout.
+_CONTRACT_TEXT = (
+    "# Contract\n\n"
+    "release-version mirror set は以下の 2 file に固定する。\n\n"
+    "- `pyproject.toml` の `[project].version`\n"
+    "- `src/mozyo_bridge/__init__.py` の `__version__`\n\n"
+    "Other section.\n"
 )
 
 
-class ReadBaseVersionTests(unittest.TestCase):
-    def test_reads_project_version(self) -> None:
-        self.assertEqual("0.9.2", mod.read_base_version(_SAMPLE_PYPROJECT))
-
-    def test_missing_version_raises(self) -> None:
-        with self.assertRaises(mod.DevVersionError):
-            mod.read_base_version("[project]\nname = \"x\"\n")
+def _build_repo(
+    root: Path,
+    *,
+    pyproject_version: str = "0.9.2",
+    module_version: str = "0.9.2",
+    module_body: str | None = None,
+) -> Path:
+    (root / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "mozyo-bridge"\n'
+        f'version = "{pyproject_version}"\n'
+        'description = "x"\n',
+        encoding="utf-8",
+    )
+    module_dir = root / "src" / "mozyo_bridge"
+    module_dir.mkdir(parents=True)
+    if module_body is None:
+        module_body = f'"""pkg."""\n\n__version__ = "{module_version}"\n'
+    (module_dir / "__init__.py").write_text(module_body, encoding="utf-8")
+    contract_dir = root / "vibes" / "docs" / "logics"
+    contract_dir.mkdir(parents=True)
+    (contract_dir / "release-helper-contract.md").write_text(
+        _CONTRACT_TEXT, encoding="utf-8"
+    )
+    return root / "pyproject.toml"
 
 
 class BuildDevVersionTests(unittest.TestCase):
@@ -60,66 +89,135 @@ class BuildDevVersionTests(unittest.TestCase):
             mod.build_dev_version("0.9.2.dev1", "2")
 
 
-class RewriteVersionTests(unittest.TestCase):
-    def test_rewrites_only_version_field(self) -> None:
-        out = mod.rewrite_version(_SAMPLE_PYPROJECT, "0.9.2.dev42")
-        self.assertIn('version = "0.9.2.dev42"', out)
-        # Name and description untouched.
-        self.assertIn('name = "mozyo-bridge"', out)
-        self.assertIn('description = "x"', out)
-        # The original release string is gone.
-        self.assertNotIn('version = "0.9.2"', out)
+class ReadMirrorBaseVersionTests(unittest.TestCase):
+    def test_equal_mirror_returns_base(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import (
+            version_mirror,
+        )
 
-    def test_missing_version_field_raises(self) -> None:
-        with self.assertRaises(mod.DevVersionError):
-            mod.rewrite_version("[project]\nname = \"x\"\n", "1.0.0.dev1")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _build_repo(root, pyproject_version="0.9.2", module_version="0.9.2")
+            mirror = version_mirror.load_mirror_set(root)
+            base, entries = mod.read_mirror_base_version(mirror)
+            self.assertEqual("0.9.2", base)
+            self.assertEqual(2, len(entries))
+
+    def test_disagreeing_mirror_raises(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import (
+            version_mirror,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _build_repo(root, pyproject_version="0.9.2", module_version="0.9.1")
+            mirror = version_mirror.load_mirror_set(root)
+            with self.assertRaises(mod.DevVersionError):
+                mod.read_mirror_base_version(mirror)
+
+    def test_missing_module_literal_raises(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import (
+            version_mirror,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _build_repo(root, module_body="# version moved elsewhere\n")
+            mirror = version_mirror.load_mirror_set(root)
+            with self.assertRaises(mod.DevVersionError):
+                mod.read_mirror_base_version(mirror)
 
 
 class MainTests(unittest.TestCase):
-    def _write_pyproject(self, tmp: Path) -> Path:
-        path = tmp / "pyproject.toml"
-        path.write_text(_SAMPLE_PYPROJECT, encoding="utf-8")
-        return path
+    def _run(self, argv: list[str]) -> tuple[int, str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main(argv)
+        return rc, buf.getvalue().strip()
 
-    def test_write_rewrites_file_and_prints_version(self) -> None:
-        import io
-        import contextlib
-        import tempfile
-
+    def test_write_mirrors_every_file_and_prints_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_pyproject(Path(tmp))
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
+            root = Path(tmp)
+            pyproject = _build_repo(root, pyproject_version="0.9.2", module_version="0.9.2")
+            rc, out = self._run(
+                ["--pyproject", str(pyproject), "--dev-number", "777", "--write"]
+            )
+            self.assertEqual(0, rc)
+            self.assertEqual("0.9.2.dev777", out)
+            # BOTH mirror files carry the exact same dev version.
+            self.assertIn(
+                'version = "0.9.2.dev777"',
+                pyproject.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                '__version__ = "0.9.2.dev777"',
+                (root / "src" / "mozyo_bridge" / "__init__.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_without_write_leaves_every_file_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pyproject = _build_repo(root, pyproject_version="0.9.2", module_version="0.9.2")
+            module = root / "src" / "mozyo_bridge" / "__init__.py"
+            before_py = pyproject.read_text(encoding="utf-8")
+            before_mod = module.read_text(encoding="utf-8")
+            rc, out = self._run(["--pyproject", str(pyproject), "--dev-number", "5"])
+            self.assertEqual(0, rc)
+            self.assertEqual("0.9.2.dev5", out)
+            self.assertEqual(before_py, pyproject.read_text(encoding="utf-8"))
+            self.assertEqual(before_mod, module.read_text(encoding="utf-8"))
+
+    def test_base_mismatch_leaves_both_files_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pyproject = _build_repo(
+                root, pyproject_version="0.9.2", module_version="0.9.1"
+            )
+            module = root / "src" / "mozyo_bridge" / "__init__.py"
+            before_py = pyproject.read_text(encoding="utf-8")
+            before_mod = module.read_text(encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
                 rc = mod.main(
-                    ["--pyproject", str(path), "--dev-number", "777", "--write"]
+                    ["--pyproject", str(pyproject), "--dev-number", "9", "--write"]
                 )
-            self.assertEqual(0, rc)
-            self.assertEqual("0.9.2.dev777", buf.getvalue().strip())
-            self.assertIn('version = "0.9.2.dev777"', path.read_text(encoding="utf-8"))
+            self.assertEqual(1, rc)
+            # Neither file was touched — no partial write.
+            self.assertEqual(before_py, pyproject.read_text(encoding="utf-8"))
+            self.assertEqual(before_mod, module.read_text(encoding="utf-8"))
 
-    def test_without_write_leaves_file_unchanged(self) -> None:
-        import io
-        import contextlib
-        import tempfile
-
+    def test_missing_module_literal_leaves_pyproject_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_pyproject(Path(tmp))
-            original = path.read_text(encoding="utf-8")
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                rc = mod.main(["--pyproject", str(path), "--dev-number", "5"])
-            self.assertEqual(0, rc)
-            self.assertEqual("0.9.2.dev5", buf.getvalue().strip())
-            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            root = Path(tmp)
+            pyproject = _build_repo(root, module_body="# version moved elsewhere\n")
+            module = root / "src" / "mozyo_bridge" / "__init__.py"
+            before_py = pyproject.read_text(encoding="utf-8")
+            before_mod = module.read_text(encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = mod.main(
+                    ["--pyproject", str(pyproject), "--dev-number", "9", "--write"]
+                )
+            self.assertEqual(1, rc)
+            self.assertEqual(before_py, pyproject.read_text(encoding="utf-8"))
+            self.assertEqual(before_mod, module.read_text(encoding="utf-8"))
 
     def test_missing_dev_number_errors(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_pyproject(Path(tmp))
-            # Explicit empty dev number, no env fallback.
-            rc = mod.main(["--pyproject", str(path), "--dev-number", ""])
+            root = Path(tmp)
+            pyproject = _build_repo(root)
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = mod.main(["--pyproject", str(pyproject), "--dev-number", ""])
             self.assertEqual(2, rc)
+
+    def test_missing_contract_doc_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pyproject = _build_repo(root)
+            (root / "vibes" / "docs" / "logics" / "release-helper-contract.md").unlink()
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = mod.main(["--pyproject", str(pyproject), "--dev-number", "9"])
+            self.assertEqual(1, rc)
 
 
 if __name__ == "__main__":
