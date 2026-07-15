@@ -119,9 +119,9 @@ PRIMITIVE_CONSULT = "project_gateway_consult"
 PRIMITIVE_CHILD_INTAKE = "project_gateway_child_intake"
 PRIMITIVE_HANDOFF_SEND = "handoff_send"
 PRIMITIVE_TICKETLESS_CALLBACK = "handoff_ticketless_callback"
-# Redmine #13489 increment 2 herdr auto-dispatch: NOT in the generic ``executable`` set (own
-# reserve+send+outcome fence + dedicated CLI leg, never the ``_primitive_argv`` rail).
+# #13489 / #13813: own reserve+send+outcome fence + a dedicated CLI leg, NOT the ``executable`` set.
 PRIMITIVE_HERDR_DISPATCH_WORKER = "herdr_dispatch_worker"
+PRIMITIVE_OPERATOR_STARTUP_RESUME = "operator_startup_resume"
 PRIMITIVE_NONE = "none"
 
 # ``state`` — the resolved workflow state token.

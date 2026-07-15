@@ -104,6 +104,9 @@ RESUME_NOT_CLEAR = "resume_not_clear"
 #: the durable gate is not in the resumable ``operator_reported_done`` state (it is
 #: pre-clear, terminal, or a resume already in flight). Zero-read, zero-write.
 RESUME_NOT_RESUMABLE = "resume_not_resumable"
+#: the durable gate-transition writer is not available (write opt-in unset / no trusted
+#: base URL / no credential) at the pre-reserve preflight -> reserve/send 0 (j#79332 §5).
+RESUME_RECORDER_UNAVAILABLE = "resume_recorder_unavailable"
 
 #: All recognized resume results.
 RESUME_RESULTS: frozenset[str] = frozenset(
@@ -114,6 +117,7 @@ RESUME_RESULTS: frozenset[str] = frozenset(
         RESUME_FENCE_UNAVAILABLE,
         RESUME_NOT_CLEAR,
         RESUME_NOT_RESUMABLE,
+        RESUME_RECORDER_UNAVAILABLE,
     }
 )
 
@@ -148,6 +152,10 @@ class StartupResumeResult:
     needs_reconcile: bool = False
     advanced_gate: Optional[OperatorStartupGate] = None
     projection_disposition: Optional[str] = None
+    #: True when a delivered send's durable gate-transition append could not be recorded
+    #: (a post-send record failure); the send was still exactly-once via the fence, so this
+    #: is an operator-reconcile flag (the durable gate journal is behind), never a re-send.
+    record_failed: bool = False
     detail: str = ""
 
     def __post_init__(self) -> None:
@@ -469,6 +477,7 @@ __all__ = (
     "RESUME_FENCE_UNAVAILABLE",
     "RESUME_NOT_CLEAR",
     "RESUME_NOT_RESUMABLE",
+    "RESUME_RECORDER_UNAVAILABLE",
     "RESUME_RESULTS",
     "StartupResumeError",
     "StartupResumeResult",

@@ -35,9 +35,10 @@ single-line JSON payload is the wire form; :func:`parse_latest_gate` reads it ba
 from __future__ import annotations
 
 import json
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
@@ -53,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume import (
     RESUME_FENCE_UNAVAILABLE,
     RESUME_NOT_RESUMABLE,
+    RESUME_RECORDER_UNAVAILABLE,
     StartupResumeResult,
     resume_startup_gate,
 )
@@ -187,14 +189,16 @@ class ObservedTargetResolution:
 
     ``observed`` is the freshly-resolved :class:`ObservedStartupTarget` (resolved /
     ambiguous / unresolved), ``read_visible`` binds the #13760 visible-pane read for the
-    resolved target, and ``profile_version`` / ``classifier_version`` are the action-time
-    provider-profile / classifier versions that stamp the projected gate's classification.
+    resolved target, ``profile_version`` / ``classifier_version`` are the action-time
+    provider-profile / classifier versions that stamp the projected gate's classification,
+    and ``locator`` is the exact resolved live target handle the send binds to.
     """
 
     observed: ObservedStartupTarget
     read_visible: Callable[[], object]
     profile_version: str
     classifier_version: str
+    locator: str = ""
 
 
 #: Read the latest durable operator startup gate for an issue from the ticket provider.
@@ -205,12 +209,25 @@ GateSource = Callable[[str], LatestGateRead]
 TargetResolver = Callable[
     [OperatorStartupGate, Mapping[str, str]], Optional[ObservedTargetResolution]
 ]
-#: Build the single high-level send that re-issues the original request anchor.
+#: Build the single high-level send that re-issues the original request anchor, given the
+#: exact resolved live target ``locator``.
 ResumeSendFactory = Callable[
-    [OperatorStartupGate, str, Mapping[str, str]], Callable[[], SendOutcome]
+    [OperatorStartupGate, str, str, Mapping[str, str]], Callable[[], SendOutcome]
 ]
-#: Durably record the advanced gate (append-only transition) back to the ticket provider.
-GateRecorder = Callable[[OperatorStartupGate], None]
+
+
+class GateRecorder(Protocol):
+    """Durably append the advanced gate transition to the ticket provider (typed port).
+
+    ``preflight`` (checked BEFORE the reserve) is True only when the write path is available
+    (write opt-in + trusted base URL + credential); ``record`` appends the advanced gate and
+    returns True on a confirmed write, False on any transport failure (a record-failed the
+    leg maps to operator reconcile — the fence stays the exactly-once authority).
+    """
+
+    def preflight(self) -> bool: ...
+
+    def record(self, gate: OperatorStartupGate) -> bool: ...
 
 
 def _utc_now() -> str:
@@ -287,11 +304,25 @@ def execute_startup_resume(
             classifier_version="",
         )
 
-    # 3. Build the single high-level send that re-issues the original anchor.
-    factory = send_factory if send_factory is not None else _default_send_factory
-    send = factory(gate, repo_root, environ)
+    # 3. Durable gate-transition WRITE preflight — BEFORE the reserve (j#79332 §5). If the
+    #    write path is unavailable (write opt-in unset / no trusted base URL / no credential),
+    #    a delivered send could not be durably recorded, so reserve/send 0.
+    recorder = gate_recorder if gate_recorder is not None else _default_gate_recorder(issue, environ)
+    if not recorder.preflight():
+        return StartupResumeResult(
+            result=RESUME_RECORDER_UNAVAILABLE,
+            detail=(
+                f"durable gate-transition writer unavailable for issue {issue} "
+                "(write opt-in / trusted base URL / credential unset); reserve/send 0"
+            ),
+        )
 
-    # 4. Bootstrap the fence (deletion-safe; a store loss fails closed, never a fresh empty
+    # 4. Build the single high-level send that re-issues the original anchor to the exact
+    #    resolved live locator.
+    factory = send_factory if send_factory is not None else _default_send_factory
+    send = factory(gate, resolution.locator, repo_root, environ)
+
+    # 5. Bootstrap the fence (deletion-safe; a store loss fails closed, never a fresh empty
     #    store that could re-send an already-delivered action — mirrors #13489's leg).
     outbox = fence if fence is not None else DispatchOutboxFence()
     try:
@@ -302,7 +333,7 @@ def execute_startup_resume(
             detail=f"dispatch outbox fence unavailable ({exc}); no send — operator recover() required",
         )
 
-    # 5. Drive the exactly-once orchestrator (reserve + at most one send, fail-closed).
+    # 6. Drive the exactly-once orchestrator (reserve + at most one send, fail-closed).
     result = resume_startup_gate(
         existing_gate=gate,
         observed=resolution.observed,
@@ -315,19 +346,31 @@ def execute_startup_resume(
         now=now,
     )
 
-    # 6. Durably record the append-only gate transition when the orchestrator advanced it.
+    # 7. Durably append the gate transition when the orchestrator advanced it. A post-send
+    #    append failure cannot roll back the send — the fence is authoritative (a delivered
+    #    row already refuses a re-reserve), so this is surfaced as a typed record_failed /
+    #    operator-reconcile flag, never a re-send (j#79332 §5).
     if result.advanced_gate is not None:
-        recorder = gate_recorder if gate_recorder is not None else _default_gate_recorder(issue, repo_root, environ)
-        recorder(result.advanced_gate)
+        if not recorder.record(result.advanced_gate):
+            return dataclasses.replace(
+                result,
+                needs_reconcile=True,
+                record_failed=True,
+                detail=(
+                    result.detail
+                    + "; durable gate-transition append FAILED (operator reconcile; the "
+                    "send is fenced exactly-once, the durable gate journal is behind)"
+                ),
+            )
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Thin live default bindings (production-only, lazy-imported — like #13489's leg
-# ``_default_send_factory`` / ``_resolve_target_locator``). Each is fail-soft toward
-# zero-send: an unresolved target / unavailable rail yields an unresolved observation or
-# a not-started outcome rather than a blind send.
+# Live default bindings (lazy-imported; each composed of injectable sub-seams so the
+# production composition root is proven with fakes). Every binding is fail-soft toward
+# zero-send: an unresolved target / unavailable writer / unconfirmed send yields an
+# unresolved observation / preflight-fail / uncertain outcome rather than a blind delivery.
 # ---------------------------------------------------------------------------
 def _os_environ() -> Mapping[str, str]:
     import os
@@ -356,51 +399,45 @@ def _default_gate_source(repo_root: str, env: Mapping[str, str]) -> GateSource:
 def _default_target_resolver(
     gate: OperatorStartupGate, env: Mapping[str, str]
 ) -> Optional[ObservedTargetResolution]:
-    """Default action-time target resolver (production-only; fail-soft to unresolved).
+    """Default action-time target resolver: lifecycle + pins + inventory + attestation.
 
-    Re-resolves the live target for the gate's pinned identity and binds the #13760 read.
-    Any resolution failure returns None so :func:`execute_startup_resume` feeds an
-    unresolved observation to the orchestrator (zero-send). The live registry / generation
-    attestation wiring lands here; until it is provisioned this default resolves nothing,
-    which is the safe (zero-send) direction.
+    Delegates to :class:`ResumeTargetResolver` (its live reads are injectable sub-seams).
+    Returns None on any drift / mismatch so the leg zero-sends — never a blind send.
     """
-    return None  # production wiring point; fail-soft to unresolved -> zero-send.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (
+        ResumeTargetResolver,
+    )
+
+    return ResumeTargetResolver(env=env).resolve(gate, env)
 
 
 def _default_send_factory(
-    gate: OperatorStartupGate, repo_root: str, env: Mapping[str, str]
+    gate: OperatorStartupGate, locator: str, repo_root: str, env: Mapping[str, str]
 ) -> Callable[[], SendOutcome]:
-    """Default high-level send: re-issue the original anchor over the handoff rail.
+    """Default high-level send: one ``handoff send --record-format json`` to the live locator.
 
-    Production-only. Binds the single send to the existing high-level handoff rail
-    (``handoff send`` re-issuing the original ``implementation_request`` anchor); the
-    structured turn-start it surfaces is the fence's :class:`SendOutcome`. Until the live
-    rail binding is provisioned, the default reports a not-started outcome (no blind send),
-    which the orchestrator maps to uncertain / reconcile — never a false delivered.
+    Delegates to :class:`ResumeHandoffSendPort` (its runner is an injectable sub-seam). Only
+    a positively confirmed landing maps to ``started``; every other outcome is uncertain.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (
-        TURN_START_NOT_STARTED,
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_send import (
+        ResumeHandoffSendPort,
     )
 
-    def _send() -> SendOutcome:
-        return SendOutcome(
-            turn_start=TURN_START_NOT_STARTED,
-            detail="live high-level resume send rail not provisioned; no blind send",
-        )
-
-    return _send
+    return ResumeHandoffSendPort(locator=locator).build(gate, repo_root, env)
 
 
-def _default_gate_recorder(issue: object, repo_root: str, env: Mapping[str, str]) -> GateRecorder:
-    """Default gate recorder: append the advanced gate's durable journal (production-only)."""
+def _default_gate_recorder(issue: object, env: Mapping[str, str]) -> GateRecorder:
+    """Default gate recorder: a credentialed ticket-provider append with pre-reserve preflight.
 
-    def _record(gate: OperatorStartupGate) -> None:
-        # Production wiring point: append render_gate_journal(gate) to the issue's Redmine
-        # journal via the high-level ticket-provider rail. A recording failure must not
-        # crash the leg (the send already happened / was fenced); it is best-effort here.
-        _ = render_gate_journal(gate)  # constructed here so the payload is always well-formed.
+    Delegates to :class:`ResumeGateRecorder` (its transport / credential resolvers are
+    injectable sub-seams). ``preflight`` gates on the write opt-in + base URL + credential;
+    ``record`` appends the advanced gate journal and reports a confirmed write.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_record import (
+        ResumeGateRecorder,
+    )
 
-    return _record
+    return ResumeGateRecorder(issue=str(issue).strip(), env=env)
 
 
 __all__ = (

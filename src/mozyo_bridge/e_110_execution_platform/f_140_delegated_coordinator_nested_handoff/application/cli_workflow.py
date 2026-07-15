@@ -92,6 +92,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
     PRIMITIVE_HERDR_DISPATCH_WORKER,
+    PRIMITIVE_OPERATOR_STARTUP_RESUME,
     PRIMITIVE_TICKETLESS_CALLBACK,
     PendingCallback,
     WorkflowAnchor,
@@ -365,6 +366,94 @@ def _execute_herdr_dispatch_leg(
     return (0 if result.ok else 1), text
 
 
+def _is_startup_resume_leg(outcome: WorkflowStepOutcome) -> bool:
+    """True when the outcome is the executable startup-clear exactly-once resume leg (#13813).
+
+    Like the herdr dispatch leg, this is NOT part of the generic ``executable`` set: it rides
+    the resume leg's own ``DispatchOutboxFence`` reserve+send+outcome and a dedicated CLI
+    executor, never the ``_primitive_argv`` rail.
+    """
+    return (
+        outcome.primitive == PRIMITIVE_OPERATOR_STARTUP_RESUME
+        and outcome.execution == EXECUTION_READY
+    )
+
+
+def _execute_startup_resume_leg(
+    outcome: WorkflowStepOutcome, args: argparse.Namespace
+) -> tuple[int, str]:
+    """Run the fenced startup-clear exactly-once resume; return (rc, summary text).
+
+    Delegates to :func:`...operator_startup_resume_leg.execute_startup_resume`, which re-reads
+    the durable gate at action time, re-resolves the exact live target / generation, preflights
+    the durable writer, and drives the exactly-once fence around one high-level send. ``rc`` is
+    ``0`` for a delivered / never-send (skipped) outcome and ``1`` otherwise (uncertain /
+    fence- or writer-unavailable / not-resumable — the operator reconciles).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+        execute_startup_resume,
+    )
+
+    issue = _anchor_issue_of(outcome.durable_anchor) or ""
+    result = execute_startup_resume(args, issue)
+    text = (
+        f"resume_result: {result.result}\n"
+        f"fence_state: {result.fence_state}\n"
+        f"sent: {result.sent}\n"
+        f"record_failed: {result.record_failed}\n"
+        f"detail: {result.detail}"
+    )
+    return (0 if result.ok else 1), text
+
+
+def _maybe_operator_startup_resume_outcome(
+    args: argparse.Namespace, outcome: WorkflowStepOutcome
+) -> "WorkflowStepOutcome | None":
+    """A resume-primitive outcome iff a durable startup gate awaits resume (#13813), else None.
+
+    Reads the latest durable operator startup gate for the step's issue at action time. When it
+    is in the resumable ``operator_reported_done`` state, this returns a copy of ``outcome`` with
+    the :data:`PRIMITIVE_OPERATOR_STARTUP_RESUME` primitive so the step routes to the exactly-once
+    resume leg (which re-reads and re-resolves authoritatively). Any other state — no gate, a
+    corrupt gate, a pre-clear / terminal / in-flight gate — leaves the normal outcome unchanged
+    (returns None); the read is fail-soft (an unreadable ticket provider never forces a resume).
+    """
+    issue = (_anchor_issue_of(outcome.durable_anchor) or "").strip()
+    if not issue:
+        issue = (getattr(args, "issue", None) or "").strip()
+    if not issue:
+        return None
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+            _default_gate_source,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+            GATE_READ_GATE,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
+            STATE_OPERATOR_REPORTED_DONE,
+        )
+        import os
+
+        read = _default_gate_source("", os.environ)(issue)
+    except Exception:  # noqa: BLE001 - unreadable ticket provider -> never force a resume
+        return None
+    if read.status != GATE_READ_GATE or read.gate is None:
+        return None
+    if read.gate.state != STATE_OPERATOR_REPORTED_DONE:
+        return None
+    anchor = outcome.durable_anchor
+    if not anchor or anchor == "none":
+        journal = (getattr(args, "journal", None) or read.gate.original_request.journal or "").strip()
+        anchor = f"redmine:issue={issue}:journal={journal}"
+    return dataclasses.replace(
+        outcome,
+        primitive=PRIMITIVE_OPERATOR_STARTUP_RESUME,
+        execution=EXECUTION_READY,
+        durable_anchor=anchor,
+    )
+
+
 def _is_herdr_forward_leg(outcome: WorkflowStepOutcome) -> bool:
     """True when the outcome is the executable Increment-3 herdr coordinator-forward leg (#13583).
 
@@ -520,17 +609,34 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     )
     outcome = reconciled.outcome
 
+    # Redmine #13813: a durable operator startup gate awaiting resume takes precedence — route
+    # this step to the exactly-once resume leg. The check reads the latest gate at action time
+    # and only overrides the outcome when it is resumable (``operator_reported_done``); any other
+    # state (no gate / corrupt / pre-clear / terminal / in-flight) leaves the normal outcome, and
+    # the read is fail-soft (an unreadable ticket provider never forces a resume).
+    resume_outcome = _maybe_operator_startup_resume_outcome(args, outcome)
+    if resume_outcome is not None:
+        outcome = resume_outcome
+
     # The increment-2 herdr worker-dispatch leg and the increment-3 herdr coordinator-forward leg
     # are executable but ride their own dedicated fences, not the generic `executable` set (Redmine
-    # #13489 / #13583). Treat each as an executable leg here.
+    # #13489 / #13583). The #13813 resume leg is the same shape. Treat each as an executable leg.
     is_herdr_dispatch = _is_herdr_dispatch_leg(outcome)
     is_herdr_forward = _is_herdr_forward_leg(outcome)
+    is_startup_resume = _is_startup_resume_leg(outcome)
 
     # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work
     # no-op): report the resolved outcome, mutate nothing.
-    if dry_run or (not outcome.executable and not is_herdr_dispatch and not is_herdr_forward):
+    if dry_run or (
+        not outcome.executable
+        and not is_herdr_dispatch
+        and not is_herdr_forward
+        and not is_startup_resume
+    ):
         reported = outcome
-        if dry_run and (outcome.executable or is_herdr_dispatch or is_herdr_forward):
+        if dry_run and (
+            outcome.executable or is_herdr_dispatch or is_herdr_forward or is_startup_resume
+        ):
             # Reflect that the executable leg was not actually run.
             reported = dataclasses.replace(outcome, execution=EXECUTION_DRY_RUN)
         if as_json:
@@ -549,6 +655,8 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         rc, primitive_out = _execute_herdr_dispatch_leg(outcome, args)
     elif is_herdr_forward:
         rc, primitive_out = _execute_herdr_forward_leg(outcome, args)
+    elif is_startup_resume:
+        rc, primitive_out = _execute_startup_resume_leg(outcome, args)
     else:
         rc, primitive_out = _execute_primitive(outcome, args, session=session)
     executed = dataclasses.replace(outcome, execution=EXECUTION_EXECUTED)

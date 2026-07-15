@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RESUME_FENCE_UNAVAILABLE,
     RESUME_NOT_CLEAR,
     RESUME_NOT_RESUMABLE,
+    RESUME_RECORDER_UNAVAILABLE,
     RESUME_SKIPPED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (  # noqa: E402
@@ -129,33 +130,45 @@ class _Entry:
 
 
 class _Recorder:
-    def __init__(self):
-        self.recorded = []
+    """A gate recorder fake: preflight()/record() with injectable outcomes."""
 
-    def __call__(self, gate):
+    def __init__(self, *, preflight_ok=True, record_ok=True):
+        self.recorded = []
+        self._preflight_ok = preflight_ok
+        self._record_ok = record_ok
+        self.preflight_calls = 0
+
+    def preflight(self) -> bool:
+        self.preflight_calls += 1
+        return self._preflight_ok
+
+    def record(self, gate) -> bool:
         self.recorded.append(gate)
+        return self._record_ok
 
 
 class _CountingSend:
     def __init__(self):
         self.calls = 0
+        self.locators = []
 
-    def factory(self, gate, repo_root, env):
+    def factory(self, gate, locator, repo_root, env):
         def _send():
             self.calls += 1
+            self.locators.append(locator)
             return SendOutcome(turn_start=TURN_START_STARTED)
 
         return _send
 
 
-def _exploding_send_factory(gate, repo_root, env):
+def _exploding_send_factory(gate, locator, repo_root, env):
     def _send():
         raise AssertionError("send must not be called on a zero-send path")
 
     return _send
 
 
-def _resolver(read_content, target=None):
+def _resolver(read_content, target=None, locator="w1:p1"):
     def _resolve(gate, env):
         return ObservedTargetResolution(
             observed=ObservedStartupTarget(
@@ -164,6 +177,7 @@ def _resolver(read_content, target=None):
             read_visible=lambda: read_content,
             profile_version="2",
             classifier_version="1",
+            locator=locator,
         )
 
     return _resolve
@@ -258,6 +272,47 @@ class ResumeLegTests(unittest.TestCase):
             gate_recorder=gate_recorder,
             fence=self.fence,
         )
+
+    def test_recorder_preflight_unavailable_is_zero_send_before_reserve(self) -> None:
+        # j#79332 §5: the durable writer is preflighted BEFORE the reserve; an unavailable
+        # writer means reserve/send 0 (the send could never be durably recorded).
+        rec = _Recorder(preflight_ok=False)
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
+            target_resolver=_resolver(_READY),
+            send_factory=_exploding_send_factory,
+            gate_recorder=rec,
+        )
+        self.assertEqual(result.result, RESUME_RECORDER_UNAVAILABLE)
+        self.assertEqual(rec.preflight_calls, 1)
+        self.assertEqual(len(rec.recorded), 0)
+
+    def test_send_receives_the_resolved_locator(self) -> None:
+        send = _CountingSend()
+        self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
+            target_resolver=_resolver(_READY, locator="w7:pQ"),
+            send_factory=send.factory,
+            gate_recorder=_Recorder(),
+        )
+        self.assertEqual(send.locators, ["w7:pQ"])
+
+    def test_record_failure_post_send_is_reconcile_not_resend(self) -> None:
+        # A delivered send whose durable append fails: the send is fenced exactly-once, so a
+        # record failure is a typed record_failed / reconcile, never a re-send.
+        send = _CountingSend()
+        rec = _Recorder(record_ok=False)
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
+            target_resolver=_resolver(_READY),
+            send_factory=send.factory,
+            gate_recorder=rec,
+        )
+        self.assertEqual(result.result, RESUME_DELIVERED)
+        self.assertTrue(result.record_failed)
+        self.assertTrue(result.needs_reconcile)
+        self.assertEqual(send.calls, 1)
+        self.assertEqual(len(rec.recorded), 1)  # record was attempted (and failed)
 
     def test_positive_delivers_once_and_records_consumed(self) -> None:
         send = _CountingSend()
