@@ -44,6 +44,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (  # noqa: E402
     GATE_JOURNAL_MARKER,
+    GATE_READ_CORRUPT,
+    GATE_READ_GATE,
+    GATE_READ_NONE,
+    LatestGateRead,
     ObservedTargetResolution,
     execute_startup_resume,
     parse_gate_from_note,
@@ -196,12 +200,37 @@ class GateJournalSerializationTests(unittest.TestCase):
         self.assertNotIn("password", note)
 
     def test_parse_latest_gate_newest_first(self) -> None:
+        # Unrelated (marker-absent) newest entry is skipped; the newest gate record wins.
         entries = [
             _Entry("no gate here"),
             _Entry(render_gate_journal(_done_gate())),
             _Entry("later unrelated note"),
         ]
-        self.assertEqual(parse_latest_gate(entries), _done_gate())
+        read = parse_latest_gate(entries)
+        self.assertEqual(read.status, GATE_READ_GATE)
+        self.assertEqual(read.gate, _done_gate())
+
+    def test_no_gate_marker_anywhere_is_none_status(self) -> None:
+        read = parse_latest_gate([_Entry("just prose"), _Entry("more prose")])
+        self.assertEqual(read.status, GATE_READ_NONE)
+        self.assertIsNone(read.gate)
+
+    def test_newest_malformed_gate_is_corrupt_not_older_fallback(self) -> None:
+        # Finding 3 (j#79309): an older valid gate + a NEWER gate-marker entry that is
+        # malformed must fail closed (corrupt), NOT fall back to the older resumable gate.
+        entries = [
+            _Entry(render_gate_journal(_done_gate())),  # older, valid, resumable
+            _Entry(f"newest transition\n{GATE_JOURNAL_MARKER}\n{{corrupt json here"),
+        ]
+        read = parse_latest_gate(entries)
+        self.assertEqual(read.status, GATE_READ_CORRUPT)
+        self.assertIsNone(read.gate)
+
+    def test_newest_schema_invalid_gate_is_corrupt(self) -> None:
+        # A newest record whose JSON parses but fails the schema invariants is also corrupt.
+        bad = f"{GATE_JOURNAL_MARKER}\n" + '{"schema_version": 2, "state": "consumed"}'
+        entries = [_Entry(render_gate_journal(_done_gate())), _Entry(bad)]
+        self.assertEqual(parse_latest_gate(entries).status, GATE_READ_CORRUPT)
 
     def test_malformed_payload_is_none(self) -> None:
         self.assertIsNone(parse_gate_from_note(f"header\n{GATE_JOURNAL_MARKER}\n{{not json"))
@@ -234,7 +263,7 @@ class ResumeLegTests(unittest.TestCase):
         send = _CountingSend()
         rec = _Recorder()
         result = self._run(
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=_resolver(_READY),
             send_factory=send.factory,
             gate_recorder=rec,
@@ -247,13 +276,13 @@ class ResumeLegTests(unittest.TestCase):
     def test_duplicate_rerun_through_leg_sends_zero(self) -> None:
         send = _CountingSend()
         self._run(
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=_resolver(_READY),
             send_factory=send.factory,
             gate_recorder=_Recorder(),
         )
         second = self._run(
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=_resolver(_READY),
             send_factory=send.factory,  # would raise via count? no — assert via calls
             gate_recorder=_Recorder(),
@@ -264,7 +293,7 @@ class ResumeLegTests(unittest.TestCase):
     def test_still_blocked_screen_is_zero_send_unrecorded(self) -> None:
         rec = _Recorder()
         result = self._run(
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=_resolver(_THEME),
             send_factory=_exploding_send_factory,
             gate_recorder=rec,
@@ -278,7 +307,7 @@ class ResumeLegTests(unittest.TestCase):
         # The leg's action-time resolution must turn this drift into zero send.
         rec = _Recorder()
         result = self._run(
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=_resolver(_READY, target=_target(lane_id="lane-beta")),
             send_factory=_exploding_send_factory,
             gate_recorder=rec,
@@ -289,16 +318,32 @@ class ResumeLegTests(unittest.TestCase):
 
     def test_missing_durable_gate_is_not_resumable(self) -> None:
         result = self._run(
-            gate_source=lambda issue: None,
+            gate_source=lambda issue: LatestGateRead(GATE_READ_NONE),
             target_resolver=_resolver(_READY),
             send_factory=_exploding_send_factory,
             gate_recorder=_Recorder(),
         )
         self.assertEqual(result.result, RESUME_NOT_RESUMABLE)
 
+    def test_corrupt_latest_gate_is_zero_send_no_fallback(self) -> None:
+        # Finding 3 (j#79309): a corrupt latest gate record must fail closed (zero-send),
+        # never resume — the leg does NOT read the pane, resolve, or send.
+        rec = _Recorder()
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_CORRUPT),
+            target_resolver=lambda gate, env: (_ for _ in ()).throw(
+                AssertionError("resolver must not run on a corrupt gate")
+            ),
+            send_factory=_exploding_send_factory,
+            gate_recorder=rec,
+        )
+        self.assertEqual(result.result, RESUME_NOT_RESUMABLE)
+        self.assertIn("corrupt", result.detail)
+        self.assertEqual(len(rec.recorded), 0)
+
     def test_unresolved_live_target_is_zero_send(self) -> None:
         result = self._run(
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=lambda gate, env: None,  # cannot resolve the live target
             send_factory=_exploding_send_factory,
             gate_recorder=_Recorder(),
@@ -317,7 +362,7 @@ class ResumeLegTests(unittest.TestCase):
             "13813",
             env={},
             observed_at="2026-07-16T01:00:00Z",
-            gate_source=lambda issue: _done_gate(),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
             target_resolver=_resolver(_READY),
             send_factory=_exploding_send_factory,
             gate_recorder=_Recorder(),

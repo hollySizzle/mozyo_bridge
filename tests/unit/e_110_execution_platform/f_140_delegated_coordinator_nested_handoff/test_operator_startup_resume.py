@@ -194,6 +194,9 @@ class _ExplodingFence:
     def mark_uncertain(self, *a, **k):
         raise AssertionError("fence.mark_uncertain must not be called on a zero-write path")
 
+    def record_uncertain(self, *a, **k):
+        raise AssertionError("fence.record_uncertain must not be called on a zero-write path")
+
 
 class _RaisingFence:
     """A fence whose reserve raises the fail-closed error (corrupt / lost store)."""
@@ -230,6 +233,10 @@ class _RowVanishesFence:
     def mark_uncertain(self, key, *, detail="", now=None):
         return self.real.mark_uncertain(key, detail=detail, now=now)
 
+    def record_uncertain(self, key, *, detail="", now=None):
+        # The real upsert re-asserts the never-send state even though the row was wiped.
+        return self.real.record_uncertain(key, detail=detail, now=now)
+
 
 class _RaiseOnWriteFence:
     """Reserve succeeds, but every outcome write raises the fail-closed store error."""
@@ -244,6 +251,9 @@ class _RaiseOnWriteFence:
         raise DispatchOutboxFenceError("store corrupt at outcome write")
 
     def mark_uncertain(self, key, *, detail="", now=None):
+        raise DispatchOutboxFenceError("store corrupt at outcome write")
+
+    def record_uncertain(self, key, *, detail="", now=None):
         raise DispatchOutboxFenceError("store corrupt at outcome write")
 
 
@@ -617,28 +627,63 @@ class PostReserveOutcomeWriteFailClosedTests(_ResumeCase):
         self.assertEqual(result.result, RESUME_UNCERTAIN)
         self.assertTrue(result.needs_reconcile)
 
-    def test_rerun_after_failclosed_uncertain_sends_zero(self) -> None:
-        # The exactly-once guarantee is preserved at the GATE level: after the fail-closed
-        # uncertain outcome the durable gate is verified_clear, so a re-run is send 0.
+    def test_rerun_reading_stale_gate_after_row_loss_sends_zero(self) -> None:
+        # Review j#79309 Finding 1: exactly-once must hold at the FENCE, not the gate. Run 1
+        # loses the reserved row at the outcome write and returns uncertain; the advanced
+        # `verified_clear` gate is NEVER durably recorded. Run 2 re-reads the STALE durable
+        # gate (still `operator_reported_done`) against the SAME real fence — and must send
+        # zero because record_uncertain re-asserted the never-send state on the fence.
+        send = _CountingSend(outcome=SendOutcome(turn_start=TURN_START_STARTED))
         first = self._resume(
             gate=_done_gate(),
             observed=_resolved(),
             read_visible=lambda: _READY_COMPOSER,
             fence=_RowVanishesFence(self.fence),
-            send=_CountingSend(outcome=SendOutcome(turn_start=TURN_START_STARTED)),
+            send=send,
         )
         self.assertEqual(first.result, RESUME_UNCERTAIN)
-        assert first.advanced_gate is not None
+        self.assertEqual(send.calls, 1)
+        # The fence itself now holds the never-send uncertain state (re-asserted upsert).
+        self.assertEqual(
+            self.fence.state_of(fence_key_for_gate(_done_gate())), FENCE_UNCERTAIN
+        )
+        # Re-run with the STALE gate (recording of verified_clear is assumed to have failed).
         rerun = self._resume(
-            gate=first.advanced_gate,  # durable gate is now verified_clear
+            gate=_done_gate(),  # stale durable pointer, NOT first.advanced_gate
             observed=_resolved(),
-            read_visible=_exploding_read(),
-            fence=_ExplodingFence(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=self.fence,
             send=_exploding_send(),
         )
-        self.assertEqual(rerun.result, RESUME_NOT_RESUMABLE)
+        self.assertEqual(rerun.result, RESUME_SKIPPED)
         self.assertFalse(rerun.sent)
         self.assertTrue(rerun.needs_reconcile)
+        self.assertEqual(send.calls, 1)  # still exactly one send total across both runs
+
+    def test_rerun_after_whole_store_loss_fails_closed(self) -> None:
+        # If the WHOLE store is lost (not just a row), record_uncertain can't re-assert, but
+        # a re-run then fails closed on the fence's _connect (no send).
+        send = _CountingSend(outcome=SendOutcome(turn_start=TURN_START_STARTED))
+        first = self._resume(
+            gate=_done_gate(),
+            observed=_resolved(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=_RaiseOnWriteFence(self.fence),
+            send=send,
+        )
+        self.assertEqual(first.result, RESUME_UNCERTAIN)
+        self.assertEqual(send.calls, 1)
+        # Simulate the whole store lost after the send.
+        self.fence.path.unlink()
+        rerun = self._resume(
+            gate=_done_gate(),
+            observed=_resolved(),
+            read_visible=lambda: _READY_COMPOSER,
+            fence=self.fence,
+            send=_exploding_send(),
+        )
+        self.assertEqual(rerun.result, RESUME_FENCE_UNAVAILABLE)
+        self.assertEqual(send.calls, 1)
 
 
 class FenceUnavailableTests(_ResumeCase):

@@ -97,16 +97,44 @@ def render_gate_journal(gate: OperatorStartupGate) -> str:
     return "\n".join([*lines, "", GATE_JOURNAL_MARKER, payload])
 
 
-def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
-    """Parse the gate JSON payload from one journal note, or None (fail-soft).
+# Gate-read status (:class:`LatestGateRead`). A durable gate read is one of three: a
+# valid gate, no gate record at all, or a CORRUPT newest gate record (fail-closed).
+GATE_READ_GATE = "gate"  # a valid latest gate was read
+GATE_READ_NONE = "no_gate"  # no gate-marker-bearing journal entry exists at all
+GATE_READ_CORRUPT = "corrupt"  # the NEWEST gate-marker entry is malformed / schema-invalid
 
-    Finds the :data:`GATE_JOURNAL_MARKER` sentinel and decodes the first non-empty line
-    after it with :meth:`OperatorStartupGate.from_record`. A note without the sentinel, a
-    malformed JSON, or a record that fails the schema invariants returns None rather than
-    raising — a bad durable record must never resume, and the caller treats "no gate" as
-    not-resumable.
+
+@dataclass(frozen=True)
+class LatestGateRead:
+    """The typed result of reading the latest durable gate (Finding 3, review j#79309).
+
+    ``status`` is :data:`GATE_READ_GATE` (``gate`` present), :data:`GATE_READ_NONE`
+    (nothing to resume), or :data:`GATE_READ_CORRUPT` (the newest gate record could not be
+    parsed — fail closed, never fall back to an older gate). Distinguishing corrupt from
+    absent is the whole point: a marker-absent journal entry is unrelated and skipped, but a
+    marker-PRESENT-but-invalid newest record must stop the resume, not silently resume from a
+    stale older gate.
     """
-    if not notes or GATE_JOURNAL_MARKER not in notes:
+
+    status: str
+    gate: Optional[OperatorStartupGate] = None
+
+
+def note_has_gate_marker(notes: object) -> bool:
+    """True when a note carries the gate sentinel (i.e. it is a gate record entry)."""
+    return isinstance(notes, str) and GATE_JOURNAL_MARKER in notes
+
+
+def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
+    """Parse the gate JSON payload from one gate-marker note, or None if malformed.
+
+    Precondition: the note carries :data:`GATE_JOURNAL_MARKER` (check
+    :func:`note_has_gate_marker` first). Decodes the first non-empty line after the sentinel
+    with :meth:`OperatorStartupGate.from_record`. Malformed JSON or a record that fails the
+    schema invariants returns None — the caller treats a malformed newest record as CORRUPT
+    (fail-closed), never as "no gate".
+    """
+    if not note_has_gate_marker(notes):
         return None
     after = notes.split(GATE_JOURNAL_MARKER, 1)[1]
     for line in after.splitlines():
@@ -126,21 +154,28 @@ def parse_gate_from_note(notes: str) -> Optional[OperatorStartupGate]:
     return None
 
 
-def parse_latest_gate(entries: Sequence[object]) -> Optional[OperatorStartupGate]:
-    """The most recent parseable durable gate across journal entries (newest-first).
+def parse_latest_gate(entries: Sequence[object]) -> LatestGateRead:
+    """Read the latest durable gate (newest-first), fail-closed on a corrupt newest record.
 
     ``entries`` is a sequence of objects exposing a ``.notes`` attribute (Redmine journal
-    entries, chronological). Scans newest-first and returns the first gate that parses; the
-    append-only transition chain means the newest gate record is the current state.
+    entries, chronological). Scans newest-first for the first *gate-marker-bearing* entry —
+    that is the current gate record (the transition chain is append-only). If it parses, the
+    result is :data:`GATE_READ_GATE`; if it is malformed / schema-invalid, the result is
+    :data:`GATE_READ_CORRUPT` — the read **stops there** and never falls back to an older,
+    stale gate (Finding 3, review j#79309: a corrupt supersede/consume record must not let a
+    stale ``operator_reported_done`` gate resume). Journal entries WITHOUT the marker are
+    unrelated and skipped; if none carry a marker, the result is :data:`GATE_READ_NONE`.
     """
     for entry in reversed(list(entries)):
         notes = getattr(entry, "notes", None)
-        if not isinstance(notes, str):
-            continue
+        if not note_has_gate_marker(notes):
+            continue  # unrelated journal entry — skip, keep scanning older entries.
+        # This is the NEWEST gate record. It decides the read; no fallback past it.
         gate = parse_gate_from_note(notes)
         if gate is not None:
-            return gate
-    return None
+            return LatestGateRead(status=GATE_READ_GATE, gate=gate)
+        return LatestGateRead(status=GATE_READ_CORRUPT)
+    return LatestGateRead(status=GATE_READ_NONE)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +198,9 @@ class ObservedTargetResolution:
 
 
 #: Read the latest durable operator startup gate for an issue from the ticket provider.
-GateSource = Callable[[str], Optional[OperatorStartupGate]]
+#: Returns a typed :class:`LatestGateRead` (gate / no_gate / corrupt) so a corrupt newest
+#: record fails closed rather than silently resuming from a stale older gate (Finding 3).
+GateSource = Callable[[str], LatestGateRead]
 #: Re-resolve the gate's live target + read primitive at action time, or None (unresolved).
 TargetResolver = Callable[
     [OperatorStartupGate, Mapping[str, str]], Optional[ObservedTargetResolution]
@@ -202,11 +239,13 @@ def execute_startup_resume(
     :func:`resume_startup_gate` (which reserves + sends at most once, fail-closed); and,
     when it advances the gate, record the append-only transition durably.
 
-    A missing durable gate is :data:`RESUME_NOT_RESUMABLE` (nothing to resume). An
-    un-resolvable live target feeds an ``unresolved`` observation to the orchestrator, which
-    zero-sends (``resume_not_clear``). A lost / corrupt fence is :data:`RESUME_FENCE_UNAVAILABLE`
-    with no send. ``send_factory`` / ``target_resolver`` / ``gate_source`` / ``gate_recorder``
-    / ``fence`` are injectable for hermetic tests; the defaults are the production bindings.
+    A missing durable gate (:data:`GATE_READ_NONE`) is :data:`RESUME_NOT_RESUMABLE`. A
+    CORRUPT newest gate record (:data:`GATE_READ_CORRUPT`) is fail-closed zero-send — it
+    NEVER falls back to an older stale gate (Finding 3, review j#79309). An un-resolvable
+    live target feeds an ``unresolved`` observation to the orchestrator, which zero-sends
+    (``resume_not_clear``). A lost / corrupt fence is :data:`RESUME_FENCE_UNAVAILABLE` with no
+    send. ``send_factory`` / ``target_resolver`` / ``gate_source`` / ``gate_recorder`` /
+    ``fence`` are injectable for hermetic tests; the defaults are the production bindings.
     """
     from mozyo_bridge.application.commands_common import repo_root_from_args
 
@@ -216,12 +255,24 @@ def execute_startup_resume(
 
     # 1. Re-read the latest durable gate + original anchor from the ticket-provider port.
     source = gate_source if gate_source is not None else _default_gate_source(repo_root, environ)
-    gate = source(str(issue).strip())
-    if gate is None:
+    read = source(str(issue).strip())
+    if read.status == GATE_READ_CORRUPT:
+        # The NEWEST gate record is malformed / schema-invalid: fail closed. Never resume
+        # from a stale older gate (Finding 3) — a corrupt supersede/consume record must not
+        # let an older `operator_reported_done` gate re-issue the request.
+        return StartupResumeResult(
+            result=RESUME_NOT_RESUMABLE,
+            detail=(
+                f"latest durable operator startup gate for issue {issue} is corrupt "
+                "(malformed / schema-invalid); fail-closed, no fallback to an older gate"
+            ),
+        )
+    if read.status != GATE_READ_GATE or read.gate is None:
         return StartupResumeResult(
             result=RESUME_NOT_RESUMABLE,
             detail=f"no durable operator startup gate found for issue {issue}",
         )
+    gate = read.gate
 
     # 2. Re-resolve the exact live target + read primitive at action time.
     resolver = target_resolver if target_resolver is not None else _default_target_resolver
@@ -287,7 +338,7 @@ def _os_environ() -> Mapping[str, str]:
 def _default_gate_source(repo_root: str, env: Mapping[str, str]) -> GateSource:
     """Default gate source: read the latest durable gate from the live Redmine journal."""
 
-    def _read(issue_id: str) -> Optional[OperatorStartupGate]:
+    def _read(issue_id: str) -> LatestGateRead:
         try:
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
                 LiveRedmineJournalSource,
@@ -296,7 +347,7 @@ def _default_gate_source(repo_root: str, env: Mapping[str, str]) -> GateSource:
             source = LiveRedmineJournalSource.from_environment(environ=env)
             entries = source.read_entries(issue_id)
         except Exception:  # noqa: BLE001 - live transport / unconfigured creds -> no gate (fail-soft, zero-send)
-            return None
+            return LatestGateRead(status=GATE_READ_NONE)
         return parse_latest_gate(list(entries))
 
     return _read
@@ -354,12 +405,17 @@ def _default_gate_recorder(issue: object, repo_root: str, env: Mapping[str, str]
 
 __all__ = (
     "GATE_JOURNAL_MARKER",
+    "GATE_READ_GATE",
+    "GATE_READ_NONE",
+    "GATE_READ_CORRUPT",
+    "LatestGateRead",
     "ObservedTargetResolution",
     "GateSource",
     "TargetResolver",
     "ResumeSendFactory",
     "GateRecorder",
     "render_gate_journal",
+    "note_has_gate_marker",
     "parse_gate_from_note",
     "parse_latest_gate",
     "execute_startup_resume",
