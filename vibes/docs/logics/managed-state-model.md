@@ -480,6 +480,36 @@ Migration stance:
   leaves the DB untouched. For caches, it may continue using legacy files if present; for registry identity, it must fail closed
   rather than rewrite unknown state.
 
+#### read-compatible / write-migrating split (shared home, parallel-lane schema skew — #13844)
+
+The home-scoped `state.sqlite` is a **single shared authority** while parallel repo lanes each run a **source CLI of a different
+schema generation** (each issue worktree ships its own branch's code). If a newer-schema source CLI forward-migrates the shared
+store on a mere READ — a status / handoff / review / callback / drain routing lookup — it fail-closes every concurrent
+older-schema reader: the older reader (correctly) refuses to downgrade the now-newer store, so `standard` handoff stops with
+`gateway_route_blocked` and the transport rail stalls permanently (live: #13842 `56d3a32` migrated the shared store to v6, then a
+concurrent v5 reader could not send #13813 j#79382). A safe per-CLI fail-closed thus becomes a system-wide liveness failure.
+
+The contract that prevents it, for a component whose rows are authority (e.g. `lane_lifecycle`):
+
+- **Reads never migrate.** Status / handoff / review / callback / drain — and any read-only projection (`workflow glance`) —
+  read the authority through a **read-only, version-compatible reader** (`LaneLifecycleReader` / `readonly_compatible_select`),
+  opened `mode=ro`: no DDL, no `ALTER`, no version re-stamp, no backup. A newer build reads an **older KNOWN additive shape** by
+  padding the columns that shape lacks with their **in-memory migration defaults** (the same value a forward `ALTER … DEFAULT`
+  would have written), so it interprets the older store faithfully without touching a byte. The shared store stays at its current
+  version and every concurrent older reader keeps working.
+- **Only a mutating use case migrates.** The forward migration (`ensure_lane_lifecycle_schema`, backup-first, additive) runs only
+  when a CAS write genuinely needs the current schema — never as a side effect of a read/notification command. It returns a
+  **typed outcome** (`created` / `intact` / `migrated{from_version, backup_dir}`) so the schema-changing event and its backup are
+  legible, not inferred.
+- **Fail-closed is preserved and made specific.** An unknown / newer / partial / malformed shape still fails closed (no
+  downgrade, no misread), judged only by the **shape / capability table** (`_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFS`), never a
+  guessed compatibility. The specific NEWER sub-case is named `reader_upgrade_required`: the store is fine, THIS reader is stale,
+  so the caller routes to the **current compatible high-level facade** (the up-to-date source CLI) rather than a raw DB downgrade.
+- **Source CLI vs installed facade boundary.** An unintegrated issue-branch source CLI is a *reader* of the shared authority; it
+  must not implicitly migrate it. A schema-changing write (a mutating command) should surface the **compatibility preflight**
+  (`lifecycle_migration_preflight`) — read-only, version-compatible — which reports the other active lanes a forward migration
+  would fail-close, so the migration is a chosen, visible act rather than an accidental side effect of a background notification.
+
 ### corruption blast radius / backup
 
 Single file raises the blast radius, so recovery policy must be component-aware:

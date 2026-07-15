@@ -106,7 +106,10 @@ class DispositionGateWiringTest(unittest.TestCase):
             with patch.dict(
                 os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
             ), patch.object(
-                ll.LaneLifecycleStore,
+                # Redmine #13844: the standard-handoff lookup reads through the read-only
+                # LaneLifecycleReader (never the migrating store), so an action-time read
+                # failure is injected on the reader's get.
+                ll.LaneLifecycleReader,
                 "get",
                 side_effect=ll.LaneLifecycleError("boom"),
             ):
@@ -165,7 +168,8 @@ class DispositionGateWiringTest(unittest.TestCase):
             home = Path(tmp)
             self._seed(home, DISPOSITION_ACTIVE)
             with patch.object(
-                ll.LaneLifecycleStore,
+                # Redmine #13844: read failure injected on the read-only reader seam.
+                ll.LaneLifecycleReader,
                 "get",
                 side_effect=ll.LaneLifecycleError("boom"),
             ), self.assertRaises(_Die):

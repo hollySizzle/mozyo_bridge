@@ -716,10 +716,19 @@ def review_round_send_fence(
 
 
 def default_lifecycle_store(*, home: Optional[Path] = None):
-    """Build the home-scoped lane lifecycle store (the #13681/#13689 owning-lane binding authority)."""
-    from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+    """The home-scoped owning-lane binding authority reader (#13681/#13689 owner, #13844 read-only).
 
-    return LaneLifecycleStore(home=home)
+    The callback supervisor only READS the lifecycle authority (``resolve_owner`` / ``get`` to
+    route a review_result / callback return to the current owning lane); it never mutates it.
+    It therefore reads through the NON-MIGRATING, version-compatible
+    :class:`LaneLifecycleReader` (Redmine #13844): a supervisor running a newer-schema source
+    CLI must not forward-migrate the shared home store while resolving an owner, which would
+    fail-close every concurrent older-schema reader lane's transport. The reader mirrors the
+    store's read surface (``resolve_owner`` / ``get``) with the same fail-closed contract.
+    """
+    from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleReader
+
+    return LaneLifecycleReader(home=home)
 
 
 def default_target_resolver(ws: SupervisedWorkspace, *, lifecycle_store: object = None):

@@ -66,7 +66,7 @@ def _resolve_target_disposition(preflight_target: Any) -> Tuple[Optional[str], b
     from mozyo_bridge.core.state.lane_lifecycle import (
         LaneLifecycleError,
         LaneLifecycleKey,
-        LaneLifecycleStore,
+        LaneLifecycleReader,
     )
 
     try:
@@ -75,7 +75,15 @@ def _resolve_target_disposition(preflight_target: Any) -> Tuple[Optional[str], b
         # A malformed unit cannot address a lifecycle row — not a read failure.
         return None, False
     try:
-        record = LaneLifecycleStore().get(key)
+        # Redmine #13844: the standard-handoff lifecycle lookup reads through the read-only,
+        # version-compatible READER — NEVER the migrating store. A ``standard`` handoff sent by
+        # a newer-schema source CLI must not forward-migrate the shared home authority store
+        # (which would fail-close every concurrent older-schema reader lane and stop their
+        # transport with ``gateway_route_blocked``). The reader reads an older KNOWN shape with
+        # in-memory defaults (no DB write) and fails closed only on an unknown / newer /
+        # partial store — so the routing read reaches the read-only API and never the mutation
+        # / migration API.
+        record = LaneLifecycleReader().get(key)
     except (LaneLifecycleError, OSError):
         # Action-time read failure: fail closed (zero-send), never assumed active.
         return None, True

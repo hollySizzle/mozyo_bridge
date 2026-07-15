@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -565,8 +566,135 @@ def readonly_component_status(conn: sqlite3.Connection) -> str:
     )
 
 
-def ensure_lane_lifecycle_schema(path: Path) -> None:
-    """Create / validate the container, this component's table + owner index.
+# -- read-compatible / write-migrating split (Redmine #13844) ----------------
+#
+# The bug: parallel repo lanes each run a source CLI of a different schema generation,
+# but the lifecycle *authority* is home-scoped and shared. A newer-schema source CLI
+# that forward-migrates the shared store on a mere READ (status / handoff / review /
+# callback / drain routing) fails-closes every concurrent older-schema reader — the
+# older reader can no longer read the authority, so ``standard`` handoff stops with
+# ``gateway_route_blocked`` (#13813 j#79382). The fix separates *reading* the authority
+# (never migrates; a newer build reads an older KNOWN additive shape by padding the
+# columns it lacks with their in-memory migration defaults) from *mutating* it (the only
+# path that runs the explicit backup-first migration below).
+
+
+def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
+    """A NON-MUTATING full-width ``SELECT`` column list for a recognized, KNOWN-shape store.
+
+    The read half of the read-compatible / write-migrating split (Redmine #13844). Given a
+    store whose recorded component version this build recognizes AND whose live table shape
+    EXACTLY matches one of that version's known signatures (:func:`_schema_signature_matches`),
+    returns a ``SELECT`` column expression that yields the full current (v6) column vocabulary
+    in :data:`COLUMNS` order — projecting the columns the store's older shape lacks as their
+    **migration-default literal** (``'' AS reconcile_phase`` for a v5 store, and so on). The
+    caller then decodes each row exactly as a native current row, WITHOUT altering the DB
+    bytes, the schema version, or taking a backup: a newer reader interprets a missing additive
+    field with the same default a forward migration's ``ALTER … DEFAULT`` would have written,
+    but writes nothing.
+
+    Returns ``None`` — fail closed — when the store's live shape is NOT a known signature for
+    its recorded version (a partial / corrupt / unknown shape), or when its version is
+    unrecognized. It never guesses a compatibility: the shape/capability table
+    (:data:`_ALLOWED_SHAPES_BY_VERSION` / :data:`_COLUMN_DEFS`) is the only authority
+    (Redmine #13844 design item 4). A missing NON-additive column (one with no default) also
+    fails closed rather than fabricate a required authority value.
+
+    This is a pure read: only ``PRAGMA``/``sqlite_master`` reads run, no DDL, no DML.
+    """
+    recorded = _recorded_version(conn)
+    if recorded is None or recorded not in _RECOGNIZED_SCHEMA_VERSIONS:
+        return None
+    if not _schema_signature_matches(conn, recorded):
+        return None
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")}
+    parts: list[str] = []
+    for column in (name.strip() for name in _COLUMNS.split(",")):
+        if column in present:
+            parts.append(column)
+            continue
+        # The column is absent from this older, known signature. It is therefore an
+        # additive column (a non-additive column with no default is caught above by the
+        # exact-signature match), so its migration default is a non-NULL literal.
+        default = _COLUMN_DEFS.get(column, (None, 0, None, 0))[2]
+        if default is None:
+            return None
+        parts.append(f"{default} AS {column}")
+    return ", ".join(parts)
+
+
+#: A read reached a store whose schema is NEWER than anything this build understands — a
+#: newer container version, or a newer component version. It is NOT downgraded or misread
+#: (Redmine #13844 item 5): the caller routes to a current, compatible high-level facade
+#: (the up-to-date source CLI), never a raw DB downgrade.
+READER_UPGRADE_REQUIRED = "reader_upgrade_required"
+
+
+def reader_upgrade_required(conn: sqlite3.Connection) -> bool:
+    """Read-only: is this store NEWER than this build can read (needs an upgraded reader)?
+
+    ``True`` when the container ``PRAGMA user_version`` exceeds this build's
+    :data:`STATE_CONTAINER_VERSION`, or the recorded component version is a genuine integer
+    greater than the newest version this build recognizes. This is the specific, actionable
+    sub-case of :data:`READONLY_COMPONENT_UNSUPPORTED` (Redmine #13844 item 5): the store is
+    fine, THIS reader is stale, so the caller routes to the current compatible facade rather
+    than downgrading. A malformed / partial / older-corrupt store is NOT this case (it is
+    ``False`` here) — it fails closed as unsupported without claiming "just upgrade".
+    """
+    try:
+        container = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return False
+    if isinstance(container, int) and container > STATE_CONTAINER_VERSION:
+        return True
+    recorded = _recorded_version(conn)
+    return (
+        isinstance(recorded, int)
+        and recorded != _VERSION_MALFORMED
+        and recorded > max(_RECOGNIZED_SCHEMA_VERSIONS)
+    )
+
+
+#: Typed outcomes of the schema-ensuring WRITE gate (Redmine #13844 item 3): so a mutating
+#: caller can tell "already current" from "migrated an older store" (and where its backup
+#: went) rather than inferring it from a bare ``None`` return.
+SCHEMA_CREATED = "created"
+SCHEMA_INTACT = "intact"
+SCHEMA_MIGRATED = "migrated"
+
+
+@dataclass(frozen=True)
+class LifecycleSchemaOutcome:
+    """What :func:`ensure_lane_lifecycle_schema` actually did (Redmine #13844 item 3).
+
+    - :data:`SCHEMA_CREATED` — a fresh store: the table + owner indexes were created and the
+      component registered at the current version (``from_version`` is ``None``).
+    - :data:`SCHEMA_INTACT` — the store already matched the current version; nothing was
+      written (``from_version == to_version``).
+    - :data:`SCHEMA_MIGRATED` — a recognized OLDER store was migrated forward backup-first;
+      ``from_version`` is where it started and ``backup_dir`` is the pre-migration snapshot.
+
+    A downgrade / corrupt / unknown store never yields an outcome — it raises
+    :class:`LaneLifecycleError` and leaves the store untouched.
+    """
+
+    action: str
+    from_version: Optional[int]
+    to_version: int = LANE_LIFECYCLE_SCHEMA_VERSION
+    backup_dir: Optional[str] = None
+
+
+def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
+    """Create / validate the container, this component's table + owner index (WRITE gate).
+
+    This is the *write-migrating* half of the read-compatible / write-migrating split
+    (Redmine #13844): the ONLY path that may forward-migrate the shared authority store, and
+    only for a genuinely mutating use case (a CAS write needs the current schema). Reads take
+    the non-migrating :func:`readonly_compatible_select` path instead, so a status / handoff /
+    review / callback / drain lookup by a newer-schema source CLI never migrates the shared
+    store out from under a concurrent older-schema reader. Returns a
+    :class:`LifecycleSchemaOutcome` (created / intact / migrated) so a caller can log the
+    schema-changing event and its backup; a downgrade / corrupt / unknown store raises.
 
     Uses the shared container guard (``PRAGMA user_version`` +
     ``state_schema_components``), then registers this component with no
@@ -604,6 +732,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
     # ``BEGIN IMMEDIATE`` (not Python's implicit deferred transaction) governs the section.
     conn.isolation_level = None
     locked = False
+    outcome: LifecycleSchemaOutcome
     try:
         conn.execute("BEGIN IMMEDIATE")
         locked = True
@@ -646,6 +775,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)
             _stamp_component_version(conn)
+            outcome = LifecycleSchemaOutcome(action=SCHEMA_CREATED, from_version=None)
         elif not _schema_signature_matches(conn, recorded):
             # A recorded version whose live shape is NOT one of that version's known
             # signatures: a missing table, a missing / extra / re-typed column, or a missing
@@ -657,7 +787,9 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             )
         elif recorded == LANE_LIFECYCLE_SCHEMA_VERSION:
             # Intact current: the signature already matches. Do NOT re-run DDL or re-stamp.
-            pass
+            outcome = LifecycleSchemaOutcome(
+                action=SCHEMA_INTACT, from_version=recorded
+            )
         else:
             # A recognized OLDER version whose shape matches one of its KNOWN predecessor
             # signatures (v1, v2, or either v3 branch). Migrate forward: back up first, then
@@ -671,7 +803,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             # on disk is the committed pre-``ALTER`` state and no other writer can change it
             # during the copy, so the snapshot is a faithful, unique pre-migration copy.
             try:
-                backup_state_container(path)
+                backup_dir = backup_state_container(path)
             except StateStoreError as exc:
                 raise LaneLifecycleError(
                     f"lane lifecycle migration to v{LANE_LIFECYCLE_SCHEMA_VERSION} "
@@ -746,6 +878,11 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)
             _stamp_component_version(conn)
+            outcome = LifecycleSchemaOutcome(
+                action=SCHEMA_MIGRATED,
+                from_version=recorded,
+                backup_dir=str(backup_dir) if backup_dir is not None else None,
+            )
         conn.execute("COMMIT")
         locked = False
     except sqlite3.DatabaseError as exc:
@@ -760,6 +897,7 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
         raise
     finally:
         conn.close()
+    return outcome
 
 
 TABLE = _TABLE
@@ -773,10 +911,17 @@ __all__ = (
     "READONLY_COMPONENT_ABSENT",
     "READONLY_COMPONENT_RECOGNIZED",
     "READONLY_COMPONENT_UNSUPPORTED",
+    "READER_UPGRADE_REQUIRED",
+    "SCHEMA_CREATED",
+    "SCHEMA_INTACT",
+    "SCHEMA_MIGRATED",
     "COLUMNS",
     "TABLE",
     "LaneLifecycleError",
+    "LifecycleSchemaOutcome",
     "ensure_lane_lifecycle_schema",
     "lane_lifecycle_path",
+    "readonly_compatible_select",
     "readonly_component_status",
+    "reader_upgrade_required",
 )

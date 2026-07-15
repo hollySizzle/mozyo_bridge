@@ -134,13 +134,10 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     LANE_LIFECYCLE_COMPONENT,
     LANE_LIFECYCLE_RECOVERY_POLICY,
     LANE_LIFECYCLE_SCHEMA_VERSION,
-    READONLY_COMPONENT_ABSENT,
-    READONLY_COMPONENT_RECOGNIZED,
     TABLE as _TABLE,
     LaneLifecycleError,
     ensure_lane_lifecycle_schema,
     lane_lifecycle_path,
-    readonly_component_status,
 )
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _active_owner,
@@ -149,6 +146,12 @@ from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _record,
     _rollback,
     _utc_now,
+)
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    LaneLifecycleReader,
+    LifecycleMigrationPreflight,
+    lifecycle_migration_preflight,
+    load_lane_lifecycle_readonly,
 )
 
 
@@ -163,9 +166,9 @@ class LaneLifecycleStore:
 
     # -- schema / connections ------------------------------------------------
 
-    def ensure_schema(self) -> None:
-        """Create / validate this component's schema (see the schema module)."""
-        ensure_lane_lifecycle_schema(self.path)
+    def ensure_schema(self) -> "LifecycleSchemaOutcome":
+        """Create / validate this component's schema; return the typed outcome (see schema module)."""
+        return ensure_lane_lifecycle_schema(self.path)
 
     def _connect(self) -> sqlite3.Connection:
         """An autocommit connection for the CAS (the container guard's is not)."""
@@ -820,50 +823,6 @@ def load_lane_lifecycle(
         return None
 
 
-def load_lane_lifecycle_readonly(
-    *, home: Path | None = None
-) -> Optional[tuple[LaneLifecycleRecord, ...]]:
-    """Every lifecycle row via a **non-creating** read (Redmine #13681 R2-F2, j#77292).
-
-    Unlike :func:`load_lane_lifecycle` (which opens read-write and runs the schema
-    ensure, creating the container / table when absent), this never writes: an absent
-    state file, or an existing store with no lifecycle component yet, yields ``()`` (no
-    rows, nothing created).
-
-    It still honours the **same downgrade guard** as the write path (R3-F1, j#77307):
-    the component's recorded ``schema_version`` is validated read-only via
-    :func:`readonly_component_status`, so an unknown / newer / malformed / partial
-    component schema yields ``None`` (fail closed) rather than reading authority rows
-    whose newer semantics this build does not agree to — never silently reading them the
-    way a bare ``SELECT`` would. It is the read a read-only projection uses —
-    ``workflow glance --snapshot-json`` must not create ``state.sqlite`` just to fold a
-    diagnostic (the command's store-free / read-only contract).
-    """
-    path = lane_lifecycle_path(home)
-    if not path.exists():
-        return ()
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.DatabaseError:
-        return None
-    try:
-        status = readonly_component_status(conn)
-        if status == READONLY_COMPONENT_ABSENT:
-            return ()
-        if status != READONLY_COMPONENT_RECOGNIZED:
-            # Unsupported / partial / malformed component schema -> fail closed, exactly
-            # like the guarded write path's LaneLifecycleError.
-            return None
-        rows = conn.execute(
-            f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY repo_workspace_id, lane_id"
-        ).fetchall()
-    except sqlite3.DatabaseError:
-        return None
-    finally:
-        conn.close()
-    return tuple(_record(row) for row in rows)
-
-
 __all__ = (
     "DECISION_SOURCES",
     "DECISION_SOURCE_REDMINE",
@@ -884,7 +843,10 @@ __all__ = (
     "LANE_LIFECYCLE_SCHEMA_VERSION",
     "LaneLifecycleError",
     "LaneLifecycleStore",
+    "LaneLifecycleReader",
+    "LifecycleMigrationPreflight",
     "lane_lifecycle_path",
+    "lifecycle_migration_preflight",
     "load_lane_lifecycle",
     "load_lane_lifecycle_readonly",
     "resolve_lane_owner",
