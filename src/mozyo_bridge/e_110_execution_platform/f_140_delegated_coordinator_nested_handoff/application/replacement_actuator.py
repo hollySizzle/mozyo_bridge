@@ -413,10 +413,15 @@ class ReplacementActuatorUseCase:
                 revision=fresh.revision, stopped_on=pin_identity,
                 detail="generation moved after renew",
             )
+        # Liveness is evaluated at a FRESH clock reading taken here — not the pre-renew
+        # ``now`` (R3-F1). The renew set the expiry to ``now + ttl``, so ``lease_is_live(now)``
+        # is tautologically true and could never detect a lease that expired while the fresh
+        # read above was in flight. ``effect_now`` is the moment we re-authorize the effect.
+        effect_now = self._clock()
         if (
             fresh.revision != renew.revision
             or fresh.lease_holder != holder
-            or not fresh.lease_is_live(now)
+            or not fresh.lease_is_live(effect_now)
         ):
             # A write (a foreign claim) landed between the renew and this read: the revision
             # is off the one renew established and/or the holder / liveness moved. Zero effect.

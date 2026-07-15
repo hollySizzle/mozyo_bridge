@@ -444,6 +444,43 @@ class LeaseAndGenerationTests(_ActuatorCase):
         self.assertEqual(self.port.launched, [])
         self.assertEqual(self.port.closed, [])
 
+    def _run_with_clock_expiring_during_fresh_read(self, ttl=1):
+        # A clock that advances by 2s the moment a renew commits — i.e. time passes DURING
+        # the post-renew fresh read, expiring H's just-renewed (ttl=1s) lease before the
+        # effect. Returns (result, actuator's store).
+        later = "2026-07-15T12:00:02+00:00"  # FIXED + 2s
+        cell = {"t": FIXED}
+        original = self.store.renew
+
+        def wrapped(key, **kwargs):
+            outcome = original(key, **kwargs)
+            if outcome.applied:
+                cell["t"] = later  # the lease (expiry FIXED+1s) is now expired at cell['t']
+            return outcome
+
+        self.store.renew = wrapped
+        actuator = ReplacementActuatorUseCase(
+            self.store, self.port, clock=lambda: cell["t"], lease_ttl_seconds=ttl
+        )
+        return actuator.run(self.key, holder="H", expected_action_generation=GEN)
+
+    def test_lease_expired_during_fresh_read_close_path_zero_effect(self):
+        # R3-F1: the post-renew liveness check must use a fresh clock. If the lease expires
+        # while the fresh read is in flight, the close must NOT run.
+        result = self._run_with_clock_expiring_during_fresh_read()
+        self.assertEqual(result.status, ACTUATION_LEASE_LOST)
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(self._phase_of(self.gw), PARTICIPANT_CLOSE_OWED)  # owed unchanged
+
+    def test_lease_expired_during_fresh_read_launch_path_zero_effect(self):
+        # Same guard on the launch path (positive-absent bounded recovery -> launch_owed).
+        self.port.old[self.gw.identity] = OLD_SLOT_ABSENT
+        result = self._run_with_clock_expiring_during_fresh_read()
+        self.assertEqual(result.status, ACTUATION_LEASE_LOST)
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(self.port.closed, [])
+
 
 class TopologyTests(_ActuatorCase):
     def _self_less_store(self):
