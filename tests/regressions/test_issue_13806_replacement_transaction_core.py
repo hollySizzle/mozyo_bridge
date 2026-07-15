@@ -218,7 +218,7 @@ class ModelEdgeTests(unittest.TestCase):
         )
 
     def test_cross_axis_actuation_gate(self):
-        # non-self actuated only in replacing_nonself; self only from self_close_armed on.
+        # non-self actuated only in replacing_nonself; self ONLY in self_close_armed (R2-F1).
         self.assertTrue(
             participant_actuation_phase_allowed(False, PHASE_REPLACING_NONSELF)
         )
@@ -229,11 +229,42 @@ class ModelEdgeTests(unittest.TestCase):
         self.assertTrue(
             participant_actuation_phase_allowed(True, PHASE_SELF_CLOSE_ARMED)
         )
-        self.assertTrue(
+        # the self participant may NOT be actuated once past its armed window (R2-F1)
+        self.assertFalse(
+            participant_actuation_phase_allowed(True, PHASE_FRESH_COORDINATOR_CLAIMED)
+        )
+        self.assertFalse(
             participant_actuation_phase_allowed(True, PHASE_DRAINING_CONTINUATION)
         )
         self.assertFalse(
             participant_actuation_phase_allowed(True, PHASE_REPLACING_NONSELF)
+        )
+
+    def test_fresh_coordinator_claimed_requires_replaced_self(self):
+        # R2-F1: -> fresh_coordinator_claimed needs the self participant existing + replaced.
+        gw = _gateway()
+        sc = _self_coordinator()
+        nonself_done_self_open = (gw.with_phase(PARTICIPANT_REPLACED), sc)
+        self.assertFalse(
+            transaction_phase_prerequisite_met(
+                nonself_done_self_open, PHASE_FRESH_COORDINATOR_CLAIMED
+            )
+        )
+        all_done = (
+            gw.with_phase(PARTICIPANT_REPLACED),
+            sc.with_phase(PARTICIPANT_REPLACED),
+        )
+        self.assertTrue(
+            transaction_phase_prerequisite_met(
+                all_done, PHASE_FRESH_COORDINATOR_CLAIMED
+            )
+        )
+        # a manifest with NO self participant cannot enter fresh_coordinator_claimed
+        no_self = (gw.with_phase(PARTICIPANT_REPLACED),)
+        self.assertFalse(
+            transaction_phase_prerequisite_met(
+                no_self, PHASE_FRESH_COORDINATOR_CLAIMED
+            )
         )
 
 
@@ -482,6 +513,19 @@ class LeaseTests(_StoreCase):
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_GENERATION_MISMATCH)
 
+    def test_claim_rejects_non_integer_generation(self):
+        # R2-F2: a float / bool generation token must not pass the equality fence.
+        for bad in (float(GEN), True, "7"):
+            with self.assertRaises(ValueError):
+                self.store.claim(
+                    self.key, expected_revision=1, expected_action_generation=bad,
+                    holder="X", lease_expires_at=FUTURE,
+                )
+        # nothing was written — the row is still pristine.
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.revision, 1)
+        self.assertEqual(rec.lease_holder, "")
+
     def test_renew_only_by_live_holder(self):
         self._claim(holder="A")
         rec = self.store.get(self.key)
@@ -576,6 +620,15 @@ class PhaseTransitionTests(_StoreCase):
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_GENERATION_MISMATCH)
 
+    def test_phase_rejects_non_integer_generation(self):
+        # R2-F2: the effect generation token is validated as an exact int, not compared raw.
+        for bad in (float(GEN), True):
+            with self.assertRaises(ValueError):
+                self.store.transition_phase(
+                    self.key, expected_revision=self._rev(),
+                    expected_action_generation=bad, target=PHASE_CLAIMED, holder="H",
+                )
+
     def test_illegal_edge_refused(self):
         out = self._phase(PHASE_REPLACING_NONSELF)  # planned -> replacing_nonself skips claimed
         self.assertFalse(out.applied)
@@ -597,19 +650,21 @@ class PhaseTransitionTests(_StoreCase):
         self._replace_participant(_worker().identity)
         self.assertTrue(self._phase(PHASE_AWAITING_SELF_TURN_END).applied)
 
-    def test_cannot_complete_with_unreplaced_self(self):
-        # Walk to draining_continuation with self still un-replaced, then completed blocks.
+    def test_cannot_claim_fresh_coordinator_with_unreplaced_self(self):
+        # R2-F1: -> fresh_coordinator_claimed is blocked while the self is still close_owed,
+        # and the self can no longer be actuated past its self_close_armed window.
         self._phase(PHASE_CLAIMED)
         self._phase(PHASE_REPLACING_NONSELF)
         self._replace_participant(_gateway().identity)
         self._replace_participant(_worker().identity)
         self._phase(PHASE_AWAITING_SELF_TURN_END)
         self._phase(PHASE_SELF_CLOSE_ARMED)
-        self._phase(PHASE_FRESH_COORDINATOR_CLAIMED)
-        self._phase(PHASE_DRAINING_CONTINUATION)
-        out = self._phase(PHASE_COMPLETED)  # self still close_owed
+        out = self._phase(PHASE_FRESH_COORDINATOR_CLAIMED)  # self still close_owed
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        # replacing the self within self_close_armed then unblocks it
+        self._replace_participant(_self_coordinator().identity)
+        self.assertTrue(self._phase(PHASE_FRESH_COORDINATOR_CLAIMED).applied)
 
     def test_full_valid_choreography_to_completed(self):
         self._phase(PHASE_CLAIMED)

@@ -186,15 +186,13 @@ def participant_transition_allowed(current: str, target: str) -> bool:
 #: yet claimed/started; after it the ``awaiting_self_turn_end`` gate has already
 #: asserted every non-self participant is ``replaced``.
 _NON_SELF_ACTUATION_PHASES = frozenset({PHASE_REPLACING_NONSELF})
-#: The transaction phases during which the SELF (current coordinator) participant may be
-#: actuated — only after its self-close is armed (steps 5–7). The self is replaced last.
-_SELF_ACTUATION_PHASES = frozenset(
-    {
-        PHASE_SELF_CLOSE_ARMED,
-        PHASE_FRESH_COORDINATOR_CLAIMED,
-        PHASE_DRAINING_CONTINUATION,
-    }
-)
+#: The only transaction phase during which the SELF (current coordinator) participant may be
+#: actuated — inside its own armed self-close window (Redmine #13806 R2-F1). The old self is
+#: closed, the fresh slot launched, and the fresh coordinator attested all while
+#: ``self_close_armed``; ``-> fresh_coordinator_claimed`` then *requires* the self to be
+#: ``replaced`` (:func:`transaction_phase_prerequisite_met`), so the self is never carried
+#: un-replaced into or past ``fresh_coordinator_claimed``.
+_SELF_ACTUATION_PHASES = frozenset({PHASE_SELF_CLOSE_ARMED})
 
 
 def _all_replaced(pins: Sequence["ParticipantPin"], *, non_self_only: bool) -> bool:
@@ -206,6 +204,17 @@ def _all_replaced(pins: Sequence["ParticipantPin"], *, non_self_only: bool) -> b
     return True
 
 
+def _self_replaced(pins: Sequence["ParticipantPin"]) -> bool:
+    """Does a self participant exist AND is it ``replaced``? (pure)
+
+    ``fresh_coordinator_claimed`` is only meaningful once the current coordinator has
+    actually been replaced (Redmine #13806 R2-F1): a transaction with no self participant,
+    or one whose self is still un-replaced, must not enter it.
+    """
+    selfs = [p for p in pins if p.is_self]
+    return bool(selfs) and all(p.phase == PARTICIPANT_REPLACED for p in selfs)
+
+
 def transaction_phase_prerequisite_met(
     participants: Sequence["ParticipantPin"], target: str
 ) -> bool:
@@ -213,16 +222,24 @@ def transaction_phase_prerequisite_met(
 
     - ``-> awaiting_self_turn_end``: every **non-self** participant must be ``replaced``
       (the coordinator may not stop replacing non-self participants while any is unfinished).
+    - ``-> fresh_coordinator_claimed``: the **self** participant must exist and be
+      ``replaced`` (Redmine #13806 R2-F1) — a fresh coordinator can only claim once the old
+      self is closed, relaunched, and attested, so an un-replaced self is never carried into
+      this phase.
     - ``-> completed``: **every** participant, including the self coordinator, must be
       ``replaced``.
 
-    All other edges carry no participant prerequisite. This is what makes ``completed``
-    with a ``close_owed`` participant — or a self-close before the non-self participants —
-    unrepresentable rather than merely discouraged (Redmine #13806 R1-F1).
+    All other edges carry no participant prerequisite. This is what makes ``completed`` with
+    a ``close_owed`` participant, a self-close before the non-self participants, or a
+    ``fresh_coordinator_claimed`` with an un-replaced self, unrepresentable rather than
+    merely discouraged.
     """
-    if norm(target) == PHASE_AWAITING_SELF_TURN_END:
+    marker = norm(target)
+    if marker == PHASE_AWAITING_SELF_TURN_END:
         return _all_replaced(participants, non_self_only=True)
-    if norm(target) == PHASE_COMPLETED:
+    if marker == PHASE_FRESH_COORDINATOR_CLAIMED:
+        return _self_replaced(participants)
+    if marker == PHASE_COMPLETED:
         return _all_replaced(participants, non_self_only=False)
     return True
 
@@ -231,8 +248,10 @@ def participant_actuation_phase_allowed(is_self: bool, transaction_phase: str) -
     """May a participant of this ``is_self`` kind be actuated in this phase? (pure)
 
     A non-self participant is actuated only while the transaction is ``replacing_nonself``;
-    the self participant only once its self-close is armed (``self_close_armed`` onward), so
-    the current coordinator is always replaced last (j#78384 §2 / Verdict j#78406).
+    the self participant only inside its armed self-close window (``self_close_armed``, and
+    ONLY that phase — Redmine #13806 R2-F1), so the current coordinator is replaced last and
+    is never advanced after ``fresh_coordinator_claimed`` (by then it is already ``replaced``,
+    the prerequisite for entering that phase).
     """
     phase = norm(transaction_phase)
     if is_self:

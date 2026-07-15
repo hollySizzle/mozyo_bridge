@@ -121,6 +121,30 @@ def _rollback(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _require_exact_generation(value: object) -> int:
+    """Validate an effect's ``expected_action_generation`` as a positive exact int.
+
+    An authority token is never compared by Python numeric equality (Redmine #13806 R2-F2):
+    ``7 == 7.0`` and ``1 == True`` fold, so a ``float`` / ``bool`` / string generation token
+    would slip through a bare ``!=`` fence and be accepted as an approved exact generation.
+    This rejects any non-``int`` (``bool`` is an ``int`` subclass and is not a generation) or
+    non-positive value BEFORE any DB read/write, mirroring ``plan_transaction``'s
+    ``action_generation`` validation and the manifest / component-version bool-float
+    fail-closed discipline. Raising (not a zero-write outcome) is deliberate: a malformed
+    token is a caller type error, exactly as ``plan_transaction`` treats a malformed
+    ``action_generation`` — distinct from a well-formed but *stale* generation, which is the
+    :data:`CAS_GENERATION_MISMATCH` zero-write path.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(
+            "expected_action_generation must be an exact integer, "
+            f"got {type(value).__name__}"
+        )
+    if value < 1:
+        raise ValueError("expected_action_generation is a positive counter (>= 1)")
+    return value
+
+
 def _is_pristine_replan(
     existing: ReplacementTransactionRecord,
     *,
@@ -349,6 +373,7 @@ class ReplacementTransactionStore:
         expires = norm(lease_expires_at)
         if not expires:
             raise ValueError("a lease claim requires a non-empty expiry")
+        _require_exact_generation(expected_action_generation)
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -433,6 +458,7 @@ class ReplacementTransactionStore:
         expires = norm(lease_expires_at)
         if not expires:
             raise ValueError("a lease renew requires a non-empty expiry")
+        _require_exact_generation(expected_action_generation)
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -511,6 +537,7 @@ class ReplacementTransactionStore:
         generation (R1-F2).
         """
         who = norm(holder)
+        _require_exact_generation(expected_action_generation)
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -594,6 +621,7 @@ class ReplacementTransactionStore:
         """
         if target not in TRANSACTION_PHASES:
             raise ValueError(f"unknown transaction phase {target!r}")
+        _require_exact_generation(expected_action_generation)
         who = norm(holder)
         stamp = now or _utc_now()
         conn = self._connect()
@@ -698,6 +726,7 @@ class ReplacementTransactionStore:
         """
         if target not in PARTICIPANT_PHASES:
             raise ValueError(f"unknown participant phase {target!r}")
+        _require_exact_generation(expected_action_generation)
         who = norm(holder)
         wanted = tuple(norm(part) for part in identity)
         stamp = now or _utc_now()
