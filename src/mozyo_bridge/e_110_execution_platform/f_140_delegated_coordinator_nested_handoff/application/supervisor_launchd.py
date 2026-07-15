@@ -93,12 +93,17 @@ REASON_EXECUTABLE_NOT_FOUND = "supervisor_executable_not_found"
 REASON_SERVICE_NOT_LOADED = "service_not_loaded"
 #: restart refused: no owned plist is installed (nothing to restart; run install first).
 REASON_NOT_INSTALLED = "service_not_installed"
-#: restart/status: the installed plist's ``--home`` pin is missing / malformed / duplicated, so the
-#: daemon-effective root cannot be trusted (fail-closed for restart; unhealthy for status).
+#: restart/status: the installed plist's ``--home`` pin is missing / malformed / duplicated / not an
+#: absolute canonical path, so the daemon-effective root cannot be trusted (fail-closed for restart;
+#: unhealthy for status). Also used when the owned plist file exists but is unreadable / non-mapping.
 REASON_HOME_PIN_UNHEALTHY = "home_pin_unhealthy"
 #: restart refused: the requested mozyo home differs from the installed plist pin (a home change
 #: must go through ``install``, which rewrites the plist — restart never silently re-points).
 REASON_HOME_PIN_MISMATCH = "home_pin_mismatch"
+#: restart refused: the installed ``ProgramArguments`` no longer match the command an install would
+#: write now (executable moved / argv drift). An executable / home change must reinstall (rewrite the
+#: plist); restart never kickstarts a drifted command (j#79136 R4-F2).
+REASON_INSTALLED_COMMAND_DRIFT = "installed_command_drift"
 #: A launchctl bootstrap failed (message redacted to a fixed token; no host detail leaks).
 REASON_BOOTSTRAP_FAILED = "launchctl_bootstrap_failed"
 #: A launchctl kickstart failed (message redacted to a fixed token).
@@ -109,7 +114,13 @@ HOME_PIN_OK = "ok"
 HOME_PIN_MISSING = "missing"
 HOME_PIN_DUPLICATE = "duplicate"
 HOME_PIN_MALFORMED = "malformed"
+#: The pin value is present but not an absolute, lexically-canonical path (relative / ``~`` / has
+#: ``..`` etc.) — a launchd daemon resolves it from a different cwd than the installer (j#79136 R4-F1).
+HOME_PIN_NOT_ABSOLUTE = "not_absolute"
 HOME_PIN_NO_ARGV = "no_argv"
+#: The owned plist file exists but could not be parsed / is not a mapping (distinct from absence,
+#: which is ``not_installed``) — j#79136 R4-F3.
+HOME_PIN_UNREADABLE = "unreadable_plist"
 HOME_PIN_NOT_INSTALLED = "not_installed"
 
 #: Credential-readiness tokens (the exact readiness the live supervisor needs to reach Redmine).
@@ -367,17 +378,24 @@ def restart(
     credential readiness, so it never reports a false-ready restart when the current shell resolves a
     different (ready) home than the one the loaded service actually runs with (j#79125 R3-F1).
 
-    Refuses — before any launchctl mutation — on a non-darwin host, no installed plist, an
-    unhealthy ``--home`` pin (missing / malformed / duplicated), a requested ``mozyo_home`` that
-    differs from the pin (a home change goes through ``install``, which rewrites the plist), a
-    missing executable, a non-ready pinned-home credential, or a service that is not loaded.
+    Refuses — before any launchctl mutation — on a non-darwin host, no installed plist (file
+    absent), an owned plist that exists but is unreadable / non-mapping, an unhealthy ``--home`` pin
+    (missing / malformed / duplicated / not an absolute canonical path), a requested ``mozyo_home``
+    that differs from the pin, installed ``ProgramArguments`` that no longer match the command an
+    install would write now (executable / argv drift — reinstall to change), a missing executable, a
+    non-ready pinned-home credential, or a service that is not loaded.
     """
     if not _running_on_darwin():
         return _refused("restart", REASON_UNSUPPORTED_PLATFORM)
-    installed = _read_installed_plist(plist_path(os_home))
-    if installed is None:
+    target = plist_path(os_home)
+    if not target.exists():
         return _refused("restart", REASON_NOT_INSTALLED)
-    pinned, pin_status = _extract_pinned_home(installed.get("ProgramArguments"))
+    installed = _read_installed_plist(target)
+    if installed is None:
+        # File present but unreadable / non-mapping — unhealthy, NOT absence (j#79136 R4-F3).
+        return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=HOME_PIN_UNREADABLE)
+    installed_argv = installed.get("ProgramArguments")
+    pinned, pin_status = _extract_pinned_home(installed_argv)
     if pin_status != HOME_PIN_OK:
         return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=pin_status)
     # A requested home that disagrees with the installed pin is a re-point attempt — refuse; a home
@@ -385,8 +403,14 @@ def restart(
     if mozyo_home is not None and str(resolve_mozyo_home(mozyo_home)) != pinned:
         return _refused("restart", REASON_HOME_PIN_MISMATCH, home_pin=pin_status)
     pinned_home = Path(pinned)
-    if resolve_supervisor_command(mozyo_home=pinned_home, which=which) is None:
+    expected = resolve_supervisor_command(mozyo_home=pinned_home, which=which)
+    if expected is None:
         return _refused("restart", REASON_EXECUTABLE_NOT_FOUND)
+    # The installed command must still be exactly what an install would write (same authority as
+    # `service_status`'s executable_matches): a moved executable or any argv drift means the loaded
+    # service runs a stale command — reinstall to change it, never kickstart the drift (j#79136 R4-F2).
+    if installed_argv != expected:
+        return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
     if readiness != CREDENTIAL_READY:
         return _refused(
@@ -450,18 +474,22 @@ def service_status(
     Reports plist existence (under the OS user home ``os_home``), loaded/pid, the *scheduled*
     interval, the ``--home`` pin health, whether the installed argv still matches the one an install
     would write now, and **daemon-effective** credential readiness — as booleans / counts / fixed
-    tokens only. When a plist is installed, ``credential_readiness`` is that of the **pinned** mozyo
-    home (the root the loaded daemon actually runs with), not the caller's current shell, so the
-    projection reflects the *installed daemon*, not a would-be re-point (j#79125 R3-F1). An unhealthy
-    pin surfaces as ``home_pin`` != ``ok`` with an empty readiness (unknowable). When nothing is
-    installed, ``credential_readiness`` is the would-be root's (``mozyo_home`` / default). Never
-    emits a credential value, a request header, a repo-local path, or pane text.
+    tokens only. When a plist is installed and readable, ``credential_readiness`` is that of the
+    **pinned** mozyo home (the root the loaded daemon actually runs with), not the caller's current
+    shell, so the projection reflects the *installed daemon*, not a would-be re-point (j#79125 R3-F1).
+    An unhealthy pin — or an owned plist that exists but is unreadable / non-mapping (``home_pin`` =
+    ``unreadable_plist``; distinct from absence, which is ``not_installed`` — j#79136 R4-F3) —
+    surfaces as ``home_pin`` != ``ok`` with an empty readiness (unknowable). Only when nothing is
+    installed is ``credential_readiness`` the would-be root's (``mozyo_home`` / default). Never emits
+    a credential value, a request header, a repo-local path, or pane text.
     """
     target = plist_path(os_home)
     plist_exists = target.exists()
     loaded, pid = _is_loaded(runner)
 
     installed = _read_installed_plist(target) if plist_exists else None
+    # Three distinct states: absent (not_installed), present-but-unreadable (unreadable_plist), and
+    # present + parsed (judged by its --home pin) — j#79136 R4-F3.
     scheduled_interval = installed.get("StartInterval") if installed else None
     run_at_load = bool(installed.get("RunAtLoad")) if installed else None
     keep_alive_present = ("KeepAlive" in installed) if installed else False
@@ -482,6 +510,11 @@ def service_status(
             if pin_status == HOME_PIN_OK
             else None
         )
+    elif plist_exists:
+        # File present but unparseable / non-mapping — unhealthy, NOT absence (j#79136 R4-F3).
+        pin_status = HOME_PIN_UNREADABLE
+        credential_readiness = ""
+        expected = None
     else:
         pin_status = HOME_PIN_NOT_INSTALLED
         credential_readiness = classify_credential_readiness(
@@ -532,8 +565,11 @@ def _extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
 
     Returns ``(pinned_home, status)``. The installed plist — not the caller's current shell — is the
     authority on the daemon's mozyo home, so restart / status read the pin from here (j#79125 R3-F1).
-    A missing / duplicated / value-less pin is *not* trusted: the daemon-effective root is unknowable,
-    so it is surfaced (fail-closed for restart, unhealthy for status) rather than silently guessed.
+    A missing / duplicated / value-less pin is *not* trusted (the daemon-effective root is unknowable),
+    and a pin that is not an **absolute, lexically-canonical** path (relative / ``~`` / containing
+    ``..``) is rejected too: a LaunchAgent resolves such a pin from a different working directory than
+    the installer, re-opening the R3-F2 divergence in the installed service (j#79136 R4-F1). Every
+    non-``ok`` case is surfaced (fail-closed for restart, unhealthy for status), never guessed.
     """
     if not isinstance(installed_argv, list):
         return None, HOME_PIN_NO_ARGV
@@ -548,6 +584,10 @@ def _extract_pinned_home(installed_argv: object) -> tuple[Optional[str], str]:
     value = installed_argv[value_index]
     if not isinstance(value, str) or not value.strip() or value.startswith("--"):
         return None, HOME_PIN_MALFORMED
+    # An install always pins ``str(resolve_mozyo_home(...))`` — absolute + canonical. Anything else
+    # (relative, ``~``, ``/a/../b``) would be resolved from launchd's cwd, not the installer's.
+    if not os.path.isabs(value) or value != os.path.normpath(value):
+        return None, HOME_PIN_NOT_ABSOLUTE
     return value, HOME_PIN_OK
 
 
@@ -567,13 +607,16 @@ __all__ = (
     "REASON_NOT_INSTALLED",
     "REASON_HOME_PIN_UNHEALTHY",
     "REASON_HOME_PIN_MISMATCH",
+    "REASON_INSTALLED_COMMAND_DRIFT",
     "REASON_BOOTSTRAP_FAILED",
     "REASON_KICKSTART_FAILED",
     "HOME_PIN_OK",
     "HOME_PIN_MISSING",
     "HOME_PIN_DUPLICATE",
     "HOME_PIN_MALFORMED",
+    "HOME_PIN_NOT_ABSOLUTE",
     "HOME_PIN_NO_ARGV",
+    "HOME_PIN_UNREADABLE",
     "HOME_PIN_NOT_INSTALLED",
     "CREDENTIAL_READY",
     "CREDENTIAL_INCOMPLETE",

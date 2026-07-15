@@ -204,6 +204,15 @@ class ExtractPinnedHomeTest(unittest.TestCase):
         self.assertEqual((None, sl.HOME_PIN_MALFORMED), sl._extract_pinned_home(["/x", "--home"]))
         self.assertEqual((None, sl.HOME_PIN_MALFORMED), sl._extract_pinned_home(["/x", "--home", "--json"]))
 
+    def test_relative_or_noncanonical_pin_is_not_absolute(self) -> None:
+        # R4-F1: only an absolute, lexically-canonical path is trusted.
+        for bad in ("relative-home", "~/mozyo", "/a/../b", "/a/./b", "/a//b"):
+            self.assertEqual(
+                (None, sl.HOME_PIN_NOT_ABSOLUTE),
+                sl._extract_pinned_home(["/x", "--home", bad]),
+                bad,
+            )
+
     def test_no_argv(self) -> None:
         self.assertEqual((None, sl.HOME_PIN_NO_ARGV), sl._extract_pinned_home(None))
 
@@ -449,6 +458,40 @@ class RestartTest(_DarwinCase):
         self.assertEqual(sl.REASON_HOME_PIN_UNHEALTHY, result["reason"])
         self.assertEqual([], runner.calls)
 
+    def test_restart_refuses_on_relative_installed_pin(self) -> None:
+        # R4-F1: a legacy plist pinning a relative --home is never kickstarted.
+        _pinned_plist(self.os_home, "relative-home")
+        runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_HOME_PIN_UNHEALTHY, result["reason"])
+        self.assertEqual(sl.HOME_PIN_NOT_ABSOLUTE, result["home_pin"])
+        self.assertEqual([], runner.calls)
+
+    def test_restart_refuses_on_installed_executable_drift(self) -> None:
+        # R4-F2: the plist pins a now-moved executable; a present current executable must NOT
+        # kickstart the stale argv — reinstall to change it.
+        _write_home_credential(self.mozyo_home)  # pinned home IS ready
+        _pinned_plist(self.os_home, _resolved(self.mozyo_home), executable="/old/missing/mozyo-bridge")
+        runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+        result = sl.restart(os_home=self.os_home, runner=runner,
+                            which=lambda _n: "/new/current/mozyo-bridge")
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_INSTALLED_COMMAND_DRIFT, result["reason"])
+        self.assertNotIn("kickstart", runner.verbs)
+
+    def test_restart_refuses_on_unreadable_plist_distinct_from_absent(self) -> None:
+        # R4-F3: a present-but-unparseable plist is unhealthy, not "not installed".
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x00\x01 not a plist")
+        runner = FakeRunner(print_result=_result(0, stdout="pid = 9\n"))
+        result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
+        self.assertFalse(result["performed"])
+        self.assertEqual(sl.REASON_HOME_PIN_UNHEALTHY, result["reason"])
+        self.assertEqual(sl.HOME_PIN_UNREADABLE, result["home_pin"])
+        self.assertEqual([], runner.calls)
+
     def test_restart_refuses_on_non_darwin(self) -> None:
         self._install_ready()
         runner = FakeRunner()
@@ -542,6 +585,32 @@ class ServiceStatusTest(_DarwinCase):
             os_home=self.os_home, runner=FakeRunner(print_result=_result(113)), which=_which_found
         )
         self.assertEqual(sl.HOME_PIN_MISSING, status["home_pin"])
+        self.assertEqual("", status["credential_readiness"])
+        self.assertFalse(status["executable_matches"])
+
+    def test_status_flags_relative_pin_unhealthy(self) -> None:
+        # R4-F1: an installed relative pin is unhealthy in the projection too.
+        _pinned_plist(self.os_home, "relative-home")
+        status = sl.service_status(
+            os_home=self.os_home, runner=FakeRunner(print_result=_result(113)), which=_which_found
+        )
+        self.assertTrue(status["installed"])
+        self.assertEqual(sl.HOME_PIN_NOT_ABSOLUTE, status["home_pin"])
+        self.assertEqual("", status["credential_readiness"])
+
+    def test_status_distinguishes_unreadable_plist_from_absent(self) -> None:
+        # R4-F3: a present-but-unparseable plist is installed=True + unreadable_plist + empty
+        # readiness — never the not_installed / would-be-root projection.
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x00\x01 not a plist")
+        with patch.dict("os.environ", SHELL_ENV, clear=False):
+            status = sl.service_status(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=FakeRunner(print_result=_result(113)), which=_which_found,
+            )
+        self.assertTrue(status["installed"])
+        self.assertEqual(sl.HOME_PIN_UNREADABLE, status["home_pin"])
         self.assertEqual("", status["credential_readiness"])
         self.assertFalse(status["executable_matches"])
 
