@@ -17,6 +17,7 @@ leaves the DB untouched).
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Optional
 
 from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
 from mozyo_bridge.core.state.state_store import (
+    BACKUPS_DIRNAME,
     STATE_CONTAINER_VERSION,
     StateStoreError,
     connect_state_container_rw,
@@ -32,14 +34,20 @@ from mozyo_bridge.core.state.state_store import (
 
 
 LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
-#: v3 (Redmine #13763 j#78052): adds the receiver-replacement generation on the
-#: same row/revision as disposition and release. v2 split the durable decision
-#: anchor's issue (``decision_issue_id``) from the lane's owner binding.
-LANE_LIFECYCLE_SCHEMA_VERSION = 3
-#: The component shapes this build can read and write. ``1`` and ``2`` are migrated
-#: additively to ``3``; anything else — a newer version from a future build, or a foreign value —
-#: fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+#: v2 split the durable decision anchor's issue (``decision_issue_id``) from the lane's
+#: owner binding. v3 (Redmine #13763 j#78052) adds the receiver-replacement generation on
+#: the same row/revision as disposition and release.
+#: v4 (Redmine #13754, integration j#78705) adds ``worktree_identity`` — the lane's
+#: canonical worktree binding, so ``sublane retire --execute`` proves the caller's
+#: ``--worktree`` from a fail-closed authority (not the display-only ``lane_metadata``).
+#: A v1/v2/v3 row lands with an empty binding — a known-unbound lane whose execute retire
+#: fails closed until it is re-declared. (This is the collision fix: #13754's worktree
+#: field takes the NEXT free version v4, so it never clashes with #13763's v3 shape.)
+LANE_LIFECYCLE_SCHEMA_VERSION = 4
+#: The component shapes this build can read and write. ``1``/``2``/``3`` are migrated
+#: additively to ``4``; anything else — a newer version from a future build, or a foreign
+#: value — fails closed and the store is left untouched (R3-F1).
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -65,6 +73,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     decision_journal TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    worktree_identity TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -84,7 +93,7 @@ _COLUMNS = (
     "repo_workspace_id, lane_id, issue_id, lane_disposition, process_release, "
     "revision, release_action_id, release_pins, replacement_state, "
     "replacement_action_id, replacement_pins, decision_source, "
-    "decision_issue_id, decision_journal, created_at, updated_at"
+    "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity"
 )
 
 
@@ -99,6 +108,57 @@ def lane_lifecycle_path(home: Path | None = None) -> Path:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _backup_stamp(now: str) -> str:
+    """Compact filesystem-safe stamp (``20260621T130000Z``) for a backup dir."""
+    parsed = datetime.fromisoformat(now)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    """Best-effort ``ROLLBACK`` so a failed migration leaves the store byte-unchanged."""
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.DatabaseError:
+        pass
+
+
+def backup_state_container(path: Path) -> Optional[Path]:
+    """Copy an existing ``state.sqlite`` into ``backups/state-<ts>/`` before a write.
+
+    A **component** write migration (an additive ``ALTER`` on authoritative rows) must
+    honor ``managed-state-model.md`` (``### backup / downgrade / partial migration``)
+    like the container's legacy import does: copy the DB under home before the first
+    write; a copy failure raises :class:`StateStoreError` so the caller fails closed with
+    the DB byte-unchanged. Returns the backup dir, or ``None`` when there is nothing to
+    preserve yet (a fresh store has no prior authority).
+
+    The backup directory **never overwrites an existing snapshot** (Redmine #13754
+    R4-F1): the second-precision stamp can collide, so a taken directory gets a numeric
+    suffix (``…-1``, ``…-2``) rather than a clobbering ``copy2`` over a prior backup.
+    Migration is serialized upstream, so this is defense in depth — a pre-migration
+    snapshot is preserved even if two backups ever share a second.
+    """
+    if not path.exists():
+        return None
+    base = path.parent / BACKUPS_DIRNAME / f"state-{_backup_stamp(_utc_now())}"
+    try:
+        backup_dir = base
+        suffix = 1
+        while backup_dir.exists():
+            backup_dir = base.with_name(f"{base.name}-{suffix}")
+            suffix += 1
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(path, backup_dir / path.name)
+    except OSError as exc:
+        raise StateStoreError(
+            f"backup near {base} failed ({exc}); migration aborted "
+            f"(nothing was written)"
+        ) from exc
+    return backup_dir
 
 #: Sentinel for a component row whose version is present but not an exact integer
 #: (a REAL like ``2.5``, TEXT, BLOB, …). It is deliberately outside
@@ -256,11 +316,22 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
             f"lane lifecycle store {path} is unreadable "
             f"({type(exc).__name__}); fail closed"
         ) from exc
+    # Serialize the whole migration under one exclusive write lock (Redmine #13754 R4-F1):
+    # ``BEGIN IMMEDIATE`` takes the reserved lock BEFORE the version is read, so a
+    # concurrent first-use caller cannot read the same pre-migration version, back up, and
+    # overwrite the only pre-migration snapshot with a post-migration copy. The lock is
+    # cross-process (SQLite file locks + the container guard's ``busy_timeout``); a second
+    # migrator blocks, re-reads the now-current version, and does nothing. The container
+    # guard's connection is default-isolation; switch it to autocommit so an explicit
+    # ``BEGIN IMMEDIATE`` (not Python's implicit deferred transaction) governs the section.
+    conn.isolation_level = None
+    locked = False
     try:
-        # Read the recorded component version BEFORE any DDL/DML: the refusal
-        # below must leave the store byte-equivalent, and `CREATE TABLE IF NOT
-        # EXISTS` / `ALTER` / the metadata upsert would each already be a write
-        # under a schema we do not understand.
+        conn.execute("BEGIN IMMEDIATE")
+        locked = True
+        # Read the recorded component version UNDER the lock and BEFORE any DDL/DML: the
+        # downgrade refusal below must leave the store byte-equivalent, and this read is
+        # now authoritative (no concurrent migrator can move it out from under us).
         recorded = _recorded_version(conn)
         if recorded is not None and recorded not in _RECOGNIZED_SCHEMA_VERSIONS:
             detail = (
@@ -273,61 +344,92 @@ def ensure_lane_lifecycle_schema(path: Path) -> None:
                 f"{sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The store is left untouched "
                 f"(downgrade-safe); use a newer build."
             )
-        with conn:
-            conn.execute(_TABLE_SQL)
-            # v1 -> v2 (R2-F1): additive, mirroring the sibling native component's
-            # ``lane_metadata`` v2 migration. A v1 row's anchor kept only the
-            # journal, so its ``decision_issue_id`` lands empty — that row is a
-            # known-incomplete anchor, not a silently-repaired one.
-            columns = {
-                row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")
-            }
-            if "decision_issue_id" not in columns:
-                conn.execute(
-                    f"ALTER TABLE {_TABLE} "
-                    "ADD COLUMN decision_issue_id TEXT NOT NULL DEFAULT ''"
-                )
-            # v2 -> v3 (Redmine #13763 j#78052): an additive third lifecycle
-            # axis for owner-approved receiver replacement. These fields share
-            # the row revision with disposition / release so their actuators
-            # cannot race past each other.
-            if "replacement_state" not in columns:
-                conn.execute(
-                    f"ALTER TABLE {_TABLE} "
-                    "ADD COLUMN replacement_state TEXT NOT NULL DEFAULT 'not_requested'"
-                )
-            if "replacement_action_id" not in columns:
-                conn.execute(
-                    f"ALTER TABLE {_TABLE} "
-                    "ADD COLUMN replacement_action_id TEXT NOT NULL DEFAULT ''"
-                )
-            if "replacement_pins" not in columns:
-                conn.execute(
-                    f"ALTER TABLE {_TABLE} "
-                    "ADD COLUMN replacement_pins TEXT NOT NULL DEFAULT ''"
-                )
-            conn.execute(_OWNER_INDEX_SQL)
+        # Backup-first write migration (Redmine #13754 R3-F1): an existing component below
+        # the current schema is about to be advanced by additive ``ALTER``s — writes on
+        # authoritative rows. ``managed-state-model.md`` requires the DB copied under home
+        # BEFORE that first write; a backup failure aborts with nothing written. Under the
+        # lock the DB on disk is the committed pre-``ALTER`` state and no other writer can
+        # change it during the copy, so the snapshot is a faithful, unique pre-migration
+        # copy. A fresh create (``recorded is None``) has no prior authority to preserve;
+        # an already-current store performs no migration (a concurrent loser re-reads
+        # current here and does not back up).
+        if recorded is not None and recorded < LANE_LIFECYCLE_SCHEMA_VERSION:
+            try:
+                backup_state_container(path)
+            except StateStoreError as exc:
+                raise LaneLifecycleError(
+                    f"lane lifecycle migration to v{LANE_LIFECYCLE_SCHEMA_VERSION} "
+                    f"aborted: {exc}. The store is left untouched (backup-first)."
+                ) from exc
+        # One atomic transaction (Redmine #13754 R4-F2): every DDL and the component version
+        # commit run inside this ``BEGIN IMMEDIATE`` block, so a failure part-way through any
+        # ``ALTER`` rolls the whole migration back — the schema and recorded version stay at
+        # v1/v2/v3, and the pre-migration backup remains the recovery point.
+        conn.execute(_TABLE_SQL)
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")}
+        # v1 -> v2 (R2-F1): additive. A v1 row's anchor kept only the journal, so its
+        # ``decision_issue_id`` lands empty — a known-incomplete anchor, not a repaired one.
+        if "decision_issue_id" not in columns:
             conn.execute(
-                "INSERT INTO state_schema_components "
-                "(component, schema_version, owner, recovery_policy, "
-                "migrated_from, updated_at) VALUES (?, ?, ?, ?, NULL, ?) "
-                "ON CONFLICT(component) DO UPDATE SET "
-                "schema_version = excluded.schema_version, "
-                "owner = excluded.owner, "
-                "recovery_policy = excluded.recovery_policy, "
-                "updated_at = excluded.updated_at",
-                (
-                    LANE_LIFECYCLE_COMPONENT,
-                    LANE_LIFECYCLE_SCHEMA_VERSION,
-                    "core/state/lane_lifecycle.py",
-                    LANE_LIFECYCLE_RECOVERY_POLICY,
-                    _utc_now(),
-                ),
+                f"ALTER TABLE {_TABLE} "
+                "ADD COLUMN decision_issue_id TEXT NOT NULL DEFAULT ''"
             )
+        # v2 -> v3 (Redmine #13763 j#78052): an additive third lifecycle axis for
+        # owner-approved receiver replacement, sharing the row revision with disposition /
+        # release so their actuators cannot race past each other.
+        if "replacement_state" not in columns:
+            conn.execute(
+                f"ALTER TABLE {_TABLE} "
+                "ADD COLUMN replacement_state TEXT NOT NULL DEFAULT 'not_requested'"
+            )
+        if "replacement_action_id" not in columns:
+            conn.execute(
+                f"ALTER TABLE {_TABLE} "
+                "ADD COLUMN replacement_action_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "replacement_pins" not in columns:
+            conn.execute(
+                f"ALTER TABLE {_TABLE} "
+                "ADD COLUMN replacement_pins TEXT NOT NULL DEFAULT ''"
+            )
+        # v3 -> v4 (Redmine #13754): additive. An existing row lands with an empty
+        # ``worktree_identity`` — a known-unbound lane whose execute retire fails closed
+        # until it is re-declared, never a silently-guessed binding.
+        if "worktree_identity" not in columns:
+            conn.execute(
+                f"ALTER TABLE {_TABLE} "
+                "ADD COLUMN worktree_identity TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute(_OWNER_INDEX_SQL)
+        conn.execute(
+            "INSERT INTO state_schema_components "
+            "(component, schema_version, owner, recovery_policy, "
+            "migrated_from, updated_at) VALUES (?, ?, ?, ?, NULL, ?) "
+            "ON CONFLICT(component) DO UPDATE SET "
+            "schema_version = excluded.schema_version, "
+            "owner = excluded.owner, "
+            "recovery_policy = excluded.recovery_policy, "
+            "updated_at = excluded.updated_at",
+            (
+                LANE_LIFECYCLE_COMPONENT,
+                LANE_LIFECYCLE_SCHEMA_VERSION,
+                "core/state/lane_lifecycle.py",
+                LANE_LIFECYCLE_RECOVERY_POLICY,
+                _utc_now(),
+            ),
+        )
+        conn.execute("COMMIT")
+        locked = False
     except sqlite3.DatabaseError as exc:
+        if locked:
+            _rollback_quietly(conn)
         raise LaneLifecycleError(
             f"lane lifecycle schema init failed ({type(exc).__name__}); fail closed"
         ) from exc
+    except LaneLifecycleError:
+        if locked:
+            _rollback_quietly(conn)
+        raise
     finally:
         conn.close()
 

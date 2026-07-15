@@ -1214,7 +1214,9 @@ class R2RegressionTest(unittest.TestCase):
             conn.close()
         self.assertIn("issue_id", columns)  # owner binding
         self.assertIn("decision_issue_id", columns)  # decision anchor
-        self.assertEqual(version, 3)
+        self.assertIn("replacement_state", columns)  # v3 (#13763) replacement axis
+        self.assertIn("worktree_identity", columns)  # v4 (#13754) worktree binding
+        self.assertEqual(version, LANE_LIFECYCLE_SCHEMA_VERSION)
 
     def test_v1_table_migrates_additively(self) -> None:
         # A v1 row's anchor kept only the journal. The migration adds the column; it
@@ -1292,21 +1294,24 @@ class R3RegressionTest(unittest.TestCase):
         self.key = LaneLifecycleKey(WS, LANE_A)
         self.addCleanup(self._tmp.cleanup)
 
-    def _v4_store(self) -> Path:
-        """A store an imagined future build upgraded past us."""
+    #: One past the version this build understands — an imagined future build.
+    _FUTURE_VERSION = LANE_LIFECYCLE_SCHEMA_VERSION + 1
+
+    def _future_store(self) -> Path:
+        """A store an imagined future build upgraded past us (one past our version)."""
         store = LaneLifecycleStore(home=self.home)
         store.declare_active(self.key, decision=_decision(), issue_id=ISSUE)
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
             conn.execute(
-                "UPDATE state_schema_components SET schema_version = 4 "
+                "UPDATE state_schema_components SET schema_version = ? "
                 "WHERE component = ?",
-                (LANE_LIFECYCLE_COMPONENT,),
+                (self._FUTURE_VERSION, LANE_LIFECYCLE_COMPONENT),
             )
             conn.execute(
                 "ALTER TABLE lane_lifecycle_records "
-                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'v4'"
+                "ADD COLUMN future_guard TEXT NOT NULL DEFAULT 'future'"
             )
             conn.commit()
         finally:
@@ -1316,19 +1321,19 @@ class R3RegressionTest(unittest.TestCase):
     # -- R3-F1: a newer component schema is never downgraded ------------------
 
     def test_f1_newer_component_schema_fails_closed(self) -> None:
-        self._v4_store()
+        self._future_store()
         with self.assertRaises(LaneLifecycleError):
             LaneLifecycleStore(home=self.home).ensure_schema()
 
     def test_f1_refusal_leaves_the_store_byte_equivalent(self) -> None:
-        path = self._v4_store()
+        path = self._future_store()
         before = path.read_bytes()
         with self.assertRaises(LaneLifecycleError):
             LaneLifecycleStore(home=self.home).ensure_schema()
         self.assertEqual(path.read_bytes(), before)
 
     def test_f1_version_and_future_columns_survive(self) -> None:
-        path = self._v4_store()
+        path = self._future_store()
         with self.assertRaises(LaneLifecycleError):
             LaneLifecycleStore(home=self.home).ensure_schema()
         conn = sqlite3.connect(path)
@@ -1347,14 +1352,14 @@ class R3RegressionTest(unittest.TestCase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, 4)  # not re-stamped down to 3
+        self.assertEqual(version, self._FUTURE_VERSION)  # not re-stamped down
         self.assertIn("future_guard", columns)
         self.assertEqual(rows, 1)
 
     def test_f1_no_write_reaches_a_newer_component(self) -> None:
         # The point of the refusal: rows here are lifecycle AUTHORITY. A build that
         # does not know v3's semantics must not be able to move them.
-        self._v4_store()
+        self._future_store()
         store = LaneLifecycleStore(home=self.home)
         with self.assertRaises(LaneLifecycleError):
             store.transition_disposition(
@@ -1366,7 +1371,7 @@ class R3RegressionTest(unittest.TestCase):
             )
 
     def test_f1_readers_fail_closed_never_assume_active(self) -> None:
-        self._v4_store()
+        self._future_store()
         # `absent` would read as "no owner, go ahead"; unsupported must be `unknown`.
         self.assertEqual(
             resolve_lane_owner(WS, ISSUE, home=self.home).status, OWNER_UNKNOWN
@@ -1376,7 +1381,7 @@ class R3RegressionTest(unittest.TestCase):
             LaneLifecycleStore(home=self.home).records()
 
     def test_f1_a_known_v1_still_migrates(self) -> None:
-        # Fail-closed on *newer* must not break the supported v1 -> v3 path.
+        # Fail-closed on *newer* must not break the supported v1 -> current path.
         store = LaneLifecycleStore(home=self.home)
         store.ensure_schema()
         path = lane_lifecycle_path(self.home)
@@ -1400,7 +1405,7 @@ class R3RegressionTest(unittest.TestCase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, 3)
+        self.assertEqual(version, LANE_LIFECYCLE_SCHEMA_VERSION)
 
     # -- R4-F1: a present-but-malformed version is not coerced to a known one --
 
@@ -1596,7 +1601,7 @@ class R3RegressionTest(unittest.TestCase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, 3)
+        self.assertEqual(version, LANE_LIFECYCLE_SCHEMA_VERSION)
 
     def test_f1_integer_stored_as_real_2_0_is_still_accepted(self) -> None:
         # SQLite folds a lossless REAL 2.0 to integer 2; that is a real v2, not
@@ -1795,6 +1800,259 @@ class ReadonlyLoaderGuardTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertIsNone(load_lane_lifecycle_readonly(home=self.home))
+
+
+class BackupFirstMigrationTest(unittest.TestCase):
+    """The v-migration is backup-first, serialized, and atomically rolled back
+    (Redmine #13754 R3-F1 / R4-F1 / R4-F2, integration collision v4 j#78705).
+
+    ``managed-state-model.md`` (``### backup / downgrade / partial migration``): a write
+    migration copies the existing DB under home BEFORE the first write; a backup failure
+    aborts with the DB byte-unchanged; concurrent migrators cannot clobber the snapshot;
+    and a partial DDL failure rolls the whole migration back.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.key = LaneLifecycleKey(WS, LANE_A)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _downgrade_to(self, version: int, drop_columns: list[str]) -> Path:
+        """A real current store rewound to an earlier recorded ``version`` by dropping
+        the columns that version did not have — a faithful pre-migration fixture."""
+        LaneLifecycleStore(home=self.home).declare_active(
+            self.key, decision=_decision(), issue_id=ISSUE
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            for col in drop_columns:
+                conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = ? WHERE component = ?",
+                (version, LANE_LIFECYCLE_COMPONENT),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def _v2_store(self) -> Path:
+        """A pre-#13763 / pre-#13754 store (no replacement axis, no worktree binding)."""
+        return self._downgrade_to(
+            2,
+            [
+                "replacement_state",
+                "replacement_action_id",
+                "replacement_pins",
+                "worktree_identity",
+            ],
+        )
+
+    def _v3_store(self) -> Path:
+        """The current-staging store (#13763 replacement axis) BEFORE #13754's worktree
+        binding — the exact collision fixture the integration finding (j#78705) named."""
+        return self._downgrade_to(3, ["worktree_identity"])
+
+    def _backups(self):
+        d = self.home / "backups"
+        return sorted(d.glob("state-*")) if d.exists() else []
+
+    def _recorded(self) -> int:
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            return conn.execute(
+                "SELECT schema_version FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def _columns(self) -> list:
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            return [
+                r[1] for r in conn.execute("PRAGMA table_info(lane_lifecycle_records)")
+            ]
+        finally:
+            conn.close()
+
+    def test_v2_migrates_to_current_with_both_column_groups_backed_up(self) -> None:
+        path = self._v2_store()
+        before = path.read_bytes()
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+        cols = self._columns()
+        self.assertIn("replacement_state", cols)  # v3 axis
+        self.assertIn("worktree_identity", cols)  # v4 binding
+
+    def test_staging_v3_replacement_store_migrates_to_v4_backed_up(self) -> None:
+        # The integration collision fixture (j#78705): a store already at #13763's v3
+        # (replacement columns present) migrates forward to v4 by ADDING only
+        # worktree_identity, backing up the v3 snapshot first.
+        path = self._v3_store()
+        before = path.read_bytes()
+        self.assertNotIn("worktree_identity", self._columns())  # precondition: v3 shape
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+        cols = self._columns()
+        self.assertIn("replacement_state", cols)  # v3 axis preserved
+        self.assertIn("worktree_identity", cols)  # v4 binding added
+
+    def test_reader_writer_worktree_parity_survives_the_migration(self) -> None:
+        # A lane declared with a worktree binding on the migrated store reads back exactly.
+        self._v3_store()
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        store = LaneLifecycleStore(home=self.home)
+        # A distinct issue (ISSUE is already owned by LANE_A from the fixture).
+        store.declare_active(
+            LaneLifecycleKey(WS, "issue_x_lane"),
+            decision=_decision(issue="99999", journal="99001"),
+            issue_id="99999",
+            worktree_identity="wt_deadbeefcafe0001",
+        )
+        record = store.get(LaneLifecycleKey(WS, "issue_x_lane"))
+        self.assertEqual(record.worktree_identity, "wt_deadbeefcafe0001")
+        self.assertEqual(record.replacement_state, REPLACEMENT_NOT_REQUESTED)
+
+    def test_a_fresh_create_does_not_back_up(self) -> None:
+        LaneLifecycleStore(home=self.home).ensure_schema()
+        self.assertEqual(self._backups(), [])
+
+    def test_an_already_current_store_does_not_re_back_up(self) -> None:
+        LaneLifecycleStore(home=self.home).declare_active(
+            self.key, decision=_decision(), issue_id=ISSUE
+        )
+        LaneLifecycleStore(home=self.home).ensure_schema()  # already current
+        self.assertEqual(self._backups(), [])
+
+    def test_backup_failure_aborts_with_the_store_byte_unchanged(self) -> None:
+        from mozyo_bridge.core.state import lane_lifecycle_schema as schema_mod
+        from mozyo_bridge.core.state.state_store import StateStoreError
+
+        path = self._v3_store()
+        before = path.read_bytes()
+
+        def _boom(_path):
+            raise StateStoreError("backup disk full")
+
+        real = schema_mod.backup_state_container
+        schema_mod.backup_state_container = _boom
+        try:
+            with self.assertRaises(LaneLifecycleError):
+                LaneLifecycleStore(home=self.home).ensure_schema()
+        finally:
+            schema_mod.backup_state_container = real
+        self.assertEqual(path.read_bytes(), before)  # byte-equivalent
+        self.assertEqual(self._recorded(), 3)  # not advanced
+        self.assertNotIn("worktree_identity", self._columns())  # not altered
+
+    def test_concurrent_migrators_keep_one_pre_migration_backup(self) -> None:
+        import threading
+
+        self._v3_store()
+        errors: list = []
+        barrier = threading.Barrier(8)
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                LaneLifecycleStore(home=self.home).ensure_schema()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)  # exactly one snapshot
+        # and it is the PRE-migration (v3, no worktree_identity) copy, never overwritten
+        conn = sqlite3.connect(backups[0] / "state.sqlite")
+        try:
+            snap_cols = [
+                r[1] for r in conn.execute("PRAGMA table_info(lane_lifecycle_records)")
+            ]
+        finally:
+            conn.close()
+        self.assertNotIn("worktree_identity", snap_cols)
+        self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
+
+    def test_backup_dir_collision_does_not_overwrite(self) -> None:
+        from mozyo_bridge.core.state import lane_lifecycle_schema as schema_mod
+
+        path = self._v3_store()
+        real_now = schema_mod._utc_now
+        schema_mod._utc_now = lambda: "2026-07-15T00:00:00+00:00"  # frozen -> collide
+        try:
+            first = schema_mod.backup_state_container(path)
+            second = schema_mod.backup_state_container(path)
+        finally:
+            schema_mod._utc_now = real_now
+        self.assertNotEqual(first, second)
+        self.assertTrue((first / "state.sqlite").exists())
+        self.assertTrue((second / "state.sqlite").exists())
+
+    def test_partial_ddl_failure_rolls_back_and_preserves_backup(self) -> None:
+        # Inject a failure AFTER at least one schema mutation but BEFORE the component
+        # version commit: the whole migration must roll back (schema + version stay v3) and
+        # the pre-migration backup must remain the recovery point.
+        from mozyo_bridge.core.state import lane_lifecycle_schema as schema_mod
+
+        path = self._v3_store()
+        before = path.read_bytes()
+
+        class _FailOnVersionCommit:
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+                object.__setattr__(self, "altered", False)
+
+            def execute(self, sql, *args):
+                if sql.strip().upper().startswith("ALTER TABLE"):
+                    object.__setattr__(self, "altered", True)
+                if "INSERT INTO state_schema_components" in sql:
+                    raise sqlite3.OperationalError(
+                        "injected failure after ALTER, before version commit"
+                    )
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._real, name, value)
+
+        proxy_holder: dict = {}
+        real_connect = schema_mod.connect_state_container_rw
+
+        def fake_connect(p):
+            proxy = _FailOnVersionCommit(real_connect(p))
+            proxy_holder["proxy"] = proxy
+            return proxy
+
+        schema_mod.connect_state_container_rw = fake_connect
+        try:
+            with self.assertRaises(LaneLifecycleError):
+                LaneLifecycleStore(home=self.home).ensure_schema()
+        finally:
+            schema_mod.connect_state_container_rw = real_connect
+
+        self.assertTrue(proxy_holder["proxy"].altered)  # a *partial* DDL ran
+        self.assertEqual(self._recorded(), 3)  # rolled back
+        self.assertNotIn("worktree_identity", self._columns())
+        backups = self._backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "state.sqlite").read_bytes(), before)
 
 
 if __name__ == "__main__":

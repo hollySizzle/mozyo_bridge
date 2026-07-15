@@ -52,9 +52,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher import (
     cmd_sublane_dispatch_worker,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_sublane_retire import (
+    register_sublane_retire,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
     cmd_sublane_list,
-    cmd_sublane_retire,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_supersede import (
     cmd_sublane_supersede,
@@ -651,110 +653,14 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     _add_lifecycle_json(sublane_list)
     sublane_list.set_defaults(func=cmd_sublane_list)
 
-    sublane_retire = sublane_sub.add_parser(
-        "retire",
-        help=(
-            "Fail-closed retire preflight: evaluate the retire decision from git "
-            "probes + durable-record invariants and emit the verdict + journal + "
-            "retirement runbook. Does NOT actuate pane kill / worktree remove / "
-            "branch delete (gated); never deletes remote branches. Exits non-zero "
-            "when retirement is blocked."
-        ),
+    # Redmine #13754: the retire parser lives with the feature that owns it
+    # (the same convention cli_agents / cli_handoff / cli_release follow); the two
+    # shared option helpers stay owned here and are injected.
+    register_sublane_retire(
+        sublane_sub,
+        add_repo_option=add_repo_option,
+        add_lifecycle_json=_add_lifecycle_json,
     )
-    sublane_retire.add_argument("--issue", required=True, help="Redmine issue id")
-    sublane_retire.add_argument(
-        "--lane-label",
-        dest="lane_label",
-        required=True,
-        help="Lane label to retire (e.g. issue_<id>_<slug>)",
-    )
-    sublane_retire.add_argument(
-        "--worktree", default=None, help="Worktree path to include in the runbook"
-    )
-    sublane_retire.add_argument(
-        "--branch", default=None, help="Local branch to include in the runbook"
-    )
-    sublane_retire.add_argument(
-        "--integration-branch",
-        dest="integration_branch",
-        default=None,
-        help="Integration branch name (recorded in the durable journal)",
-    )
-    # Durable-record invariants the operator asserts (each defaults to unsatisfied
-    # so an omitted flag fails closed).
-    sublane_retire.add_argument(
-        "--issue-closed",
-        dest="issue_closed",
-        action="store_true",
-        help=(
-            "The lane's Redmine issue is durably closed under the close contract that "
-            "applies to its issue type (a child Task/Test/Bug via task_close; a US / "
-            "standalone issue via an owner_close_approval-backed close). Redmine #13602 "
-            "(Option A): routine green-preflight retirement is coordinator authority and "
-            "takes no separate --owner-approved flag regardless of which close contract "
-            "applied — retire actuation never re-collects the owner close approval."
-        ),
-    )
-    sublane_retire.add_argument(
-        "--callbacks-drained",
-        dest="callbacks_drained",
-        action="store_true",
-        help="No outstanding coordinator callback is owed.",
-    )
-    sublane_retire.add_argument(
-        "--verified",
-        dest="verified",
-        action="store_true",
-        help="The lane's verification (tests / checks) passed.",
-    )
-    sublane_retire.add_argument(
-        "--durable-record",
-        dest="durable_record",
-        action="store_true",
-        help="The durable retire record / anchor is present.",
-    )
-    sublane_retire.add_argument(
-        "--target-identity-known",
-        dest="target_identity_known",
-        action="store_true",
-        help="The lane / worktree / pane target is positively resolved.",
-    )
-    sublane_retire.add_argument(
-        "--latest-generation-admissible",
-        dest="latest_generation_admissible",
-        action="store_true",
-        help=(
-            "#13518 R2-F7 / R3-F2: assert (from the durable review journals) that the LATEST review "
-            "generation is approved AND carries no unresolved blocking finding. Fail-closed when "
-            "unset: the actual retire/integration no longer default-admits a stale approval. Ignored "
-            "when --review-generation-json is supplied (that MEASURES it at action-time)."
-        ),
-    )
-    sublane_retire.add_argument(
-        "--review-generation-json",
-        dest="review_generation_json",
-        default=None,
-        help=(
-            "#13518 R3-F2: path to a coordinator-produced durable review observation "
-            "{issue, review_request_journal, target_head, decisions:[{kind,seq,blocking,disposition,"
-            "journal_id}]}. When supplied, latest-generation admissibility is MEASURED at action-time "
-            "via the review-generation fence (an unreadable / malformed file fails closed)."
-        ),
-    )
-    sublane_retire.add_argument(
-        "--execute",
-        dest="execute",
-        action="store_true",
-        help=(
-            "Redmine #13331: under backend: herdr, and only when the preflight permits "
-            "retirement, close the lane workspace's managed gateway/worker agents "
-            "(mzb1 default-lane codex/claude). Never removes a worktree or deletes a "
-            "branch (still runbook); never closes a foreign agent. No-op under tmux."
-        ),
-    )
-    add_repo_option(sublane_retire)
-    _add_lifecycle_json(sublane_retire)
-    sublane_retire.set_defaults(func=cmd_sublane_retire)
 
     sublane_supersede = sublane_sub.add_parser(
         "supersede",

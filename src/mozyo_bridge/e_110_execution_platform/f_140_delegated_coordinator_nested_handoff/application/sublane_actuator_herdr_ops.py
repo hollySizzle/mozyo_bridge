@@ -437,10 +437,15 @@ class HerdrSublaneActuatorOps:
         # separate: metadata is a display join that *revives a tombstone*, while the
         # lifecycle row is CAS'd owner authority the roster (W4) and send gate (W3)
         # fail-closed against. The live lane unit `(project workspace, lane_label)` is
-        # the same unit those projections join on.
-        self._declare_lane_lifecycle(repo_workspace_id)
+        # the same unit those projections join on. The `token` computed above is the
+        # lane's canonical worktree identity — recorded in the fail-closed lifecycle row
+        # (Redmine #13754) so `retire --execute` can prove the caller's `--worktree`
+        # belongs to this lane before closing.
+        self._declare_lane_lifecycle(repo_workspace_id, worktree_identity=token)
 
-    def _declare_lane_lifecycle(self, repo_workspace_id: str) -> None:
+    def _declare_lane_lifecycle(
+        self, repo_workspace_id: str, *, worktree_identity: str = ""
+    ) -> None:
         """Declare this lane's owner binding (best-effort, never raises; Redmine #13681 W1).
 
         A declare needs both the lane unit identity `(repo_workspace_id, lane_label)`
@@ -448,6 +453,11 @@ class HerdrSublaneActuatorOps:
         unresolved workspace segment / lane label — is **owner-unbound**: no lifecycle
         row is written, and the lane reads as owner-unbound at the roster and send gate.
         That is a fail-closed gap surfaced honestly downstream, never a guessed owner.
+
+        ``worktree_identity`` (Redmine #13754) is the lane's canonical worktree token,
+        recorded here so ``retire --execute`` can prove the caller's ``--worktree``
+        belongs to this lane. It is the SAME token the display-metadata record is keyed
+        on, computed once at the create boundary so writer and reader cannot drift.
 
         The write is best-effort like the metadata upsert: a store error never breaks the
         actuation. A re-run (self-heal, #13378) re-declares and is refused idempotently
@@ -479,7 +489,12 @@ class HerdrSublaneActuatorOps:
             # rather than write an owner row no recovery could ever resolve.
             return
         try:
-            LaneLifecycleStore().declare_active(key, decision=decision, issue_id=issue)
+            LaneLifecycleStore().declare_active(
+                key,
+                decision=decision,
+                issue_id=issue,
+                worktree_identity=worktree_identity,
+            )
         except (LaneLifecycleError, DecisionPointerError, OSError) as exc:
             print(
                 f"warning: lane lifecycle declare skipped ({type(exc).__name__}); "
