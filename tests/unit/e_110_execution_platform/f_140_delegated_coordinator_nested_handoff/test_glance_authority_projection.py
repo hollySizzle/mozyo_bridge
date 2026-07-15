@@ -138,6 +138,21 @@ class ExecutionSurfaceFactsTest(unittest.TestCase):
         ).validated()
         self.assertFalse(facts.managed_lane_identity_verified)
 
+    def test_capacity_fails_closed_off_managed_sublane(self):
+        # review F5: an internal task agent / unverified surface can never be capacity-eligible.
+        internal = ExecutionSurfaceFacts(
+            execution_surface=EXECUTION_SURFACE_INTERNAL_TASK_AGENT,
+            productive_capacity_eligible=True,
+        ).validated()
+        self.assertFalse(internal.productive_capacity_eligible)
+        # managed_sublane but identity NOT verified -> also fail-closed.
+        unverified = ExecutionSurfaceFacts(
+            execution_surface=EXECUTION_SURFACE_MANAGED_SUBLANE,
+            managed_lane_identity_verified=False,
+            productive_capacity_eligible=True,
+        ).validated()
+        self.assertFalse(unverified.productive_capacity_eligible)
+
     def test_verified_kept_on_managed_sublane(self):
         facts = ExecutionSurfaceFacts(
             execution_surface=EXECUTION_SURFACE_MANAGED_SUBLANE,

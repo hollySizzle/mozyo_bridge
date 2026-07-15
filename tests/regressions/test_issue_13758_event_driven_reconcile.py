@@ -48,6 +48,8 @@ def _observe(**kw):
         redmine_readable=True,
         generation_status=GEN_MATCH,
         gate_advanced=False,
+        advanced_gate_journal="79368",
+        callback_delivered=False,
         has_outstanding_gate=True,
         terminal_disposition=False,
         deadline_exceeded=False,
@@ -102,7 +104,7 @@ class Issue13758Regression(unittest.TestCase):
         self._run(cyc, _observe())  # self-heal 1
         rep = self._run(cyc, _observe(terminal_disposition=True))  # hibernate -> close
         self.assertEqual(self.store.get(cyc.key).phase, "closed")
-        self.assertFalse(rep["sent"])
+        self.assertFalse(rep["enqueued"])
         # Resume as a new generation / anchor -> a brand-new reconcile record, counter 0.
         resumed = self._cycle(anchor="13758:80001", gen=3)
         r2 = self._run(resumed, _observe())
@@ -136,9 +138,13 @@ class Issue13758Regression(unittest.TestCase):
         self._run(cyc, _observe())  # self-heal 2
         rep = self._run(cyc, _observe(gate_advanced=True))  # gate finally moved
         self.assertEqual(rep["action"], RECONCILE_ACTION_DELIVER)
-        self.assertEqual(self.store.get(cyc.key).phase, "notified")
+        # review F4: enqueue -> callback_pending; the durable outbox delivery notifies.
+        self.assertEqual(self.store.get(cyc.key).phase, "callback_pending")
         delivered = [r for r in self.outbox.read() if r.callback_route == "coordinator"]
         self.assertEqual(len(delivered), 1)
+        rep2 = self._run(cyc, _observe(gate_advanced=True, callback_delivered=True))
+        self.assertEqual(self.store.get(cyc.key).phase, "notified")
+        self.assertEqual(rep2["action"], "none")
 
     def test_newer_review_generation_zero_sends(self):
         cyc = self._cycle()

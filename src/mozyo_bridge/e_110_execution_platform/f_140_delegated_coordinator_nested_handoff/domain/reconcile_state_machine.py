@@ -60,7 +60,14 @@ RECONCILE_SELF_HEAL_2 = "self_heal_attempt_2"
 #: The self-heal ladder is exhausted — the anomaly has been escalated to the coordinator
 #: once; further no-progress cycles are suppressed (acceptance §5 "以後 duplicate 抑止").
 RECONCILE_COORDINATOR_ESCALATION = "coordinator_escalation"
-#: The expected gate advanced and the coordinator callback was delivered once — terminal.
+#: The expected gate advanced and the coordinator callback was **enqueued** (the outbox row
+#: exists), but its durable delivery is not yet confirmed. This is the ``callback_pending``
+#: step of the issue's ``gate_recorded -> callback_pending -> notified`` chain: enqueue is
+#: not delivery (``ack-completion-receiver-state.md``), so the record does not read
+#: ``notified`` until the outbox durably ``delivered`` the row (Redmine #13758 review F4).
+RECONCILE_CALLBACK_PENDING = "callback_pending"
+#: The expected gate advanced and the coordinator callback was durably DELIVERED once
+#: (the outbox row reached ``delivered``) — terminal.
 RECONCILE_NOTIFIED = "notified"
 #: The reconcile closed with no callback owed (no outstanding gate, or an explicit
 #: deferral / hibernate / retire) — terminal.
@@ -73,6 +80,7 @@ RECONCILE_PHASES = frozenset(
         RECONCILE_SELF_HEAL_1,
         RECONCILE_SELF_HEAL_2,
         RECONCILE_COORDINATOR_ESCALATION,
+        RECONCILE_CALLBACK_PENDING,
         RECONCILE_NOTIFIED,
         RECONCILE_CLOSED,
     }
@@ -121,6 +129,7 @@ REASON_ROUTE_AMBIGUOUS = "reconcile_route_ambiguous"
 # deliver
 REASON_GATE_ADVANCED = "reconcile_gate_advanced"
 # none
+REASON_CALLBACK_DELIVERED = "reconcile_callback_delivered"
 REASON_NO_OUTSTANDING_GATE = "reconcile_no_outstanding_gate"
 REASON_TERMINAL_DISPOSITION = "reconcile_terminal_disposition"
 REASON_ALREADY_NOTIFIED = "reconcile_already_notified"
@@ -203,7 +212,20 @@ class ReconcileObservation:
       dispatch anchor / lane generation (:data:`GEN_MATCH` / :data:`GEN_MISMATCH` /
       :data:`GEN_UNKNOWN`). Anything but :data:`GEN_MATCH` zero-sends.
     - ``gate_advanced`` — the expected handoff-worthy gate is now recorded at the exact
-      anchor (the durable record moved). Delivered once to the coordinator.
+      anchor (the durable record moved). Delivered once to the coordinator. Effective only
+      together with ``advanced_gate_journal`` (a gate cannot be delivered without its exact
+      source journal — Redmine #13758 review F3).
+    - ``advanced_gate`` / ``advanced_gate_journal`` — the EXACT gate token and Redmine journal
+      id the advanced gate was recorded at (the gate's own ``## Gate:`` journal). The
+      coordinator-callback outbox key is keyed on BOTH so it is byte-identical to the discovery
+      path's key for the same gate (one delivery, never two — acceptance §1 / review F3): the
+      discovery path keys on the actual gate marker, so the deliver key must use the actual
+      advanced gate token, not the canonical expected one. An empty journal with
+      ``gate_advanced`` is treated as "not advanced yet" (fail-closed: never deliver anchorless).
+    - ``callback_delivered`` — the coordinator callback for this gate has DURABLY delivered
+      (the outbox deliver-key row reached ``delivered``). Only then does the record advance to
+      ``notified``; an enqueued-but-undelivered callback stays ``callback_pending`` (enqueue is
+      not delivery — review F4).
     - ``has_outstanding_gate`` — a gate was expected for this dispatch (there is something a
       turn end should have produced). ``False`` + not advanced -> a plain turn-end / ack with
       nothing owed -> no notify (acceptance §6).
@@ -223,12 +245,20 @@ class ReconcileObservation:
     redmine_readable: bool = False
     generation_status: str = GEN_UNKNOWN
     gate_advanced: bool = False
+    advanced_gate: str = ""
+    advanced_gate_journal: str = ""
+    callback_delivered: bool = False
     has_outstanding_gate: bool = False
     terminal_disposition: bool = False
     deadline_exceeded: bool = False
     prior_send_uncertain: bool = False
     route_status: str = ROUTE_UNRESOLVED
     expected_next_owner: str = ""
+
+    @property
+    def gate_advanced_effective(self) -> bool:
+        """A gate is deliverable only with its exact source journal (review F3, fail-closed)."""
+        return bool(self.gate_advanced) and bool(_norm(self.advanced_gate_journal))
 
 
 @dataclass(frozen=True)
@@ -299,15 +329,21 @@ def advance_reconcile(
         return _none(RECONCILE_CLOSED, count, REASON_TERMINAL_DISPOSITION)
 
     # 3. The expected gate advanced -> deliver the coordinator callback exactly once
-    #    (acceptance §1). Idempotent: an already-notified record does not re-deliver (the
-    #    outbox UNIQUE fence also guards the wire).
-    if observation.gate_advanced:
+    #    (acceptance §1). Enqueue is not delivery (review F4): a gate-advanced cycle enqueues
+    #    and moves to ``callback_pending``; only a subsequent cycle that observes the outbox
+    #    row DURABLY ``delivered`` (``callback_delivered``) advances to ``notified``. An
+    #    already-notified record does not re-deliver (the outbox UNIQUE fence also guards the
+    #    wire). A gate with no exact source journal is not deliverable (review F3, fail-closed).
+    if observation.gate_advanced_effective:
         if current == RECONCILE_NOTIFIED:
             return _none(RECONCILE_NOTIFIED, count, REASON_ALREADY_NOTIFIED)
+        if observation.callback_delivered:
+            # The outbox durably delivered the coordinator callback -> terminal notified.
+            return _none(RECONCILE_NOTIFIED, count, REASON_CALLBACK_DELIVERED)
         return ReconcileDecision(
             action=RECONCILE_ACTION_DELIVER,
             reason=REASON_GATE_ADVANCED,
-            next_phase=RECONCILE_NOTIFIED,
+            next_phase=RECONCILE_CALLBACK_PENDING,
             next_failure_count=count,
             route=COORDINATOR_ROUTE,
         )
@@ -396,6 +432,7 @@ __all__ = (
     "RECONCILE_SELF_HEAL_1",
     "RECONCILE_SELF_HEAL_2",
     "RECONCILE_COORDINATOR_ESCALATION",
+    "RECONCILE_CALLBACK_PENDING",
     "RECONCILE_NOTIFIED",
     "RECONCILE_CLOSED",
     "RECONCILE_PHASES",
@@ -409,6 +446,7 @@ __all__ = (
     "REASON_GENERATION_MISMATCH",
     "REASON_ROUTE_AMBIGUOUS",
     "REASON_GATE_ADVANCED",
+    "REASON_CALLBACK_DELIVERED",
     "REASON_NO_OUTSTANDING_GATE",
     "REASON_TERMINAL_DISPOSITION",
     "REASON_ALREADY_NOTIFIED",

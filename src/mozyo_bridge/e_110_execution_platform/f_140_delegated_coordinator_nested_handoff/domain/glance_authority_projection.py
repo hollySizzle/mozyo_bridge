@@ -180,6 +180,14 @@ class ExecutionSurfaceFacts:
         # provenance contradiction -> fail closed to unverified.
         if surface != EXECUTION_SURFACE_MANAGED_SUBLANE:
             verified = False
+        # Capacity eligibility is fail-closed to a verified managed sublane (Redmine #13758
+        # review F5): an internal task agent / coordinator-local / unknown-provenance surface,
+        # or a managed sublane whose lane identity is not verified, NEVER satisfies a capacity
+        # slot, so an incoming ``True`` on any of those is a provenance contradiction and is
+        # dropped. Only ``managed_sublane`` with a verified identity may carry the incoming flag.
+        eligible = bool(self.productive_capacity_eligible)
+        if not (surface == EXECUTION_SURFACE_MANAGED_SUBLANE and verified):
+            eligible = False
         return ExecutionSurfaceFacts(
             execution_surface=surface,
             managed_lane_identity_verified=verified,
@@ -190,7 +198,7 @@ class ExecutionSurfaceFacts:
             worker_dispatch_state=_enum(
                 self.worker_dispatch_state, DISPATCH_STATES, DISPATCH_STATE_UNKNOWN
             ),
-            productive_capacity_eligible=bool(self.productive_capacity_eligible),
+            productive_capacity_eligible=eligible,
         )
 
     def as_payload(self) -> dict[str, object]:

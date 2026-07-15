@@ -87,33 +87,46 @@ class ReconcileCycleInput:
 
 
 def outbox_key_for(
-    cycle: ReconcileCycleInput, decision: ReconcileDecision
+    cycle: ReconcileCycleInput,
+    decision: ReconcileDecision,
+    *,
+    advanced_gate: str = "",
+    advanced_gate_journal: str = "",
 ) -> CallbackOutboxKey:
     """The outbox idempotency key for a reconcile send decision. (pure)
 
-    The ``normalized_gate`` token distinguishes the reconcile send kinds so each fires
-    exactly once through the shared UNIQUE fence:
+    The ``(journal, normalized_gate, callback_route)`` distinguish the reconcile send kinds
+    so each fires exactly once through the shared UNIQUE fence:
 
-    - deliver -> the advanced gate itself (collides-and-dedups with the discovery path's
-      coordinator callback for the same gate — exactly-once, §1);
-    - self-heal -> the target phase (``self_heal_attempt_1`` / ``self_heal_attempt_2``), so
-      the two attempts are distinct keys but each attempt is idempotent under duplicate wakes;
-    - escalate -> ``coordinator_escalation``, so repeated no-progress cycles after the
-      escalation re-enqueue the same key and are deduped (§5 "以後 duplicate 抑止").
+    - deliver -> keyed on the advanced gate's **exact source journal** (``advanced_gate_journal``)
+      and the gate itself, so the key is byte-identical to the discovery path's coordinator
+      callback for the same gate and the two paths dedup to a single delivery (acceptance §1 /
+      review F3). The discovery path keys on the gate's own ``## Gate:`` journal, NOT the
+      dispatch anchor journal, so the deliver key must too;
+    - self-heal -> keyed on the dispatch anchor journal + the target phase
+      (``self_heal_attempt_1`` / ``self_heal_attempt_2``), so the two attempts are distinct
+      keys but each attempt is idempotent under duplicate wakes;
+    - escalate -> the dispatch anchor journal + ``coordinator_escalation``, so repeated
+      no-progress cycles after the escalation re-enqueue the same key and are deduped (§5).
     """
     if decision.action == RECONCILE_ACTION_DELIVER:
-        gate = cycle.expected_gate
+        # The actual advanced gate token + its journal (not the canonical expected gate), so the
+        # key is byte-identical to the discovery path's row for the same gate (review F3).
+        gate = str(advanced_gate or "").strip() or cycle.expected_gate
         route = COORDINATOR_ROUTE
+        journal = str(advanced_gate_journal or "").strip()
     elif decision.action == RECONCILE_ACTION_ESCALATE:
         gate = RECONCILE_COORDINATOR_ESCALATION
         route = COORDINATOR_ROUTE
+        journal = str(cycle.dispatch_journal).strip()
     else:  # self-heal
         gate = decision.next_phase
         route = decision.route
+        journal = str(cycle.dispatch_journal).strip()
     return CallbackOutboxKey(
         source=RECONCILE_SOURCE,
         issue=str(cycle.issue_id).strip(),
-        journal=str(cycle.dispatch_journal).strip(),
+        journal=journal,
         normalized_gate=str(gate).strip(),
         callback_route=str(route).strip(),
         workspace_id=str(cycle.key.workspace_id).strip(),
@@ -168,7 +181,12 @@ def reconcile_once(
     outbox_state = ""
     enqueued = None
     if decision.sends:
-        key = outbox_key_for(cycle, decision)
+        key = outbox_key_for(
+            cycle,
+            decision,
+            advanced_gate=observation.advanced_gate,
+            advanced_gate_journal=observation.advanced_gate_journal,
+        )
         kind = _kind_for(decision)
         receiver = (
             "" if decision.route == COORDINATOR_ROUTE else str(decision.route).strip()
@@ -204,9 +222,14 @@ def reconcile_once(
         "route": decision.route,
         "next_phase": decision.next_phase,
         "reconcile_failure_count": decision.next_failure_count,
-        "sent": bool(decision.sends),
+        # ``enqueued`` records that a row was written / already existed for this cycle —
+        # NOT that the callback was delivered (enqueue is not delivery; review F4). The
+        # durable delivery state is ``callback_outbox_state`` (pending / inflight /
+        # delivered / uncertain / dead_letter), and a gate-advanced record only reaches
+        # ``notified`` on a later cycle that observes the outbox durably ``delivered``.
+        "enqueued": bool(decision.sends),
         "outbox_inserted": bool(enqueued.inserted) if enqueued is not None else False,
-        "outbox_state": outbox_state,
+        "callback_outbox_state": outbox_state,
         "persisted": bool(persisted.applied) if persisted is not None else False,
     }
 

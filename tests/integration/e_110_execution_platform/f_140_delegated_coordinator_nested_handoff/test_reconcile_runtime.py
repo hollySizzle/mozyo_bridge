@@ -38,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECONCILE_ACTION_NONE,
     RECONCILE_ACTION_SELF_HEAL,
     RECONCILE_ACTION_ZERO_SEND,
+    RECONCILE_CALLBACK_PENDING,
     RECONCILE_COORDINATOR_ESCALATION,
     RECONCILE_NOTIFIED,
     ROUTE_AMBIGUOUS,
@@ -68,6 +69,8 @@ def _observe(**kw):
         redmine_readable=True,
         generation_status=GEN_MATCH,
         gate_advanced=False,
+        advanced_gate_journal="79368",
+        callback_delivered=False,
         has_outstanding_gate=True,
         terminal_disposition=False,
         deadline_exceeded=False,
@@ -98,21 +101,50 @@ class ReconcileRuntimeHarness(unittest.TestCase):
 
 
 class GateAdvancedFlow(ReconcileRuntimeHarness):
-    def test_gate_advanced_delivers_one_coordinator_callback(self):
+    def test_gate_advanced_enqueues_pending_then_notifies_on_delivery(self):
         rep = self._run(_observe(gate_advanced=True))
         self.assertEqual(rep["action"], RECONCILE_ACTION_DELIVER)
-        self.assertTrue(rep["sent"])
+        self.assertTrue(rep["enqueued"])
         self.assertTrue(rep["outbox_inserted"])
         rows = self._outbox_rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].callback_route, "coordinator")
         self.assertEqual(rows[0].normalized_gate, "implementation_done")
         self.assertEqual(rows[0].source, RECONCILE_SOURCE)
-        # terminal notified; a second cycle does not re-deliver.
-        rep2 = self._run(_observe(gate_advanced=True))
-        self.assertEqual(rep2["action"], RECONCILE_ACTION_NONE)
+        # review F3: the deliver key uses the ADVANCED GATE's journal (79368), not the
+        # dispatch anchor journal (79337) -> byte-identical to the discovery path.
+        self.assertEqual(rows[0].journal, "79368")
+        # review F4: enqueue is not delivery -> callback_pending, not notified.
+        self.assertEqual(self.store.get(self.cycle.key).phase, RECONCILE_CALLBACK_PENDING)
+        # A second cycle before the outbox delivered re-enqueues idempotently (still one row).
+        self._run(_observe(gate_advanced=True))
+        self.assertEqual(len(self._outbox_rows()), 1)
+        # Only the durable outbox delivery advances to notified.
+        rep3 = self._run(_observe(gate_advanced=True, callback_delivered=True))
+        self.assertEqual(rep3["action"], RECONCILE_ACTION_NONE)
         self.assertEqual(self.store.get(self.cycle.key).phase, RECONCILE_NOTIFIED)
         self.assertEqual(len(self._outbox_rows()), 1)  # still exactly one
+
+    def test_deliver_key_dedups_with_discovery_path(self):
+        # review F3: a discovery-path row for the same gate/journal/route + a reconciler
+        # deliver row collapse to ONE outbox row (exactly-once, acceptance §1).
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutboxKey
+
+        # Discovery enqueues the coordinator callback keyed on the gate's own journal (79368).
+        self.outbox.enqueue(
+            CallbackOutboxKey(
+                source=RECONCILE_SOURCE,
+                issue="13758",
+                journal="79368",
+                normalized_gate="implementation_done",
+                callback_route="coordinator",
+                workspace_id="ws1",
+            )
+        )
+        self.assertEqual(len(self._outbox_rows()), 1)
+        # The reconciler deliver for the same advanced gate does NOT create a second row.
+        self._run(_observe(gate_advanced=True))
+        self.assertEqual(len(self._outbox_rows()), 1)
 
 
 class SelfHealLadderFlow(ReconcileRuntimeHarness):
@@ -172,7 +204,7 @@ class FailClosedFlow(ReconcileRuntimeHarness):
         before = self.store.get(self.cycle.key)
         rep = self._run(_observe(redmine_readable=False))
         self.assertEqual(rep["action"], RECONCILE_ACTION_ZERO_SEND)
-        self.assertFalse(rep["sent"])
+        self.assertFalse(rep["enqueued"])
         self.assertFalse(rep["persisted"])
         after = self.store.get(self.cycle.key)
         self.assertEqual(after.revision, before.revision)  # byte-unchanged

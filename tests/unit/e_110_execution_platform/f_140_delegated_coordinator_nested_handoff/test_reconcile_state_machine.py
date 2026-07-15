@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GEN_UNKNOWN,
     REASON_ALREADY_ESCALATED,
     REASON_ALREADY_NOTIFIED,
+    REASON_CALLBACK_DELIVERED,
     REASON_DEADLINE_EXCEEDED,
     REASON_GATE_ADVANCED,
     REASON_GENERATION_MISMATCH,
@@ -51,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECONCILE_ACTION_NONE,
     RECONCILE_ACTION_SELF_HEAL,
     RECONCILE_ACTION_ZERO_SEND,
+    RECONCILE_CALLBACK_PENDING,
     RECONCILE_CLOSED,
     RECONCILE_COORDINATOR_ESCALATION,
     RECONCILE_NOTIFIED,
@@ -77,6 +79,8 @@ def _obs(**kw) -> ReconcileObservation:
         redmine_readable=True,
         generation_status=GEN_MATCH,
         gate_advanced=False,
+        advanced_gate_journal="79368",
+        callback_delivered=False,
         has_outstanding_gate=True,
         terminal_disposition=False,
         deadline_exceeded=False,
@@ -164,8 +168,9 @@ class FailClosedGuardTest(unittest.TestCase):
 
 
 class GateAdvancedTest(unittest.TestCase):
-    def test_gate_advanced_delivers_coordinator_once(self):
-        # §1: turn ended + gate advanced -> exactly-once coordinator callback.
+    def test_gate_advanced_enqueues_then_pends_not_notified(self):
+        # §1 + review F4: gate advanced -> deliver (enqueue) and move to callback_pending;
+        # enqueue is not delivery, so it does NOT jump to notified.
         d = advance_reconcile(
             phase=RECONCILE_TURN_ENDED_GATE_PENDING,
             reconcile_failure_count=0,
@@ -173,9 +178,30 @@ class GateAdvancedTest(unittest.TestCase):
         )
         self.assertEqual(d.action, RECONCILE_ACTION_DELIVER)
         self.assertEqual(d.reason, REASON_GATE_ADVANCED)
-        self.assertEqual(d.next_phase, RECONCILE_NOTIFIED)
+        self.assertEqual(d.next_phase, RECONCILE_CALLBACK_PENDING)
         self.assertEqual(d.route, COORDINATOR_ROUTE)
         self.assertTrue(d.sends)
+
+    def test_callback_delivered_advances_to_notified(self):
+        # review F4: only the durable outbox delivery advances callback_pending -> notified.
+        d = advance_reconcile(
+            phase=RECONCILE_CALLBACK_PENDING,
+            reconcile_failure_count=0,
+            observation=_obs(gate_advanced=True, callback_delivered=True),
+        )
+        self.assertEqual(d.action, RECONCILE_ACTION_NONE)
+        self.assertEqual(d.reason, REASON_CALLBACK_DELIVERED)
+        self.assertEqual(d.next_phase, RECONCILE_NOTIFIED)
+        self.assertFalse(d.sends)
+
+    def test_gate_advanced_without_journal_is_not_delivered(self):
+        # review F3 fail-closed: a gate cannot be delivered without its exact source journal.
+        d = advance_reconcile(
+            phase=RECONCILE_TURN_ENDED_GATE_PENDING,
+            reconcile_failure_count=0,
+            observation=_obs(gate_advanced=True, advanced_gate_journal=""),
+        )
+        self.assertNotEqual(d.action, RECONCILE_ACTION_DELIVER)  # falls through to self-heal
 
     def test_gate_advanced_after_self_heal_still_delivers(self):
         # §2/§3->progress: a self-heal that worked (gate finally advanced) delivers the callback.
@@ -185,7 +211,7 @@ class GateAdvancedTest(unittest.TestCase):
             observation=_obs(gate_advanced=True),
         )
         self.assertEqual(d.action, RECONCILE_ACTION_DELIVER)
-        self.assertEqual(d.next_phase, RECONCILE_NOTIFIED)
+        self.assertEqual(d.next_phase, RECONCILE_CALLBACK_PENDING)
 
     def test_already_notified_does_not_redeliver(self):
         d = advance_reconcile(

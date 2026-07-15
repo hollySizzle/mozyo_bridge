@@ -78,6 +78,14 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _int_field(obj: object, name: str, default: int = 0) -> int:
+    """Read an integer attribute, tolerant of blank / non-numeric (fail-closed to default)."""
+    try:
+        return int(getattr(obj, name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclasses.dataclass(frozen=True)
 class SupervisedWorkspace:
     """The minimal workspace facts the supervisor needs (id + canonical checkout path).
@@ -152,6 +160,7 @@ class WorkspaceCallbackSupervisor:
         lease_ttl_seconds: int = SUPERVISOR_LEASE_TTL_SECONDS,
         release_after: bool = True,
         callback_route: str = DEFAULT_CALLBACK_ROUTE,
+        reconcile_leg_fn: Optional[Callable[[str, str, object], object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -174,6 +183,10 @@ class WorkspaceCallbackSupervisor:
         self._ttl = int(lease_ttl_seconds)
         self._release_after = bool(release_after)
         self._route = callback_route
+        # The event-driven reconcile leg (Redmine #13758): run per issue after the callback
+        # drain, on the same lease/wake path. Optional so the callback-only supervisor
+        # (pre-#13758) is unchanged; the production leg is wired in build_supervisor.
+        self._reconcile_leg_fn = reconcile_leg_fn
 
     # -- public entrypoint -------------------------------------------------
 
@@ -392,6 +405,17 @@ class WorkspaceCallbackSupervisor:
                 issue=issue, events_supplied=events_supplied, error=error or ISSUE_PASS_ERROR,
                 review_return_refusals=review_return_refusals,
             )
+
+        # Event-driven reconcile leg (Redmine #13758): after the callback drain, on the same
+        # lease/wake path, re-read the issue's structured gate + run one reconcile cycle
+        # (turn-ended -> gate re-read -> deliver / self-heal / escalate). Fail-open — the leg
+        # never aborts the sweep, and its durable effects (reconcile-state rows, outbox rows)
+        # are observable via `workflow glance`. Disabled when no leg was wired.
+        if self._reconcile_leg_fn is not None:
+            try:
+                self._reconcile_leg_fn(workspace_id, issue, source)
+            except Exception:  # noqa: BLE001 - a reconcile failure never breaks the sweep
+                pass
 
         deliver = report.get("deliver") or {}
         sweep = report.get("sweep") or {}
@@ -836,10 +860,22 @@ def build_supervisor(
         BackgroundServiceCallbackSender,
     )
 
+    from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+    from mozyo_bridge.core.state.reconcile_state import ReconcileStateStore
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_supervisor_leg import (
+        build_reconcile_leg_fn,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        markers_from_source,
+    )
+
     resolved_store_path = store_path or workflow_runtime_store_path(home)
     lease_store = SupervisorLeaseStore(path=supervisor_lease_path(home))
     store = WorkflowRuntimeStore(path=resolved_store_path)
     outbox = CallbackOutbox(path=resolved_store_path)
+    # #13758 reconcile state lives in the native state.sqlite component (home-scoped), NOT the
+    # workflow-runtime DB; the reconcile leg reuses the shared outbox for delivery.
+    reconcile_store = ReconcileStateStore(home=home)
     # #13684: the durable owning-lane binding authority (#13681/#13689). It supplies both the *expected*
     # generation stamped at ingest (via owner_binding_fn) and the independent *live* generation read at
     # delivery (via default_target_resolver's live_generation_fn) — the two-sided fence correction 1.
@@ -868,6 +904,32 @@ def build_supervisor(
             workspace_id, issue, binding, lifecycle_store=lifecycle_store
         )
 
+    def _lane_facts(workspace_id: str, issue: str) -> "tuple[str, int, str]":
+        """Resolve ``(lane_id, live_generation, lifecycle_disposition)`` for the reconcile leg.
+
+        The owning-lane authority (#13681/#13689) resolves the active lane; the lifecycle row's
+        ``lane_generation`` (#13810 incarnation) is the reconcile generation, and its
+        ``lane_disposition`` gates a terminal (hibernated / retired / superseded) close. An
+        unresolved / unreadable owner is a fail-closed blank lane (the leg then skips).
+        """
+        wsid, issue_s = str(workspace_id).strip(), str(issue).strip()
+        owner = lifecycle_store.resolve_owner(wsid, issue_s)
+        if not getattr(owner, "resolved", False):
+            return "", 0, ""
+        lane_id = str(getattr(owner, "lane_id", "") or "").strip()
+        record = lifecycle_store.get(LaneLifecycleKey(wsid, lane_id))
+        if record is None:
+            return lane_id, 0, ""
+        generation = _int_field(record, "lane_generation")
+        return lane_id, generation, str(getattr(record, "lane_disposition", "") or "").strip()
+
+    reconcile_leg_fn = build_reconcile_leg_fn(
+        reconcile_store=reconcile_store,
+        outbox=outbox,
+        lane_facts_fn=_lane_facts,
+        markers_fn=markers_from_source,
+    )
+
     return WorkspaceCallbackSupervisor(
         holder=holder,
         lease_store=lease_store,
@@ -882,6 +944,7 @@ def build_supervisor(
         wake_store=SupervisorWakeStore(path=supervisor_wake_path(home)),
         release_after=release_after,
         lease_ttl_seconds=lease_ttl_seconds,
+        reconcile_leg_fn=reconcile_leg_fn,
     )
 
 
