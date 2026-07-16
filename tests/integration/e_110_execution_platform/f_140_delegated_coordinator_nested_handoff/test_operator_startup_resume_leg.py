@@ -79,6 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GATE_READ_GATE,
     GATE_READ_LEGACY,
     GATE_READ_NONE,
+    GATE_READ_UNREADABLE,
     LatestGateRead,
     ObservedTargetResolution,
     execute_startup_resume,
@@ -175,10 +176,11 @@ class _Entry:
 
 
 class _Recorder:
-    """A gate recorder fake: preflight()/record() with injectable outcomes."""
+    """A gate recorder fake: preflight()/record()/record_reissue() with injectable outcomes."""
 
     def __init__(self, *, preflight_ok=True, record_ok=True):
         self.recorded = []
+        self.reissued = []  # (gate, supersedes_note) captured by record_reissue
         self._preflight_ok = preflight_ok
         self._record_ok = record_ok
         self.preflight_calls = 0
@@ -189,6 +191,10 @@ class _Recorder:
 
     def record(self, gate) -> bool:
         self.recorded.append(gate)
+        return self._record_ok
+
+    def record_reissue(self, gate, supersedes_note) -> bool:
+        self.reissued.append((gate, supersedes_note))
         return self._record_ok
 
 
@@ -336,7 +342,16 @@ class ResumeLegTests(unittest.TestCase):
         self.fence.bootstrap()
         self.args = argparse.Namespace(repo=str(self.home))
 
-    def _run(self, *, gate_source, target_resolver, send_factory, gate_recorder, observed_at="2026-07-16T01:00:00Z"):
+    def _run(
+        self,
+        *,
+        gate_source,
+        target_resolver,
+        send_factory,
+        gate_recorder,
+        legacy_reissuer=None,
+        observed_at="2026-07-16T01:00:00Z",
+    ):
         return execute_startup_resume(
             self.args,
             "13813",
@@ -346,6 +361,7 @@ class ResumeLegTests(unittest.TestCase):
             target_resolver=target_resolver,
             send_factory=send_factory,
             gate_recorder=gate_recorder,
+            legacy_reissuer=legacy_reissuer,
             fence=self.fence,
         )
 
@@ -472,6 +488,22 @@ class ResumeLegTests(unittest.TestCase):
         self.assertIn("corrupt", result.detail)
         self.assertEqual(len(rec.recorded), 0)
 
+    def test_unreadable_latest_gate_is_zero_send(self) -> None:
+        # review j#79504 F1: an UNREADABLE ticket-provider read is indeterminate -> fail closed with
+        # zero actuation (never conflated with no_gate, never resolves/sends).
+        rec = _Recorder()
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_UNREADABLE),
+            target_resolver=lambda gate, env: (_ for _ in ()).throw(
+                AssertionError("resolver must not run on an unreadable read")
+            ),
+            send_factory=_exploding_send_factory,
+            gate_recorder=rec,
+        )
+        self.assertEqual(result.result, RESUME_NOT_RESUMABLE)
+        self.assertIn("unreadable", result.detail)
+        self.assertEqual(len(rec.recorded), 0)
+
     def test_unresolved_live_target_is_zero_send(self) -> None:
         result = self._run(
             gate_source=lambda issue: LatestGateRead(GATE_READ_GATE, _done_gate()),
@@ -482,21 +514,115 @@ class ResumeLegTests(unittest.TestCase):
         self.assertEqual(result.result, RESUME_NOT_CLEAR)
         self.assertEqual(result.projection_disposition, PROJECT_IDENTITY_UNRESOLVED)
 
-    def test_legacy_latest_gate_is_reapproval_required_zero_send(self) -> None:
-        # j#79405 §B: a readable legacy (v1/v2) latest gate routes to a fixed reapproval-required
-        # disposition — reserve/send 0, no resolve, no record — never a resume of a legacy gate.
+    def test_legacy_latest_gate_reissue_unavailable_is_manual_reapproval_zero_send(self) -> None:
+        # j#79405 §B: a readable legacy latest routes to reapproval — reserve/send 0, no resume of
+        # the legacy gate. When no fresh observation can be re-observed (reissuer -> None), the leg
+        # guides a MANUAL reapproval and records nothing.
         rec = _Recorder()
         result = self._run(
-            gate_source=lambda issue: LatestGateRead(GATE_READ_LEGACY),
+            gate_source=lambda issue: LatestGateRead(GATE_READ_LEGACY, legacy_record={"gate_id": "g"}),
             target_resolver=lambda gate, env: (_ for _ in ()).throw(
                 AssertionError("resolver must not run on a legacy gate")
             ),
             send_factory=_exploding_send_factory,
             gate_recorder=rec,
+            legacy_reissuer=lambda legacy_record, issue, repo_root: None,
         )
         self.assertEqual(result.result, RESUME_LEGACY_REAPPROVAL_REQUIRED)
         self.assertFalse(result.sent)
         self.assertEqual(len(rec.recorded), 0)
+        self.assertEqual(len(rec.reissued), 0)
+
+    def test_legacy_latest_gate_reissues_fresh_v3_with_supersedes(self) -> None:
+        # review j#79504 F2: a readable legacy latest re-observes a FRESH v3 required gate via the
+        # producer-backed reissuer and durably records it (record_reissue) with a supersedes pointer
+        # naming the legacy gate — reserve/send 0, no legacy backfill, awaiting fresh owner approval.
+        rec = _Recorder()
+        fresh = build_required_gate(
+            gate_id="gate-1",
+            action_generation=2,
+            original_request=_original(),
+            target=_target(),
+            classification=_classification(),
+        )
+        legacy_record = {"gate_id": "gate-1", "action_generation": 1}
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(GATE_READ_LEGACY, legacy_record=legacy_record),
+            target_resolver=lambda gate, env: (_ for _ in ()).throw(
+                AssertionError("resolver must not run on a legacy gate")
+            ),
+            send_factory=_exploding_send_factory,
+            gate_recorder=rec,
+            legacy_reissuer=lambda lr, issue, repo_root: fresh,
+        )
+        self.assertEqual(result.result, RESUME_LEGACY_REAPPROVAL_REQUIRED)
+        self.assertFalse(result.sent)
+        self.assertEqual(len(rec.recorded), 0)  # no same-gate transition
+        self.assertEqual(len(rec.reissued), 1)  # fresh v3 gate durably recorded
+        recorded_gate, supersedes_note = rec.reissued[0]
+        self.assertEqual(recorded_gate, fresh)
+        self.assertIn("gate=gate-1", supersedes_note)
+        self.assertIn("action_generation=1", supersedes_note)  # names the superseded legacy gen
+
+    def test_default_legacy_reissuer_invokes_producer_from_observation(self) -> None:
+        # review j#79504 F2: the DEFAULT (production) reissuer is a real call-site of the producer.
+        # A seeded lifecycle observation + provider binding -> a fresh v3 required gate whose runtime
+        # identity comes from the declared pin (fail-closed sub-seams only: lifecycle / binding read).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            operator_startup_resume_leg as leg_mod,
+            operator_startup_resume_target as tgt_mod,
+            workflow_binding_source as bind_mod,
+        )
+
+        class _Binding:
+            def provider_for(self, role):
+                return "claude"
+
+        record = SimpleNamespace(
+            repo_workspace_id="ws-alpha",
+            lane_id="lane-alpha",
+            lane_generation=3,
+            revision=1,
+            declared_pins=(
+                ProcessGenerationPin(
+                    role="claude", provider="claude", assigned_name="worker-a", locator="w1:p1"
+                ),
+            ),
+        )
+        orig_lc = tgt_mod._default_lifecycle_get
+        orig_bind = bind_mod.load_workflow_binding
+        tgt_mod._default_lifecycle_get = lambda ws, lane: record
+        bind_mod.load_workflow_binding = lambda repo_root=None: (_Binding(), ())
+        try:
+            legacy_record = {
+                "gate_id": "gate-1",
+                "action_generation": 1,
+                "target": {
+                    "workspace_id": "ws-alpha",
+                    "lane_id": "lane-alpha",
+                    "target_role": "implementation_worker",
+                    "execution_root": ".",
+                },
+                "original_request": {
+                    "source": "redmine", "issue": "13760", "journal": "77948", "delivery_id": "deliv-1"
+                },
+                "classification": {
+                    "blocker_id": "first_run_theme",
+                    "profile_version": "2",
+                    "classifier_version": "1",
+                    "observed_at": "x",
+                },
+            }
+            fresh = leg_mod._default_legacy_reissuer(legacy_record, "13813", str(self.home))
+        finally:
+            tgt_mod._default_lifecycle_get = orig_lc
+            bind_mod.load_workflow_binding = orig_bind
+        self.assertIsNotNone(fresh)
+        assert fresh is not None
+        self.assertEqual(fresh.state, "required")
+        self.assertEqual(fresh.target.runtime_role, "claude")  # from the declared pin
+        self.assertEqual(fresh.target.target_role, "implementation_worker")  # workflow role
+        self.assertEqual(fresh.action_generation, 2)  # legacy generation + 1
 
     def test_unsafe_execution_root_is_zero_send_before_reserve(self) -> None:
         # j#79405 §C: an execution_root that does not safely resolve under the action-time repo

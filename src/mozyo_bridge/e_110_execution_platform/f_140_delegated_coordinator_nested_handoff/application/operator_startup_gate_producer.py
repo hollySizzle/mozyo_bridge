@@ -137,21 +137,26 @@ def build_v3_required_gate_from_observation(
     )
 
 
-#: Narrative marker naming the legacy journal a fresh v3 gate supersedes (j#79405 §B). A human
+#: Narrative marker naming the legacy gate a fresh v3 gate supersedes (j#79405 §B). A human
 #: pasteable pointer only — the exact revision / runtime role is re-observed, never backfilled.
-SUPERSEDES_MARKER = "supersedes-legacy-startup-gate-journal"
+#: The supersede MECHANISM is the append-only newest-wins chain; this line is for auditability.
+SUPERSEDES_MARKER = "supersedes-legacy-startup-gate"
 
 
-def reissue_supersedes_note(*, superseded_journal: str) -> str:
+def reissue_supersedes_note(*, superseded_gate_id: str, superseded_generation: object) -> str:
     """The ``supersedes`` narrative line for a fresh v3 gate re-issued over a legacy v1/v2 gate.
 
-    Names the legacy journal explicitly so the reissue is auditable, WITHOUT copying the legacy
-    gate's approval / revision (a fresh owner approval + a freshly observed generation supersede it).
+    Names the legacy gate (its ``gate_id`` + ``action_generation``) explicitly so the reissue is
+    auditable, WITHOUT copying the legacy gate's approval / revision (a fresh owner approval + a
+    freshly observed generation supersede it).
     """
-    journal = str(superseded_journal or "").strip()
-    if not journal:
-        raise GateProducerError("reissue_supersedes_note requires a non-empty superseded journal id")
-    return f"[mozyo:{SUPERSEDES_MARKER}:journal={journal}] fresh v3 gate re-observed (no legacy backfill)"
+    gate_id = str(superseded_gate_id or "").strip()
+    if not gate_id:
+        raise GateProducerError("reissue_supersedes_note requires a non-empty superseded gate_id")
+    return (
+        f"[mozyo:{SUPERSEDES_MARKER}:gate={gate_id}:action_generation={superseded_generation}] "
+        "fresh v3 gate re-observed (no legacy backfill)"
+    )
 
 
 __all__ = (

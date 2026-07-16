@@ -85,14 +85,15 @@ GATE_JOURNAL_MARKER = f"{GATE_JOURNAL_MARKER_PREFIX}{OPERATOR_STARTUP_GATE_SCHEM
 # ---------------------------------------------------------------------------
 # Durable gate serialization (ticket-provider wire form).
 # ---------------------------------------------------------------------------
-def render_gate_journal(gate: OperatorStartupGate) -> str:
+def render_gate_journal(gate: OperatorStartupGate, *, supersedes_note: str = "") -> str:
     """Render a pasteable durable journal note for a gate (human lines + JSON payload).
 
     The human lines are the state-appropriate pasteable renderer; the machine payload is
     ``gate.to_record()`` as compact single-line JSON after :data:`GATE_JOURNAL_MARKER`.
     Both are path/secret-safe by construction. ``owner_approved`` / ``operator_reported_done``
     have no dedicated human renderer (they are recorded by owner / operator action upstream),
-    so only the machine payload is emitted for them.
+    so only the machine payload is emitted for them. ``supersedes_note`` (when a fresh v3 gate is
+    re-issued over a legacy one) is prepended as an auditable pointer to the superseded gate.
     """
     if gate.state == STATE_REQUIRED:
         lines = list(operator_startup_gate_record_lines(gate))
@@ -105,17 +106,21 @@ def render_gate_journal(gate: OperatorStartupGate) -> str:
                 f"- operator_startup_gate (gate {gate.gate_id}, "
                 f"action_generation={gate.action_generation}, state={gate.state})."
             ]
+    if supersedes_note.strip():
+        lines = [supersedes_note.strip(), *lines]
     payload = json.dumps(gate.to_record(), sort_keys=True, separators=(",", ":"))
     return "\n".join([*lines, "", GATE_JOURNAL_MARKER, payload])
 
 
-# Gate-read status (:class:`LatestGateRead`). A durable gate read is one of four: a valid
-# current (v3) gate, no gate record at all, a readable LEGACY (v1/v2) record (reapproval
-# required — never resumed), or a CORRUPT newest gate record (fail-closed).
+# Gate-read status (:class:`LatestGateRead`). A durable gate read is one of five: a valid
+# current (v3) gate, definitively no gate record at all, a readable LEGACY (v1/v2) record
+# (reapproval required — never resumed), a CORRUPT newest gate record (fail-closed), or an
+# UNREADABLE ticket-provider read (indeterminate — fail-closed, NOT conflated with no_gate).
 GATE_READ_GATE = "gate"  # a valid current (v3) gate was read
-GATE_READ_NONE = "no_gate"  # no gate-marker-bearing journal entry exists at all
+GATE_READ_NONE = "no_gate"  # the journal read SUCCEEDED and carries no gate marker (proceed)
 GATE_READ_LEGACY = "legacy"  # the NEWEST gate record is a readable legacy (v1/v2) schema
 GATE_READ_CORRUPT = "corrupt"  # the NEWEST gate-marker entry is malformed / schema-invalid
+GATE_READ_UNREADABLE = "unreadable"  # the ticket-provider read itself failed (indeterminate)
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,9 @@ class LatestGateRead:
 
     status: str
     gate: Optional[OperatorStartupGate] = None
+    #: The raw legacy record dict when ``status`` is :data:`GATE_READ_LEGACY` — the reapproval leg
+    #: structurally extracts the work anchor / lane / classification to re-observe a fresh v3 gate.
+    legacy_record: Optional[dict] = None
 
 
 def note_has_gate_marker(notes: object) -> bool:
@@ -264,9 +272,10 @@ def parse_latest_gate(entries: Sequence[object]) -> LatestGateRead:
             return LatestGateRead(status=GATE_READ_CORRUPT)
         version = schema_version_of(record)
         if version in OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS:
-            # A readable legacy record -> reapproval; a malformed legacy fragment -> corrupt.
+            # A readable legacy record -> reapproval (carry it for re-observation); a malformed
+            # legacy fragment -> corrupt.
             if _legacy_record_is_readable(record):
-                return LatestGateRead(status=GATE_READ_LEGACY)
+                return LatestGateRead(status=GATE_READ_LEGACY, legacy_record=record)
             return LatestGateRead(status=GATE_READ_CORRUPT)
         if version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
             return LatestGateRead(status=GATE_READ_CORRUPT)
@@ -312,6 +321,10 @@ TargetResolver = Callable[
 ResumeSendFactory = Callable[
     [OperatorStartupGate, str, str, Mapping[str, str]], Callable[[], SendOutcome]
 ]
+#: Re-observe a fresh v3 ``required`` gate for a readable legacy (v1/v2) latest gate, from the
+#: authoritative lifecycle observation (``legacy_record, issue, repo_root``), or None on any drift /
+#: producer error (fail-closed). The default binds the production :mod:`operator_startup_gate_producer`.
+LegacyReissuer = Callable[[dict, str, str], Optional[OperatorStartupGate]]
 
 
 class GateRecorder(Protocol):
@@ -326,6 +339,10 @@ class GateRecorder(Protocol):
     def preflight(self) -> bool: ...
 
     def record(self, gate: OperatorStartupGate) -> bool: ...
+
+    def record_reissue(self, gate: OperatorStartupGate, supersedes_note: str) -> bool:
+        """Append a fresh v3 gate journal carrying a ``supersedes`` pointer (legacy reapproval)."""
+        ...
 
 
 def _utc_now() -> str:
@@ -344,6 +361,7 @@ def execute_startup_resume(
     target_resolver: Optional[TargetResolver] = None,
     send_factory: Optional[ResumeSendFactory] = None,
     gate_recorder: Optional[GateRecorder] = None,
+    legacy_reissuer: Optional[LegacyReissuer] = None,
     fence: Optional[DispatchOutboxFence] = None,
 ) -> StartupResumeResult:
     """Drive the action-time resume for an issue (the live leg over injectable ports).
@@ -371,30 +389,62 @@ def execute_startup_resume(
     # 1. Re-read the latest durable gate + original anchor from the ticket-provider port.
     source = gate_source if gate_source is not None else _default_gate_source(repo_root, environ)
     read = source(str(issue).strip())
-    if read.status == GATE_READ_CORRUPT:
-        # The NEWEST gate record is malformed / schema-invalid: fail closed. Never resume
-        # from a stale older gate (Finding 3) — a corrupt supersede/consume record must not
-        # let an older `operator_reported_done` gate re-issue the request.
+    if read.status in (GATE_READ_CORRUPT, GATE_READ_UNREADABLE):
+        # The newest gate record is malformed/schema-invalid, OR the ticket-provider read itself
+        # failed (indeterminate): fail closed with zero actuation (review j#79309 F3 / j#79504 F1).
+        # Never resume from a stale older gate, and never conflate an unreadable read with "no gate".
+        why = "corrupt (malformed / schema-invalid)" if read.status == GATE_READ_CORRUPT else (
+            "unreadable (ticket-provider read failed; indeterminate)"
+        )
         return StartupResumeResult(
             result=RESUME_NOT_RESUMABLE,
             detail=(
-                f"latest durable operator startup gate for issue {issue} is corrupt "
-                "(malformed / schema-invalid); fail-closed, no fallback to an older gate"
+                f"latest durable operator startup gate for issue {issue} is {why}; "
+                "fail-closed, no fallback and no send"
             ),
         )
     if read.status == GATE_READ_LEGACY:
         # The NEWEST gate record is a readable legacy (v1/v2) schema: it predates the v3
         # runtime_role / lane_revision contract, so resuming it would fabricate an exact-revision
-        # approval (Design Answer j#79405 §B). Fixed disposition — reserve/send 0. The operator
-        # re-approves a fresh v3 gate; this is not corrupt and is never promoted to current-v3.
-        return StartupResumeResult(
-            result=RESUME_LEGACY_REAPPROVAL_REQUIRED,
-            detail=(
-                f"latest durable operator startup gate for issue {issue} is a legacy (v1/v2) "
-                "record predating the v3 runtime_role/lane_revision contract; reserve/send 0, "
-                "operator re-approval of a fresh v3 gate required (no implicit backfill)"
-            ),
+        # approval (Design Answer j#79405 §B). Reserve/send 0. Re-observe a FRESH v3 `required`
+        # gate from the authoritative lifecycle observation (production producer) and durably
+        # record it with a `supersedes` pointer to the legacy gate — the newest-wins append chain
+        # makes it supersede the legacy record, and it awaits a fresh owner approval (review j#79504
+        # F2). A producer drift / unavailable writer degrades to guiding a MANUAL reapproval.
+        legacy_record = read.legacy_record or {}
+        reissuer = legacy_reissuer if legacy_reissuer is not None else _default_legacy_reissuer
+        try:
+            fresh = reissuer(legacy_record, str(issue).strip(), repo_root)
+        except Exception:  # noqa: BLE001 - reissue failure -> manual reapproval (never actuation)
+            fresh = None
+        reissued = False
+        if fresh is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_gate_producer import (
+                reissue_supersedes_note,
+            )
+
+            recorder = gate_recorder if gate_recorder is not None else _default_gate_recorder(
+                issue, environ
+            )
+            if recorder.preflight():
+                note = reissue_supersedes_note(
+                    superseded_gate_id=str(legacy_record.get("gate_id") or ""),
+                    superseded_generation=legacy_record.get("action_generation"),
+                )
+                reissued = recorder.record_reissue(fresh, note)
+        detail = (
+            f"latest durable operator startup gate for issue {issue} is a legacy (v1/v2) record; "
+            + (
+                "re-observed and durably recorded a fresh v3 required gate (supersedes the legacy "
+                "gate, awaiting fresh owner approval); reserve/send 0, no legacy backfill"
+                if reissued
+                else "reserve/send 0, manual operator re-approval of a fresh v3 gate required "
+                "(no fresh observation recorded)"
+            )
         )
+        # `advanced_gate` is deliberately unset: a fresh v3 `required` gate is a NEW gate (recorded
+        # via record_reissue above), not a same-gate transition of the legacy record.
+        return StartupResumeResult(result=RESUME_LEGACY_REAPPROVAL_REQUIRED, detail=detail)
     if read.status != GATE_READ_GATE or read.gate is None:
         return StartupResumeResult(
             result=RESUME_NOT_RESUMABLE,
@@ -520,9 +570,17 @@ def _default_gate_source(repo_root: str, env: Mapping[str, str]) -> GateSource:
             )
 
             source = LiveRedmineJournalSource.from_environment(environ=env)
-            entries = source.read_entries(issue_id)
-        except Exception:  # noqa: BLE001 - live transport / unconfigured creds -> no gate (fail-soft, zero-send)
+        except Exception:  # noqa: BLE001 - ticket provider NOT CONFIGURED (no creds / base URL)
+            # No ticket-provider read path exists here, so there is no startup-gate system to
+            # consult: this is a definitive "no gate" (proceed), NOT an indeterminate read. Keeping
+            # these distinct is what stops an unconfigured environment from hijacking every step.
             return LatestGateRead(status=GATE_READ_NONE)
+        try:
+            entries = source.read_entries(issue_id)
+        except Exception:  # noqa: BLE001 - CONFIGURED but the read FAILED -> indeterminate
+            # The provider is configured but the read failed (transient / transport): fail closed,
+            # never conflated with "no gate" (review j#79504 F1). The top-level workflow zero-actuates.
+            return LatestGateRead(status=GATE_READ_UNREADABLE)
         return parse_latest_gate(list(entries))
 
     return _read
@@ -574,6 +632,64 @@ def _default_gate_recorder(issue: object, env: Mapping[str, str]) -> GateRecorde
     return ResumeGateRecorder(issue=str(issue).strip(), env=env)
 
 
+def _default_legacy_reissuer(
+    legacy_record: dict, issue: str, repo_root: str
+) -> Optional[OperatorStartupGate]:
+    """Re-observe a fresh v3 ``required`` gate for a readable legacy latest, or None (fail-closed).
+
+    Structurally extracts the work anchor / lane / workflow role / classification from the legacy
+    record (never its runtime identity — that is re-observed), reads the authoritative live lifecycle
+    record + the repo's provider binding, and builds a fresh v3 gate through the production
+    :func:`build_v3_required_gate_from_observation`. The fresh gate carries its runtime_role / provider
+    / generation / revision / workspace from the CURRENT observation (Design Answer j#79405 §B — no
+    legacy backfill); its ``action_generation`` is the legacy generation + 1. Any missing field /
+    unreadable lifecycle / producer drift returns None so the leg guides manual reapproval instead.
+    """
+    target = legacy_record.get("target") or {}
+    workspace_id = str(target.get("workspace_id") or "").strip()
+    lane_id = str(target.get("lane_id") or "").strip()
+    workflow_role = str(target.get("target_role") or "").strip()
+    execution_root = str(target.get("execution_root") or "").strip()
+    gate_id = str(legacy_record.get("gate_id") or "").strip()
+    try:
+        action_generation = int(legacy_record.get("action_generation"))
+    except (TypeError, ValueError):
+        return None
+    if not (workspace_id and lane_id and workflow_role and execution_root and gate_id):
+        return None
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_gate_producer import (
+            build_v3_required_gate_from_observation,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (
+            _default_lifecycle_get,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+            load_workflow_binding,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
+            GateClassification,
+            OriginalRequest,
+        )
+
+        lifecycle = _default_lifecycle_get(workspace_id, lane_id)
+        if lifecycle is None:
+            return None
+        binding, _warnings = load_workflow_binding(repo_root)
+        return build_v3_required_gate_from_observation(
+            record=lifecycle,
+            binding=binding,
+            workflow_role=workflow_role,
+            execution_root=execution_root,
+            gate_id=gate_id,
+            action_generation=action_generation + 1,
+            original_request=OriginalRequest.from_record(legacy_record.get("original_request") or {}),
+            classification=GateClassification.from_record(legacy_record.get("classification") or {}),
+        )
+    except Exception:  # noqa: BLE001 - producer drift / unreadable observation -> manual reapproval
+        return None
+
+
 __all__ = (
     "GATE_JOURNAL_MARKER",
     "GATE_JOURNAL_MARKER_PREFIX",
@@ -581,11 +697,13 @@ __all__ = (
     "GATE_READ_NONE",
     "GATE_READ_LEGACY",
     "GATE_READ_CORRUPT",
+    "GATE_READ_UNREADABLE",
     "LatestGateRead",
     "ObservedTargetResolution",
     "GateSource",
     "TargetResolver",
     "ResumeSendFactory",
+    "LegacyReissuer",
     "GateRecorder",
     "render_gate_journal",
     "note_has_gate_marker",

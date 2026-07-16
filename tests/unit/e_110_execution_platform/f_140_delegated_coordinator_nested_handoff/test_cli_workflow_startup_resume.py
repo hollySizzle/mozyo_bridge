@@ -25,6 +25,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GATE_READ_GATE,
     GATE_READ_LEGACY,
     GATE_READ_NONE,
+    GATE_READ_UNREADABLE,
     LatestGateRead,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (  # noqa: E402
@@ -134,11 +135,23 @@ class MaybeResumeOutcomeTests(unittest.TestCase):
             cli_workflow._maybe_operator_startup_resume_outcome(argparse.Namespace(), _outcome())
         )
 
-    def test_corrupt_gate_does_not_route(self) -> None:
-        self._patch_gate(LatestGateRead(GATE_READ_CORRUPT))
-        self.assertIsNone(
-            cli_workflow._maybe_operator_startup_resume_outcome(argparse.Namespace(), _outcome())
-        )
+    def _assert_routes(self, read: LatestGateRead) -> None:
+        self._patch_gate(read)
+        result = cli_workflow._maybe_operator_startup_resume_outcome(argparse.Namespace(), _outcome())
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.primitive, PRIMITIVE_OPERATOR_STARTUP_RESUME)
+        self.assertEqual(result.execution, EXECUTION_READY)
+        self.assertTrue(cli_workflow._is_startup_resume_leg(result))
+
+    def test_corrupt_gate_routes_fail_closed(self) -> None:
+        # review j#79504 F1: a corrupt latest is INDETERMINATE -> route to the (zero-actuating) leg
+        # so the normal primitive does NOT execute (the leg returns RESUME_NOT_RESUMABLE).
+        self._assert_routes(LatestGateRead(GATE_READ_CORRUPT))
+
+    def test_unreadable_gate_routes_fail_closed(self) -> None:
+        # An unreadable ticket-provider read is INDETERMINATE, distinct from no_gate -> fail closed.
+        self._assert_routes(LatestGateRead(GATE_READ_UNREADABLE))
 
     def test_legacy_gate_routes_to_resume_reapproval(self) -> None:
         # review j#79481 F1: a readable legacy latest gate MUST route to the resume leg (so the leg
@@ -154,7 +167,9 @@ class MaybeResumeOutcomeTests(unittest.TestCase):
         self.assertEqual(result.execution, EXECUTION_READY)
         self.assertTrue(cli_workflow._is_startup_resume_leg(result))
 
-    def test_unreadable_source_is_fail_soft(self) -> None:
+    def test_source_error_routes_fail_closed(self) -> None:
+        # review j#79504 F1: a source error is INDETERMINATE -> route to the (zero-actuating) leg,
+        # never fall through to the normal primitive.
         def _raises(repo_root, env):
             def _src(issue):
                 raise RuntimeError("ticket provider down")
@@ -162,9 +177,11 @@ class MaybeResumeOutcomeTests(unittest.TestCase):
             return _src
 
         operator_startup_resume_leg._default_gate_source = _raises
-        self.assertIsNone(
-            cli_workflow._maybe_operator_startup_resume_outcome(argparse.Namespace(), _outcome())
-        )
+        result = cli_workflow._maybe_operator_startup_resume_outcome(argparse.Namespace(), _outcome())
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.primitive, PRIMITIVE_OPERATOR_STARTUP_RESUME)
+        self.assertTrue(cli_workflow._is_startup_resume_leg(result))
 
     def test_no_issue_anywhere_does_not_route(self) -> None:
         # No anchor issue and no --issue arg: nothing to read, no resume.

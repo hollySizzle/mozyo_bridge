@@ -83,6 +83,13 @@ class ResumeGateRecorder:
         return self.transport_factory(self.env) is not None
 
     def record(self, gate: OperatorStartupGate) -> bool:
+        return self._append(gate, supersedes_note="")
+
+    def record_reissue(self, gate: OperatorStartupGate, supersedes_note: str) -> bool:
+        """Append a fresh v3 gate journal carrying a ``supersedes`` pointer (legacy reapproval)."""
+        return self._append(gate, supersedes_note=supersedes_note)
+
+    def _append(self, gate: OperatorStartupGate, *, supersedes_note: str) -> bool:
         transport = self.transport_factory(self.env)
         if transport is None:
             return False
@@ -92,7 +99,9 @@ class ResumeGateRecorder:
         )
 
         try:
-            transport.post_issue_note(self.issue, render_gate_journal(gate))  # type: ignore[attr-defined]
+            transport.post_issue_note(  # type: ignore[attr-defined]
+                self.issue, render_gate_journal(gate, supersedes_note=supersedes_note)
+            )
             return True
         except Exception:  # noqa: BLE001 - transport failure -> record failed (operator reconcile)
             return False

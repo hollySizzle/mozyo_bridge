@@ -427,22 +427,39 @@ def _maybe_operator_startup_resume_outcome(
       ``legacy_gate_reapproval_required`` disposition (reserve/send 0) and guides reapproval
       (review j#79481 F1 — a legacy latest must not let a normal primitive execute).
 
-    Any other state — no gate, a corrupt gate, a pre-clear / terminal / in-flight v3 gate — leaves
-    the normal outcome unchanged (returns None); the read is fail-soft (an unreadable ticket
-    provider never forces a resume).
+    Only a DEFINITIVE ``no_gate`` read (the journal read succeeded and carries no gate marker) — or
+    a pre-clear / terminal / in-flight v3 gate — leaves the normal outcome unchanged (returns None,
+    the normal primitive runs). Every INDETERMINATE / outstanding read — a corrupt newest gate, an
+    UNREADABLE ticket-provider read, or a source error — is ALSO routed to the resume leg, which
+    zero-actuates (RESUME_NOT_RESUMABLE) so no normal primitive, reserve, send, or write occurs
+    (review j#79504 F1: an indeterminate startup state must fail closed at the top level, per
+    j#79214 Required implementation 2, not fall through to a normal primitive).
     """
     issue = (_anchor_issue_of(outcome.durable_anchor) or "").strip()
     if not issue:
         issue = (getattr(args, "issue", None) or "").strip()
     if not issue:
         return None
+
+    def _route(journal_fallback: str) -> WorkflowStepOutcome:
+        anchor = outcome.durable_anchor
+        if not anchor or anchor == "none":
+            journal = (getattr(args, "journal", None) or journal_fallback or "").strip()
+            anchor = f"redmine:issue={issue}:journal={journal}"
+        return dataclasses.replace(
+            outcome,
+            primitive=PRIMITIVE_OPERATOR_STARTUP_RESUME,
+            execution=EXECUTION_READY,
+            durable_anchor=anchor,
+        )
+
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
             _default_gate_source,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
             GATE_READ_GATE,
-            GATE_READ_LEGACY,
+            GATE_READ_NONE,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
             STATE_OPERATOR_REPORTED_DONE,
@@ -450,27 +467,19 @@ def _maybe_operator_startup_resume_outcome(
         import os
 
         read = _default_gate_source("", os.environ)(issue)
-    except Exception:  # noqa: BLE001 - unreadable ticket provider -> never force a resume
-        return None
-    if read.status == GATE_READ_LEGACY:
-        # Readable legacy latest: route to the leg (fixed reapproval disposition), no gate parsed.
-        journal_fallback = ""
-    elif read.status == GATE_READ_GATE and read.gate is not None:
+    except Exception:  # noqa: BLE001 - a source error is INDETERMINATE -> fail closed (route to leg)
+        return _route("")
+    if read.status == GATE_READ_NONE:
+        return None  # definitively no startup gate -> proceed with the normal primitive.
+    if read.status == GATE_READ_GATE and read.gate is not None:
         if read.gate.state != STATE_OPERATOR_REPORTED_DONE:
+            # A pre-clear / terminal / in-flight v3 gate is not a resume candidate; the #13760
+            # pre-send admission gate guards a normal primitive's actuation, so proceed.
             return None
-        journal_fallback = read.gate.original_request.journal
-    else:
-        return None
-    anchor = outcome.durable_anchor
-    if not anchor or anchor == "none":
-        journal = (getattr(args, "journal", None) or journal_fallback or "").strip()
-        anchor = f"redmine:issue={issue}:journal={journal}"
-    return dataclasses.replace(
-        outcome,
-        primitive=PRIMITIVE_OPERATOR_STARTUP_RESUME,
-        execution=EXECUTION_READY,
-        durable_anchor=anchor,
-    )
+        return _route(read.gate.original_request.journal)  # resumable v3 gate.
+    # GATE_READ_LEGACY (reapproval), GATE_READ_CORRUPT, GATE_READ_UNREADABLE, or any unknown status:
+    # route to the (zero-actuating) resume leg so no normal primitive executes.
+    return _route("")
 
 
 def _is_herdr_forward_leg(outcome: WorkflowStepOutcome) -> bool:
