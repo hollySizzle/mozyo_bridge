@@ -44,6 +44,13 @@ DISPATCH_EXPECTED_GATE = "implementation_done"
 #: The default role profile the gated IR handoff routes with (the same-lane worker leg).
 DISPATCH_ROLE_PROFILE = "implementation_worker"
 
+#: The ONLY handoff ``--source`` this writer supports (review R9-F1). The IR journal is a Redmine
+#: journal note and the anchor is ``--issue/--journal``; an ``asana`` anchor forbids ``--issue/--journal``
+#: (``normalize_anchor`` raises), so a non-redmine route would persist a marker journal that the
+#: handoff can never deliver. It is fail-closed at validation, BEFORE any write, not the full handoff
+#: ``SOURCES`` — this canonical writer is Redmine-issue/journal anchored by design (Design Answer j#79507 Q2).
+DISPATCH_SOURCE = "redmine"
+
 #: Terminal dispatch outcomes (fixed vocabulary; a fail-closed status never delivers a handoff).
 DISPATCH_WRITTEN = "dispatched"  #: fresh marker written + anchor resolved + handoff delivered
 DISPATCH_RECOVERED = "recovered"  #: existing marker reused (idempotent, no new write) + delivered
@@ -73,7 +80,7 @@ class DispatchRoute:
     lane: str
     gateway_callback_target: str
     role_profile: str = DISPATCH_ROLE_PROFILE
-    source: str = "redmine"
+    source: str = DISPATCH_SOURCE
 
     def missing(self) -> "tuple[str, ...]":
         """The required identity fields that are empty (a non-empty result blocks the dispatch)."""
@@ -302,14 +309,18 @@ def build_live_ir_dispatch() -> "tuple[Callable[[str, str], object], Callable[[s
 
 
 def build_live_vocabulary() -> DispatchVocabulary:
-    """Build the live route vocabulary from the f_130 handoff contract (review R8-F3).
+    """Build the live route vocabulary from the f_130 handoff contract (review R8-F3 / R9-F1).
 
-    Reuses the SINGLE source of truth for the handoff receiver / source / role vocabularies and the
+    Reuses the SINGLE source of truth for the handoff receiver / role vocabularies and the
     role-template placeholders, so a route this validator accepts is one the handoff parser accepts
     (no drift): a rejected route fails closed BEFORE writing a marker journal. ``durable_anchor`` /
     ``redmine_project`` are the handoff's own send-time auto-fills, so they are not required on the route.
+
+    ``sources`` is intentionally NARROWER than the handoff's full ``SOURCES`` — only :data:`DISPATCH_SOURCE`
+    (``redmine``). This canonical writer anchors on ``--issue/--journal`` (a Redmine journal), which an
+    ``asana`` anchor forbids, so a non-redmine route is rejected here BEFORE it can persist an
+    undeliverable marker journal (review R9-F1).
     """
-    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import SOURCES
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
         ROLE_PROFILE_TOKENS,
         template_placeholders,
@@ -331,7 +342,7 @@ def build_live_vocabulary() -> DispatchVocabulary:
             required[role] = ()
     return DispatchVocabulary(
         receivers=frozenset(receiver_choices()),
-        sources=frozenset(SOURCES),
+        sources=frozenset({DISPATCH_SOURCE}),  # R9-F1: Redmine-anchor writer -> redmine source only
         role_profiles=roles,
         required_placeholders=required,
         autofilled_placeholders=frozenset({DURABLE_ANCHOR_FIELD, REDMINE_PROJECT_FIELD}),
@@ -374,6 +385,7 @@ def build_live_handoff_send(*, issue: str, route: DispatchRoute) -> Callable[[st
 __all__ = (
     "DISPATCH_EXPECTED_GATE",
     "DISPATCH_ROLE_PROFILE",
+    "DISPATCH_SOURCE",
     "DISPATCH_WRITTEN",
     "DISPATCH_RECOVERED",
     "DISPATCH_INPUT_INVALID",

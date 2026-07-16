@@ -29,6 +29,7 @@ from pathlib import Path
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_dispatch_writer import (
     DISPATCH_ROLE_PROFILE,
     DISPATCH_SENDABLE,
+    DISPATCH_SOURCE,
     DispatchRoute,
     build_live_handoff_send,
     build_live_ir_dispatch,
@@ -165,7 +166,11 @@ def register_dispatch_ir(workflow_sub) -> None:
         "--role-profile", dest="role_profile", default=DISPATCH_ROLE_PROFILE,
         help=f"The handoff role profile (--execute; default {DISPATCH_ROLE_PROFILE}).",
     )
-    p.add_argument("--source", default="redmine", help="The handoff --source (--execute; default redmine).")
+    p.add_argument(
+        "--source", default=DISPATCH_SOURCE, choices=[DISPATCH_SOURCE],
+        help=f"The handoff --source (--execute). This canonical writer is Redmine-issue/journal "
+             f"anchored, so only {DISPATCH_SOURCE!r} is supported (review R9-F1).",
+    )
     p.add_argument("--to", default="claude", help="The handoff --to receiver (--execute; default claude).")
     p.add_argument(
         "--execute", action="store_true",

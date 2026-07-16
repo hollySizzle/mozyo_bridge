@@ -235,6 +235,23 @@ class FailClosedTest(unittest.TestCase):
             self.assertEqual(redmine.posted, [])  # never wrote a marker for a parser-rejected route
         self.assertEqual(handoff.calls, [])
 
+    def test_cross_source_asana_route_fails_closed_with_no_io(self):
+        # review R9-F1: this writer anchors on --issue/--journal (Redmine); an asana route would
+        # persist a marker journal that the handoff (normalize_anchor) can never deliver. It must
+        # fail closed at validation BEFORE any Redmine read/write or handoff send.
+        redmine, handoff = _FakeRedmine(), _Handoff()
+        asana = DispatchRoute(
+            to="claude", target="mzb1_ws1_claude_la", target_repo="/repos/mozyo", lane="lane-a",
+            gateway_callback_target="mzb1_ws1_codex_la", source="asana",
+        )
+        result = _dispatch(redmine, handoff, route=asana)
+        self.assertEqual(result.status, DISPATCH_INPUT_INVALID)
+        self.assertIn("source:asana", result.detail)
+        # not one Redmine read, write, or handoff was attempted.
+        self.assertEqual(redmine.posted, [])
+        self.assertEqual(redmine._read_calls, 0)
+        self.assertEqual(handoff.calls, [])
+
 
 class DeliveryOutcomeTest(unittest.TestCase):
     def test_only_a_positively_delivered_handoff_is_sendable(self):
@@ -260,6 +277,14 @@ class RouteValidationTest(unittest.TestCase):
                             gateway_callback_target="gw", role_profile="not-a-role")
         problems = validate_dispatch_route(bad, _VOCAB)
         self.assertIn("role_profile:not-a-role", problems)
+
+    def test_non_redmine_source_is_rejected(self):
+        # review R9-F1: the writer's vocabulary is narrower than the handoff's — redmine only.
+        asana = DispatchRoute(to="claude", target="t", target_repo="/r", lane="lane-a",
+                              gateway_callback_target="gw", source="asana")
+        self.assertIn("source:asana", validate_dispatch_route(asana, _VOCAB))
+        # the vocabulary itself carries only the redmine source.
+        self.assertEqual(_VOCAB.sources, frozenset({"redmine"}))
 
 
 class HandoffArgvTest(unittest.TestCase):
