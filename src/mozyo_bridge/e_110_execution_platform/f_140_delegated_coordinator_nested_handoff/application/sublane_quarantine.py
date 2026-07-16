@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
@@ -185,6 +185,10 @@ class QuarantineOutcome:
     closed_old_receiver: bool = False
     fresh_locator: str = ""
     detail: str = ""
+    #: The shared-store schema migration this quarantine's replacement write gate performed, if
+    #: any (Redmine #13844 R3-F2): the typed audit record so the migration is legible in JSON/text,
+    #: not only the pre-migration stderr advisory.
+    lifecycle_migration: Optional[dict[str, Any]] = None
 
     @property
     def is_blocked(self) -> bool:
@@ -205,6 +209,7 @@ class QuarantineOutcome:
             "fresh_locator": self.fresh_locator or None,
             "is_blocked": self.is_blocked,
             "detail": self.detail,
+            "lifecycle_migration": self.lifecycle_migration,
         }
 
 
@@ -824,6 +829,13 @@ def format_quarantine_text(outcome: QuarantineOutcome) -> str:
         lines.append("  candidate only; --execute requires exact positive approval fields")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
+    if outcome.lifecycle_migration:
+        mig = outcome.lifecycle_migration
+        lines.append(
+            "  - shared lifecycle store forward-migrated "
+            f"v{mig['from_version']} -> v{mig['to_version']} "
+            f"(peer lanes at read-fail-closed risk: {mig['peer_active_lanes'] or 'none'})"
+        )
     return "\n".join(lines)
 
 
@@ -846,6 +858,17 @@ def cmd_sublane_quarantine(args: argparse.Namespace) -> int:
         store=LaneReplacementStore(),
     )
     outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
+    # Redmine #13844 R3-F2: surface, in the structured outcome, any shared-store schema migration
+    # the replacement write gate performed (the pre-migration advisory already went to stderr).
+    from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+        lifecycle_migration_payload,
+    )
+
+    migration = lifecycle_migration_payload(
+        getattr(use_case.store, "last_write_preparation", None)
+    )
+    if migration is not None:
+        outcome = replace(outcome, lifecycle_migration=migration)
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:

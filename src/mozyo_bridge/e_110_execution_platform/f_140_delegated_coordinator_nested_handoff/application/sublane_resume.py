@@ -46,9 +46,6 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
 )
-from mozyo_bridge.core.state.lane_lifecycle_readonly import (
-    emit_lifecycle_migration_advisory,
-)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -381,17 +378,14 @@ class SublaneResumeUseCase:
         # Commit point: CAS hibernated -> active, clearing the settled release generation on
         # rehydrate. Guarded on the lane's exact state + revision and the durable anchor.
         assert rec is not None  # guaranteed by lane_hibernated
+        # Redmine #13844 R3: resume opens through the universal `_connect_write` gate, which emits
+        # the PRE-migration peer-reader advisory before the shared store is migrated.
         transition = self.store.transition_disposition(
             key,
             expected_disposition=DISPOSITION_HIBERNATED,
             expected_revision=rec.revision,
             target=DISPOSITION_ACTIVE,
             decision=decision,
-        )
-        # Redmine #13844 R2: resume is a schema-needing mutation — surface any forward migration
-        # of the shared store and its active peer-reader risk (same advisory adopt uses).
-        emit_lifecycle_migration_advisory(
-            getattr(self.store, "last_write_preparation", None), stream=sys.stderr
         )
         if not transition.applied:
             return ResumeOutcome(

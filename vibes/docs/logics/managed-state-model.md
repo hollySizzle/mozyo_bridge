@@ -499,15 +499,22 @@ The contract that prevents it, for a component whose rows are authority (e.g. `l
   value a forward `ALTER … DEFAULT` would have written), so it interprets the older store faithfully without touching a byte. The
   shared store stays at its current version and every concurrent older reader keeps working. (A read landing during a peer's
   migration commit waits it out via `busy_timeout` rather than fail-closing on a transient lock.)
-- **Every mutation migrates through ONE explicit write gate.** No CAS opens the store with a bare `ensure`. Every schema-needing
-  mutation — declaration / incarnation AND disposition / supersede / release / replacement / retire / reconcile — opens via the
-  single choke point `LaneLifecycleStore._connect_write(writer_key)`, which runs the **compatibility preflight FIRST** (the active
-  peer lanes a forward migration would fail-close, read on the PRE-migration store, the writer's own lane excluded), THEN the
-  backup-first migration, capturing a **typed `LifecycleWritePreparation`** (the preflight + the `created` / `intact` /
-  `migrated{from_version, backup_dir}` outcome) on `last_write_preparation`. So a migration is a chosen, visible act with legible
-  peer risk for *any* mutation, never an implicit side effect of opening the store — and a read that precedes the write never
-  migrates ahead of the preflight. The command surfaces (adopt / hibernate / resume / supersede / …) emit the shared
-  `format_lifecycle_migration_advisory` to the operator when a mutation forward-migrated the shared store with peers at risk.
+- **Every mutation migrates through ONE explicit write gate, preflight BEFORE the migration.** No CAS opens the store with a bare
+  `ensure`. Every schema-needing mutation — declaration / incarnation AND disposition / supersede / release / replacement / retire
+  / reconcile — opens via the single choke point `LaneLifecycleStore._connect_write(writer_key)`, in strict order: (1) read the
+  compatibility **preflight** on the STILL-OLD store (the active peer lanes a forward migration would fail-close, the writer's own
+  lane excluded); (2) **BEFORE migrating**, emit the operator advisory (`emit_lifecycle_migration_advisory`) when a migration is
+  pending with peers at risk — a genuine PRE-migration warning while the store is still the old version, *not* a post-hoc notice
+  (at the moment it fires the recorded version is still the old one and no backup has been taken); (3) run the backup-first
+  migration; (4) capture BOTH the pre-migration preflight and the post `created` / `intact` / `migrated{from_version, backup_dir}`
+  outcome — kept distinct — on `last_write_preparation`. So a migration is a chosen, visible act with legible peer risk for *any*
+  mutation, announced before it happens, never an implicit side effect — and a read that precedes the write never migrates ahead
+  of the preflight.
+- **The migration is auditable in each command's structured outcome, not only stderr.** The composing-store commands
+  (`sublane quarantine` / hibernated-legacy-retire / hibernated-live-reconcile) expose the wrapped store's `last_write_preparation`
+  and carry `lifecycle_migration_payload(...)` (from/to version, backup, peer-reader risk) in their JSON/text outcome, so a forward
+  migration is legible in the command's audit record for replacement / retire / reconcile alike — matching the universal
+  pre-migration stderr advisory above.
 - **Fail-closed is preserved and made specific.** An unknown / newer / partial / malformed shape still fails closed (no
   downgrade, no misread), judged only by the **shape / capability table** (`_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFS`), never a
   guessed compatibility. The specific NEWER sub-case is named `reader_upgrade_required`: the store is fine, THIS reader is stale,

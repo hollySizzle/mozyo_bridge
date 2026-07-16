@@ -134,6 +134,11 @@ class HibernatedLiveReconcileVerdict:
     #: Did this run (or a prior same-flow run this replays) durably retire the lane? A blocked
     #: verdict with ``retired=True`` still performed a durable write (R7).
     retired: bool = False
+    #: The shared-store schema migration this reconcile's write gate performed, if any (Redmine
+    #: #13844 R3-F2): ``None`` when nothing was forward-migrated; otherwise the typed audit record
+    #: (from/to version, backup, peer-reader risk) so the migration is legible in JSON/text, not
+    #: only the pre-migration stderr advisory.
+    lifecycle_migration: Optional[dict] = None
 
     @property
     def ok(self) -> bool:
@@ -148,6 +153,7 @@ class HibernatedLiveReconcileVerdict:
             "lane_id": self.lane_id,
             "closed": list(self.closed),
             "retired": self.retired,
+            "lifecycle_migration": self.lifecycle_migration,
         }
 
 
@@ -159,6 +165,7 @@ def _blocked(
     lane_id: str = "",
     retired: bool = False,
     closed: tuple[str, ...] = (),
+    lifecycle_migration: Optional[dict] = None,
 ) -> HibernatedLiveReconcileVerdict:
     return HibernatedLiveReconcileVerdict(
         state=RECONCILE_BLOCKED,
@@ -168,6 +175,7 @@ def _blocked(
         lane_id=lane_id,
         retired=retired,
         closed=closed,
+        lifecycle_migration=lifecycle_migration,
     )
 
 
@@ -653,7 +661,7 @@ def run_hibernated_live_reconcile(
             return (close.closed, False)
         return (close.closed, decide_pair_reconcile(_observe(rows3)).absent)
 
-    def _reconciled(closed):
+    def _reconciled(closed, lifecycle_migration=None):
         return HibernatedLiveReconcileVerdict(
             state=RECONCILE_RECONCILED,
             detail=(
@@ -664,6 +672,7 @@ def run_hibernated_live_reconcile(
             lane_id=lane_label,
             closed=tuple(f"{role} {loc}" for role, loc in closed),
             retired=True,
+            lifecycle_migration=lifecycle_migration,
         )
 
     # Terminal (retire-first) branch: this reconcile OR an ordinary lifecycle path may have retired
@@ -828,8 +837,16 @@ def run_hibernated_live_reconcile(
     # (Redmine #13842 review j#79363 R6), so a crash after the CAS but before the pane close is
     # resumable in this same reconcile authority — no separate losable ledger, and the provenance
     # is recovered with the row by the component's own re-declare.
+    # Redmine #13844 R3-F2: retain the store so the reconcile can surface, in its structured
+    # verdict (JSON/text), the schema migration its write gate performed — the pre-migration
+    # advisory already went to stderr inside ``_connect_write``; this makes it auditable too.
+    from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+        lifecycle_migration_payload,
+    )
+
+    reconcile_store = LaneReconcileBindingStore()
     try:
-        outcome = LaneReconcileBindingStore().retire_reconciled_hibernated_legacy(
+        outcome = reconcile_store.retire_reconciled_hibernated_legacy(
             key,
             expected_revision=record.revision,
             issue_id=issue,
@@ -849,7 +866,11 @@ def run_hibernated_live_reconcile(
             detail=f"the reconcile retire CAS raised ({type(exc).__name__}); fail closed",
             workspace_id=workspace_id,
             lane_id=lane_label,
+            lifecycle_migration=lifecycle_migration_payload(
+                reconcile_store.last_write_preparation
+            ),
         )
+    migration = lifecycle_migration_payload(reconcile_store.last_write_preparation)
     if not outcome.applied:
         reason_map = {
             CAS_NOT_FOUND: RECON_LANE_NOT_DECLARED,
@@ -866,6 +887,7 @@ def run_hibernated_live_reconcile(
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
+            lifecycle_migration=migration,
         )
     # Durably retired under the exact verified generation (terminal — no rehydrate possible), with
     # the ``reconcile_phase`` provenance written ON the row. Close the exact pinned pair,
@@ -887,8 +909,9 @@ def run_hibernated_live_reconcile(
             lane_id=lane_label,
             retired=True,
             closed=tuple(f"{role} {loc}" for role, loc in closed),
+            lifecycle_migration=migration,
         )
-    return _reconciled(closed)
+    return _reconciled(closed, lifecycle_migration=migration)
 
 
 def format_reconcile_text(result: HibernatedLiveReconcileVerdict) -> str:
@@ -910,6 +933,13 @@ def format_reconcile_text(result: HibernatedLiveReconcileVerdict) -> str:
         lines.append("    - durable write: lane retired (retire-first)")
     for closed in result.closed:
         lines.append(f"    - closed {closed}")
+    if result.lifecycle_migration:
+        mig = result.lifecycle_migration
+        lines.append(
+            "    - shared lifecycle store forward-migrated "
+            f"v{mig['from_version']} -> v{mig['to_version']} "
+            f"(peer lanes at read-fail-closed risk: {mig['peer_active_lanes'] or 'none'})"
+        )
     if not result.ok:
         if result.retired or result.closed:
             lines.append(

@@ -934,14 +934,19 @@ class UniversalWriteGateTest(unittest.TestCase):
             target="hibernated",
             decision=_issue_decision(),
         )
-        msg = format_lifecycle_migration_advisory(store.last_write_preparation)
+        # Redmine #13844 R3: the advisory is PRE-migration and takes the preflight (read on the
+        # still-old store), whose current_version is 5 -> peers_at_risk -> advisory.
+        msg = format_lifecycle_migration_advisory(store.last_write_preparation.preflight)
         self.assertIsNotNone(msg)
         self.assertIn("issue_13800_peer_lane", msg)
         self.assertIn("13844", msg)
-        # a current store with no migration -> no advisory
+        self.assertIn("ABOUT TO", msg)  # pre-migration wording, not post-hoc
+        # a current store with no pending migration -> no advisory
         fresh = LaneLifecycleStore(home=self.home)
         fresh.prepare_write(writer_workspace_id=WS, writer_lane_id=LANE)
-        self.assertIsNone(format_lifecycle_migration_advisory(fresh.last_write_preparation))
+        self.assertIsNone(
+            format_lifecycle_migration_advisory(fresh.last_write_preparation.preflight)
+        )
 
 
 class RealCommandMigrationAdvisoryTest(unittest.TestCase):
@@ -1054,9 +1059,212 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
         # emitted advisory is the authoritative signal.)
         advisory = err.getvalue()
         self.assertIn("advisory (Redmine #13844)", advisory)
+        self.assertIn("ABOUT TO forward-migrate", advisory)  # pre-migration wording
         self.assertIn("issue_13800_peer_lane", advisory)
-        self.assertIn("5 -> 6", advisory)
+        self.assertIn("v5 -> v6", advisory)
         self.assertEqual(_recorded_version(self.home), 6)
+
+
+# -- R3-F1: the advisory is emitted BEFORE the migration (time-series) -------------------
+
+
+class PreMigrationAdvisoryTimingTest(unittest.TestCase):
+    """Review R3 j#79534 F1: the operator advisory is a PRE-migration preflight — at the moment
+    it is emitted the store is still v5 / backup 0; only AFTER does it become v6 / backup 1."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_v5_with_peer(self) -> Path:
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(
+            LaneLifecycleKey(WS, LANE), decision=_issue_decision(), issue_id=ISSUE
+        )
+        store.declare_active(
+            LaneLifecycleKey(WS, "issue_13800_peer_lane"),
+            decision=DecisionPointer(source="redmine", issue_id="13800", journal_id="1"),
+            issue_id="13800",
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_advisory_fires_at_v5_backup0_then_migration_makes_v6_backup1(self) -> None:
+        self._seed_v5_with_peer()
+
+        # Snapshot the on-disk state AT THE MOMENT the advisory is emitted — it must still be the
+        # OLD version with no backup (a genuine PRE-migration preflight, not a post-hoc notice).
+        snap = {}
+        orig = ll.emit_lifecycle_migration_advisory
+
+        def _traced(preflight, **kw):
+            fired = orig(preflight, **kw)
+            if fired:
+                snap["version_at_emit"] = _recorded_version(self.home)
+                snap["backups_at_emit"] = (
+                    len(list((self.home / "backups").glob("state-*")))
+                    if (self.home / "backups").exists()
+                    else 0
+                )
+            return fired
+
+        store = LaneLifecycleStore(home=self.home)
+        rec = store.get(LaneLifecycleKey(WS, LANE))
+        with patch.object(ll, "emit_lifecycle_migration_advisory", _traced):
+            store.transition_disposition(
+                LaneLifecycleKey(WS, LANE),
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=rec.revision,
+                target="hibernated",
+                decision=_issue_decision(),
+            )
+
+        # The advisory fired while the store was STILL v5 with no backup taken yet ...
+        self.assertEqual(snap.get("version_at_emit"), 5)
+        self.assertEqual(snap.get("backups_at_emit"), 0)
+        # ... and only the subsequent migration made it v6 with the backup-first snapshot.
+        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(len(list((self.home / "backups").glob("state-*"))), 1)
+
+
+# -- R3-F2: composing-store mutations carry the typed migration to their command outcomes -
+
+
+class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
+    """Review R3 j#79534 F2: replacement / retire / reconcile mutations run through the same
+    gate AND their typed migration reaches the command surface (structured JSON/text)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_v5_with_peer(self) -> Path:
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(
+            LaneLifecycleKey(WS, LANE), decision=_issue_decision(), issue_id=ISSUE
+        )
+        store.declare_active(
+            LaneLifecycleKey(WS, "issue_13800_peer_lane"),
+            decision=DecisionPointer(source="redmine", issue_id="13800", journal_id="1"),
+            issue_id="13800",
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_retire_migration_store_cas_migrates_and_exposes_preparation(self) -> None:
+        from mozyo_bridge.core.state.lane_retire_migration import LaneRetireMigrationStore
+        from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+            lifecycle_migration_payload,
+        )
+
+        self._seed_v5_with_peer()
+        store = LaneRetireMigrationStore(home=self.home)
+        # The row is ACTIVE (not released/hibernated) so this CAS REFUSES — but the gate still
+        # migrates the shared store (in _connect_write, before the CAS transaction), and exposes
+        # the typed preparation the command threads into its verdict.
+        store.retire_released_hibernated_legacy(
+            LaneLifecycleKey(WS, LANE),
+            expected_revision=1,
+            issue_id=ISSUE,
+            decision=_issue_decision(),
+        )
+        prep = store.last_write_preparation
+        self.assertTrue(prep.migrated)
+        self.assertEqual(prep.preflight.current_version, 5)  # read pre-migration
+        self.assertIn("issue_13800_peer_lane", prep.preflight.peer_active_lanes)
+        payload = lifecycle_migration_payload(prep)
+        self.assertEqual(payload["from_version"], 5)
+        self.assertIn("issue_13800_peer_lane", payload["peer_active_lanes"])
+
+    def test_reconcile_store_cas_migrates_and_exposes_preparation(self) -> None:
+        from mozyo_bridge.core.state.lane_reconcile_binding import (
+            LaneReconcileBindingStore,
+        )
+
+        from mozyo_bridge.core.state.lane_lifecycle import ProcessGenerationPin
+
+        self._seed_v5_with_peer()
+        store = LaneReconcileBindingStore(home=self.home)
+        # Valid pins so arg-validation passes and the CAS opens (via _connect_write, which
+        # migrates) before it refuses on the row's state.
+        store.retire_reconciled_hibernated_legacy(
+            LaneLifecycleKey(WS, LANE),
+            expected_revision=1,
+            issue_id=ISSUE,
+            worktree_identity="wt_x",
+            declared_slots=(
+                ProcessGenerationPin(
+                    role="codex", provider="codex", assigned_name="n", locator="wProj:p2"
+                ),
+            ),
+            decision=_issue_decision(),
+        )
+        prep = store.last_write_preparation
+        self.assertTrue(prep.migrated)
+        self.assertEqual(prep.preflight.current_version, 5)
+
+    def test_replacement_store_cas_migrates_and_exposes_preparation(self) -> None:
+        from mozyo_bridge.core.state.lane_replacement import LaneReplacementStore
+        from mozyo_bridge.core.state.lane_lifecycle import ReleasePin
+
+        self._seed_v5_with_peer()
+        store = LaneReplacementStore(home=self.home)
+        store.request_replacement(
+            LaneLifecycleKey(WS, LANE),
+            expected_revision=1,
+            action_id="act",
+            pins=[ReleasePin(role="codex", assigned_name="n", locator="wProj:p2")],
+            decision=_issue_decision(),
+        )
+        prep = store.last_write_preparation
+        self.assertTrue(prep.migrated)
+        self.assertEqual(prep.preflight.current_version, 5)
+
+    def test_command_verdicts_serialize_lifecycle_migration(self) -> None:
+        # The three composing-store commands' outcomes carry lifecycle_migration in JSON (R3-F2
+        # condition 1: auditable in JSON/text, not only stderr).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile import (  # noqa: E501
+            HibernatedLiveReconcileVerdict,
+            RECONCILE_RECONCILED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
+            HibernatedLegacyRetireVerdict,
+            MIGRATE_RETIRED,
+        )
+
+        rec = {"from_version": 5, "to_version": 6, "backup_dir": "/b", "peer_active_lanes": ["p"], "peer_reader_risk": True}
+        v1 = HibernatedLiveReconcileVerdict(state=RECONCILE_RECONCILED, lifecycle_migration=rec)
+        self.assertEqual(v1.as_payload()["lifecycle_migration"], rec)
+        v2 = HibernatedLegacyRetireVerdict(state=MIGRATE_RETIRED, lifecycle_migration=rec)
+        self.assertEqual(v2.as_payload()["lifecycle_migration"], rec)
+        # QuarantineOutcome carries it too (its as_payload includes the key); verified end-to-end
+        # by the quarantine command suite. The reconcile / retire verdicts are checked here.
 
 
 if __name__ == "__main__":  # pragma: no cover

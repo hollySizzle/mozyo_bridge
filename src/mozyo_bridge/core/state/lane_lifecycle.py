@@ -70,6 +70,7 @@ have a single import surface.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -151,6 +152,7 @@ from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LaneLifecycleReaderUpgradeRequired,
     LifecycleMigrationPreflight,
     LifecycleWritePreparation,
+    emit_lifecycle_migration_advisory,
     lifecycle_migration_preflight,
     load_lane_lifecycle_readonly,
 )
@@ -195,23 +197,36 @@ class LaneLifecycleStore:
         self,
         writer_workspace_id: Optional[str],
         writer_lane_id: Optional[str],
+        *,
+        emit_advisory: bool,
     ) -> LifecycleWritePreparation:
-        """The explicit schema-changing WRITE gate shared by EVERY mutation (Redmine #13844 R2).
+        """The explicit schema-changing WRITE gate shared by EVERY mutation (Redmine #13844 R2/R3).
 
-        The single production choke point for a schema-needing mutation: it reads the
-        compatibility **preflight FIRST** (the active peer lanes a forward migration would
-        fail-close, on the PRE-migration store — version-compatible, read-only, never itself a
-        migration trigger), THEN runs the backup-first migration and captures its **typed
-        outcome** (created / intact / migrated{from_version, backup_dir}), recording BOTH on
-        ``last_write_preparation``. So a migration is a visible, typed act with legible peer
-        risk — never an implicit side effect of opening the store — for disposition / supersede
-        / release / declaration / replacement / retire / reconcile alike, not only declaration.
+        The single production choke point for a schema-needing mutation, in strict order:
+
+        1. read the compatibility **preflight** on the STILL-OLD store (version-compatible,
+           read-only, never a migration trigger) — the active peer lanes a forward migration
+           would fail-close;
+        2. **BEFORE migrating**, when ``emit_advisory`` and a migration is pending with peers at
+           risk, emit the operator advisory to stderr — a genuine PRE-migration warning while the
+           shared store is still the old version (Redmine #13844 R3-F1), not a post-hoc notice;
+        3. run the backup-first migration and capture its **typed outcome** (created / intact /
+           migrated{from_version, backup_dir});
+        4. record BOTH — the pre-migration ``preflight`` and the post ``outcome``, kept distinct
+           (R3-F1) — on ``last_write_preparation``.
+
+        This covers disposition / supersede / release / declaration / replacement / retire /
+        reconcile alike, not only declaration.
         """
         preflight = lifecycle_migration_preflight(
             path=self.path,
             writer_workspace_id=writer_workspace_id,
             writer_lane_id=writer_lane_id,
         )
+        if emit_advisory:
+            # PRE-migration: the store is still the old version at this point (ensure_schema
+            # below has not run), so the operator sees the peer risk BEFORE it is realized.
+            emit_lifecycle_migration_advisory(preflight, stream=sys.stderr)
         outcome = self.ensure_schema()
         prep = LifecycleWritePreparation(outcome=outcome, preflight=preflight)
         self._last_write_preparation = prep
@@ -222,15 +237,18 @@ class LaneLifecycleStore:
         *,
         writer_workspace_id: Optional[str] = None,
         writer_lane_id: Optional[str] = None,
+        emit_advisory: bool = False,
     ) -> LifecycleWritePreparation:
         """Run the explicit write gate and return its typed result (Redmine #13844 design 3/6).
 
-        The public entry for a caller that wants to gate + inspect a migration WITHOUT opening a
-        write connection (e.g. a preflight-only command). The CAS methods take the same gate via
-        :meth:`_connect_write`. The preflight is read on ``self.path`` (the exact store this
-        write targets), so a path-scoped store reports its own peers, not the default home's.
+        The public entry for a caller that wants to gate + inspect a migration; the CAS methods
+        take the same gate via :meth:`_connect_write`. ``emit_advisory`` (default off for the
+        programmatic entry) prints the PRE-migration advisory to stderr before migrating. The
+        preflight is read on ``self.path`` (the exact store this write targets).
         """
-        return self._run_write_gate(writer_workspace_id, writer_lane_id)
+        return self._run_write_gate(
+            writer_workspace_id, writer_lane_id, emit_advisory=emit_advisory
+        )
 
     def _open_autocommit_conn(self) -> sqlite3.Connection:
         """A plain autocommit connection (no schema ensure) — the gate ran separately."""
@@ -241,14 +259,16 @@ class LaneLifecycleStore:
     def _connect_write(
         self, writer_key: Optional[LaneLifecycleKey] = None
     ) -> sqlite3.Connection:
-        """The universal mutating write open (Redmine #13844 R2): run the explicit write gate
-        (preflight FIRST, typed outcome captured on ``last_write_preparation``) BEFORE opening
-        the autocommit connection. EVERY schema-needing CAS goes through here, so no mutation
-        migrates the shared store implicitly — the migration + peer risk are always surfaced.
+        """The universal mutating write open (Redmine #13844 R2/R3): run the explicit write gate
+        — read the preflight, emit the PRE-migration advisory, THEN migrate and capture the typed
+        outcome on ``last_write_preparation`` — BEFORE opening the autocommit connection. EVERY
+        schema-needing CAS goes through here, so no mutation migrates the shared store implicitly
+        and the peer-reader risk is surfaced to the operator BEFORE the migration (not after).
         ``writer_key`` (the lane being written) is excluded from the peer set."""
         self._run_write_gate(
             writer_key.repo_workspace_id if writer_key is not None else None,
             writer_key.lane_id if writer_key is not None else None,
+            emit_advisory=True,
         )
         return self._open_autocommit_conn()
 

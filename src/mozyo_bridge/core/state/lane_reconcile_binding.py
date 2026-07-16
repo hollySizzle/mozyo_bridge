@@ -89,6 +89,15 @@ class LaneReconcileBindingStore:
     def path(self) -> Path:
         return self._lifecycle.path
 
+    @property
+    def last_write_preparation(self):
+        """The last mutation's explicit-write-gate result (Redmine #13844 R3-F2).
+
+        Delegates to the wrapped lifecycle store so a reconcile command can surface the
+        pre-migration preflight + post migration outcome (peer-reader risk) in its typed outcome.
+        """
+        return self._lifecycle.last_write_preparation
+
     def retire_reconciled_hibernated_legacy(
         self,
         key: LaneLifecycleKey,

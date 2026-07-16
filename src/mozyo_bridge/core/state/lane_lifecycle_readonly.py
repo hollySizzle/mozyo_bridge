@@ -47,6 +47,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
 )
 from mozyo_bridge.core.state.lane_lifecycle_rows import _record
 from mozyo_bridge.core.state.lane_lifecycle_schema import (
+    LANE_LIFECYCLE_SCHEMA_VERSION,
     READER_UPGRADE_REQUIRED,
     READONLY_COMPONENT_ABSENT,
     READONLY_COMPONENT_RECOGNIZED,
@@ -312,6 +313,30 @@ class LifecycleMigrationPreflight:
     def has_peers(self) -> bool:
         return bool(self.peer_active_lanes)
 
+    @property
+    def migration_pending(self) -> bool:
+        """A forward migration WILL happen on the next write (the store is an OLDER version).
+
+        Read on the PRE-migration store, so a caller can decide BEFORE it mutates (Redmine
+        #13844 R3-F1). An absent store (``current_version is None``) is a fresh CREATE, not a
+        forward migration of existing authority peers depend on, so it is NOT pending here.
+        """
+        return (
+            self.current_version is not None
+            and self.current_version < LANE_LIFECYCLE_SCHEMA_VERSION
+        )
+
+    @property
+    def peers_at_risk(self) -> bool:
+        """A forward migration is pending AND concurrent peers may be older-schema readers of it.
+
+        The condition under which an operator must be warned BEFORE the migration commits: the
+        store is older (a write will migrate it) and there are other active lanes (or the peer
+        set could not be read). When ``True`` the shared store is still the OLD version at the
+        moment this is evaluated — the advisory is a genuine preflight, not a post-hoc notice.
+        """
+        return self.migration_pending and (self.has_peers or self.unreadable)
+
 
 def lifecycle_migration_preflight(
     *,
@@ -407,35 +432,66 @@ class LifecycleWritePreparation:
 
 
 def format_lifecycle_migration_advisory(
-    preparation: Optional[LifecycleWritePreparation],
+    preflight: Optional[LifecycleMigrationPreflight],
+    *,
+    to_version: int = LANE_LIFECYCLE_SCHEMA_VERSION,
 ) -> Optional[str]:
-    """The operator advisory when a mutation forward-migrated the shared store with peers at risk.
+    """The PRE-migration operator advisory when a pending migration would fail-close peers.
 
-    The single shared wording (Redmine #13844 R2) every schema-changing command surface uses so
-    a forward migration is operator-visible — declaration/adopt AND disposition / supersede /
-    release / retire / reconcile alike — not only the adopt path. Returns ``None`` when there was
-    no migration or no peer at risk (nothing to warn about).
+    A genuine preflight, not a post-hoc notice (Redmine #13844 R3-F1): given the compatibility
+    :class:`LifecycleMigrationPreflight` read on the STILL-OLD store, it warns — BEFORE the write
+    migrates — that the store is *about to* be forward-migrated and which concurrent peer lanes
+    would then read-fail-closed. The single shared wording every schema-changing command surface
+    uses (declaration / adopt AND disposition / supersede / release / retire / reconcile alike).
+    Returns ``None`` when no migration is pending or no peer is at risk (nothing to warn about).
     """
-    if preparation is None or not preparation.peer_reader_risk:
+    if preflight is None or not preflight.peers_at_risk:
         return None
-    peers = ", ".join(preparation.preflight.peer_active_lanes) or "(unreadable peer set)"
+    peers = ", ".join(preflight.peer_active_lanes) or "(unreadable peer set)"
     return (
-        "advisory (Redmine #13844): this operation forward-migrated the shared lifecycle "
-        f"store {preparation.outcome.from_version} -> {preparation.outcome.to_version} "
-        f"(backup {preparation.outcome.backup_dir}); active peer lanes that may run an older-"
-        f"schema source CLI and now read-fail-closed: {peers}. Re-run those lanes' reads from "
-        "the current facade; do not downgrade the store."
+        "advisory (Redmine #13844): this command is ABOUT TO forward-migrate the shared "
+        f"lifecycle store v{preflight.current_version} -> v{to_version}; the store is NOT "
+        "migrated yet. Active peer lanes that may run an older-schema source CLI will "
+        f"read-fail-closed AFTER this migration: {peers}. Upgrade those lanes' source CLIs, or "
+        "accept that they must re-run their reads from the current facade; do not downgrade "
+        "the store."
     )
 
 
-def emit_lifecycle_migration_advisory(
+def lifecycle_migration_payload(
     preparation: Optional[LifecycleWritePreparation],
+) -> Optional[dict]:
+    """A JSON/text-serializable audit record of a mutation's schema migration (Redmine #13844 R3-F2).
+
+    So a command surface can carry the migration in its STRUCTURED outcome (not only a stderr
+    side-channel): the pre-migration preflight (peer lanes, the version the migration started
+    from) and the post outcome (backup dir), kept distinct. Returns ``None`` when the mutation did
+    not forward-migrate (``created`` / ``intact``) — there is nothing to audit.
+    """
+    if preparation is None or not preparation.migrated:
+        return None
+    return {
+        "action": preparation.outcome.action,
+        "from_version": preparation.outcome.from_version,
+        "to_version": preparation.outcome.to_version,
+        "backup_dir": preparation.outcome.backup_dir,
+        "peer_active_lanes": list(preparation.preflight.peer_active_lanes),
+        "peer_reader_risk": preparation.peer_reader_risk,
+    }
+
+
+def emit_lifecycle_migration_advisory(
+    preflight: Optional[LifecycleMigrationPreflight],
     *,
+    to_version: int = LANE_LIFECYCLE_SCHEMA_VERSION,
     stream=None,
 ) -> bool:
-    """Print the peer-reader-risk advisory (if any) to ``stream`` (default stderr). Returns whether
-    an advisory was emitted, so a caller can also thread it into a structured outcome if wanted."""
-    message = format_lifecycle_migration_advisory(preparation)
+    """Print the PRE-migration peer-risk advisory (if any) to ``stream`` (default stderr).
+
+    Call this BEFORE the schema-changing write, with the preflight read on the pre-migration
+    store, so the operator sees the peer risk while the store is still the old version (Redmine
+    #13844 R3-F1). Returns whether an advisory was emitted."""
+    message = format_lifecycle_migration_advisory(preflight, to_version=to_version)
     if message is None:
         return False
     import sys
@@ -451,6 +507,7 @@ __all__ = (
     "LifecycleWritePreparation",
     "emit_lifecycle_migration_advisory",
     "format_lifecycle_migration_advisory",
+    "lifecycle_migration_payload",
     "lifecycle_migration_preflight",
     "load_lane_lifecycle_readonly",
 )

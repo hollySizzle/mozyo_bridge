@@ -47,7 +47,6 @@ generally relaxed.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -57,9 +56,6 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
-from mozyo_bridge.core.state.lane_lifecycle_readonly import (
-    emit_lifecycle_migration_advisory,
-)
 from mozyo_bridge.core.state.lane_lifecycle import (
     BINDING_KIND_ISSUE,
     DecisionPointer,
@@ -391,11 +387,9 @@ def declare_adopted_owner_row(
         return ADOPT_DECL_OWNER_CONFLICT
 
     outcome = _attempt()
-    # Redmine #13844 R2: if the declaration's explicit write gate forward-migrated the shared home
-    # store while other active lanes are present, the migration is NOT silent — surface the typed
-    # peer-reader risk via the shared advisory (the same wording every mutation surface uses). A
-    # stderr advisory only; the declaration's status token is unchanged.
-    emit_lifecycle_migration_advisory(adopt_store.last_write_preparation, stream=sys.stderr)
+    # Redmine #13844 R3: the declaration write opens through the universal `_connect_write` gate,
+    # which emits the PRE-migration peer-reader advisory before the shared store is migrated (no
+    # per-command emit needed here; the migration is surfaced BEFORE it happens for every surface).
     if outcome in (ADOPT_DECL_DECLARED, ADOPT_DECL_BACKFILLED):
         # Owner-bound: a fresh declaration, an idempotent duplicate, or a legacy row whose
         # missing worktree binding was just filled — all leave the lane the active owner.

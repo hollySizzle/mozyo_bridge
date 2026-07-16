@@ -100,6 +100,10 @@ class HibernatedLegacyRetireVerdict:
     workspace_id: str = ""
     lane_id: str = ""
     expected_live: tuple[str, ...] = ()
+    #: The shared-store schema migration this retire's write gate performed, if any (Redmine
+    #: #13844 R3-F2): the typed audit record (from/to version, backup, peer-reader risk) so the
+    #: migration is legible in JSON/text, not only the pre-migration stderr advisory.
+    lifecycle_migration: Optional[dict] = None
 
     @property
     def ok(self) -> bool:
@@ -113,6 +117,7 @@ class HibernatedLegacyRetireVerdict:
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
             "expected_live": list(self.expected_live),
+            "lifecycle_migration": self.lifecycle_migration,
         }
 
 
@@ -123,6 +128,7 @@ def _blocked(
     workspace_id: str = "",
     lane_id: str = "",
     expected_live: tuple[str, ...] = (),
+    lifecycle_migration: Optional[dict] = None,
 ) -> HibernatedLegacyRetireVerdict:
     return HibernatedLegacyRetireVerdict(
         state=MIGRATE_BLOCKED,
@@ -131,6 +137,7 @@ def _blocked(
         workspace_id=workspace_id,
         lane_id=lane_id,
         expected_live=expected_live,
+        lifecycle_migration=lifecycle_migration,
     )
 
 
@@ -418,8 +425,15 @@ def run_hibernated_legacy_retire_migration(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
+    # Redmine #13844 R3-F2: retain the store so the migration record its write gate produced is
+    # surfaced in the structured verdict (JSON/text), not only the pre-migration stderr advisory.
+    from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+        lifecycle_migration_payload,
+    )
+
+    retire_store = LaneRetireMigrationStore()
     try:
-        outcome = LaneRetireMigrationStore().retire_released_hibernated_legacy(
+        outcome = retire_store.retire_released_hibernated_legacy(
             key,
             expected_revision=record.revision,
             issue_id=issue,
@@ -431,7 +445,11 @@ def run_hibernated_legacy_retire_migration(
             detail=f"the retire migration CAS raised ({type(exc).__name__}); fail closed",
             workspace_id=workspace_id,
             lane_id=lane_label,
+            lifecycle_migration=lifecycle_migration_payload(
+                retire_store.last_write_preparation
+            ),
         )
+    migration = lifecycle_migration_payload(retire_store.last_write_preparation)
     if outcome.applied:
         return HibernatedLegacyRetireVerdict(
             state=MIGRATE_RETIRED,
@@ -441,6 +459,7 @@ def run_hibernated_legacy_retire_migration(
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
+            lifecycle_migration=migration,
         )
     # Map the CAS refusal to a diagnostic reason (each is a distinct fail-closed shape).
     reason_map = {
@@ -457,6 +476,7 @@ def run_hibernated_legacy_retire_migration(
         ),
         workspace_id=workspace_id,
         lane_id=lane_label,
+        lifecycle_migration=migration,
     )
 
 
@@ -476,6 +496,13 @@ def format_migration_text(result: HibernatedLegacyRetireVerdict) -> str:
     if result.expected_live:
         lines.append(
             "    live expected managed slots: " + ", ".join(result.expected_live)
+        )
+    if result.lifecycle_migration:
+        mig = result.lifecycle_migration
+        lines.append(
+            "    - shared lifecycle store forward-migrated "
+            f"v{mig['from_version']} -> v{mig['to_version']} "
+            f"(peer lanes at read-fail-closed risk: {mig['peer_active_lanes'] or 'none'})"
         )
     return "\n".join(lines)
 
