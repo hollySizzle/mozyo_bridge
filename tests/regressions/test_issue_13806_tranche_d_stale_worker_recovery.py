@@ -379,6 +379,22 @@ class ApprovalFenceTests(_RecoveryCase):
         self.assertEqual(outcome.status, RECOVERY_REFUSED)
         self.assertEqual(self.port.closed, [])
 
+    def test_missing_lane_revision_is_zero_close(self):
+        # R1-F2: a destructive worker recovery must carry the exact lane lifecycle evidence.
+        ops = FakeRecoveryOps(_all_clear())
+        outcome = self._use_case(ops).run(self._request(lane_revision=""), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("lifecycle", outcome.detail)
+        self.assertEqual(self.port.closed, [])
+        # nothing planned
+        self.assertIsNone(self.store.get(ReplacementTransactionKey(self.workspace_id, ACTION_ID)))
+
+    def test_missing_lane_generation_is_zero_close(self):
+        ops = FakeRecoveryOps(_all_clear())
+        outcome = self._use_case(ops).run(self._request(lane_generation=""), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertEqual(self.port.closed, [])
+
     def test_authority_conflict_when_foreign_generation_already_planned(self):
         # A DIFFERENT approved generation already owns this worker's transaction key.
         key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)

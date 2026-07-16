@@ -306,6 +306,21 @@ class StaleWorkerRecoveryUseCase:
                 observation=observation,
                 detail="approved generation is not a positive exact integer",
             )
+        # A DESTRUCTIVE worker recovery requires the exact lane lifecycle (revision,
+        # generation) evidence the approval pinned (Redmine #13806 R1-F2 / j#79485 §2): the
+        # ParticipantPin treats these as optional for the default companion / coordinator, but a
+        # standard-sublane worker recovery must carry them so the durable manifest holds — and
+        # each destructive effect / replay re-verifies against — the exact lifecycle generation.
+        # A missing one is a typed zero-close blocker, never actuated on a bare boolean.
+        if not norm(request.lane_revision) or not norm(request.lane_generation):
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation,
+                detail=(
+                    "lane lifecycle revision / generation evidence is required for a "
+                    "destructive worker recovery; zero close"
+                ),
+            )
         try:
             continuation = ContinuationPointer(
                 source="redmine", issue_id=norm(request.issue),
@@ -574,12 +589,9 @@ class StaleWorkerRecoveryUseCase:
 
 # -- CLI ------------------------------------------------------------------------
 
-#: This tranche ships the pure semantic surface + use case (fully tested with fakes). The live
-#: read-only observation / destructive actuation adapter is a follow-up (the tranche A/B/C
-#: precedent — live process mutation is non-scope). Until it lands, the CLI reports a
-#: fail-closed staged-seam outcome rather than pretending to observe or actuate.
-LIVE_RECOVERY_SEAM_INSTALLED = False
-SEAM_UNAVAILABLE_VERDICT = "live_seam_unavailable"
+#: The verdict a fail-closed construction error surfaces (a missing repo / workspace identity),
+#: so a broken invocation never silently reads as a clean preflight.
+SEAM_UNAVAILABLE_VERDICT = "recovery_seam_error"
 
 
 def format_recover_text(outcome: RecoveryOutcome) -> str:
@@ -599,6 +611,56 @@ def format_recover_text(outcome: RecoveryOutcome) -> str:
     return "\n".join(lines)
 
 
+def _run_live_recovery(
+    args: argparse.Namespace, request: RecoveryRequest, *, execute: bool
+) -> RecoveryOutcome:
+    """Construct the LIVE use case (real inventory + actuation + redispatch) and run it.
+
+    The live adapters are imported lazily to avoid an import cycle (they import this module for
+    the request / ops types). A construction error — a repo / workspace identity that cannot be
+    resolved — is a fail-closed typed outcome, never a fabricated preflight.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        repo_scope_workspace_id,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
+        LiveRecoveryActuatorPort,
+        LiveStaleWorkerRecoveryOps,
+    )
+
+    repo = getattr(args, "repo", None)
+    repo_root = Path(repo).expanduser() if repo else Path.cwd()
+    try:
+        workspace_id = repo_scope_workspace_id(repo_root)
+    except Exception:  # noqa: BLE001 - an unresolvable workspace identity fails closed
+        workspace_id = ""
+    if not norm(workspace_id):
+        return RecoveryOutcome(
+            issue=norm(request.issue), lane=norm(request.lane), role=norm(request.role),
+            verdict=SEAM_UNAVAILABLE_VERDICT, status=RECOVERY_REFUSED, executed=execute,
+            detail="could not resolve the repo workspace identity; zero process effect",
+        )
+    # The transaction key the use case will derive (best-effort; the use case re-derives and
+    # refuses on incomplete inputs before the port is ever exercised).
+    try:
+        action_id = stale_worker_recovery_action_id(
+            lane_id=request.lane, role=request.role, provider=request.provider,
+            assigned_name=request.assigned_name, locator=request.locator,
+        )
+        key = ReplacementTransactionKey(workspace_id, action_id)
+    except Exception:  # noqa: BLE001 - incomplete identity => the use case refuses downstream
+        key = ReplacementTransactionKey(workspace_id, "recover:pending")
+    store = ReplacementTransactionStore()
+    actuation_port = LiveRecoveryActuatorPort(
+        repo_root=repo_root, request=request, store=store, key=key,
+    )
+    ops = LiveStaleWorkerRecoveryOps(repo_root=repo_root, request=request)
+    use_case = StaleWorkerRecoveryUseCase(
+        store, actuation_port, ops, workspace_id=workspace_id,
+    )
+    return use_case.run(request, execute=execute)
+
+
 def cmd_sublane_recover_stale(args: argparse.Namespace) -> int:
     request = RecoveryRequest(
         issue=getattr(args, "issue", "") or "",
@@ -616,22 +678,7 @@ def cmd_sublane_recover_stale(args: argparse.Namespace) -> int:
         next_semantic_action=getattr(args, "next_semantic_action", "") or "",
     )
     execute = bool(getattr(args, "execute", False))
-    if not LIVE_RECOVERY_SEAM_INSTALLED:
-        # Fail closed: this tranche ships only the pure surface. Never fabricate an observation
-        # or actuate. The full flow is exercised by the use-case tests with injected fakes.
-        outcome = RecoveryOutcome(
-            issue=norm(request.issue), lane=norm(request.lane), role=norm(request.role),
-            verdict=SEAM_UNAVAILABLE_VERDICT, status=RECOVERY_REFUSED, executed=execute,
-            detail=(
-                "live stale-worker recovery seam is not installed in this build; the pure "
-                "semantic surface shipped (Redmine #13806 tranche D). Live observation / "
-                "actuation is a follow-up. Zero process effect."
-            ),
-        )
-    else:  # pragma: no cover - reached only once a live adapter is wired in a follow-up
-        raise NotImplementedError(
-            "a live StaleWorkerRecoveryOps / ExactGenerationActuatorPort must be wired here"
-        )
+    outcome = _run_live_recovery(args, request, execute=execute)
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
