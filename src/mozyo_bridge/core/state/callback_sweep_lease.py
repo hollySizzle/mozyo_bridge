@@ -58,24 +58,14 @@ LEASE_RECLAIMED = "reclaimed"
 #: happens under the outbox fence *after* the leased work.
 DEFAULT_LEASE_TTL_SECONDS = 120.0
 
-#: The margin a durable act must have LEFT on its lease before it may start (review R8-F1).
+#: The attempt lease serializes the sweep's slow READS. It is intentionally reclaimable: a crashed
+#: holder must not block the anchor forever.
 #:
-#: A boolean ``owns()`` and an HTTP write are not one transaction: the lease can lapse and be
-#: reclaimed in between, and then the old and new owner both publish. No amount of moving the check
-#: closer to the write removes that -- with no CAS at the resource, the only sound rule is the
-#: classic lease discipline: **do not start an action unless the lease outlives the action's
-#: worst case**. The holder must have at least this much time remaining, and the action must be
-#: bounded below it (the note transport's HTTP timeout).
-#:
-#: With that, there is no instant at which A is writing and B may reclaim: B cannot reclaim before
-#: expiry, and A never begins a write that could still be running at expiry.
-#:
-#: Assumptions, stated because they are load-bearing: the store is a single SQLite file, so all
-#: parties read one clock (no skew); the write is bounded by its transport timeout; and a process
-#: frozen mid-write for longer than the margin is out of scope -- that is the fencing-token problem,
-#: which needs the RESOURCE to reject stale writers (Redmine cannot), and is why receiver-side
-#: exactly-once is Redmine #13910 rather than something this lease can promise.
-LEASE_ACTION_MARGIN_SECONDS = 30.0
+#: It is NOT the publication authority. An earlier revision tried to make it one -- first by moving
+#: an ownership check closer to the write, then by requiring a safety margin -- and each was broken
+#: (R7 / R8 / R9): a check and a remote write are never one transaction, and reclaim is exactly what
+#: lets a second owner publish. Publication is a non-retryable outbox action and belongs to
+#: :class:`...callback_publication_fence.CallbackPublicationFence`, which never reclaims.
 
 _META_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -388,11 +378,10 @@ class CallbackSweepLease:
         (which the outbox fence gates); it never covered the publication, which only the lease
         gates.
 
-        ``min_remaining`` is the safety margin (review R8-F1): the caller is about to perform a
-        durable act, so it must not merely own the lease *now* -- it must own it for at least as
-        long as the act can take. Checking liveness alone lets the lease lapse mid-write and a new
-        owner publish the same record. Callers about to write pass
-        :data:`LEASE_ACTION_MARGIN_SECONDS`; callers only reporting state pass ``0``.
+        ``min_remaining`` lets a caller ask for headroom before a bounded local step. It is NOT a
+        publication guard: no margin can make a check and a remote write atomic (review R9-F1), and
+        treating one as safety is what allowed a suspended owner to publish a duplicate. The
+        publication fence is the authority for writes.
 
         Fail-closed by construction: an unreadable / lost / replaced store raises out of
         :meth:`_connect`, an expired (or too-nearly-expired) lease reads as not-owned, and a
@@ -435,7 +424,6 @@ __all__ = (
     "LEASE_HELD",
     "LEASE_RECLAIMED",
     "DEFAULT_LEASE_TTL_SECONDS",
-    "LEASE_ACTION_MARGIN_SECONDS",
     "CallbackSweepLeaseError",
     "LeaseKey",
     "LeaseResult",
