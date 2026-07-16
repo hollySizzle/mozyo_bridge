@@ -3,12 +3,15 @@
 The event-driven PRIMARY activation the reconciler needs: instead of only the bounded
 StartInterval sweep (which cannot observe the ``busy -> turn_ended`` transient), the
 ``WorkspaceCallbackSupervisor`` — the SOLE reconcile owner — is driven by Herdr turn events.
-Each bounded iteration runs one supervisor pass (which observes the live runtime + reconciles
-+ re-reads Redmine), enumerates the active-lane expected-owner targets, and arms a bounded
-MULTIPLEX Herdr ``wait agent-status --status done`` (the raw status mozyo maps to
-``turn_ended``; NOT the ``working`` default used for turn-START). On any event / timeout /
-error it proceeds — a single target never blocks the others and loses their edges (Design
-Answer j#79507 Q1).
+After a startup bootstrap reconcile, each bounded iteration is **wait -> pass**: it enumerates
+the active-lane expected-owner targets, arms a bounded CONCURRENT/MULTIPLEX Herdr ``wait
+agent-status --status done`` (the raw status mozyo maps to ``turn_ended``; NOT the ``working``
+default used for turn-START), then runs one supervisor pass that CONSUMES that outcome (observes
+the live runtime + reconciles + re-reads Redmine). So an observed edge is reconciled within the
+same bounded invocation — even the CLI default ``--max-iterations 1`` (review R6-F3). On any
+event / timeout / error it proceeds — every target's wait is armed together so a single target
+never blocks the others and loses their edges (Design Answer j#79507 Q1; review R6-F2). The wait
+spawns the sanctioned trusted-environment ``herdr`` binary, never ``mozyo-bridge`` (review R6-F1).
 
 Design invariants (j#79507 Q1):
 
@@ -25,6 +28,7 @@ Design invariants (j#79507 Q1):
 
 from __future__ import annotations
 
+import concurrent.futures as _futures
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -62,21 +66,62 @@ def multiplex_wait(
     wait_builder: Callable[[EventPumpTarget], Callable[[], object]],
     resolve_wake_fn: Callable[..., WakeSignal] = resolve_wake,
 ) -> "tuple[WakeSignal, Optional[EventPumpTarget]]":
-    """Arm a bounded wait per target and return the FIRST that wakes (or a timeout). (multiplex)
+    """Arm every target's bounded wait CONCURRENTLY and return the FIRST that wakes. (multiplex)
 
-    Round-robins one bounded :mod:`...callback_wake` wait per target and returns the first target
-    that OBSERVES a ``busy -> turn_ended`` change (``WAKE_WOKE``), so a single target's bounded
-    wait never blocks the others (Design Answer j#79507 Q1 point 2). If none woke, returns the
-    LAST non-woke signal (timeout / error) and no target — the pump then still runs the bounded
-    whole-roster reconciliation. Empty targets -> a benign timeout signal.
+    Review R6-F2: a serial loop would block every other target's ``busy -> turn_ended`` edge
+    behind the first target's whole bounded wait (N idle targets => N x timeout, and a real edge
+    on target 2 is lost while target 1 blocks). So all target waits are armed together on a bounded
+    thread pool and the FIRST target that observes the change (``WAKE_WOKE``) wins — a single
+    target never blocks the others (Design Answer j#79507 Q1 point 2). The remaining in-flight
+    waits are cancelled / detached (each is already bounded by its own ``wait agent-status
+    --timeout`` + the outer subprocess timeout, so a detached thread cannot pin the runtime). If
+    none woke, the LAST observed non-woke signal (timeout / error) and no target are returned — the
+    pump then still runs the bounded whole-roster reconciliation. Empty targets -> a benign timeout.
     """
-    last = WakeSignal(kind=WAKE_TIMED_OUT, detail="no_targets")
-    for t in targets or ():
-        signal = resolve_wake_fn(wait_builder(t), detail=f"{t.workspace_id}:{t.issue}")
-        if signal.kind == WAKE_WOKE:
-            return signal, t  # first observed turn-end edge wins
-        last = signal
+    tlist = [t for t in (targets or ())]
+    if not tlist:
+        return WakeSignal(kind=WAKE_TIMED_OUT, detail="no_targets"), None
+
+    def _resolve(t: EventPumpTarget) -> WakeSignal:
+        return resolve_wake_fn(wait_builder(t), detail=f"{t.workspace_id}:{t.issue}")
+
+    executor = _futures.ThreadPoolExecutor(max_workers=len(tlist))
+    future_target = {executor.submit(_resolve, t): t for t in tlist}
+    last = WakeSignal(kind=WAKE_TIMED_OUT, detail="all_pending")
+    won = None  # (WakeSignal, EventPumpTarget) of the first observed turn-end edge, if any
+    try:
+        for fut in _futures.as_completed(future_target):
+            t = future_target[fut]
+            try:
+                signal = fut.result()
+            except Exception as exc:  # noqa: BLE001 - a resolver crash is a fail-safe wake error
+                signal = WakeSignal(kind=WAKE_ERROR, detail=f"{type(exc).__name__}")
+            if signal.kind == WAKE_WOKE:
+                won = (signal, t)  # first observed turn-end edge wins
+                break
+            last = signal
+    finally:
+        for fut in future_target:
+            fut.cancel()
+        # Do NOT block on the still-running bounded waits (that would re-serialize the multiplex);
+        # each is self-bounded, so detach the pool and let them reap in the background.
+        executor.shutdown(wait=False)
+    if won is not None:
+        return won
     return last, None
+
+
+def _run_supervisor_pass(
+    supervisor_pass: Callable[[str, Sequence[tuple]], object],
+    mode: str,
+    hints: Sequence[tuple],
+) -> dict:
+    """Run one supervisor pass fail-safe; a raised pass is recorded, never kills the pump."""
+    try:
+        supervisor_pass(mode, hints)
+        return {"mode": mode, "pass_ok": True}
+    except Exception as exc:  # noqa: BLE001 - a failed pass must not kill the pump
+        return {"mode": mode, "pass_ok": False, "error": type(exc).__name__}
 
 
 def run_event_pump(
@@ -86,41 +131,43 @@ def run_event_pump(
     wait_multiplex_fn: Callable[[Sequence[EventPumpTarget]], "tuple[WakeSignal, Optional[EventPumpTarget]]"],
     max_iterations: int,
 ) -> list:
-    """Run the bounded supervisor event pump; return one record per iteration.
+    """Run the bounded supervisor event pump; return one record per supervisor pass.
 
-    Each iteration: (1) run one supervisor pass (bounded reconciliation — observes the live
-    runtime, reconciles, re-reads Redmine); (2) enumerate the active-lane targets; (3) arm the
-    bounded multiplex wait. A woken target threads its ``(workspace_id, issue)`` as a local-wake
-    hint into the NEXT pass so the just-ended turn is reconciled promptly (``local_wake`` mode);
-    a timeout / error runs the next bounded whole-roster reconciliation. Bounded by
-    ``max_iterations`` so the pump is never an unbounded poll. A pass that raises is recorded and
-    the loop survives to its next bounded wait (the outbox / store fences make every pass
-    idempotent).
+    Review R6-F3: an observed wake MUST be consumed by a supervisor reconcile within the SAME
+    bounded invocation — not deferred to a "next" pass that the CLI default (``--max-iterations
+    1``) never runs. So each iteration is **wait -> pass**: (1) enumerate the active-lane targets;
+    (2) arm the bounded multiplex wait; (3) run exactly one supervisor pass that CONSUMES that
+    outcome — a woken target's ``(workspace_id, issue)`` drives a ``local_wake`` pass, a timeout /
+    error drives the bounded whole-roster reconciliation. A single ``--max-iterations 1`` run
+    therefore observes an edge and reconciles it before returning.
+
+    A startup **bootstrap** pass (bounded whole-roster reconciliation) runs once before the first
+    wait so already-outstanding work is reconciled promptly instead of waiting a whole timeout
+    window for the first edge. It is not counted against ``max_iterations``. Every pass re-reads
+    the exact Redmine gate / generation / route / outbox (the wake is only a hint), and the
+    outbox / store fences make every pass idempotent, so a duplicate / persistent-done event folds
+    into the same state. Bounded by ``max_iterations`` so the pump is never an unbounded poll.
     """
     results: list = []
-    hints: Sequence[tuple] = ()
-    for _ in range(max(0, int(max_iterations))):
-        mode = SUPERVISION_LOCAL_WAKE if hints else SUPERVISION_BOUNDED_RECONCILIATION
-        try:
-            outcome = supervisor_pass(mode, hints)
-            pass_ok = True
-        except Exception as exc:  # noqa: BLE001 - a failed pass must not kill the pump
-            outcome, pass_ok = {"error": type(exc).__name__}, False
+    n = max(0, int(max_iterations))
+    if n <= 0:
+        return results
+    # Startup bootstrap: reconcile already-outstanding work before waiting for the first edge.
+    boot = _run_supervisor_pass(supervisor_pass, SUPERVISION_BOUNDED_RECONCILIATION, ())
+    boot.update({"wake": "bootstrap", "woke_target": ""})
+    results.append(boot)
+    for _ in range(n):
         try:
             targets = list(targets_fn())
         except Exception:  # noqa: BLE001 - an unreadable target set is a benign empty wait
             targets = []
         signal, woken = wait_multiplex_fn(targets)
-        # A woken target's (workspace, issue) becomes the next pass's local-wake hint.
-        hints = ((woken.workspace_id, woken.issue),) if woken is not None else ()
-        results.append(
-            {
-                "mode": mode,
-                "pass_ok": pass_ok,
-                "wake": signal.kind,
-                "woke_target": woken.target if woken is not None else "",
-            }
-        )
+        # The wake (or timeout) is consumed by THIS iteration's pass, not a deferred next one.
+        hints: Sequence[tuple] = ((woken.workspace_id, woken.issue),) if woken is not None else ()
+        mode = SUPERVISION_LOCAL_WAKE if hints else SUPERVISION_BOUNDED_RECONCILIATION
+        rec = _run_supervisor_pass(supervisor_pass, mode, hints)
+        rec.update({"wake": signal.kind, "woke_target": woken.target if woken is not None else ""})
+        results.append(rec)
     return results
 
 
@@ -128,7 +175,7 @@ def build_event_pump_seams(
     *,
     supervisor,
     targets_fn: Callable[[], Sequence[EventPumpTarget]],
-    wait_binary: str = "mozyo-bridge",
+    wait_binary: str,
     timeout_ms: int,
     wait_runner=None,
 ) -> "tuple[Callable, Callable, Callable]":
@@ -139,17 +186,30 @@ def build_event_pump_seams(
     - ``targets_fn`` enumerates the active-lane expected-owner Herdr targets (injected);
     - the multiplex wait arms a bounded :mod:`...callback_wake` ``wait agent-status --status done``
       per target (the turn_ended raw status), reusing the stable Herdr wait primitive.
+
+    ``wait_binary`` MUST be the sanctioned trusted-environment herdr executable — resolved by the
+    composition root via :func:`resolve_herdr_binary` (review R6-F1). It is ``herdr`` (whose
+    ``wait agent-status`` surface this uses), never ``mozyo-bridge`` (which has no ``wait``
+    subcommand). When the herdr binary is not configured in the trusted environment the composition
+    root passes an empty ``wait_binary``: the pump then degrades to a TIMEOUT-ONLY wait (no live
+    event source) so it still runs the bounded whole-roster reconciliation each iteration rather
+    than spawning a bogus executable.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_wake import (
         build_herdr_event_wait,
     )
 
+    binary = str(wait_binary or "").strip()
+
     def _pass(mode, hints):
         return supervisor.run_once(mode=mode, wake_hints=hints)
 
     def _wait_builder(t: EventPumpTarget):
+        if not binary:
+            # No trusted herdr binary -> no event source: a benign bounded timeout (still re-reads).
+            return lambda: False
         return build_herdr_event_wait(
-            wait_binary, t.target,
+            binary, t.target,
             status=HERDR_STATUS_TURN_ENDED, timeout_ms=int(timeout_ms), runner=wait_runner,
         )
 

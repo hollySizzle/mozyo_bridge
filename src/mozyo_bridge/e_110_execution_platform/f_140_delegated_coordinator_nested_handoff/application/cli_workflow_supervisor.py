@@ -282,6 +282,26 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     return 0 if performed else 1
 
 
+def _resolve_watch_wait_binary() -> str:
+    """Resolve the sanctioned trusted-environment herdr binary for the event wait (review R6-F1).
+
+    Uses the single shared :func:`resolve_herdr_binary` (``MOZYO_HERDR_BINARY`` -> trusted-PATH
+    ``herdr``), the same resolver ``workflow callbacks --watch`` binds its wake to, so the pump
+    spawns ``herdr wait agent-status`` and never ``mozyo-bridge`` (which has no ``wait``
+    subcommand). Fail-safe: an unconfigured / unresolvable binary returns ``""`` so the pump
+    degrades to a bounded timeout-only wait (still runs the whole-roster reconciliation) instead of
+    launching a bogus executable.
+    """
+    try:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
+            resolve_herdr_binary,
+        )
+
+        return resolve_herdr_binary(os.environ).path
+    except Exception:  # noqa: BLE001 - binary unconfigured / unresolvable -> timeout-only degrade
+        return ""
+
+
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Run the bounded supervisor event pump: Herdr turn events drive the reconcile passes.
 
@@ -309,9 +329,16 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         holder=holder, home=home,
         store_path=_store_path_from_args(args), release_after=False,
     )
+    # Review R6-F1: the event wait spawns herdr's ``wait agent-status`` surface, so the seam must
+    # get the sanctioned trusted-environment herdr binary — never ``mozyo-bridge`` (no ``wait``
+    # subcommand). If it is not configured, pass an empty binary so the pump degrades to a
+    # timeout-only wait (still runs the bounded whole-roster reconciliation) rather than spawning a
+    # bogus executable (mirrors the ``workflow callbacks --watch`` fail-safe).
+    wait_binary = _resolve_watch_wait_binary()
     supervisor_pass, targets_fn, wait_multiplex_fn = build_event_pump_seams(
         supervisor=supervisor,
         targets_fn=lambda: default_pump_targets(home=home),
+        wait_binary=wait_binary,
         timeout_ms=timeout_ms,
     )
     results = run_event_pump(
@@ -388,7 +415,9 @@ def register_supervisor(workflow_sub) -> None:
     )
     p.add_argument(
         "--max-iterations", dest="max_iterations", type=int, default=1,
-        help="Event-pump bound: number of (pass + multiplex wait) iterations (--watch; default 1).",
+        help="Event-pump bound: number of (multiplex wait -> reconcile pass) iterations after the "
+             "startup bootstrap reconcile (--watch; default 1 -> bootstrap + one observed edge "
+             "consumed in-invocation).",
     )
     p.add_argument(
         "--wait-timeout-ms", dest="wait_timeout_ms", type=int, default=50000,

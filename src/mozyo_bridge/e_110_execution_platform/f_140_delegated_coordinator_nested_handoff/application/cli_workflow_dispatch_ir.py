@@ -1,0 +1,155 @@
+"""CLI surface for `workflow dispatch-ir` — the canonical Implementation Request writer (#13758 R6-F4).
+
+`mozyo-bridge workflow dispatch-ir` is the production entry point that makes the reconciler's exact
+dispatch anchor durable: it writes the Implementation Request journal with the machine dispatch
+marker embedded (Design Answer j#79507 Q2), reads back the marker's OWNING journal id, and — only on
+a single resolved anchor — prints the gated `handoff send ... --journal <anchor>` command anchored on
+that journal id. The write -> readback -> handoff sequence and its fail-closed cases live in the pure
+:func:`...application.reconcile_dispatch_writer.dispatch_implementation_request`; this is the thin CLI
+that owns argv, stdout, and the live-transport composition.
+
+Modes:
+
+- default (dry-run) — compose the marker-bearing note and print it for preview; **no** Redmine write,
+  no handoff. The operator sees the exact journal body (marker included) that ``--execute`` would post.
+- ``--execute`` — write the note as a Redmine journal via the opt-in-gated live transport, read the
+  journal back, resolve the anchor, and print the gated handoff command. A write / readback failure or
+  an unresolved / ambiguous anchor fails closed (exit 2, an explicit redacted reason on stderr, no
+  handoff) — the durable dispatch intent still persists for a later readback-recovery.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_dispatch_writer import (
+    DISPATCH_ROLE_PROFILE,
+    DISPATCH_WRITTEN,
+    build_ir_handoff_command,
+    build_live_ir_dispatch,
+    dispatch_implementation_request,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    render_dispatch_note,
+)
+
+
+def _dispatch_body(args: argparse.Namespace) -> str:
+    """Resolve the IR prose body from ``--body`` or ``--body-file`` (a file read fails closed)."""
+    body = getattr(args, "body", None)
+    if body is not None:
+        return str(body)
+    path_text = getattr(args, "body_file", None)
+    if path_text:
+        try:
+            return Path(path_text).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"mozyo-bridge workflow dispatch-ir: cannot read --body-file: {exc}")
+    return ""
+
+
+def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
+    """Write the canonical marker-bearing IR journal and print its anchored handoff (or preview it).
+
+    Exit codes: 0 on a dry-run preview or a resolved ``--execute`` dispatch; 2 on a fail-closed
+    ``--execute`` (write / readback failure or an unresolved / ambiguous anchor — never a guessed
+    anchor, never a handoff).
+    """
+    issue = str(getattr(args, "issue", "") or "").strip()
+    lane = str(getattr(args, "lane", "") or "").strip()
+    generation = getattr(args, "generation", None)
+    body = _dispatch_body(args)
+
+    if not getattr(args, "execute", False):
+        note = render_dispatch_note(body, lane=lane, lane_generation=generation)
+        print("dispatch-ir (dry-run: no Redmine write). Marker-bearing IR journal body:")
+        print(note)
+        print(
+            "\nRun with --execute to write this journal and resolve the dispatch anchor for handoff."
+        )
+        return 0
+
+    post_note, read_entries = build_live_ir_dispatch()
+
+    def _handoff(anchor: str) -> str:
+        return build_ir_handoff_command(
+            issue=issue,
+            target=str(getattr(args, "target", "") or ""),
+            target_repo=str(getattr(args, "target_repo", "") or ""),
+            dispatch_journal=anchor,
+            role_profile=str(getattr(args, "role_profile", None) or DISPATCH_ROLE_PROFILE),
+            source=str(getattr(args, "source", None) or "redmine"),
+            to=str(getattr(args, "to", None) or "claude"),
+        )
+
+    result = dispatch_implementation_request(
+        issue=issue,
+        lane=lane,
+        lane_generation=generation,
+        body=body,
+        post_note=post_note,
+        read_entries=read_entries,
+        handoff_builder=_handoff,
+    )
+    if result.status != DISPATCH_WRITTEN or not result.sendable:
+        print(
+            f"mozyo-bridge workflow dispatch-ir: dispatch not sent ({result.status}): "
+            f"{result.detail}",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"dispatch_journal: {result.dispatch_journal}")
+    print(f"handoff: {result.handoff_command}")
+    return 0
+
+
+def register_dispatch_ir(workflow_sub) -> None:
+    """Register ``workflow dispatch-ir`` onto the ``workflow`` subparser (Redmine #13758 R6-F4)."""
+    p = workflow_sub.add_parser(
+        "dispatch-ir",
+        description=(
+            "Canonical Implementation Request writer (Redmine #13758). Writes the IR journal with "
+            "the durable dispatch marker embedded, reads back the marker's owning journal id, and "
+            "prints the gated `handoff send --journal <anchor>` command anchored on it — so the "
+            "reconciler can correlate the Herdr turn edge against the exact dispatch anchor. Default "
+            "is a dry-run preview (no Redmine write); --execute writes + resolves + emits. A write / "
+            "readback failure or an unresolved / ambiguous anchor fails closed (no handoff)."
+        ),
+        help=(
+            "Write the canonical marker-bearing Implementation Request journal and print its "
+            "anchored handoff command (dry-run preview by default; --execute to write)."
+        ),
+    )
+    p.add_argument("--issue", required=True, help="The Redmine issue id the IR journal is written on.")
+    p.add_argument("--lane", required=True, help="The lane id the dispatch marker names.")
+    p.add_argument(
+        "--generation", required=True,
+        help="The lane generation the dispatch marker names (distinguishes same-lane re-dispatch).",
+    )
+    body = p.add_mutually_exclusive_group()
+    body.add_argument("--body", help="The IR prose body (the marker is appended to it).")
+    body.add_argument("--body-file", dest="body_file", help="Read the IR prose body from a file.")
+    p.add_argument(
+        "--target",
+        help="The worker target for the gated handoff command (--execute; the actual send stays gated).",
+    )
+    p.add_argument(
+        "--target-repo", dest="target_repo",
+        help="The --target-repo identity gate value for the gated handoff command (--execute).",
+    )
+    p.add_argument(
+        "--role-profile", dest="role_profile", default=DISPATCH_ROLE_PROFILE,
+        help=f"The handoff role profile (--execute; default {DISPATCH_ROLE_PROFILE}).",
+    )
+    p.add_argument("--source", default="redmine", help="The handoff --source (--execute; default redmine).")
+    p.add_argument("--to", default="claude", help="The handoff --to receiver (--execute; default claude).")
+    p.add_argument(
+        "--execute", action="store_true",
+        help="Write the IR journal + resolve the anchor + emit the handoff (default: dry-run preview).",
+    )
+    p.set_defaults(func=cmd_workflow_dispatch_ir)
+
+
+__all__ = ("cmd_workflow_dispatch_ir", "register_dispatch_ir")
