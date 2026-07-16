@@ -461,9 +461,19 @@ Table naming:
       (`sublane retire --retire-hibernated-bound`) が **連言検証**する: exact issue+lane+workspace・**bound worktree
       一致**（#13754 `attest_retire_target` を再利用。空 binding は `worktree_binding_unverified` で #13841 へ route、
       別 token は `worktree_binding_mismatch`）・`--worktree` 実 branch==`--branch`・integration ancestry・
-      **readable live inventory の全 expected slot absent**・exact lifecycle revision。live 残存 / inventory
-      unreadable / foreign / branch mismatch / detached / unintegrated / revision race / pending replacement は
-      すべて zero-write。書込は「row 存在 かつ exact `expected_revision` 一致」かつ「`hibernated` /
+      **readable live inventory の全 expected slot absent**・**target unit に foreign/unexpected occupant 無し**・
+      exact lifecycle revision。live 残存 / inventory unreadable / foreign occupant / branch mismatch / detached /
+      unintegrated / revision race / pending replacement はすべて zero-write。★**live-zero と unoccupied は別の事実**
+      (review j#80115 F1): `expected_live_slots` は **managed role のみ**を集計するため、foreign provider だけが
+      占有する unit は「live 0」と測定される。これを quiescent と誤認すると、実 process が稼働中の lane を
+      terminal `retired` として記録してしまう (実測: foreign-only inventory で `exit 0` / `state=retired` /
+      `expected_live=[]` / durable `retired`)。したがって `expected_live_slots` の live-zero に加えて
+      **`plan.foreign_names` 非空を独立に fail-closed** する (`foreign_inventory_present`)。この surface は
+      何も close しないので unit を空にする手段を持たず、occupant は触れてはならない foreign process である。
+      同 class を #13842 は `foreign_at_position` で gate 済みであり、その正解形を踏襲する。verdict は
+      `expected_live` と `foreign_names` を **別 field** で surface し、どちらの測定が拒否したかを operator が
+      識別できるようにする。foreign fence は idempotent `already_retired` の **前**に置く: persisted `retired` は
+      現在の quiescence を証明しない (j#79150 F2 と同型)。書込は「row 存在 かつ exact `expected_revision` 一致」かつ「`hibernated` /
       `binding_kind='issue'` / この exact issue 所有 / project scope 無し / `worktree_identity` **非空 かつ caller の
       attested token と一致**」かつ「`process_release='released'` / replacement settled」の全成立時のみ。
       ★**worktree token は CAS 内（row lock 下）で再照合**する: action-time attestation は診断であって authority では
