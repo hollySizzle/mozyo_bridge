@@ -256,20 +256,59 @@ class SourceRefPreflightTest(unittest.TestCase):
         # The colliding refs are named, so the operator can act on them.
         self.assertIn("refs/heads/foo/refs/heads/main", err)
         self.assertIn(nested, err)
-        # Full-path input must NOT be told to re-spell as a full path.
-        self.assertIn("already a full ref path", err)
+        # The input names a matched ref exactly, so no re-spelling can narrow
+        # it; the only real recovery is on origin.
+        self.assertIn("is itself one of the refs above", err)
         self.assertIn("rename/delete the colliding ref on origin", err)
 
     def test_short_name_collision_is_told_to_use_the_full_path(self) -> None:
         # The other branch of the recovery: a short name CAN often be
         # disambiguated by spelling the full path, so that advice is given
-        # only here — not for a full path that already collides.
+        # only here — not when the input already names a ref exactly.
         _git(self.clone, "tag", "main")
         _git(self.clone, "push", "-q", "origin", "refs/tags/main")
         err = self._assert_refused("main")
         self.assertIn("resolved to 2 origin refs", err)
-        self.assertIn("pass its full path verbatim", err)
-        self.assertNotIn("already a full ref path", err)
+        self.assertIn("is a tail pattern here", err)
+        self.assertIn("--source-ref refs/heads/main", err)
+        self.assertNotIn("is itself one of the refs above", err)
+
+    def test_refs_prefixed_short_name_gets_short_name_recovery(self) -> None:
+        """A `refs/`-prefixed BRANCH short name is not a full path (j#80048 R2-F1).
+
+        `refs/foo` is a legal branch short name — origin publishes it as
+        `refs/heads/refs/foo`. Classifying by the `refs/` prefix would call it a
+        full path and tell the operator to delete refs on origin, hiding the
+        full-path correction that actually works. The classification must come
+        from the match facts: `refs/foo` names none of the matched refs exactly,
+        so a more specific spelling exists.
+        """
+        self.assertEqual(
+            0,
+            subprocess.run(
+                ["git", "-C", str(self.clone), "check-ref-format", "--branch", "refs/foo"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode,
+            msg="premise: `refs/foo` must be a legal branch short name",
+        )
+        _git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/refs/foo")
+        _git(self.clone, "push", "-q", "origin", "HEAD:refs/tags/refs/foo")
+
+        err = self._assert_refused("refs/foo")
+        self.assertIn("resolved to 2 origin refs", err)
+        # Correct branch: a more specific spelling exists, so say so.
+        self.assertIn("is a tail pattern here", err)
+        self.assertIn("--source-ref refs/heads/refs/foo", err)
+        # Must NOT claim the input is already the ref's full name, and must not
+        # send the operator to mutate origin when re-spelling would work.
+        self.assertNotIn("is itself one of the refs above", err)
+        self.assertNotIn("rename/delete the colliding ref on origin", err)
+
+        # And the advertised correction must actually resolve.
+        rc, out = self._publish("refs/heads/refs/foo")
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertIn("source_ref_resolved: refs/heads/refs/foo", out)
 
     def test_mismatch_refuses_before_dispatch(self) -> None:
         _git(self.clone, "checkout", "-q", "-b", "other")

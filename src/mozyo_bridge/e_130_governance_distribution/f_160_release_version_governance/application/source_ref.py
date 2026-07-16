@@ -188,26 +188,31 @@ def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
     if len(matches) > 1:
         listed = "\n".join(f"  {name} -> {sha}" for sha, name in matches)
         # `git ls-remote` matches a ref-name TAIL at `/` boundaries, so the
-        # recovery depends on what was passed. A short name can often be
-        # disambiguated by spelling the full path; a full path cannot — a ref
-        # like `foo/refs/heads/main` collides with `refs/heads/main` itself, so
-        # re-pasting the canonical form just reproduces this refusal (j#79995
-        # F1). Say which situation the operator is actually in.
-        if source_ref.startswith("refs/"):
+        # recovery depends on whether a MORE SPECIFIC spelling still exists.
+        # Decide that from the match facts, not from the shape of the input: a
+        # `refs/` prefix does not mean "full ref path", because a branch may
+        # legally be named `refs/foo` (which origin publishes as
+        # `refs/heads/refs/foo`), and telling its owner to delete refs would
+        # hide the full-path correction that actually works (j#80048 R2-F1).
+        # If the input already equals one of the matched ref names, it IS the
+        # full name and no re-spelling can narrow it further (j#79995 F1).
+        names_the_ref_exactly = any(name == source_ref for _, name in matches)
+        if names_the_ref_exactly:
             recovery = (
-                "This is already a full ref path, so re-spelling it cannot "
-                "disambiguate: `git ls-remote` matches a ref-name TAIL, and the "
-                "refs above share this one. The exactly-one requirement is also "
-                "enforced server-side, so this ref cannot be dispatched while "
-                "the collision exists. Either rename/delete the colliding ref on "
+                f"{source_ref!r} is itself one of the refs above, so it is "
+                "already the ref's full name and re-spelling cannot narrow it: "
+                "`git ls-remote` matches a ref-name TAIL, and the refs above "
+                "share this one. The exactly-one requirement is also enforced "
+                "server-side, so this ref cannot be dispatched while the "
+                "collision exists. Either rename/delete the colliding ref on "
                 "origin, or pass a different ref that resolves to exactly one."
             )
         else:
             recovery = (
-                "`git ls-remote` matches a ref-name TAIL, so a short name can "
-                "also match refs/tags/<name> or refs/heads/<prefix>/<name>. If "
-                "one of the refs above is the one you mean, pass its full path "
-                "verbatim, e.g. --source-ref refs/heads/<branch>."
+                f"{source_ref!r} is a tail pattern here — it names none of the "
+                "refs above exactly, so a more specific spelling exists. Pass "
+                "the full path of the one you mean, verbatim, e.g. --source-ref "
+                f"{matches[0][1]}"
             )
         die(
             f"source_ref {source_ref!r} resolved to {len(matches)} origin refs; "

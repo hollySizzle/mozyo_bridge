@@ -87,7 +87,10 @@ peel 行を落とす帰結として、**annotated tag の non-peel tip は tag o
 
 - **どの綴りも「構造上つねに exactly-one」ではない。** `refs/heads/<branch>` は *最も曖昧さが少ない canonical form* であって、一意性が保証された form ではない。docs / help / 診断 message でこれを「always exactly one」と書かない。
 - exactly-one は **preflight と server gate が動的に検査する不変条件**である。衝突時は client / server の双方が同じ logic で refuse するため、fail-closed と parity は保たれる。
-- **回復手順は入力形式で異なる**。短縮名なら full path が曖昧性を解消しうる。**既に full path の場合、再提示は無意味**であり、回復は (a) origin 側の衝突 ref を rename / 削除する、(b) 一意に解決する別 ref を使う、のいずれか。診断 message はこの 2 分岐を出し分ける。
+- **回復手順は 2 通りあり、`ls-remote` の match facts で判定する** (入力の見た目で判定しない):
+  - **入力が一致した ref のいずれとも完全一致しない** -> 入力は tail pattern であり、より特定的な綴りが存在する。列挙した ref の full path を verbatim で渡せば解消しうる。
+  - **入力が一致した ref のいずれかと完全一致する** -> 入力は既にその ref の完全名であり、再提示では絞れない。回復は (a) origin 側の衝突 ref を rename / 削除する、(b) 一意に解決する別 ref を使う、のいずれか。
+  - **`refs/` prefix を「full path である」の判定に使わない** (Redmine #13883 j#80048 R2-F1)。branch 短縮名は合法に `refs/` で始まれる (`refs/foo` は origin 上で `refs/heads/refs/foo` になる)。prefix で判定すると、この入力を full path と誤分類し、**実際に有効な full-path 訂正を隠して不要な origin 側 ref 削除を勧める**。判定は「入力と完全一致する ref が解決結果にあるか」で行う。
 
 client 側で full path の exact-match semantics を実装して衝突を回避する案は **採らない**。server が glob のままなので、client だけ exact-match にすると **client が greenlight した ref を server が refuse する**状態が生じ、本 contract が掲げる「client は server より緩くならない」parity を破る。exact-match を入れるなら trusted workflow gate 側と同時に変更する必要があり、それは別 issue の scope である。
 
