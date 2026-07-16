@@ -50,8 +50,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     STORE_RECOGNIZED,
     AttestationMigrationOutcome,
     HerdrIdentityAttestationSchemaError,
-    backup_attestation_store,
     probe_store_schema,
+    quarantine_attestation_store_artifacts,
+    remove_attestation_store_artifacts,
 )
 from mozyo_bridge.core.state.state_store import StateStoreError
 
@@ -419,8 +420,12 @@ def run_attestation_store_rebuild(
             ),
         )
     try:
-        backup_dir = backup_attestation_store(path)
-        path.unlink()
+        # Raw quarantine, not a logical snapshot (review j#80029 R2-F1): the store is
+        # already proven unreadable above, so there is nothing to snapshot logically and
+        # its bytes ARE the evidence. Whole artifact set — a stranded `-wal` would both
+        # lose forensic evidence and let a later open resurrect a partial store.
+        backup_dir = quarantine_attestation_store_artifacts(path)
+        remove_attestation_store_artifacts(path)
     except (StateStoreError, OSError) as exc:
         return AttestationStoreMaintenanceResult(
             intent="rebuild",

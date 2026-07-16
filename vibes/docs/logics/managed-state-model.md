@@ -609,10 +609,21 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   reproduced: a v1 store with one committed row under `journal_mode=WAL` / `wal_autocheckpoint=0` produced a recovery point reading
   `version=1, rows=0` while the live store held the row. A recovery point that is incomplete *and trusted* is worse than none.
   `Connection.backup()` is transaction-consistent and checkpoint-independent, so the snapshot is judged by **content** (version +
-  rows), not bytes. The one exception is a non-SQLite / corrupt file, which has no logical snapshot: there `rebuild` falls back to a
-  byte copy, the correct semantics precisely because there are no committed pages to miss and the bytes themselves are the evidence.
-  (The sibling `lane_lifecycle_schema.backup_state_container` and `state_store._backup` still use the file-copy shape; that is
-  pre-existing and out of this component's scope, but shares the hazard.)
+  rows), not bytes. (The sibling `lane_lifecycle_schema.backup_state_container` and `state_store._backup` still use the file-copy
+  shape; that is pre-existing and out of this component's scope, but shares the hazard.)
+- **The two preservation rails are split by CALLER INTENT, never by exception type** (#13882 review j#80029 R2-F1). The logical
+  snapshot (`backup_attestation_store`, used by `migrate`) has **no fallback**: any failure raises and the migration aborts with the
+  store untouched. The raw byte quarantine (`quarantine_attestation_store_artifacts`, used only by `rebuild`) runs only where
+  `probe_store_schema` has *already proven* the store unreadable — a file with no logical snapshot to take, whose bytes are the
+  evidence an operator needs. The first fix instead inferred "not a database" from `sqlite3.DatabaseError` and fell back to a byte
+  copy; but SQLite raises that same type when a **valid** database is busy or its I/O fails, so the type cannot distinguish the two.
+  Fault-injecting a lock error into a valid WAL store's `backup()` made the migration report `migration_applied` while writing a
+  `rows=0` recovery point — the original F1 defect regenerated through its own fix. **Corruption is a caller's conclusion from a
+  probe, not an inference from an exception.**
+- **Preservation and rotation are whole-artifact** (R2-F1(b)). A crashed WAL writer leaves `-wal` / `-shm` beside a corrupt main DB.
+  Copying only the main file stranded that evidence in place while `rebuild` removed its sibling; leaving a `-wal` behind after
+  removing the main DB would also let a later open resurrect a partial store from the orphaned sidecar. Both the quarantine and the
+  removal cover the main file plus every existing sidecar.
 - **Only a whole, canonical capability token is credited** (#13882 review j#80000 finding 3). Both advertisement tokens are bounded
   on each side and matched against an exact grammar (`<int>` / `<int>(_<int>)*`); a malformed spelling is **not** salvaged into a
   capability. Unbounded matching credited `…schema=2x` as a clean v2, and `stores=1__2` / `_1_2_` / `1_2junk` as `{1, 2}` — handing a

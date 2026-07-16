@@ -367,26 +367,14 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version = {HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}")
 
 
-def backup_attestation_store(path: Path) -> Optional[Path]:
-    """Snapshot the store into ``backups/herdr-identity-attestation-<ts>/`` before a write.
+#: SQLite sidecars that can carry committed state or forensic evidence beside the main DB
+#: file. A raw quarantine must move the whole artifact set, not just the main file
+#: (Redmine #13882 review j#80029 R2-F1(b)).
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
-    Uses SQLite's **backup API**, not a file copy (Redmine #13882 review j#80000 finding 1).
-    A ``shutil.copy2`` duplicates only the main DB file, so a store in WAL mode leaves its
-    committed pages in the ``-wal`` sidecar and the snapshot silently loses them —
-    reproduced: a v1 store with one committed row under ``journal_mode=WAL`` /
-    ``wal_autocheckpoint=0`` backed up to a recovery point reading ``version=1, rows=0``
-    while the live store held the row. A recovery point that is missing committed
-    attestations is worse than none, because it is *trusted*. ``Connection.backup()`` is
-    transaction-consistent and checkpoint-independent, so the snapshot carries every
-    committed row whatever the journal mode.
 
-    A failure raises :class:`StateStoreError` so the caller fails closed with the store
-    unchanged, and an existing snapshot is **never overwritten** (a second-precision stamp
-    can collide, so a taken directory takes a numeric suffix). Returns ``None`` when there
-    is nothing to preserve yet.
-    """
-    if not path.exists():
-        return None
+def _new_backup_dir(path: Path) -> Path:
+    """Create the next free ``backups/<stem>-<ts>[-N]/`` directory (never overwriting)."""
     base = path.parent / BACKUPS_DIRNAME / f"{path.stem}-{_backup_stamp(_utc_now())}"
     backup_dir = base
     suffix = 1
@@ -397,36 +385,103 @@ def backup_attestation_store(path: Path) -> Optional[Path]:
         backup_dir.mkdir(parents=True, exist_ok=False)
     except OSError as exc:
         raise StateStoreError(
-            f"backup near {base} failed ({exc}); migration aborted (nothing was written)"
+            f"backup near {base} failed ({exc}); operation aborted (nothing was written)"
         ) from exc
+    return backup_dir
+
+
+def backup_attestation_store(path: Path) -> Optional[Path]:
+    """Take a **logical** snapshot before a migration. Fail-closed; never falls back.
+
+    Uses SQLite's backup API, not a file copy (review j#80000 finding 1): ``shutil.copy2``
+    duplicates only the main DB file, so a WAL store leaves committed pages in ``-wal`` and
+    the snapshot loses them — reproduced as a recovery point reading ``version=1, rows=0``
+    while the live store held the row. A recovery point that is incomplete *and trusted* is
+    worse than none. ``Connection.backup()`` is transaction-consistent and
+    checkpoint-independent, so it carries every committed row whatever the journal mode.
+
+    **Any** failure raises :class:`StateStoreError` (review j#80029 R2-F1). The first fix
+    caught ``sqlite3.DatabaseError`` here and fell back to a byte copy, reasoning that such
+    an error meant "not a database" — but that exception is raised just as readily when a
+    *valid* database is busy or its I/O fails, and the type carries no way to tell the two
+    apart. Fault-injecting a lock error into a valid WAL store's ``backup()`` made the
+    migration report ``migration_applied`` while writing a ``rows=0`` recovery point: the
+    original defect, regenerated through its own fix. Corruption is not something to infer
+    from an exception type — it is decided **by the caller's intent**, before the call, from
+    :func:`probe_store_schema`. A caller that wants raw byte preservation for an
+    already-proven-unreadable store calls :func:`quarantine_attestation_store_artifacts`.
+
+    An existing snapshot is never overwritten (a second-precision stamp can collide, so a
+    taken directory takes a numeric suffix). Returns ``None`` when there is nothing to
+    preserve yet.
+    """
+    if not path.exists():
+        return None
+    backup_dir = _new_backup_dir(path)
     target = backup_dir / path.name
     source: Optional[sqlite3.Connection] = None
     dest: Optional[sqlite3.Connection] = None
     try:
-        # Read-only source: a snapshot must never be able to mutate the store it preserves.
+        # Read-only source: a snapshot must never mutate the store it preserves.
         source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         source.execute("PRAGMA busy_timeout = 2000")
         dest = sqlite3.connect(target)
         source.backup(dest)
         dest.commit()
     except (sqlite3.DatabaseError, OSError) as exc:
-        # A non-SQLite / corrupt file has no logical snapshot. Fall back to a byte copy so
-        # `rebuild` can still preserve the bytes it is about to rotate away — the only case
-        # where a file copy is the *correct* semantics, because there are no committed
-        # pages to miss and the bytes themselves are the evidence.
-        try:
-            shutil.copy2(path, target)
-        except OSError as copy_exc:
-            raise StateStoreError(
-                f"backup near {base} failed ({copy_exc}); migration aborted "
-                f"(nothing was written)"
-            ) from copy_exc
-        _ = exc
+        raise StateStoreError(
+            f"logical snapshot of {path} failed ({exc.__class__.__name__}: {exc}); "
+            f"refusing to migrate without a complete recovery point (the store is left "
+            f"untouched). A byte copy is NOT substituted here: it would silently drop any "
+            f"WAL-committed rows and produce a recovery point that looks valid"
+        ) from exc
     finally:
         for conn in (source, dest):
             if conn is not None:
                 conn.close()
     return backup_dir
+
+
+def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
+    """Raw byte-preserve the whole store artifact set before ``rebuild`` rotates it away.
+
+    The counterpart to :func:`backup_attestation_store`, split by **caller intent** rather
+    than by exception type (review j#80029 R2-F1). Only ``rebuild`` calls this, and only
+    after :func:`probe_store_schema` has already proven the store unreadable / unsupported:
+    such a file has no logical snapshot to take, and its *bytes are the evidence* an
+    operator may need to diagnose what happened, so a raw copy is the correct — and only —
+    semantics here.
+
+    Preserves the **whole artifact set**, not just the main file (R2-F1(b)): a crashed WAL
+    writer leaves ``-wal`` / ``-shm`` beside a corrupt main DB, and copying only the main
+    file stranded that evidence in place while the rebuild removed its sibling. Every
+    sidecar that exists is captured alongside it.
+    """
+    if not path.exists():
+        return None
+    backup_dir = _new_backup_dir(path)
+    try:
+        shutil.copy2(path, backup_dir / path.name)
+        for suffix in _SIDECAR_SUFFIXES:
+            sidecar = path.with_name(path.name + suffix)
+            if sidecar.exists():
+                shutil.copy2(sidecar, backup_dir / sidecar.name)
+    except OSError as exc:
+        raise StateStoreError(
+            f"quarantine of {path} failed ({exc}); rebuild aborted (nothing was removed)"
+        ) from exc
+    return backup_dir
+
+
+def remove_attestation_store_artifacts(path: Path) -> None:
+    """Remove the store and every sidecar (only after a successful quarantine).
+
+    Leaving a ``-wal`` behind while removing the main DB would let a later open resurrect
+    a partial store from the orphaned sidecar, so the rotation must be whole-artifact too.
+    """
+    for candidate in (path, *(path.with_name(path.name + s) for s in _SIDECAR_SUFFIXES)):
+        if candidate.exists():
+            candidate.unlink()
 
 
 # --- Migration outcome vocabulary (the explicit operator command only). ---------------
@@ -575,6 +630,8 @@ __all__ = (
     "create_schema",
     "migrate_attestation_store",
     "probe_store_schema",
+    "quarantine_attestation_store_artifacts",
+    "remove_attestation_store_artifacts",
     "readonly_compatible_select",
     "reader_upgrade_required",
     "recorded_version",
