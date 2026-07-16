@@ -45,11 +45,17 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     build_attest_capability_probe_argv,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
+    LauncherCapabilityObservation,
     decide_launcher_capability,
+    decide_store_compatibility,
     parse_launcher_capability_output,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    herdr_identity_attestation_path,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    probe_store_schema,
 )
 
 
@@ -106,7 +112,7 @@ def preflight_attest_launcher_capability(
     runner: Runner,
     timeout: float,
     env: Mapping[str, str],
-) -> None:
+) -> LauncherCapabilityObservation:
     """Fail closed unless ``launcher`` can run the ``herdr agent-attest`` wrapper.
 
     Redmine #13748. The #13637 managed launch execs every provider THROUGH
@@ -155,6 +161,11 @@ def preflight_attest_launcher_capability(
     caller only probes when a wrapper will actually run (a launch plan under a resolved
     launcher); an adopt-only / dry-run session starts no wrapped process and is never
     probed.
+
+    Returns the parsed :class:`LauncherCapabilityObservation` (Redmine #13882) so the
+    caller can feed the same probe into :func:`preflight_attest_store_schema` without
+    re-running the subprocess. Every check here remains **code vs code**; the store join
+    is the separate step.
     """
     recovery = (
         f" Recovery: install or release a mozyo-bridge whose CLI has `herdr agent-attest` "
@@ -185,8 +196,9 @@ def preflight_attest_launcher_capability(
     # non-launcher lacks the marker; an older installed launcher carries the marker but
     # advertises a stale (or no) schema — both fail closed here, before any launch.
     output = (completed.stdout or "") + (completed.stderr or "")
+    observation = parse_launcher_capability_output(output)
     verdict = decide_launcher_capability(
-        parse_launcher_capability_output(output),
+        observation,
         required_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     )
     if not verdict.ok:
@@ -195,6 +207,50 @@ def preflight_attest_launcher_capability(
             f"`herdr agent-attest` probe but {verdict.detail}; refusing to launch a "
             f"provider whose self-attestation would be dropped, leaving a partial / "
             f"immediately-vanishing or live-but-unattested lane." + recovery,
+            reason=verdict.reason,
+        )
+    return observation
+
+
+def preflight_attest_store_schema(
+    observation: LauncherCapabilityObservation,
+    *,
+    store_home: Path,
+    replacement_launch: bool = False,
+) -> None:
+    """Fail closed unless the SELECTED home store's real shape can be attested into.
+
+    Redmine #13882 — the check the #13847 capability preflight structurally cannot make.
+    That one joins the launcher's *advertised* schema against this runtime's *required*
+    schema; both are **code**, so two v2 runtimes agree, the probe passes, and nothing
+    ever opens the store that will actually be written. The measured failure: a shared
+    ``MOZYO_BRIDGE_HOME`` holding the pre-0.12 v1 shape. The launch is wrapped with
+    ``--env MOZYO_BRIDGE_HOME=<store_home>``, the child's best-effort write hits the store
+    guard, swallows the error (an agent boot must never be blocked by a store failure),
+    and the pair boots **live but unattested** with every downstream verify failing closed.
+
+    Store-side only, and read-only: it probes the store as it lies and **never migrates**
+    (a launch that silently migrated the shared home would break every older installed
+    launcher the same way — see ``herdr_identity_attestation_schema``). Called next to the
+    launcher probe, i.e. before the caller's first ``workspace`` / ``tab`` / ``agent``
+    write, so an incompatible store aborts with zero herdr side effect (acceptance 1).
+
+    A v1 store with a **normal** launch is admitted: the launcher writes it v1-shaped and
+    ``replacement_action_id`` is empty, so nothing is dropped and no generation is
+    fabricated. A **replacement** launch is refused there, because that field cannot
+    survive the v1 shape. The error is raised, never persisted, so no personal path is
+    written to a durable store.
+    """
+    verdict = decide_store_compatibility(
+        observation,
+        probe_store_schema(herdr_identity_attestation_path(Path(store_home))),
+        required_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+        replacement_launch=replacement_launch,
+    )
+    if not verdict.ok:
+        raise HerdrLauncherIncompatibleError(
+            f"managed-launch preflight refused the selected attestation store: "
+            f"{verdict.detail}. No workspace / tab / agent was created.",
             reason=verdict.reason,
         )
 

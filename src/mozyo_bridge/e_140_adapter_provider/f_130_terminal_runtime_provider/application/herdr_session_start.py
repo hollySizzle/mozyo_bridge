@@ -189,6 +189,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _invoke,
     _list_rows,
     preflight_attest_launcher_capability,
+    preflight_attest_store_schema,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
@@ -585,8 +586,19 @@ def prepare_session(
     # Gated on a resolved wrapper AND an actual launch plan: an unwrapped (`attest_launcher
     # == ""`) or adopt-only / dry-run run runs no wrapper, so it is never probed and stays
     # byte-invariant (Redmine #13637 fallback preserved).
+    # The store-schema join (Redmine #13882) rides the same boundary: the probe above is
+    # code-vs-code, so it cannot see that the SELECTED home holds an older shape on disk —
+    # the live-but-unattested pair. Read-only; never migrates the shared home. See
+    # `preflight_attest_store_schema`.
     if attest_launcher and launch_plans:
-        preflight_attest_launcher_capability(attest_launcher, runner, timeout, env)
+        observation = preflight_attest_launcher_capability(
+            attest_launcher, runner, timeout, env
+        )
+        preflight_attest_store_schema(
+            observation,
+            store_home=Path(store_home),
+            replacement_launch=bool((replacement_action_id or "").strip()),
+        )
 
     # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
     # to launch (all adopt / dry-run) means no workspace create and no reclaim —

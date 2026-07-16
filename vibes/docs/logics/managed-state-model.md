@@ -537,6 +537,70 @@ The contract that prevents it, for a component whose rows are authority (e.g. `l
   (`lifecycle_migration_preflight`) — read-only, version-compatible — which reports the other active lanes a forward migration
   would fail-close, so the migration is a chosen, visible act rather than an accidental side effect of a background notification.
 
+#### attestation store: read-compatible / write-conservative (mixed-runtime shared home — #13882)
+
+`herdr-identity-attestation.sqlite` takes the read half of the #13844 contract above and **deliberately inverts the write half**.
+The reason is a boundary no other component has: it is the one home store written by a process this runtime did not build. A
+managed launch wraps the provider through `<attest_launcher> herdr agent-attest …` and injects
+`--env MOZYO_BRIDGE_HOME=<store_home>` (`herdr_launch_argv`), so **whichever `mozyo-bridge` the operator happens to have installed
+writes into the same file this runtime reads**. Its readers are not all shipped in this build, and cannot be migrated in step with it.
+
+Live evidence (#13882): the shared home held the pre-0.12 **v1** shape while the runtime required v2. The old exact-version write
+guard raised, the best-effort writer swallowed it (an agent boot must never be blocked by a store failure), and a fresh pair booted
+**live but unattested** — `partial_pair_recovery_required`, with re-adopt (`unattested_slot`) and `recover-pair` (`missing_pins`)
+both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability preflight could not see any of it: it joins the launcher's
+*advertised* schema against the *source runtime's required* schema — both **code** — and never opens the store on disk.
+
+- **Reads never migrate, and project older shapes up.** Identical to #13844: `readonly_compatible_select` emits the current column
+  vocabulary, padding a column an older shape lacks with its migration-default literal, inside **one explicit read transaction**
+  begun before the first schema query (the R9 torn-snapshot discipline). A v1 row's empty `replacement_action_id` is not a guess:
+  its writer predates the replacement transaction (#13806) entirely, so `''` is that row's **true** value. Padding it is a proven
+  backward-compatible projection; the field-drop hazard the pre-#13882 comment feared lives on the *write* side, and is refused there.
+- **Writes never migrate either — the deliberate divergence.** In `lane_lifecycle`, every mutation migrates through one write gate,
+  which is safe because all its readers ship in this build. Here, forward-migrating the shared home on a launch would leave every
+  **older installed launcher** hitting its own exact-version guard, silently dropping its attestation and booting live-but-unattested:
+  the identical defect, merely inverted onto the old runtimes. So a recognized older store is written in **its own shape**
+  (`writable_projection`) and left at its own version. Forward migration is an **explicit operator command only**, never a launch
+  side effect.
+- **The one write refusal is the field that cannot be dropped.** A **normal** launch (empty `replacement_action_id`) writes the v1
+  shape losing nothing. A **replacement** launch (non-empty `action_id`) is refused there and raises
+  (`write_drops_replacement_action_id`), because a dropped binding would leave a fresh worker a replacement recovery matches on
+  exactly (`sublane_stale_worker_recovery_live`) permanently unverifiable. The best-effort writer still never raises into a boot —
+  the refusal is surfaced by the **preflight, before the launch**, not by crashing the child.
+- **Admission joins the launcher against the REAL store, before any actuation.** `probe_store_schema` (read-only; creates nothing;
+  an unopenable file is `store_unreadable`, never folded into "absent") + `decide_store_compatibility` run at the #13748/#13847
+  preflight boundary in `prepare_session`, i.e. before the first herdr `workspace` / `tab` / `agent` write, so an incompatible store
+  aborts with zero herdr side effect. Admitted: absent store; exact-version store; older store + normal launch + a launcher that can
+  prove it writes that shape. Refused: unreadable; unsupported (naming *upgrade* vs *corrupt* honestly from `reader_upgrade_required`);
+  replacement launch onto a pre-`replacement_action_id` shape; a launcher that cannot prove it writes the store's shape.
+- **The launcher advertises the writable SET, not just its native schema.** The #13847 token (`mozyo_attest_capability_schema=`)
+  carries one exact version, which **cannot distinguish** a pre-#13882 build (writes v2 only) from a #13882 build (writes v1
+  conservatively) — both advertise `2`, yet only the second is safe against a v1 home. So `agent-attest --help` additionally
+  advertises `mozyo_attest_capability_stores=1_2` (underscore-separated: argparse help wrapping breaks on hyphens and width). A
+  launcher advertising no set is credited with its **native schema only** — fail-closed, because that is precisely the build whose
+  write guard is an exact match.
+- **Migration / rebuild is public, backup-first, and consumer-gated.** `mozyo-bridge herdr attestation-store {status,migrate,rebuild}`
+  is the only supported rail (raw SQLite editing is a #13882 non-goal). Read-only plan by default; `--write` acts. `migrate` is
+  additive and idempotent; `rebuild` rotates an **unreadable / unsupported** store into `backups/` and is refused for a recognized
+  older store, which `migrate` handles without discarding rows. Rebuild is legitimate only because this component's recovery policy
+  is `rebuildable_cache`: the next launch's self-attestation re-derives it, and until then reads degrade to fail-closed (adopt
+  refuses, doctor non-green), never to a false attestation. Both mutating intents refuse while a **proven consumer** is live, and the
+  **live-zero read runs before** the idempotent already-current success, so a replay never reports success while consumers are live
+  (#13841 j#79150 finding 2). An **unreadable** inventory is not an empty one and refuses just as hard. Neither intent closes, sends
+  to, or launches a process.
+- **"Active consumer" is scoped by evidence, not by guess.** herdr exposes no surface returning a launched process's environment
+  (the constraint this whole component exists to work around), so *which home a live agent was launched against is unobservable*. A
+  **stored row is the only proof** that ties a live agent to this store, so a consumer is an agent that is live **AND** carries a
+  record here — cross-workspace, never repo-scoped, since the store is shared. Counting every managed agent on the server instead is
+  not "more conservative", it is wrong in both directions: it refuses an unrelated home forever (measured: 18 live agents blocking a
+  scratch home none of them had ever written) without protecting anything extra. Excluding a live agent with no row here is not a
+  fail-open, because attestation is a **one-shot write at boot** (`perform_self_attestation` is the sole production writer and
+  `exec`s immediately after): a live agent has already completed its only write, so it either uses another home or already failed to
+  attest, and in neither case can this store's shape degrade it further.
+- **Compatibility is judged by the shape table.** As in #13844, `_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFAULTS` — never a guessed
+  version comparison. A recognized version whose on-disk columns disagree is partial / corrupt and fails closed rather than being
+  silently repaired.
+
 ### corruption blast radius / backup
 
 Single file raises the blast radius, so recovery policy must be component-aware:

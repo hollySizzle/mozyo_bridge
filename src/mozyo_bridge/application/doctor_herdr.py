@@ -90,7 +90,10 @@ _ATTESTATION_NEXT_ACTION = (
     "injected identity env is unverified, so their handoff sends fail closed): "
     "herdr cannot read or repair a running process's env, so recover with an "
     "owner-approved close of the affected pane(s) + a same-slot relaunch via "
-    "`mozyo-bridge herdr session-start` (the relaunch re-runs the self-check)"
+    "`mozyo-bridge herdr session-start` (the relaunch re-runs the self-check). "
+    "First check `mozyo-bridge herdr attestation-store status` (Redmine #13882): "
+    "when the whole home reads unattested at once, the cause is usually the store's "
+    "schema, not the panes — and relaunching cannot fix that"
 )
 
 

@@ -1,0 +1,447 @@
+"""Public attestation-store maintenance use case (Redmine #13882 acceptance 3).
+
+The #13882 write policy deliberately leaves a v1 shared home **at v1** so older installed
+launchers keep working (``herdr_identity_attestation_schema``). That makes forward
+migration an explicit operator act rather than a launch side effect — and this module is
+that act's only public rail. It exists because the alternative the incident actually left
+operators with was hand-editing ``herdr-identity-attestation.sqlite`` with raw SQLite,
+which the issue rules out as a non-goal.
+
+Three intents, each a read-only plan by default:
+
+- ``status`` — what shape the selected store is, and what that admits;
+- ``migrate`` — additive v1 -> v2, backup-first, idempotent;
+- ``rebuild`` — rotate an unmigratable (corrupt / foreign / newer) store aside into
+  ``backups/`` and start a fresh one. Legitimate *only* because this projection is a
+  ``rebuildable_cache``: the next launch's self-attestation re-derives it, and until then
+  every read degrades to fail-closed rather than to a false attestation. Rebuild is not
+  offered as a shortcut around migrate — migrate preserves the rows, rebuild discards
+  them, so the command refuses to rebuild a store that migrate could handle.
+
+**Active-consumer safety.** Both mutating intents refuse while a **proven consumer of this
+store** is live — a managed agent that is live AND carries a record here (see
+:func:`_live_consumer_names` for why a stored row is the only available evidence, herdr
+having no surface that reveals a live process's injected home). Changing the shape under
+them would change what a concurrent older-runtime reader sees of their records; rebuilding
+would additionally orphan the attestations of processes still running, turning verified
+slots unverifiable. The scope is cross-workspace, never repo-scoped, because the store is
+shared. An **unreadable** inventory is never folded into "no consumers" (the #13682 R1-F1
+/ #13754 anti-pattern): it refuses just as hard.
+
+Actuation boundary: this module never closes, sends to, or launches a process. It copies
+a file and runs additive DDL, nothing more.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Sequence
+
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    herdr_identity_attestation_path,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    MIGRATION_APPLIED,
+    RECOGNIZED_SCHEMA_VERSIONS,
+    STORE_ABSENT,
+    STORE_RECOGNIZED,
+    AttestationMigrationOutcome,
+    HerdrIdentityAttestationSchemaError,
+    backup_attestation_store,
+    probe_store_schema,
+)
+from mozyo_bridge.core.state.state_store import StateStoreError
+
+# --- Outcome vocabulary (fail-closed; only *_OK / *_PLANNED admit an action). ---------
+#: The read-only report intent always succeeds if the store could be probed.
+STATUS_REPORTED = "status_reported"
+#: A dry-run plan: the action is admissible and would run under ``--write``.
+PLANNED = "planned"
+#: The mutation ran.
+APPLIED = "applied"
+#: Verified idempotent no-op — the store is already at the target shape.
+ALREADY_CURRENT = "already_current"
+#: Refused: managed agents are live in this home.
+BLOCKED_CONSUMERS_LIVE = "blocked_consumers_live"
+#: Refused: liveness could not be measured (an unreadable inventory is not an empty one).
+BLOCKED_INVENTORY_UNREADABLE = "blocked_inventory_unreadable"
+#: Refused: the store's shape is not one this intent can act on.
+BLOCKED_STORE_UNSUPPORTED = "blocked_store_unsupported"
+#: Refused: rebuild was asked for a store that ``migrate`` can handle without data loss.
+BLOCKED_MIGRATE_INSTEAD = "blocked_migrate_instead"
+#: Refused: the mutation itself failed (the store is left untouched / backed up).
+BLOCKED_FAILED = "blocked_failed"
+
+_OK_STATES = frozenset({STATUS_REPORTED, PLANNED, APPLIED, ALREADY_CURRENT})
+
+
+@dataclass(frozen=True)
+class AttestationStoreMaintenanceResult:
+    """The auditable result of one maintenance intent (structured, not only stderr)."""
+
+    intent: str
+    state: str
+    store_version: Optional[int] = None
+    store_state: str = ""
+    target_version: int = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+    detail: str = ""
+    backup_dir: Optional[Path] = None
+    live_consumers: tuple = ()
+    executed: bool = False
+    notes: Sequence[str] = field(default_factory=tuple)
+
+    @property
+    def ok(self) -> bool:
+        return self.state in _OK_STATES
+
+    def as_payload(self) -> dict:
+        return {
+            "intent": self.intent,
+            "state": self.state,
+            "ok": self.ok,
+            "executed": self.executed,
+            "store_version": self.store_version,
+            "store_state": self.store_state,
+            "target_version": self.target_version,
+            "detail": self.detail,
+            # Operator-facing evidence. A pasteable durable record redacts absolute paths
+            # (Redmine #12098 / #13368); that is the caller's boundary, not this payload's.
+            "backup_dir": str(self.backup_dir) if self.backup_dir else None,
+            "live_consumers": list(self.live_consumers),
+            "notes": list(self.notes),
+        }
+
+
+def _live_consumer_names(view, home: Path) -> tuple:
+    """The live managed agents that are **proven consumers of this store**.
+
+    Scoped by evidence, not by guess. herdr exposes no surface returning a launched
+    process's environment, so which home a live agent was launched against is
+    unobservable from outside (the constraint the whole self-attestation design exists to
+    work around). A **stored row** is the only proof that ties a live agent to *this*
+    store — so a consumer is a managed agent that is both live AND carries a record here.
+    It is deliberately NOT repo-scoped: the store is shared across workspaces, so another
+    workspace's live pair counts exactly as much as this one's.
+
+    A live agent with no row here is correctly excluded, and that is not a fail-open:
+    attestation is a **one-shot write at boot** (``perform_self_attestation`` is the sole
+    production writer and ``exec``s immediately after), so a live agent has already
+    completed its only write. Either it uses a different home, or it already failed to
+    attest — in both cases changing this store's shape cannot degrade it further, because
+    it will never write again and has no record here for a concurrent reader to misread.
+    """
+    live = {agent.name for agent in view.managed_agents}
+    return tuple(sorted(live & HerdrIdentityAttestationStore(home=home).assigned_names()))
+
+
+def _consumer_gate(view, intent: str, home: Path) -> Optional[AttestationStoreMaintenanceResult]:
+    """Refuse a mutation while consumers are live / unmeasurable, else ``None``."""
+    if not view.backend_selected:
+        # No herdr backend: there are no managed consumers of this store by construction.
+        return None
+    if not view.ok:
+        return AttestationStoreMaintenanceResult(
+            intent=intent,
+            state=BLOCKED_INVENTORY_UNREADABLE,
+            detail=(
+                f"the live herdr inventory is unreadable ({view.reason}: {view.detail}); "
+                f"liveness cannot be measured, and an unreadable inventory is not an "
+                f"empty one. Refusing to touch the store"
+            ),
+        )
+    live = _live_consumer_names(view, home)
+    if live:
+        return AttestationStoreMaintenanceResult(
+            intent=intent,
+            state=BLOCKED_CONSUMERS_LIVE,
+            detail=(
+                f"{len(live)} live managed agent(s) hold a startup self-attestation in "
+                f"this store ({', '.join(live)}); changing its shape would change what a "
+                f"concurrent older-runtime reader sees of their records. Retire / close "
+                f"them first, then re-run"
+            ),
+            live_consumers=live,
+        )
+    return None
+
+
+def run_attestation_store_status(*, home: Path) -> AttestationStoreMaintenanceResult:
+    """Read-only report of the selected store's shape (creates nothing)."""
+    store = probe_store_schema(herdr_identity_attestation_path(home))
+    notes: list[str] = []
+    if store.state == STORE_ABSENT:
+        notes.append(
+            f"no store yet; the first self-attestation creates it at "
+            f"v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}"
+        )
+    elif store.state == STORE_RECOGNIZED:
+        if store.version == HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION:
+            notes.append("current shape; normal and replacement launches are admitted")
+        else:
+            notes.append(
+                f"v{store.version} is read-compatible: reads project up to "
+                f"v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION} and normal launches write "
+                f"it v{store.version}-shaped, so older installed launchers keep working"
+            )
+            notes.append(
+                "replacement launches are REFUSED at this shape (no "
+                "`replacement_action_id` column); run `migrate --write` to admit them"
+            )
+    elif store.upgrade_required:
+        notes.append("the store is newer than this runtime; use a newer runtime")
+    else:
+        notes.append(
+            "the store's recorded version and on-disk shape disagree (partial / corrupt "
+            "/ foreign); restore a backup, or `rebuild --write` to rotate it aside"
+        )
+    return AttestationStoreMaintenanceResult(
+        intent="status",
+        state=STATUS_REPORTED,
+        store_version=store.version,
+        store_state=store.state,
+        detail=f"attestation store is {store.state}",
+        notes=tuple(notes),
+    )
+
+
+def run_attestation_store_migrate(
+    *, home: Path, view, write: bool = False
+) -> AttestationStoreMaintenanceResult:
+    """Additive v1 -> v2 migration: backup-first, idempotent, consumer-gated."""
+    path = herdr_identity_attestation_path(home)
+    store = probe_store_schema(path)
+    if store.state not in (STORE_ABSENT, STORE_RECOGNIZED):
+        return AttestationStoreMaintenanceResult(
+            intent="migrate",
+            state=BLOCKED_STORE_UNSUPPORTED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                "the store is newer than this runtime; use a newer runtime"
+                if store.upgrade_required
+                else "the store's recorded version and on-disk shape disagree (partial / "
+                "corrupt / foreign); migration would have to guess a shape. Restore a "
+                "backup, or `rebuild --write` to rotate it aside"
+            ),
+        )
+    # The live-zero read runs BEFORE the idempotent already-current success, so a replay
+    # can never report success while consumers are live (Redmine #13841 review j#79150
+    # finding 2).
+    blocked = _consumer_gate(view, "migrate", home)
+    if blocked is not None:
+        return AttestationStoreMaintenanceResult(
+            intent=blocked.intent,
+            state=blocked.state,
+            store_version=store.version,
+            store_state=store.state,
+            detail=blocked.detail,
+            live_consumers=blocked.live_consumers,
+        )
+    if store.state == STORE_ABSENT:
+        return AttestationStoreMaintenanceResult(
+            intent="migrate",
+            state=ALREADY_CURRENT,
+            store_version=None,
+            store_state=store.state,
+            detail=(
+                f"no store exists yet; nothing to migrate (the first self-attestation "
+                f"creates it at v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}). Creating "
+                f"one here would fabricate an empty projection no launch asked for"
+            ),
+        )
+    if store.version == HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION:
+        return AttestationStoreMaintenanceResult(
+            intent="migrate",
+            state=ALREADY_CURRENT,
+            store_version=store.version,
+            store_state=store.state,
+            detail=f"already at v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}; no DDL ran",
+        )
+    if not write:
+        return AttestationStoreMaintenanceResult(
+            intent="migrate",
+            state=PLANNED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                f"would migrate v{store.version} -> "
+                f"v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION} (additive, backup-first). "
+                f"Re-run with --write to perform it"
+            ),
+            notes=(
+                "after migrating, launchers that write only v"
+                f"{store.version} can no longer attest into this home — they will be "
+                "refused visibly at the managed-launch preflight, not silently dropped",
+            ),
+        )
+    try:
+        outcome: AttestationMigrationOutcome = _migrate(path)
+    except (HerdrIdentityAttestationSchemaError, StateStoreError) as exc:
+        return AttestationStoreMaintenanceResult(
+            intent="migrate",
+            state=BLOCKED_FAILED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=str(exc),
+        )
+    return AttestationStoreMaintenanceResult(
+        intent="migrate",
+        state=APPLIED if outcome.outcome == MIGRATION_APPLIED else ALREADY_CURRENT,
+        store_version=outcome.from_version,
+        store_state=store.state,
+        detail=(
+            f"migrated v{outcome.from_version} -> v{outcome.to_version} "
+            f"(additive, backup-first)"
+        ),
+        backup_dir=outcome.backup_dir,
+        executed=True,
+    )
+
+
+def _migrate(path: Path) -> AttestationMigrationOutcome:
+    """Seam for the schema-module migration (kept injectable for tests)."""
+    from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+        migrate_attestation_store,
+    )
+
+    return migrate_attestation_store(path)
+
+
+def run_attestation_store_rebuild(
+    *, home: Path, view, write: bool = False
+) -> AttestationStoreMaintenanceResult:
+    """Rotate an unmigratable store aside into ``backups/`` and start fresh.
+
+    Only for a store ``migrate`` cannot handle. A recognized older store is refused here
+    (:data:`BLOCKED_MIGRATE_INSTEAD`) because rebuild **discards** its rows while migrate
+    preserves them — offering rebuild as the easier path would quietly destroy real
+    attestations.
+    """
+    path = herdr_identity_attestation_path(home)
+    store = probe_store_schema(path)
+    if store.state == STORE_ABSENT:
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=ALREADY_CURRENT,
+            store_version=None,
+            store_state=store.state,
+            detail="no store exists; nothing to rebuild",
+        )
+    if store.state == STORE_RECOGNIZED:
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_MIGRATE_INSTEAD,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                f"the store is a recognized v{store.version} and is not corrupt; rebuild "
+                f"would discard its rows. Use `migrate --write` (additive, preserves "
+                f"them), or restore a backup if you intend to lose them"
+            ),
+        )
+    if store.upgrade_required:
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_STORE_UNSUPPORTED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                "the store is newer than this runtime understands. Rebuilding it would "
+                "destroy a newer runtime's authority; use a newer runtime instead"
+            ),
+        )
+    blocked = _consumer_gate(view, "rebuild", home)
+    if blocked is not None:
+        return AttestationStoreMaintenanceResult(
+            intent=blocked.intent,
+            state=blocked.state,
+            store_version=store.version,
+            store_state=store.state,
+            detail=blocked.detail,
+            live_consumers=blocked.live_consumers,
+        )
+    if not write:
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=PLANNED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                f"would rotate the unreadable / unsupported store into backups/ and start "
+                f"a fresh v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION} store. Re-run with "
+                f"--write to perform it"
+            ),
+            notes=(
+                "rebuilt attestations are re-derived by each slot's next launch; until "
+                "then every read degrades to fail-closed (adopt refuses, doctor "
+                "non-green), never to a false attestation",
+            ),
+        )
+    try:
+        backup_dir = backup_attestation_store(path)
+        path.unlink()
+    except (StateStoreError, OSError) as exc:
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_FAILED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=f"rebuild aborted: {exc} (the store is left untouched)",
+        )
+    return AttestationStoreMaintenanceResult(
+        intent="rebuild",
+        state=APPLIED,
+        store_version=store.version,
+        store_state=store.state,
+        detail=(
+            f"rotated the unsupported store into backups/ and removed it; the next "
+            f"self-attestation creates a fresh v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION} "
+            f"store"
+        ),
+        backup_dir=backup_dir,
+        executed=True,
+    )
+
+
+def format_maintenance_text(result: AttestationStoreMaintenanceResult) -> str:
+    """Human-readable rendering (the JSON payload is the machine surface)."""
+    lines = [
+        f"herdr attestation-store {result.intent}: {result.state}",
+        f"  store: {result.store_state}"
+        + (f" (v{result.store_version})" if result.store_version is not None else "")
+        + f" target: v{result.target_version}",
+    ]
+    if result.detail:
+        lines.append(f"  {result.detail}")
+    for note in result.notes:
+        lines.append(f"  note: {note}")
+    if result.live_consumers:
+        lines.append(f"  live consumers: {', '.join(result.live_consumers)}")
+    if result.backup_dir:
+        lines.append(f"  backup: {result.backup_dir}")
+    if not result.executed and result.state == PLANNED:
+        lines.append("  (plan only; re-run with --write to perform it)")
+    return "\n".join(lines)
+
+
+_SUPPORTED = sorted(RECOGNIZED_SCHEMA_VERSIONS)
+
+__all__ = (
+    "ALREADY_CURRENT",
+    "APPLIED",
+    "BLOCKED_CONSUMERS_LIVE",
+    "BLOCKED_FAILED",
+    "BLOCKED_INVENTORY_UNREADABLE",
+    "BLOCKED_MIGRATE_INSTEAD",
+    "BLOCKED_STORE_UNSUPPORTED",
+    "PLANNED",
+    "STATUS_REPORTED",
+    "AttestationStoreMaintenanceResult",
+    "format_maintenance_text",
+    "run_attestation_store_migrate",
+    "run_attestation_store_rebuild",
+    "run_attestation_store_status",
+)

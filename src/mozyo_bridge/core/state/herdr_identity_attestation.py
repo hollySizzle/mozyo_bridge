@@ -40,11 +40,23 @@ stored — the whitelist dataclass simply has no field for them.
 
 Conventions mirror the sibling home-scoped stores (``herdr_delivery_ledger`` /
 ``workspace_registry``): a ``*_FILENAME`` constant, a ``*_path(home=None)`` helper
-through :func:`mozyo_bridge.shared.paths.mozyo_bridge_home`, a ``PRAGMA
-user_version`` guard, a frozen dataclass with ``as_payload()``, ISO-second UTC
-timestamps, and a best-effort write that never raises into the caller. A pure leaf:
-it imports only stdlib + shared paths, so the dependency never points core ->
-provider.
+through :func:`mozyo_bridge.shared.paths.mozyo_bridge_home`, a frozen dataclass with
+``as_payload()``, ISO-second UTC timestamps, and a best-effort write that never raises
+into the caller. A pure leaf: it imports only stdlib, shared paths, and the sibling
+schema authority, so the dependency never points core -> provider.
+
+**Mixed-runtime compatibility (Redmine #13882).** A shared ``MOZYO_BRIDGE_HOME`` is
+written by launchers of different vintages at once, so schema policy lives in
+:mod:`.herdr_identity_attestation_schema` and this module never compares versions
+itself. Reads are **read-compatible**: an older recognized shape is projected up to
+:data:`COLUMNS_V2` inside one pinned read transaction, so a v1 store's rows decode
+natively instead of reading as ``absent`` (the #13882 live evidence: 94 real rows that
+every downstream verify treated as unattested). Writes are **conservative**: a v1 store
+is written v1-shaped rather than migrated, because auto-migrating the shared home would
+break every older installed launcher the same way. The one refusal is a **replacement**
+launch onto a v1 store — that field cannot be dropped, so the write raises instead of
+landing a row a replacement recovery could never match. Forward migration is an
+explicit operator command only.
 """
 
 from __future__ import annotations
@@ -55,20 +67,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
 
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    COLUMNS_V2,
+    HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY,
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    RECOGNIZED_SCHEMA_VERSIONS,
+    STORE_ABSENT,
+    STORE_RECOGNIZED,
+    create_schema,
+    readonly_compatible_select,
+    recorded_version,
+    store_status,
+    writable_projection,
+    write_drops_replacement_action_id,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 HERDR_IDENTITY_ATTESTATION_FILENAME = "herdr-identity-attestation.sqlite"
-#: v2 (Redmine #13806 tranche D R2-F2): additive ``replacement_action_id`` — the fresh
-#: process's startup self-attestation records which replacement transaction ``action_id``
-#: launched it (empty on a normal launch). The bump is downgrade-safe: an older / newer
-#: schema is rejected fail-closed on write and read as ``None`` (never a silent field drop).
-HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 2
-
-#: Recovery policy (managed-state-model.md ``### recovery policy vocabulary``): a
-#: rebuildable projection. Losing the file degrades to fail-closed (adopt refuses,
-#: doctor non-green) and is re-derived by the next launch's self-attestation; it is
-#: never authoritative for identity / liveness / workflow truth.
-HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY = "rebuildable_cache"
 
 # --- Env self-observation verdict vocabulary (what the AGENT observed of its env). --
 #: All three identity vars present and equal to the expected identity.
@@ -295,45 +310,35 @@ def evaluate_attestation(
     )
 
 
-_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS herdr_identity_attestations (
-    assigned_name TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    lane_id TEXT NOT NULL,
-    locator TEXT NOT NULL,
-    verdict TEXT NOT NULL,
-    detail TEXT NOT NULL DEFAULT '',
-    observed_at TEXT NOT NULL,
-    replacement_action_id TEXT NOT NULL DEFAULT ''
-)
-"""
+def _connect_rw(path: Path) -> tuple[sqlite3.Connection, int]:
+    """Open for writing and resolve the shape to write, without ever migrating.
 
-_COLUMNS = (
-    "assigned_name, workspace_id, role, lane_id, locator, verdict, detail, observed_at, "
-    "replacement_action_id"
-)
-
-
-def _connect_rw(path: Path) -> sqlite3.Connection:
+    Returns ``(conn, version)`` where ``version`` selects the write projection. A fresh
+    store is created at the current version; a recognized older store is left **exactly
+    as it lies** (Redmine #13882) so older installed launchers sharing this home keep
+    reading it. Anything unrecognized raises with the file byte-untouched.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA busy_timeout = 2000")
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version == 0:
-        conn.execute(_TABLE_SQL)
-        conn.execute(
-            f"PRAGMA user_version = {HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}"
-        )
-        conn.commit()
-    elif version != HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION:
+    try:
+        conn.execute("PRAGMA busy_timeout = 2000")
+        status = store_status(conn)
+        if status == STORE_ABSENT:
+            with conn:
+                create_schema(conn)
+            return conn, HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+        if status != STORE_RECOGNIZED:
+            version = recorded_version(conn)
+            raise HerdrIdentityAttestationError(
+                f"herdr identity attestation store {path} has an unsupported schema "
+                f"(recorded version {version}); this build recognizes "
+                f"{sorted(RECOGNIZED_SCHEMA_VERSIONS)}. The file is left untouched "
+                f"(fail-closed, no silent repair)."
+            )
+        return conn, int(recorded_version(conn))
+    except BaseException:
         conn.close()
-        raise HerdrIdentityAttestationError(
-            f"herdr identity attestation store {path} has schema version {version}; "
-            f"this build supports {HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}. The file "
-            f"is left untouched (downgrade-safe)."
-        )
-    return conn
+        raise
 
 
 class HerdrIdentityAttestationStore:
@@ -353,31 +358,46 @@ class HerdrIdentityAttestationStore:
         Stamps ``observed_at`` when absent. Returns the persisted record. The
         best-effort :func:`record_identity_attestation` wraps this so a store failure
         never blocks an agent boot.
+
+        Writes the store's **own** shape (Redmine #13882) rather than migrating it: a v1
+        store takes a v1-shaped row, which loses nothing on a normal launch because
+        ``replacement_action_id`` is empty. A **replacement** launch onto a v1 store
+        raises instead — dropping that field would silently unbind the fresh process from
+        the replacement transaction that a recovery matches on exactly.
         """
         observed_at = record.observed_at or _utc_now()
-        conn = _connect_rw(self.path)
+        conn, version = _connect_rw(self.path)
         try:
+            if write_drops_replacement_action_id(version, record.replacement_action_id):
+                raise HerdrIdentityAttestationError(
+                    f"herdr identity attestation store {self.path} is schema v{version}, "
+                    f"which has no `replacement_action_id` column, but this is a "
+                    f"replacement launch carrying one. Refusing to write a row that "
+                    f"silently drops the replacement binding (the store is left "
+                    f"untouched). Migrate the store first: "
+                    f"`mozyo-bridge herdr attestation-store migrate --write`."
+                )
+            columns = writable_projection(version)
+            assert columns is not None  # store_status() already proved it recognized
+            values = {
+                "assigned_name": record.assigned_name,
+                "workspace_id": record.workspace_id,
+                "role": record.role,
+                "lane_id": record.lane_id,
+                "locator": record.locator,
+                "verdict": record.verdict,
+                "detail": record.detail,
+                "observed_at": observed_at,
+                "replacement_action_id": record.replacement_action_id,
+            }
+            updatable = [c for c in columns if c != "assigned_name"]
             with conn:
                 conn.execute(
-                    f"INSERT INTO herdr_identity_attestations ({_COLUMNS}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    f"INSERT INTO herdr_identity_attestations ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)}) "
                     "ON CONFLICT(assigned_name) DO UPDATE SET "
-                    "workspace_id = excluded.workspace_id, role = excluded.role, "
-                    "lane_id = excluded.lane_id, locator = excluded.locator, "
-                    "verdict = excluded.verdict, detail = excluded.detail, "
-                    "observed_at = excluded.observed_at, "
-                    "replacement_action_id = excluded.replacement_action_id",
-                    (
-                        record.assigned_name,
-                        record.workspace_id,
-                        record.role,
-                        record.lane_id,
-                        record.locator,
-                        record.verdict,
-                        record.detail,
-                        observed_at,
-                        record.replacement_action_id,
-                    ),
+                    + ", ".join(f"{c} = excluded.{c}" for c in updatable),
+                    tuple(values[c] for c in columns),
                 )
         finally:
             conn.close()
@@ -393,23 +413,62 @@ class HerdrIdentityAttestationStore:
             replacement_action_id=record.replacement_action_id,
         )
 
+    def assigned_names(self) -> frozenset:
+        """The assigned names carrying a record here (read-only; ``frozenset()`` on any
+        unreadable / unsupported store).
+
+        Proves *which* agents actually attested into **this** home (Redmine #13882). herdr
+        exposes no surface returning a launched process's environment, so the home a live
+        agent was launched against is unobservable from outside — a stored row is the only
+        evidence that ties a live agent to this specific store. The maintenance command's
+        consumer gate joins this against the live inventory.
+        """
+        if not self.path.exists():
+            return frozenset()
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            try:
+                conn.execute("PRAGMA busy_timeout = 2000")
+                conn.execute("BEGIN")
+                if readonly_compatible_select(conn) is None:
+                    return frozenset()
+                rows = conn.execute(
+                    "SELECT assigned_name FROM herdr_identity_attestations"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return frozenset()
+        return frozenset(row[0] for row in rows)
+
     def read(self, assigned_name: str) -> Optional[IdentityAttestationRecord]:
         """Return the recorded self-attestation for ``assigned_name``, or ``None``.
 
-        Read-only, fail-open to ``None`` (absent file / unreadable / schema drift):
+        Read-only, fail-open to ``None`` (absent file / unreadable / unsupported shape):
         the caller fails closed on a ``None`` (adopt refuses, doctor non-green), so a
         cache loss never falsely attests a slot.
+
+        **Read-compatible, never migrating** (Redmine #13882): a recognized older shape is
+        projected up to the current column vocabulary — a v1 row decodes with an empty
+        ``replacement_action_id``, which is that row's true value (its writer had no
+        replacement concept), not a fabricated one. The whole read — status, version,
+        shape check, projection, and the row ``SELECT`` — runs inside **one explicit read
+        transaction** begun before the first schema query, so a peer migration committing
+        mid-read cannot yield a torn view (v1 shape + v2 version). ``busy_timeout`` is a
+        lock-wait aid only; it is not the snapshot authority (Redmine #13844 R9).
         """
         if not self.path.exists():
             return None
         try:
             conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
             try:
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version != HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION:
+                conn.execute("PRAGMA busy_timeout = 2000")
+                conn.execute("BEGIN")
+                select = readonly_compatible_select(conn)
+                if select is None:
                     return None
                 row = conn.execute(
-                    f"SELECT {_COLUMNS} FROM herdr_identity_attestations "
+                    f"SELECT {select} FROM herdr_identity_attestations "
                     "WHERE assigned_name = ?",
                     (assigned_name,),
                 ).fetchone()
@@ -449,9 +508,11 @@ def record_identity_attestation(
 
 
 __all__ = (
+    "COLUMNS_V2",
     "HERDR_IDENTITY_ATTESTATION_FILENAME",
     "HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION",
     "HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY",
+    "RECOGNIZED_SCHEMA_VERSIONS",
     "VERDICT_PRESENT",
     "VERDICT_MISSING",
     "VERDICT_CONFLICT",

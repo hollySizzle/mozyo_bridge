@@ -194,11 +194,12 @@ class HelpTokenWrapRobustness(unittest.TestCase):
 
 class PreflightAdapter(unittest.TestCase):
     def test_capable_launcher_passes(self):
-        self.assertIsNone(
-            preflight_attest_launcher_capability(
-                "/abs/launcher", _runner(_capable_help()), 5.0, {}
-            )
+        # Returns the parsed observation since Redmine #13882 (it feeds the store join
+        # without re-running the probe); "passes" still means "does not raise".
+        observation = preflight_attest_launcher_capability(
+            "/abs/launcher", _runner(_capable_help()), 5.0, {}
         )
+        self.assertEqual(observation.advertised_schema_version, _V)
 
     def test_v1_launcher_raises_typed_incompatible(self):
         with self.assertRaises(HerdrLauncherIncompatibleError) as ctx:

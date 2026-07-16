@@ -817,6 +817,14 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         ),
     )
     herdr_sub = herdr.add_subparsers(dest="herdr_command", required=True)
+    # `attestation-store` (Redmine #13882) is the public maintenance rail for the
+    # home-scoped self-attestation store. A feature-local parser module, per the
+    # `cli_sublane_retire` precedent, so this near-ceiling module gains no flags.
+    from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.cli_herdr_attestation_store import (  # noqa: E501
+        register_herdr_attestation_store_parser,
+    )
+
+    register_herdr_attestation_store_parser(herdr_sub, add_repo_option=add_repo_option)
     herdr_session_start = herdr_sub.add_parser(
         "session-start",
         help=(
@@ -867,11 +875,18 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     # it gates, and is whitespace-free so `--help` wrapping cannot split it. A launcher
     # predating this token (e.g. the v1 installed launcher) advertises none and fails the
     # preflight closed, before any process launch.
+    # The #13882 companion token advertises the store shapes this build can WRITE, built
+    # from the same store module's recognized-version set so it cannot drift either. The
+    # native-schema token alone cannot separate a pre-#13882 build (writes v2 only) from a
+    # v1-compatible one — both say `2` — yet only the latter is safe against a v1 shared
+    # home, so the store join consults the SET.
     from mozyo_bridge.core.state.herdr_identity_attestation import (
         HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+        RECOGNIZED_SCHEMA_VERSIONS,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
         build_attest_capability_contract_line,
+        build_attest_capability_stores_line,
     )
 
     herdr_agent_attest = herdr_sub.add_parser(
@@ -892,6 +907,8 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
             + build_attest_capability_contract_line(
                 HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
             )
+            + "\nwritable attestation store shapes (Redmine #13882):\n"
+            + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
         ),
     )
     herdr_agent_attest.add_argument("--assigned-name", dest="assigned_name", default="")

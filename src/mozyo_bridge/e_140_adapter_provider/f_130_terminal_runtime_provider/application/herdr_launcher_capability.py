@@ -35,8 +35,20 @@ is rejected ``schema_version_mismatch`` (the shared store's write guard requires
 match, so newer and older are both incompatible). Only an exact schema match — with the
 subcommand marker still present — is compatible.
 
-Pure: no I/O, no subprocess, no store access. It imports only the sibling capability
-marker constant, so the dependency stays within the terminal-runtime application layer.
+Redmine #13882 extends this module with the other half of the join. The decision above is
+still **code vs code** — a launcher's advertised schema against the source runtime's
+required schema — so two v2 runtimes agree while the *selected shared home* holds a v1
+store on disk, the probe passes, and the pair boots live but unattested exactly as
+described above. :func:`decide_store_compatibility` joins the same launcher observation
+against the real store's probed shape, and
+:func:`build_attest_capability_stores_line` / :attr:`LauncherCapabilityObservation
+.writable_store_versions` let a launcher advertise the store shapes it can *write* —
+without which a pre-#13882 build and a v1-compatible one are indistinguishable.
+
+Pure: no I/O, no subprocess, no store access. It imports the sibling capability marker
+constant plus the core store's schema vocabulary (state tokens and the probe's
+observation type — constants and a frozen dataclass, no I/O), so the dependency points
+only at a core leaf, never provider -> provider.
 """
 
 from __future__ import annotations
@@ -45,6 +57,12 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    STORE_ABSENT as _STORE_ABSENT_STATE,
+    STORE_UNREADABLE as _STORE_UNREADABLE_STATE,
+    STORE_UNSUPPORTED as _STORE_UNSUPPORTED_STATE,
+    StoreSchemaObservation,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     ATTEST_CAPABILITY_MARKER,
 )
@@ -62,6 +80,18 @@ ATTEST_CAPABILITY_CONTRACT_PREFIX = "mozyo_attest_capability_schema="
 #: Matches the advertised schema token in probe output. Anchored on the exact prefix so a
 #: stray digit elsewhere in the help can never be misread as the advertised schema.
 _CONTRACT_RE = re.compile(re.escape(ATTEST_CAPABILITY_CONTRACT_PREFIX) + r"(\d+)")
+
+#: The stable prefix advertising the set of **store shapes this launcher can write**
+#: (Redmine #13882). The #13847 token above advertises a single *native* schema, which
+#: cannot distinguish two launchers that both say ``2``: a pre-#13882 build that can only
+#: write a v2 store, and a #13882 build that can also write a v1 store conservatively.
+#: Against a v1 shared home the first silently drops its attestation and the second is
+#: safe — so the writable SET, not the native version, is what a store join must consult.
+#: Underscore-separated for the same reason the sibling token is hyphen-free: argparse's
+#: help wrapping breaks on hyphens and width, and underscores are not break points.
+ATTEST_CAPABILITY_STORES_PREFIX = "mozyo_attest_capability_stores="
+
+_STORES_RE = re.compile(re.escape(ATTEST_CAPABILITY_STORES_PREFIX) + r"([\d_]+)")
 
 # --- Verdict vocabulary (fail-closed; only LAUNCHER_CAPABILITY_OK proceeds). ----------
 #: Subcommand marker present AND advertised schema == the required source schema.
@@ -87,10 +117,27 @@ class LauncherCapabilityObservation:
     ``agent-attest`` subcommand exists, the #13748 check). ``advertised_schema_version`` —
     the attestation-store schema the launcher declares via the #13847 contract token, or
     ``None`` when the launcher advertises no contract (a pre-#13847 build).
+    ``advertised_store_versions`` — the store shapes the launcher declares it can WRITE
+    (Redmine #13882), or ``None`` when it advertises no such set (a pre-#13882 build).
     """
 
     subcommand_marker_present: bool
     advertised_schema_version: Optional[int]
+    advertised_store_versions: Optional[frozenset] = None
+
+    @property
+    def writable_store_versions(self) -> frozenset:
+        """The store shapes this launcher can be *proven* to write (fail-closed).
+
+        A launcher advertising no #13882 set is credited with its native schema **only**:
+        that is exactly the pre-#13882 build whose write guard is an exact-version match,
+        so crediting it with anything more would re-admit the silent-drop it cannot avoid.
+        """
+        if self.advertised_store_versions is not None:
+            return self.advertised_store_versions
+        if self.advertised_schema_version is None:
+            return frozenset()
+        return frozenset({self.advertised_schema_version})
 
 
 @dataclass(frozen=True)
@@ -115,21 +162,41 @@ def build_attest_capability_contract_line(schema_version: int) -> str:
     return f"{ATTEST_CAPABILITY_CONTRACT_PREFIX}{int(schema_version)}"
 
 
+def build_attest_capability_stores_line(store_versions) -> str:
+    """The writable-store-set token the source ``agent-attest --help`` advertises (pure).
+
+    Built from the store module's recognized-version set at the call site so the
+    advertised set can never drift from the shapes the writer actually accepts.
+    Underscore-separated and sorted for a stable, wrap-proof rendering.
+    """
+    joined = "_".join(str(int(v)) for v in sorted(store_versions))
+    return f"{ATTEST_CAPABILITY_STORES_PREFIX}{joined}"
+
+
 def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation:
     """Parse a launcher's capability probe output into observed facts (pure).
 
     Reads the combined stdout+stderr of ``<launcher> herdr agent-attest --help``. The
-    subcommand marker and the advertised schema are looked up independently: a launcher
-    can carry the subcommand yet advertise no schema (the v1 installed launcher), which
-    the decision fails closed. A malformed / absent contract token leaves the advertised
-    schema ``None`` (unprovable → fail closed), never a guessed default.
+    subcommand marker, the advertised schema, and the advertised writable store set are
+    looked up independently: a launcher can carry the subcommand yet advertise no schema
+    (the pre-#13847 installed launcher), or advertise a schema but no store set (a
+    pre-#13882 build). Each unprovable fact stays ``None`` → fail closed, never a guessed
+    default.
     """
     haystack = text or ""
     match = _CONTRACT_RE.search(haystack)
     advertised: Optional[int] = int(match.group(1)) if match else None
+    stores_match = _STORES_RE.search(haystack)
+    stores: Optional[frozenset] = None
+    if stores_match:
+        parsed = {int(p) for p in stores_match.group(1).split("_") if p}
+        # An empty / malformed set is unprovable, not "supports nothing": leave it None so
+        # the native-schema fallback applies rather than inventing a capability.
+        stores = frozenset(parsed) if parsed else None
     return LauncherCapabilityObservation(
         subcommand_marker_present=ATTEST_CAPABILITY_MARKER in haystack,
         advertised_schema_version=advertised,
+        advertised_store_versions=stores,
     )
 
 
@@ -188,15 +255,136 @@ def decide_launcher_capability(
     )
 
 
+# --- Store-join verdict vocabulary (Redmine #13882; fail-closed). ---------------------
+#: The selected store's shape is writable by the probed launcher for this launch kind.
+STORE_JOIN_OK = "attestation_store_ok"
+#: The store file exists but cannot be opened / queried at all.
+STORE_UNREADABLE = "attestation_store_unreadable"
+#: The store's recorded version / on-disk shape is not one this runtime recognizes.
+STORE_UNSUPPORTED = "attestation_store_unsupported"
+#: The store is older than this runtime and the probed launcher cannot prove it writes
+#: that shape — the exact live-but-unattested class of #13882.
+STORE_LAUNCHER_CANNOT_WRITE = "attestation_store_launcher_cannot_write"
+#: A replacement launch was requested against a store whose shape has no
+#: ``replacement_action_id`` column.
+STORE_REPLACEMENT_UNSUPPORTED = "attestation_store_replacement_unsupported"
+
+#: The store shape that first carried ``replacement_action_id`` (#13806). A replacement
+#: launch cannot be attested by anything older.
+_REPLACEMENT_MIN_STORE_VERSION = 2
+
+_MIGRATE_HINT = "`mozyo-bridge herdr attestation-store migrate --write`"
+
+
+def decide_store_compatibility(
+    observation: LauncherCapabilityObservation,
+    store: StoreSchemaObservation,
+    *,
+    required_schema_version: int,
+    replacement_launch: bool,
+) -> LauncherCapabilityVerdict:
+    """Join the launcher's advertised capability with the SELECTED store's real shape.
+
+    The check #13882 adds. The #13847 decision compares the launcher's advertised schema
+    to the source runtime's required schema — both code — so two v2 runtimes agree while
+    the shared home on disk holds v1, the probe passes, and the pair boots live but
+    unattested. This one opens the store that will actually be written.
+
+    Fail-closed precedence:
+
+    1. store unreadable -> :data:`STORE_UNREADABLE` (nothing about it is knowable);
+    2. store shape unrecognized -> :data:`STORE_UNSUPPORTED` (upgrade vs corrupt named
+       honestly from ``store.upgrade_required``);
+    3. an absent store is fine — the first write creates it at the required version;
+    4. replacement launch onto a pre-``replacement_action_id`` shape ->
+       :data:`STORE_REPLACEMENT_UNSUPPORTED` (the field cannot be dropped);
+    5. the probed launcher cannot prove it writes this shape ->
+       :data:`STORE_LAUNCHER_CANNOT_WRITE`;
+    6. otherwise :data:`STORE_JOIN_OK` — including the v1-store / normal-launch case,
+       which acceptance 2 admits via the proven backward-compatible write path.
+    """
+    if store.state == _STORE_UNREADABLE_STATE:
+        return LauncherCapabilityVerdict(
+            False,
+            STORE_UNREADABLE,
+            "the selected attestation store could not be read (corrupt, or not a "
+            "database); an unreadable store is not an empty one, so no launch may "
+            "proceed against it — its attestations could not be verified afterwards",
+        )
+    if store.state == _STORE_UNSUPPORTED_STATE:
+        hint = (
+            "it is newer than this runtime understands; use a newer runtime"
+            if store.upgrade_required
+            else "its recorded version and on-disk shape disagree (partial / corrupt / "
+            f"foreign); restore from a backup or rebuild it with "
+            f"`mozyo-bridge herdr attestation-store rebuild --write`"
+        )
+        return LauncherCapabilityVerdict(
+            False,
+            STORE_UNSUPPORTED,
+            f"the selected attestation store has an unsupported schema "
+            f"(recorded version {store.version}) — {hint}. Launching would boot a pair "
+            f"whose self-attestations this runtime could never read",
+        )
+    if store.state == _STORE_ABSENT_STATE:
+        return LauncherCapabilityVerdict(
+            True,
+            STORE_JOIN_OK,
+            f"no attestation store exists yet; the first self-attestation creates it at "
+            f"v{int(required_schema_version)}",
+        )
+    version = int(store.version or 0)
+    if replacement_launch and version < _REPLACEMENT_MIN_STORE_VERSION:
+        return LauncherCapabilityVerdict(
+            False,
+            STORE_REPLACEMENT_UNSUPPORTED,
+            f"this is a replacement launch, but the selected attestation store is "
+            f"v{version}, whose shape has no `replacement_action_id` column. Attesting "
+            f"it would silently drop the replacement binding a recovery matches on "
+            f"exactly, so the pair would relaunch unverifiable. Migrate the store first: "
+            f"{_MIGRATE_HINT}",
+        )
+    if version not in observation.writable_store_versions:
+        provable = (
+            "advertises no writable-store set, so it is credited only with its native "
+            f"schema v{observation.advertised_schema_version}"
+            if observation.advertised_store_versions is None
+            else "advertises writable store shapes "
+            f"{sorted(observation.writable_store_versions)}"
+        )
+        return LauncherCapabilityVerdict(
+            False,
+            STORE_LAUNCHER_CANNOT_WRITE,
+            f"the selected attestation store is v{version}, but the launcher {provable} "
+            f"— it cannot be proven to write this store's shape. Its self-attestation "
+            f"would be dropped and the pair would boot live but unattested. Either use a "
+            f"launcher that writes v{version}, or migrate the store: {_MIGRATE_HINT}",
+        )
+    return LauncherCapabilityVerdict(
+        True,
+        STORE_JOIN_OK,
+        f"the selected attestation store is v{version} and the launcher can write that "
+        f"shape",
+    )
+
+
 __all__ = (
     "ATTEST_CAPABILITY_CONTRACT_PREFIX",
+    "ATTEST_CAPABILITY_STORES_PREFIX",
     "LAUNCHER_CAPABILITY_OK",
     "LAUNCHER_SUBCOMMAND_ABSENT",
     "LAUNCHER_SCHEMA_CONTRACT_ABSENT",
     "LAUNCHER_SCHEMA_VERSION_MISMATCH",
+    "STORE_JOIN_OK",
+    "STORE_LAUNCHER_CANNOT_WRITE",
+    "STORE_REPLACEMENT_UNSUPPORTED",
+    "STORE_UNREADABLE",
+    "STORE_UNSUPPORTED",
     "LauncherCapabilityObservation",
     "LauncherCapabilityVerdict",
     "build_attest_capability_contract_line",
+    "build_attest_capability_stores_line",
     "parse_launcher_capability_output",
     "decide_launcher_capability",
+    "decide_store_compatibility",
 )
