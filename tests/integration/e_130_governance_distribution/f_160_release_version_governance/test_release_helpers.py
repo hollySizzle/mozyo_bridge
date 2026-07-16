@@ -1522,7 +1522,27 @@ class ReleasePublishTest(unittest.TestCase):
     SOURCE_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
     NONCE = "deadbeefcafef00d"
 
+    def _stub_source_ref_policy(self) -> None:
+        """Neutralize the origin preflight for dispatch-shape tests.
+
+        `_publish_testpypi` resolves `--source-ref` against the real origin
+        before dispatching (Redmine #13883). These tests cover the dispatch
+        argv and nonce correlation with a synthetic SHA, so the preflight is
+        stubbed here to keep them focused and offline; the preflight's own
+        behaviour is covered against a real isolated origin in
+        tests/regressions/test_issue_13883_source_ref_preflight.py.
+        """
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        for name, result in (("validate", None), ("preflight", "refs/heads/int_13472_session_continuity")):
+            patcher = patch.object(
+                release_mod.source_ref_policy, name, return_value=result
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _testpypi_namespace(self, **overrides) -> argparse.Namespace:
+        self._stub_source_ref_policy()
         base = dict(
             testpypi=True,
             pypi=False,

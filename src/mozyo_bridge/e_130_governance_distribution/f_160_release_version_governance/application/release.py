@@ -43,6 +43,7 @@ from mozyo_bridge.scaffold.rules import (
     write_scaffold,
 )
 from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import (
+    source_ref as source_ref_policy,
     version_mirror,
 )
 from mozyo_bridge.shared.errors import die
@@ -910,6 +911,7 @@ _TAG_RE = re.compile(
 _SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+
 def _validate_version(value: str) -> None:
     if not version_mirror.is_valid_version(value):
         die(
@@ -1227,6 +1229,10 @@ def _publish_testpypi(args: argparse.Namespace) -> int:
     dispatch is correlated to its run deterministically by nonce; ambiguous or
     not-yet-registered correlation is surfaced fail-closed rather than guessing
     the most recent run.
+
+    Every input is validated and ``--source-ref`` is resolved against origin
+    BEFORE `gh workflow run` is reached, so an unresolvable ref costs zero
+    dispatches instead of a run that dies in its first gate (Redmine #13883).
     """
     source_sha = getattr(args, "source_sha", None)
     expected_version = getattr(args, "expected_version", None) or getattr(
@@ -1245,8 +1251,16 @@ def _publish_testpypi(args: argparse.Namespace) -> int:
             "release publish --testpypi requires --source-ref <approved origin "
             "ref that resolves to source_sha>"
         )
+    repo_root = resolve_repo_root(getattr(args, "repo", None))
     _validate_source_sha(source_sha)
     _validate_version(expected_version)
+    source_ref_policy.validate(source_ref, repo_root=repo_root)
+    # Action-time client preflight: prove on origin what the trusted workflow
+    # gate will re-prove server-side. Any failure raises, so `gh workflow run`
+    # below is unreachable and the dispatch count stays 0 (Redmine #13883).
+    resolved_ref = source_ref_policy.preflight(
+        source_ref, source_sha, repo_root=repo_root
+    )
     nonce = _new_dispatch_nonce()
     info = _gh_dispatch_testpypi(source_sha, expected_version, source_ref, nonce)
 
@@ -1255,6 +1269,7 @@ def _publish_testpypi(args: argparse.Namespace) -> int:
     print("ref: main")
     print(f"source_sha: {source_sha}")
     print(f"source_ref: {source_ref}")
+    print(f"source_ref_resolved: {resolved_ref} -> {source_sha}")
     print(f"expected_version: {expected_version}")
     print(f"dispatch_nonce: {nonce}")
 
