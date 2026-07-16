@@ -856,12 +856,38 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     # self-inspect its injected identity env before `exec`ing the provider, and
     # record a generation-bound startup self-attestation. It is not an operator
     # command — it is the wrapper the launch argv points at.
+    # Redmine #13847: advertise the attestation-store schema/capability contract in this
+    # subcommand's `--help` so the managed-launch preflight can verify a probed launcher's
+    # store schema matches the source runtime's — not just that the subcommand exists. The
+    # token is built from the store's schema constant so it can never drift from the store
+    # it gates, and is whitespace-free so `--help` wrapping cannot split it. A launcher
+    # predating this token (e.g. the v1 installed launcher) advertises none and fails the
+    # preflight closed, before any process launch.
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
+        build_attest_capability_contract_line,
+    )
+
     herdr_agent_attest = herdr_sub.add_parser(
         "agent-attest",
         help=(
             "Managed-launch internal wrapper (Redmine #13637): self-inspect this "
             "agent's injected identity env, record a generation-bound startup "
             "self-attestation, then exec the provider given after `--`."
+        ),
+        # RawDescriptionHelpFormatter so the capability contract token in the epilog is
+        # emitted VERBATIM: argparse's default formatter reflows the epilog and would split
+        # the token across lines (measured), making a capable launcher's probe read as
+        # incapable. The token is on its own line, unwrapped, so a launcher's `--help` (the
+        # #13847 preflight probe input) carries it intact.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "capability contract (Redmine #13847):\n"
+            + build_attest_capability_contract_line(
+                HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+            )
         ),
     )
     herdr_agent_attest.add_argument("--assigned-name", dest="assigned_name", default="")

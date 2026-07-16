@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
     REASON_LAUNCH_BLOCKED,
+    REASON_LAUNCHER_INCOMPATIBLE,
     REASON_FILL_STOP,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
@@ -42,6 +43,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_SKIPPED,
     ActuationStep,
     SublaneActuationOutcome,
+    SublaneLauncherIncompatibleError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
     evaluate_dispatch_admission,
@@ -544,6 +546,33 @@ class SublaneActuateUseCase:
         else:
             try:
                 self.ops.append_lane_column(lane_runtime_root)
+            except SublaneLauncherIncompatibleError as exc:
+                # Redmine #13847: the managed-launch capability preflight refused BEFORE any
+                # process launch — the launcher's attestation-store schema does not match this
+                # runtime's, so its self-attestations would be dropped and the pair would boot
+                # live-but-unattested. Zero-actuation with a DISTINCT typed blocker (not a
+                # transient pane-create failure): the recovery is to upgrade the launcher.
+                steps.append(
+                    ActuationStep(
+                        order=2,
+                        title="managed-launch capability preflight",
+                        status=STEP_BLOCKED,
+                        detail=f"launcher incompatible ({exc.reason}): {exc}",
+                        command=None,
+                    )
+                )
+                return self._blocked(
+                    request,
+                    launch_action=launch.action,
+                    reason="managed-launch launcher capability-incompatible "
+                    "(attestation-store schema mismatch); refusing to launch a pair that "
+                    "would boot live but unattested — upgrade the launcher and re-run",
+                    reasons=(REASON_LAUNCHER_INCOMPATIBLE, exc.reason),
+                    dispatch=dispatch,
+                    steps=tuple(steps),
+                    fill_decision=fill_decision,
+                    fill_override_reason=fill_override_reason,
+                )
             except Exception as exc:  # noqa: BLE001 — fail-closed on any append failure.
                 steps.append(
                     ActuationStep(

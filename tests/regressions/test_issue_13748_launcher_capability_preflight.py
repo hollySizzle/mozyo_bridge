@@ -47,8 +47,14 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     resolve_attest_launcher,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
+    build_attest_capability_contract_line,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     preflight_attest_launcher_capability,
@@ -57,9 +63,18 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
 )
 
-# A launcher whose `herdr agent-attest --help` prints the wrapper contract marker and
-# exits 0 (a source-capable / released mozyo-bridge).
-_CAPABLE = "#!/bin/sh\necho 'usage: mozyo-bridge herdr agent-attest [-h] --assigned-name NAME'\nexit 0\n"
+# A launcher whose `herdr agent-attest --help` prints the wrapper contract marker AND (Redmine
+# #13847) advertises the required attestation-store schema, then exits 0 — a source-capable /
+# released mozyo-bridge whose attestation store matches this runtime's. The subcommand marker
+# alone is no longer sufficient (#13847 adds the schema check); a truly-capable launcher
+# advertises both.
+_CAPABLE = (
+    "#!/bin/sh\n"
+    "echo 'usage: mozyo-bridge herdr agent-attest [-h] --assigned-name NAME'\n"
+    "echo 'capability contract (Redmine #13847):'\n"
+    f"echo '{build_attest_capability_contract_line(HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION)}'\n"
+    "exit 0\n"
+)
 # An installed launcher whose CLI lacks the subcommand (argparse invalid choice / exit 2).
 _SKEW = "#!/bin/sh\necho \"invalid choice: 'agent-attest'\" >&2\nexit 2\n"
 # A success-exit non-launcher: exits 0 for any args, emits no marker (the R1 `/usr/bin/true`).

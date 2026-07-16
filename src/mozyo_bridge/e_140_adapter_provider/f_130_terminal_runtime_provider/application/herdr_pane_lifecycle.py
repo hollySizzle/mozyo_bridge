@@ -41,10 +41,34 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _parse_workspace_created,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
-    ATTEST_CAPABILITY_MARKER,
     MOZYO_BRIDGE_LAUNCHER_ENV,
     build_attest_capability_probe_argv,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
+    decide_launcher_capability,
+    parse_launcher_capability_output,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+)
+
+
+class HerdrLauncherIncompatibleError(HerdrSessionStartError):
+    """The probed managed-launch launcher is executable but capability-incompatible.
+
+    Redmine #13847: a subclass of :class:`HerdrSessionStartError` so every existing
+    caller that fails closed on a session-start error still does — but a caller that must
+    surface a *typed* ``launcher_runtime_incompatible`` blocker (the ``sublane
+    create/start`` path) can catch this specifically. Raised only for a launcher that ran
+    the probe but failed the capability contract (wrong / absent ``agent-attest``
+    subcommand, or an attestation-store schema that does not match the source runtime);
+    a mechanical failure to run the probe stays a plain :class:`HerdrSessionStartError`.
+    """
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        #: The :mod:`herdr_launcher_capability` verdict reason token (for the typed blocker).
+        self.reason = reason
 
 
 def _invoke(
@@ -101,17 +125,30 @@ def preflight_attest_launcher_capability(
     ``workspace`` / ``tab`` / ``agent`` write — so an executable-but-incapable launcher
     aborts the run with zero side effect.
 
-    A positive verdict requires BOTH an exit code of 0 AND
-    :data:`ATTEST_CAPABILITY_MARKER` in the probe output (review R1). The exit code alone
-    is not proof: a success-exit non-launcher (e.g. ``/usr/bin/true``) ignores the args and
-    exits 0 without the subcommand, then the real launch — which runs the SAME launcher as
-    the wrapper's ``argv[0]`` — would still exit before ``exec``ing the provider, the exact
-    vanishing lane this closes. So an exit-0 without the marker fails closed just like a
-    non-zero exit; a mechanical failure to even run the probe fails closed too. The error
-    names the launcher path, the required command, and the two recovery actions
-    (release/install a capable ``mozyo-bridge``, or pin an explicit absolute
-    :data:`MOZYO_BRIDGE_LAUNCHER_ENV`); it is raised, never written to a durable store, so
-    no personal path is persisted.
+    A positive verdict requires an exit code of 0 AND — decided purely in
+    :mod:`herdr_launcher_capability` from the probe output — the ``agent-attest``
+    subcommand marker AND an advertised attestation-store schema that exactly matches this
+    runtime's (Redmine #13847). The exit code alone is not proof: a success-exit
+    non-launcher (e.g. ``/usr/bin/true``) ignores the args and exits 0 without the
+    subcommand, then the real launch — which runs the SAME launcher as the wrapper's
+    ``argv[0]`` — would still exit before ``exec``ing the provider, the exact vanishing
+    lane this closes. The **schema** check is what #13847 adds over the #13748
+    subcommand-only check: an older installed launcher carries ``agent-attest`` +
+    ``--assigned-name`` (so the subcommand marker passes) but its attestation store is a
+    stale schema; injected with this runtime's shared ``MOZYO_BRIDGE_HOME`` it opens the
+    newer store, hits the exact-version write guard, silently drops the attestation, and
+    the pair boots **live but unattested** — no public recovery, the failure #13847 closes.
+
+    This function is the **probe adapter** only: it runs the subprocess, then delegates
+    the verdict to the pure :func:`parse_launcher_capability_output` /
+    :func:`decide_launcher_capability` (probe / decision separation, #13847 item 6). A
+    capability-verdict failure raises the typed :class:`HerdrLauncherIncompatibleError`
+    (carrying the verdict reason) so a caller can surface a typed
+    ``launcher_runtime_incompatible`` blocker; a mechanical failure to run the probe stays
+    a plain :class:`HerdrSessionStartError`. The error names the launcher path, the
+    required command, and the two recovery actions (release/install a capable
+    ``mozyo-bridge``, or pin an explicit absolute :data:`MOZYO_BRIDGE_LAUNCHER_ENV`); it is
+    raised, never written to a durable store, so no personal path is persisted.
 
     Only an executable-but-incapable launcher reaches here. An unresolvable launcher is
     already ``""`` (wrapping disabled — the byte-invariant #13637 fallback), and the
@@ -119,6 +156,11 @@ def preflight_attest_launcher_capability(
     launcher); an adopt-only / dry-run session starts no wrapped process and is never
     probed.
     """
+    recovery = (
+        f" Recovery: install or release a mozyo-bridge whose CLI has `herdr agent-attest` "
+        f"at attestation schema v{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}, or set "
+        f"{MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
+    )
     probe = build_attest_capability_probe_argv(launcher)
     try:
         completed = runner(
@@ -129,35 +171,31 @@ def preflight_attest_launcher_capability(
             f"managed-launch preflight could not run launcher {launcher!r} to verify it "
             f"provides the required `herdr agent-attest` wrapper subcommand "
             f"({exc.__class__.__name__}); refusing to launch a provider whose "
-            f"self-attestation wrapper may exit before the provider starts. Recovery: "
-            f"install or release a mozyo-bridge whose CLI has `herdr agent-attest`, or "
-            f"set {MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
+            f"self-attestation wrapper may exit before the provider starts." + recovery
         ) from exc
     if completed.returncode != 0:
         raise HerdrSessionStartError(
             f"selected managed-launch launcher {launcher!r} cannot run the required "
             f"`herdr agent-attest` wrapper subcommand (probe exited "
             f"{completed.returncode}); its self-attestation wrapper would exit before the "
-            f"provider starts, leaving a partial / immediately-vanishing lane. Recovery: "
-            f"install or release a mozyo-bridge whose CLI has `herdr agent-attest`, or set "
-            f"{MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
+            f"provider starts, leaving a partial / immediately-vanishing lane." + recovery
         )
-    # Exit 0 is necessary but NOT sufficient (review R1): a success-exit non-launcher
-    # (e.g. `/usr/bin/true`) ignores the args and exits 0 without the subcommand, then the
-    # real launch — running the SAME launcher as the wrapper's argv[0] — exits before the
-    # provider. Require the marker the wrapper actually passes to appear in the probe
-    # output, the positive signal that this launcher carries the `agent-attest` contract.
+    # Exit 0 is necessary but NOT sufficient: the pure decision requires the subcommand
+    # marker AND an exactly-matching advertised attestation schema (#13847). A success-exit
+    # non-launcher lacks the marker; an older installed launcher carries the marker but
+    # advertises a stale (or no) schema — both fail closed here, before any launch.
     output = (completed.stdout or "") + (completed.stderr or "")
-    if ATTEST_CAPABILITY_MARKER not in output:
-        raise HerdrSessionStartError(
+    verdict = decide_launcher_capability(
+        parse_launcher_capability_output(output),
+        required_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    )
+    if not verdict.ok:
+        raise HerdrLauncherIncompatibleError(
             f"selected managed-launch launcher {launcher!r} exited 0 for the "
-            f"`herdr agent-attest` probe but did not emit the expected wrapper contract "
-            f"marker {ATTEST_CAPABILITY_MARKER!r}; a bare success exit does not prove the "
-            f"subcommand (e.g. a non-mozyo executable that ignores its arguments), and its "
-            f"wrapper would exit before the provider starts, leaving a partial / "
-            f"immediately-vanishing lane. Recovery: install or release a mozyo-bridge whose "
-            f"CLI has `herdr agent-attest`, or set {MOZYO_BRIDGE_LAUNCHER_ENV} to an "
-            f"absolute launcher that has it."
+            f"`herdr agent-attest` probe but {verdict.detail}; refusing to launch a "
+            f"provider whose self-attestation would be dropped, leaving a partial / "
+            f"immediately-vanishing or live-but-unattested lane." + recovery,
+            reason=verdict.reason,
         )
 
 
@@ -267,6 +305,7 @@ def _close_base_pane(
 
 
 __all__ = (
+    "HerdrLauncherIncompatibleError",
     "_close_base_pane",
     "_create_tab",
     "_create_workspace",

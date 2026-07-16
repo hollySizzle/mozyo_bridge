@@ -97,6 +97,13 @@ REASON_WORKTREE_CREATE_FAILED = "worktree_create_failed"
 #: The cockpit lane column could not be appended, or the read-back did not show a live
 #: gateway + worker pane pair for the lane.
 REASON_PANE_CREATE_FAILED = "pane_create_failed"
+#: The managed-launch capability preflight (Redmine #13847) refused BEFORE any process
+#: launch: the resolved launcher is executable and carries ``herdr agent-attest`` but its
+#: attestation-store schema does not match this runtime's, so its self-attestations would
+#: be dropped and the pair would boot live-but-unattested. Distinct from
+#: ``pane_create_failed`` so create/start surfaces the typed launcher-compat blocker with
+#: its schema-upgrade recovery, and never actuates a lane that cannot attest.
+REASON_LAUNCHER_INCOMPATIBLE = "launcher_runtime_incompatible"
 #: The appended / adopted lane did not carry the expected identity stamps (repo-root /
 #: lane) on read-back, so the lane could not be positively confirmed.
 REASON_STAMP_FAILED = "stamp_failed"
@@ -155,9 +162,26 @@ BLOCKED_REASONS = frozenset(
         REASON_SENDER_UNATTESTED,
         REASON_PAIR_SPLIT,
         REASON_RUNTIME_FINGERPRINT,
+        REASON_LAUNCHER_INCOMPATIBLE,
         REASON_FILL_STOP,
     }
 )
+
+
+class SublaneLauncherIncompatibleError(RuntimeError):
+    """A live launch was refused because the launcher is capability-incompatible.
+
+    Redmine #13847: raised by the herdr-backed actuator ops when the managed-launch
+    capability preflight refuses (its attestation-store schema does not match the source
+    runtime), so the use case can map it to the typed :data:`REASON_LAUNCHER_INCOMPATIBLE`
+    blocker distinctly from a generic pane-create failure — the schema mismatch has a
+    different recovery (upgrade the launcher) and must never read as a transient append
+    failure. Carries the underlying capability verdict ``reason`` for the journal detail.
+    """
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 # ---------------------------------------------------------------------------
 # Dispatch outcome tokens recorded in the outcome / journal.

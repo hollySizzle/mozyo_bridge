@@ -9,40 +9,33 @@ the lane worktree stays a linked git worktree and its two managed agents are lau
 :func:`~...terminal_runtime_provider.application.herdr_session_start.prepare_session`
 (join-or-create workspace + ``agent start --workspace --cwd <lane-worktree>`` + root-pane
 reclaim). Placement refined by Redmine #13380 (dedicated sublane host workspace): lane
-slots land in a single sublane host workspace separate from the coordinator pair's
-project workspace, so the herdr workspace count is a constant "project 1 + host 1" —
-still never scaling with the lane count. This supersedes the #13331 j#73314 per-lane
-``wt_<hash>`` workspace (option A), which survives read-side as legacy compatibility
-only.
+slots land in a single sublane host workspace separate from the coordinator pair's project
+workspace, so the herdr workspace count is a constant "project 1 + host 1" — never scaling
+with the lane count. This supersedes the #13331 j#73314 per-lane ``wt_<hash>`` workspace
+(option A), which survives read-side as legacy compatibility only.
 
 :class:`HerdrSublaneActuatorOps` implements the SAME
 :class:`~...application.sublane_actuator_ops.SublaneActuatorOps` port the tmux adapter
 does, so the pure fail-closed :class:`~...application.sublane_actuator_use_case.SublaneActuateUseCase`
 choreography is unchanged — only the side effects differ:
 
-* ``create_worktree`` — the identical additive #12604 git op (worktree add is backend-agnostic
-  and already inside ``worktree-lifecycle-boundary.md``);
+* ``create_worktree`` — the identical additive #12604 git op (backend-agnostic worktree add);
 * ``append_lane_column`` — instead of a cockpit append, :func:`prepare_session` on the lane
   worktree with ``lane_id=lane_label``, launching the codex gateway + claude worker as lane
   slots of the project identity, placed in the dedicated sublane host workspace (#13380);
-* ``read_lane`` — resolves the lane from the **live herdr inventory** (``agent list``
-  ``mzb1`` decode, #13247) filtered to the lane's unit ``(project workspace, lane_label)``,
-  not a tmux pane snapshot; a pre-#13377 lane still resolves through its legacy
-  ``wt_<hash>`` default-lane slots (compatibility read, so a live legacy lane is never
-  double-created);
+* ``read_lane`` — resolves the lane from the **live herdr inventory** (``agent list`` mzb1
+  decode, #13247) filtered to ``(project workspace, lane_label)``, not a tmux snapshot; a
+  pre-#13377 lane resolves through its legacy ``wt_<hash>`` slots (compatibility read, so a
+  live legacy lane is never double-created);
 * ``probe_gateway_ready`` — a non-fatal boot-readiness check of the gateway agent: live in
-  the inventory AND rendered (``agent read`` returns non-blank text, #13378 — the same
-  booted-and-rendered gate as the tmux probe; the send rail's turn-start observation +
-  Enter-resend, #13322, stays the landing net);
+  the inventory AND rendered (``agent read`` returns non-blank text, #13378); the send
+  rail's turn-start observation + Enter-resend (#13322) stays the landing net;
 * ``dispatch_implementation_request`` — the governed ``handoff send`` to the gateway. The
-  gateway is a lane slot of the SAME *mozyo* workspace identity (its herdr placement —
-  the sublane host workspace, #13380 — is irrelevant to routing, which matches on the
-  mzb1 decode), so the coordinator→gateway leg is an **explicit-lane** send: the
-  dispatch passes ``--target-lane
-  <lane_label>`` (the j#73613 explicit lane field — never an all-lane scan) plus
-  ``--target-repo <lane-worktree>`` as the repo/cwd gate (a gate, not a workspace
-  selector) and a non-``%pane`` herdr target so the send rides the herdr rail (#13320
-  effective-backend predicate).
+  gateway is a lane slot of the SAME *mozyo* workspace identity (its #13380 host placement
+  is irrelevant to routing, which matches on the mzb1 decode), so the coordinator→gateway
+  leg is an **explicit-lane** send: ``--target-lane <lane_label>`` (the j#73613 explicit
+  lane field — never an all-lane scan) plus ``--target-repo <lane-worktree>`` as the
+  repo/cwd gate and a non-``%pane`` herdr target so the send rides the herdr rail (#13320).
 
 Boundary (identical to the tmux adapter): creation-side / additive only — there is no
 remove / kill / delete / merge method here; the destructive retire half stays gated
@@ -85,7 +78,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _workspace_prefix,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
+    HerdrLauncherIncompatibleError,
     _list_rows,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     HerdrSessionStartError,
@@ -387,6 +384,10 @@ class HerdrSublaneActuatorOps:
                 # #13806 R2-F2: carry the recovery's action_id into the fresh startup attestation.
                 replacement_action_id=self.replacement_action_id,
             )
+        except HerdrLauncherIncompatibleError as exc:
+            # Redmine #13847: typed launcher-compat error (not a generic pane-create failure),
+            # so the use case reports `launcher_runtime_incompatible` with schema-upgrade recovery.
+            raise SublaneLauncherIncompatibleError(str(exc), reason=exc.reason) from exc
         except HerdrSessionStartError as exc:
             raise RuntimeError(f"herdr lane slot creation failed: {exc}") from exc
         # Best-effort lane metadata upsert (Redmine #13356 j#73386 Q2 / #13377): record

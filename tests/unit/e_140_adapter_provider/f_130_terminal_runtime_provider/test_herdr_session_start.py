@@ -32,7 +32,13 @@ from support.agent_provider_binaries import (
     FakeAgentBinaries,
     neutralized_overrides,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+)
 from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
+    build_attest_capability_contract_line,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
     encode_assigned_name,
@@ -215,11 +221,19 @@ class _Herdr:
             self.attest_probes.append(list(argv))
             if self.attest_capable:
                 # Capable => exit 0 AND the wrapper-contract marker in the help output
-                # (Redmine #13748 R1: exit 0 alone is not proof of capability).
+                # (Redmine #13748 R1: exit 0 alone is not proof of capability) AND (Redmine
+                # #13847) the advertised attestation-schema capability contract matching
+                # this runtime — the subcommand marker alone is no longer sufficient.
                 return subprocess.CompletedProcess(
                     argv,
                     0,
-                    stdout="usage: mozyo-bridge herdr agent-attest [-h] --assigned-name ...",
+                    stdout=(
+                        "usage: mozyo-bridge herdr agent-attest [-h] --assigned-name ...\n"
+                        "capability contract (Redmine #13847):\n"
+                        + build_attest_capability_contract_line(
+                            HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+                        )
+                    ),
                     stderr="",
                 )
             return subprocess.CompletedProcess(
