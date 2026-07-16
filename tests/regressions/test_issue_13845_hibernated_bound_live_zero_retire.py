@@ -1060,6 +1060,73 @@ class BoundRetireCommandTests(unittest.TestCase):
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
         self.assertEqual(self.executed_closes, [])
 
+    # -- the canonical-identity duplicate key (review j#80187 R3-F1) ------
+
+    def _stale_row(self, ws: str, role: str, lane: str) -> dict:
+        """A locator-less row the shared liveness contract POSITIVELY calls dead."""
+        row = _row(ws, role, lane, "")
+        row["agent"] = ""  # present-but-blank == the positive shell-residue signal
+        self.assertEqual(classify_named_slot(row), SLOT_STALE)
+        return row
+
+    def test_cross_twin_same_role_stale_rows_terminalize(self) -> None:
+        """The shared slot and its legacy twin share a role but are DIFFERENT slots.
+
+        Review j#80187 R3-F1: keying duplicate multiplicity on ``role`` read this normal
+        compatibility shape (pinned by ``test_legacy_twin_closes_alongside_shared_unit``) as a
+        uniqueness violation. Each row alone is positively-stale residue and terminalizes; two
+        of them in *different* units must too. A locator-less stale twin is not a close target
+        either, so over-blocking here left the lane permanently un-terminalizable — this
+        ticket's own defect in a new shape.
+        """
+        self._seed_row()
+        self.rows.append(self._stale_row(_WORKSPACE_ID, "codex", _LANE))
+        self.rows.append(self._stale_row(self.bound_token, "codex", ""))
+        code, payload = self._retire()
+        self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
+        self.assertEqual(self._bound(payload)["state"], BOUND_RETIRE_RETIRED)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        self.assertEqual(self.executed_closes, [])
+
+    def test_cross_twin_same_role_with_locators_is_live_not_duplicate(self) -> None:
+        # The same cross-twin shape carrying locators is an ordinary live pair, and must be
+        # named as such — not as a corrupt inventory.
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "codex", _LANE, "w28:pS"))
+        self.rows.append(_row(self.bound_token, "codex", "", "wL:pL"))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        verdict = self._bound(payload)
+        self.assertEqual(verdict["reason"], BOUND_RETIRE_LIVE_PAIR_PRESENT)
+        self.assertEqual(verdict["expected_live"], ["codex"])
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_same_canonical_slot_duplicate_still_blocks(self) -> None:
+        # The narrowed key must still catch a REAL assigned-name duplicate: two rows for the
+        # same (workspace, lane, role). Pinned for the locator-less shape here and for the
+        # locator-carrying shape by test_duplicate_expected_rows_with_locators_name_the_duplicate.
+        self._seed_row()
+        self.rows.append(self._stale_row(_WORKSPACE_ID, "codex", _LANE))
+        self.rows.append(self._stale_row(_WORKSPACE_ID, "codex", _LANE))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self._bound(payload)["reason"], BOUND_RETIRE_DUPLICATE_INVENTORY
+        )
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_cross_twin_unresolved_twin_still_blocks(self) -> None:
+        # Per-candidate judgment: a stale shared slot does not excuse an unresolvable twin.
+        self._seed_row()
+        self.rows.append(self._stale_row(_WORKSPACE_ID, "codex", _LANE))
+        self.rows.append(_row(self.bound_token, "codex", "", ""))  # minimal => reads LIVE
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self._bound(payload)["reason"], BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED
+        )
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
     def test_locatorless_row_in_another_lane_does_not_block(self) -> None:
         # Scoping: the fences read only the TARGETED units.
         self._seed_row()

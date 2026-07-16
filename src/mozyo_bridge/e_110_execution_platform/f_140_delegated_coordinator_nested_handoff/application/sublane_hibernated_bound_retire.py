@@ -483,25 +483,37 @@ def run_hibernated_bound_retire(
     # question the aggregate cannot answer, because it collapses roles into a set (losing
     # duplicate multiplicity) and skips rows with no locator entirely.
     candidates = expected_slot_rows(rows, plan, managed_roles=managed_roles)
-    # A herdr assigned name is unique by construction, so two rows claiming the same expected
-    # role is a corrupt / ambiguous inventory, not two slots. Checked BEFORE the live read: a
-    # duplicate pair carrying locators would otherwise be reported as an ordinary
-    # `live_pair_present`, which names the wrong problem — the inventory itself is unsound and
-    # no measurement taken from it can license a terminal write. `herdr_target_resolution`
-    # refuses to send to such a unit (`multiple_matches`: "refuse to guess"); this refuses to
-    # terminalize it, for the same reason.
-    seen_roles: dict[str, int] = {}
-    for role, _locator, _row in candidates:
-        seen_roles[role] = seen_roles.get(role, 0) + 1
-    duplicates = sorted(role for role, count in seen_roles.items() if count > 1)
+    # A herdr assigned name is unique by construction, so two rows claiming the SAME canonical
+    # slot is a corrupt / ambiguous inventory, not two slots. Keyed on the decoded
+    # `(workspace_id, lane_id, role)` — one-to-one with the assigned name — and NOT on `role`
+    # (review j#80187 R3-F1): the shared `(project workspace, lane, role)` slot and its legacy
+    # `(worktree token, default, role)` compatibility twin share a role while being two
+    # distinct, legitimately coexisting slots (`test_legacy_twin_closes_alongside_shared_unit`
+    # pins exactly that shape as normal). Keying on role read that as a uniqueness violation
+    # and left such a lane permanently un-terminalizable — this ticket's own defect in a new
+    # shape, since a locator-less stale twin is not a close target either.
+    #
+    # Checked BEFORE the live read: a real duplicate carrying locators would otherwise be
+    # reported as an ordinary `live_pair_present`, which names the wrong problem — the
+    # inventory itself is unsound and no measurement taken from it can license a terminal
+    # write. `herdr_target_resolution` refuses to send to such a unit (`multiple_matches`:
+    # "refuse to guess"); this refuses to terminalize it, for the same reason.
+    seen_slots: dict[tuple[str, str, str], int] = {}
+    for found in candidates:
+        seen_slots[found.slot_key] = seen_slots.get(found.slot_key, 0) + 1
+    duplicates = sorted(
+        f"{role}@{ws}/{lane or '<default>'}"
+        for (ws, lane, role), count in seen_slots.items()
+        if count > 1
+    )
     if duplicates:
         return _blocked(
             BOUND_RETIRE_DUPLICATE_INVENTORY,
             detail=(
-                "the lane unit's inventory carries more than one row for expected managed "
-                f"role(s) ({', '.join(duplicates)}); a herdr assigned name is unique, so this "
-                "is an ambiguous / corrupt inventory and no reading of it can prove the lane "
-                "quiescent — resolve the duplicate before a terminal retire"
+                "the lane unit's inventory carries more than one row for the same canonical "
+                f"managed slot ({', '.join(duplicates)}); a herdr assigned name is unique, so "
+                "this is an ambiguous / corrupt inventory and no reading of it can prove the "
+                "lane quiescent — resolve the duplicate before a terminal retire"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
@@ -534,11 +546,14 @@ def run_hibernated_bound_retire(
     # liveness. A positively-stale row is genuine residue and does not block — blocking it
     # would recreate this ticket's own defect (a lane stuck un-terminalizable forever) in a new
     # shape. Anything else fails closed.
+    # Per-candidate, not per-role: each slot is judged on its own row. The role set is only the
+    # operator-facing label, so a shared slot and its legacy twin are decided independently
+    # even when they share a role (review j#80187 R3-F1).
     unresolved = sorted(
         {
-            role
-            for role, locator, row in candidates
-            if not locator and classify_named_slot(row) != SLOT_STALE
+            found.role
+            for found in candidates
+            if not found.locator and classify_named_slot(found.row) != SLOT_STALE
         }
     )
     if unresolved:

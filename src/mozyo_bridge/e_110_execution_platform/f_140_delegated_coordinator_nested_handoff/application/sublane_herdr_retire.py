@@ -181,30 +181,56 @@ def blocked_actuation(
     )
 
 
+@dataclass(frozen=True)
+class ExpectedSlotRow:
+    """One expected managed-slot row found in a targeted unit (Redmine #13845 j#80148).
+
+    ``slot_key`` is the row's **canonical slot identity** — the decoded
+    ``(workspace_id, lane_id, role)``, which is one-to-one with its herdr assigned name.
+    It is what a caller must count multiplicity by (review j#80187 R3-F1): the shared
+    ``(project workspace, lane, role)`` slot and its legacy ``(worktree token, default,
+    role)`` compatibility twin share a ROLE but are two distinct slots that legitimately
+    coexist (``test_legacy_twin_closes_alongside_shared_unit``), so keying on ``role``
+    alone reads that normal shape as a uniqueness violation.
+    """
+
+    workspace_id: str
+    lane_id: str
+    role: str
+    locator: str
+    row: Mapping[str, object]
+
+    @property
+    def slot_key(self) -> tuple[str, str, str]:
+        return (self.workspace_id, self.lane_id, self.role)
+
+
 def expected_slot_rows(
     rows: Sequence[Mapping[str, object]],
     plan: HerdrRetireClosePlan,
     *,
     managed_roles: Sequence[str] = _MANAGED_ROLES,
-) -> tuple[tuple[str, str, Mapping[str, object]], ...]:
+) -> tuple[ExpectedSlotRow, ...]:
     """Every expected managed-slot row in the plan's targeted unit(s), raw (pure).
 
     The unaggregated scan :func:`expected_live_slots` is defined over (Redmine #13845
-    review j#80148). It yields ``(role, locator, row)`` per matching row — **including
-    rows carrying no locator**, and **without collapsing duplicates** — because those two
-    facts are exactly what the aggregated measurement discards, and a caller that needs
-    "is this unit quiescent?" rather than "which expected roles are live?" cannot
-    reconstruct them from the role set.
+    review j#80148). It yields one :class:`ExpectedSlotRow` per matching row — **including
+    rows carrying no locator**, **without collapsing duplicates**, and **carrying each
+    row's canonical slot identity** — because those are exactly the facts the aggregated
+    measurement discards, and a caller that needs "is this unit quiescent?" rather than
+    "which expected roles are live?" cannot reconstruct them from the role set.
 
     Scoped to the same two units :func:`plan_herdr_retire_close` targets — the shared
     ``(workspace_id, lane_id)`` unit and the legacy ``(legacy_workspace_id, default)``
     twin. Rows are returned in input order. Empty inputs match nothing.
 
     This is a scan, not a judgment: whether a locator-less row means "gone" or "cannot be
-    read" is the caller's policy (see :func:`...herdr_slot_liveness.classify_named_slot`).
+    read" is the caller's policy (see :func:`...herdr_slot_liveness.classify_named_slot`),
+    and so is what counts as a duplicate — hence :attr:`ExpectedSlotRow.slot_key` is
+    exposed rather than pre-aggregated.
     """
     managed = frozenset(managed_roles)
-    found: list[tuple[str, str, Mapping[str, object]]] = []
+    found: list[ExpectedSlotRow] = []
     for row in rows:
         if not isinstance(row, Mapping):
             continue
@@ -227,7 +253,15 @@ def expected_slot_rows(
             and row_lane == DEFAULT_LANE
         )
         if in_shared or in_legacy:
-            found.append((identity.role, _agent_locator(row), row))
+            found.append(
+                ExpectedSlotRow(
+                    workspace_id=identity.workspace_id,
+                    lane_id=row_lane,
+                    role=identity.role,
+                    locator=_agent_locator(row),
+                    row=row,
+                )
+            )
     return tuple(found)
 
 
@@ -262,11 +296,11 @@ def expected_live_slots(
     return tuple(
         sorted(
             {
-                role
-                for role, locator, _row in expected_slot_rows(
+                found.role
+                for found in expected_slot_rows(
                     rows, plan, managed_roles=managed_roles
                 )
-                if locator
+                if found.locator
             }
         )
     )
