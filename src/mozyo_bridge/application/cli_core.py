@@ -342,12 +342,14 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         "--execute",
         dest="execute",
         action="store_true",
-        help="ACTUATE the recovery: derive the verdict, re-read the durable record immediately "
-        "before mutating, and deliver AT MOST ONE recovery notification per dispatch anchor "
-        "(fenced on the home-scoped dispatch outbox fence). Requires --journals-json (an "
-        "actuating sweep never trusts a hand-set --progress), plus --issue / --lane / "
-        "--lane-generation / --target. Zero-sends on a landed gate, opaque post-anchor "
-        "journals, a superseded round, a held fence, or an unavailable fence.",
+        help="ACTUATE the recovery: read Redmine LIVE, re-read immediately before mutating, "
+        "record the classification durably, then deliver AT MOST ONE notification per dispatch "
+        "anchor pointing at that record. Requires --issue / --lane / --lane-generation / "
+        "--target, live Redmine read credentials, and the note-write opt-in. Refuses "
+        "--journals-json: a snapshot is frozen, so its re-read cannot see a gate that landed "
+        "after the decision. Zero-sends on a landed gate, opaque post-anchor journals, a "
+        "superseded round, an unattested workspace, an unwritable record, or a held / "
+        "unavailable fence.",
     )
     sublane_callback.add_argument(
         "--target",
@@ -359,7 +361,9 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         "--workspace-id",
         dest="workspace_id",
         default="",
-        help="Workspace id that scopes the recovery fence key (with --execute).",
+        help="Assert the workspace id that partitions the recovery fence key (with --execute). "
+        "It is MATCHED against the durable workspace anchor, never used to override it: a "
+        "mismatch fails closed rather than minting a fresh fence partition.",
     )
     sublane_callback.add_argument(
         "--callback",

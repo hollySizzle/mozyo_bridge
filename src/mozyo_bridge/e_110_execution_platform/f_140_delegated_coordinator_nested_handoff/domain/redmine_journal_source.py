@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Protocol, Sequence
+from typing import ClassVar, Iterable, Mapping, Protocol, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     JournalMarker,
@@ -272,6 +272,13 @@ class MappingRedmineJournalSource:
     """
 
     payload: Mapping[str, object]
+
+    #: This source is a FROZEN snapshot: every :meth:`read_entries` re-parses the SAME supplied
+    #: mapping, so two reads can never differ. An actuating caller that re-reads before mutating
+    #: (the #13889 callback sweep) would get a no-op guard and leave its TOCTOU window open, so the
+    #: property is declared False and such callers must refuse to mutate on it (review R2-F1).
+    #: Read-only classification over a snapshot remains perfectly valid.
+    fresh_read: ClassVar[bool] = False
 
     @staticmethod
     def _as_journal_list(raw: object) -> list[Mapping[str, object]] | None:

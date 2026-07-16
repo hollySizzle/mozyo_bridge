@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence
+from typing import ClassVar, Mapping, Protocol, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MappingRedmineJournalSource,
@@ -225,6 +225,12 @@ class LiveRedmineJournalSource:
     transport: LiveRedmineTransport = urllib_issue_detail_fetch
     since: str | None = None
     warnings: tuple[str, ...] = field(default=())
+
+    #: Every :meth:`read_entries` performs a NEW network fetch, so two reads can legitimately
+    #: differ and a re-read is a real guard. Actuating callers (the #13889 callback sweep) require
+    #: this to be positively declared before they may mutate — a snapshot source declares it False,
+    #: so its "re-read" can never be mistaken for a fresh observation (review R2-F1).
+    fresh_read: ClassVar[bool] = True
 
     @classmethod
     def from_environment(

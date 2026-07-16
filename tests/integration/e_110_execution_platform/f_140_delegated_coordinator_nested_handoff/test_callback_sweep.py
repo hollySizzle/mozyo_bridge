@@ -26,7 +26,15 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
     SWEEP_SOURCE_UNREADABLE,
+    ZERO_SEND_RECORD_FAILED,
+    ZERO_SEND_SOURCE_NOT_FRESH,
+    ZERO_SEND_WORKSPACE_UNATTESTED,
+    build_recovery_recorder,
+    source_is_fresh,
     sweep_once,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+    LiveRedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
     SEND_RESERVED,
@@ -39,9 +47,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND_STALL_UNPROVABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+    opaque_entries_after,
+    progress_entries_after,
     render_progress_note,
+    render_sweep_record_note,
+    resolve_watermark,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MappingRedmineJournalSource,
     RedmineJournalEntry,
     render_dispatch_note,
     render_gate_note,
@@ -83,11 +96,20 @@ def prose(jid, heading):
 
 
 class RaceSource:
-    """A journal source whose snapshot can advance between reads (the TOCTOU window).
+    """A LIVE-shaped journal source whose record can advance between reads (the TOCTOU window).
 
     ``lands_on_read`` injects an entry *after* the Nth read has been served, reproducing a gate
     landing between the sweep's decision read and its pre-mutation re-read.
+
+    ``fresh_read = True`` because this models the live adapter, which re-fetches per call. That
+    declaration is load-bearing: review R2-F1 showed the production path was wired to a FROZEN
+    snapshot source, whose re-read returns the identical payload — so this fixture's race was a
+    behaviour production could not exhibit, and the "closed" TOCTOU window was open. `sweep_once`
+    now refuses to mutate on any source that does not declare freshness, and
+    `SnapshotSourceTest` pins that refusal against the real snapshot class.
     """
+
+    fresh_read = True
 
     def __init__(self, entries, *, lands_on_read=None, land=None, raises_on_read=None):
         self._entries = list(entries)
@@ -106,6 +128,18 @@ class RaceSource:
         return served
 
 
+class FakeRecorder:
+    """A durable recorder seam: records the resolution and hands back its journal id."""
+
+    def __init__(self, journal="90001"):
+        self.journal = journal
+        self.records = []
+
+    def __call__(self, result, watermark):
+        self.records.append(result.get("state"))
+        return self.journal
+
+
 class SweepFenceTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -113,12 +147,15 @@ class SweepFenceTest(unittest.TestCase):
         self.fence = DispatchOutboxFence(home=self.home)
         self.fence.bootstrap()
         self.sends = []
+        self.recorder = FakeRecorder()
         self.addCleanup(self._tmp.cleanup)
 
-    def send(self):
-        self.sends.append("recovery")
+    def send(self, record_journal):
+        self.sends.append(record_journal)
 
     def sweep(self, source, **kw):
+        kw.setdefault("send_fn", self.send)
+        kw.setdefault("record_fn", self.recorder)
         return sweep_once(
             workspace_id=WS,
             lane_id=LANE,
@@ -127,7 +164,6 @@ class SweepFenceTest(unittest.TestCase):
             source=source,
             fence=self.fence,
             target_assigned_name=TARGET,
-            send_fn=self.send,
             **kw,
         )
 
@@ -147,7 +183,7 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(result["state"], STATE_NO_PROGRESS_AFTER_HANDOFF)
         self.assertTrue(result["sent"])
         self.assertEqual(result["send_reason"], SEND_RESERVED)
-        self.assertEqual(self.sends, ["recovery"])
+        self.assertEqual(self.sends, [self.recorder.journal])
         self.assertEqual(self.fence.state_of(self.anchor_key()), FENCE_DELIVERED)
 
     def test_the_sweep_re_reads_before_mutating(self):
@@ -229,7 +265,7 @@ class SweepFenceTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=2,
             source=source, fence=self.fence, target_assigned_name=TARGET, send_fn=self.send,
-            callback=CALLBACK_SAME_LANE_ONLY,
+            record_fn=self.recorder, callback=CALLBACK_SAME_LANE_ONLY,
         )
         # Sweeping generation 2 itself: its own progress is visible, so it is not a stall.
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
@@ -243,7 +279,7 @@ class SweepFenceTest(unittest.TestCase):
         second = self.sweep(RaceSource([ir("79990")]))
         self.assertFalse(second["sent"])
         self.assertEqual(second["send_reason"], ZERO_SEND_FENCE_HELD)
-        self.assertEqual(self.sends, ["recovery"])  # still exactly one delivery
+        self.assertEqual(self.sends, [self.recorder.journal])  # still exactly one delivery
 
     def test_a_new_dispatch_round_gets_its_own_recovery_budget(self):
         # The fence keys on the dispatch anchor, so a genuinely NEW round is not starved by the
@@ -251,7 +287,7 @@ class SweepFenceTest(unittest.TestCase):
         self.sweep(RaceSource([ir("79990")]))
         result = self.sweep(RaceSource([ir("80100")]))
         self.assertTrue(result["sent"])
-        self.assertEqual(self.sends, ["recovery", "recovery"])
+        self.assertEqual(len(self.sends), 2)
 
     def test_unbootstrapped_fence_is_zero_send(self):
         # The idempotency authority is unavailable -> refuse to send rather than risk a duplicate.
@@ -265,25 +301,17 @@ class SweepFenceTest(unittest.TestCase):
             fence=bare,
             target_assigned_name=TARGET,
             send_fn=self.send,
+            record_fn=self.recorder,
         )
         self.assertFalse(result["sent"])
         self.assertEqual(result["send_reason"], ZERO_SEND_FENCE_UNAVAILABLE)
         self.assertEqual(self.sends, [])
 
     def test_a_raising_send_marks_the_fence_uncertain_and_never_auto_retries(self):
-        def boom():
+        def boom(record_journal):
             raise RuntimeError("transport died")
 
-        result = sweep_once(
-            workspace_id=WS,
-            lane_id=LANE,
-            issue=ISSUE,
-            lane_generation=GEN,
-            source=RaceSource([ir("79990")]),
-            fence=self.fence,
-            target_assigned_name=TARGET,
-            send_fn=boom,
-        )
+        result = self.sweep(RaceSource([ir("79990")]), send_fn=boom)
         self.assertFalse(result["sent"])
         self.assertTrue(result["needs_reconcile"])
         self.assertEqual(self.fence.state_of(self.anchor_key()), FENCE_UNCERTAIN)
@@ -320,6 +348,207 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(result["state"], STATE_NO_PROGRESS_AFTER_HANDOFF)
         self.assertFalse(result["sent"])
         self.assertEqual(self.fence.state_of(self.anchor_key()), "absent")
+
+
+class SnapshotSourceRefusalTest(unittest.TestCase):
+    """Review R2-F1: a frozen snapshot's "re-read" is a no-op, so it may never actuate.
+
+    Pinned against the REAL `MappingRedmineJournalSource` — the class production was actually wired
+    to — not a fixture. The previous revision's race test used a source that changes between reads,
+    a behaviour the snapshot class cannot exhibit, so it "proved" a TOCTOU closure that did not
+    exist in production.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
+        self.fence.bootstrap()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_the_real_snapshot_source_cannot_observe_a_later_landing(self):
+        # Reproduced exactly as production composes it: the CLI did `json.loads(file)` ONCE and
+        # handed the resulting mapping to the source. A gate landing on Redmine afterwards (here:
+        # the file being rewritten) is invisible, so the sweep's "re-read" returns the decision
+        # read verbatim. Note the mapping must be loaded from the file, not shared with the test —
+        # sharing the dict would make it look live, which production never is.
+        import json
+
+        path = Path(tempfile.mkdtemp()) / "snapshot.json"
+        payload = {"issue": {"id": ISSUE}, "journals": [
+            {"id": "79990", "notes": render_dispatch_note("IR", lane=LANE, lane_generation=GEN)}]}
+        path.write_text(json.dumps(payload))
+
+        source = MappingRedmineJournalSource(payload=json.loads(path.read_text()))
+        first = [e.journal_id for e in source.read_entries(ISSUE)]
+
+        payload["journals"].append({"id": "79995", "notes": "## Gate: review_finding_verdict"})
+        path.write_text(json.dumps(payload))  # the gate lands durably
+
+        second = [e.journal_id for e in source.read_entries(ISSUE)]
+        self.assertEqual(first, ["79990"])
+        self.assertEqual(second, ["79990"])  # the "fresh" re-read never sees j#79995
+        self.assertFalse(source_is_fresh(source))
+
+    def test_sweep_refuses_to_mutate_on_a_snapshot_source(self):
+        sends = []
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=MappingRedmineJournalSource(payload={"issue": {"id": ISSUE}, "journals": [
+                {"id": "79990", "notes": render_dispatch_note("IR", lane=LANE, lane_generation=GEN)}]}),
+            fence=self.fence, target_assigned_name=TARGET,
+            send_fn=lambda j: sends.append(j), record_fn=FakeRecorder(),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_SOURCE_NOT_FRESH)
+        self.assertEqual(sends, [])
+
+    def test_the_live_source_declares_freshness(self):
+        # The counterpart: the live adapter re-fetches per call, so it may actuate.
+        self.assertTrue(source_is_fresh(LiveRedmineJournalSource(base_url="https://x", api_key="k")))
+
+
+class WorkspaceAttestationTest(unittest.TestCase):
+    """Review R2-F2: the fence key is workspace-partitioned, so a blank id is a fence bypass."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
+        self.fence.bootstrap()
+        self.addCleanup(self._tmp.cleanup)
+
+    def sweep(self, ws, sends):
+        return sweep_once(
+            workspace_id=ws, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=RaceSource([ir("79990")]), fence=self.fence,
+            target_assigned_name=TARGET, send_fn=lambda j: sends.append(j),
+            record_fn=FakeRecorder(),
+        )
+
+    def test_a_blank_workspace_id_is_zero_send(self):
+        sends = []
+        result = self.sweep("", sends)
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_WORKSPACE_UNATTESTED)
+        self.assertEqual(sends, [])
+
+    def test_blank_then_real_workspace_cannot_send_twice(self):
+        # The exact reproduction: blank reserved a DIFFERENT fence row, so the same recovery for
+        # the same dispatch anchor sent twice (reviewer measured send_count=2).
+        sends = []
+        self.sweep("", sends)
+        self.sweep("ws-real", sends)
+        self.assertEqual(len(sends), 1)
+
+
+class RecoveryRecordTest(unittest.TestCase):
+    """Review R2-F3: the classification is durable BEFORE the send, and the pointer names it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
+        self.fence.bootstrap()
+        self.addCleanup(self._tmp.cleanup)
+
+    def sweep(self, *, record_fn, sends, source=None):
+        return sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=source or RaceSource([ir("79990")]), fence=self.fence,
+            target_assigned_name=TARGET, send_fn=lambda j: sends.append(j), record_fn=record_fn,
+        )
+
+    def test_no_recorder_means_no_send(self):
+        sends = []
+        result = self.sweep(record_fn=None, sends=sends)
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_RECORD_FAILED)
+        self.assertEqual(sends, [])
+
+    def test_the_record_is_written_before_the_send_and_is_what_the_pointer_names(self):
+        order = []
+
+        def recorder(result, watermark):
+            order.append("record")
+            return "90001"
+
+        def send(journal):
+            order.append(f"send->{journal}")
+
+        sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=RaceSource([ir("79990")]), fence=self.fence,
+            target_assigned_name=TARGET, send_fn=send, record_fn=recorder,
+        )
+        self.assertEqual(order, ["record", "send->90001"])
+
+    def test_an_unresolvable_record_cancels_the_send_and_releases_the_fence(self):
+        # A send whose reason never landed durably is the prohibited silent re-poke.
+        sends = []
+        result = self.sweep(record_fn=lambda r, w: "", sends=sends)
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_RECORD_FAILED)
+        self.assertEqual(sends, [])
+        # Cancelled, not delivered: a later attempt is not permanently fenced out by this failure.
+        self.assertEqual(self.fence.state_of(FenceKey(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, journal="79990",
+            action_id=SWEEP_RECOVERY_ACTION_ID, target_assigned_name=TARGET)), "cancelled")
+
+    def test_a_zero_send_resolution_is_still_recorded(self):
+        # Acceptance 3: the first-pass resolution is durable; no correction journal is needed.
+        rec = FakeRecorder()
+        sends = []
+        result = self.sweep(
+            record_fn=rec, sends=sends,
+            source=RaceSource([ir("79990"), gate("79995", "implementation_done")]),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(rec.records, [result["state"]])
+        self.assertEqual(result["recovery_record_journal"], rec.journal)
+
+    def test_the_sweep_record_is_recognized_but_never_progress(self):
+        # The needle R2-F3 requires: the coordinator's own record must not clear a genuine stall
+        # (masquerade as worker progress), and must not be opaque either (which would make every
+        # later sweep abstain — the sweep would silence itself).
+        note = render_sweep_record_note(
+            "## sweep record", lane=LANE, lane_generation=GEN,
+            dispatch_anchor="79990", outcome="no_progress_after_handoff",
+        )
+        rec = entry("79996", note)
+        entries = [ir("79990"), rec]
+        self.assertEqual(
+            progress_entries_after(entries, after_journal="79990", lane=LANE, lane_generation=GEN),
+            (),  # not progress
+        )
+        self.assertEqual(opaque_entries_after(entries, after_journal="79990"), ())  # not opaque
+        # So a still-silent lane stays a provable stall even after the sweep recorded itself.
+        w = resolve_watermark(entries, dispatch_journal="79990", lane=LANE, lane_generation=GEN,
+                              latest_generation=GEN)
+        self.assertTrue(w.stall_provable)
+
+    def test_the_recorder_resolves_its_own_journal_and_is_idempotent(self):
+        # Redmine's note write returns 204 with no journal id, so the recorder must write then
+        # re-read and resolve its marker's OWNING entry (the reconcile_dispatch_writer pattern).
+        posted = []
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                return [ir("79990")] + [entry("80500", n) for n in posted]
+
+        src = Src()
+        recorder = build_recovery_recorder(
+            source=src, issue=ISSUE, lane=LANE, lane_generation=GEN,
+            post_note=lambda i, n: posted.append(n),
+        )
+        wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
+                               lane_generation=GEN, latest_generation=GEN)
+        first = recorder({"state": "no_progress_after_handoff", "dispatch_journal": "79990"}, wm)
+        self.assertEqual(first, "80500")
+        self.assertEqual(len(posted), 1)
+        # A repeated pass at the same resolution recovers the record instead of duplicating it.
+        again = recorder({"state": "no_progress_after_handoff", "dispatch_journal": "79990"}, wm)
+        self.assertEqual(again, "80500")
+        self.assertEqual(len(posted), 1)
 
 
 class ProducerWiringTest(unittest.TestCase):
@@ -385,17 +614,18 @@ class RecoverySenderTest(unittest.TestCase):
 
         calls = []
         send = build_recovery_sender(
-            issue=ISSUE, journal="79990", target="w1:p2",
+            issue=ISSUE, target="w1:p2",
             runner=lambda argv: (calls.append(argv), (0, ""))[1],
         )
-        send()
+        send("90001")   # the recovery record journal sweep_once just wrote
         self.assertEqual(len(calls), 1)
         argv = calls[0]
         self.assertEqual(argv[1:3], ["handoff", "send"])
         # The notification is a pointer: it must name the durable anchor, not carry the content.
         self.assertIn("--issue", argv)
         self.assertEqual(argv[argv.index("--issue") + 1], ISSUE)
-        self.assertEqual(argv[argv.index("--journal") + 1], "79990")
+        # R2-F3: the pointer names the RECOVERY RECORD, not the original dispatch.
+        self.assertEqual(argv[argv.index("--journal") + 1], "90001")
         self.assertEqual(argv[argv.index("--target") + 1], "w1:p2")
 
     def test_a_failing_send_raises_so_the_fence_records_uncertain(self):
@@ -405,11 +635,11 @@ class RecoverySenderTest(unittest.TestCase):
         )
 
         send = build_recovery_sender(
-            issue=ISSUE, journal="79990", target="w1:p2",
+            issue=ISSUE, target="w1:p2",
             runner=lambda argv: (3, "target unresolved"),
         )
         with self.assertRaises(RecoverySendError):
-            send()
+            send("90001")
 
     def test_the_fenced_path_delivers_exactly_one_send_through_the_real_sender(self):
         # F1 end-to-end: sweep_once + a real fence + the production sender (injected runner).
@@ -422,14 +652,14 @@ class RecoverySenderTest(unittest.TestCase):
         fence.bootstrap()
         calls = []
         sender = build_recovery_sender(
-            issue=ISSUE, journal="79990", target=TARGET,
+            issue=ISSUE, target=TARGET,
             runner=lambda argv: (calls.append(argv), (0, ""))[1],
         )
         for _ in range(3):  # repeated sweeps of the same still-silent round
             sweep_once(
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
                 source=RaceSource([ir("79990")]), fence=fence,
-                target_assigned_name=TARGET, send_fn=sender,
+                target_assigned_name=TARGET, send_fn=sender, record_fn=FakeRecorder(),
             )
         self.assertEqual(len(calls), 1)  # at most once per dispatch anchor
 
