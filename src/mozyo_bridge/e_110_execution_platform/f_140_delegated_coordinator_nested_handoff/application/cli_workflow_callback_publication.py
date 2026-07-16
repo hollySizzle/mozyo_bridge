@@ -111,14 +111,29 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
         state = "ready (sealed operational)"
     elif seal == SEAL_INVALID:
         state = "NOT ready: the seal exists but cannot be read — restore it; do not re-create"
-    elif seal == SEAL_ABSENT:
+    elif not fence.has_store():
+        # No artifact at all: the only state where --bootstrap is a first init rather than a
+        # decision about existing rows.
+        state = (
+            "absent / never initialized — run --bootstrap"
+            if seal == SEAL_ABSENT
+            else f"NOT ready: sealed `{seal}` but the store is GONE — a loss; restore it"
+        )
+    elif fence.has_usable_store():
         state = (
             "NOT ready: store exists but is unsealed — run --bootstrap to adopt it in place"
-            if fence.has_store()
-            else "absent / never initialized — run --bootstrap"
+            if seal == SEAL_ABSENT
+            else f"NOT ready: seal `{seal}` — run --bootstrap to adopt in place"
         )
     else:
-        state = f"NOT ready: seal is `{seal}` but the store is missing or incomplete"
+        # Artifacts exist but do not work together. NOT a fresh install, and not adoptable: the DB
+        # may still hold rows (R16-F1/F3), so the honest report is damage, not "never initialized".
+        state = (
+            "NOT ready: store artifacts are inconsistent (only one of DB / sidecar, mismatched "
+            "nonce, or an unreadable DB). This is damage, not a fresh install — the DB may still "
+            "hold a live reservation. Restore it, or remove BOTH artifacts once Redmine confirms "
+            "nothing is in flight"
+        )
     print(f"callback publication fence: {state} at {fence.path}")
     return 0
 
