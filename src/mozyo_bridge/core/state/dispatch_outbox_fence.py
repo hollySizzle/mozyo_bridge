@@ -432,47 +432,6 @@ class DispatchOutboxFence:
         finally:
             conn.close()
 
-    def release(self, key: FenceKey) -> bool:
-        """Drop a still-:data:`FENCE_RESERVED` row so a later attempt may reserve it (Redmine #13889).
-
-        The abort counterpart to :meth:`reserve`, for the caller that **knows its send never
-        happened** — it reserved, then found the premise gone (a gate landed, the record could not
-        be written) and is standing down before touching the transport.
-
-        This is deliberately NOT :meth:`mark_cancelled`. ``FENCE_CANCELLED`` is *terminal* to
-        ``reserve`` (it means "a durable supersede was confirmed; never send this action again"), so
-        using it for a transient abort blocks that action forever — the #13889 R3-F3 defect. Deleting
-        the row instead says the weaker, true thing: **this attempt did not happen**, so the next
-        attempt starts clean.
-
-        Safe because it only ever deletes a row still in :data:`FENCE_RESERVED` — the state that
-        means "reserved, outcome not yet recorded". A row that reached delivered / uncertain /
-        cancelled has a *recorded* outcome and is never dropped, so release can neither erase a
-        delivery nor resurrect an action whose fate is unknown. Returns True when a row was dropped.
-        Existing callers that never release are unaffected: this adds a transition, it does not
-        change any existing one.
-        """
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cur = conn.execute(
-                "DELETE FROM dispatch_outbox WHERE workspace_id=? AND lane_id=? AND issue=? "
-                "AND journal=? AND action_id=? AND target_assigned_name=? AND state=?",
-                (*key.as_row(), FENCE_RESERVED),
-            )
-            conn.execute("COMMIT")
-            return cur.rowcount > 0
-        except sqlite3.DatabaseError as exc:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.DatabaseError:
-                pass
-            raise DispatchOutboxFenceError(
-                f"dispatch outbox fence release failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
-
     def mark_delivered(self, key: FenceKey, *, detail: str = "", now: Optional[str] = None) -> bool:
         """Record the reserved key's send as positively delivered (turn-start confirmed)."""
         return self._set_state(key, FENCE_DELIVERED, detail or "send delivered", now=now)

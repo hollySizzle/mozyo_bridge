@@ -1,0 +1,234 @@
+"""Owner-token attempt lease for the callback sweep (Redmine #13889 review R5-F1).
+
+The sweep needs an authority it can **hold across slow I/O** — a Redmine read, a record write,
+another read — so that a concurrent sweep cannot publish a duplicate record or race the send.
+
+:class:`...dispatch_outbox_fence.DispatchOutboxFence` cannot be that authority, and the attempt to
+make it one was rejected (R5-F1). Its contract assumes a reservation is **instantaneous**:
+``reserve`` treats an existing ``reserved`` row as *crash residue* and transitions it to
+``uncertain``. That is correct for its own callers, which reserve and send in one breath. But a
+sweep that holds a reservation across seconds of I/O gets its live row rewritten to ``uncertain``
+by any concurrent sweep — the owner can then no longer stand down, and the anchor is blocked
+permanently. Adding a ``release`` did not fix that: ``state == reserved`` **does not prove the send
+never happened**, because the row carries no owner identity.
+
+So this is a separate, lane-local authority with the property the fence deliberately lacks:
+**every row names its owner**. That single addition is what makes the difference:
+
+- a **loser is passive** (``LEASE_HELD``): it observes that someone else owns the attempt and
+  changes *nothing*, so an active owner is never corrupted and never mistaken for a crash;
+- **release is owner-conditional**: only the holder can drop its own lease, so "stand down" is a
+  claim only the party that knows it did not send can make;
+- an **expired** lease is reclaimable, so a genuinely crashed owner does not block the anchor
+  forever — the failure mode the fence avoids by declaring the crash window ``uncertain``, solved
+  here by a deadline instead, because here a crashed owner has provably not sent (the send happens
+  under the *fence*, after the lease work is done).
+
+The division of labour is deliberate. This lease serializes the **attempt** (reads + record
+publication). The dispatch outbox fence still serializes the **send**, in exactly the short,
+native way its contract supports. Neither is asked to do the other's job.
+"""
+
+from __future__ import annotations
+
+import secrets
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from mozyo_bridge.shared.paths import mozyo_bridge_home
+
+CALLBACK_SWEEP_LEASE_FILENAME = "callback-sweep-lease.sqlite"
+CALLBACK_SWEEP_LEASE_SCHEMA_VERSION = 1
+
+#: This caller now owns the attempt and must release it when done.
+LEASE_ACQUIRED = "acquired"
+#: Another owner holds a live lease. The caller does NOTHING — it does not mutate the row, does not
+#: reclassify the owner as crashed, and does not send. Passivity is the whole point (R5-F1).
+LEASE_HELD = "held"
+#: A previous owner's lease passed its deadline and was reclaimed by this caller.
+LEASE_RECLAIMED = "reclaimed"
+
+#: How long an attempt may hold the lease before another sweep may reclaim it. Generous relative to
+#: a sweep (a few Redmine round-trips) so a slow-but-live owner is never stolen from; short enough
+#: that a crashed owner does not strand the anchor. A crashed owner cannot have sent: the send
+#: happens under the outbox fence *after* the leased work.
+DEFAULT_LEASE_TTL_SECONDS = 120.0
+
+_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS sweep_lease (
+    workspace_id TEXT NOT NULL,
+    lane_id      TEXT NOT NULL,
+    issue        TEXT NOT NULL,
+    anchor       TEXT NOT NULL,
+    owner_token  TEXT NOT NULL,
+    expires_at   REAL NOT NULL,
+    acquired_at  REAL NOT NULL,
+    UNIQUE(workspace_id, lane_id, issue, anchor)
+)
+"""
+
+
+class CallbackSweepLeaseError(RuntimeError):
+    """The lease store is unusable, so the attempt must not proceed (fail-closed)."""
+
+
+@dataclass(frozen=True)
+class LeaseKey:
+    """The attempt identity: one lease per (workspace, lane, issue, dispatch anchor)."""
+
+    workspace_id: str
+    lane_id: str
+    issue: str
+    anchor: str
+
+    def as_row(self) -> tuple[str, str, str, str]:
+        return (self.workspace_id, self.lane_id, self.issue, self.anchor)
+
+
+@dataclass(frozen=True)
+class LeaseResult:
+    """The outcome of an acquire. ``token`` is set only when this caller owns the attempt."""
+
+    status: str
+    token: str = ""
+    detail: str = ""
+
+    @property
+    def owned(self) -> bool:
+        return self.status in (LEASE_ACQUIRED, LEASE_RECLAIMED)
+
+
+def callback_sweep_lease_path(home: Optional[Path] = None) -> Path:
+    return (home or mozyo_bridge_home()) / CALLBACK_SWEEP_LEASE_FILENAME
+
+
+class CallbackSweepLease:
+    """Owner-token attempt leases, serialized by ``BEGIN IMMEDIATE`` (home-scoped SQLite)."""
+
+    def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
+        self.path = Path(path) if path else callback_sweep_lease_path(home)
+
+    def _connect(self) -> sqlite3.Connection:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.path, isolation_level=None)
+            conn.execute("PRAGMA busy_timeout = 2000")
+            conn.execute(_TABLE_SQL)
+            conn.execute(f"PRAGMA user_version = {CALLBACK_SWEEP_LEASE_SCHEMA_VERSION}")
+            return conn
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise CallbackSweepLeaseError(
+                f"callback sweep lease store {self.path} is unusable ({type(exc).__name__}); "
+                f"fail closed rather than run an unserialized attempt"
+            ) from exc
+
+    def acquire(
+        self, key: LeaseKey, *, ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
+        now: Optional[float] = None,
+    ) -> LeaseResult:
+        """Take the attempt lease, or report that a live owner holds it (passively).
+
+        A live owner's row is **never** mutated by a loser — the defect that made the shared fence
+        unusable here (R5-F1). An expired row is reclaimed with a fresh token, which also
+        invalidates the dead owner's release.
+        """
+        stamp = float(now if now is not None else time.time())
+        token = secrets.token_hex(16)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT owner_token, expires_at FROM sweep_lease WHERE workspace_id=? AND "
+                "lane_id=? AND issue=? AND anchor=?",
+                key.as_row(),
+            ).fetchone()
+            if row is not None and float(row[1]) > stamp:
+                conn.execute("ROLLBACK")
+                return LeaseResult(
+                    status=LEASE_HELD,
+                    detail="another sweep owns this attempt; standing down without touching it",
+                )
+            reclaimed = row is not None
+            conn.execute(
+                "INSERT INTO sweep_lease (workspace_id, lane_id, issue, anchor, owner_token, "
+                "expires_at, acquired_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id, lane_id, issue, anchor) DO UPDATE SET "
+                "owner_token=excluded.owner_token, expires_at=excluded.expires_at, "
+                "acquired_at=excluded.acquired_at",
+                (*key.as_row(), token, stamp + float(ttl_seconds), stamp),
+            )
+            conn.execute("COMMIT")
+            return LeaseResult(
+                status=LEASE_RECLAIMED if reclaimed else LEASE_ACQUIRED,
+                token=token,
+                detail="reclaimed an expired lease" if reclaimed else "acquired a fresh lease",
+            )
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise CallbackSweepLeaseError(
+                f"callback sweep lease acquire failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def release(self, key: LeaseKey, token: str) -> bool:
+        """Drop the lease, but only if ``token`` still owns it. Returns True when dropped.
+
+        Owner-conditional by construction: a caller that has been superseded (its lease expired and
+        was reclaimed) cannot delete the new owner's lease.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "DELETE FROM sweep_lease WHERE workspace_id=? AND lane_id=? AND issue=? AND "
+                "anchor=? AND owner_token=?",
+                (*key.as_row(), str(token)),
+            )
+            conn.execute("COMMIT")
+            return cur.rowcount > 0
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise CallbackSweepLeaseError(
+                f"callback sweep lease release failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def owner_of(self, key: LeaseKey) -> str:
+        """The current owner token, or ``""`` when unheld / expired (read-only, for tests+debug)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT owner_token, expires_at FROM sweep_lease WHERE workspace_id=? AND "
+                "lane_id=? AND issue=? AND anchor=?",
+                key.as_row(),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or float(row[1]) <= time.time():
+            return ""
+        return str(row[0])
+
+
+__all__ = (
+    "CALLBACK_SWEEP_LEASE_FILENAME",
+    "LEASE_ACQUIRED",
+    "LEASE_HELD",
+    "LEASE_RECLAIMED",
+    "DEFAULT_LEASE_TTL_SECONDS",
+    "CallbackSweepLeaseError",
+    "LeaseKey",
+    "LeaseResult",
+    "CallbackSweepLease",
+    "callback_sweep_lease_path",
+)
