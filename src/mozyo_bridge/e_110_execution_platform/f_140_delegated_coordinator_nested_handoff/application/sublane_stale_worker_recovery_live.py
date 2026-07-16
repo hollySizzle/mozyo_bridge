@@ -398,18 +398,24 @@ class LiveStaleWorkerRecoveryOps:
         )
         if not identity_resolved:
             return RecoveryObservation()
-        # A STANDARD sublane WORKER (Redmine #13806 R2-F1): positively the configured worker
-        # (implementer) provider, NOT the lane gateway (coordinator) provider, NOT the default
-        # coordinator lane, and the approval itself must name the worker provider. A same-issue
-        # lane gateway (a non-``default`` lane but the gateway provider) is therefore rejected as
-        # ``gateway_or_foreign_protected``, never closed as a worker. An unresolvable provider
-        # binding fails closed (not a worker).
+        # A STANDARD sublane WORKER (Redmine #13806 R2-F1 / R2-R1): positively the configured
+        # worker (implementer) provider on EVERY axis — the live slot's role AND the approval's
+        # own independent ``role`` and ``provider`` fields must all equal the worker provider and
+        # none may be the gateway (coordinator) provider — NOT the default coordinator lane. A
+        # same-issue-lane gateway (a non-``default`` lane but the gateway provider), a foreign
+        # slot, OR an approval whose provider pin points at the gateway / a foreign provider, is
+        # rejected as ``gateway_or_foreign_protected`` (never closed as a worker). An unresolvable
+        # provider binding fails closed (not a worker). ``request.provider`` is validated here
+        # BECAUSE it is the pin that enters the transaction authority yet is not a herdr-observable
+        # field downstream — so an unchecked foreign provider pin would otherwise pass unseen.
         worker_provider, gateway_provider = self._worker_gateway_providers()
         is_standard = bool(worker_provider) and (
             _norm_lane(identity.lane_id) != "default"
             and identity.role == worker_provider
             and identity.role != gateway_provider
             and _norm(request.role) == worker_provider
+            and _norm(request.provider) == worker_provider
+            and _norm(request.provider) != gateway_provider
         )
         # a live-generation revision match (a same-name recycle at a new revision is stale gen)
         revision_raw = row.get("revision")
@@ -500,38 +506,69 @@ class LiveStaleWorkerRecoveryOps:
             return DRAIN_SEND_ERROR
         return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
 
+    def _redispatch_marker(self, continuation: ContinuationPointer, worker_provider: str) -> str:
+        """The EXACT ``[mozyo:handoff:...]`` marker ``dispatch_to_worker`` writes (byte-for-byte).
+
+        The governed worker-forward rail always sends ``--source redmine --kind
+        implementation_request --to <worker_provider>`` (:mod:`...sublane_worker_dispatcher`),
+        so the redispatch's marker is deterministic. ``gate_redispatched`` matches it exactly —
+        a delivery of a *different* gate kind / anchor / receiver produces a different marker
+        and can never be mistaken for THIS redispatch (Redmine #13806 R2-R2).
+        """
+        return (
+            f"[mozyo:handoff:source=redmine:issue={_norm(continuation.issue_id)}:"
+            f"journal={_norm(continuation.journal_id)}:kind=implementation_request:"
+            f"to={worker_provider}]"
+        )
+
     def gate_redispatched(self, continuation: ContinuationPointer) -> bool:
-        """Has the original gate CONFIRMED-landed on the FRESH worker? (durable idempotency)
+        """Has the original gate CONFIRMED-landed on the exact FRESH worker? (durable idempotency)
 
         Reads the REAL herdr delivery ledger (written by the dispatch rail, never self-written)
-        and confirms only a record that is unmistakably the redispatch to the fresh worker
-        (Redmine #13806 R2-F3), matching ALL of:
+        and confirms ONLY a record that is unmistakably THIS redispatch to the fresh worker
+        (Redmine #13806 R2-F3 / R2-R2). Every axis is matched fail-closed — a single mismatch is
+        not confirmed (the use case then reports ``uncertain`` and never blind-resends):
 
-        - the exact anchor (``issue_id`` + ``journal_id`` of the continuation);
-        - the resolved worker ``receiver`` provider;
-        - ``status == "sent"`` AND an **accepted reason** (``ok`` — a landing-marker-observed
-          submit; a bare ``queue_enter`` / unconfirmed reason is NOT confirmed);
-        - recorded **after the fresh worker's startup attestation** (``recorded_at`` >
-          the fresh attestation ``observed_at``) — so the INITIAL delivery to the now-vanished
-          old worker (same anchor, before the recovery) can never be mistaken for the redispatch.
-
-        Any unreadable ledger / missing fresh attestation / only-``queue_enter`` record yields
-        ``False`` (the use case then reports ``uncertain`` and never blind-resends).
+        - the resolved worker provider (unresolved binding => never confirmed, not skipped);
+        - a live fresh worker locator distinct from the vanished old one;
+        - the **exact deterministic notification marker** (source=redmine + exact issue/journal
+          anchor + ``kind=implementation_request`` + ``to=<worker_provider>``) — a wrong gate
+          kind / anchor / receiver is a different marker;
+        - the ledger anchor (``source=redmine`` / ``issue_id`` / ``journal_id``), ``receiver``
+          == the worker provider, ``backend=herdr``, ``rail=queue_enter_rail``;
+        - ``target`` == the **current fresh worker locator** — so a delivery to any other pane
+          (incl. the pre-recovery delivery to the now-vanished old worker) is rejected;
+        - ``status=sent`` AND an **accepted reason** (``ok`` — a landing-marker-observed submit;
+          a bare ``queue_enter`` / unconfirmed reason is NOT confirmed);
+        - recorded **after the fresh worker's startup attestation** — a second, temporal fence
+          against the same-anchor pre-recovery delivery.
         """
+        worker_provider, _gateway = self._worker_gateway_providers()
+        if not worker_provider:
+            return False  # unresolved provider binding => fail-closed (never skip the check)
         fresh_observed_at = self._fresh_attestation_observed_at()
         if not fresh_observed_at:
             return False  # no fresh attested worker => cannot establish the post-launch boundary
-        worker_provider, _gateway = self._worker_gateway_providers()
+        fresh_locator = self._fresh_worker_locator()
+        if not fresh_locator or fresh_locator == _norm(self.request.locator):
+            return False  # no distinct fresh worker resolved
+        marker = self._redispatch_marker(continuation, worker_provider)
         try:
-            records = self._ledger().records_for_issue(_norm(continuation.issue_id))
+            records = self._ledger().records_for_marker(marker)
         except Exception:  # noqa: BLE001 - unreadable ledger => not confirmed (never assume sent)
             return False
         for rec in records:
             if (
-                _norm(rec.journal_id) == _norm(continuation.journal_id)
+                _norm(rec.notification_marker) == marker
+                and _norm(rec.source) == "redmine"
+                and _norm(rec.issue_id) == _norm(continuation.issue_id)
+                and _norm(rec.journal_id) == _norm(continuation.journal_id)
+                and _norm(rec.receiver) == worker_provider
+                and _norm(rec.backend) == "herdr"
+                and _norm(rec.rail) == "queue_enter_rail"
+                and _norm(rec.target) == fresh_locator
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"  # accepted (marker-observed submit), not queue_enter
-                and (not worker_provider or _norm(rec.receiver) == worker_provider)
                 and _recorded_after(rec.recorded_at, fresh_observed_at)
             ):
                 return True

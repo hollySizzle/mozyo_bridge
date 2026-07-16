@@ -150,6 +150,21 @@ class ObserveTargetTests(_LiveCase):
         )
         self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_GATEWAY_OR_FOREIGN)
 
+    def test_approval_provider_gateway_is_protected(self):
+        # R2-R1: a live Claude worker row but an approval whose provider pins the GATEWAY must be
+        # protected — the provider field enters the transaction authority and is not observable
+        # downstream, so it is validated here.
+        obs = self._ops([_row()]).observe_target(_request(provider="codex"))
+        self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_GATEWAY_OR_FOREIGN)
+
+    def test_approval_provider_foreign_is_protected(self):
+        obs = self._ops([_row()]).observe_target(_request(provider="rustc"))
+        self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_GATEWAY_OR_FOREIGN)
+
+    def test_approval_provider_blank_is_protected(self):
+        obs = self._ops([_row()]).observe_target(_request(provider=""))
+        self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_GATEWAY_OR_FOREIGN)
+
     def test_wrong_issue_lane(self):
         name = encode_assigned_name(WS, ROLE, "issue_99999_other")
         obs = self._ops([_row(name=name)]).observe_target(
@@ -400,15 +415,20 @@ class ActuatorDelegationTests(_LiveCase):
 
 
 class RedispatchLedgerTests(_LiveCase):
-    """R2-F3: gate_redispatched confirms ONLY a real, fresh-target, post-launch, accepted send."""
+    """R2-F3 / R2-R2: gate_redispatched confirms ONLY the exact-marker, fresh-target,
+    herdr/queue-enter, accepted, post-launch redispatch of THIS gate to the worker."""
 
     ISSUE, JOURNAL = "13806", "79485"
+    OLD = LOCATOR  # the vanished old worker's locator (== request.locator)
+    FRESH = "w28:p99"  # the freshly-relaunched worker's distinct locator
     LAUNCH_AT = "2026-07-15T12:00:00+00:00"
     AFTER = "2026-07-15T12:05:00+00:00"
     BEFORE = "2026-07-15T11:00:00+00:00"
+    MARKER = f"[mozyo:handoff:source=redmine:issue={ISSUE}:journal={JOURNAL}:kind=implementation_request:to={ROLE}]"
 
     def _ops(self, ledger, att_home):
-        live.list_herdr_agent_rows = lambda env: [_row()]
+        # the live inventory shows the FRESH worker (distinct locator from the old request.locator)
+        live.list_herdr_agent_rows = lambda env: [_row(pane_id=self.FRESH)]
         return live.LiveStaleWorkerRecoveryOps(
             repo_root=ROOT, request=_request(), ledger=ledger, attestation_home=att_home,
         )
@@ -421,19 +441,28 @@ class RedispatchLedgerTests(_LiveCase):
 
     def _seed_launch(self, att_home, observed_at=LAUNCH_AT):
         HerdrIdentityAttestationStore(home=att_home).upsert(IdentityAttestationRecord(
-            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=LOCATOR,
+            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=self.FRESH,
             verdict="present", observed_at=observed_at, replacement_action_id="a",
         ))
 
     def _delivered(self, **over):
+        # a full, correct herdr worker-dispatch delivery record (as the real writer projects it)
         base = dict(
-            issue_id=self.ISSUE, journal_id=self.JOURNAL, status="sent", reason="ok",
-            receiver=ROLE, target=LOCATOR, recorded_at=self.AFTER,
+            notification_marker=self.MARKER, source="redmine", issue_id=self.ISSUE,
+            journal_id=self.JOURNAL, receiver=ROLE, backend="herdr", rail="queue_enter_rail",
+            target=self.FRESH, status="sent", reason="ok", recorded_at=self.AFTER,
         )
         base.update(over)
         return HerdrDeliveryLedgerRecord(**base)
 
-    def test_confirmed_when_accepted_delivery_after_launch(self):
+    def _fixture(self, **over):
+        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
+        att = Path(tempfile.mkdtemp())
+        self._seed_launch(att)
+        ledger.append(self._delivered(**over))
+        return self._ops(ledger, att)
+
+    def test_confirmed_when_full_exact_delivery_after_launch(self):
         ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
         att = Path(tempfile.mkdtemp())
         self._seed_launch(att)
@@ -442,41 +471,80 @@ class RedispatchLedgerTests(_LiveCase):
         ledger.append(self._delivered())
         self.assertTrue(ops.gate_redispatched(self._continuation()))
 
-    def test_queue_enter_reason_is_not_confirmed(self):
-        # A submit-unconfirmed (queue_enter) delivery is NOT a landing (R2-F3 cond 4).
-        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
-        att = Path(tempfile.mkdtemp())
-        self._seed_launch(att)
-        ledger.append(self._delivered(reason="queue_enter"))
-        self.assertFalse(self._ops(ledger, att).gate_redispatched(self._continuation()))
-
-    def test_delivery_before_launch_is_the_old_worker_not_confirmed(self):
-        # The INITIAL delivery to the now-vanished old worker (same anchor, before the recovery
-        # launch) must never be mistaken for the redispatch (R2-F3 cond 3 / "same anchor").
-        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
-        att = Path(tempfile.mkdtemp())
-        self._seed_launch(att)
-        ledger.append(self._delivered(recorded_at=self.BEFORE))
-        self.assertFalse(self._ops(ledger, att).gate_redispatched(self._continuation()))
-
-    def test_no_fresh_attestation_is_not_confirmed(self):
-        # Without a fresh-launch boundary the redispatch cannot be distinguished => unconfirmed.
-        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
-        ledger.append(self._delivered())
-        self.assertFalse(
-            self._ops(ledger, Path(tempfile.mkdtemp())).gate_redispatched(self._continuation())
+    def test_confirmed_via_real_delivery_outcome_projection(self):
+        # R2-R2: prove the oracle matches what the REAL writer (record_herdr_delivery on a
+        # make_outcome) projects — backend/rail are derived, not hand-set.
+        from mozyo_bridge.core.state.herdr_delivery_ledger import record_herdr_delivery
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            RedmineAnchor,
+            make_outcome,
         )
 
-    def test_wrong_receiver_is_not_confirmed(self):
-        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
+        led_home = Path(tempfile.mkdtemp())
         att = Path(tempfile.mkdtemp())
         self._seed_launch(att)
-        ledger.append(self._delivered(receiver="codex"))  # gateway, not the worker
-        self.assertFalse(self._ops(ledger, att).gate_redispatched(self._continuation()))
+        outcome = make_outcome(
+            status="sent", reason="ok", receiver=ROLE, target=self.FRESH,
+            anchor=RedmineAnchor(issue=self.ISSUE, journal=self.JOURNAL),
+            mode="queue-enter", kind="implementation_request", notification_marker=self.MARKER,
+            source="redmine",
+            queue_enter_turn_start_observation={"observation_kind": "post_choreography_snapshot",
+                                                "runtime_state": "turn_ended", "read_ok": True},
+        )
+        record_herdr_delivery(outcome, home=led_home)
+        ops = self._ops(HerdrDeliveryLedger(home=led_home), att)
+        self.assertTrue(ops.gate_redispatched(self._continuation()))
+
+    def test_queue_enter_reason_is_not_confirmed(self):
+        self.assertFalse(self._fixture(reason="queue_enter").gate_redispatched(self._continuation()))
+
+    def test_wrong_marker_kind_is_not_confirmed(self):
+        bad = self.MARKER.replace("kind=implementation_request", "kind=custom")
+        self.assertFalse(
+            self._fixture(notification_marker=bad).gate_redispatched(self._continuation())
+        )
+
+    def test_wrong_target_is_not_confirmed(self):
+        self.assertFalse(self._fixture(target="w99:p1").gate_redispatched(self._continuation()))
+
+    def test_wrong_backend_is_not_confirmed(self):
+        self.assertFalse(self._fixture(backend="tmux").gate_redispatched(self._continuation()))
+
+    def test_wrong_rail_is_not_confirmed(self):
+        self.assertFalse(self._fixture(rail="event_rail").gate_redispatched(self._continuation()))
+
+    def test_wrong_receiver_is_not_confirmed(self):
+        self.assertFalse(self._fixture(receiver="codex").gate_redispatched(self._continuation()))
+
+    def test_delivery_before_launch_is_not_confirmed(self):
+        # the same-anchor pre-recovery delivery to the old worker is temporally rejected too
+        self.assertFalse(
+            self._fixture(recorded_at=self.BEFORE).gate_redispatched(self._continuation())
+        )
+
+    def test_no_fresh_attestation_is_not_confirmed(self):
+        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
+        ledger.append(self._delivered())
+        live.list_herdr_agent_rows = lambda env: [_row(pane_id=self.FRESH)]
+        ops = live.LiveStaleWorkerRecoveryOps(
+            repo_root=ROOT, request=_request(), ledger=ledger,
+            attestation_home=Path(tempfile.mkdtemp()),  # empty
+        )
+        self.assertFalse(ops.gate_redispatched(self._continuation()))
+
+    def test_unresolved_provider_is_not_confirmed(self):
+        orig = live.resolve_worker_provider
+        live.resolve_worker_provider = lambda root: (_ for _ in ()).throw(
+            live.WorkflowProviderUnresolved("unbound")
+        )
+        try:
+            self.assertFalse(self._fixture().gate_redispatched(self._continuation()))
+        finally:
+            live.resolve_worker_provider = orig
 
     def test_redispatch_gate_without_fresh_worker_is_error(self):
-        # No fresh worker resolved (only the old locator) => never dispatch blind.
-        live.list_herdr_agent_rows = lambda env: []
+        # No distinct fresh worker resolved (still the old locator) => never dispatch blind.
+        live.list_herdr_agent_rows = lambda env: [_row(pane_id=self.OLD)]
         ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
         self.assertEqual(ops.redispatch_gate(self._continuation()), DRAIN_SEND_ERROR)
 
