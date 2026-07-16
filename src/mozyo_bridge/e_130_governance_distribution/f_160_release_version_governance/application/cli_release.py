@@ -210,9 +210,12 @@ def register(sub) -> None:
             "event ref stays `main`; --source-sha is the artifact "
             "authority, --expected-version the version it must carry, and "
             "--source-ref the approved origin ref it must currently "
-            "resolve from. All three are required. The run is correlated "
-            "to a unique dispatch nonce (no latest-one guessing); polling "
-            "is delegated to `release workflow wait`."
+            "resolve from (spelled as ORIGIN spells it). All three are "
+            "required and are checked before dispatch: an unresolvable, "
+            "ambiguous, or mismatched --source-ref costs zero dispatches. "
+            "The run is correlated to a unique dispatch nonce (no "
+            "latest-one guessing); polling is delegated to `release "
+            "workflow wait`."
         ),
     )
     publish_mode.add_argument(
@@ -257,7 +260,14 @@ def register(sub) -> None:
         help=(
             "Approved origin integration/release-candidate ref that must "
             "currently resolve to --source-sha (lineage evidence) under "
-            "`--testpypi`."
+            "`--testpypi`. Spell it AS ORIGIN SPELLS IT, not as git spells "
+            "it locally: `refs/heads/<branch>` (canonical) or `<branch>`. "
+            "Local remote-tracking names (`origin/<branch>`, "
+            "`refs/remotes/origin/<branch>`) name refs that exist only in "
+            "your clone; they are rejected before dispatch with the exact "
+            "correction to use, never silently rewritten (Redmine #13883). "
+            "The ref is resolved on origin before dispatch and must match "
+            "exactly one non-peel ref whose tip is --source-sha."
         ),
     )
     release_publish.add_argument(

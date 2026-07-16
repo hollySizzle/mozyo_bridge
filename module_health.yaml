@@ -1125,7 +1125,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
-    lines: 1495
+    lines: 1510
     reason: >-
       Release check/bump/publish/workflow helpers in one module. Splitting
       touches release gates, so it is sequenced carefully. Path re-keyed from
@@ -1139,6 +1139,13 @@ allowlist:
       deterministic nonce-based run correlation) is cohesive with the existing
       publish helper and is not split ad hoc while the release-gate split is
       still sequenced.
+      Baseline 1495 -> 1510 for #13883: the `source_ref` spelling policy and
+      action-time origin preflight were extracted to the sibling module
+      ``application/source_ref.py`` rather than grown here (same posture as
+      ``version_mirror``), so only the wiring — the import and the pre-dispatch
+      validate/preflight call in ``_publish_testpypi`` — remains in this module.
+      The feature itself is ~190 lines; +15 is what could not be moved without
+      making the publish helper's own control flow unreadable.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

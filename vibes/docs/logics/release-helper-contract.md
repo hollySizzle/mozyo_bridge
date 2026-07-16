@@ -44,9 +44,43 @@ repo の **現在 authoritative な release-version mirror set** を 1 つの ve
 
 publish workflow の dispatch / 状態確認に専念する helper。version 文字列の整合・gate 判定・release notes は扱わない。
 
-- `release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin ref>` — exact-candidate 内部 beta dispatch (Redmine #13601)。`gh workflow run testpypi.yml --ref main -f source_sha=... -f expected_version=... -f source_ref=... -f dispatch_nonce=...` を構成する。workflow の定義 / event ref は `main` 固定 (artifact authority は SHA、workflow authority は main)。3 input は必須で、`source_sha` は exact 40-hex に validate、`expected_version` は PEP 440 shape に validate、`source_ref` は origin 上で action-time に `source_sha` へ解決すべき approved ref。`--version` は `--expected-version` の後方互換 alias。dispatch は run-name 中の unique `dispatch_nonce` で決定的に相関し (latest-one 推測禁止)、exact 1 件以外は fail-closed で `result: blocker` を返す。相関した run-id を active ticket に貼れる shape で stdout に出す。fail-closed 照合そのもの (HEAD==SHA / version mirror / candidate test.yml が trusted origin/main と byte 一致 / Test CI success / version 未使用 schema fail-closed / source_ref が exact 1 件の named origin ref。#13601 j#76006 F1-F3) は trusted な main-defined workflow build job の inline gate 内で行い、helper は dispatch と相関のみを担う。workflow 完了 polling は `release workflow wait` に委ねる。
+- `release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin 上の ref literal>` — exact-candidate 内部 beta dispatch (Redmine #13601)。`gh workflow run testpypi.yml --ref main -f source_sha=... -f expected_version=... -f source_ref=... -f dispatch_nonce=...` を構成する。workflow の定義 / event ref は `main` 固定 (artifact authority は SHA、workflow authority は main)。3 input は必須で、`source_sha` は exact 40-hex に validate、`expected_version` は PEP 440 shape に validate、`source_ref` は origin 上で action-time に `source_sha` へ解決すべき approved ref であり、**origin 上の ref literal として綴る** (`### source_ref Spelling Policy`)。`--version` は `--expected-version` の後方互換 alias。dispatch は run-name 中の unique `dispatch_nonce` で決定的に相関し (latest-one 推測禁止)、exact 1 件以外は fail-closed で `result: blocker` を返す。相関した run-id を active ticket に貼れる shape で stdout に出す。fail-closed 照合そのもの (HEAD==SHA / version mirror / candidate test.yml が trusted origin/main と byte 一致 / Test CI success / version 未使用 schema fail-closed / source_ref が exact 1 件の named origin ref。#13601 j#76006 F1-F3) は trusted な main-defined workflow build job の inline gate 内で行い、**gate authority は workflow 側に残す**。helper が client 側で行うのは、`source_ref` の綴り検査と origin 解決の **preflight** (`### Action-Time Client Preflight`)、dispatch、nonce 相関のみである。preflight は workflow gate の複製ではなく mirror であり、workflow 側 gate を削ってよい根拠にはならない (untrusted client の検査結果を trusted gate の代わりにしない)。workflow 完了 polling は `release workflow wait` に委ねる。
 - `release publish --pypi --tag vX.Y.Z` — production publish の trigger を組み立てる。具体的には `gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file <path>` のドライランを出力し、release notes file path と tag が揃っていることを assert する。`--execute` flag が明示的に渡された場合のみ `gh release create` を実行する。
 - `release publish --plan` — TestPyPI / PyPI それぞれで、現在の git ref / pyproject version / 最新の `Test` workflow conclusion / TestPyPI 既存 version の有無を読み取り、operator が次に取りうる選択肢を列挙する。判定はしない。
+
+#### `source_ref` Spelling Policy (Redmine #13883)
+
+`source_ref` は **remote 上の ref literal** である。helper も workflow も、この値を `git ls-remote origin <source_ref>` へそのまま渡して解決する。したがって「git が local で表示する名前」ではなく「**origin がその ref を綴っている名前**」を渡す。両者は別物であり、本 doc / help / examples 全体でこの区別を維持する。
+
+| 種別 | 例 | 実体 | `source_ref` として |
+| --- | --- | --- | --- |
+| remote ref literal (canonical) | `refs/heads/int_release_x` | origin 上に存在する ref の完全 path | **推奨**。構造上つねに exactly-one |
+| remote ref literal (短縮) | `int_release_x` | ls-remote が tail 一致で解決 | 受理。ただし exactly-one は保証されない (下記) |
+| local remote-tracking name | `origin/int_release_x` | local の `refs/remotes/origin/int_release_x` の表示名 | **reject**。origin 上にこの名前の ref は無い |
+| local remote-tracking full path | `refs/remotes/origin/int_release_x` | local 専用 namespace | **reject**。同上 |
+
+**採用 policy: reject with exact correction (単一 policy)。** local remote-tracking 表記を受けたら、helper は dispatch 前に停止し、そのまま貼れる訂正 (`--source-ref refs/heads/<branch>` / `--source-ref <branch>`) を添えて exit する。**silent normalize (`origin/<branch>` -> `<branch>`) は採用しない。**
+
+却下理由 (`origin/<branch>` の normalize):
+
+- **`origin/<branch>` は曖昧である。** remote は `origin/<branch>` という名前の branch を実際に持てる (`refs/heads/origin/<branch>`)。この状態で `origin/main` を `main` へ書き換えると、artifact authority を **別 ref へ silent に付け替える**。regression test `test_origin_prefixed_branch_can_really_exist_on_origin` が実 git に対してこの反例を pin している。
+- **normalize 先自体が exactly-one とは限らない。** `git ls-remote <pattern>` は exact lookup ではなく **ref 名の tail 一致 glob** である。`main` は `refs/heads/main` に加え `refs/tags/main` や `refs/heads/origin/main` にも一致する。「安全に normalize できる」前提が成立しない。
+- **周辺 gate との整合。** この経路は他のすべての link (exact 40-hex SHA、exactly-one ref、candidate `test.yml` の byte 一致) で曖昧さを拒否している。helper だけが operator の意図を推測すると、そこが唯一の soft spot になる。
+- **reject の代償が小さい。** preflight が origin を引く以上、helper は正しい綴りを exact に提示できる。operator は 1 回貼り直すだけで、silent な取り違えは起きない。
+
+`origin/<branch>` という名前の branch を **literal に指したい** 場合の逃げ道は残す: `--source-ref refs/heads/origin/<branch>` を渡す。reject message がこの exact form を併記する。
+
+#### Action-Time Client Preflight (Redmine #13883)
+
+`release publish --testpypi` は `gh workflow run` に到達する **前に**、client 側で origin を引いて次を確定する。これは trusted workflow の gate `Verify source_ref resolves to source SHA on origin` の **client mirror** であり、置き換えではない (workflow 側の inline gate は trusted authority として残す)。
+
+- `git ls-remote origin <source_ref>` の結果から peel 行 (`^{}`) を落とし、**non-peel でちょうど 1 件** を要求する。
+- その 1 件の tip が `--source-sha` と一致することを要求し、`source_ref_resolved: <ref> -> <sha>` として stdout に出す。
+- **zero / multi / mismatch のいずれでも dispatch を 0 回**にする (`gh workflow run` を呼ばない)。charset (`[A-Za-z0-9._/-]+`、glob / refspec metachar / whitespace 拒否) は workflow gate と同一で、shell-safety guard も兼ねる。
+
+peel 行を落とす帰結として、**annotated tag の non-peel tip は tag object であって commit ではない**。よって annotated tag を `source_ref` に渡すと mismatch として refuse される。これは server 側 gate と同じ挙動であり、client が server より緩くならないための意図的な parity である。
+
+これは #13601 の trust model を弱めない。preflight は read-only な `git ls-remote` のみで、**判断を自動化しない** (曖昧なら止めるだけで、ref を選び直したり推測したりしない)。狙いは、build 前に落ちると分かっている dispatch を発行しないこと。run `29481593519` はこの preflight が無かったために起動後 build 前に失敗した。
 
 `release publish --pypi` は GitHub Release の published event を発火させる権利を helper に渡すという意味で危険度が高い。default は dry-run、`--execute` を明示しない限り `gh release create` を実行しない。helper は GA / beta の判断を内蔵しない (後述の Boundary を参照)。
 
@@ -65,7 +99,7 @@ helper が触ってよい層と触ってはいけない層を明示する。
 
 ### Helper (script) が自動でやってよいこと
 
-- read-only な検査 (`git status` / `git log -S` / `git grep` / build artifact 展開後の grep / GitHub Actions run の status 取得)。
+- read-only な検査 (`git status` / `git log -S` / `git grep` / `git remote` / `git ls-remote` / build artifact 展開後の grep / GitHub Actions run の status 取得)。
 - repo の authoritative な release-version mirror set 全 file (現状: `pyproject.toml` + `src/mozyo_bridge/__init__.py`) の version 文字列の機械的書き換え (`release bump --to <version>`)。worktree に diff として残し、commit はしない。mirror set 自体の定義は本 contract と `release-flow.md` が正本。
 - GitHub Actions workflow の dispatch (`gh workflow run`)。
 - GitHub Actions workflow の polling / status 取得。
@@ -104,7 +138,7 @@ helper が触ってよい層と触ってはいけない層を明示する。
 ### Dry-run / idempotent / resumable
 
 - すべての `release check` は read-only / idempotent。連続実行で同じ output を返すことが期待値。
-- `release publish --testpypi` は同一 version の 2 回目以降 dispatch を helper 側で blocker にしない (TestPyPI 側で reject されるため state は GitHub 側で管理される)。helper は dispatch attempt を発行するだけ。
+- `release publish --testpypi` は同一 version の 2 回目以降 dispatch を helper 側で blocker にしない (TestPyPI 側で reject されるため state は GitHub 側で管理される)。version の一意性判断は helper に持たせない。ただし `source_ref` が origin 上で exactly-one に解決し `source_sha` と一致することは dispatch 前に client preflight で確認し、満たさなければ dispatch を発行しない (`### Action-Time Client Preflight`)。これは judgment の自動化ではなく、確実に build 前に失敗する dispatch を出さないための機械的検査である。
 - `release workflow wait` は同じ run-id に対して resumable。途中で中断しても再度 wait をかけ直せる。
 - `release bump --to <version>` は冪等 (現在 version と同じ値を渡された場合は no-op として明示する)。
 
@@ -122,7 +156,7 @@ helper が触ってよい層と触ってはいけない層を明示する。
 | `Canonical Renderer / Plugin Mirror Drift` | `release check drift` | strict-fail 検査として実行 |
 | `Release Ref Consistency` (pyproject version / tag / install ref) | `release bump --check` + `release check workflow` | read-only の参照情報を表示。mirror set 内 version 不一致は exit non-zero |
 | `Version Bump` (release-version mirror set の書き換え + 単独 commit) | `release bump --to <version>` | mirror set 全 file (現状: `pyproject.toml` + `src/mozyo_bridge/__init__.py`) を worktree に書き換えるだけ |
-| TestPyPI publish workflow の dispatch | `release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin ref>` | main-fixed exact-candidate workflow dispatch + nonce 相関のみ (Redmine #13601) |
+| TestPyPI publish workflow の dispatch | `release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref <origin 上の ref literal>` | main-fixed exact-candidate workflow dispatch + `source_ref` の action-time preflight (zero/multi/mismatch は dispatch 0 回, Redmine #13883) + nonce 相関 (Redmine #13601) |
 | `Test` / `Publish to TestPyPI` / `Publish to PyPI` workflow の green 確認 | `release check workflow` / `release workflow wait` | run status / conclusion 取得のみ |
 | Fresh install smoke (`pipx install ...`) | (helper 化しない) | tester 環境依存のため operator が実行 |
 | GitHub Release 作成 (`gh release create`) | `release publish --pypi --tag vX.Y.Z` | default dry-run / `--execute` で実行 |

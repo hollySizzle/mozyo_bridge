@@ -62,6 +62,16 @@ completion criteria for beta and production distribution live here.
   SHA. Trusted Publishing credentials (`id-token: write` + `environment:
   testpypi`) live only in the artifact-download+publish job, separate from
   checkout/build/verify.
+- Spell `source_ref` as a ref literal ON ORIGIN (`refs/heads/<branch>` is
+  canonical; a bare `<branch>` is accepted). Git's LOCAL remote-tracking names
+  (`origin/<branch>`, `refs/remotes/origin/<branch>`) name no ref on origin, so
+  the helper rejects them before dispatch with the exact correction rather than
+  normalizing them silently — `origin/<branch>` is genuinely ambiguous, because
+  a remote may carry a branch literally named `origin/<branch>`. The helper also
+  resolves the ref against origin before dispatching, so a zero / ambiguous /
+  mismatched ref costs zero dispatches instead of a run that dies before build
+  (Redmine #13883; policy source: `vibes/docs/logics/release-helper-contract.md`
+  -> `source_ref Spelling Policy`).
 - Order the internal-beta steps as #13528 (TestPyPI publish) then #13527 (exact
   install QA); the install QA runs against the published exact version, not a
   floating `main` install.
