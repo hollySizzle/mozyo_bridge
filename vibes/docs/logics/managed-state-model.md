@@ -632,6 +632,17 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   published namespace — and publish with a single `os.replace` of the directory once every artifact is complete. A reader of
   `backups/` sees the whole set or nothing. The rule generalizes the section's own principle: *incomplete and trusted is worse than
   none* applies to the failure path too, not only the success path.
+- **The staging directory is reserved atomically and owned exclusively; the destination is allocated at publish time** (#13882
+  review j#80081 R4-F1). "Whole set or nothing" must hold under **concurrency**, not only against sequential failure. Deriving the
+  staging name from the second-resolution stamp and `rmtree`-ing that guessed path — intending to clear a prior crash's leftovers —
+  let two quarantines starting in the same second share one staging dir: the later deleted the earlier's *active* tree, and the
+  earlier then published the later's partial bytes as a complete recovery point while returning success (measured: the published
+  artifact held 7 bytes of a peer's half-written copy). A guessed path can belong to a live peer, so the answer is not a better
+  guess but **never guessing** — `mkdtemp` reserves a unique directory atomically, and no operation ever removes a tree it did not
+  create. Symmetrically, reserving the final name up-front via `exists()` was a TOCTOU that *guaranteed* collision rather than
+  avoiding it (the final dir does not exist until publication, so concurrent operations always chose the same name); each candidate
+  is instead *attempted* at publish time, and because a published recovery point is always non-empty, `rename` onto a peer's
+  directory fails `ENOTEMPTY` and yields the next suffix instead of clobbering it.
 - **The main file is the rotation's completion sentinel: sidecars first, main LAST** (R3-F2). `probe_store_schema` decides a store
   *exists* by the main file, so removing it first made a half-done rotation indistinguishable from a finished one — measured: a
   failing `-wal` unlink left `main` gone and the sidecar orphaned, the retry then probed `STORE_ABSENT` and reported

@@ -48,9 +48,11 @@ never points core -> provider.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -380,8 +382,8 @@ _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _STAGING_DIRNAME = ".backups-staging"
 
 
-def _stage_backup(path: Path) -> tuple:
-    """Reserve ``(staging_dir, final_dir)`` for a backup. Nothing is published yet.
+def _stage_backup(path: Path) -> Path:
+    """Atomically reserve a staging dir this operation **exclusively owns**.
 
     ``backups/<ts>/`` is the namespace an operator trusts as a recovery point, so writing
     directly into it means every failure *publishes a partial one* — measured (review
@@ -394,44 +396,70 @@ def _stage_backup(path: Path) -> tuple:
     Artifacts are therefore built under ``.backups-staging/`` — deliberately a sibling of
     ``backups/``, not a child, so that even a failed cleanup leaves nothing discoverable in
     the published namespace — and published by :func:`_publish_backup`.
+
+    **Ownership is the correctness property** (review j#80081 R4-F1). The first version
+    *derived* the staging name from the final name (a second-resolution stamp) and
+    ``rmtree``d that guessed path first, meaning to clear a prior crash's leftovers. But a
+    guessed path can belong to a **live peer**: two quarantines starting in the same second
+    computed the same staging dir, the later deleted the earlier's active tree, and the
+    earlier then published the later's partial bytes as a complete recovery point —
+    measured, with the published artifact holding 7 bytes of another operation's
+    half-written copy while its call returned success. The fix is not a better guess; it is
+    to never guess. ``mkdtemp`` reserves a uniquely-named directory atomically, so no
+    operation can name — let alone delete — another's staging.
     """
-    root = path.parent
-    base = root / BACKUPS_DIRNAME / f"{path.stem}-{_backup_stamp(_utc_now())}"
-    final_dir = base
-    suffix = 1
-    staging: Optional[Path] = None
+    staging_root = path.parent / _STAGING_DIRNAME
     try:
-        while final_dir.exists():
-            final_dir = base.with_name(f"{base.name}-{suffix}")
-            suffix += 1
-        staging = root / _STAGING_DIRNAME / final_dir.name
-        shutil.rmtree(staging, ignore_errors=True)  # a prior crash's staging is not ours
-        staging.mkdir(parents=True, exist_ok=False)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        # Atomic, unique, and ours alone. No pre-emptive rmtree of anyone else's tree.
+        return Path(tempfile.mkdtemp(prefix=f"{path.stem}-", dir=staging_root))
     except OSError as exc:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
         raise StateStoreError(
-            f"backup near {base} failed ({exc}); operation aborted (nothing was written)"
+            f"backup staging under {staging_root} failed ({exc}); operation aborted "
+            f"(nothing was written)"
         ) from exc
-    return staging, final_dir
 
 
-def _publish_backup(staging: Path, final_dir: Path) -> Path:
+def _publish_backup(path: Path, staging: Path) -> Path:
     """Atomically publish a COMPLETE staging dir as the recovery point.
 
-    One ``os.replace`` of the directory, so a reader of ``backups/`` sees the whole
+    A single ``os.replace`` of the directory, so a reader of ``backups/`` sees the whole
     artifact set or nothing — never a half-written one.
+
+    The destination name is allocated **at publish time, race-safely** (review j#80081
+    R4-F1). Reserving it earlier via ``exists()`` was a TOCTOU that guaranteed collision
+    rather than avoiding it: the final dir does not exist until publication, so two
+    concurrent operations always chose the same name. Each candidate is *attempted*
+    instead — ``rename`` onto a non-empty directory fails ``ENOTEMPTY``, and a published
+    recovery point always holds at least one artifact, so a peer that got there first
+    pushes this operation to the next suffix rather than being clobbered by it.
     """
+    base = path.parent / BACKUPS_DIRNAME / f"{path.stem}-{_backup_stamp(_utc_now())}"
     try:
-        final_dir.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging, final_dir)
+        base.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        shutil.rmtree(staging, ignore_errors=True)
+        _discard_staging(staging)
         raise StateStoreError(
-            f"publishing the backup to {final_dir} failed ({exc}); the operation was "
-            f"aborted and no partial recovery point was published"
+            f"publishing the backup near {base} failed ({exc}); the operation was aborted "
+            f"and no partial recovery point was published"
         ) from exc
-    return final_dir
+    candidate = base
+    suffix = 1
+    while True:
+        try:
+            os.replace(staging, candidate)
+            return candidate
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST) and suffix < 1000:
+                # A peer published there first. Take the next name; never overwrite theirs.
+                candidate = base.with_name(f"{base.name}-{suffix}")
+                suffix += 1
+                continue
+            _discard_staging(staging)
+            raise StateStoreError(
+                f"publishing the backup to {candidate} failed ({exc}); the operation was "
+                f"aborted and no partial recovery point was published"
+            ) from exc
 
 
 def _discard_staging(staging: Path) -> None:
@@ -466,7 +494,7 @@ def backup_attestation_store(path: Path) -> Optional[Path]:
     """
     if not path.exists():
         return None
-    staging, final_dir = _stage_backup(path)
+    staging = _stage_backup(path)
     target = staging / path.name
     source: Optional[sqlite3.Connection] = None
     dest: Optional[sqlite3.Connection] = None
@@ -493,7 +521,7 @@ def backup_attestation_store(path: Path) -> Optional[Path]:
         for conn in (source, dest):
             if conn is not None:
                 conn.close()
-    return _publish_backup(staging, final_dir)
+    return _publish_backup(path, staging)
 
 
 def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
@@ -513,7 +541,7 @@ def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
     """
     if not path.exists():
         return None
-    staging, final_dir = _stage_backup(path)
+    staging = _stage_backup(path)
     try:
         shutil.copy2(path, staging / path.name)
         for suffix in _SIDECAR_SUFFIXES:
@@ -526,7 +554,7 @@ def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
             f"quarantine of {path} failed ({exc}); rebuild aborted (nothing was removed, "
             f"and no partial recovery point was published)"
         ) from exc
-    return _publish_backup(staging, final_dir)
+    return _publish_backup(path, staging)
 
 
 def remove_attestation_store_artifacts(path: Path) -> None:
