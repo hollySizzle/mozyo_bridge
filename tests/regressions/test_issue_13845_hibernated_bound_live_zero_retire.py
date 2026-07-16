@@ -120,6 +120,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_retire import (  # noqa: E402,E501
     BOUND_RETIRE_ALREADY_RETIRED,
     BOUND_RETIRE_BLOCKED,
+    BOUND_RETIRE_DUPLICATE_INVENTORY,
+    BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED,
     BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT,
     BOUND_RETIRE_HEAD_NOT_INTEGRATED,
     BOUND_RETIRE_LIVE_PAIR_PRESENT,
@@ -131,6 +133,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     derive_lane_workspace_token,
     encode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E402,E501
+    SLOT_STALE,
+    classify_named_slot,
 )
 
 _WORKSPACE_ID = "b3d17ac95e6f4802"
@@ -977,6 +983,91 @@ class BoundRetireCommandTests(unittest.TestCase):
         code, payload = self._retire()
         self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
         self.assertEqual(self._bound(payload)["foreign_names"], [])
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+
+    # -- the duplicate / unresolved-identity axes (review j#80148 R2-F1) --
+
+    def test_duplicate_locatorless_expected_rows_block_zero_write(self) -> None:
+        """Two rows claiming the same expected role is a corrupt inventory (j#80148 R2-F1).
+
+        Before the fix this exited 0 and terminalized: ``expected_live_slots`` skips
+        locator-less rows AND collapses roles into a set, so the duplicate measured as zero
+        live. A herdr assigned name is unique by construction — this is ambiguity, and no
+        reading of an ambiguous inventory can license a terminal write.
+        """
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "codex", _LANE, ""))
+        self.rows.append(_row(_WORKSPACE_ID, "codex", _LANE, ""))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        verdict = self._bound(payload)
+        self.assertEqual(verdict["reason"], BOUND_RETIRE_DUPLICATE_INVENTORY)
+        self.assertEqual(verdict["expected_live"], [])
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual(self.executed_closes, [])
+
+    def test_duplicate_expected_rows_with_locators_name_the_duplicate(self) -> None:
+        # The duplicate check runs BEFORE the live read: such a unit was already blocked, but
+        # as `live_pair_present`, which names the wrong problem. The inventory itself is
+        # unsound, and that is what the operator must be told.
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "codex", _LANE, "w28:pA"))
+        self.rows.append(_row(_WORKSPACE_ID, "codex", _LANE, "w28:pB"))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self._bound(payload)["reason"], BOUND_RETIRE_DUPLICATE_INVENTORY
+        )
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+    def test_single_locatorless_expected_row_blocks_zero_write(self) -> None:
+        """A minimal locator-less row is "cannot resolve", not "absent" (j#80148 R2-F1).
+
+        The shared `classify_named_slot` reads a row with neither a detected-agent field nor a
+        status field as LIVE, and `herdr_target_resolution` refuses to send to a row with no
+        locator (`missing_locator`). Terminalizing off it would rest on the absence of proof
+        of liveness rather than proof of absence.
+        """
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "codex", _LANE, ""))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        verdict = self._bound(payload)
+        self.assertEqual(
+            verdict["reason"], BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED
+        )
+        self.assertEqual(verdict["expected_live"], [])
+        self.assertFalse(payload["retire_ok"])
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual(self.executed_closes, [])
+
+    def test_positively_stale_locatorless_row_does_not_block(self) -> None:
+        """Residue the liveness contract POSITIVELY calls dead must not block forever.
+
+        The other half of the fence: proceeding requires positive proof of deadness, and a row
+        whose detected-agent field is present-but-blank is exactly that (herdr reports the pane
+        carries no managed agent). Blocking it would recreate this ticket's own defect — a lane
+        stuck un-terminalizable — in a new shape.
+        """
+        self._seed_row()
+        residue = _row(_WORKSPACE_ID, "codex", _LANE, "")
+        residue["agent"] = ""  # present-but-blank == the positive shell-residue signal
+        self.assertEqual(classify_named_slot(residue), SLOT_STALE)
+        self.rows.append(residue)
+        code, payload = self._retire()
+        self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
+        self.assertEqual(self._bound(payload)["state"], BOUND_RETIRE_RETIRED)
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+        self.assertEqual(self.executed_closes, [])
+
+    def test_locatorless_row_in_another_lane_does_not_block(self) -> None:
+        # Scoping: the fences read only the TARGETED units.
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "codex", "issue_99999_other_lane", ""))
+        self.rows.append(_row(_WORKSPACE_ID, "codex", "issue_99999_other_lane", ""))
+        code, payload = self._retire()
+        self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
+        self.assertEqual(self._bound(payload)["state"], BOUND_RETIRE_RETIRED)
         self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
     def test_unreadable_inventory_is_not_an_empty_one(self) -> None:

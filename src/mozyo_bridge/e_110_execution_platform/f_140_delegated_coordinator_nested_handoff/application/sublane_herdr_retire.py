@@ -181,6 +181,56 @@ def blocked_actuation(
     )
 
 
+def expected_slot_rows(
+    rows: Sequence[Mapping[str, object]],
+    plan: HerdrRetireClosePlan,
+    *,
+    managed_roles: Sequence[str] = _MANAGED_ROLES,
+) -> tuple[tuple[str, str, Mapping[str, object]], ...]:
+    """Every expected managed-slot row in the plan's targeted unit(s), raw (pure).
+
+    The unaggregated scan :func:`expected_live_slots` is defined over (Redmine #13845
+    review j#80148). It yields ``(role, locator, row)`` per matching row — **including
+    rows carrying no locator**, and **without collapsing duplicates** — because those two
+    facts are exactly what the aggregated measurement discards, and a caller that needs
+    "is this unit quiescent?" rather than "which expected roles are live?" cannot
+    reconstruct them from the role set.
+
+    Scoped to the same two units :func:`plan_herdr_retire_close` targets — the shared
+    ``(workspace_id, lane_id)`` unit and the legacy ``(legacy_workspace_id, default)``
+    twin. Rows are returned in input order. Empty inputs match nothing.
+
+    This is a scan, not a judgment: whether a locator-less row means "gone" or "cannot be
+    read" is the caller's policy (see :func:`...herdr_slot_liveness.classify_named_slot`).
+    """
+    managed = frozenset(managed_roles)
+    found: list[tuple[str, str, Mapping[str, object]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        identity = decode.identity
+        if identity.role not in managed:
+            continue
+        row_lane = _norm_lane(identity.lane_id)
+        in_shared = bool(
+            plan.workspace_id
+            and plan.lane_id
+            and identity.workspace_id == plan.workspace_id
+            and row_lane == plan.lane_id
+        )
+        in_legacy = bool(
+            plan.legacy_workspace_id
+            and identity.workspace_id == plan.legacy_workspace_id
+            and row_lane == DEFAULT_LANE
+        )
+        if in_shared or in_legacy:
+            found.append((identity.role, _agent_locator(row), row))
+    return tuple(found)
+
+
 def expected_live_slots(
     rows: Sequence[Mapping[str, object]],
     plan: HerdrRetireClosePlan,
@@ -199,33 +249,27 @@ def expected_live_slots(
     Scoped to the same two units :func:`plan_herdr_retire_close` targets — the shared
     ``(workspace_id, lane_id)`` unit and the legacy ``(legacy_workspace_id, default)``
     twin — and to rows carrying a live locator. Empty inputs measure nothing live.
+
+    **What this deliberately does NOT measure** (Redmine #13845 review j#80148): it is an
+    aggregate over the MANAGED roles that carry a locator, so its empty result means "no
+    expected role is live", never "the unit is empty". It drops (a) unexpected occupants —
+    see ``plan.foreign_names``, (b) rows with no locator, and (c) duplicate multiplicity
+    (roles collapse into a set). A caller whose contract needs quiescence rather than
+    liveness must read :func:`expected_slot_rows` as well; reading this empty result as
+    absence is the j#80115 / j#80148 fail-open. Behaviour is unchanged — this is now
+    expressed over the raw scan so the two share one scoping definition.
     """
-    managed = frozenset(managed_roles)
-    live: set[str] = set()
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        if not decode.ok or decode.identity is None:
-            continue
-        identity = decode.identity
-        if identity.role not in managed or not _agent_locator(row):
-            continue
-        row_lane = _norm_lane(identity.lane_id)
-        in_shared = bool(
-            plan.workspace_id
-            and plan.lane_id
-            and identity.workspace_id == plan.workspace_id
-            and row_lane == plan.lane_id
+    return tuple(
+        sorted(
+            {
+                role
+                for role, locator, _row in expected_slot_rows(
+                    rows, plan, managed_roles=managed_roles
+                )
+                if locator
+            }
         )
-        in_legacy = bool(
-            plan.legacy_workspace_id
-            and identity.workspace_id == plan.legacy_workspace_id
-            and row_lane == DEFAULT_LANE
-        )
-        if in_shared or in_legacy:
-            live.add(identity.role)
-    return tuple(sorted(live))
+    )
 
 
 def decide_retire_actuation(

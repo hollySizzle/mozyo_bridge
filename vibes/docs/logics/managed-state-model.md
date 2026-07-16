@@ -473,7 +473,20 @@ Table naming:
       同 class を #13842 は `foreign_at_position` で gate 済みであり、その正解形を踏襲する。verdict は
       `expected_live` と `foreign_names` を **別 field** で surface し、どちらの測定が拒否したかを operator が
       識別できるようにする。foreign fence は idempotent `already_retired` の **前**に置く: persisted `retired` は
-      現在の quiescence を証明しない (j#79150 F2 と同型)。書込は「row 存在 かつ exact `expected_revision` 一致」かつ「`hibernated` /
+      現在の quiescence を証明しない (j#79150 F2 と同型)。★**`expected_live_slots` は aggregate であり 3 つの事実を
+      落とす** (review j#80148): (a) unexpected occupant、(b) **duplicate multiplicity** (role が set へ集約される)、
+      (c) **locator 無し row** (無条件 skip)。ゆえに空の結果は「expected role が live でない」であって「unit が空」
+      ではない。本 surface の契約は後者の強い命題を要するので、raw scan `expected_slot_rows` を併読して各軸を
+      fail-closed する: **duplicate** (同一 expected role の row が 2 件以上 → `duplicate_inventory`。herdr assigned
+      name は一意ゆえ ambiguity であり、`herdr_target_resolution` も `multiple_matches` で送信を拒否する。live check
+      の **前**に置く — locator 付き duplicate を `live_pair_present` と呼ぶのは問題の名指しとして誤り)、
+      **locator 欠落** (`expected_identity_unresolved`)。★**進行の条件は deadness の positive な証明であって
+      liveness の証明の不在ではない**: `classify_named_slot` は "conservative in the never-clobber direction" で
+      minimal row を **live** と読むため、同 contract が `SLOT_STALE` と **積極的に判定した** row (detected agent が
+      present かつ blank / status が present かつ unknown) のみを residue として通す。全 residue を block すると
+      #13845 が解消しようとしている「恒久 stuck」を別 shape で再生産するため。走査 helper `expected_slot_rows` は
+      additive で `expected_live_slots` を behavior-preserving に再定義したもの (**guard の共有ではなく走査の共有**。
+      判定は各 surface が持つ)。書込は「row 存在 かつ exact `expected_revision` 一致」かつ「`hibernated` /
       `binding_kind='issue'` / この exact issue 所有 / project scope 無し / `worktree_identity` **非空 かつ caller の
       attested token と一致**」かつ「`process_release='released'` / replacement settled」の全成立時のみ。
       ★**worktree token は CAS 内（row lock 下）で再照合**する: action-time attestation は診断であって authority では
