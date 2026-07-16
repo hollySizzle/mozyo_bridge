@@ -181,6 +181,35 @@ class CommandContractTest(unittest.TestCase):
         self.assertIn("published as journal 80500", out)
         self.assertFalse(self.fence.reserve(self._key()).may_publish)
 
+    def test_status_tells_a_fresh_machine_to_bootstrap(self):
+        # R15-F3: `seal_state() is not None` was always true once the return type stopped being
+        # Optional, so every store reported "seal present, store missing" and this advice -- the
+        # only thing that gets an operator to a working fence -- could never print.
+        for path in (self.fence.seal_path, self.fence.path, self.fence.sidecar_path):
+            path.unlink()
+        rc, out = self._run([])
+        self.assertEqual(rc, 0)
+        self.assertIn("never initialized", out)
+        self.assertIn("--bootstrap", out)
+
+    def test_status_offers_adoption_for_an_unsealed_store(self):
+        self.fence.seal_path.unlink()                # a store from before the seal existed
+        rc, out = self._run([])
+        self.assertEqual(rc, 0)
+        self.assertIn("unsealed", out)
+        self.assertIn("adopt it in place", out)
+
+    def test_status_reports_a_ready_fence_as_ready(self):
+        rc, out = self._run([])
+        self.assertEqual(rc, 0)
+        self.assertIn("ready", out)
+
+    def test_status_does_not_offer_adoption_when_the_seal_is_unreadable(self):
+        self.fence.seal_path.write_text("garbage", encoding="utf-8")
+        rc, out = self._run([])
+        self.assertIn("cannot be read", out)
+        self.assertNotIn("adopt", out)
+
     def test_list_shows_blocked_anchors_and_says_what_to_do(self):
         self.fence.reserve(self._key())
         rc, out = self._run(["--list"])

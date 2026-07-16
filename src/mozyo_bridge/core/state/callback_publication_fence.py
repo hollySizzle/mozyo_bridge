@@ -80,14 +80,19 @@ _SEAL_OPERATIONAL = "operational"     # this fence has run here; a missing pair 
 #: meant "operational", and MUST be read as such: folding it into `absent` re-mints a lost store on
 #: upgrade, which is the very thing the seal was added to stop (R14-F1).
 _SEAL_LEGACY_OPERATIONAL = "legacy_operational"
+SEAL_LEGACY_OPERATIONAL = _SEAL_LEGACY_OPERATIONAL
 #: The seal exists but cannot be trusted — unknown content, wrong version, or unreadable. NEVER
 #: `absent`: "I cannot read the record of whether this fence operated" is not "it never did".
 _SEAL_INVALID = "invalid_or_unreadable"
+SEAL_INVALID = _SEAL_INVALID
 #: Sentinel: the seal file genuinely does not exist (FileNotFoundError, and nothing else).
 _SEAL_ABSENT = "absent"
+SEAL_ABSENT = _SEAL_ABSENT
 
 _SEAL_FORMAT = "mozyo-callback-publication-seal"
 _SEAL_FORMAT_VERSION = 1
+#: The version token exactly as it must appear on disk. Compared literally, never parsed.
+_SEAL_VERSION_TOKEN = "v1"
 #: Exactly how R13 spelled its seal. Matched in full, not by prefix.
 _LEGACY_SEAL_FIRST_LINE = "callback publication fence first initialized at "
 CALLBACK_PUBLICATION_FENCE_SCHEMA_VERSION = 1
@@ -299,16 +304,17 @@ class CallbackPublicationFence:
             return _SEAL_LEGACY_OPERATIONAL
         # Exact format + version, not a prefix match: `startswith` would accept anything that
         # merely opened with the right word, and version drift would read as a valid state.
-        parts = first.split()
-        if len(parts) == 3 and parts[0] == _SEAL_FORMAT:
-            try:
-                version = int(parts[1].removeprefix("v"))
-            except ValueError:
-                return _SEAL_INVALID
-            if version != _SEAL_FORMAT_VERSION:
-                return _SEAL_INVALID   # a newer build's seal; this one must not act on it
-            if parts[2] in (_SEAL_INITIALIZING, _SEAL_OPERATIONAL):
-                return parts[2]
+        # Literal equality on every token. Parsing the version with int() accepted `1`, `v01` and
+        # even `v+1` as version 1 -- a lenient reader on the one field whose whole job is to say
+        # "a different build wrote this, do not act on it" (R15-F2).
+        parts = first.split(" ")
+        if (
+            len(parts) == 3
+            and parts[0] == _SEAL_FORMAT
+            and parts[1] == _SEAL_VERSION_TOKEN
+            and parts[2] in (_SEAL_INITIALIZING, _SEAL_OPERATIONAL)
+        ):
+            return parts[2]
         return _SEAL_INVALID
 
     @property
@@ -375,10 +381,14 @@ class CallbackPublicationFence:
         # Process-unique temp: a fixed name is a collision between concurrent writers (R14-F2).
         tmp = self.seal_path.with_suffix(f"{self.seal_path.suffix}.{os.getpid()}.tmp")
         tmp.write_text(
-            f"{_SEAL_FORMAT} v{_SEAL_FORMAT_VERSION} {state}\nsealed at {_utc_now()}\n{note}\n",
+            f"{_SEAL_FORMAT} {_SEAL_VERSION_TOKEN} {state}\nsealed at {_utc_now()}\n{note}\n",
             encoding="utf-8",
         )
         tmp.replace(self.seal_path)
+
+    def has_store(self) -> bool:
+        """True when a usable store exists here, sealed or not (the adoption candidate)."""
+        return self._pair_is_healthy()
 
     def has_operated(self) -> bool:
         """True once this fence has been sealed here, whether or not its store still exists.
@@ -406,12 +416,14 @@ class CallbackPublicationFence:
         operational/legacy + healthy      nothing to do (legacy is migrated to the current format,
                                           in place, keeping its reservations).
         operational/legacy + pair gone    REFUSE. It ran here, so this is a loss.
-        initializing + anything           re-mint. It never became operational, so no reserve can
-                                          have gone through it -- reserve() itself now enforces
-                                          that, which is what makes this inference true rather
-                                          than merely plausible.
-        absent + healthy pair             ADOPT in place; it may hold live reservations.
-        absent + both gone                genuine first init.
+        any seal + healthy pair           ADOPT in place. A store that EXISTS is never re-minted,
+                                          whatever its seal says: `initializing` only proves
+                                          "nothing was reserved" for stores this version made, and
+                                          older builds could reserve against an unsealed one
+                                          (R15-F1). A crashed init has no rows to keep anyway.
+        initializing + no usable store    re-mint. Here "nothing was reserved" is a fact about the
+                                          disk, not an inference about which build wrote it.
+        absent + no usable store          genuine first init.
         absent + one side only            REFUSE. Torn store.
         invalid/unreadable seal           REFUSE. Something is here and cannot be read; that is
                                           not evidence it never ran.
@@ -450,13 +462,22 @@ class CallbackPublicationFence:
                     self._write_seal(_SEAL_OPERATIONAL)
                 return
 
-            if seal == _SEAL_INITIALIZING:
-                self._create_fresh(secrets.token_hex(16))
+            if pair_ok:
+                # ADOPT, never re-mint -- whatever the seal says. An `initializing` seal was
+                # supposed to prove "no reservation can exist here", but that inference only ever
+                # held for stores this version created: the code that shipped before the mutation
+                # guard could reserve against an unsealed store, so `initializing + healthy pair`
+                # may hold live rows, and re-minting silently dropped them and re-granted the same
+                # identity (R15-F1). A crashed init that got this far has no rows anyway, so
+                # adoption is right in both cases and re-minting is right in neither.
                 self._write_seal(_SEAL_OPERATIONAL)
                 return
 
-            if pair_ok:
-                self._write_seal(_SEAL_OPERATIONAL)      # adopt in place
+            if seal == _SEAL_INITIALIZING:
+                # Only now, with no usable store present, is "nothing was ever reserved" a fact
+                # about the disk rather than an inference about which code wrote it.
+                self._create_fresh(secrets.token_hex(16))
+                self._write_seal(_SEAL_OPERATIONAL)
                 return
 
             if self._read_sidecar_nonce() is None and not self.path.exists():

@@ -1656,7 +1656,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         fence.seal_path.write_text("whatever", encoding="utf-8")
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
             self.assertEqual(fence.seal_state(), _SEAL_INVALID)
-            self.assertFalse(fence.has_operated() is False)      # not "never ran"
+            self.assertTrue(fence.has_operated())                # NOT "never ran"
             with self.assertRaises(CallbackPublicationFenceError):
                 fence.bootstrap()
 
@@ -1738,6 +1738,61 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                 nonce, "the store was re-minted under a live reservation",
             )
         self.assertFalse(CallbackPublicationFence(home=home).reserve(key).may_publish)
+
+    def test_a_resume_adopts_a_store_that_exists_rather_than_re_minting_over_its_reservations(self):
+        # R15-F1: `initializing` was taken to prove "nothing was ever reserved here", but that only
+        # held for stores THIS version made. The code that shipped before the mutation guard could
+        # reserve against an unsealed store, so initializing + healthy pair can hold live rows --
+        # and re-minting dropped them and re-granted the identity. A store that exists is adopted,
+        # never re-minted, whatever its seal says.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)          # A reserves, then stalls pre-PUT
+        with closing(sqlite3.connect(fence.path)) as conn:
+            nonce = conn.execute(
+                "SELECT value FROM store_meta WHERE key='store_nonce'").fetchone()[0]
+        fence._write_seal(_SEAL_INITIALIZING)                    # a pre-guard store's state
+
+        CallbackPublicationFence(home=home).bootstrap()          # resume
+
+        self.assertEqual(fence.state_of(key), PUBLICATION_RESERVED, "A's reservation was dropped")
+        with closing(sqlite3.connect(fence.path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT value FROM store_meta WHERE key='store_nonce'").fetchone()[0],
+                nonce, "the store was re-minted under a live reservation",
+            )
+        self.assertFalse(CallbackPublicationFence(home=home).reserve(key).may_publish)
+
+    def test_a_resume_only_mints_when_no_store_exists_to_adopt(self):
+        # The other half: re-minting stays available exactly where "nothing was reserved" is a fact
+        # about the disk rather than an inference about which build wrote it.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence._write_seal(_SEAL_INITIALIZING)
+        self.assertFalse(fence.has_store())
+        fence.bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+
+    def test_the_seal_version_token_is_compared_literally(self):
+        # R15-F2: int(token.removeprefix("v")) accepted `1`, `v01` and even `v+1` as version 1 -- a
+        # lenient reader on the one field whose whole job is to say "another build wrote this".
+        for token in ("1", "v01", "v+1", "v1.0", "V1", ""):
+            with self.subTest(token=token):
+                fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+                fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+                fence.seal_path.write_text(
+                    f"mozyo-callback-publication-seal {token} operational\n", encoding="utf-8")
+                self.assertEqual(fence.seal_state(), _SEAL_INVALID)
+
+    def test_the_canonical_seal_round_trips(self):
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+        self.assertTrue(
+            fence.seal_path.read_text(encoding="utf-8").startswith(
+                "mozyo-callback-publication-seal v1 operational"))
 
     def test_readiness_always_implies_a_seal_across_every_reachable_state(self):
         # R13-F1 requirement 1, as a property rather than a case: whatever combination of seal and
