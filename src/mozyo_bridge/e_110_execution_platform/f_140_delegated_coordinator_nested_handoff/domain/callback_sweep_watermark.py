@@ -83,6 +83,14 @@ PROGRESS_BEARING_KINDS: frozenset[str] = frozenset(
 #: also progress; the reverse does not hold.
 QUALIFYING_PROGRESS_KINDS: frozenset[str] = frozenset(PROGRESS_BEARING_KINDS | GATE_BEARING_KINDS)
 
+#: The coordinator's OWN durable sweep record — a THIRD vocabulary, deliberately outside
+#: :data:`QUALIFYING_PROGRESS_KINDS` (review R2-F3). It has to thread a needle: the record must be
+#: **recognized** (so the coordinator's own journal does not become an opaque entry that makes every
+#: later sweep abstain — the sweep would silence itself) while never being **progress** (so a
+#: coordinator recovery can never masquerade as the worker advancing and clear a genuine stall).
+#: Two properties, two different vocabularies — which is why it is not just another progress kind.
+SWEEP_RECORD_KIND = "callback_sweep_record"
+
 #: The sweep verdict for a lane whose dispatch has no durable structured anchor (a legacy
 #: prose-only IR). Not a stall — an unanchorable baseline, so the sweep abstains rather than
 #: guessing (fail-closed; #13758 R5-F3 takes the same branch).
@@ -442,6 +450,92 @@ def render_progress_note(
     return f"{body_s}\n\n{marker}" if body_s else marker
 
 
+def render_sweep_record_marker(
+    *, lane: str, lane_generation: object, dispatch_anchor: str, outcome: str
+) -> str:
+    """The coordinator's own durable sweep-record marker (pure; recognized, never progress).
+
+    Review R2-F3: a stall check and every re-notification are themselves durable events — "a silent
+    re-poke is invisible to the next coordinator and is not permitted"
+    (``skills/mozyo-bridge-agent/references/workflow.md`` ``### 検出と再通知を durable journal として
+    記録する``). This marker identifies that record so the sweep can (a) point its notification at
+    the exact journal it wrote, and (b) recognize its own prior record on a later pass instead of
+    writing a duplicate.
+
+    ``outcome`` is in the key because a round's verdict legitimately changes (``stall_unprovable``
+    -> ``progress_without_callback`` once a gate lands): each distinct resolution is recorded once,
+    while a repeated pass at the same resolution recovers rather than spams.
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    anchor_s = str(dispatch_anchor or "").strip()
+    outcome_s = str(outcome or "").strip()
+    if not (lane_s and gen_s and anchor_s and outcome_s):
+        raise ValueError(
+            "render_sweep_record_marker requires lane, lane_generation, dispatch_anchor and "
+            "outcome: an unkeyed sweep record cannot be recovered or pointed at"
+        )
+    return (
+        f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:kind={SWEEP_RECORD_KIND}:"
+        f"lane={lane_s}:lane_generation={gen_s}:anchor={anchor_s}:outcome={outcome_s}]"
+    )
+
+
+def render_sweep_record_note(
+    body: str, *, lane: str, lane_generation: object, dispatch_anchor: str, outcome: str
+) -> str:
+    """A canonical sweep-record note: the classification prose + its identifying marker (pure)."""
+    marker = render_sweep_record_marker(
+        lane=lane, lane_generation=lane_generation,
+        dispatch_anchor=dispatch_anchor, outcome=outcome,
+    )
+    body_s = str(body or "").rstrip()
+    return f"{body_s}\n\n{marker}" if body_s else marker
+
+
+def sweep_record_journals(
+    entries: Iterable[object],
+    *,
+    lane: str,
+    lane_generation: object,
+    dispatch_anchor: str,
+    outcome: str,
+) -> tuple[str, ...]:
+    """The OWNING entry journal ids of this exact sweep record (pure, sorted, deduped).
+
+    The read side of :func:`render_sweep_record_marker`, mirroring
+    :func:`...redmine_journal_source.dispatch_entry_journals`: the anchor authority is the durable
+    entry's own id, never a self-reported field. A pre-read hit means this resolution is already
+    recorded (recover it, write nothing); ``>= 2`` is ambiguous and the caller fails closed.
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    anchor_s = str(dispatch_anchor or "").strip()
+    outcome_s = str(outcome or "").strip()
+    if not (lane_s and gen_s and anchor_s and outcome_s):
+        return ()
+    found: set[str] = set()
+    for entry in entries or ():
+        jid = str(getattr(entry, "journal_id", "") or "").strip()
+        if not jid:
+            continue
+        for channel, fields in marker_fields_in_note(str(getattr(entry, "notes", "") or "")):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            if str(fields.get("kind", "")).strip() != SWEEP_RECORD_KIND:
+                continue
+            if str(fields.get("lane", "")).strip() != lane_s:
+                continue
+            if str(fields.get("lane_generation", "")).strip() != gen_s:
+                continue
+            if str(fields.get("anchor", "")).strip() != anchor_s:
+                continue
+            if str(fields.get("outcome", "")).strip() != outcome_s:
+                continue
+            found.add(jid)
+    return tuple(sorted(found))
+
+
 @dataclass(frozen=True)
 class RecoveryDecision:
     """Whether the sweep may perform its one recovery mutation, and why not when it may not."""
@@ -536,6 +630,10 @@ __all__ = (
     "PROGRESS_KIND_DESIGN_CONSULTATION",
     "PROGRESS_BEARING_KINDS",
     "QUALIFYING_PROGRESS_KINDS",
+    "SWEEP_RECORD_KIND",
+    "render_sweep_record_marker",
+    "render_sweep_record_note",
+    "sweep_record_journals",
     "SWEEP_STATE_ANCHOR_MISSING",
     "SWEEP_STATE_STALL_UNPROVABLE",
     "SWEEP_RECOVERY_ACTION_ID",

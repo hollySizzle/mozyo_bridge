@@ -191,51 +191,108 @@ def _derive_from_journals(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _attested_workspace_id(args: argparse.Namespace) -> str:
+    """Resolve the attested partition workspace id from the durable anchor, or fail closed (R2-F2).
+
+    The fence key is partitioned by workspace, so a blank / wrong id reserves a DIFFERENT row and
+    the same recovery sends twice. The id therefore has to be *measured*, not defaulted: it comes
+    from the repo's durable workspace anchor, and an explicit ``--workspace-id`` must MATCH it
+    rather than override it (an operator typo would otherwise mint a fresh fence partition).
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.core.state.workspace_registry import read_anchor
+
+    try:
+        anchor = read_anchor(repo_root_from_args(args))
+    except Exception:  # noqa: BLE001 - an unreadable anchor is unattested, never assumed
+        anchor = None
+    resolved = ""
+    if isinstance(anchor, dict):
+        resolved = str(anchor.get("workspace_id", "") or "").strip()
+    asserted = str(getattr(args, "workspace_id", "") or "").strip()
+    if asserted and resolved and asserted != resolved:
+        raise SystemExit(
+            f"--workspace-id {asserted!r} does not match the durable workspace anchor "
+            f"{resolved!r}; refusing to actuate on an unattested fence partition"
+        )
+    return resolved or asserted
+
+
 def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
-    """The ACTUATING sweep: derive -> re-read -> fence -> at-most-once recovery (review F1).
+    """The ACTUATING sweep: fresh read -> re-read -> fence -> durable record -> one recovery.
 
-    The production caller :func:`...callback_sweep.sweep_once` was missing. Everything the
-    acceptance turns on — the pre-mutation re-read, the first-pass zero-send, the at-most-once fence
-    keyed on the dispatch anchor — only binds when a real recovery goes through this path, so this
-    is where the operator's recovery now runs.
+    The production caller for :func:`...callback_sweep.sweep_once` (review R1-F1). Everything the
+    acceptance turns on binds only when a real recovery runs through here, so the path is composed
+    from the three authorities the reviews established:
 
-    ``--target`` is the pane the one re-notification is delivered to; the fence (a real home-scoped
-    store) gates it to at most once per dispatch anchor. Fail-closed throughout: an unbootstrapped
-    fence, a lost reserve, opaque post-anchor journals, a landed gate, or a superseded round all
-    zero-send.
+    - a **live** durable source (R2-F1). ``--journals-json`` is read-only classification: it is a
+      frozen snapshot, so its "re-read" cannot observe a gate landing after the decision and
+      ``sweep_once`` refuses to mutate on it;
+    - an **attested** workspace id (R2-F2), measured from the durable anchor, not defaulted;
+    - a **durable recovery record written before the send** (R2-F3), which the notification then
+      points at — a re-poke with no journal behind it is prohibited outright.
+
+    Fail-closed throughout: an unconfigured live source, an unattested workspace, an unwritable
+    record, an unbootstrapped fence, a lost reserve, opaque post-anchor journals, a landed gate, or
+    a superseded round all zero-send.
     """
     from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+        build_recovery_recorder,
         build_recovery_sender,
         sweep_once,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+        LiveRedmineJournalSource,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
+        redmine_delivery_transport_from_env,
     )
 
     issue = str(getattr(args, "issue", "") or "").strip()
     lane = str(getattr(args, "lane", "") or "").strip()
-    generation = getattr(args, "lane_generation", None)
+    generation = str(getattr(args, "lane_generation", "") or "").strip()
     target = str(getattr(args, "target", "") or "").strip()
     if not (issue and lane and generation and target):
         raise SystemExit(
             "--execute requires --issue, --lane, --lane-generation and --target "
             "(the recovery is fenced on the exact dispatch round and delivered to one target)"
         )
-    source = _snapshot_source(args)
-    fence = DispatchOutboxFence(home=None)
-    dispatch_anchor = read_watermark(
-        source, issue, lane=lane, lane_generation=generation
-    ).dispatch_journal
-    sender = build_recovery_sender(
-        issue=issue, journal=dispatch_anchor or issue, target=target
-    )
+    if getattr(args, "journals_json", None):
+        raise SystemExit(
+            "--execute cannot use --journals-json: a snapshot is frozen, so the pre-mutation "
+            "re-read could not observe a gate landing after the decision (Redmine #13889 R2-F1). "
+            "The actuating sweep reads Redmine live; --journals-json stays read-only."
+        )
+    # The live read boundary fails closed when the trusted credentials are unconfigured.
+    try:
+        source = LiveRedmineJournalSource.from_environment()
+    except Exception as exc:  # noqa: BLE001 - unconfigured live read -> no actuation
+        raise SystemExit(
+            f"--execute needs a live Redmine read boundary ({type(exc).__name__}: {exc}); "
+            f"without it the pre-mutation re-read cannot see new gates, so the sweep will not "
+            f"mutate"
+        ) from exc
+    transport = redmine_delivery_transport_from_env()
+    if transport is None:
+        raise SystemExit(
+            "--execute needs the Redmine note write opt-in (MOZYO_REDMINE_DELIVERY_WRITE): the "
+            "stall classification must be durably recorded before the pointer send (a silent "
+            "re-poke is prohibited)"
+        )
     result = sweep_once(
-        workspace_id=str(getattr(args, "workspace_id", "") or "").strip(),
+        workspace_id=_attested_workspace_id(args),
         lane_id=lane,
         issue=issue,
         lane_generation=generation,
         source=source,
-        fence=fence,
+        fence=DispatchOutboxFence(home=None),
         target_assigned_name=target,
-        send_fn=sender,
+        send_fn=build_recovery_sender(issue=issue, target=target),
+        record_fn=build_recovery_recorder(
+            source=source, issue=issue, lane=lane, lane_generation=generation,
+            post_note=transport.post_issue_note,
+        ),
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),
     )
@@ -255,15 +312,10 @@ def build_callback_recovery(args: argparse.Namespace) -> dict[str, Any]:
       that produced the #13883 false stalls (an agent's earlier read is a coordinator-local cutoff),
       so the verdict is tagged unanchored rather than being silently trusted as equivalent.
     """
-    if getattr(args, "journals_json", None):
-        if getattr(args, "execute", False):
-            return _execute_sweep(args)
-        return _derive_from_journals(args)
     if getattr(args, "execute", False):
-        raise SystemExit(
-            "--execute requires --journals-json: an actuating sweep must derive its verdict from "
-            "the durable record, never from a hand-set --progress boolean (Redmine #13889)"
-        )
+        return _execute_sweep(args)
+    if getattr(args, "journals_json", None):
+        return _derive_from_journals(args)
     result = sublane_callback.classify_callback_stall(
         dispatch_delivered=bool(getattr(args, "dispatch_delivered", False)),
         new_durable_progress=bool(getattr(args, "progress", False)),
