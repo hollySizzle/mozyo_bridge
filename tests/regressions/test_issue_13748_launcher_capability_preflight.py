@@ -95,9 +95,12 @@ class Issue13748LauncherCapabilityPreflight(unittest.TestCase):
     def test_capable_launcher_passes(self):
         with tempfile.TemporaryDirectory() as d:
             launcher = self._script(d, "mozyo-bridge", _CAPABLE)
-            self.assertIsNone(
-                preflight_attest_launcher_capability(launcher, subprocess.run, _TIMEOUT, {})
+            # Returns the parsed observation since Redmine #13882 (it feeds the store
+            # join without re-running the probe); "passes" still means "does not raise".
+            observation = preflight_attest_launcher_capability(
+                launcher, subprocess.run, _TIMEOUT, {}
             )
+            self.assertTrue(observation.subcommand_marker_present)
 
     def test_exit2_skew_launcher_fails_closed(self):
         # The original #13748 defect: installed launcher lacks the subcommand (exit 2).

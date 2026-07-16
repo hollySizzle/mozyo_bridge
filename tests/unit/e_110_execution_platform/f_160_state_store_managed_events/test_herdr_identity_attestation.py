@@ -33,6 +33,30 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 )
 
 
+def _seed_v1_store(home: Path) -> Path:
+    """A genuine pre-#13806 (v1) store: the shape the real shared home carries."""
+    path = herdr_identity_attestation_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            "CREATE TABLE herdr_identity_attestations ("
+            "assigned_name TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, lane_id TEXT NOT NULL, locator TEXT NOT NULL, "
+            "verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', "
+            "observed_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO herdr_identity_attestations VALUES "
+            "('mzb1_ws1_claude_default','ws1','claude','default','wY:p2','present','','t')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
 def _rec(**over) -> IdentityAttestationRecord:
     base = dict(
         assigned_name="mzb1_ws1_claude_default",
@@ -272,24 +296,50 @@ class StoreRoundTripTest(unittest.TestCase):
             store.upsert(_rec())  # no replacement_action_id
             self.assertEqual(store.read("mzb1_ws1_claude_default").replacement_action_id, "")
 
-    def test_old_schema_version_is_fail_closed(self) -> None:
-        # An older (v1) attestation file is rejected fail-closed: the read returns None
-        # (adopt / doctor then fail closed) rather than decoding a record missing the field.
+    def test_old_schema_version_is_read_compatible(self) -> None:
+        # SUPERSEDED EXPECTATION (Redmine #13882). This asserted that a v1 store read as
+        # None ("fail-closed, never a silent field drop"). Measured consequence on the
+        # real shared home: 94 genuine v1 rows all read as ABSENT, so every adopt / resume
+        # / recover on that home failed closed with no public recovery — the #13882
+        # incident. A v1 row is not ambiguous: its writer predates the replacement
+        # transaction (#13806) entirely, so an empty `replacement_action_id` is that row's
+        # TRUE value. Reading it is a proven backward-compatible projection, not the field
+        # drop the old comment feared (that hazard is on the WRITE side, and is refused
+        # there — see the replacement-launch tests below).
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _seed_v1_store(home)
+            got = HerdrIdentityAttestationStore(home=home).read("mzb1_ws1_claude_default")
+            self.assertIsNotNone(got)
+            self.assertEqual(got.locator, "wY:p2")
+            self.assertEqual(got.verdict, VERDICT_PRESENT)
+            # Padded, not fabricated: the v1 writer had no replacement concept at all.
+            self.assertEqual(got.replacement_action_id, "")
+
+    def test_read_does_not_migrate_the_store(self) -> None:
+        # A read must never migrate a shared home out from under an older installed
+        # launcher (Redmine #13844's lesson, and the inverse of the #13882 defect).
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1_store(home)
+            before = path.read_bytes()
+            HerdrIdentityAttestationStore(home=home).read("mzb1_ws1_claude_default")
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_unsupported_schema_version_is_fail_closed(self) -> None:
+        # A version outside the recognized set is still fail-closed to None: unprovable
+        # compatibility never decodes.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             path = herdr_identity_attestation_path(home)
             path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(path))
             try:
-                conn.execute("PRAGMA user_version = 1")  # a stale pre-#13806 schema
+                conn.execute("PRAGMA user_version = 99")  # newer than this build knows
                 conn.execute(
                     "CREATE TABLE herdr_identity_attestations ("
                     "assigned_name TEXT PRIMARY KEY, workspace_id TEXT, role TEXT, "
                     "lane_id TEXT, locator TEXT, verdict TEXT, detail TEXT, observed_at TEXT)"
-                )
-                conn.execute(
-                    "INSERT INTO herdr_identity_attestations VALUES "
-                    "('mzb1_ws1_claude_default','ws1','claude','default','wY:p2','present','','t')"
                 )
                 conn.commit()
             finally:
