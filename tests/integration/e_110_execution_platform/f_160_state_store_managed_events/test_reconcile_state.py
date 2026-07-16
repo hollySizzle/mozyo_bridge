@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,9 +40,20 @@ from mozyo_bridge.core.state.reconcile_state_schema import (
 KEY = ReconcileStateKey(workspace_id="ws1", lane_id="lane-a", dispatch_anchor="13758:79337")
 
 
+def _tmp_dir(case: unittest.TestCase) -> Path:
+    """Per-test temp dir torn down via ``addCleanup``.
+
+    ``TestCase.enterContext`` is Python 3.11+; the CI matrix still runs 3.10, so the
+    context-manager form must not be used here.
+    """
+    td = tempfile.TemporaryDirectory()
+    case.addCleanup(td.cleanup)
+    return Path(td.name)
+
+
 class SelfRegistrationTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(self.enterContext(_TmpDir()))
+        self.tmp = _tmp_dir(self)
         self.path = self.tmp / "state.sqlite"
         self.store = ReconcileStateStore(path=self.path)
 
@@ -99,7 +111,7 @@ class SelfRegistrationTest(unittest.TestCase):
 
 class OpenCycleTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(self.enterContext(_TmpDir()))
+        self.tmp = _tmp_dir(self)
         self.store = ReconcileStateStore(path=self.tmp / "state.sqlite")
 
     def test_open_cycle_inserts_fresh_record(self):
@@ -140,7 +152,7 @@ class OpenCycleTest(unittest.TestCase):
 
 class AdvanceCasTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(self.enterContext(_TmpDir()))
+        self.tmp = _tmp_dir(self)
         self.store = ReconcileStateStore(path=self.tmp / "state.sqlite")
         self.store.open_cycle(KEY, phase="turn_ended_gate_pending")
 
@@ -205,20 +217,6 @@ class AdvanceCasTest(unittest.TestCase):
     def test_touch_runtime_missing_row_is_false(self):
         other = ReconcileStateKey(workspace_id="ws1", lane_id="none", dispatch_anchor="x")
         self.assertFalse(self.store.touch_runtime(other, "busy"))
-
-
-class _TmpDir:
-    """A tiny ``enterContext``-compatible temp dir (no external deps)."""
-
-    def __enter__(self):
-        import tempfile
-
-        self._td = tempfile.TemporaryDirectory()
-        return self._td.name
-
-    def __exit__(self, *exc):
-        self._td.cleanup()
-        return False
 
 
 if __name__ == "__main__":

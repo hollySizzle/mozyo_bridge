@@ -46,6 +46,38 @@ _TEST_YML = _WF / "test.yml"
 _TESTPYPI_YML = _WF / "testpypi.yml"
 _PUBLISH_YML = _WF / "publish.yml"
 
+# A governed release-candidate ref (Redmine #13525 j#79788 / j#79792) carries the
+# trusted `origin/main` `test.yml` BY DESIGN: the TestPyPI gate separately
+# fail-closes on byte equality with trusted main, so the candidate cannot weaken
+# its own Test workflow. On such a ref the three classes that pin the checkout's
+# tiered `test.yml` shape contradict that requirement and are skipped — ONLY
+# there. Everywhere else (local runs, issue branches, staging `int_*`, tags, PR
+# refs, or a non-push event) the tiered invariants stay enforced.
+_GOVERNED_RC_REF_PREFIX = "refs/heads/int_release_"
+
+
+def _is_governed_rc_ci_run(env) -> bool:
+    """True only for a real GitHub-Actions run on a governed RC ref.
+
+    All three conditions are required so a lookalike branch name alone (local
+    checkout, forged env fragment) never disables the tiered-shape pins:
+    ``GITHUB_ACTIONS`` must be exactly ``"true"``, the event must be ``push`` or
+    ``workflow_dispatch``, and the ref must be a branch ref under
+    ``int_release_`` (a tag or PR merge ref never matches).
+    """
+    if env.get("GITHUB_ACTIONS") != "true":
+        return False
+    if env.get("GITHUB_EVENT_NAME") not in ("push", "workflow_dispatch"):
+        return False
+    return str(env.get("GITHUB_REF", "")).startswith(_GOVERNED_RC_REF_PREFIX)
+
+
+_SKIP_TIERED_SHAPE_ON_GOVERNED_RC = unittest.skipIf(
+    _is_governed_rc_ci_run(os.environ),
+    "governed RC ref intentionally carries the trusted origin/main test.yml "
+    "(TestPyPI gate enforces byte equality); tiered-shape pins do not apply here",
+)
+
 
 def _load(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -200,6 +232,62 @@ class ExprEvaluatorSelfTest(unittest.TestCase):
         self.assertTrue(_eval("!(a == 'x')", **{"a": "z"}))
 
 
+class GovernedRcSkipGuardTest(unittest.TestCase):
+    """Pin the skip guard NARROW: Actions + push/dispatch + int_release_* only.
+
+    These always run (they read no workflow file), so a guard regression that
+    widens the skip is caught on every lane including the governed RC ref itself.
+    """
+
+    @staticmethod
+    def _env(actions="true", event="push", ref="refs/heads/int_release_0120a2_x"):
+        return {"GITHUB_ACTIONS": actions, "GITHUB_EVENT_NAME": event, "GITHUB_REF": ref}
+
+    def test_governed_rc_push_on_actions_skips(self) -> None:
+        self.assertTrue(_is_governed_rc_ci_run(self._env()))
+
+    def test_governed_rc_workflow_dispatch_on_actions_skips(self) -> None:
+        self.assertTrue(_is_governed_rc_ci_run(self._env(event="workflow_dispatch")))
+
+    def test_local_run_never_skips(self) -> None:
+        # No GitHub-Actions env at all — the common local / developer case.
+        self.assertFalse(_is_governed_rc_ci_run({}))
+        # Branch name alone (env fragment without GITHUB_ACTIONS) is not enough.
+        self.assertFalse(
+            _is_governed_rc_ci_run(
+                {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/int_release_x"}
+            )
+        )
+
+    def test_actions_flag_must_be_exactly_true(self) -> None:
+        self.assertFalse(_is_governed_rc_ci_run(self._env(actions="1")))
+        self.assertFalse(_is_governed_rc_ci_run(self._env(actions="TRUE")))
+
+    def test_issue_branch_never_skips(self) -> None:
+        self.assertFalse(
+            _is_governed_rc_ci_run(self._env(ref="refs/heads/issue_13525_rc_ci_compat_r2"))
+        )
+
+    def test_staging_int_branch_never_skips(self) -> None:
+        # `int_` staging refs are NOT governed RC refs; their checkout keeps the
+        # tiered test.yml and must keep being pinned.
+        self.assertFalse(
+            _is_governed_rc_ci_run(self._env(ref="refs/heads/int_13472_session_continuity"))
+        )
+
+    def test_tag_ref_never_skips(self) -> None:
+        self.assertFalse(_is_governed_rc_ci_run(self._env(ref="refs/tags/v0.12.0a2")))
+        self.assertFalse(
+            _is_governed_rc_ci_run(self._env(ref="refs/tags/int_release_lookalike"))
+        )
+
+    def test_pull_request_ref_and_event_never_skip(self) -> None:
+        self.assertFalse(_is_governed_rc_ci_run(self._env(ref="refs/pull/12/merge")))
+        self.assertFalse(_is_governed_rc_ci_run(self._env(event="pull_request")))
+        self.assertFalse(_is_governed_rc_ci_run(self._env(event="schedule")))
+
+
+@_SKIP_TIERED_SHAPE_ON_GOVERNED_RC
 class TestYmlTriggerMatrixTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -271,6 +359,7 @@ class TestYmlTriggerMatrixTest(unittest.TestCase):
             self.assertFalse(_eval(cancel, **_ctx("push", ref=ref)), msg=ref)
 
 
+@_SKIP_TIERED_SHAPE_ON_GOVERNED_RC
 class TestYmlRoutingTest(unittest.TestCase):
     """Behavioral routing: which job(s) run for each event (positive+negative)."""
 
@@ -332,6 +421,7 @@ class TestYmlRoutingTest(unittest.TestCase):
         )
 
 
+@_SKIP_TIERED_SHAPE_ON_GOVERNED_RC
 class IntegrationBatchStepsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
