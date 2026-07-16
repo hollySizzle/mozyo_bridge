@@ -934,20 +934,29 @@ def _execute_slot(
     )
 
 
-def cmd_herdr_session_start(args: "argparse.Namespace") -> int:
-    """Compatibility facade for the relocated CLI handler (Redmine #13882 R8-F1).
+def __getattr__(name: str):
+    """Lazy re-export of the relocated CLI handler (Redmine #13882 R8-F1 / R9-F1).
 
-    The handler itself now lives in :mod:`.herdr_session_start_cli` (the module split
-    approved in j#80207), but this module's public import surface predates that move and
-    the split was declared behavior-preserving — so callers importing it from here must
-    keep working. Imported lazily because the CLI module imports this one; the indirection
-    also keeps both paths pointing at exactly one callable.
+    The handler now lives in :mod:`.herdr_session_start_cli` (the split approved in
+    j#80207), but this module's public import surface predates that move and the split was
+    declared behavior-preserving, so ``from ...herdr_session_start import
+    cmd_herdr_session_start`` must keep working.
+
+    It is a module ``__getattr__`` (PEP 562) rather than a forwarding wrapper because the
+    contract is **object identity**, not merely "a call that works": the first attempt
+    defined a second function here, so ``old.cmd_herdr_session_start is
+    new.cmd_herdr_session_start`` was False and callers comparing, patching or registering
+    the handler saw two different objects (review j#80348 R9-F1). Resolving on attribute
+    access returns the one real handler while still importing lazily, which is what keeps
+    the CLI module free to import this one.
     """
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_cli import (  # noqa: E501
-        cmd_herdr_session_start as _relocated,
-    )
+    if name == "cmd_herdr_session_start":
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_cli import (  # noqa: E501
+            cmd_herdr_session_start,
+        )
 
-    return _relocated(args)
+        return cmd_herdr_session_start
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = (

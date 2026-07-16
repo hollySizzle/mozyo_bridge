@@ -1664,17 +1664,25 @@ class ReviewJ80305FindingsTest(unittest.TestCase):
         )
 
         self.assertIn("cmd_herdr_session_start", old_module.__all__)
-        # Both paths must reach ONE handler: the facade forwards rather than duplicating.
-        args = argparse.Namespace()
-        seen: list = []
-        with mock.patch(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_session_start_cli.cmd_herdr_session_start",
-            lambda a: seen.append(a) or 0,
-        ):
-            via_old_path(args)
-        self.assertEqual(seen, [args], "the old path must delegate to the relocated handler")
-        self.assertTrue(callable(via_new_path))
+        # IDENTITY, not merely "a call that works" (review j#80348 R9-F1). The first fix
+        # defined a forwarding wrapper in the old module, so the two paths were different
+        # objects while this test — named for sameness — only checked that forwarding
+        # happened. A caller comparing, patching or registering the handler by identity
+        # would still have seen two handlers.
+        self.assertIs(
+            via_old_path, via_new_path,
+            "the old import path must yield the relocated handler OBJECT, not a wrapper",
+        )
+        self.assertIs(old_module.cmd_herdr_session_start, via_new_path)
+
+    def test_r9f1_old_module_still_rejects_unknown_attributes(self) -> None:
+        # A module __getattr__ must not turn every typo into something importable.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as old_module,
+        )
+
+        with self.assertRaises(AttributeError):
+            old_module.definitely_not_a_real_symbol
 
     def test_r8f2_public_signature_is_explicit_not_kwargs(self) -> None:
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
