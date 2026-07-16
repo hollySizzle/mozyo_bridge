@@ -5,6 +5,11 @@ owner that died mid-PUT, and nothing local can tell those apart. Rather than gue
 what duplicated records — it stalls the anchor and waits for someone to read the actual Redmine
 journal. That trade is only coherent if the operator has a way to act, which is this command.
 
+But an operator surface is not an authority override, which is what R10-F1 caught this command
+being: it could delete a live ``reserved`` row on the strength of "Redmine shows zero right now",
+letting the stalled owner and its replacement both publish. The fence decides what each state
+permits; this command only carries the operator's intent to it, and reports the refusal.
+
 Split out of :mod:`...cli_workflow` to keep that module under the health gate; the shape follows the
 sibling ``dispatch-fence`` / ``callback-lease`` surfaces.
 """
@@ -20,8 +25,13 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     ``--list`` shows every anchor the fence is currently blocking. ``--reconcile`` is the operator
     disposition for one of them, taken AFTER reading the issue's journal: ``--landed <journal_id>``
     closes the anchor as published (no second record will ever be written), while ``--none-landed``
-    releases the identity so a later sweep may publish it. Passing ``--none-landed`` when a record
-    did land is precisely how a duplicate gets created, so confirm in Redmine first.
+    releases the identity so a later sweep may publish it.
+
+    The fence — not this command — decides which of those the current state permits, and refuses
+    the rest with a non-zero exit (R10-F1). In particular ``--none-landed`` cannot release a
+    ``reserved`` row: that state means an owner may be mid-PUT, and "Redmine shows zero right now"
+    is not proof it will not PUT later. An operator surface that could override that would just be
+    a hand-operated version of the reclaim this fence exists to refuse.
 
     ``--bootstrap`` is a safe first init (DB + sidecar both absent); ``--recover`` is deliberate
     loss recovery under a fresh nonce, which forgets every reservation and so can republish — only
@@ -44,6 +54,10 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
             fence.bootstrap()
             print(f"callback publication fence bootstrapped at {fence.path}")
             return 0
+        stray = getattr(args, "pub_landed", None) or getattr(args, "pub_none_landed", False)
+        if stray and not getattr(args, "pub_reconcile", None):
+            print("--landed / --none-landed only mean something with --reconcile")
+            return 2
         if getattr(args, "pub_reconcile", None):
             landed = getattr(args, "pub_landed", None)
             if not landed and not getattr(args, "pub_none_landed", False):
@@ -55,7 +69,14 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
                 workspace_id=workspace, lane_id=lane, issue=issue,
                 lane_generation=generation, dispatch_anchor=anchor, outcome=outcome,
             )
-            fence.reconcile(key, published_journal=landed or None)
+            try:
+                fence.reconcile(key, published_journal=landed or None)
+            except CallbackPublicationFenceError as exc:
+                # Deliberately NOT the store-loss hint: `--recover` forgets every reservation, so
+                # suggesting it to someone who merely mistyped an anchor points them straight at
+                # the duplicate this whole mechanism prevents.
+                print(f"reconcile refused: {exc}")
+                return 1
             verdict = f"published as journal {landed}" if landed else "released for republication"
             print(f"reconciled {issue}/{anchor}/{outcome}: {verdict}")
             return 0
@@ -96,29 +117,34 @@ def register_callback_publication_parser(workflow_sub) -> None:
         ),
         help="List / reconcile / bootstrap / recover the callback-sweep publication fence.",
     )
-    pub_p.add_argument(
+    # Exactly one action, and at most one disposition: an operator who types two intents at once
+    # has not decided which they mean, and this command must never pick for them (R10-F1).
+    action = pub_p.add_mutually_exclusive_group()
+    action.add_argument(
         "--list", dest="pub_list", action="store_true",
         help="List every anchor the fence is currently blocking (reserved / uncertain).",
     )
-    pub_p.add_argument(
+    action.add_argument(
         "--reconcile", dest="pub_reconcile", nargs=6,
         metavar=("ISSUE", "GENERATION", "ANCHOR", "OUTCOME", "WORKSPACE", "LANE"),
         help="Dispose of one blocked anchor; needs --landed or --none-landed.",
     )
-    pub_p.add_argument(
-        "--landed", dest="pub_landed", metavar="JOURNAL_ID",
-        help="The record DID land as this journal: close the anchor, never write a second.",
-    )
-    pub_p.add_argument(
-        "--none-landed", dest="pub_none_landed", action="store_true",
-        help="No record landed (CONFIRM in Redmine first): release the identity for republication.",
-    )
-    pub_p.add_argument(
+    action.add_argument(
         "--bootstrap", dest="pub_bootstrap", action="store_true",
         help="Initialize the fence store (safe first init; refuses on a detected loss).",
     )
-    pub_p.add_argument(
+    action.add_argument(
         "--recover", dest="pub_recover", action="store_true",
         help="Deliberate loss recovery: fresh store under a new nonce (forgets all reservations).",
+    )
+    disposition = pub_p.add_mutually_exclusive_group()
+    disposition.add_argument(
+        "--landed", dest="pub_landed", metavar="JOURNAL_ID",
+        help="The record DID land as this journal: close the anchor, never write a second.",
+    )
+    disposition.add_argument(
+        "--none-landed", dest="pub_none_landed", action="store_true",
+        help="No record landed (CONFIRM in Redmine): release an `uncertain` identity. The fence "
+             "refuses this for a `reserved` row, whose owner may be mid-PUT.",
     )
     pub_p.set_defaults(func=cmd_workflow_callback_publication)

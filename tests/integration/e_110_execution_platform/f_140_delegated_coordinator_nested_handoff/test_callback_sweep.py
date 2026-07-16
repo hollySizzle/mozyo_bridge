@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_publication_fence import (
+    PUBLICATION_PUBLISHED,
     PUBLICATION_RESERVED,
     PUBLICATION_UNCERTAIN,
     CallbackPublicationFenceError,
@@ -1188,12 +1189,15 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.assertTrue(self.lease.owns(self.key(), a.token))
 
     def test_the_r9_sequence_publishes_exactly_once(self):
-        # The R9-F1 sequence, verbatim: A reserves -> A is suspended past the attempt TTL -> B
-        # reclaims the lease and attempts the SAME record -> A resumes holding a stale check.
-        # Previously this produced posted_count=2. The publication fence never reclaims, so
-        # whoever reserved the record identity is the only one who can ever write it.
+        # The R9-F1 sequence, with A genuinely suspended where it matters: AFTER its publication
+        # reserve and BEFORE its PUT. The recorder's order is pre-read -> grant_is_live -> reserve
+        # -> post_note, so driving B from inside A's grant_is_live (the R10-F2 defect in this test)
+        # ran B to completion before A reserved anything -- pinning "B first, A blocked", the
+        # reverse of the sequence under test. A barrier inside post_note puts A where the duplicate
+        # was actually produced: holding a passed lease check and an open reservation.
         posted = []
-        outer = self
+        a_reserved = threading.Event()
+        b_done = threading.Event()
 
         class Src:
             fresh_read = True
@@ -1201,33 +1205,45 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
             def read_entries(self, issue_id):
                 return [ir("79990")] + [entry(str(99000 + k), n) for k, n in enumerate(posted)]
 
-        def mk(grant):
-            return build_recovery_recorder(
-                source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
-                post_note=lambda i, n: posted.append(n), grant_is_live=grant,
-                publication_fence=self.pubfence, workspace_id=WS,
-            )
-
         wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
                                lane_generation=GEN, latest_generation=GEN)
         res = {"state": STATE_NO_PROGRESS_AFTER_HANDOFF, "dispatch_journal": "79990"}
-        a = self.lease.acquire(self.key())
+        a_grant = self.lease.acquire(self.key())
 
-        def a_grant():
-            ok = self.lease.owns(self.key(), a.token)
-            # A is suspended here, past its TTL. B reclaims and attempts the same record.
-            self.lease.acquire(self.key(), now=time.time() + 99999)
+        def a_put(issue_id, note):
+            a_reserved.set()                       # A holds its reservation, PUT not yet issued
+            self.assertTrue(b_done.wait(timeout=5))  # ...and stalls here, past its lease TTL
+            posted.append(note)                    # A resumes and completes the PUT it began
+
+        def b_attempt():
+            self.assertTrue(a_reserved.wait(timeout=5))
+            self.lease.acquire(self.key(), now=time.time() + 99999)   # B reclaims the stale lease
             try:
-                mk(lambda: True)(res, wm)
-            except (RecordPublicationHeldError, RecordPublicationUncertainError):
-                pass
-            return ok      # A resumes, still holding the check it already passed
+                build_recovery_recorder(
+                    source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
+                    post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
+                    publication_fence=self.pubfence, workspace_id=WS,
+                )(res, wm)
+                self.b_outcome = "published"
+            except (RecordPublicationHeldError, RecordPublicationUncertainError) as exc:
+                self.b_outcome = type(exc).__name__
+            finally:
+                b_done.set()
 
+        b = threading.Thread(target=b_attempt)
+        b.start()
         try:
-            mk(a_grant)(res, wm)
+            build_recovery_recorder(
+                source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=a_put,
+                grant_is_live=lambda: self.lease.owns(self.key(), a_grant.token),
+                publication_fence=self.pubfence, workspace_id=WS,
+            )(res, wm)
         except (RecordPublicationHeldError, RecordPublicationUncertainError):
             pass
-        self.assertEqual(len(posted), 1)
+        b.join(timeout=5)
+
+        self.assertEqual(len(posted), 1)                       # the whole point: one record
+        self.assertEqual(self.b_outcome, "RecordPublicationHeldError")  # and B is why, not luck
 
     def test_a_reservation_is_never_reclaimed_so_a_crashed_owner_blocks_rather_than_duplicates(self):
         # A reserved and then crashed (no published/uncertain mark). A re-entry must NOT take over:
@@ -1318,15 +1334,58 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.assertEqual(self.pubfence.pending(), [])
         self.assertFalse(self.pubfence.reserve(key).may_publish)
 
-    def test_reconciling_as_none_landed_releases_the_identity_for_one_more_publication(self):
+    def test_an_operator_cannot_release_a_live_reserved_owner(self):
+        # R10-F1: this test previously asserted the DEFECT -- that --none-landed releases a
+        # `reserved` row. It does not, and must not: `reserved` means an owner may be mid-PUT, so
+        # releasing it lets that owner and its replacement both publish. Redmine showing zero
+        # records *now* is not proof a stalled owner will not PUT *later*.
         key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
                              dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
-        self.pubfence.reserve(key)
-        # Disposition B: the operator confirmed NOTHING landed -> a later sweep may publish.
+        self.pubfence.reserve(key)                       # A reserved, then stalled before its PUT
+        with self.assertRaises(CallbackPublicationFenceError):
+            self.pubfence.reconcile(key, published_journal=None)
+        self.assertEqual(self.pubfence.state_of(key), PUBLICATION_RESERVED)   # untouched
+        self.assertFalse(self.pubfence.reserve(key).may_publish)              # B still cannot
+
+    def test_only_an_uncertain_identity_can_be_released_for_one_more_publication(self):
+        # The one release that IS sound: the owner finished its PUT attempt and reported the
+        # outcome unknown, so it will not resume and write again. An operator who confirms nothing
+        # landed may hand the identity back -- exactly once.
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79991", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        res = self.pubfence.reserve(key)
+        self.pubfence.mark_uncertain(key, res.token)
         self.pubfence.reconcile(key, published_journal=None)
         self.assertEqual(self.pubfence.pending(), [])
         self.assertTrue(self.pubfence.reserve(key).may_publish)
         self.assertFalse(self.pubfence.reserve(key).may_publish)   # and only once more
+
+    def test_a_published_identity_is_terminal_and_an_absent_one_is_not_reconcilable(self):
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79992", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        res = self.pubfence.reserve(key)
+        self.pubfence.mark_published(key, res.token, "80500")
+        for disposition in (None, "80501"):          # reopening a published row republishes it
+            with self.assertRaises(CallbackPublicationFenceError):
+                self.pubfence.reconcile(key, published_journal=disposition)
+        self.assertEqual(self.pubfence.state_of(key), PUBLICATION_PUBLISHED)
+
+        absent = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE,
+                                lane_generation=str(GEN), dispatch_anchor="does-not-exist",
+                                outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        for disposition in (None, "80502"):          # silently succeeding would hide a typo
+            with self.assertRaises(CallbackPublicationFenceError):
+                self.pubfence.reconcile(absent, published_journal=disposition)
+
+    def test_a_reserved_owner_that_did_land_a_record_can_be_closed_but_never_reopened(self):
+        # The only disposition a `reserved` row accepts: it can never permit a write, only forbid
+        # one more, so it is safe without proving anything about the owner.
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79993", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.pubfence.reserve(key)
+        self.pubfence.reconcile(key, published_journal="80500")
+        self.assertEqual(self.pubfence.state_of(key), PUBLICATION_PUBLISHED)
+        self.assertFalse(self.pubfence.reserve(key).may_publish)
 
     def test_actuation_refuses_a_grant_less_raw_writer(self):
         # R8-F2: the unsafe shape must be unrepresentable, not merely discouraged. A raw writer
