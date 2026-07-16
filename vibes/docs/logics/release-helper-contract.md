@@ -54,16 +54,17 @@ publish workflow の dispatch / 状態確認に専念する helper。version 文
 
 | 種別 | 例 | 実体 | `source_ref` として |
 | --- | --- | --- | --- |
-| remote ref literal (canonical) | `refs/heads/int_release_x` | origin 上に存在する ref の完全 path | **推奨**。構造上つねに exactly-one |
-| remote ref literal (短縮) | `int_release_x` | ls-remote が tail 一致で解決 | 受理。ただし exactly-one は保証されない (下記) |
-| local remote-tracking name | `origin/int_release_x` | local の `refs/remotes/origin/int_release_x` の表示名 | **reject**。origin 上にこの名前の ref は無い |
-| local remote-tracking full path | `refs/remotes/origin/int_release_x` | local 専用 namespace | **reject**。同上 |
+| remote ref literal (canonical) | `refs/heads/int_release_x` | origin 上に存在する ref の完全 path | **推奨** (最も曖昧さが少ない)。ただし exactly-one は保証されない (下記) |
+| remote ref literal (短縮) | `int_release_x` | ls-remote が tail 一致で解決 | 受理。exactly-one は保証されない (下記) |
+| local remote-tracking name | `origin/int_release_x` | local の `refs/remotes/origin/int_release_x` の表示名。ただし remote 上に同名 branch が存在しうる | **reject** (曖昧なため) |
+| local remote-tracking full path | `refs/remotes/origin/int_release_x` | remote ref の local mirror。remote は branch を `refs/heads/` に publish する | **reject** |
 
-**採用 policy: reject with exact correction (単一 policy)。** local remote-tracking 表記を受けたら、helper は dispatch 前に停止し、そのまま貼れる訂正 (`--source-ref refs/heads/<branch>` / `--source-ref <branch>`) を添えて exit する。**silent normalize (`origin/<branch>` -> `<branch>`) は採用しない。**
+**採用 policy: reject with exact correction (単一 policy)。** local remote-tracking 表記を受けたら、helper は dispatch 前に停止し、そのまま貼れる訂正を添えて exit する。**silent normalize (`origin/<branch>` -> `<branch>`) は採用しない。**
 
 却下理由 (`origin/<branch>` の normalize):
 
-- **`origin/<branch>` は曖昧である。** remote は `origin/<branch>` という名前の branch を実際に持てる (`refs/heads/origin/<branch>`)。この状態で `origin/main` を `main` へ書き換えると、artifact authority を **別 ref へ silent に付け替える**。regression test `test_origin_prefixed_branch_can_really_exist_on_origin` が実 git に対してこの反例を pin している。
+- **`origin/<branch>` は曖昧である (これが reject の理由)。** remote は `origin/<branch>` という名前の branch を実際に持てる (`refs/heads/origin/<branch>`)。よって `origin/main` は「local が表示する `main`」とも「remote 上の literal な `origin/main`」とも読める。`main` へ書き換えると、artifact authority を **別 commit へ silent に付け替えうる**。regression test `test_origin_prefixed_branch_can_really_exist_on_origin` が実 git に対してこの反例を pin している。
+  - **注意 (Redmine #13883 j#79995 F3)**: reject の理由は「zero 解決するから」**ではない**。zero 解決は同名 branch が無い場合の典型的な結末にすぎず、上記のとおり 1 件解決することもある。診断 message / docs / help は「曖昧だから拒否する」を理由として書き、「常に zero」と断定しない。
 - **normalize 先自体が exactly-one とは限らない。** `git ls-remote <pattern>` は exact lookup ではなく **ref 名の tail 一致 glob** である。`main` は `refs/heads/main` に加え `refs/tags/main` や `refs/heads/origin/main` にも一致する。「安全に normalize できる」前提が成立しない。
 - **周辺 gate との整合。** この経路は他のすべての link (exact 40-hex SHA、exactly-one ref、candidate `test.yml` の byte 一致) で曖昧さを拒否している。helper だけが operator の意図を推測すると、そこが唯一の soft spot になる。
 - **reject の代償が小さい。** preflight が origin を引く以上、helper は正しい綴りを exact に提示できる。operator は 1 回貼り直すだけで、silent な取り違えは起きない。
@@ -79,6 +80,16 @@ publish workflow の dispatch / 状態確認に専念する helper。version 文
 - **zero / multi / mismatch のいずれでも dispatch を 0 回**にする (`gh workflow run` を呼ばない)。charset (`[A-Za-z0-9._/-]+`、glob / refspec metachar / whitespace 拒否) は workflow gate と同一で、shell-safety guard も兼ねる。
 
 peel 行を落とす帰結として、**annotated tag の non-peel tip は tag object であって commit ではない**。よって annotated tag を `source_ref` に渡すと mismatch として refuse される。これは server 側 gate と同じ挙動であり、client が server より緩くならないための意図的な parity である。
+
+#### exactly-one は構造保証ではなく動的検査 (Redmine #13883 j#79995 F1)
+
+`ls-remote` の tail 一致は **full path 入力にも作用する**。remote に branch `foo/refs/heads/main` があると、`git ls-remote origin refs/heads/main` は `refs/heads/foo/refs/heads/main` と `refs/heads/main` の **2 件**を返す (isolated real-git で実証、regression test に pin)。したがって:
+
+- **どの綴りも「構造上つねに exactly-one」ではない。** `refs/heads/<branch>` は *最も曖昧さが少ない canonical form* であって、一意性が保証された form ではない。docs / help / 診断 message でこれを「always exactly one」と書かない。
+- exactly-one は **preflight と server gate が動的に検査する不変条件**である。衝突時は client / server の双方が同じ logic で refuse するため、fail-closed と parity は保たれる。
+- **回復手順は入力形式で異なる**。短縮名なら full path が曖昧性を解消しうる。**既に full path の場合、再提示は無意味**であり、回復は (a) origin 側の衝突 ref を rename / 削除する、(b) 一意に解決する別 ref を使う、のいずれか。診断 message はこの 2 分岐を出し分ける。
+
+client 側で full path の exact-match semantics を実装して衝突を回避する案は **採らない**。server が glob のままなので、client だけ exact-match にすると **client が greenlight した ref を server が refuse する**状態が生じ、本 contract が掲げる「client は server より緩くならない」parity を破る。exact-match を入れるなら trusted workflow gate 側と同時に変更する必要があり、それは別 issue の scope である。
 
 これは #13601 の trust model を弱めない。preflight は read-only な `git ls-remote` のみで、**判断を自動化しない** (曖昧なら止めるだけで、ref を選び直したり推測したりしない)。狙いは、build 前に落ちると分かっている dispatch を発行しないこと。run `29481593519` はこの preflight が無かったために起動後 build 前に失敗した。
 

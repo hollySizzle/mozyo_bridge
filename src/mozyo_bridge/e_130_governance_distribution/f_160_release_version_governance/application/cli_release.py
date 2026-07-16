@@ -263,11 +263,15 @@ def register(sub) -> None:
             "`--testpypi`. Spell it AS ORIGIN SPELLS IT, not as git spells "
             "it locally: `refs/heads/<branch>` (canonical) or `<branch>`. "
             "Local remote-tracking names (`origin/<branch>`, "
-            "`refs/remotes/origin/<branch>`) name refs that exist only in "
-            "your clone; they are rejected before dispatch with the exact "
-            "correction to use, never silently rewritten (Redmine #13883). "
+            "`refs/remotes/origin/<branch>`) are rejected before dispatch "
+            "with the exact correction to use, never silently rewritten "
+            "(Redmine #13883) — they are ambiguous rather than absent, "
+            "since a remote can also carry a branch literally named "
+            "`origin/<branch>`, so the helper refuses instead of guessing. "
             "The ref is resolved on origin before dispatch and must match "
-            "exactly one non-peel ref whose tip is --source-sha."
+            "exactly one non-peel ref whose tip is --source-sha; that is "
+            "checked dynamically, as `git ls-remote` matches a ref-name "
+            "tail and so no spelling is unique by construction."
         ),
     )
     release_publish.add_argument(
