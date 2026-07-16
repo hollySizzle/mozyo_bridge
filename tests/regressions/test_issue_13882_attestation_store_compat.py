@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -863,6 +864,162 @@ class ReviewJ80000FindingsTest(unittest.TestCase):
         )
         self.assertEqual(obs.advertised_schema_version, 2)
         self.assertEqual(obs.advertised_store_versions, frozenset({1, 2}))
+
+
+class ReviewJ80045FindingsTest(unittest.TestCase):
+    """Review j#80045: the failure paths of the backup/rotation rails."""
+
+    @staticmethod
+    def _published(home: Path) -> list:
+        backups = home / "backups"
+        return sorted(f.name for f in backups.iterdir()) if backups.exists() else []
+
+    # --- R3-F1: a failure must never publish a partial recovery point -----------------
+    def test_r3f1_partial_logical_snapshot_is_never_published(self) -> None:
+        # backups/<ts>/ is the namespace an operator trusts, so writing directly into it
+        # published a partial recovery point on every failure: a snapshot that raised
+        # mid-backup() left an 8192-byte DB with user_version=0 sitting there. Staging +
+        # atomic publish means a reader sees the whole set or nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1(home)
+            before = _digest(path)
+
+            class _PartialBackup(sqlite3.Connection):
+                def backup(self, dest, *a, **k):
+                    dest.execute("CREATE TABLE partial_backup_marker (x INTEGER)")
+                    dest.commit()
+                    raise sqlite3.OperationalError("simulated: failure mid-backup")
+
+            real_connect = sqlite3.connect
+
+            def _patched(target, *a, **k):
+                if "mode=ro" in str(target):
+                    k["factory"] = _PartialBackup
+                return real_connect(target, *a, **k)
+
+            with mock.patch.object(sch.sqlite3, "connect", _patched):
+                with self.assertRaises(StateStoreError):
+                    sch.backup_attestation_store(path)
+            self.assertEqual(self._published(home), [])
+            self.assertEqual(_digest(path), before)
+
+    def test_r3f1_partial_quarantine_is_never_published(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            path.with_name(path.name + "-wal").write_bytes(b"WAL EVIDENCE")
+            real_copy = shutil.copy2
+
+            def _flaky(src, dst, *a, **k):
+                if str(src).endswith("-wal"):
+                    raise OSError("simulated: sidecar copy failed")
+                return real_copy(src, dst, *a, **k)
+
+            with mock.patch.object(sch.shutil, "copy2", _flaky):
+                with self.assertRaises(StateStoreError):
+                    sch.quarantine_attestation_store_artifacts(path)
+            # A "whole-artifact" recovery point holding only the main file is exactly the
+            # trusted-but-incomplete snapshot this component refuses to produce.
+            self.assertEqual(self._published(home), [])
+            self.assertTrue(path.exists())  # source artifacts untouched
+
+    def test_r3f1_staging_lives_outside_the_published_namespace(self) -> None:
+        # Even a failed cleanup must leave nothing discoverable under backups/.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1(home)
+            staging, final_dir = sch._stage_backup(path)
+            try:
+                self.assertNotIn("backups", staging.parts[-2:])
+                self.assertIn("backups", final_dir.parts)
+            finally:
+                sch._discard_staging(staging)
+
+    def test_r3f1_successful_backup_is_still_published(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1(home, rows=2)
+            backup = sch.backup_attestation_store(path)
+            self.assertTrue(backup.exists())
+            self.assertIn("backups", backup.parts)
+            self.assertEqual(_store_content(backup / path.name), (1, 2))
+
+    # --- R3-F2: rotation order makes an interruption recoverable ----------------------
+    def test_r3f2_interrupted_rotation_leaves_main_and_retry_completes(self) -> None:
+        # Removing the main file first made a half-done rotation indistinguishable from a
+        # finished one: the retry probed STORE_ABSENT and reported already_current while
+        # the orphaned -wal persisted forever. The main file is the completion sentinel,
+        # so it goes last.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            wal = path.with_name(path.name + "-wal")
+            wal.write_bytes(b"WAL EVIDENCE")
+            real_unlink = Path.unlink
+
+            def _flaky(self_path, *a, **k):
+                if self_path.name.endswith("-wal"):
+                    raise OSError("simulated: unlink failed")
+                return real_unlink(self_path, *a, **k)
+
+            with mock.patch.object(Path, "unlink", _flaky):
+                first = run_attestation_store_rebuild(
+                    home=home, view=_View(agents=[]), write=True
+                )
+            self.assertFalse(first.ok)
+            self.assertTrue(path.exists(), "main must survive as the completion sentinel")
+            # The report must not DENY a side effect that happened. It previously said
+            # "the store is left untouched" while the main file was already gone.
+            self.assertIn("NOT untouched", first.detail)
+            self.assertNotIn("left untouched", first.detail)
+            self.assertIn("Re-run", first.detail)
+            self.assertTrue(first.executed)
+
+            retry = run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+            self.assertEqual(retry.state, APPLIED)  # not a false already_current
+            self.assertFalse(path.exists())
+            self.assertFalse(wal.exists(), "the orphan sidecar must not survive")
+
+    def test_r3f2_sidecars_are_removed_before_the_main_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+            for suffix in ("-wal", "-shm", "-journal"):
+                path.with_name(path.name + suffix).write_bytes(b"y")
+            order: list = []
+            real_unlink = Path.unlink
+
+            def _record(self_path, *a, **k):
+                order.append(self_path.name)
+                return real_unlink(self_path, *a, **k)
+
+            with mock.patch.object(Path, "unlink", _record):
+                sch.remove_attestation_store_artifacts(path)
+            self.assertEqual(order[-1], path.name, "the main file must be removed LAST")
+
+    def test_r3f2_quarantine_failure_still_reports_untouched_truthfully(self) -> None:
+        # "untouched" is only true before any removal begins — that branch must keep it.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            with mock.patch.object(
+                sch.shutil, "copy2", mock.Mock(side_effect=OSError("no space"))
+            ):
+                result = run_attestation_store_rebuild(
+                    home=home, view=_View(agents=[]), write=True
+                )
+            self.assertFalse(result.ok)
+            self.assertIn("untouched", result.detail)
+            self.assertTrue(path.exists())
 
 
 class ZeroSideEffectTest(unittest.TestCase):

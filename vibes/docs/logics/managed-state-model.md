@@ -624,6 +624,22 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   Copying only the main file stranded that evidence in place while `rebuild` removed its sibling; leaving a `-wal` behind after
   removing the main DB would also let a later open resurrect a partial store from the orphaned sidecar. Both the quarantine and the
   removal cover the main file plus every existing sidecar.
+- **A backup is STAGED and published atomically; a failure publishes nothing** (#13882 review j#80045 R3-F1). `backups/<ts>/` is the
+  namespace an operator trusts as a recovery point, so building the artifacts directly inside it means every failure publishes a
+  partial one — measured: a snapshot raising mid-`backup()` left an 8192-byte DB with `user_version=0` sitting in `backups/`, and a
+  quarantine whose sidecar copy failed left a "whole-artifact" recovery point holding only the main file. Both rails therefore build
+  under `.backups-staging/` — a **sibling** of `backups/`, never a child, so even a failed cleanup leaves nothing discoverable in the
+  published namespace — and publish with a single `os.replace` of the directory once every artifact is complete. A reader of
+  `backups/` sees the whole set or nothing. The rule generalizes the section's own principle: *incomplete and trusted is worse than
+  none* applies to the failure path too, not only the success path.
+- **The main file is the rotation's completion sentinel: sidecars first, main LAST** (R3-F2). `probe_store_schema` decides a store
+  *exists* by the main file, so removing it first made a half-done rotation indistinguishable from a finished one — measured: a
+  failing `-wal` unlink left `main` gone and the sidecar orphaned, the retry then probed `STORE_ABSENT` and reported
+  `already_current` ("no store exists"), so the public command declared success while the orphan persisted and no rerun could ever
+  clear it. Sidecars-first inverts that: any interruption leaves the main file present, the store still probes as existing, and the
+  same command re-run finishes the job — which is what Acceptance 3's idempotency requires. Correspondingly, an interrupted rotation
+  **must not report "untouched"**: it reports that artifacts may already be removed and that a re-run completes it (`an audit record
+  must never deny a side effect that happened`). "Untouched" survives only on the branch that fails *before* any removal begins.
 - **Only a whole, canonical capability token is credited** (#13882 review j#80000 finding 3). Both advertisement tokens are bounded
   on each side and matched against an exact grammar (`<int>` / `<int>(_<int>)*`); a malformed spelling is **not** salvaged into a
   capability. Unbounded matching credited `…schema=2x` as a clean v2, and `stores=1__2` / `_1_2_` / `1_2junk` as `{1, 2}` — handing a

@@ -419,20 +419,42 @@ def run_attestation_store_rebuild(
                 "non-green), never to a false attestation",
             ),
         )
+    # Raw quarantine, not a logical snapshot (review j#80029 R2-F1): the store is already
+    # proven unreadable above, so there is nothing to snapshot logically and its bytes ARE
+    # the evidence. Whole artifact set — a stranded `-wal` would both lose forensic
+    # evidence and let a later open resurrect a partial store.
     try:
-        # Raw quarantine, not a logical snapshot (review j#80029 R2-F1): the store is
-        # already proven unreadable above, so there is nothing to snapshot logically and
-        # its bytes ARE the evidence. Whole artifact set — a stranded `-wal` would both
-        # lose forensic evidence and let a later open resurrect a partial store.
         backup_dir = quarantine_attestation_store_artifacts(path)
-        remove_attestation_store_artifacts(path)
     except (StateStoreError, OSError) as exc:
+        # Nothing was removed yet, so "untouched" is a true statement HERE and only here.
         return AttestationStoreMaintenanceResult(
             intent="rebuild",
             state=BLOCKED_FAILED,
             store_version=store.version,
             store_state=store.state,
-            detail=f"rebuild aborted: {exc} (the store is left untouched)",
+            detail=f"rebuild aborted before any removal: {exc} (the store is untouched)",
+        )
+    try:
+        remove_attestation_store_artifacts(path)
+    except OSError as exc:
+        # The rotation began, so the store is NOT untouched and must not be reported as
+        # such (review j#80045 R3-F2; managed-state-model.md: "an audit record must never
+        # deny a side effect that happened"). Sidecars are removed before the main file,
+        # so an interruption leaves the main file present, the store still probes as
+        # existing, and re-running this same command finishes the rotation.
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_FAILED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                f"rebuild was interrupted partway through rotating the store away "
+                f"({exc}); the backup is complete and published, but some artifacts may "
+                f"already be removed — the store is NOT untouched. Re-run this same "
+                f"command to finish the rotation"
+            ),
+            backup_dir=backup_dir,
+            executed=True,
         )
     return AttestationStoreMaintenanceResult(
         intent="rebuild",
