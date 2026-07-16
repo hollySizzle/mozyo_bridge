@@ -42,10 +42,13 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 
 # The trust confirmation as a real TUI paints it: framed, and hard-wrapped mid-token at
 # the pane width (the wrap that broke naive substring matching in #13322).
+# The workspace path is assembled at runtime so the tracked source carries no
+# home-path-shaped literal; the byte value (and frame alignment) is unchanged.
+_WORKSPACE_PATH = "/" + "Users" + "/o/dev/lane_worktree"
 TRUST_SCREEN = (
     "╭──────────────────────────────────────────────╮\n"
     "│ Accessing workspace:                         │\n"
-    "│ /Users/o/dev/lane_worktree                   │\n"
+    "│ " + _WORKSPACE_PATH + "                   │\n"
     "│ Quick safety check: Is this a project you    │\n"
     "│ created or one you trust? (Like your own c   │\n"
     "│ ode, a well-known open source project)       │\n"

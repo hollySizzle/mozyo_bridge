@@ -50,7 +50,15 @@ from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.re
 )
 
 #: A shell env that WOULD look ready on the interactive path — but the launchd daemon never sees it.
-SHELL_ENV = {API_KEY_ENV: "shell-key-value", BASE_URL_ENV: "https://redmine.shell.test"}
+SHELL_ENV = {API_KEY_ENV: "shell-key-sentinel", BASE_URL_ENV: "https://redmine.shell.test"}
+
+#: The uid the tests pin. It must be the REAL process uid: the `os.getuid` patch in
+#: `_DarwinCase` is visible process-wide (shared `os` module), so the credential
+#: ownership check in redmine_credentials compares fixture files owned by the actual
+#: runner uid against this value. A fixed 501 only passed where the operator uid
+#: happened to be 501 and broke on Linux CI runners.
+_TEST_UID = os.getuid() if hasattr(os, "getuid") else 501
+_GUI_DOMAIN = f"gui/{_TEST_UID}"
 
 
 def _resolved(p: Path) -> str:
@@ -58,7 +66,7 @@ def _resolved(p: Path) -> str:
     return str(sl.resolve_mozyo_home(p))
 
 
-def _write_home_credential(mozyo_home: Path, *, api_key="home-key", url="https://redmine.example.test",
+def _write_home_credential(mozyo_home: Path, *, api_key="home-key-sentinel", url="https://redmine.example.test",
                            mode=0o600) -> Path:
     """Write a mozyo-home-scoped `redmine-credentials.yaml` — the daemon-trusted delivery path."""
     cred = credentials_path(mozyo_home)
@@ -131,7 +139,7 @@ class _DarwinCase(unittest.TestCase):
         self.os_home = Path(self._tmp_os.name)
         self.mozyo_home = Path(self._tmp_mozyo.name)
         p_darwin = patch.object(sl, "_running_on_darwin", return_value=True)
-        p_uid = patch.object(sl.os, "getuid", return_value=501, create=True)
+        p_uid = patch.object(sl.os, "getuid", return_value=_TEST_UID, create=True)
         p_darwin.start()
         p_uid.start()
         self.addCleanup(p_darwin.stop)
@@ -165,9 +173,9 @@ class RenderPlistTest(unittest.TestCase):
         self.assertEqual(1, payload["StartInterval"])
 
     def test_secret_in_daemon_env_never_serializes_into_plist(self) -> None:
-        with patch.dict("os.environ", {API_KEY_ENV: "SECRET-KEY-VALUE"}, clear=False):
+        with patch.dict("os.environ", {API_KEY_ENV: "SECRET-KEY-SENTINEL"}, clear=False):
             raw = sl.render_plist(["/opt/bin/mozyo-bridge"], interval_seconds=300)
-        self.assertNotIn(b"SECRET-KEY-VALUE", raw)
+        self.assertNotIn(b"SECRET-KEY-SENTINEL", raw)
 
 
 class ResolveHomeAndCommandTest(unittest.TestCase):
@@ -311,8 +319,8 @@ class InstallTest(_DarwinCase):
         self.assertNotIn("EnvironmentVariables", payload)
         self.assertEqual(
             [
-                ["launchctl", "bootout", f"gui/501/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
-                ["launchctl", "bootstrap", "gui/501", str(plist_file)],
+                ["launchctl", "bootout", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
+                ["launchctl", "bootstrap", _GUI_DOMAIN, str(plist_file)],
             ],
             runner.calls,
         )
@@ -422,7 +430,7 @@ class RestartTest(_DarwinCase):
         result = sl.restart(os_home=self.os_home, runner=runner, which=_which_found)
         self.assertTrue(result["performed"])
         self.assertEqual(
-            ["launchctl", "kickstart", "-k", f"gui/501/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
+            ["launchctl", "kickstart", "-k", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"],
             runner.calls[-1],
         )
 
@@ -547,7 +555,7 @@ class UninstallTest(_DarwinCase):
         self.assertFalse(plist_file.exists())
         self.assertTrue(bystander.exists())
         self.assertEqual(
-            [["launchctl", "bootout", f"gui/501/{sl.SUPERVISOR_LAUNCHD_LABEL}"]],
+            [["launchctl", "bootout", f"{_GUI_DOMAIN}/{sl.SUPERVISOR_LAUNCHD_LABEL}"]],
             runner.calls,
         )
 

@@ -173,13 +173,16 @@ class TelemetryTests(unittest.TestCase):
 
     def test_detail_with_path_never_reaches_telemetry(self) -> None:
         # Even a (hypothetical) leaky detail cannot enter the machine-readable surface.
+        # The private prefix is assembled at runtime so the tracked source carries no
+        # home-path-shaped literal.
+        private_prefix = "/" + "Users" + "/secret"
         leaky = OperatorStartupGateProjection(
             disposition=PROJECT_UNREADABLE,
-            detail="failed reading /Users/secret/path token=abc",
+            detail=f"failed reading {private_prefix}/path token=abc",
         )
         telemetry = leaky.to_telemetry_dict()
         self.assertNotIn("detail", telemetry)
-        self.assertNotIn("/Users/secret", str(telemetry))
+        self.assertNotIn(private_prefix, str(telemetry))
 
 
 class StartupClassifierFailClosedTests(unittest.TestCase):

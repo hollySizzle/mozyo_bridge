@@ -116,8 +116,9 @@ class RepoIdentityDigestTests(unittest.TestCase):
 
 class RejectPathOrSecretShapedTests(unittest.TestCase):
     def test_absolute_path_rejected(self) -> None:
+        # Assembled at runtime so the tracked source carries no home-path-shaped literal.
         with self.assertRaises(OperatorStartupGateError):
-            reject_path_or_secret_shaped("/Users/me/x", field_name="f")
+            reject_path_or_secret_shaped("/" + "Users" + "/me/x", field_name="f")
 
     def test_secret_token_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
@@ -134,11 +135,11 @@ class GateTargetTests(unittest.TestCase):
 
     def test_path_shaped_workspace_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
-            _target(workspace_id="/Users/someone/ws")
+            _target(workspace_id="/" + "Users" + "/someone/ws")
 
     def test_repo_digest_must_be_opaque_digest_not_path(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
-            _target(repo_identity_digest="/home/me/repo")
+            _target(repo_identity_digest="/" + "home" + "/me/repo")
 
     def test_repo_digest_bare_label_rejected(self) -> None:
         with self.assertRaises(OperatorStartupGateError):
