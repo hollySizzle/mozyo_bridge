@@ -404,29 +404,89 @@ class CallbackPublicationFence:
     def reconcile(self, key: PublicationKey, *, published_journal: str | None) -> None:
         """Operator disposition for one stalled anchor, after reading the actual Redmine journal.
 
-        This is the ONLY way a ``reserved`` / ``uncertain` row ever moves, and it is deliberately
-        manual: the whole point of the fence is that no automatic rule can decide this correctly.
-        Pass the journal id if a record did land (the anchor is then closed as published, and no
-        second record will ever be written); pass ``None`` only after confirming none landed, which
-        releases the identity so a later sweep may publish it.
+        Deliberately manual — no automatic rule can decide this correctly — but *manual is not
+        unconditional*, which is the R10-F1 defect this method carries the scar of. An operator
+        surface that can delete a live ``reserved`` row is a second, hand-operated reclaim path
+        around the very authority the fence exists to be: A reserves, stalls before its PUT, an
+        operator reads zero records in Redmine and releases the identity, B publishes, A resumes
+        and publishes too. Two records, from the mechanism built to prevent them.
+
+        So each transition is allowed only where it cannot increase the record count:
+
+        - ``reserved``  + ``--landed``      -> ``published``. Safe in one direction only: it can
+          never permit a write, only forbid one more.
+        - ``uncertain`` + ``--landed``      -> ``published``. Same.
+        - ``uncertain`` + ``none landed``   -> released. The owner already finished its PUT attempt
+          and reported the outcome as unknown; it will not resume and write again.
+        - ``reserved``  + ``none landed``   -> **REFUSED**. ``reserved`` means "an owner may be
+          mid-PUT". Redmine reading zero *now* does not prove a stalled owner will not PUT *later*,
+          and no local signal proves it either (an expired lease is exactly the case that started
+          this — slow is not dead). Releasing it needs a quiescence / owner-termination protocol
+          this fence does not have, so it stays fail-closed and the anchor stalls. See the residual
+          declared in j#80390.
+        - ``published`` / absent            -> **REFUSED**. Terminal, or nothing to dispose of.
+
+        Raises :class:`CallbackPublicationFenceError` on any refused transition; the row is left
+        exactly as it was.
         """
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state FROM publication_fence WHERE workspace_id=? AND lane_id=? AND "
+                "issue=? AND lane_generation=? AND dispatch_anchor=? AND outcome=?",
+                key.as_row(),
+            ).fetchone()
+            state = str(row[0]) if row is not None else PUBLICATION_ABSENT
+            self._assert_reconcilable(key, state, published_journal)
             if published_journal is None:
-                conn.execute(
+                cur = conn.execute(
                     "DELETE FROM publication_fence WHERE workspace_id=? AND lane_id=? AND issue=? "
-                    "AND lane_generation=? AND dispatch_anchor=? AND outcome=?",
-                    key.as_row(),
+                    "AND lane_generation=? AND dispatch_anchor=? AND outcome=? AND state=?",
+                    (*key.as_row(), PUBLICATION_UNCERTAIN),
                 )
             else:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE publication_fence SET state=?, journal_id=?, owner_token='', "
                     "detail='operator reconcile', updated_at=? WHERE workspace_id=? AND "
-                    "lane_id=? AND issue=? "
-                    "AND lane_generation=? AND dispatch_anchor=? AND outcome=?",
-                    (PUBLICATION_PUBLISHED, str(published_journal), _utc_now(), *key.as_row()),
+                    "lane_id=? AND issue=? AND lane_generation=? AND dispatch_anchor=? AND "
+                    "outcome=? AND state IN (?, ?)",
+                    (PUBLICATION_PUBLISHED, str(published_journal), _utc_now(), *key.as_row(),
+                     PUBLICATION_RESERVED, PUBLICATION_UNCERTAIN),
+                )
+            if cur.rowcount != 1:
+                # The state moved under us between the read and the write, or matched nothing.
+                conn.rollback()
+                raise CallbackPublicationFenceError(
+                    f"publication reconcile for {key.issue}/{key.dispatch_anchor}/{key.outcome} "
+                    f"changed {cur.rowcount} row(s), expected exactly 1 (state raced or absent); "
+                    f"nothing was changed — re-run `--list` and reconcile from the current state"
                 )
             conn.commit()
+
+    @staticmethod
+    def _assert_reconcilable(
+        key: PublicationKey, state: str, published_journal: Optional[str]
+    ) -> None:
+        """Refuse every operator transition that could let a second record be written."""
+        if state == PUBLICATION_ABSENT:
+            raise CallbackPublicationFenceError(
+                f"publication fence has no row for {key.issue}/{key.dispatch_anchor}/"
+                f"{key.outcome}; there is nothing to reconcile (a reconcile that silently "
+                f"succeeds on an absent key hides a mistyped anchor)"
+            )
+        if state == PUBLICATION_PUBLISHED:
+            raise CallbackPublicationFenceError(
+                f"{key.issue}/{key.dispatch_anchor}/{key.outcome} is already published; that is "
+                f"terminal and reopening it is how a duplicate record gets written"
+            )
+        if published_journal is None and state == PUBLICATION_RESERVED:
+            raise CallbackPublicationFenceError(
+                f"{key.issue}/{key.dispatch_anchor}/{key.outcome} is `reserved`: an owner may be "
+                f"mid-PUT right now. Zero records in Redmine at this moment does not prove it will "
+                f"not PUT later, so releasing it could produce a duplicate. Use `--landed <id>` if "
+                f"a record did land; otherwise this anchor stays fail-closed (releasing a reserved "
+                f"row needs an owner-termination protocol this fence does not have)"
+            )
 
     def state_of(self, key: PublicationKey) -> str:
         conn = self._connect()
