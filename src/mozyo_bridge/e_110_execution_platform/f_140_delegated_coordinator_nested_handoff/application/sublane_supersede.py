@@ -40,6 +40,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
 )
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    emit_lifecycle_migration_advisory,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_SUPERSEDED,
@@ -432,6 +435,11 @@ class SublaneSupersedeUseCase:
             recovery_expected_revision=(
                 recovery_rec.revision if recovery_rec is not None else None
             ),
+        )
+        # Redmine #13844 R2: supersede is a schema-needing mutation — surface any forward
+        # migration of the shared store and its active peer-reader risk (same advisory as adopt).
+        emit_lifecycle_migration_advisory(
+            getattr(self.store, "last_write_preparation", None), stream=sys.stderr
         )
         if not supersede.applied:
             return SupersedeOutcome(

@@ -77,29 +77,21 @@ class LaneDeclarationStore:
 
     def __init__(self, *, home: Path | None = None, path: Path | None = None) -> None:
         self._lifecycle = LaneLifecycleStore(home=home, path=path)
-        #: The explicit write-gate result of the LAST declaration / incarnation (Redmine #13844
-        #: F1): the compatibility preflight (peer lanes) + typed schema outcome the mutating
-        #: write ran, so the caller (the adopt / declare command) can surface a migration and
-        #: its peer risk instead of migrating the shared store implicitly.
-        self.last_write_preparation: Optional[LifecycleWritePreparation] = None
 
     @property
     def path(self) -> Path:
         return self._lifecycle.path
 
-    def _prepare_write(self, key: LaneLifecycleKey) -> None:
-        """Run the explicit schema-changing write gate (Redmine #13844 F1) before a CAS.
+    @property
+    def last_write_preparation(self) -> Optional[LifecycleWritePreparation]:
+        """The explicit write gate's typed result from the last declaration / incarnation.
 
-        A declaration / incarnation is a schema-needing mutation: it runs the compatibility
-        preflight FIRST (peer old-reader lanes, on the pre-migration store) and the backup-first
-        migration, recording the typed :class:`LifecycleWritePreparation` on
-        ``last_write_preparation`` so the migration and its peer risk are visible to the command
-        — never an implicit side effect of opening the store. The lane being written is the
-        writer, excluded from its own peer set.
+        Redmine #13844 R2: the declaration / incarnation is a schema-needing mutation that opens
+        via the shared :meth:`...LaneLifecycleStore._connect_write` gate (preflight FIRST, then
+        backup-first migration). This delegates to the wrapped lifecycle store's captured
+        preparation so the adopt / declare command can surface a migration and its peer risk.
         """
-        self.last_write_preparation = self._lifecycle.prepare_write(
-            writer_workspace_id=key.repo_workspace_id, writer_lane_id=key.lane_id
-        )
+        return self._lifecycle.last_write_preparation
 
     def declare_lane(
         self,
@@ -169,11 +161,11 @@ class LaneDeclarationStore:
                     "a project-gateway declaration requires its provider-bound slot set"
                 )
         stamp = now or _utc_now()
-        # Redmine #13844 F1: a declaration is a schema-needing mutation — run the explicit write
-        # gate (preflight peers FIRST, then backup-first migration, typed outcome) so the shared
-        # store is never migrated implicitly and the outcome is surfaced, not discarded.
-        self._prepare_write(key)
-        conn = self._lifecycle._connect()
+        # Redmine #13844 R2: a declaration is a schema-needing mutation — open through the shared
+        # explicit write gate (preflight peers FIRST, then backup-first migration, typed outcome
+        # captured on the wrapped store's last_write_preparation) so the shared store is never
+        # migrated implicitly and the outcome is surfaced, not discarded.
+        conn = self._lifecycle._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = _locked_row(conn, key)
@@ -299,7 +291,9 @@ class LaneDeclarationStore:
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
         stamp = now or _utc_now()
-        conn = self._lifecycle._connect()
+        # Redmine #13844 R2: a binding backfill is a schema-needing mutation — open via the shared
+        # explicit write gate (preflight FIRST, then backup-first migration).
+        conn = self._lifecycle._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)
@@ -414,10 +408,9 @@ class LaneDeclarationStore:
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
         stamp = now or _utc_now()
-        # Redmine #13844 F1: an incarnation is a schema-needing mutation — run the explicit write
-        # gate before the CAS (preflight peers FIRST, then backup-first migration, typed outcome).
-        self._prepare_write(key)
-        conn = self._lifecycle._connect()
+        # Redmine #13844 R2: an incarnation is a schema-needing mutation — open through the shared
+        # explicit write gate (preflight peers FIRST, then backup-first migration, typed outcome).
+        conn = self._lifecycle._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)

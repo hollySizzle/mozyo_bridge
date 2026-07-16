@@ -161,7 +161,7 @@ class LaneReconcileBindingStore:
             )
         encoded_slots = encode_declared_slots(pinned)
         stamp = now or _utc_now()
-        conn = self._lifecycle._connect()
+        conn = self._lifecycle._connect_write(key)  # Redmine #13844 R2: shared write gate
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)

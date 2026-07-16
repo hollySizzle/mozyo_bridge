@@ -406,11 +406,51 @@ class LifecycleWritePreparation:
         )
 
 
+def format_lifecycle_migration_advisory(
+    preparation: Optional[LifecycleWritePreparation],
+) -> Optional[str]:
+    """The operator advisory when a mutation forward-migrated the shared store with peers at risk.
+
+    The single shared wording (Redmine #13844 R2) every schema-changing command surface uses so
+    a forward migration is operator-visible — declaration/adopt AND disposition / supersede /
+    release / retire / reconcile alike — not only the adopt path. Returns ``None`` when there was
+    no migration or no peer at risk (nothing to warn about).
+    """
+    if preparation is None or not preparation.peer_reader_risk:
+        return None
+    peers = ", ".join(preparation.preflight.peer_active_lanes) or "(unreadable peer set)"
+    return (
+        "advisory (Redmine #13844): this operation forward-migrated the shared lifecycle "
+        f"store {preparation.outcome.from_version} -> {preparation.outcome.to_version} "
+        f"(backup {preparation.outcome.backup_dir}); active peer lanes that may run an older-"
+        f"schema source CLI and now read-fail-closed: {peers}. Re-run those lanes' reads from "
+        "the current facade; do not downgrade the store."
+    )
+
+
+def emit_lifecycle_migration_advisory(
+    preparation: Optional[LifecycleWritePreparation],
+    *,
+    stream=None,
+) -> bool:
+    """Print the peer-reader-risk advisory (if any) to ``stream`` (default stderr). Returns whether
+    an advisory was emitted, so a caller can also thread it into a structured outcome if wanted."""
+    message = format_lifecycle_migration_advisory(preparation)
+    if message is None:
+        return False
+    import sys
+
+    print(message, file=stream if stream is not None else sys.stderr)
+    return True
+
+
 __all__ = (
     "LaneLifecycleReader",
     "LaneLifecycleReaderUpgradeRequired",
     "LifecycleMigrationPreflight",
     "LifecycleWritePreparation",
+    "emit_lifecycle_migration_advisory",
+    "format_lifecycle_migration_advisory",
     "lifecycle_migration_preflight",
     "load_lane_lifecycle_readonly",
 )

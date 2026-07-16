@@ -431,8 +431,8 @@ class StandardHandoffReadOnlyGuardBiteTest(unittest.TestCase):
         self.assertFalse((self.home / "backups").exists())
 
     def test_handoff_lookup_never_reaches_migration_api(self) -> None:
-        # Guard-bite: booby-trap the migration API. The read-only reader path must not touch it;
-        # the OLD migrating store path WOULD — proving the seam actually changed (adversarial).
+        # Guard-bite: booby-trap the migration API. The read-only handoff lookup must not touch
+        # it; a WRITE (the only thing allowed to migrate) DOES — proving the read/write seam.
         _seed_v5(self.home)
         sentinel = RuntimeError("migration API reached")
 
@@ -444,9 +444,18 @@ class StandardHandoffReadOnlyGuardBiteTest(unittest.TestCase):
                     (DISPOSITION_ACTIVE, False, False),
                 )
                 m.assert_not_called()
-                # Adversarial: the old migrating read (store.get) DOES reach it — the guard bites.
+                # A store READ (get) also never migrates now (Redmine #13844 R2 read-not-migrate).
+                LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
+                m.assert_not_called()
+                # Adversarial contrast: a WRITE reaches the migration API — the guard bites.
                 with self.assertRaises(RuntimeError):
-                    LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
+                    LaneLifecycleStore(home=self.home).transition_disposition(
+                        LaneLifecycleKey(WS, LANE),
+                        expected_disposition=DISPOSITION_ACTIVE,
+                        expected_revision=1,
+                        target="hibernated",
+                        decision=_issue_decision(),
+                    )
                 m.assert_called()
 
 
@@ -529,13 +538,25 @@ class WriteGatePreparationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_connect_captures_migration_outcome_not_discarded(self) -> None:
-        # Guard-bite: a mutating open (declare_active -> _connect) that migrates a v5 store must
-        # RECORD the typed outcome, never silently discard it.
+    def test_write_captures_migration_outcome_read_does_not(self) -> None:
+        # Guard-bite (Redmine #13844 R2): a WRITE (_connect_write) that migrates a v5 store must
+        # RECORD the typed outcome, never silently discard it — AND a READ never migrates at all.
         _seed_v5(self.home)
+        reader_store = LaneLifecycleStore(home=self.home)
+        reader_store.get(LaneLifecycleKey(WS, LANE))  # a READ must not migrate / not record
+        self.assertIsNone(reader_store.last_schema_outcome)
+        self.assertEqual(_recorded_version(self.home), 5)  # still v5 after the read
+
         store = LaneLifecycleStore(home=self.home)
-        self.assertIsNone(store.last_schema_outcome)  # nothing opened yet
-        store.get(LaneLifecycleKey(WS, LANE))  # a store read still uses the migrating connect
+        self.assertIsNone(store.last_schema_outcome)  # nothing written yet
+        rec = store.get(LaneLifecycleKey(WS, LANE))
+        store.transition_disposition(  # a WRITE runs the gate and migrates
+            LaneLifecycleKey(WS, LANE),
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rec.revision,
+            target="hibernated",
+            decision=_issue_decision(),
+        )
         self.assertIsNotNone(store.last_schema_outcome)
         self.assertEqual(store.last_schema_outcome.action, SCHEMA_MIGRATED)
         self.assertEqual(store.last_schema_outcome.from_version, 5)
@@ -779,6 +800,263 @@ class FaithfulReviewAndConcurrencyTest(unittest.TestCase):
             again = ensure_lane_lifecycle_schema(path)
             self.assertEqual(again.action, SCHEMA_INTACT)
         self.assertEqual(len(list((self.home / "backups").glob("state-*"))), 1)
+
+
+# -- R2-F1: explicit write gate wired to EVERY mutation; reads never migrate --------------
+
+
+class UniversalWriteGateTest(unittest.TestCase):
+    """Review R2 j#79512 F1: the explicit write gate (preflight FIRST + typed outcome) runs for
+    EVERY schema-needing mutation, not only declaration; reads never migrate."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_v5_with_peer(self):
+        """A v5 store with LANE active AND a second active peer lane."""
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(
+            LaneLifecycleKey(WS, LANE), decision=_issue_decision(), issue_id=ISSUE
+        )
+        store.declare_active(
+            LaneLifecycleKey(WS, "issue_13800_peer_lane"),
+            decision=DecisionPointer(source="redmine", issue_id="13800", journal_id="1"),
+            issue_id="13800",
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_disposition_mutation_runs_gate_preflight_before_migration(self) -> None:
+        # A hibernate/resume commit (transition_disposition) — NOT declaration — runs the gate:
+        # preflight peers on the PRE-migration store, then migrate, typed outcome captured.
+        self._seed_v5_with_peer()
+        store = LaneLifecycleStore(home=self.home)
+        rec = store.get(LaneLifecycleKey(WS, LANE))  # read: must not migrate
+        self.assertEqual(_recorded_version(self.home), 5)
+        out = store.transition_disposition(
+            LaneLifecycleKey(WS, LANE),
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rec.revision,
+            target="hibernated",
+            decision=_issue_decision(),
+        )
+        self.assertTrue(out.applied)
+        prep = store.last_write_preparation
+        self.assertTrue(prep.migrated)
+        self.assertEqual(prep.outcome.from_version, 5)
+        self.assertEqual(prep.preflight.current_version, 5)  # read BEFORE migration
+        self.assertIn("issue_13800_peer_lane", prep.preflight.peer_active_lanes)
+        self.assertNotIn(LANE, prep.preflight.peer_active_lanes)  # writer excluded
+        self.assertTrue(prep.peer_reader_risk)
+        self.assertEqual(_recorded_version(self.home), 6)
+
+    def test_release_mutation_runs_gate(self) -> None:
+        # A release open (request_release) on a non-active lane also runs the gate.
+        self._seed_v5_with_peer()
+        store = LaneLifecycleStore(home=self.home)
+        rec = store.get(LaneLifecycleKey(WS, LANE))
+        store.transition_disposition(  # -> hibernated (this migrates the store)
+            LaneLifecycleKey(WS, LANE),
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rec.revision,
+            target="hibernated",
+            decision=_issue_decision(),
+        )
+        self.assertEqual(_recorded_version(self.home), 6)
+        # request_release still goes through the gate (intact now); last_write_preparation set.
+        rec2 = store.get(LaneLifecycleKey(WS, LANE))
+        from mozyo_bridge.core.state.lane_lifecycle import ReleasePin
+
+        store.request_release(
+            LaneLifecycleKey(WS, LANE),
+            expected_revision=rec2.revision,
+            action_id="act-1",
+            pins=[ReleasePin(role="codex", assigned_name="n", locator="wProj:p2")],
+        )
+        self.assertIsNotNone(store.last_write_preparation)
+        self.assertEqual(store.last_write_preparation.outcome.action, SCHEMA_INTACT)
+
+    def test_composing_store_mutation_runs_gate(self) -> None:
+        # A composing store (declaration) mutation also opens through the shared gate and
+        # surfaces the preparation on the wrapped store.
+        self._seed_v5_with_peer()
+        decl = LaneDeclarationStore(home=self.home)
+        decl.declare_lane(
+            LaneLifecycleKey(WS, "issue_13900_new_lane"),
+            decision=DecisionPointer(source="redmine", issue_id="13900", journal_id="2"),
+            binding_kind=BINDING_KIND_ISSUE,
+            issue_id="13900",
+        )
+        prep = decl.last_write_preparation
+        self.assertTrue(prep.migrated)
+        self.assertEqual(prep.preflight.current_version, 5)
+        self.assertTrue(prep.peer_reader_risk)
+
+    def test_all_store_reads_are_non_migrating(self) -> None:
+        # Redmine #13844 R2 condition 4: get / records / resolve_owner never migrate — even
+        # inside a mutating flow, the read comes before the write's gate without migrating.
+        path = self._seed_v5_with_peer()
+        before = _digest(path)
+        store = LaneLifecycleStore(home=self.home)
+        store.get(LaneLifecycleKey(WS, LANE))
+        store.records()
+        store.resolve_owner(WS, ISSUE)
+        self.assertEqual(_digest(path), before)
+        self.assertEqual(_recorded_version(self.home), 5)
+        self.assertFalse((self.home / "backups").exists())
+
+    def test_advisory_helper_formats_only_on_peer_risk(self) -> None:
+        from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+            format_lifecycle_migration_advisory,
+        )
+
+        self._seed_v5_with_peer()
+        store = LaneLifecycleStore(home=self.home)
+        rec = store.get(LaneLifecycleKey(WS, LANE))
+        store.transition_disposition(
+            LaneLifecycleKey(WS, LANE),
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rec.revision,
+            target="hibernated",
+            decision=_issue_decision(),
+        )
+        msg = format_lifecycle_migration_advisory(store.last_write_preparation)
+        self.assertIsNotNone(msg)
+        self.assertIn("issue_13800_peer_lane", msg)
+        self.assertIn("13844", msg)
+        # a current store with no migration -> no advisory
+        fresh = LaneLifecycleStore(home=self.home)
+        fresh.prepare_write(writer_workspace_id=WS, writer_lane_id=LANE)
+        self.assertIsNone(format_lifecycle_migration_advisory(fresh.last_write_preparation))
+
+
+class RealCommandMigrationAdvisoryTest(unittest.TestCase):
+    """Review R2 j#79512 F1 condition 3: a REAL non-declaration command (hibernate) run on a v5
+    store with an active peer runs the preflight before migration and emits the typed advisory."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_hibernate_command_emits_peer_advisory_and_migrates_after_preflight(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+            HerdrRetireCloseResult,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
+            HibernateAssertions,
+            HibernateRequest,
+            SublaneHibernateUseCase,
+        )
+
+        hib_issue, hib_lane, hib_journal = "13441", "issue_13441_provider", "77485"
+
+        class _FakeOps:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def workspace_id(self):
+                return WS
+
+            def read_inventory(self):
+                return list(self._rows), True
+
+            def execute_close(self, plan):
+                return HerdrRetireCloseResult(
+                    workspace_id=plan.workspace_id,
+                    lane_id=plan.lane_id,
+                    closed=tuple(plan.close_targets),
+                    failed=(),
+                    foreign_names=plan.foreign_names,
+                )
+
+        # A v5 store: the lane to hibernate is active, AND a second active peer lane exists.
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(
+            LaneLifecycleKey(WS, hib_lane),
+            decision=DecisionPointer(source="redmine", issue_id=hib_issue, journal_id=hib_journal),
+            issue_id=hib_issue,
+        )
+        store.declare_active(
+            LaneLifecycleKey(WS, "issue_13800_peer_lane"),
+            decision=DecisionPointer(source="redmine", issue_id="13800", journal_id="1"),
+            issue_id="13800",
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(_recorded_version(self.home), 5)
+
+        ops = _FakeOps(
+            [
+                {"name": encode_assigned_name(WS, "codex", hib_lane), "pane_id": f"{WS}:p2"},
+                {"name": encode_assigned_name(WS, "claude", hib_lane), "pane_id": f"{WS}:p3"},
+            ]
+        )
+        request = HibernateRequest(
+            issue=hib_issue,
+            lane=hib_lane,
+            journal=hib_journal,
+            assertions=HibernateAssertions(
+                explicitly_parked=True,
+                callbacks_drained=True,
+                no_review_pending=True,
+                no_owner_approval_pending=True,
+                no_integration_pending=True,
+                no_pending_prompt=True,
+                not_working=True,
+                worktree_clean=True,
+                boundary_recorded=False,
+            ),
+        )
+
+        import io
+        import contextlib
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                request, execute=True
+            )
+
+        self.assertTrue(outcome.transition.applied)
+        # The advisory is emitted at the transition commit (the schema-changing write), naming
+        # the peer read from the PRE-migration (v5) store and the 5 -> 6 forward migration — proof
+        # the preflight ran before the migration. (Note store.last_write_preparation at the END
+        # reflects the LATER release write on the now-v6 store, not the migrating transition; the
+        # emitted advisory is the authoritative signal.)
+        advisory = err.getvalue()
+        self.assertIn("advisory (Redmine #13844)", advisory)
+        self.assertIn("issue_13800_peer_lane", advisory)
+        self.assertIn("5 -> 6", advisory)
+        self.assertEqual(_recorded_version(self.home), 6)
 
 
 if __name__ == "__main__":  # pragma: no cover

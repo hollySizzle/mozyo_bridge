@@ -57,6 +57,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    emit_lifecycle_migration_advisory,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     BINDING_KIND_ISSUE,
     DecisionPointer,
@@ -388,22 +391,11 @@ def declare_adopted_owner_row(
         return ADOPT_DECL_OWNER_CONFLICT
 
     outcome = _attempt()
-    # Redmine #13844 F1: if the declaration's explicit write gate actually forward-migrated the
-    # shared home store while other active lanes are present, the migration is NOT silent — the
-    # command surfaces the typed outcome + peer-reader risk so the operator knows concurrent
-    # older-schema lanes may now fail-close. A stderr advisory (never a raw DB action); the
-    # declaration's status token is unchanged.
-    prep = adopt_store.last_write_preparation
-    if prep is not None and prep.peer_reader_risk:
-        peers = ", ".join(prep.preflight.peer_active_lanes) or "(unreadable peer set)"
-        print(
-            "advisory (Redmine #13844): this adopt forward-migrated the shared lifecycle "
-            f"store {prep.outcome.from_version} -> {prep.outcome.to_version} "
-            f"(backup {prep.outcome.backup_dir}); active peer lanes that may run an older-"
-            f"schema source CLI and now read-fail-closed: {peers}. Re-run those lanes' reads "
-            "from the current facade; do not downgrade the store.",
-            file=sys.stderr,
-        )
+    # Redmine #13844 R2: if the declaration's explicit write gate forward-migrated the shared home
+    # store while other active lanes are present, the migration is NOT silent — surface the typed
+    # peer-reader risk via the shared advisory (the same wording every mutation surface uses). A
+    # stderr advisory only; the declaration's status token is unchanged.
+    emit_lifecycle_migration_advisory(adopt_store.last_write_preparation, stream=sys.stderr)
     if outcome in (ADOPT_DECL_DECLARED, ADOPT_DECL_BACKFILLED):
         # Owner-bound: a fresh declaration, an idempotent duplicate, or a legacy row whose
         # missing worktree binding was just filled — all leave the lane the active owner.

@@ -491,16 +491,23 @@ concurrent v5 reader could not send #13813 j#79382). A safe per-CLI fail-closed 
 
 The contract that prevents it, for a component whose rows are authority (e.g. `lane_lifecycle`):
 
-- **Reads never migrate.** Status / handoff / review / callback / drain — and any read-only projection (`workflow glance`) —
-  read the authority through a **read-only, version-compatible reader** (`LaneLifecycleReader` / `readonly_compatible_select`),
-  opened `mode=ro`: no DDL, no `ALTER`, no version re-stamp, no backup. A newer build reads an **older KNOWN additive shape** by
-  padding the columns that shape lacks with their **in-memory migration defaults** (the same value a forward `ALTER … DEFAULT`
-  would have written), so it interprets the older store faithfully without touching a byte. The shared store stays at its current
-  version and every concurrent older reader keeps working.
-- **Only a mutating use case migrates.** The forward migration (`ensure_lane_lifecycle_schema`, backup-first, additive) runs only
-  when a CAS write genuinely needs the current schema — never as a side effect of a read/notification command. It returns a
-  **typed outcome** (`created` / `intact` / `migrated{from_version, backup_dir}`) so the schema-changing event and its backup are
-  legible, not inferred.
+- **Reads never migrate.** Status / handoff / review / callback / drain — any read-only projection (`workflow glance`), AND the
+  store's own read methods (`LaneLifecycleStore.get` / `records` / `resolve_owner`, even the ones a mutating flow calls before it
+  writes) — read the authority through a **read-only, version-compatible reader** (`LaneLifecycleReader` /
+  `readonly_compatible_select`), opened `mode=ro`: no DDL, no `ALTER`, no version re-stamp, no backup. A newer build reads an
+  **older KNOWN additive shape** by padding the columns that shape lacks with their **in-memory migration defaults** (the same
+  value a forward `ALTER … DEFAULT` would have written), so it interprets the older store faithfully without touching a byte. The
+  shared store stays at its current version and every concurrent older reader keeps working. (A read landing during a peer's
+  migration commit waits it out via `busy_timeout` rather than fail-closing on a transient lock.)
+- **Every mutation migrates through ONE explicit write gate.** No CAS opens the store with a bare `ensure`. Every schema-needing
+  mutation — declaration / incarnation AND disposition / supersede / release / replacement / retire / reconcile — opens via the
+  single choke point `LaneLifecycleStore._connect_write(writer_key)`, which runs the **compatibility preflight FIRST** (the active
+  peer lanes a forward migration would fail-close, read on the PRE-migration store, the writer's own lane excluded), THEN the
+  backup-first migration, capturing a **typed `LifecycleWritePreparation`** (the preflight + the `created` / `intact` /
+  `migrated{from_version, backup_dir}` outcome) on `last_write_preparation`. So a migration is a chosen, visible act with legible
+  peer risk for *any* mutation, never an implicit side effect of opening the store — and a read that precedes the write never
+  migrates ahead of the preflight. The command surfaces (adopt / hibernate / resume / supersede / …) emit the shared
+  `format_lifecycle_migration_advisory` to the operator when a mutation forward-migrated the shared store with peers at risk.
 - **Fail-closed is preserved and made specific.** An unknown / newer / partial / malformed shape still fails closed (no
   downgrade, no misread), judged only by the **shape / capability table** (`_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFS`), never a
   guessed compatibility. The specific NEWER sub-case is named `reader_upgrade_required`: the store is fine, THIS reader is stale,

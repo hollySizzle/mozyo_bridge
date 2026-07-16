@@ -45,6 +45,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    emit_lifecycle_migration_advisory,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -491,6 +494,12 @@ class SublaneHibernateUseCase:
             expected_revision=rec.revision,
             target=DISPOSITION_HIBERNATED,
             decision=decision,
+        )
+        # Redmine #13844 R2: hibernate is a schema-needing mutation. If its write gate forward-
+        # migrated the shared store while active peer lanes are present, surface the peer-reader
+        # risk to the operator (the same advisory adopt uses) — not just declaration/adopt.
+        emit_lifecycle_migration_advisory(
+            getattr(self.store, "last_write_preparation", None), stream=sys.stderr
         )
         if not transition.applied:
             return HibernateOutcome(
