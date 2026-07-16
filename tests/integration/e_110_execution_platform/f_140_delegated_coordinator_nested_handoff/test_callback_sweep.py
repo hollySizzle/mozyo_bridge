@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND_SOURCE_NOT_FRESH,
     ZERO_SEND_WORKSPACE_UNATTESTED,
     build_recovery_recorder,
+    build_recovery_sender,
     source_is_fresh,
     sweep_once,
 )
@@ -692,6 +694,196 @@ class RecoveryRecordTest(unittest.TestCase):
         self.assertEqual(len(posted), 1)
 
 
+class ProductionRecorderTest(unittest.TestCase):
+    """Drive the REAL `build_recovery_recorder` + real fence (review R4-F1/F2/F3/F4).
+
+    `FakeRecorder` has no pre-write read, so it cannot exhibit the recorder's own durable
+    observation point -- which is precisely where R4-F1 lived while every FakeRecorder-based
+    regression stayed green. These tests use the production recorder for that reason.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
+        self.fence.bootstrap()
+        self.posted = []
+        self.sends = []
+        self.addCleanup(self._tmp.cleanup)
+
+    def outcomes(self):
+        import re
+        return [re.search(r"outcome=([a-z_]+)", n).group(1) for n in self.posted]
+
+    def recorder(self, source):
+        return build_recovery_recorder(
+            source=source, issue=ISSUE, lane=LANE, lane_generation=GEN,
+            post_note=lambda i, n: self.posted.append(n),
+        )
+
+    def _published(self):
+        return [entry(str(90000 + k), n) for k, n in enumerate(self.posted)]
+
+    def test_a_gate_visible_only_to_the_recorder_writes_no_stall_record(self):
+        # R4-F1: the recorder's pre-write read is a durable OBSERVATION. Writing a stall record
+        # against a read that already shows the gate produced the exact
+        # [no_progress_after_handoff, progress_without_callback] pair acceptance 3 forbids.
+        gate_j = gate("79995", "review_result", conclusion="changes_requested")
+        outer = self
+
+        class LateSource:
+            fresh_read = True
+
+            def __init__(self):
+                self.n = 0
+
+            def read_entries(self, issue_id):
+                self.n += 1
+                base = [ir("79990")] if self.n <= 2 else [ir("79990"), gate_j]
+                return base + outer._published()
+
+        src = LateSource()
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
+            fence=self.fence, target_assigned_name=TARGET,
+            send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
+        )
+        self.assertEqual(self.outcomes(), [STATE_PROGRESS_WITHOUT_CALLBACK])  # no stall record
+        self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
+        self.assertEqual(self.sends, [])
+
+    def test_a_gate_landing_during_the_reserve_is_not_replayed(self):
+        # R4-F2: the record's journal id is a POSITION, not a CAS against future writes. A gate
+        # becoming durable while the reservation is taken was still replayed until the final live
+        # read moved to immediately before the send.
+        gate_j = gate("79995", "review_result", conclusion="changes_requested")
+        landed = []
+        outer = self
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                return [ir("79990")] + list(landed) + outer._published()
+
+        class LateFence(DispatchOutboxFence):
+            def reserve(self, key, *, now=None):
+                landed.append(gate_j)  # becomes durable DURING the reserve
+                return super().reserve(key, now=now)
+
+        fence = LateFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        src = Src()
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
+            fence=fence, target_assigned_name=TARGET,
+            send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(self.sends, [])
+
+    def test_two_concurrent_sweeps_publish_one_record_and_send_at_most_once(self):
+        # R4-F3: with the record published outside the reservation, two sweeps both passed an empty
+        # pre-read, posted duplicate records, and then BOTH returned "" forever (>=2 = ambiguous),
+        # losing recovery for that anchor permanently. The reservation now owns the whole attempt.
+        lock = threading.Lock()
+        start = threading.Event()
+        outer = self
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                with lock:
+                    return [ir("79990")] + outer._published()
+
+        def publish(issue_id, note):
+            with lock:
+                outer.posted.append(note)
+
+        reasons = []
+
+        def run():
+            start.wait()
+            src = Src()
+            r = sweep_once(
+                workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
+                fence=self.fence, target_assigned_name=TARGET,
+                send_fn=lambda j: self.sends.append(j),
+                record_fn=build_recovery_recorder(
+                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish
+                ),
+            )
+            reasons.append(r["send_reason"])
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        start.set()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(len(self.posted), 1)          # one durable record
+        self.assertLessEqual(len(self.sends), 1)       # one send budget
+        self.assertIn(ZERO_SEND_FENCE_HELD, reasons)   # the loser stood down
+
+    def test_a_post_record_read_failure_keeps_the_pointer_and_reports_incomplete(self):
+        # R4-F4: the record IS durable, so returning a bare unreadable result dropped the pointer
+        # and let the CLI exit 0 on a sweep that had already mutated Redmine.
+        class FailVerify:
+            fresh_read = True
+
+            def __init__(self):
+                self.n = 0
+
+            def read_entries(self, issue_id):
+                self.n += 1
+                if self.n >= 3:
+                    raise RuntimeError("redmine read failed")
+                return [ir("79990")]
+
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=FailVerify(), fence=self.fence, target_assigned_name=TARGET,
+            send_fn=lambda j: self.sends.append(j), record_fn=FakeRecorder("90001"),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["recovery_record_journal"], "90001")  # pointer preserved
+        self.assertFalse(result["sweep_complete"])
+        self.assertEqual(self.sends, [])
+
+
+class FenceReleaseTest(unittest.TestCase):
+    """`release()` drops only a still-reserved row -- the abort that `cancelled` cannot express."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
+        self.fence.bootstrap()
+        self.addCleanup(self._tmp.cleanup)
+
+    def key(self):
+        return FenceKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, journal="79990",
+                        action_id=SWEEP_RECOVERY_ACTION_ID, target_assigned_name=TARGET)
+
+    def test_release_drops_a_reserved_row_so_a_later_attempt_can_reserve(self):
+        self.assertTrue(self.fence.reserve(self.key()).won)
+        self.assertTrue(self.fence.release(self.key()))
+        self.assertEqual(self.fence.state_of(self.key()), "absent")
+        self.assertTrue(self.fence.reserve(self.key()).won)  # clean retry
+
+    def test_release_never_drops_a_recorded_outcome(self):
+        # A row whose fate IS recorded must survive: release must not erase a delivery, nor
+        # resurrect an action whose outcome is unknown.
+        for mark in ("mark_delivered", "mark_uncertain", "mark_cancelled"):
+            fence = DispatchOutboxFence(home=Path(tempfile.mkdtemp()))
+            fence.bootstrap()
+            fence.reserve(self.key())
+            getattr(fence, mark)(self.key())
+            before = fence.state_of(self.key())
+            self.assertFalse(fence.release(self.key()), f"{mark} row must not be released")
+            self.assertEqual(fence.state_of(self.key()), before)
+
+
 class ProducerWiringTest(unittest.TestCase):
     """Review F2: the progress marker needs a PRODUCTION writer, or the reader finds nothing real.
 
@@ -803,6 +995,60 @@ class RecoverySenderTest(unittest.TestCase):
                 target_assigned_name=TARGET, send_fn=sender, record_fn=FakeRecorder(),
             )
         self.assertEqual(len(calls), 1)  # at most once per dispatch anchor
+
+
+class AttestedWorkspaceIdTest(unittest.TestCase):
+    """Direct regression for the `_attested_workspace_id` caller (R4 coverage note).
+
+    R3-F2 was that the "measured" authority did not exist where the command runs: `read_anchor`
+    returns None in a linked sublane worktree, so the CLI flag silently became the authority. These
+    pin the resolver contract at the caller, not just in the registry.
+    """
+
+    def resolve(self, *, workspace_id="", canonical=None, raises=False):
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            sublane_diagnostics as sd,
+        )
+
+        class _Resolved:
+            def __init__(self, wsid):
+                self.workspace_id = wsid
+
+        def fake_resolve(repo_root, **kw):
+            if raises:
+                raise RuntimeError("registry unreadable")
+            return _Resolved(canonical)
+
+        import mozyo_bridge.core.state.workspace_registry as reg
+
+        original = reg.resolve_canonical_session
+        reg.resolve_canonical_session = fake_resolve
+        try:
+            return sd._attested_workspace_id(
+                argparse.Namespace(workspace_id=workspace_id, repo=None)
+            )
+        finally:
+            reg.resolve_canonical_session = original
+
+    def test_a_linked_worktree_inherits_its_main_checkout_identity(self):
+        # The #13152 topology the real command runs in: no local anchor, identity inherited.
+        self.assertEqual(self.resolve(canonical="ws-main"), "ws-main")
+
+    def test_an_unresolved_authority_is_blank_so_the_sweep_zero_sends(self):
+        self.assertEqual(self.resolve(canonical=None), "")
+        self.assertEqual(self.resolve(raises=True), "")
+
+    def test_the_flag_can_assert_the_measured_identity_but_never_supply_it(self):
+        # Matching assertion passes through...
+        self.assertEqual(self.resolve(workspace_id="ws-main", canonical="ws-main"), "ws-main")
+        # ...a mismatch fails closed...
+        with self.assertRaises(SystemExit):
+            self.resolve(workspace_id="ws-other", canonical="ws-main")
+        # ...and with NO measured authority the flag cannot mint one (the R3-F2 defect).
+        with self.assertRaises(SystemExit):
+            self.resolve(workspace_id="ws-invented", canonical=None)
 
 
 if __name__ == "__main__":
