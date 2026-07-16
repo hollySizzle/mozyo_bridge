@@ -259,68 +259,153 @@ def _mutating_path(
     record_fn: Callable[[dict, SweepWatermark], str],
     now: Optional[str],
 ) -> dict[str, Any]:
-    """The stall path: re-read at the mutation boundary, record, verify, reserve, send once.
+    """The stall path: ONE reservation owns the whole attempt — read, record, verify, send.
 
-    The ordering is the whole design, and each step is where a previous revision broke:
+    Four review rounds of local re-ordering produced a design where the fence guarded only the
+    *send*, and every other step raced. This is the structure that follows from making the
+    reservation own the attempt end to end:
 
-    1. **re-read + re-classify** at the mutation boundary. A gate landing here folds the verdict to
-       a zero-send resolution (acceptance 2/3);
-    2. **record** the stall durably — BEFORE the reserve (review R3-F3). An earlier revision
-       reserved first and cancelled the key when the record failed, but ``FENCE_CANCELLED`` is
-       *terminal* to ``reserve``, so a transient write failure blocked that anchor's recovery
-       forever. The record is idempotent (marker pre-read), so it is safe to write before holding
-       the reservation, and a failed write now touches no durable authority at all: the retry is
-       simply the next sweep. The fence's job is narrowed to what it is actually good at — making
-       the **send** at-most-once;
-    3. **verify against the record's own position** (review R3-F1). Redmine offers no CAS, but the
-       record's journal id ``R`` is a durable serialization point: every qualifying gate is either
-       before ``R`` or after it. The invariant the sweep can and does enforce is *no qualifying gate
-       precedes our record*. A gate at ``< R`` means the record was already stale when written, so
-       the send is refused; a gate at ``> R`` genuinely landed after the sweep's recorded verdict;
-    4. **reserve**, then **send** exactly once, pointing at ``R``.
+    ``reserve -> boundary read -> record -> final live read -> send -> mark_delivered``,
+    with :meth:`DispatchOutboxFence.release` on any abort.
+
+    Why each position (and what broke when it was elsewhere):
+
+    - **reserve first.** The fence's ``BEGIN IMMEDIATE`` row is the only real serialization
+      authority available — Redmine has none. Holding it across the *whole* attempt is what makes
+      the record publication atomic: a concurrent sweep loses the reserve and never writes, so two
+      sweeps cannot post duplicate records and strand the anchor in permanent ambiguity (R4-F3).
+      An earlier revision moved the reserve after the record to fix a retry block (R3-F3), which
+      bought retryability by giving up atomicity.
+    - **release, not cancel, on abort.** That retry block is instead fixed by
+      :meth:`DispatchOutboxFence.release`, which drops a still-reserved row: this attempt did not
+      happen, so the next one starts clean. ``mark_cancelled`` is terminal and would block the
+      anchor forever.
+    - **final live read immediately before the send** (R4-F2). The record's journal id is only a
+      *position*, not a CAS against future Redmine writes — an earlier revision claimed otherwise
+      and a gate landing during the reserve was still replayed. The window cannot be closed to
+      zero over a store with no CAS; it is narrowed to read->send and no wider claim is made.
+    - **the recorder aborts rather than write a stale verdict** (R4-F1): its own pre-write read is
+      an observation too, so a superseded stall raises :class:`RecordSupersededError` and folds to
+      the first-pass resolution instead of writing a false record and correcting it.
     """
-    # (1) Mutation-boundary re-read: the last chance to notice the lane is not stalled.
+    key = FenceKey(
+        workspace_id=workspace_id,
+        lane_id=lane,
+        issue=issue,
+        journal=decided.dispatch_journal,
+        action_id=SWEEP_RECOVERY_ACTION_ID,
+        target_assigned_name=str(target_assigned_name).strip(),
+    )
+
+    # (1) Take ownership of the whole attempt before any durable work.
+    try:
+        reserve = fence.reserve(key, now=now)
+    except DispatchOutboxFenceError as exc:
+        result["send_reason"] = ZERO_SEND_FENCE_UNAVAILABLE
+        result["send_detail"] = (
+            f"the idempotency authority is unavailable ({exc}); zero-send rather than risk a "
+            f"duplicate replay"
+        )
+        return result
+    if not reserve.won:
+        result["send_reason"] = ZERO_SEND_FENCE_HELD
+        result["send_detail"] = (
+            f"recovery for dispatch anchor {decided.dispatch_journal} is already "
+            f"{reserve.current_state}; at most one recovery attempt per gate anchor "
+            f"({reserve.detail})"
+        )
+        result["needs_reconcile"] = bool(reserve.needs_reconcile)
+        return result
+
+    def _abort(folded: dict[str, Any], watermark: SweepWatermark) -> dict[str, Any]:
+        """Stand down without having sent: drop the reservation so a later sweep may retry."""
+        try:
+            fence.release(key)
+        except DispatchOutboxFenceError:
+            pass  # the row stays reserved; a re-entry surfaces it as uncertain for reconcile
+        _record_resolution(folded, record_fn, watermark)
+        return folded
+
+    # (2) Mutation-boundary re-read: the last chance to notice the lane is not stalled.
     try:
         rechecked = read_watermark(
             source, issue, lane=lane, lane_generation=lane_generation
         )
     except Exception as exc:  # noqa: BLE001 - an unreadable re-check must not mutate
+        try:
+            fence.release(key)
+        except DispatchOutboxFenceError:
+            pass
         return _unreadable(exc)
 
     decision = decide_recovery(
         decided=decided, rechecked=rechecked, decided_state=result["state"]
     )
     if decision.zero_send:
-        folded = _apply_zero_send(result, decision, rechecked)
-        _record_resolution(folded, record_fn, rechecked)
-        return folded
+        return _abort(_apply_zero_send(result, decision, rechecked), rechecked)
 
-    # (2) Record the stall durably BEFORE reserving anything (R3-F3).
+    # (3) Record the stall durably, inside the reservation (R4-F3 atomicity).
     try:
         record_journal = str(record_fn(dict(result), rechecked) or "").strip()
+    except RecordSupersededError as exc:
+        # R4-F1: the recorder's own pre-write read contradicted the verdict, so nothing was
+        # written. Fold to the first-pass resolution — no false stall record, no correction.
+        try:
+            fresh = read_watermark(source, issue, lane=lane, lane_generation=lane_generation)
+        except Exception:  # noqa: BLE001 - fall back to the boundary read for the fold
+            fresh = rechecked
+        folded = _apply_zero_send(
+            result,
+            RecoveryDecision(
+                send=False,
+                reason=(
+                    ZERO_SEND_PROGRESS_LANDED if fresh.has_progress else ZERO_SEND_STALL_UNPROVABLE
+                ),
+                detail=f"{exc}; the recovery is refused",
+            ),
+            fresh,
+        )
+        return _abort(folded, fresh)
     except Exception as exc:  # noqa: BLE001 - an unwritable record must not become a silent poke
         record_journal, record_error = "", type(exc).__name__
     else:
         record_error = ""
     if not record_journal:
+        try:
+            fence.release(key)
+        except DispatchOutboxFenceError:
+            pass
         result["send_reason"] = ZERO_SEND_RECORD_FAILED
         result["send_detail"] = (
             f"the recovery classification could not be durably recorded "
-            f"({record_error or 'unresolved'}); nothing was sent and NO durable authority was "
-            f"touched, so the next sweep retries this anchor cleanly"
+            f"({record_error or 'unresolved'}); nothing was sent and the reservation was released, "
+            f"so the next sweep retries this anchor cleanly"
         )
         result["resolution_recorded"] = False
         return result
     result["recovery_record_journal"] = record_journal
     result["resolution_recorded"] = True
 
-    # (3) The CAS-equivalent: no qualifying gate may PRECEDE our record (R3-F1).
+    # (4) Final live read immediately before the send (R4-F2).
     try:
         verified = read_watermark(
             source, issue, lane=lane, lane_generation=lane_generation
         )
     except Exception as exc:  # noqa: BLE001 - an unverifiable position must not send
-        return _unreadable(exc)
+        # R4-F4: a durable record already landed. Keep its pointer and report the sweep INCOMPLETE
+        # rather than returning a bare unreadable result that drops the mutation from view.
+        try:
+            fence.release(key)
+        except DispatchOutboxFenceError:
+            pass
+        result["send_reason"] = SWEEP_SOURCE_UNREADABLE
+        result["send_detail"] = (
+            f"the post-record verification read failed ({type(exc).__name__}): a recovery record "
+            f"j#{record_journal} IS durable but the send was not attempted, so this sweep is "
+            f"incomplete and must be re-run"
+        )
+        result["sweep_complete"] = False
+        return result
     if not verified.stall_provable:
         # ANY qualifying progress refuses the send — a lane that is demonstrably advancing must not
         # be poked, whenever the gate landed. The record's position does not change *whether* to
@@ -361,37 +446,9 @@ def _mutating_path(
             verified,
         )
         folded["record_stale_at_write"] = bool(preceding)
-        _record_resolution(folded, record_fn, verified)
-        return folded
+        return _abort(folded, verified)
 
-    # (4) Reserve the ONE send, then send it pointing at the record.
-    key = FenceKey(
-        workspace_id=workspace_id,
-        lane_id=lane,
-        issue=issue,
-        journal=rechecked.dispatch_journal,
-        action_id=SWEEP_RECOVERY_ACTION_ID,
-        target_assigned_name=str(target_assigned_name).strip(),
-    )
-    try:
-        reserve = fence.reserve(key, now=now)
-    except DispatchOutboxFenceError as exc:
-        result["send_reason"] = ZERO_SEND_FENCE_UNAVAILABLE
-        result["send_detail"] = (
-            f"the idempotency authority is unavailable ({exc}); zero-send rather than risk a "
-            f"duplicate replay"
-        )
-        return result
-    if not reserve.won:
-        result["send_reason"] = ZERO_SEND_FENCE_HELD
-        result["send_detail"] = (
-            f"recovery for dispatch anchor {rechecked.dispatch_journal} is already "
-            f"{reserve.current_state}; at most one recovery delivery per gate anchor "
-            f"({reserve.detail})"
-        )
-        result["needs_reconcile"] = bool(reserve.needs_reconcile)
-        return result
-
+    # (5) Send exactly once, pointing at the record. The reservation has been held since step (1).
     try:
         send_fn(record_journal)
     except Exception as exc:  # noqa: BLE001 - an ambiguous send is uncertain, never auto-retried
@@ -533,6 +590,16 @@ class RecoverySendError(RuntimeError):
     """The one recovery notification did not positively succeed (-> the fence marks it uncertain)."""
 
 
+class RecordSupersededError(RuntimeError):
+    """The recorder's own pre-write read contradicts the verdict, so it wrote nothing (R4-F1).
+
+    Distinct from a write failure: nothing went wrong and nothing is broken — the lane simply is
+    not stalled after all, discovered at the last durable read before the write. The caller folds
+    it into the first-pass resolution, which is what acceptance 3 asks for: no false stall record
+    to correct later.
+    """
+
+
 def build_recovery_sender(
     *,
     issue: str,
@@ -611,11 +678,31 @@ def build_recovery_recorder(
         keys = dict(
             lane=lane, lane_generation=lane_generation, dispatch_anchor=anchor, outcome=outcome
         )
-        existing = sweep_record_journals(source.read_entries(str(issue)), **keys)
+        pre = list(source.read_entries(str(issue)))
+        existing = sweep_record_journals(pre, **keys)
         if len(existing) == 1:
             return existing[0]  # already recorded this resolution: recover, write nothing
         if len(existing) >= 2:
             return ""  # ambiguous: fail closed rather than pick one
+        # Review R4-F1: this pre-read is a durable OBSERVATION, not just an idempotency lookup.
+        # Writing a stall record while it already shows a landed gate produces exactly the
+        # false-verdict-then-correction pair acceptance 3 forbids, so the verdict is re-checked
+        # against the very entries about to be written against, and a superseded stall aborts
+        # BEFORE the write. The caller folds this into the first-pass resolution.
+        if outcome == STATE_NO_PROGRESS_AFTER_HANDOFF:
+            fresh = resolve_watermark(
+                pre,
+                dispatch_journal=anchor,
+                lane=lane,
+                lane_generation=lane_generation,
+                latest_generation=(dispatch_generations(pre, lane=lane) or (0,))[-1],
+            )
+            if not fresh.stall_provable or fresh.superseded:
+                raise RecordSupersededError(
+                    f"the stall verdict no longer holds at write time (progress="
+                    f"{[j for j, _ in fresh.progress]} opaque={list(fresh.opaque)} "
+                    f"superseded={fresh.superseded}); no stall record was written"
+                )
         post_note(str(issue), render_sweep_record_note(_record_body(result), **keys))
         written = sweep_record_journals(source.read_entries(str(issue)), **keys)
         return written[0] if len(written) == 1 else ""
@@ -676,6 +763,7 @@ __all__ = (
     "ZERO_SEND_WORKSPACE_UNATTESTED",
     "ZERO_SEND_RECORD_FAILED",
     "RecoverySendError",
+    "RecordSupersededError",
     "source_is_fresh",
     "read_watermark",
     "sweep_once",
