@@ -1150,6 +1150,140 @@ class ReviewJ80081FindingsTest(unittest.TestCase):
             self.assertEqual(_store_content(second / path.name), (1, 2))
 
 
+class ReviewJ80103FindingsTest(unittest.TestCase):
+    """Review j#80103 R5-F1: the preserved artifact SET must be pinned, not re-observed."""
+
+    def _corrupt_with_sidecars(self, home: Path) -> Path:
+        path = herdr_identity_attestation_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"corrupt main")
+        path.with_name(path.name + "-wal").write_bytes(b"WAL EVIDENCE")
+        path.with_name(path.name + "-shm").write_bytes(b"SHM EVIDENCE")
+        return path
+
+    def test_r5f1_concurrent_rebuild_never_publishes_a_main_only_recovery_point(self) -> None:
+        # Evaluating each sidecar's exists() just before copying it put a TOCTOU between
+        # CHOOSING what to preserve and preserving it: a peer rotating the store in that
+        # window made this operation skip sidecars that were present at its start and
+        # publish a main-only directory as a complete recovery point with state=applied.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt_with_sidecars(home)
+            b_copied_main = threading.Event()
+            a_done = threading.Event()
+            real_copy = shutil.copy2
+
+            def _barrier_copy(src, dst, *a, **k):
+                result = real_copy(src, dst, *a, **k)
+                if threading.current_thread().name == "B" and str(src).endswith(".sqlite"):
+                    b_copied_main.set()
+                    a_done.wait(5)
+                return result
+
+            results: dict = {}
+
+            def _run(name):
+                try:
+                    results[name] = run_attestation_store_rebuild(
+                        home=home, view=_View(agents=[]), write=True
+                    )
+                except Exception as exc:  # noqa: BLE001 - asserted below
+                    results[name] = exc
+
+            with mock.patch.object(sch.shutil, "copy2", _barrier_copy):
+                b = threading.Thread(target=_run, args=("B",), name="B")
+                b.start()
+                self.assertTrue(b_copied_main.wait(5))
+                a = threading.Thread(target=_run, args=("A",), name="A")
+                a.start()
+                a.join(10)
+                a_done.set()
+                b.join(10)
+
+            published = sorted((home / "backups").iterdir())
+            for directory in published:
+                names = {f.name for f in directory.iterdir()}
+                self.assertEqual(
+                    names,
+                    {path.name, path.name + "-wal", path.name + "-shm"},
+                    "a published recovery point must hold every artifact observed at its "
+                    "own start — never a main-only remainder",
+                )
+            # The racer must fail closed rather than publish a partial set.
+            states = {n: getattr(results[n], "state", results[n]) for n in ("A", "B")}
+            self.assertIn(APPLIED, states.values())
+            self.assertEqual(len(published), sum(1 for s in states.values() if s == APPLIED))
+
+    def test_r5f1_vanished_artifact_fails_closed_and_publishes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt_with_sidecars(home)
+            real_copy = shutil.copy2
+
+            def _peer_rotated(src, dst, *a, **k):
+                if str(src).endswith("-wal"):
+                    raise FileNotFoundError(2, "No such file or directory", str(src))
+                return real_copy(src, dst, *a, **k)
+
+            with mock.patch.object(sch.shutil, "copy2", _peer_rotated):
+                with self.assertRaises(StateStoreError) as ctx:
+                    sch.quarantine_attestation_store_artifacts(path)
+            self.assertIn("observed at its start", str(ctx.exception))
+            self.assertFalse((home / "backups").exists(), "nothing may be published")
+            self.assertTrue(path.exists(), "and nothing may be removed")
+
+    def test_r5f1_manifest_is_pinned_before_the_first_copy(self) -> None:
+        # GUARD BITE: a sidecar created AFTER the manifest is pinned is not part of this
+        # operation's promise, and its absence from the recovery point is correct. What
+        # matters is that the pinned set is preserved whole.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            wal = path.with_name(path.name + "-wal")
+            wal.write_bytes(b"WAL EVIDENCE")
+            backup = sch.quarantine_attestation_store_artifacts(path)
+            self.assertEqual(
+                {f.name for f in backup.iterdir()}, {path.name, wal.name}
+            )
+
+    # --- self-found axis: the removal loop's own exists()->unlink() window -------------
+    def test_removal_is_idempotent_when_a_peer_already_removed_an_artifact(self) -> None:
+        # An already-absent artifact IS this function's goal state. Guarding with exists()
+        # left a window where a peer's unlink between the check and ours turned a fully
+        # achieved goal state into a false "interrupted / NOT untouched / re-run" report —
+        # a side effect denied in the opposite direction.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            path.with_name(path.name + "-wal").write_bytes(b"WAL")
+            real_unlink = Path.unlink
+
+            def _peer_wins_window(self_path, *a, **k):
+                if self_path.name.endswith("-wal") and not k.get("missing_ok"):
+                    raise FileNotFoundError(2, "No such file", str(self_path))
+                return real_unlink(self_path, *a, **k)
+
+            with mock.patch.object(Path, "unlink", _peer_wins_window):
+                result = run_attestation_store_rebuild(
+                    home=home, view=_View(agents=[]), write=True
+                )
+            self.assertEqual(result.state, APPLIED)
+            self.assertTrue(result.ok)
+
+    def test_removal_reaches_goal_state_when_artifacts_are_already_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Nothing exists: removal must be a silent no-op, not an error.
+            sch.remove_attestation_store_artifacts(path)
+            self.assertFalse(path.exists())
+
+
 class ZeroSideEffectTest(unittest.TestCase):
     """Acceptance 1: an incompatible store creates no workspace / tab / agent."""
 

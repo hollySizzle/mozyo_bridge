@@ -643,6 +643,16 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   avoiding it (the final dir does not exist until publication, so concurrent operations always chose the same name); each candidate
   is instead *attempted* at publish time, and because a published recovery point is always non-empty, `rename` onto a peer's
   directory fails `ENOTEMPTY` and yields the next suffix instead of clobbering it.
+- **The preserved artifact set is pinned once, before the first copy** (#13882 review j#80103 R5-F1). Owning the *destination* is not
+  enough if the *source* is re-observed as you go: deciding each sidecar's fate with an `exists()` evaluated just before copying it
+  put a TOCTOU between **choosing** what to preserve and **preserving** it. A peer rebuild rotating the store in that window made an
+  operation skip sidecars that were present when it started and publish a **main-only** directory as a complete recovery point with
+  `state=applied` (measured). The manifest is therefore fixed up front and becomes this operation's promise; any artifact from it
+  that has since vanished is a hard failure — the quarantine fails closed and publishes nothing. So a published recovery point holds
+  everything observed at its own start, or does not exist, and a racing peer fails closed rather than publishing a remainder.
+- **Removal is idempotent (`missing_ok`), never `exists()`-guarded** (same family). An already-absent artifact *is* the rotation's
+  goal state, so erroring on it denies a side effect in the opposite direction: a peer's unlink landing between the check and ours
+  turned a fully-achieved goal state into a false "interrupted, re-run" report.
 - **The main file is the rotation's completion sentinel: sidecars first, main LAST** (R3-F2). `probe_store_schema` decides a store
   *exists* by the main file, so removing it first made a half-done rotation indistinguishable from a finished one — measured: a
   failing `-wal` unlink left `main` gone and the sidecar orphaned, the retry then probed `STORE_ABSENT` and reported
