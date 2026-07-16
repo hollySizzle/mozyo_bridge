@@ -104,6 +104,32 @@ class SlotRecoveryDecision(unittest.TestCase):
         # A fully-default (all-unsafe) observation must preserve, never actuate.
         self.assertFalse(slot_recovers(decide_slot_recovery(SlotRecoveryObservation())))
 
+    def test_absent_slot_is_relaunch_recoverable(self):
+        # R1-F1: a vanished pair slot (0 live panes — e.g. closed in a prior partial run) is
+        # SLOT_RECOVER (relaunch), NOT preserve_ambiguous, so a partial close/relaunch replays.
+        v = decide_slot_recovery(
+            SlotRecoveryObservation(slot_absent=True, generation_not_newer=True)
+        )
+        self.assertEqual(v, SLOT_RECOVER)
+        self.assertTrue(slot_recovers(v))
+
+    def test_absent_slot_on_superseded_lane_preserves(self):
+        # An absent slot whose lane generation was superseded must NOT be relaunched.
+        v = decide_slot_recovery(
+            SlotRecoveryObservation(slot_absent=True, generation_not_newer=False)
+        )
+        self.assertEqual(v, SLOT_PRESERVE_NEWER)
+        self.assertFalse(slot_recovers(v))
+
+    def test_guard_bite_absent_vs_ambiguous(self):
+        # Adversarial: absent (0 panes) recovers; ambiguous (>1 panes: not absent, not resolved)
+        # preserves. The two must never be conflated (conflating them would either strand a
+        # replay or relaunch onto a duplicate).
+        self.assertTrue(slot_recovers(decide_slot_recovery(
+            SlotRecoveryObservation(slot_absent=True, generation_not_newer=True))))
+        self.assertFalse(slot_recovers(decide_slot_recovery(
+            SlotRecoveryObservation(slot_absent=False, identity_resolved=False, generation_not_newer=True))))
+
 
 class RecoveryActionId(unittest.TestCase):
     def test_pins_exact_hibernated_generation(self):

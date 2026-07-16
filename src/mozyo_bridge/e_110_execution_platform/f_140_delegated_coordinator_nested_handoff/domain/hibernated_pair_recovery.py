@@ -80,8 +80,13 @@ class SlotRecoveryObservation:
     Every field is a **positive** fact defaulting to the unsafe (preserve) side (``False``),
     so a missing / unreadable / ambiguous observation preserves at :func:`decide_slot_recovery`:
 
+    - ``slot_absent`` — the live inventory resolves ZERO panes at the slot's pinned name (the
+      slot's process is gone — e.g. it was closed in a prior partial recovery run, or the
+      launch never produced it). A vanished pair slot is RELAUNCH-recoverable (no close), so a
+      partial close/relaunch is replayable (Redmine #13847 R1-F1);
     - ``identity_resolved`` — the live inventory resolves EXACTLY one candidate at the slot's
-      pinned identity (never ambiguous / unreadable);
+      pinned identity (never ambiguous / unreadable). Mutually exclusive with ``slot_absent``
+      (0 vs 1 panes); more than one pane leaves both ``False`` -> ambiguous;
     - ``belongs_to_pair`` — that candidate is THIS hibernated lane's slot (matching the
       declared workspace / lane / issue / provider pin), not a foreign slot;
     - ``generation_not_newer`` — the live slot's generation is NOT newer than the approved
@@ -97,6 +102,7 @@ class SlotRecoveryObservation:
     """
 
     __slots__ = (
+        "slot_absent",
         "identity_resolved",
         "belongs_to_pair",
         "generation_not_newer",
@@ -110,6 +116,7 @@ class SlotRecoveryObservation:
     def __init__(
         self,
         *,
+        slot_absent: bool = False,
         identity_resolved: bool = False,
         belongs_to_pair: bool = False,
         generation_not_newer: bool = False,
@@ -119,6 +126,7 @@ class SlotRecoveryObservation:
         is_bad_generation: bool = False,
         already_healthy: bool = False,
     ) -> None:
+        self.slot_absent = bool(slot_absent)
         self.identity_resolved = bool(identity_resolved)
         self.belongs_to_pair = bool(belongs_to_pair)
         self.generation_not_newer = bool(generation_not_newer)
@@ -143,6 +151,10 @@ def decide_slot_recovery(observation: SlotRecoveryObservation) -> str:
 
     Order (each preserves a distinct zero-close class before the actuating check):
 
+    0. a VANISHED pair slot (``slot_absent`` — zero live panes) is RELAUNCH-recovered (no
+       close), UNLESS a newer lane generation superseded the approval (preserve). This is
+       what makes a partial close/relaunch replayable: a slot closed in a prior run comes
+       back ``slot_absent`` and is relaunched, not stuck ``preserve_ambiguous`` (R1-F1);
     1. identity must resolve uniquely (ambiguous / unreadable → preserve);
     2. the slot must belong to this pair (a foreign slot is preserved);
     3. the generation must not be newer (a superseded approval preserves the newer slot);
@@ -152,6 +164,10 @@ def decide_slot_recovery(observation: SlotRecoveryObservation) -> str:
     7. an already-healthy slot needs no action (never close a good generation);
     8. only then, a slot positively presenting the bad-generation residue is recovered.
     """
+    if observation.slot_absent:
+        # A vanished pair slot is relaunch-recoverable — but a newer lane generation that
+        # superseded the approval still preserves it (never relaunch onto a superseded lane).
+        return SLOT_RECOVER if observation.generation_not_newer else SLOT_PRESERVE_NEWER
     if not observation.identity_resolved:
         return SLOT_PRESERVE_AMBIGUOUS
     if not observation.belongs_to_pair:

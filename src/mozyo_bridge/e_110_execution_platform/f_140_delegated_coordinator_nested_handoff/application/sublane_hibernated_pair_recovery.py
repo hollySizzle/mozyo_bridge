@@ -124,7 +124,14 @@ class SlotPlan:
 class RecoverPairRequest:
     issue: str
     lane: str
+    #: The owner-APPROVAL journal authorizing this destructive recovery — the resume
+    #: DecisionPointer / authorization anchor. Distinct from the original request journal
+    #: below (Redmine #13847 R1-F3).
     journal: str
+    #: The ORIGINAL ``implementation_request`` journal to re-deliver to the gateway. This is
+    #: the exactly-once fence key + delivery anchor, so a re-approval (a different approval
+    #: journal) never changes the fence key and can never re-send the same original request.
+    implementation_request_journal: str
 
 
 @dataclass(frozen=True)
@@ -395,17 +402,25 @@ class SublaneRecoverPairUseCase:
                 ),
             )
 
-        # -- actuation: close ONLY the bad-generation slots (byte-preserving), then relaunch --
+        # -- actuation: close ONLY the LIVE bad-generation slots (byte-preserving), then relaunch --
+        # A slot that recovers with NO live locator is a vanished pair slot (e.g. closed in a
+        # prior partial run): it needs no close, only a relaunch. Closing only live bad-gen
+        # slots + relaunching whenever ANY slot needs recovery (not gated on "closed THIS run")
+        # is what makes a partial close/relaunch replayable (Redmine #13847 R1-F1): a re-run of a
+        # partially-closed pair sees the closed slot as `slot_absent` -> SLOT_RECOVER -> relaunch.
+        recover_slots = [slot for slot in preflight.slots if slot.recovers]
         closed: list[str] = []
-        for slot in preflight.slots:
-            if not slot.recovers:
-                continue  # SLOT_HEALTHY — never closed
+        for slot in recover_slots:
+            if not slot.locator:
+                continue  # vanished (absent) — nothing to close; the relaunch recreates it
             ok = self.ops.close_bad_slot(
                 role=slot.role, provider=slot.provider,
                 assigned_name=slot.assigned_name, locator=slot.locator,
                 action_id=action_id,
             )
             if not ok:
+                # A live close failed: fail-closed. The partial state stays replayable — a
+                # re-run finds the already-closed slot(s) `slot_absent` and relaunches them.
                 return RecoverPairOutcome(
                     executed=True, preflight=preflight, issue=issue, lane=lane,
                     closed_roles=tuple(closed),
@@ -413,14 +428,16 @@ class SublaneRecoverPairUseCase:
                 )
             closed.append(slot.role)
 
-        if closed and not self.ops.relaunch_pair(action_id=action_id):
+        if recover_slots and not self.ops.relaunch_pair(action_id=action_id):
             return RecoverPairOutcome(
                 executed=True, preflight=preflight, issue=issue, lane=lane,
                 closed_roles=tuple(closed), detail=BLOCK_RELAUNCH_FAILED,
             )
-        relaunched = bool(closed)
+        relaunched = bool(recover_slots)
 
         # -- resume: both-slots post-hibernate attestation verify + hibernated->active CAS --
+        # Authorized by the owner-APPROVAL journal (request.journal), distinct from the original
+        # implementation_request journal that the redispatch re-sends (Redmine #13847 R1-F3).
         resume_outcome = self.resume.run(
             ResumeRequest(issue=issue, lane=lane, journal=_norm(request.journal)),
             execute=True,
@@ -432,14 +449,17 @@ class SublaneRecoverPairUseCase:
                 detail=BLOCK_RESUME_REFUSED,
             )
 
-        # -- redispatch: original implementation_request to the gateway, exactly-once --
+        # -- redispatch: the ORIGINAL implementation_request to the gateway, exactly-once --
+        # The fence key + delivery anchor use the ORIGINAL implementation_request journal (never
+        # the owner-approval journal), so a re-approval never changes the fence key and can never
+        # re-send the same original request (Redmine #13847 R1-F3).
         gateway_name = preflight.gateway.assigned_name if preflight.gateway else ""
         redispatch = self.ops.redispatch_to_gateway(
             action_id=action_id,
             gateway_assigned_name=gateway_name,
             issue=issue,
             lane=lane,
-            journal=_norm(request.journal),
+            journal=_norm(request.implementation_request_journal),
             workspace_id=workspace_id,
         )
         return RecoverPairOutcome(
@@ -502,12 +522,16 @@ def cmd_sublane_recover_pair(args: argparse.Namespace) -> int:
         issue=getattr(args, "issue", "") or "",
         lane=getattr(args, "lane", "") or "",
         journal=getattr(args, "journal", "") or "",
+        implementation_request_journal=getattr(args, "implementation_request_journal", "") or "",
     )
     json_mode = bool(getattr(args, "json", False))
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
         build_live_recover_pair_use_case,
     )
 
+    # The builder binds the owner-APPROVAL journal into the live ops (close/relaunch/actuator
+    # requests); the ORIGINAL implementation_request journal flows per-run through the request
+    # to the redispatch call, so it is not a builder argument.
     use_case = build_live_recover_pair_use_case(
         repo_root=repo_root, env=dict(os.environ),
         issue=request.issue, lane=request.lane, journal=request.journal,
@@ -534,7 +558,17 @@ def register_sublane_recover_pair_parser(sublane_sub: Any) -> None:
     parser.add_argument("--issue", required=True, help="Redmine issue the hibernated lane owns")
     parser.add_argument("--lane", required=True, help="Hibernated lane label to recover")
     parser.add_argument(
-        "--journal", required=True, help="Redmine journal authorizing the recovery"
+        "--journal",
+        required=True,
+        help="Redmine journal of the owner APPROVAL authorizing this destructive recovery "
+        "(the resume authorization anchor)",
+    )
+    parser.add_argument(
+        "--implementation-request-journal",
+        dest="implementation_request_journal",
+        required=True,
+        help="Redmine journal of the ORIGINAL implementation_request to re-deliver to the "
+        "gateway exactly-once (the fence key + delivery anchor; distinct from --journal)",
     )
     parser.add_argument(
         "--execute",

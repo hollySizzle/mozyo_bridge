@@ -197,6 +197,69 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 )
             self.assertEqual(result, REDISPATCH_UNCERTAIN)
 
+    def test_unbootstrapped_fence_is_uncertain_never_sends(self):
+        # R1-F2: the recovery must NOT bootstrap a missing fence. An absent / never-bootstrapped
+        # fence store => zero-send (uncertain), never a fresh reserve that could re-send.
+        with tempfile.TemporaryDirectory() as tmp:
+            fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(Path(tmp)))  # NOT bootstrapped
+            self.assertFalse(fence.is_bootstrapped())
+            ops = _ops(tmp, fence=fence)
+            gw_name = encode_assigned_name(_WS, "codex", _LANE)
+            sends = []
+            with patch.object(live, "list_herdr_agent_rows", return_value=[_row(gw_name, "wZ:p3G")]), \
+                 patch.object(live.HerdrSublaneActuatorOps, "dispatch_implementation_request",
+                              lambda self, **kw: sends.append(kw) or 0):
+                result = ops.redispatch_to_gateway(
+                    action_id="a", gateway_assigned_name=gw_name, issue="13847",
+                    lane=_LANE, journal="79612", workspace_id=_WS,
+                )
+            self.assertEqual(result, REDISPATCH_UNCERTAIN)
+            self.assertEqual(sends, [], "an un-bootstrapped fence must never send")
+            # The recovery must NOT have created the fence store (no auto-bootstrap).
+            self.assertFalse(fence.is_bootstrapped(), "recovery must not bootstrap the fence")
+
+
+class AttestationReadFailClosed(unittest.TestCase):
+    """R1-F4: an attestation store READ ERROR is not a positive bad-generation fact."""
+
+    def test_read_error_returns_not_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            class _Boom:
+                def read(self, name):
+                    raise OSError("attestation store unreadable")
+            with patch.object(live, "HerdrIdentityAttestationStore", return_value=_Boom()):
+                record, readable = ops._read_attestation("mzb1_x")
+            self.assertIsNone(record)
+            self.assertFalse(readable, "a store read error must report not-readable")
+
+    def test_readable_absent_record_is_readable(self):
+        # A genuinely-absent record (store readable, no row) is (None, True) — the residue.
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)  # empty isolated attestation store
+            record, readable = ops._read_attestation(encode_assigned_name(_WS, "claude", _LANE))
+            self.assertIsNone(record)
+            self.assertTrue(readable)
+
+    def test_unreadable_attestation_slot_is_not_bad_generation(self):
+        # End-to-end: a live slot whose attestation store is UNREADABLE must NOT be classified
+        # bad-generation (would close on an unknowable store). It preserves (zero-close).
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            name = encode_assigned_name(_WS, "claude", _LANE)
+            class _Boom:
+                def read(self, n):
+                    raise OSError("unreadable")
+            with patch.object(live, "list_herdr_agent_rows", return_value=[_row(name, "wZ:p3H")]), \
+                 patch.object(live, "HerdrIdentityAttestationStore", return_value=_Boom()), \
+                 patch.object(type(ops), "_no_pending_composer", return_value=True), \
+                 patch.object(type(ops), "_worktree_readable", return_value=True), \
+                 patch.object(type(ops), "_generation_not_newer", return_value=True):
+                obs, locator, an = ops.observe_slot(
+                    role="worker", provider="claude", workspace_id=_WS, lane=_LANE, record=_rec())
+            self.assertFalse(obs.is_bad_generation, "an unreadable attestation store must not read as bad-gen")
+            self.assertFalse(obs.already_healthy)
+
 
 class CloseAndRelaunchDelegate(unittest.TestCase):
     def test_close_bad_slot_delegates_to_quarantine_close(self):

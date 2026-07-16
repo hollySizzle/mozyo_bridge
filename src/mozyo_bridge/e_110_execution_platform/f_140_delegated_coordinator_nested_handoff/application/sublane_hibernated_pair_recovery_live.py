@@ -154,14 +154,27 @@ class LiveHibernatedPairRecoveryOps:
         assigned_name = encode_assigned_name(workspace_id, provider, lane)
         try:
             rows = self._rows()
-        except Exception:  # noqa: BLE001 - unreadable inventory => nothing observable (preserve)
+        except Exception:  # noqa: BLE001 - UNREADABLE inventory => nothing observable (preserve)
             return SlotRecoveryObservation(), "", assigned_name
         matches = [
             row for row in rows
             if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == _norm(assigned_name)
         ]
+        if len(matches) == 0:
+            # A VANISHED pair slot (0 live panes — e.g. closed in a prior partial run): relaunch-
+            # recoverable, unless the lane generation was superseded (the newer fence still
+            # applies to an absent slot). Distinct from an UNREADABLE inventory above (Redmine
+            # #13847 R1-F1). No live locator to pin — the relaunch recreates it.
+            return (
+                SlotRecoveryObservation(
+                    slot_absent=True,
+                    generation_not_newer=self._generation_not_newer(record, workspace_id, lane),
+                ),
+                "",
+                assigned_name,
+            )
         if len(matches) != 1:
-            # ambiguous (duplicate name) or absent (vanished) => identity not resolved.
+            # ambiguous (a duplicate name) => not resolved, not absent => preserve.
             return SlotRecoveryObservation(), "", assigned_name
         row = matches[0]
         live_locator = _agent_locator(row)
@@ -177,8 +190,12 @@ class LiveHibernatedPairRecoveryOps:
         )
         # attestation join at the LIVE locator: attested => already healthy; present but
         # not attested (absent / stale / missing / conflict) => the bad generation to close.
+        # A store READ ERROR (Redmine #13847 R1-F4) is NOT a positive bad-generation fact:
+        # `att_readable` gates BOTH `is_bad_generation` and `already_healthy`, so an unreadable
+        # attestation store leaves the slot indeterminate -> preserve (zero-close), never close.
+        record_att, att_readable = self._read_attestation(assigned_name)
         join = evaluate_attestation(
-            self._read_attestation(assigned_name),
+            record_att,
             live_locator=live_locator,
             expected_workspace_id=workspace_id,
             expected_role=provider,
@@ -193,16 +210,25 @@ class LiveHibernatedPairRecoveryOps:
                 role=role, assigned_name=assigned_name, locator=live_locator
             ),
             worktree_readable=self._worktree_readable(row),
-            is_bad_generation=belongs and not join.ok,
-            already_healthy=join.ok,
+            is_bad_generation=belongs and att_readable and not join.ok,
+            already_healthy=att_readable and join.ok,
         )
         return observation, live_locator, assigned_name
 
-    def _read_attestation(self, assigned_name: str):
+    def _read_attestation(self, assigned_name: str) -> "Tuple[Any, bool]":
+        """Return ``(record, readable)``: the slot's self-attestation and whether the store
+        READ succeeded (Redmine #13847 R1-F4).
+
+        A genuinely-absent record (store readable, no row) is ``(None, True)`` — the live-but-
+        unattested residue the recovery closes. A store READ ERROR is ``(None, False)`` — the
+        caller must NOT treat that as a bad generation (it is unknowable, so fail closed to
+        preserve). The two must never be conflated.
+        """
         try:
-            return HerdrIdentityAttestationStore(home=self.attestation_home).read(_norm(assigned_name))
-        except Exception:  # noqa: BLE001 - unreadable attestation => None (join fails closed)
-            return None
+            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(_norm(assigned_name))
+        except Exception:  # noqa: BLE001 - unreadable attestation store => (None, not readable)
+            return None, False
+        return record, True
 
     def _generation_not_newer(self, record: Any, workspace_id: str, lane: str) -> bool:
         """Re-read the live lifecycle: the pinned generation must still be the current one.
@@ -290,12 +316,13 @@ class LiveHibernatedPairRecoveryOps:
     # -- redispatch (existing outbox fence = sole exactly-once authority, item 5) -------
 
     def _fence(self) -> DispatchOutboxFence:
-        fence = self.fence if self.fence is not None else DispatchOutboxFence()
-        try:
-            fence.bootstrap()
-        except DispatchOutboxFenceError:
-            pass
-        return fence
+        # Redmine #13847 R1-F2: the recovery NEVER bootstraps the fence. A missing / lost fence
+        # store must NOT be auto-created here — `DispatchOutboxFence.bootstrap` treats a TOTAL
+        # loss (both DB + sidecar gone) as a genuine first-init and mints a fresh store, which
+        # would forget an already-`delivered` row and re-send the original request. The redispatch
+        # requires an ALREADY-bootstrapped fence and fails closed otherwise (the store-loss
+        # contract: missing/corrupt -> zero-send + operator `recover()` + a new action_id).
+        return self.fence if self.fence is not None else DispatchOutboxFence()
 
     def _gateway_live_locator(self, gateway_assigned_name: str) -> str:
         try:
@@ -317,6 +344,15 @@ class LiveHibernatedPairRecoveryOps:
             target_assigned_name=_norm(gateway_assigned_name),
         )
         fence = self._fence()
+        # Fail closed on a missing / lost / inconsistent fence (Redmine #13847 R1-F2): only an
+        # already-bootstrapped, identity-matched fence can prove exactly-once. An un-bootstrapped
+        # or lost store is a reconcile condition, never a fresh reserve that could re-send.
+        try:
+            bootstrapped = fence.is_bootstrapped()
+        except Exception:  # noqa: BLE001 - unreadable fence state => uncertain (never send)
+            return REDISPATCH_UNCERTAIN
+        if not bootstrapped:
+            return REDISPATCH_UNCERTAIN
         try:
             reserve = fence.reserve(key)
         except DispatchOutboxFenceError:
