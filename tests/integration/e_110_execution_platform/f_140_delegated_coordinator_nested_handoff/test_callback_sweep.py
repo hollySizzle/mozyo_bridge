@@ -13,7 +13,9 @@ import sys
 import tempfile
 import threading
 import time
+import sqlite3
 import unittest
+from contextlib import closing
 from unittest import mock
 from pathlib import Path
 
@@ -22,6 +24,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_publication_fence import (
     _SEAL_INITIALIZING,
+    _SEAL_INVALID,
+    _SEAL_LEGACY_OPERATIONAL,
     _SEAL_OPERATIONAL,
     PUBLICATION_PUBLISHED,
     CallbackPublicationFence,
@@ -93,6 +97,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 WS = "ws-1"
 LANE = "issue_13883_lane"
+_R13_SEAL_TEXT = (
+    "callback publication fence first initialized at 2026-07-16T00:00:00+00:00\n"
+    "presence of this file means a both-absent store is a LOSS, never a fresh install\n"
+)
+
 ISSUE = "13883"
 GEN = 1
 TARGET = "claude-worker-1"
@@ -1526,10 +1535,10 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         home = Path(tempfile.mkdtemp())
         fence = CallbackPublicationFence(home=home)
         fence.bootstrap()
-        fence.seal_path.unlink()                                  # unsealed, as before this fix
         key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
                              dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
         self.assertTrue(fence.reserve(key).may_publish)           # A reserves, then stalls pre-PUT
+        fence.seal_path.unlink()                                  # the store loses its seal
         fence.path.unlink()
         fence.sidecar_path.unlink()
 
@@ -1588,6 +1597,147 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         fence.sidecar_path.unlink()                       # torn AFTER it operated
         with self.assertRaises(CallbackPublicationFenceError):
             fence.bootstrap()
+
+    def test_a_legacy_seal_is_operational_authority_not_a_missing_one(self):
+        # R14-F1: the seal R13 shipped is prose, and R14's parser did not recognize it -- so on
+        # upgrade it read as "never sealed". Harmless while the store is healthy (adoption saves
+        # it), fatal in exactly the state the seal exists to catch: pair lost, old seal left.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        fence.reserve(key)
+        fence.seal_path.write_text(_R13_SEAL_TEXT, encoding="utf-8")
+        self.assertEqual(fence.seal_state(), _SEAL_LEGACY_OPERATIONAL)
+
+        fence.path.unlink()
+        fence.sidecar_path.unlink()                       # the loss the seal must catch
+        reborn = CallbackPublicationFence(home=home)
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)
+
+    def test_a_legacy_seal_on_a_healthy_store_migrates_without_touching_its_reservations(self):
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        fence.reserve(key)
+        fence.seal_path.write_text(_R13_SEAL_TEXT, encoding="utf-8")
+
+        fence.bootstrap()                                  # migrate the format, not the store
+        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+        self.assertFalse(fence.reserve(key).may_publish)   # the reservation survived
+
+    def test_an_unknown_seal_is_never_read_as_absent(self):
+        # "I cannot read whether this fence operated" is not "it never did". Folding the two
+        # together is the same fail-open as the legacy seal (R14-F1).
+        for content in ("garbage from somewhere", "",
+                        "mozyo-callback-publication-seal v99 operational",   # a newer build's seal
+                        "mozyo-callback-publication-seal vX operational",
+                        "mozyo-callback-publication-seal v1 something-else"):
+            with self.subTest(content=content):
+                fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+                fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+                fence.seal_path.write_text(content, encoding="utf-8")
+                self.assertEqual(fence.seal_state(), _SEAL_INVALID)
+                self.assertFalse(fence.is_bootstrapped())
+                with self.assertRaises(CallbackPublicationFenceError):
+                    fence.bootstrap()
+
+    def test_a_seal_that_cannot_be_read_is_never_read_as_absent(self):
+        # The distinct failure the OSError branch exists for: the file is right there, and we are
+        # not allowed to read it. Treating that as "never sealed" re-mints a live store.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+        fence.seal_path.write_text("whatever", encoding="utf-8")
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            self.assertEqual(fence.seal_state(), _SEAL_INVALID)
+            self.assertFalse(fence.has_operated() is False)      # not "never ran"
+            with self.assertRaises(CallbackPublicationFenceError):
+                fence.bootstrap()
+
+    def test_a_seal_that_is_not_valid_utf8_is_never_read_as_absent(self):
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+        fence.seal_path.write_bytes(b"\xff\xfe\x00 not text at all")
+        self.assertEqual(fence.seal_state(), _SEAL_INVALID)
+        with self.assertRaises(CallbackPublicationFenceError):
+            fence.bootstrap()
+
+    def test_a_reserve_is_refused_unless_the_authority_itself_says_operational(self):
+        # R14-F2: readiness was enforced at the composition root, so reserve() granted publication
+        # rights on an `initializing` store -- which bootstrap would then re-mint underneath it. A
+        # check at the door is not a guard on the safe.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        # Reserve while the store is legitimately operational, so that each action below is
+        # refused BY THE SEAL rather than incidentally by some other precondition -- otherwise the
+        # test passes with the guard deleted and pins nothing.
+        reservation = fence.reserve(key)
+        fence._write_seal(_SEAL_INITIALIZING)
+        for name, action in (
+            ("reserve", lambda: fence.reserve(key)),
+            ("mark_published", lambda: fence.mark_published(key, reservation.token, "80500")),
+            ("mark_uncertain", lambda: fence.mark_uncertain(key, reservation.token)),
+            ("reconcile", lambda: fence.reconcile(key, published_journal="80500")),
+        ):
+            with self.subTest(action=name), self.assertRaises(CallbackPublicationFenceError):
+                action()
+
+    def test_concurrent_bootstraps_neither_double_grant_nor_corrupt_the_store(self):
+        # R14-F2: the fence was exclusive (BEGIN IMMEDIATE + UNIQUE) but the procedure that BUILDS
+        # it had no exclusion at all -- so racing initializers minted over each other. Without the
+        # lifecycle lock this raises sqlite errors from half-created stores; with it, one winner.
+        home = Path(tempfile.mkdtemp())
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        grants, errors = [], []
+        barrier = threading.Barrier(6)
+
+        def racer():
+            fence = CallbackPublicationFence(home=home)
+            barrier.wait(timeout=5)
+            try:
+                fence.bootstrap()
+                grants.append(fence.reserve(key).may_publish)
+            except CallbackPublicationFenceError:
+                grants.append(False)
+            except Exception as exc:                       # a corrupted store, not a refusal
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=racer) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(errors, [], "racing bootstraps corrupted the store")
+        self.assertEqual(sum(1 for g in grants if g is True), 1)
+
+    def test_an_operational_store_is_never_re_minted_by_a_later_bootstrap(self):
+        # Monotonicity, in the form that matters: once A is operational and holding a reservation,
+        # no later bootstrap may swap the store out from under it.
+        home = Path(tempfile.mkdtemp())
+        a = CallbackPublicationFence(home=home)
+        a.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(a.reserve(key).may_publish)
+        with closing(sqlite3.connect(a.path)) as conn:
+            nonce = conn.execute("SELECT value FROM store_meta WHERE key='store_nonce'").fetchone()[0]
+
+        CallbackPublicationFence(home=home).bootstrap()     # a second initializer, later
+        with closing(sqlite3.connect(a.path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT value FROM store_meta WHERE key='store_nonce'").fetchone()[0],
+                nonce, "the store was re-minted under a live reservation",
+            )
+        self.assertFalse(CallbackPublicationFence(home=home).reserve(key).may_publish)
 
     def test_readiness_always_implies_a_seal_across_every_reachable_state(self):
         # R13-F1 requirement 1, as a property rather than a case: whatever combination of seal and
