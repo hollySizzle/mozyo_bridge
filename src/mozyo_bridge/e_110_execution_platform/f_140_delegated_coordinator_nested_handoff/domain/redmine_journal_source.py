@@ -401,6 +401,36 @@ def dispatch_entry_journals(
     return tuple(sorted(found))
 
 
+def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str) -> "tuple[int, ...]":
+    """Every lane_generation this lane has a dispatch marker for (pure, sorted ascending).
+
+    The **round authority** a sweep needs to notice it is reasoning about a superseded round
+    (Redmine #13889 review F3): :func:`resolve_dispatch_entry_journal` answers "where is round N's
+    anchor" for a generation the caller already fixed, so it can never reveal that round N+1 has
+    since opened. This scans the same durable dispatch markers WITHOUT fixing a generation, so a
+    caller can compare the round it is sweeping against the newest round on the record. A
+    non-numeric / blank generation is skipped (never guessed).
+    """
+    lane_s = str(lane or "").strip()
+    if not lane_s:
+        return ()
+    found: set[int] = set()
+    for entry in entries or ():
+        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
+                continue
+            if str(fields.get("lane", "")).strip() != lane_s:
+                continue
+            raw = str(fields.get("lane_generation", "")).strip()
+            try:
+                found.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+    return tuple(sorted(found))
+
+
 def resolve_dispatch_entry_journal(
     entries: "Iterable[RedmineJournalEntry]",
     *,
@@ -506,6 +536,7 @@ __all__ = (
     "render_dispatch_marker",
     "render_dispatch_note",
     "dispatch_entry_journals",
+    "dispatch_generations",
     "resolve_dispatch_entry_journal",
     "dispatch_entry_journal_from_source",
 )

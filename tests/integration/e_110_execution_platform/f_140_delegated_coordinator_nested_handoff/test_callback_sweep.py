@@ -31,9 +31,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
     SEND_RESERVED,
     SWEEP_RECOVERY_ACTION_ID,
+    SWEEP_STATE_STALL_UNPROVABLE,
+    ZERO_SEND_DISPATCH_ROUND_CHANGED,
     ZERO_SEND_FENCE_HELD,
     ZERO_SEND_FENCE_UNAVAILABLE,
     ZERO_SEND_PROGRESS_LANDED,
+    ZERO_SEND_STALL_UNPROVABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
     render_progress_note,
@@ -44,6 +47,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_gate_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
+    CALLBACK_SAME_LANE_ONLY,
     STATE_NO_PROGRESS_AFTER_HANDOFF,
     STATE_PROGRESS_WITHOUT_CALLBACK,
 )
@@ -55,24 +59,27 @@ GEN = 1
 TARGET = "claude-worker-1"
 
 
-def ir(jid):
-    return RedmineJournalEntry(
-        issue_id=ISSUE,
-        journal_id=str(jid),
-        notes=render_dispatch_note("## Implementation Request", lane=LANE, lane_generation=GEN),
-    )
+def entry(jid, notes):
+    return RedmineJournalEntry(issue_id=ISSUE, journal_id=str(jid), notes=notes)
+
+
+def ir(jid, generation=GEN):
+    return entry(jid, render_dispatch_note("## Implementation Request", lane=LANE, lane_generation=generation))
 
 
 def gate(jid, kind, **fields):
-    return RedmineJournalEntry(
-        issue_id=ISSUE, journal_id=str(jid), notes=render_gate_note(kind, body="## Gate", **fields)
+    return entry(jid, render_gate_note(kind, body="## Gate", **fields))
+
+
+def progress(jid, kind, generation=GEN):
+    return entry(
+        jid, render_progress_note(kind, lane=LANE, lane_generation=generation, body="## Gate")
     )
 
 
-def progress(jid, kind):
-    return RedmineJournalEntry(
-        issue_id=ISSUE, journal_id=str(jid), notes=render_progress_note(kind, body="## Gate")
-    )
+def prose(jid, heading):
+    """A journal in the REAL #13883 shape: a gate heading with no structured marker."""
+    return entry(jid, f"{heading}\n\n(prose body)")
 
 
 class RaceSource:
@@ -178,6 +185,57 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(result["progress_journals"], [{"journal": "80002", "kind": "review_finding_verdict"}])
         self.assertEqual(self.sends, [])
 
+    def test_prose_only_gate_landing_in_the_window_is_zero_send(self):
+        # Review j#80105 F2 / verdict j#80112: the REAL #13883 j#80002 carries no marker. A
+        # marker-only reader sees nothing there, and the re-read is equally blind — so before this
+        # correction the sweep sent the stale replay exactly once and the fence never saw it. The
+        # sweep must ABSTAIN on an unreadable record instead of asserting a stall it cannot prove.
+        source = RaceSource(
+            [ir("79990")],
+            lands_on_read=1,
+            land=prose("80002", "## Gate: review_finding_verdict"),
+        )
+        result = self.sweep(source)
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_STALL_UNPROVABLE)
+        self.assertEqual(result["state"], SWEEP_STATE_STALL_UNPROVABLE)
+        self.assertFalse(result["is_stall"])
+        self.assertEqual(result["opaque_journals"], ["80002"])
+        self.assertEqual(self.sends, [])
+        self.assertEqual(self.fence.state_of(self.anchor_key()), "absent")
+
+    def test_prose_only_gate_present_from_the_start_is_never_a_stall_verdict(self):
+        # The same real shape, already on the record at the decision read (the j#79995 case).
+        result = self.sweep(RaceSource([ir("79990"), prose("79995", "## Gate: review — changes_requested")], ))
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["state"], SWEEP_STATE_STALL_UNPROVABLE)
+        self.assertEqual(self.sends, [])
+
+    def test_a_new_dispatch_round_landing_in_the_window_is_zero_send(self):
+        # Review F3, through the REAL read path: read_watermark resolves the round authority from
+        # the source, so a generation-2 IR landing mid-sweep supersedes the generation-1 verdict.
+        # The previous anchor-vs-anchor check could never fire here — both reads resolve the same
+        # caller-fixed generation and so always agreed.
+        source = RaceSource([ir("100", generation=1)], lands_on_read=1, land=ir("200", generation=2))
+        result = self.sweep(source)
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_DISPATCH_ROUND_CHANGED)
+        self.assertEqual(self.sends, [])
+
+    def test_progress_from_a_newer_round_does_not_clear_an_older_rounds_stall(self):
+        # The inverse fail-open: generation 2's progress must not make generation 1 look alive.
+        source = RaceSource([ir("100", generation=1), ir("200", generation=2),
+                             progress("201", "progress_log", generation=2)])
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=2,
+            source=source, fence=self.fence, target_assigned_name=TARGET, send_fn=self.send,
+            callback=CALLBACK_SAME_LANE_ONLY,
+        )
+        # Sweeping generation 2 itself: its own progress is visible, so it is not a stall.
+        self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
+        self.assertFalse(result["sent"])
+        self.assertEqual(self.sends, [])
+
     def test_recovery_is_at_most_once_per_gate_anchor(self):
         # Acceptance 5: a repeat sweep of the SAME still-silent lane must not replay.
         first = self.sweep(RaceSource([ir("79990")]))
@@ -262,6 +320,118 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(result["state"], STATE_NO_PROGRESS_AFTER_HANDOFF)
         self.assertFalse(result["sent"])
         self.assertEqual(self.fence.state_of(self.anchor_key()), "absent")
+
+
+class ProducerWiringTest(unittest.TestCase):
+    """Review F2: the progress marker needs a PRODUCTION writer, or the reader finds nothing real.
+
+    This is the #13520 F1a gap repeated: a reader whose markers nothing in production writes sees
+    an empty issue. The writer closes producer -> Redmine journal -> sweep classify end-to-end.
+    """
+
+    def setUp(self):
+        self.posted = []
+
+    class _FakeTransport:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def post_issue_note(self, issue_id, notes):
+            self.sink.append((issue_id, notes))
+            return f"redmine:issue={issue_id}"
+
+    def test_emitted_progress_record_is_discoverable_by_the_sweep(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
+            emit_progress_record,
+        )
+
+        receipt = emit_progress_record(
+            ISSUE, "review_finding_verdict", lane=LANE, lane_generation=GEN,
+            body="## Gate: review_finding_verdict",
+            transport=self._FakeTransport(self.posted),
+        )
+        self.assertTrue(receipt.recorded)
+        # The producer's own output, read back by the consumer: the loop closes.
+        written = entry("80002", self.posted[0][1])
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=RaceSource([ir("80000"), written]),
+            fence=DispatchOutboxFence(home=Path(tempfile.mkdtemp())),
+            target_assigned_name=TARGET, send_fn=None, callback=CALLBACK_SAME_LANE_ONLY,
+        )
+        self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
+        self.assertEqual(result["progress_journals"], [{"journal": "80002", "kind": "review_finding_verdict"}])
+
+    def test_writer_is_fail_closed_when_the_optin_is_unset(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
+            GATE_RECORD_WRITE_OPTIN_UNSET,
+            emit_progress_record,
+        )
+
+        receipt = emit_progress_record(
+            ISSUE, "progress_log", lane=LANE, lane_generation=GEN, transport=None
+        )
+        self.assertFalse(receipt.recorded)
+        self.assertEqual(receipt.reason, GATE_RECORD_WRITE_OPTIN_UNSET)
+
+
+class RecoverySenderTest(unittest.TestCase):
+    """Review F1: the production send_fn, verified through its injected runner (no external send)."""
+
+    def test_sender_issues_one_handoff_send_naming_the_durable_anchor(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+            build_recovery_sender,
+        )
+
+        calls = []
+        send = build_recovery_sender(
+            issue=ISSUE, journal="79990", target="w1:p2",
+            runner=lambda argv: (calls.append(argv), (0, ""))[1],
+        )
+        send()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[1:3], ["handoff", "send"])
+        # The notification is a pointer: it must name the durable anchor, not carry the content.
+        self.assertIn("--issue", argv)
+        self.assertEqual(argv[argv.index("--issue") + 1], ISSUE)
+        self.assertEqual(argv[argv.index("--journal") + 1], "79990")
+        self.assertEqual(argv[argv.index("--target") + 1], "w1:p2")
+
+    def test_a_failing_send_raises_so_the_fence_records_uncertain(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+            RecoverySendError,
+            build_recovery_sender,
+        )
+
+        send = build_recovery_sender(
+            issue=ISSUE, journal="79990", target="w1:p2",
+            runner=lambda argv: (3, "target unresolved"),
+        )
+        with self.assertRaises(RecoverySendError):
+            send()
+
+    def test_the_fenced_path_delivers_exactly_one_send_through_the_real_sender(self):
+        # F1 end-to-end: sweep_once + a real fence + the production sender (injected runner).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+            build_recovery_sender,
+        )
+
+        home = Path(tempfile.mkdtemp())
+        fence = DispatchOutboxFence(home=home)
+        fence.bootstrap()
+        calls = []
+        sender = build_recovery_sender(
+            issue=ISSUE, journal="79990", target=TARGET,
+            runner=lambda argv: (calls.append(argv), (0, ""))[1],
+        )
+        for _ in range(3):  # repeated sweeps of the same still-silent round
+            sweep_once(
+                workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+                source=RaceSource([ir("79990")]), fence=fence,
+                target_assigned_name=TARGET, send_fn=sender,
+            )
+        self.assertEqual(len(calls), 1)  # at most once per dispatch anchor
 
 
 if __name__ == "__main__":

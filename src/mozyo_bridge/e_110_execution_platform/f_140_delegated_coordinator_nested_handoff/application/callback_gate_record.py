@@ -80,6 +80,46 @@ def emit_gate_record(
     be a callback-required kind, else ``render_gate_note`` raises (a programming error, surfaced).
     """
     notes = render_gate_note(gate, body=body, **(marker_fields or {}))
+    return _post(issue, notes, transport)
+
+
+def emit_progress_record(
+    issue: str,
+    kind: str,
+    *,
+    lane: str,
+    lane_generation: object,
+    body: str = "",
+    transport: Optional[NoteWriteTransport],
+) -> GateRecordReceipt:
+    """Render a canonical **progress** note and post it via ``transport`` (fail-closed, opt-in).
+
+    The producer half of the #13889 sweep watermark (review F2). The consumer
+    (:func:`...domain.callback_sweep_watermark.progress_entries_after`) reads worker-side progress
+    gates — ``review_finding_verdict`` / ``progress_log`` / ``start`` / ``design_consultation`` —
+    that prove a lane is alive but owe the coordinator no callback. Without this writer those gates
+    are recorded as prose (the real #13883 j#79995 / j#80002 shape), the sweep cannot classify them,
+    and it must abstain from every stall verdict on that issue.
+
+    This is the exact gap #13520 F1a closed for callback-required gates: a reader whose markers
+    nothing in production writes finds nothing on a real issue. ``kind`` must be a progress-bearing
+    kind and ``lane`` / ``lane_generation`` are required — an unscoped progress marker cannot be
+    attributed to a dispatch round (review F3), so the renderer raises rather than emit one.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+        render_progress_note,
+    )
+
+    notes = render_progress_note(
+        kind, lane=lane, lane_generation=lane_generation, body=body
+    )
+    return _post(issue, notes, transport)
+
+
+def _post(
+    issue: str, notes: str, transport: Optional[NoteWriteTransport]
+) -> GateRecordReceipt:
+    """Post a rendered, marker-bearing note (fail-closed, opt-in); shared by both writers."""
     if transport is None:
         return GateRecordReceipt(recorded=False, reason=GATE_RECORD_WRITE_OPTIN_UNSET)
     # Import lazily so this module carries no infrastructure dependency in the pure path.
@@ -103,4 +143,5 @@ __all__ = (
     "NoteWriteTransport",
     "GateRecordReceipt",
     "emit_gate_record",
+    "emit_progress_record",
 )
