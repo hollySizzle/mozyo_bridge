@@ -307,9 +307,12 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
         lease=lease,
         target_assigned_name=target,
         send_fn=build_recovery_sender(issue=issue, target=target),
-        record_fn=build_recovery_recorder(
+        # R7-F1: `sweep_once` supplies the live-grant predicate, so the ownership check lands
+        # after the recorder's own reads and immediately before its write — not merely before the
+        # recorder is called, which left a whole Redmine round-trip unguarded.
+        record_fn_factory=lambda grant_is_live: build_recovery_recorder(
             source=source, issue=issue, lane=lane, lane_generation=generation,
-            post_note=transport.post_issue_note,
+            post_note=transport.post_issue_note, grant_is_live=grant_is_live,
         ),
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),
