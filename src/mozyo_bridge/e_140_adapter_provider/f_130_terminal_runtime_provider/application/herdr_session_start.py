@@ -131,6 +131,10 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     evaluate_attestation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_identity import (  # noqa: E501
+    _lane_id_from_metadata,
+    _resolve_workspace_id_readonly,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -245,28 +249,6 @@ def _find_named_agent(
     ]
 
 
-def _lane_id_from_metadata(resolved_root: Path) -> str:
-    """The recorded lane id for a lane worktree (``""`` when unrecorded).
-
-    Shared project workspace model (Redmine #13377): a lane worktree's slots are
-    ``mzb1_<project-ws>_<role>_<lane>``, so a relaunch from the worktree must
-    recover the SAME lane segment ``sublane create`` launched with. The lane
-    metadata record — keyed on the worktree's stable per-path token — carries it
-    (``lane_id``, falling back to ``lane_label`` for a record written before the
-    column existed). Read-only and fail-open to ``""`` (the caller fails closed:
-    a lane slot is never minted with a guessed lane).
-    """
-    from mozyo_bridge.core.state.lane_metadata import load_lane_records
-
-    token = derive_lane_workspace_token(str(resolved_root))
-    record = load_lane_records().get(token)
-    if record is None:
-        return ""
-    return _norm(getattr(record, "lane_id", "")) or _norm(
-        getattr(record, "lane_label", "")
-    )
-
-
 @dataclass(frozen=True)
 class _SlotPlan:
     """A per-provider decision (adopt / launch / dry-run plan) made before any launch.
@@ -283,47 +265,21 @@ class _SlotPlan:
     detail: str = ""  # fail-closed reason for kind == "unattested" (Redmine #13637); else ""
 
 
-def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
-    """Resolve a registered workspace's ``workspace_id`` for ``--dry-run``, read-only.
-
-    The query-side mirror of :func:`register_workspace`'s identity precedence
-    (Redmine #13595): an existing **anchor** pins the id, else an existing
-    **registry row** for this canonical path — but purely read-only (never create
-    the registry, write ``last_seen``, or touch the anchor; the exact defect this
-    fixes called ``register_workspace`` before the dry-run branch). Fails closed
-    rather than minting a fake assigned identity: both anchor names present is the
-    same ambiguity the write path refuses (guess nothing), and no anchor + no
-    registry row means no durable identity yet (register first). Linked worktrees
-    never reach here — the :func:`prepare_session` inheritance branch
-    (:func:`herdr_workspace_segment`) resolves them read-only.
-    """
-    if anchor_resolution(resolved_root).both_exist:
-        raise HerdrSessionStartError(
-            f"both {ANCHOR_RELATIVE.as_posix()} and "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist in {resolved_root}; the new "
-            "name is authoritative but a dry-run refuses to guess which identity a "
-            f"real session-start would use — remove the legacy "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} and re-run "
-            "`mozyo-bridge workspace register`, then --dry-run"
-        )
-    anchor = read_anchor(resolved_root)
-    if isinstance(anchor, dict):
-        workspace_id = _norm(anchor.get("workspace_id"))
-        if workspace_id:
-            return workspace_id
-    record = load_workspace_by_path(resolved_root)
-    if record is not None:
-        workspace_id = _norm(record.workspace_id)
-        if workspace_id:
-            return workspace_id
-    raise HerdrSessionStartError(
-        f"dry-run cannot resolve a durable workspace identity for {resolved_root} "
-        "and refuses to register it (a dry-run has no side effect) or mint a fake "
-        "one; run `mozyo-bridge workspace register` first, then re-run with --dry-run"
-    )
-
-
-def prepare_session(**kwargs) -> SessionStartResult:
+def prepare_session(
+    *,
+    repo_root: Path,
+    providers: Sequence[str],
+    lane_id: str,
+    env: Mapping[str, str],
+    runner: Optional[Runner] = None,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+    dry_run: bool = False,
+    claude_permission_mode_default: Optional[str] = None,
+    agent_launch: "Optional[AgentLaunchConfig]" = None,
+    lane_placement: "Optional[LanePlacementConfig]" = None,
+    attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
+    replacement_action_id: str = "",
+) -> SessionStartResult:
     """Managed-launch admission under the store's shared lock (Redmine #13882 j#80190).
 
     Boundary 1 of the three-boundary lock protocol, and the one that lets the other two be
@@ -343,13 +299,33 @@ def prepare_session(**kwargs) -> SessionStartResult:
     A dry run takes no lock: it plans, actuates nothing, and creating a fail-closed path
     for a read-only report would only make diagnosis harder during maintenance.
     """
-    if kwargs.get("dry_run"):
-        return _prepare_session_locked(**kwargs)
+    # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
+    # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
+    # callers), and Python's argument binding at THIS entry is what rejects a malformed
+    # call *before* any side effect. Collapsing it to `**kwargs` let a bad call create the
+    # lock file first and only then raise from the inner function — a side effect ahead of
+    # validation, which is exactly what the rest of this component refuses to do.
+    call = dict(
+        repo_root=repo_root,
+        providers=providers,
+        lane_id=lane_id,
+        env=env,
+        runner=runner,
+        timeout=timeout,
+        dry_run=dry_run,
+        claude_permission_mode_default=claude_permission_mode_default,
+        agent_launch=agent_launch,
+        lane_placement=lane_placement,
+        attestation_reader=attestation_reader,
+        replacement_action_id=replacement_action_id,
+    )
+    if dry_run:
+        return _prepare_session_locked(**call)
     try:
         with attestation_store_lock(
             mozyo_bridge_home(), exclusive=False, blocking=False
         ):
-            return _prepare_session_locked(**kwargs)
+            return _prepare_session_locked(**call)
     except AttestationStoreLockBusy as exc:
         raise HerdrLauncherIncompatibleError(
             f"managed-launch admission refused: the selected attestation store is being "
@@ -958,7 +934,24 @@ def _execute_slot(
     )
 
 
+def cmd_herdr_session_start(args: "argparse.Namespace") -> int:
+    """Compatibility facade for the relocated CLI handler (Redmine #13882 R8-F1).
+
+    The handler itself now lives in :mod:`.herdr_session_start_cli` (the module split
+    approved in j#80207), but this module's public import surface predates that move and
+    the split was declared behavior-preserving — so callers importing it from here must
+    keep working. Imported lazily because the CLI module imports this one; the indirection
+    also keeps both paths pointing at exactly one callable.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_cli import (  # noqa: E501
+        cmd_herdr_session_start as _relocated,
+    )
+
+    return _relocated(args)
+
+
 __all__ = (
+    "cmd_herdr_session_start",
     "SLOT_ADOPTED",
     "SLOT_LAUNCHED",
     "SLOT_PLANNED",
