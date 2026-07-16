@@ -781,6 +781,9 @@ def cmd_workflow_forward_fence(args: argparse.Namespace) -> int:
     return 0
 
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callback_publication import (
+    register_callback_publication_parser,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callback_lease import (
     cmd_workflow_callback_lease,
 )
@@ -882,6 +885,8 @@ def register(sub) -> None:
         help="Deliberate loss recovery: fresh store under a new nonce (invalidates all grants).",
     )
     lease_p.set_defaults(func=cmd_workflow_callback_lease)
+
+    register_callback_publication_parser(workflow_sub)
 
     forward_fence_p = workflow_sub.add_parser(
         "forward-fence",

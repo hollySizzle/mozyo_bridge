@@ -383,6 +383,51 @@ class CallbackPublicationFence:
         return self._resolve(key, token, PUBLICATION_UNCERTAIN, journal_id="",
                              detail=detail or "PUT outcome unknown; never auto-retried", now=now)
 
+    def pending(self) -> list[dict]:
+        """Every anchor this fence is currently blocking, for the operator surface.
+
+        ``reserved`` here means "an owner may be mid-PUT, or died mid-PUT" — the fence cannot tell
+        the two apart, which is exactly why it refuses to guess. ``uncertain`` means a PUT was
+        started and its fate is unknown. Both stall their anchor until someone looks at Redmine.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT workspace_id, lane_id, issue, lane_generation, dispatch_anchor, outcome, "
+                "state, journal_id, detail FROM publication_fence WHERE state IN (?, ?) "
+                "ORDER BY issue, dispatch_anchor",
+                (PUBLICATION_RESERVED, PUBLICATION_UNCERTAIN),
+            ).fetchall()
+        cols = ("workspace_id", "lane_id", "issue", "lane_generation", "dispatch_anchor",
+                "outcome", "state", "journal_id", "detail")
+        return [dict(zip(cols, r)) for r in rows]
+
+    def reconcile(self, key: PublicationKey, *, published_journal: str | None) -> None:
+        """Operator disposition for one stalled anchor, after reading the actual Redmine journal.
+
+        This is the ONLY way a ``reserved`` / ``uncertain` row ever moves, and it is deliberately
+        manual: the whole point of the fence is that no automatic rule can decide this correctly.
+        Pass the journal id if a record did land (the anchor is then closed as published, and no
+        second record will ever be written); pass ``None`` only after confirming none landed, which
+        releases the identity so a later sweep may publish it.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if published_journal is None:
+                conn.execute(
+                    "DELETE FROM publication_fence WHERE workspace_id=? AND lane_id=? AND issue=? "
+                    "AND lane_generation=? AND dispatch_anchor=? AND outcome=?",
+                    key.as_row(),
+                )
+            else:
+                conn.execute(
+                    "UPDATE publication_fence SET state=?, journal_id=?, owner_token='', "
+                    "detail='operator reconcile', updated_at=? WHERE workspace_id=? AND "
+                    "lane_id=? AND issue=? "
+                    "AND lane_generation=? AND dispatch_anchor=? AND outcome=?",
+                    (PUBLICATION_PUBLISHED, str(published_journal), _utc_now(), *key.as_row()),
+                )
+            conn.commit()
+
     def state_of(self, key: PublicationKey) -> str:
         conn = self._connect()
         try:

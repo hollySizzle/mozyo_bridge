@@ -1302,6 +1302,32 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.pubfence.recover()
         self.assertTrue(self.pubfence.reserve(key).may_publish)
 
+    def test_a_blocked_anchor_is_visible_and_reconcilable_by_an_operator(self):
+        # The fence stalls an anchor rather than risk a duplicate. That trade is only coherent if
+        # an operator can see the stall and dispose of it -- otherwise the anchor is blocked forever.
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.pubfence.reserve(key)                       # an owner that then died mid-PUT
+        blocked = self.pubfence.pending()
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["dispatch_anchor"], "79990")
+        self.assertEqual(blocked[0]["state"], PUBLICATION_RESERVED)
+
+        # Disposition A: the operator read Redmine and a record HAD landed -> never write a second.
+        self.pubfence.reconcile(key, published_journal="80500")
+        self.assertEqual(self.pubfence.pending(), [])
+        self.assertFalse(self.pubfence.reserve(key).may_publish)
+
+    def test_reconciling_as_none_landed_releases_the_identity_for_one_more_publication(self):
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.pubfence.reserve(key)
+        # Disposition B: the operator confirmed NOTHING landed -> a later sweep may publish.
+        self.pubfence.reconcile(key, published_journal=None)
+        self.assertEqual(self.pubfence.pending(), [])
+        self.assertTrue(self.pubfence.reserve(key).may_publish)
+        self.assertFalse(self.pubfence.reserve(key).may_publish)   # and only once more
+
     def test_actuation_refuses_a_grant_less_raw_writer(self):
         # R8-F2: the unsafe shape must be unrepresentable, not merely discouraged. A raw writer
         # could previously actuate and reproduce the very race the factory prevents.
