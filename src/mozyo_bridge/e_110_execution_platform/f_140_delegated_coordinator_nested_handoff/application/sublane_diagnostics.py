@@ -306,10 +306,12 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
     publication_fence = CallbackPublicationFence(home=None)
     if not publication_fence.is_bootstrapped():
         raise SystemExit(
-            "callback publication fence is not initialized (or its store was lost): refusing to "
-            "sweep, because publishing without the fence can duplicate a recovery record. "
-            "Run `mozyo-bridge workflow callback-publication --bootstrap` on first use; a store "
-            "loss after that is fail-closed by design and needs the store restored."
+            "callback publication fence is not ready: refusing to sweep, because publishing "
+            "without the fence can duplicate a recovery record. Run `mozyo-bridge workflow "
+            "callback-publication --bootstrap` -- on first use it initializes the store, and on a "
+            "store that predates the fence's first-init seal it adopts it in place, keeping any "
+            "reservation it already holds. A store LOSS after that is fail-closed by design and "
+            "needs the store restored, not re-created."
         )
     result = sweep_once(
         workspace_id=_attested_workspace_id(args),
