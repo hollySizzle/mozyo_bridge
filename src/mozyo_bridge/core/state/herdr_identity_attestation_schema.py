@@ -538,21 +538,38 @@ def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
     writer leaves ``-wal`` / ``-shm`` beside a corrupt main DB, and copying only the main
     file stranded that evidence in place while the rebuild removed its sibling. Every
     sidecar that exists is captured alongside it.
+
+    **The manifest is pinned once, before the first copy** (review j#80103 R5-F1). Deciding
+    each sidecar's fate with an ``exists()`` evaluated just before copying it put a TOCTOU
+    between *choosing* what to preserve and *preserving* it: a peer rebuild rotating the
+    store in that window made this operation skip sidecars that were present when it
+    started, and publish a **main-only** directory as a complete recovery point with
+    ``state=applied`` (measured). Pinning the manifest first makes the set this operation
+    promised to preserve immutable, and any artifact from it that has since vanished is a
+    hard failure — the whole quarantine fails closed and publishes nothing — so a published
+    recovery point always contains everything observed at its own start, or does not exist.
     """
     if not path.exists():
         return None
+    # Pinned BEFORE any copy: this is the exact set this operation promises to preserve.
+    manifest = [path] + [
+        sidecar
+        for sidecar in (path.with_name(path.name + s) for s in _SIDECAR_SUFFIXES)
+        if sidecar.exists()
+    ]
     staging = _stage_backup(path)
     try:
-        shutil.copy2(path, staging / path.name)
-        for suffix in _SIDECAR_SUFFIXES:
-            sidecar = path.with_name(path.name + suffix)
-            if sidecar.exists():
-                shutil.copy2(sidecar, staging / sidecar.name)
+        for artifact in manifest:
+            # A vanished artifact is NOT skipped: it means a peer changed the set under us,
+            # and silently publishing the remainder is the incomplete-but-trusted hazard.
+            shutil.copy2(artifact, staging / artifact.name)
     except OSError as exc:
         _discard_staging(staging)
         raise StateStoreError(
-            f"quarantine of {path} failed ({exc}); rebuild aborted (nothing was removed, "
-            f"and no partial recovery point was published)"
+            f"quarantine of {path} could not preserve every artifact observed at its start "
+            f"({exc.__class__.__name__}: {exc}) — a concurrent rebuild may have rotated the "
+            f"store. Aborted: nothing was removed, and no partial recovery point was "
+            f"published"
         ) from exc
     return _publish_backup(path, staging)
 
@@ -573,13 +590,17 @@ def remove_attestation_store_artifacts(path: Path) -> None:
     Sidecars-first inverts that. Any interruption leaves the main file present, so the
     store still probes as existing, the rotation is still visibly incomplete, and the very
     same command re-run finishes the job — which is what Acceptance 3's idempotency means.
+
+    Each removal is ``missing_ok`` rather than ``exists()``-guarded: an already-absent
+    artifact **is** this function's goal state, so treating it as an error would be a
+    third instance of the same TOCTOU family. Guarding with ``exists()`` left a window in
+    which a peer's rotation between the check and the unlink turned a fully-achieved goal
+    state into a false "interrupted, re-run" report (measured) — a side effect denied in
+    the opposite direction.
     """
     for suffix in _SIDECAR_SUFFIXES:
-        sidecar = path.with_name(path.name + suffix)
-        if sidecar.exists():
-            sidecar.unlink()
-    if path.exists():
-        path.unlink()
+        path.with_name(path.name + suffix).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
 
 
 # --- Migration outcome vocabulary (the explicit operator command only). ---------------
