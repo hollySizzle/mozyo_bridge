@@ -866,6 +866,31 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         self.assertIn("forward-migrated", text)
         self.assertIn("v5 -> v6", text)
 
+    def test_reused_store_does_not_report_a_past_run_migration(self) -> None:
+        # Redmine #13844 R5-F1: the migration is OPERATION-scoped, not store-lifetime. A store /
+        # use case reused after a migrating run must NOT report that past migration in a later
+        # read-only or already-current action (audit must not fabricate a side effect).
+        self._active_lane()
+        self._rewind_to_v5_with_peer()
+        self.store = LaneReplacementStore(home=self.home)
+
+        # (a) v5 success -> migrates the shared store to v6 and reports it.
+        first = self._run(_FakeOps(), execute=True)
+        self.assertEqual(first.lifecycle_migration["from_version"], 5)
+        self.assertEqual(self._recorded_version(), 6)
+
+        # (b) execute=False preflight on the SAME store: no write, no migration this run.
+        second = self._run(_FakeOps(signal=_signal(correlated_marker_ids=(MARKER,))), execute=False)
+        self.assertFalse(second.executed)
+        self.assertIsNone(second.lifecycle_migration)
+        self.assertIsNone(second.as_payload()["lifecycle_migration"])
+        self.assertNotIn("forward-migrated", quarantine_module.format_quarantine_text(second))
+
+        # (c) a later execute run on the now-v6 store: the write is intact, so no migration.
+        third = self._run(_FakeOps(), execute=True)
+        self.assertIsNone(third.lifecycle_migration)
+        self.assertNotIn("forward-migrated", quarantine_module.format_quarantine_text(third))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -514,11 +514,13 @@ The contract that prevents it, for a component whose rows are authority (e.g. `l
   (`sublane quarantine` / hibernated-legacy-retire / hibernated-live-reconcile) expose the wrapped store's `last_write_preparation`
   and carry `lifecycle_migration_payload(...)` (from/to version, backup, peer-reader risk) in their JSON/text outcome, so a forward
   migration is legible in the command's audit record for replacement / retire / reconcile alike — matching the universal
-  pre-migration stderr advisory above. `last_write_preparation` **accumulates** the migration across a command's several writes
-  (migrations are monotonic v5 -> v6, so the first `migrated` is never clobbered by a later `intact` write), and the use case
-  carries it into its outcome rather than the CLI re-reading the mutable last write. A fail-closed (CAS-refused) verdict that
-  nonetheless migrated the store scopes its "zero-write" claim to the lane ROW and reports the schema migration as a separate side
-  effect — an audit record must never deny a side effect that happened.
+  pre-migration stderr advisory above. `last_write_preparation` is **most-recent** (this write's), NOT a store-lifetime
+  accumulator: a store instance may be reused across operations, so a lifetime accumulator would let a later read-only / intact
+  action inherit a PAST migration and fabricate a side effect it did not perform. Preserving the migration across a *single*
+  command's several writes is the **use case's** job, **operation-scoped** — reset at the start of each run and captured after that
+  run's migrating write — so a preflight-only run, or a reused store whose earlier run migrated, reports nothing. A fail-closed
+  (CAS-refused) verdict that nonetheless migrated the store scopes its "zero-write" claim to the lane ROW and reports the schema
+  migration as a separate side effect — an audit record must never deny a side effect that happened, nor invent one that did not.
 - **Fail-closed is preserved and made specific.** An unknown / newer / partial / malformed shape still fails closed (no
   downgrade, no misread), judged only by the **shape / capability table** (`_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFS`), never a
   guessed compatibility. The specific NEWER sub-case is named `reader_upgrade_required`: the store is fine, THIS reader is stale,

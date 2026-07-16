@@ -39,6 +39,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MIGRATE_RELEASE_NOT_PROVEN,
     MIGRATE_RETIRED,
     MIGRATE_WORKTREE_BRANCH_MISMATCH,
+    format_migration_text,
+)
+from mozyo_bridge.core.state.lane_lifecycle import lane_lifecycle_path  # noqa: E402
+from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
+    LANE_LIFECYCLE_COMPONENT,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E402,E501
     REASON_NO_WORKTREE_ANCHOR,
@@ -460,6 +466,7 @@ class RetireMigrationCommandTests(unittest.TestCase):
         integration_branch: str = "main",
         preflight_green: bool = True,
         also_execute: bool = False,
+        json_out: bool = True,
     ):
         repo = repo if repo is not None else self.primary
         wt = self.lane_worktree if worktree == "__lane__" else worktree
@@ -473,7 +480,7 @@ class RetireMigrationCommandTests(unittest.TestCase):
             integration_branch=integration_branch,
             execute=also_execute,
             migrate_hibernated_legacy=True,
-            json=True,
+            json=json_out,
             issue_closed=preflight_green,
             callbacks_drained=preflight_green,
             verified=preflight_green,
@@ -485,10 +492,87 @@ class RetireMigrationCommandTests(unittest.TestCase):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             code = sublane_lifecycle_command.cmd_sublane_retire(args)
-        return code, json.loads(buffer.getvalue())
+        raw = buffer.getvalue()
+        return code, (json.loads(raw) if json_out else raw)
 
     def _mig(self, payload) -> dict:
         return payload.get("hibernated_legacy_retire_migration", {})
+
+    # -- Redmine #13844 R5-F2: v5 + active peer + CAS refusal via the PRODUCTION entrypoint --
+
+    def _add_active_peer_and_rewind_to_v5(self) -> None:
+        LaneLifecycleStore().declare_active(
+            LaneLifecycleKey(_WORKSPACE_ID, "issue_13800_peer_lane"),
+            decision=_decision("13800"),
+            issue_id="13800",
+        )
+        conn = sqlite3.connect(lane_lifecycle_path())
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _rewind_schema_to_v5(self) -> None:
+        conn = sqlite3.connect(lane_lifecycle_path())
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _schema_version(self) -> int:
+        conn = sqlite3.connect(lane_lifecycle_path())
+        try:
+            return conn.execute(
+                "SELECT schema_version FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_r13844_v5_peer_cas_refusal_reports_migration_and_honest_text(self) -> None:
+        # A faithful production run: a non-legacy (non-empty-worktree) row that reaches the retire
+        # CAS, on a shared v5 store with an active peer. The write gate migrates v5 -> v6, the CAS
+        # then refuses (not the empty-binding legacy signature) — a blocked verdict that DID
+        # migrate. JSON must report the migration; text must separate the side effects.
+        self._seed_row(worktree_identity="wt_deadbeef")
+        self._add_active_peer_and_rewind_to_v5()
+        self.assertEqual(self._schema_version(), 5)
+
+        code, payload = self._migrate()  # json
+        self.assertEqual(code, 1)
+        mig = self._mig(payload)
+        self.assertEqual(mig["state"], MIGRATE_BLOCKED)
+        self.assertEqual(mig["reason"], MIGRATE_NOT_LEGACY_STATE)
+        self.assertEqual(self._schema_version(), 6)  # the write gate migrated the shared store
+        self.assertIsNotNone(mig["lifecycle_migration"])
+        self.assertEqual(mig["lifecycle_migration"]["from_version"], 5)
+        self.assertEqual(mig["lifecycle_migration"]["to_version"], 6)
+        self.assertIn(
+            "issue_13800_peer_lane", mig["lifecycle_migration"]["peer_active_lanes"]
+        )
+        # the lane ROW itself was NOT retired (the CAS refused).
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+
+        # Re-arm the v5 signature and re-run json=False to exercise the exact production TEXT.
+        self._rewind_schema_to_v5()
+        self.assertEqual(self._schema_version(), 5)
+        code2, text = self._migrate(json_out=False)
+        self.assertEqual(code2, 1)
+        self.assertEqual(self._schema_version(), 6)
+        self.assertNotIn("nothing was written", text)
+        self.assertIn("row CAS did not apply", text)
+        self.assertIn("SCHEMA was already forward-migrated", text)
+        self.assertIn("v5 -> v6", text)
 
     # -- the happy path ---------------------------------------------------
 

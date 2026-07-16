@@ -258,17 +258,14 @@ class SublaneQuarantineUseCase:
         classification: PendingComposerClassification,
         **changes: Any,
     ) -> QuarantineOutcome:
-        # Redmine #13844 R4-F1: carry the schema migration the replacement write gate performed
-        # into the use-case outcome at EVERY return, read from the store's ACCUMULATED
-        # preparation (which preserves the first ``migrated`` across this command's multiple
-        # writes). The CLI must not re-read the mutable "last write" — the typed migration is
-        # threaded through the outcome here, so a quarantine that migrated the shared store on its
-        # first write still reports it after later ``intact`` writes.
+        # Redmine #13844 R5-F1: carry the schema migration THIS run performed into the outcome at
+        # EVERY return, read from the OPERATION-SCOPED capture (reset at run() start, set only
+        # after this run's migrating write) — NOT from the store's mutable / potentially reused
+        # ``last_write_preparation``. So a preflight-only run, or a reused store whose earlier run
+        # migrated, reports ``None`` here (no side effect fabricated); a run that actually migrated
+        # keeps it across its later ``intact`` writes.
         changes.setdefault(
-            "lifecycle_migration",
-            lifecycle_migration_payload(
-                getattr(self.store, "last_write_preparation", None)
-            ),
+            "lifecycle_migration", getattr(self, "_operation_migration", None)
         )
         return QuarantineOutcome(
             issue=_norm(request.issue),
@@ -305,6 +302,11 @@ class SublaneQuarantineUseCase:
         return ""
 
     def run(self, request: QuarantineRequest, *, execute: bool) -> QuarantineOutcome:
+        # Redmine #13844 R5-F1: the schema migration this ONE command performs is captured
+        # operation-scoped — reset at the start of every run(), so a REUSED use case / store never
+        # carries a PAST run's migration into this action's audit. It is set only after this run's
+        # migrating write below (a read-only / preflight run never sets it).
+        self._operation_migration: Optional[dict[str, Any]] = None
         inspection = self.ops.inspect(request)
         classification = inspection.classification
         if not execute:
@@ -441,6 +443,13 @@ class SublaneQuarantineUseCase:
                 action_id=expected_action,
                 pins=(pin,),
                 decision=decision,
+            )
+            # Redmine #13844 R5-F1: capture the migration THIS run's write gate performed (the
+            # store is most-recent, so read it right after the migrating write). ``or`` keeps the
+            # first migration if any later write in this run reads back ``intact``. request_replacement
+            # is this command's first (and only migration-capable) write on the shared store.
+            self._operation_migration = self._operation_migration or lifecycle_migration_payload(
+                self.store.last_write_preparation
             )
             if not opened.applied:
                 return self._base_outcome(

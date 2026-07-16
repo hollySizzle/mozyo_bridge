@@ -887,11 +887,12 @@ class UniversalWriteGateTest(unittest.TestCase):
             action_id="act-1",
             pins=[ReleasePin(role="codex", assigned_name="n", locator="wProj:p2")],
         )
-        # The raw last-write outcome is INTACT (the store was already v6 by the release write) ...
+        # Redmine #13844 R5-F1: ``last_write_preparation`` is MOST-RECENT (this write's), NOT a
+        # store-lifetime accumulator — the release write found the store already v6, so it is
+        # ``intact``. (Preserving a migration across a command's several writes is the use case's
+        # operation-scoped job, exercised by the quarantine multi-write regression, not the store.)
         self.assertEqual(store.last_schema_outcome.action, SCHEMA_INTACT)
-        # ... but last_write_preparation PRESERVES the earlier migration (Redmine #13844 R4-F1):
-        # a command's later intact write must not erase the migration it did on its first write.
-        self.assertTrue(store.last_write_preparation.migrated)
+        self.assertFalse(store.last_write_preparation.migrated)
 
     def test_composing_store_mutation_runs_gate(self) -> None:
         # A composing store (declaration) mutation also opens through the shared gate and
