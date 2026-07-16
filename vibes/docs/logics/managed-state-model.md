@@ -711,6 +711,13 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   `state=applied` (measured). The manifest is therefore fixed up front and becomes this operation's promise; any artifact from it
   that has since vanished is a hard failure — the quarantine fails closed and publishes nothing. So a published recovery point holds
   everything observed at its own start, or does not exist, and a racing peer fails closed rather than publishing a remainder.
+- **"Nothing to preserve" after a non-absent probe means backup-first is UNPROVEN, not satisfied** (#13882 review j#80129 R6-F1). When
+  the probe saw a store but the quarantine finds none, the store vanished in between — a peer's rotation, or something outside this
+  rail. Treating that as "no backup needed" and continuing reported `state=applied`, `executed=True` and a detail claiming the store
+  was *rotated into backups/* while **no backup directory existed at all** (measured): fabricated recovery evidence, the exact mirror
+  of the denial R3-F2 closed — the same rule forbids both. The rebuild fails closed there (`executed=False`, nothing published,
+  nothing removed) and says so; a re-run converges, since its probe then reports `STORE_ABSENT` → already current. **`APPLIED` must
+  always imply a real recovery point on disk.**
 - **Removal is idempotent (`missing_ok`), never `exists()`-guarded** (same family). An already-absent artifact *is* the rotation's
   goal state, so erroring on it denies a side effect in the opposite direction: a peer's unlink landing between the check and ours
   turned a fully-achieved goal state into a false "interrupted, re-run" report.

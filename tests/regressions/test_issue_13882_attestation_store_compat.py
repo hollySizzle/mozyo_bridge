@@ -56,12 +56,14 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (  # noqa:
     StoreSchemaObservation,
     probe_store_schema,
 )
+import mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_attestation_store_maintenance as mnt  # noqa: E402,E501
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_attestation_store_maintenance import (  # noqa: E402,E501
     ALREADY_CURRENT,
     APPLIED,
     BLOCKED_CONSUMERS_LIVE,
     BLOCKED_CONSUMERS_UNMEASURABLE,
     BLOCKED_INVENTORY_UNREADABLE,
+    BLOCKED_FAILED,
     BLOCKED_MIGRATE_INSTEAD,
     PLANNED,
     run_attestation_store_migrate,
@@ -1282,6 +1284,139 @@ class ReviewJ80103FindingsTest(unittest.TestCase):
             # Nothing exists: removal must be a silent no-op, not an error.
             sch.remove_attestation_store_artifacts(path)
             self.assertFalse(path.exists())
+
+
+class ReviewJ80129FindingsTest(unittest.TestCase):
+    """Review j#80129 R6-F1: never claim a backup-first rotation that did not happen."""
+
+    def _rebuild(self, home: Path):
+        return run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+
+    def _vanishing_quarantine(self):
+        """The real quarantine, with the store deleted just before it runs."""
+        real = sch.quarantine_attestation_store_artifacts
+
+        def _vanish(path):
+            if path.exists():
+                path.unlink()
+            return real(path)   # genuinely returns None: there is nothing left to preserve
+
+        return _vanish
+
+    def test_r6f1_external_disappearance_fails_closed_without_fabricating_a_backup(self) -> None:
+        # `quarantine(...) -> None` after a non-absent probe does NOT mean "nothing to
+        # preserve"; it means backup-first could not be PROVEN. Flowing to APPLIED reported
+        # `rotated ... into backups/` while no backup directory existed at all — fabricated
+        # recovery evidence, the mirror of the denial R3-F2 closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            with mock.patch.object(
+                mnt, "quarantine_attestation_store_artifacts", self._vanishing_quarantine()
+            ):
+                result = self._rebuild(home)
+            self.assertEqual(result.state, BLOCKED_FAILED)
+            self.assertFalse(result.ok)
+            self.assertFalse(result.executed)
+            self.assertIsNone(result.backup_dir)
+            self.assertFalse((home / "backups").exists(), "no recovery point exists")
+            self.assertNotIn(
+                "rotated the unsupported store into backups/",
+                result.detail,
+                "must never claim a rotation it did not perform",
+            )
+            self.assertIn("backup-first cannot be proven", result.detail)
+
+    def test_r6f1_retry_after_disappearance_converges_to_already_current(self) -> None:
+        # Fail-closed must not mean stuck: the retry's probe sees STORE_ABSENT.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            with mock.patch.object(
+                mnt, "quarantine_attestation_store_artifacts", self._vanishing_quarantine()
+            ):
+                self._rebuild(home)
+            retry = self._rebuild(home)
+            self.assertEqual(retry.state, ALREADY_CURRENT)
+            self.assertTrue(retry.ok)
+
+    def test_r6f1_public_peer_completion_race_leaves_one_true_recovery_point(self) -> None:
+        # The same code path is reached when a public peer legitimately completes first.
+        # The loser must not claim a rotation either; the winner's recovery point stands.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            path.with_name(path.name + "-wal").write_bytes(b"WAL")
+            real = sch.quarantine_attestation_store_artifacts
+            peer_ran = []
+
+            def _peer_completes_first(p):
+                # A peer completes the real preserve+rotate exactly once, right in our
+                # probe->quarantine window (using the real primitives, not a nested
+                # rebuild, which would re-enter this patch).
+                if not peer_ran:
+                    peer_ran.append(real(p))
+                    sch.remove_attestation_store_artifacts(p)
+                return real(p)                      # our quarantine now finds nothing
+
+            with mock.patch.object(
+                mnt, "quarantine_attestation_store_artifacts", _peer_completes_first
+            ):
+                loser = self._rebuild(home)
+            self.assertTrue(peer_ran and peer_ran[0] is not None)
+
+            self.assertEqual(loser.state, BLOCKED_FAILED)
+            self.assertFalse(loser.executed)
+            published = sorted((home / "backups").iterdir())
+            self.assertEqual(len(published), 1, "exactly the winner's recovery point")
+            # The set includes `-shm`: opening a store beside a `-wal` makes SQLite itself
+            # materialize the index even under mode=ro, so by quarantine time it is a real
+            # artifact and preserving it is correct (see probe_store_schema's caveat).
+            self.assertEqual(
+                {f.name for f in published[0].iterdir()},
+                {path.name, path.name + "-wal", path.name + "-shm"},
+                "and it is whole",
+            )
+
+    def test_probe_never_creates_a_store_but_sqlite_may_materialize_shm(self) -> None:
+        # Honest pinning of the probe's real footprint (self-found while fixing R6-F1).
+        # The docstring used to claim it "creates nothing"; opening a store beside a -wal
+        # makes SQLite materialize the -shm index even under mode=ro. No store, row, shape
+        # or version is created -- and immutable=1 would suppress it only by ignoring the
+        # -wal, which would resurrect the WAL blindness of F1.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # No store at all -> the probe must create nothing whatsoever.
+            self.assertEqual(probe_store_schema(path).state, STORE_ABSENT)
+            self.assertFalse(path.exists())
+            self.assertEqual(sorted(home.iterdir()), [])
+            # Store + -wal -> SQLite's own -shm may appear; the store itself is unchanged.
+            path.write_bytes(b"corrupt main")
+            path.with_name(path.name + "-wal").write_bytes(b"WAL")
+            before = _digest(path)
+            probe_store_schema(path)
+            self.assertEqual(_digest(path), before, "the store itself must be untouched")
+
+    def test_r6f1_applied_always_carries_a_real_backup_dir(self) -> None:
+        # GUARD BITE on the invariant itself: APPLIED implies a recovery point on disk.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main")
+            result = self._rebuild(home)
+            self.assertEqual(result.state, APPLIED)
+            self.assertIsNotNone(result.backup_dir)
+            self.assertTrue(result.backup_dir.exists())
+            self.assertTrue(any(result.backup_dir.iterdir()))
 
 
 class ZeroSideEffectTest(unittest.TestCase):

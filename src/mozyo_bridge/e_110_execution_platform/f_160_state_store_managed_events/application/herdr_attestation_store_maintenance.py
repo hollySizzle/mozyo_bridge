@@ -434,6 +434,27 @@ def run_attestation_store_rebuild(
             store_state=store.state,
             detail=f"rebuild aborted before any removal: {exc} (the store is untouched)",
         )
+    if backup_dir is None:
+        # The probe above proved a store was here, so `None` does not mean "nothing to
+        # preserve" — it means the store vanished between the probe and the quarantine and
+        # **backup-first could not be proven** (review j#80129 R6-F1). Continuing to
+        # APPLIED reported `rotated ... into backups/` while no backup directory existed at
+        # all: fabricated recovery evidence, the mirror of the denial R3-F2 closed. A peer
+        # may have completed its own rotation, or something outside this rail deleted the
+        # file; this rail cannot tell, and must not claim a backup it never took. Re-running
+        # converges: the retry's probe sees STORE_ABSENT and reports ALREADY_CURRENT.
+        return AttestationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_FAILED,
+            store_version=store.version,
+            store_state=store.state,
+            detail=(
+                "the store disappeared after this rebuild's initial probe and before it "
+                "could be preserved, so backup-first cannot be proven. Nothing was "
+                "published and nothing was removed by this run. Re-run to converge (if a "
+                "peer already rotated the store, the re-run reports it as already current)"
+            ),
+        )
     try:
         remove_attestation_store_artifacts(path)
     except OSError as exc:
