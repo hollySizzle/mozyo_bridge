@@ -43,6 +43,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     herdr_identity_attestation_path,
 )
 import mozyo_bridge.core.state.herdr_identity_attestation_schema as sch  # noqa: E402
+from mozyo_bridge.core.state.state_store import StateStoreError  # noqa: E402
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (  # noqa: E402
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     RECOGNIZED_SCHEMA_VERSIONS,
@@ -682,8 +683,86 @@ class ReviewJ80000FindingsTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = b"corrupt, not a sqlite database"
             path.write_bytes(payload)
-            backup = sch.backup_attestation_store(path)
+            backup = sch.quarantine_attestation_store_artifacts(path)
             self.assertEqual((backup / path.name).read_bytes(), payload)
+
+    # --- R2-F1 (review j#80029): the fix for F1 must not regenerate F1 ----------------
+    def test_r2f1_valid_store_backup_failure_fails_closed(self) -> None:
+        # The first F1 fix caught sqlite3.DatabaseError and fell back to a byte copy,
+        # reasoning it meant "not a database". But that exception is raised just as
+        # readily when a VALID database is busy or its I/O fails, and the type cannot
+        # tell the two apart. Injecting a lock error into a valid WAL store's backup()
+        # made the migration report success while writing a rows=0 recovery point — the
+        # original defect, regenerated through its own fix. Corruption is decided by the
+        # caller's intent from probe_store_schema, never inferred from an exception type.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path, conn = _seed_v1_wal(home)
+            try:
+                before = _digest(path)
+
+                class _FailingBackup(sqlite3.Connection):
+                    def backup(self, *a, **k):
+                        raise sqlite3.OperationalError("simulated: database is locked")
+
+                real_connect = sqlite3.connect
+
+                def _patched(target, *a, **k):
+                    if "mode=ro" in str(target):
+                        k["factory"] = _FailingBackup
+                    return real_connect(target, *a, **k)
+
+                with mock.patch.object(sch.sqlite3, "connect", _patched):
+                    with self.assertRaises(sch.HerdrIdentityAttestationSchemaError):
+                        sch.migrate_attestation_store(path)
+                # Fail-closed: no migration, no silent byte-copy recovery point.
+                self.assertEqual(_digest(path), before)
+                self.assertEqual(probe_store_schema(path).version, 1)
+            finally:
+                conn.close()
+
+    def test_r2f1_backup_never_substitutes_a_byte_copy(self) -> None:
+        # GUARD BITE on the split itself: the logical snapshot rail must have no byte-copy
+        # escape hatch at all, whatever the error.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt, not a sqlite database")
+            with self.assertRaises(StateStoreError):
+                sch.backup_attestation_store(path)
+
+    def test_r2f1_quarantine_preserves_the_whole_artifact_set(self) -> None:
+        # A crashed WAL writer leaves -wal / -shm beside a corrupt main DB. Copying only
+        # the main file stranded that evidence in place while rebuild removed its sibling.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main file")
+            path.with_name(path.name + "-wal").write_bytes(b"WAL SIDECAR EVIDENCE")
+            path.with_name(path.name + "-shm").write_bytes(b"SHM SIDECAR")
+            backup = sch.quarantine_attestation_store_artifacts(path)
+            self.assertEqual(
+                (backup / (path.name + "-wal")).read_bytes(), b"WAL SIDECAR EVIDENCE"
+            )
+            self.assertTrue((backup / (path.name + "-shm")).exists())
+            self.assertEqual((backup / path.name).read_bytes(), b"corrupt main file")
+
+    def test_r2f1_rebuild_rotates_every_artifact_away(self) -> None:
+        # A stranded -wal would let a later open resurrect a partial store from the
+        # orphaned sidecar, so the rotation must be whole-artifact too.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt main file")
+            path.with_name(path.name + "-wal").write_bytes(b"WAL SIDECAR")
+            result = run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+            self.assertEqual(result.state, APPLIED)
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(path.name + "-wal").exists())
+            self.assertTrue((result.backup_dir / (path.name + "-wal")).exists())
 
     # --- F2: unreadable store + live agents must not fail open ------------------------
     def test_f2_unreadable_store_with_live_agents_refuses_destructive_rebuild(self) -> None:
