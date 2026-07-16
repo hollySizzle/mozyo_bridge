@@ -58,6 +58,25 @@ LEASE_RECLAIMED = "reclaimed"
 #: happens under the outbox fence *after* the leased work.
 DEFAULT_LEASE_TTL_SECONDS = 120.0
 
+#: The margin a durable act must have LEFT on its lease before it may start (review R8-F1).
+#:
+#: A boolean ``owns()`` and an HTTP write are not one transaction: the lease can lapse and be
+#: reclaimed in between, and then the old and new owner both publish. No amount of moving the check
+#: closer to the write removes that -- with no CAS at the resource, the only sound rule is the
+#: classic lease discipline: **do not start an action unless the lease outlives the action's
+#: worst case**. The holder must have at least this much time remaining, and the action must be
+#: bounded below it (the note transport's HTTP timeout).
+#:
+#: With that, there is no instant at which A is writing and B may reclaim: B cannot reclaim before
+#: expiry, and A never begins a write that could still be running at expiry.
+#:
+#: Assumptions, stated because they are load-bearing: the store is a single SQLite file, so all
+#: parties read one clock (no skew); the write is bounded by its transport timeout; and a process
+#: frozen mid-write for longer than the margin is out of scope -- that is the fencing-token problem,
+#: which needs the RESOURCE to reject stale writers (Redmine cannot), and is why receiver-side
+#: exactly-once is Redmine #13910 rather than something this lease can promise.
+LEASE_ACTION_MARGIN_SECONDS = 30.0
+
 _META_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS store_meta (
     key   TEXT PRIMARY KEY,
@@ -164,18 +183,26 @@ class CallbackSweepLease:
         self.sidecar_path.write_text(nonce, encoding="utf-8")
 
     def is_bootstrapped(self) -> bool:
-        """True when the DB and its sidecar co-exist at the SAME nonce (read-only)."""
-        sidecar = self._read_sidecar_nonce()
-        if sidecar is None or not self.path.exists():
+        """True when the DB and sidecar co-exist at the same nonce AND schema version (fail-soft).
+
+        A genuine probe: opened ``mode=ro`` so the check cannot create, migrate, or otherwise touch
+        the store it is inspecting. An earlier revision opened a read/write connection and executed
+        DDL here while its docstring claimed "read-only" (review R8-F4) — a probe that mutates is
+        not a probe. The schema version is verified too: a foreign / older store is not this store.
+        """
+        sidecar_nonce = self._read_sidecar_nonce()
+        if sidecar_nonce is None or not self.path.exists():
             return False
         try:
-            conn = sqlite3.connect(self.path, isolation_level=None)
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
         except sqlite3.DatabaseError:
             return False
         try:
-            conn.execute(_META_TABLE_SQL)
-            return self._db_nonce(conn) == sidecar
-        except sqlite3.DatabaseError:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version != CALLBACK_SWEEP_LEASE_SCHEMA_VERSION:
+                return False
+            return self._db_nonce(conn) == sidecar_nonce
+        except (sqlite3.DatabaseError, TypeError, ValueError):
             return False
         finally:
             conn.close()
@@ -343,7 +370,14 @@ class CallbackSweepLease:
         finally:
             conn.close()
 
-    def owns(self, key: LeaseKey, token: str, *, store_nonce: str = "") -> bool:
+    def owns(
+        self,
+        key: LeaseKey,
+        token: str,
+        *,
+        store_nonce: str = "",
+        min_remaining: float = 0.0,
+    ) -> bool:
         """True only if ``token`` STILL owns a live lease on ``key`` in the SAME store (R6-F1/F2).
 
         The check a caller must make immediately before every durable publication and before the
@@ -354,9 +388,15 @@ class CallbackSweepLease:
         (which the outbox fence gates); it never covered the publication, which only the lease
         gates.
 
+        ``min_remaining`` is the safety margin (review R8-F1): the caller is about to perform a
+        durable act, so it must not merely own the lease *now* -- it must own it for at least as
+        long as the act can take. Checking liveness alone lets the lease lapse mid-write and a new
+        owner publish the same record. Callers about to write pass
+        :data:`LEASE_ACTION_MARGIN_SECONDS`; callers only reporting state pass ``0``.
+
         Fail-closed by construction: an unreadable / lost / replaced store raises out of
-        :meth:`_connect`, an expired lease reads as not-owned, and a mismatched ``store_nonce``
-        means the grant came from a store that no longer exists.
+        :meth:`_connect`, an expired (or too-nearly-expired) lease reads as not-owned, and a
+        mismatched ``store_nonce`` means the grant came from a store that no longer exists.
         """
         conn = self._connect()
         try:
@@ -369,7 +409,7 @@ class CallbackSweepLease:
             ).fetchone()
         finally:
             conn.close()
-        if row is None or float(row[1]) <= time.time():
+        if row is None or float(row[1]) <= time.time() + float(min_remaining):
             return False
         return str(row[0]) == str(token)
 
@@ -395,6 +435,7 @@ __all__ = (
     "LEASE_HELD",
     "LEASE_RECLAIMED",
     "DEFAULT_LEASE_TTL_SECONDS",
+    "LEASE_ACTION_MARGIN_SECONDS",
     "CallbackSweepLeaseError",
     "LeaseKey",
     "LeaseResult",

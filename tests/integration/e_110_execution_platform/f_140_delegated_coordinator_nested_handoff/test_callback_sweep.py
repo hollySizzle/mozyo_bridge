@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_sweep_lease import (
+    LEASE_ACTION_MARGIN_SECONDS,
     CallbackSweepLeaseError,
     LEASE_HELD,
     LEASE_RECLAIMED,
@@ -40,6 +41,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND_RECORD_FAILED,
     ZERO_SEND_SOURCE_NOT_FRESH,
     ZERO_SEND_WORKSPACE_UNATTESTED,
+    RecordOwnershipLostError,
     build_recovery_recorder,
     build_recovery_sender,
     source_is_fresh,
@@ -148,6 +150,18 @@ class RaceSource:
         return served
 
 
+def as_factory(record_fn):
+    """Adapt a plain test recorder to the factory seam.
+
+    `sweep_once` takes only a factory (review R8-F2): a raw writer let a caller reproduce the very
+    defect the factory prevents, so the API makes the unsafe shape unrepresentable rather than
+    trusting caller convention. Tests adapt to the contract; they do not get a back door.
+    """
+    if record_fn is None:
+        return None
+    return lambda grant_is_live: record_fn
+
+
 class FakeRecorder:
     """A durable recorder seam: records the resolution and hands back its journal id."""
 
@@ -176,7 +190,7 @@ class SweepFenceTest(unittest.TestCase):
 
     def sweep(self, source, **kw):
         kw.setdefault("send_fn", self.send)
-        kw.setdefault("record_fn", self.recorder)
+        kw.setdefault("record_fn_factory", as_factory(self.recorder))
         kw.setdefault("lease", _bootstrapped_lease())
         return sweep_once(
             workspace_id=WS,
@@ -297,7 +311,7 @@ class SweepFenceTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=2,
             source=source, fence=self.fence, lease=self.lease, target_assigned_name=TARGET, send_fn=self.send,
-            record_fn=self.recorder, callback=CALLBACK_SAME_LANE_ONLY,
+            record_fn_factory=as_factory(self.recorder), callback=CALLBACK_SAME_LANE_ONLY,
         )
         # Sweeping generation 2 itself: its own progress is visible, so it is not a stall.
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
@@ -334,7 +348,7 @@ class SweepFenceTest(unittest.TestCase):
             target_assigned_name=TARGET,
             lease=_bootstrapped_lease(),
             send_fn=self.send,
-            record_fn=self.recorder,
+            record_fn_factory=as_factory(self.recorder),
         )
         self.assertFalse(result["sent"])
         self.assertEqual(result["send_reason"], ZERO_SEND_FENCE_UNAVAILABLE)
@@ -431,7 +445,7 @@ class SnapshotSourceRefusalTest(unittest.TestCase):
             source=MappingRedmineJournalSource(payload={"issue": {"id": ISSUE}, "journals": [
                 {"id": "79990", "notes": render_dispatch_note("IR", lane=LANE, lane_generation=GEN)}]}),
             fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: sends.append(j), record_fn=FakeRecorder(),
+            send_fn=lambda j: sends.append(j), record_fn_factory=as_factory(FakeRecorder()),
         )
         self.assertFalse(result["sent"])
         self.assertEqual(result["send_reason"], ZERO_SEND_SOURCE_NOT_FRESH)
@@ -457,7 +471,7 @@ class WorkspaceAttestationTest(unittest.TestCase):
             source=RaceSource([ir("79990")]), fence=self.fence,
             target_assigned_name=TARGET,
             lease=_bootstrapped_lease(), send_fn=lambda j: sends.append(j),
-            record_fn=FakeRecorder(),
+            record_fn_factory=as_factory(FakeRecorder()),
         )
 
     def test_a_blank_workspace_id_is_zero_send(self):
@@ -490,8 +504,8 @@ class RecoveryRecordTest(unittest.TestCase):
         return sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=source or RaceSource([ir("79990")]), fence=self.fence,
-            target_assigned_name=TARGET,
-            lease=_bootstrapped_lease(), send_fn=lambda j: sends.append(j), record_fn=record_fn,
+            target_assigned_name=TARGET, lease=self.lease,
+            send_fn=lambda j: sends.append(j), record_fn_factory=as_factory(record_fn),
         )
 
     def test_no_recorder_means_no_send(self):
@@ -515,7 +529,7 @@ class RecoveryRecordTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("79990")]), fence=self.fence,
             target_assigned_name=TARGET,
-            lease=_bootstrapped_lease(), send_fn=send, record_fn=recorder,
+            lease=self.lease, send_fn=send, record_fn_factory=as_factory(recorder),
         )
         self.assertEqual(order, ["record", "send->90001"])
 
@@ -583,7 +597,7 @@ class RecoveryRecordTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=LateGateSource(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: sends.append(j), record_fn=FakeRecorder("99999"),
+            send_fn=lambda j: sends.append(j), record_fn_factory=as_factory(FakeRecorder("99999")),
         )
         self.assertFalse(result["sent"])
         self.assertEqual(result["send_reason"], ZERO_SEND_PROGRESS_LANDED)
@@ -610,7 +624,7 @@ class RecoveryRecordTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=AfterRecordSource(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: sends.append(j), record_fn=FakeRecorder("90001"),
+            send_fn=lambda j: sends.append(j), record_fn_factory=as_factory(FakeRecorder("90001")),
         )
         self.assertFalse(result["sent"])
         self.assertEqual(result["send_reason"], ZERO_SEND_PROGRESS_LANDED)
@@ -633,7 +647,7 @@ class RecoveryRecordTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=PrecedingSource(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: None, record_fn=FakeRecorder("99999"),
+            send_fn=lambda j: None, record_fn_factory=as_factory(FakeRecorder("99999")),
         )
         self.assertFalse(result["sent"])
         self.assertTrue(result["record_stale_at_write"])  # j#79995 < j#99999
@@ -708,7 +722,7 @@ class RecoveryRecordTest(unittest.TestCase):
         src = Src()
         recorder = build_recovery_recorder(
             source=src, issue=ISSUE, lane=LANE, lane_generation=GEN,
-            post_note=lambda i, n: posted.append(n),
+            post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
         )
         wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
                                lane_generation=GEN, latest_generation=GEN)
@@ -743,9 +757,10 @@ class ProductionRecorderTest(unittest.TestCase):
         return [re.search(r"outcome=([a-z_]+)", n).group(1) for n in self.posted]
 
     def recorder(self, source):
-        return build_recovery_recorder(
+        """A recorder FACTORY, like production: the grant predicate comes from sweep_once."""
+        return lambda grant_is_live: build_recovery_recorder(
             source=source, issue=ISSUE, lane=LANE, lane_generation=GEN,
-            post_note=lambda i, n: self.posted.append(n),
+            post_note=lambda i, n: self.posted.append(n), grant_is_live=grant_is_live,
         )
 
     def _published(self):
@@ -773,7 +788,7 @@ class ProductionRecorderTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
             fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
+            send_fn=lambda j: self.sends.append(j), record_fn_factory=self.recorder(src),
         )
         self.assertEqual(self.outcomes(), [STATE_PROGRESS_WITHOUT_CALLBACK])  # no stall record
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
@@ -809,7 +824,7 @@ class ProductionRecorderTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
             fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
+            send_fn=lambda j: self.sends.append(j), record_fn_factory=self.recorder(src),
         )
         self.assertFalse(result["sent"])
         self.assertEqual(self.sends, [])
@@ -833,7 +848,7 @@ class ProductionRecorderTest(unittest.TestCase):
             source=RaceSource([ir("79990"), gate("79995", "review_result",
                                                  conclusion="changes_requested")]),
             fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: self.sends.append(j), record_fn=recorder,
+            send_fn=lambda j: self.sends.append(j), record_fn_factory=as_factory(recorder),
             callback=CALLBACK_SAME_LANE_ONLY,
         )
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
@@ -869,8 +884,8 @@ class ProductionRecorderTest(unittest.TestCase):
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
                 fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
                 send_fn=lambda j: self.sends.append(j), callback=CALLBACK_SAME_LANE_ONLY,
-                record_fn=build_recovery_recorder(
-                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish
+                record_fn_factory=lambda live: build_recovery_recorder(
+                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live
                 ),
             )
 
@@ -913,8 +928,8 @@ class ProductionRecorderTest(unittest.TestCase):
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
                 fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
                 send_fn=lambda j: self.sends.append(j),
-                record_fn=build_recovery_recorder(
-                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish
+                record_fn_factory=lambda live: build_recovery_recorder(
+                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live
                 ),
             )
             reasons.append(r["send_reason"])
@@ -956,7 +971,7 @@ class ProductionRecorderTest(unittest.TestCase):
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=FailVerify(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
-            send_fn=lambda j: self.sends.append(j), record_fn=FakeRecorder("90001"),
+            send_fn=lambda j: self.sends.append(j), record_fn_factory=as_factory(FakeRecorder("90001")),
         )
         self.assertFalse(result["sent"])
         self.assertEqual(result["recovery_record_journal"], "90001")  # pointer preserved
@@ -1044,9 +1059,9 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("79990")]), fence=self.fence, lease=self.lease,
             target_assigned_name=TARGET, send_fn=lambda j: self.sends.append(j),
-            record_fn=build_recovery_recorder(
+            record_fn_factory=lambda live: build_recovery_recorder(
                 source=RaceSource([ir("79990")]), issue=ISSUE, lane=LANE, lane_generation=GEN,
-                post_note=lambda i, n: self.posted.append(n),
+                post_note=lambda i, n: self.posted.append(n), grant_is_live=live,
             ),
         )
         # This sweep is a fresh attempt: it either owns the lease cleanly, or stands down. What it
@@ -1081,7 +1096,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=StealingSource(), fence=self.fence, lease=self.lease,
             target_assigned_name=TARGET, send_fn=lambda j: self.sends.append(j),
-            record_fn=lambda r, w: (posted.append(r["state"]), "90001")[1],
+            record_fn_factory=as_factory(lambda r, w: (posted.append(r["state"]), "90001")[1]),
         )
         self.assertEqual(posted, [])                 # published nothing: it no longer owns it
         self.assertFalse(result["sent"])
@@ -1143,6 +1158,68 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         a = self.lease.acquire(self.key())
         self.lease.bootstrap()                            # DB + sidecar agree -> no-op
         self.assertTrue(self.lease.owns(self.key(), a.token))
+
+    def test_a_write_never_starts_without_enough_lease_left_to_finish_it(self):
+        # R8-F1. A bool check and an HTTP write are not one transaction: the reviewer showed
+        # check-True -> B reclaims -> B publishes -> A publishes = 2 records. Moving the check
+        # closer cannot fix that; with no CAS at the resource the sound rule is the classic lease
+        # discipline -- do not START an act unless the lease outlives the act's worst case. Then no
+        # instant exists at which A writes and B may reclaim.
+        posted = []
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                return [ir("79990")] + [entry(str(98000 + k), n) for k, n in enumerate(posted)]
+
+        a = self.lease.acquire(self.key(), ttl_seconds=LEASE_ACTION_MARGIN_SECONDS - 5)
+        self.assertTrue(self.lease.owns(self.key(), a.token))          # live...
+        recorder = build_recovery_recorder(
+            source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
+            post_note=lambda i, n: posted.append(n),
+            grant_is_live=lambda: self.lease.owns(
+                self.key(), a.token, store_nonce=a.store_nonce,
+                min_remaining=LEASE_ACTION_MARGIN_SECONDS,
+            ),
+        )
+        wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
+                               lane_generation=GEN, latest_generation=GEN)
+        with self.assertRaises(RecordOwnershipLostError):              # ...but too near expiry
+            recorder({"state": STATE_NO_PROGRESS_AFTER_HANDOFF, "dispatch_journal": "79990"}, wm)
+        self.assertEqual(posted, [])
+
+    def test_actuation_refuses_a_grant_less_raw_writer(self):
+        # R8-F2: the unsafe shape must be unrepresentable, not merely discouraged. A raw writer
+        # could previously actuate and reproduce the very race the factory prevents.
+        sends = []
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=RaceSource([ir("79990")]), fence=self.fence, lease=self.lease,
+            target_assigned_name=TARGET, send_fn=lambda j: sends.append(j),
+        )  # no record_fn_factory at all
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_RECORD_FAILED)
+        self.assertEqual(sends, [])
+
+    def test_the_probe_does_not_mutate_the_store_it_inspects(self):
+        # R8-F4: is_bootstrapped() claimed "read-only" while executing DDL. A probe that mutates is
+        # not a probe. Opened mode=ro, a write attempt would raise rather than silently succeed.
+        before = self.lease.path.read_bytes()
+        self.assertTrue(self.lease.is_bootstrapped())
+        self.assertEqual(self.lease.path.read_bytes(), before)
+
+    def test_a_foreign_schema_is_not_this_store(self):
+        # R8-F4: the sibling verifies the exact schema version; a foreign / older store must not
+        # read as bootstrapped.
+        import sqlite3
+
+        conn = sqlite3.connect(self.lease.path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA user_version = 999")
+        finally:
+            conn.close()
+        self.assertFalse(self.lease.is_bootstrapped())
 
     def test_expiry_alone_ends_ownership_even_if_nobody_reclaims(self):
         # Isolates the TTL check. The reclaim test cannot: reclaiming REPLACES the token, so it
@@ -1313,7 +1390,7 @@ class RecoverySenderTest(unittest.TestCase):
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
                 source=RaceSource([ir("79990")]), fence=fence,
                 target_assigned_name=TARGET,
-            lease=_bootstrapped_lease(), send_fn=sender, record_fn=FakeRecorder(),
+            lease=_bootstrapped_lease(), send_fn=sender, record_fn_factory=as_factory(FakeRecorder()),
             )
         self.assertEqual(len(calls), 1)  # at most once per dispatch anchor
 

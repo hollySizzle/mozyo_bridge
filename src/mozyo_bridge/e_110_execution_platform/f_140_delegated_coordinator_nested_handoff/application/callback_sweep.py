@@ -57,6 +57,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from mozyo_bridge.core.state.callback_sweep_lease import (
+    LEASE_ACTION_MARGIN_SECONDS,
     CallbackSweepLease,
     CallbackSweepLeaseError,
     LeaseKey,
@@ -171,7 +172,6 @@ def sweep_once(
     target_assigned_name: str,
     lease: Optional[CallbackSweepLease] = None,
     send_fn: Optional[Callable[[str], object]] = None,
-    record_fn: Optional[Callable[[dict, SweepWatermark], str]] = None,
     record_fn_factory: Optional[Callable[[Callable[[], bool]], Callable[[dict, SweepWatermark], str]]] = None,
     callback: str = CALLBACK_ABSENT,
     stale_cli: bool = False,
@@ -240,11 +240,16 @@ def sweep_once(
         return result
     # R2-F3: without a durable writer the send would be a silent re-poke, which the workflow
     # contract prohibits outright.
-    if record_fn is None and record_fn_factory is None:
+    if record_fn_factory is None:
+        # R8-F2: actuation takes ONLY the factory. A raw writer was previously accepted, which let
+        # a caller reproduce the exact defect the factory exists to prevent (check before the
+        # recorder, then a whole Redmine round-trip before the write). A public invariant cannot be
+        # a caller convention -- the API has to make the unsafe shape unrepresentable.
         result["send_reason"] = ZERO_SEND_RECORD_FAILED
         result["send_detail"] = (
-            "no record_fn supplied: every stall check and re-notification must be recorded as a "
-            "durable journal before the pointer send (a silent re-poke is prohibited)"
+            "no record_fn_factory supplied: an actuating sweep must build its recorder around the "
+            "live-grant predicate, so the ownership check lands immediately before the write "
+            "(a raw grant-less writer is refused, and a silent re-poke is prohibited)"
         )
         return result
 
@@ -279,6 +284,23 @@ def sweep_once(
         except CallbackSweepLeaseError:
             pass  # the lease expires on its own; a later sweep reclaims it
 
+    def _may_act() -> bool:
+        """May this sweep START a durable act? Ownership plus enough lease left to finish it.
+
+        R8-F1: `owns()` alone answers "do I own it *now*", and a bool check plus an HTTP write are
+        not one transaction — the lease could lapse and be reclaimed between them, and then two
+        owners publish. The margin closes that by construction: an act only starts when the lease
+        outlives the act's worst case, so no instant exists at which this sweep is writing and
+        another may reclaim.
+        """
+        try:
+            return lease_store.owns(
+                lease_key, held.token, store_nonce=held.store_nonce,
+                min_remaining=LEASE_ACTION_MARGIN_SECONDS,
+            )
+        except CallbackSweepLeaseError:
+            return False
+
     def _still_owns() -> bool:
         """Re-verify ownership at the authority, immediately before a durable act (R6-F1).
 
@@ -301,10 +323,10 @@ def sweep_once(
         result["resolution_recorded"] = False
         return result
 
-    # R7-F1: with the grant in hand, build the recorder around a live-grant predicate so the
-    # ownership check sits immediately before the WRITE rather than before the whole recorder.
-    if record_fn_factory is not None:
-        record_fn = record_fn_factory(_still_owns)
+    # R7-F1 / R8-F1: with the grant in hand, build the recorder around the live-grant predicate so
+    # the ownership check lands immediately before the WRITE -- and requires a MARGIN, so the lease
+    # cannot lapse while the write is still in flight.
+    record_fn = record_fn_factory(_may_act)
 
     if result["state"] != STATE_NO_PROGRESS_AFTER_HANDOFF:
         decision = decide_recovery(
@@ -333,7 +355,7 @@ def sweep_once(
         lease_key=lease_key,
         lease_token=held.token,
         release=_release,
-        still_owns=_still_owns,
+        still_owns=_may_act,
         ownership_lost=_ownership_lost,
         target_assigned_name=target_assigned_name,
         send_fn=send_fn,
@@ -777,7 +799,7 @@ def build_recovery_recorder(
     lane: str,
     lane_generation: object,
     post_note: Callable[[str, str], object],
-    grant_is_live: Optional[Callable[[], bool]] = None,
+    grant_is_live: Callable[[], bool],
 ) -> Callable[[dict, SweepWatermark], str]:
     """Build the production ``record_fn``: write the sweep record, then RESOLVE its journal id.
 
@@ -839,7 +861,7 @@ def build_recovery_recorder(
         # R7-F1: the LAST thing before the write. Every read above has completed, so this is the
         # narrowest point at which the grant can be checked; a lapse discovered here means the
         # current owner will publish and this one must not.
-        if grant_is_live is not None and not grant_is_live():
+        if not grant_is_live():
             raise RecordOwnershipLostError(
                 "the attempt lease lapsed before the record write; publishing nothing"
             )
