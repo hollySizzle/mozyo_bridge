@@ -141,7 +141,9 @@ class SourceRefPreflightTest(unittest.TestCase):
         self.assertIn(f"source_ref_resolved: refs/heads/main -> {self.head}", out)
 
     def test_refs_heads_form_resolves_and_dispatches(self) -> None:
-        # The canonical spelling is supported and is exactly-one by construction.
+        # The canonical spelling is supported. It is the least ambiguous form,
+        # NOT a uniqueness guarantee — see
+        # test_full_ref_path_is_not_exactly_one_by_construction.
         rc, out = self._publish("refs/heads/main")
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
         self.assertIn(f"source_ref_resolved: refs/heads/main -> {self.head}", out)
@@ -158,13 +160,20 @@ class SourceRefPreflightTest(unittest.TestCase):
     # -- policy: reject local remote-tracking spellings -------------------
 
     def test_origin_prefixed_name_is_rejected_with_exact_correction(self) -> None:
-        # The #13883 failure mode: `origin/main` is git's LOCAL spelling; origin
-        # has no ref by that name, so the old path dispatched and died in-run.
+        # The #13883 failure mode: `origin/main` is git's LOCAL spelling, which
+        # the old path dispatched as-is and which died in-run.
         err = self._assert_refused("origin/main")
-        self.assertIn("LOCAL remote-tracking name", err)
-        # The correction must be exact and pasteable, per Acceptance 1.
+        # The stated reason must be AMBIGUITY, not non-existence: this repo's own
+        # test_origin_prefixed_branch_can_really_exist_on_origin shows the name
+        # can resolve (to a different branch). Claiming "resolves zero refs"
+        # would contradict it (j#79995 F3).
+        self.assertIn("is ambiguous", err)
+        self.assertNotIn("resolves zero refs", err)
+        # The correction must be exact and pasteable, per Acceptance 1, and must
+        # offer BOTH readings so the operator picks rather than the helper.
         self.assertIn("--source-ref refs/heads/main", err)
         self.assertIn("--source-ref main", err)
+        self.assertIn("--source-ref refs/heads/origin/main", err)
 
     def test_refs_remotes_form_is_rejected_with_exact_correction(self) -> None:
         err = self._assert_refused("refs/remotes/origin/main")
@@ -219,6 +228,48 @@ class SourceRefPreflightTest(unittest.TestCase):
         # The canonical full path disambiguates the very same repo state.
         rc, _ = self._publish("refs/heads/main")
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
+
+    def test_full_ref_path_is_not_exactly_one_by_construction(self) -> None:
+        """A canonical full ref path can still collide (Redmine #13883 j#79995 F1).
+
+        `git ls-remote` matches a ref-name TAIL at `/` boundaries, and that
+        applies to full paths too: a branch `foo/refs/heads/main` is matched by
+        the pattern `refs/heads/main`. This pins the refutation of the earlier
+        "canonical, always exactly one" claim, and pins that the refusal tells
+        the operator the truth — re-spelling cannot fix it, because the pattern
+        IS already the full path.
+        """
+        _git(self.clone, "checkout", "-q", "-b", "nested")
+        (self.clone / "n.txt").write_text("n\n", encoding="utf-8")
+        _git(self.clone, "add", "-A")
+        _git(self.clone, "commit", "-qm", "nested")
+        nested = _git(self.clone, "rev-parse", "HEAD").strip()
+        _git(self.clone, "push", "-q", "origin", "nested:refs/heads/foo/refs/heads/main")
+
+        # Real git really does return both for the canonical spelling.
+        listing = _git(self.clone, "ls-remote", "origin", "refs/heads/main")
+        self.assertIn("refs/heads/foo/refs/heads/main", listing)
+        self.assertIn(f"{self.head}\trefs/heads/main", listing)
+
+        err = self._assert_refused("refs/heads/main")
+        self.assertIn("resolved to 2 origin refs", err)
+        # The colliding refs are named, so the operator can act on them.
+        self.assertIn("refs/heads/foo/refs/heads/main", err)
+        self.assertIn(nested, err)
+        # Full-path input must NOT be told to re-spell as a full path.
+        self.assertIn("already a full ref path", err)
+        self.assertIn("rename/delete the colliding ref on origin", err)
+
+    def test_short_name_collision_is_told_to_use_the_full_path(self) -> None:
+        # The other branch of the recovery: a short name CAN often be
+        # disambiguated by spelling the full path, so that advice is given
+        # only here — not for a full path that already collides.
+        _git(self.clone, "tag", "main")
+        _git(self.clone, "push", "-q", "origin", "refs/tags/main")
+        err = self._assert_refused("main")
+        self.assertIn("resolved to 2 origin refs", err)
+        self.assertIn("pass its full path verbatim", err)
+        self.assertNotIn("already a full ref path", err)
 
     def test_mismatch_refuses_before_dispatch(self) -> None:
         _git(self.clone, "checkout", "-q", "-b", "other")

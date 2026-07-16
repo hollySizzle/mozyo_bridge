@@ -63,15 +63,20 @@ completion criteria for beta and production distribution live here.
   testpypi`) live only in the artifact-download+publish job, separate from
   checkout/build/verify.
 - Spell `source_ref` as a ref literal ON ORIGIN (`refs/heads/<branch>` is
-  canonical; a bare `<branch>` is accepted). Git's LOCAL remote-tracking names
-  (`origin/<branch>`, `refs/remotes/origin/<branch>`) name no ref on origin, so
-  the helper rejects them before dispatch with the exact correction rather than
-  normalizing them silently — `origin/<branch>` is genuinely ambiguous, because
-  a remote may carry a branch literally named `origin/<branch>`. The helper also
+  canonical; a bare `<branch>` is accepted). The helper rejects git's LOCAL
+  remote-tracking names (`origin/<branch>`, `refs/remotes/origin/<branch>`)
+  before dispatch with the exact correction rather than normalizing them
+  silently, because they are AMBIGUOUS rather than absent: a remote may carry a
+  branch literally named `origin/<branch>`, so `origin/main` could mean either
+  branch and guessing would silently build a different commit. The helper also
   resolves the ref against origin before dispatching, so a zero / ambiguous /
-  mismatched ref costs zero dispatches instead of a run that dies before build
-  (Redmine #13883; policy source: `vibes/docs/logics/release-helper-contract.md`
-  -> `source_ref Spelling Policy`).
+  mismatched ref costs zero dispatches instead of a run that dies before build.
+  Note `git ls-remote` matches a ref-name TAIL — including for full paths — so
+  no spelling is exactly-one by construction; the exactly-one requirement is
+  checked dynamically on both client and server, and a genuine collision is
+  resolved on origin, not by re-spelling the ref (Redmine #13883; policy source:
+  `vibes/docs/logics/release-helper-contract.md` -> `source_ref Spelling
+  Policy`).
 - Order the internal-beta steps as #13528 (TestPyPI publish) then #13527 (exact
   install QA); the install QA runs against the published exact version, not a
   floating `main` install.

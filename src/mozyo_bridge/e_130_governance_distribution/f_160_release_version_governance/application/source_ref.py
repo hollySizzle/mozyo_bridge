@@ -15,10 +15,22 @@ an unresolvable ref costs zero dispatches.
 Policy is **reject with an exact correction**, never silent normalization; the
 decision and its rejected alternative live in
 ``vibes/docs/logics/release-helper-contract.md`` -> ``source_ref Spelling
-Policy``. The short version: ``origin/<branch>`` is genuinely ambiguous, because
-a remote may carry a branch literally named ``origin/<branch>``
-(``refs/heads/origin/<branch>``), so rewriting it to ``<branch>`` would silently
-retarget the artifact authority.
+Policy``. The reason a local remote-tracking spelling is refused is
+**ambiguity, not non-existence**: a remote may carry a branch literally named
+``origin/<branch>`` (``refs/heads/origin/<branch>``), so `origin/main` can name
+either "the branch `main`, spelled the way my clone shows it" or "the branch
+actually called `origin/main` on the remote". Rewriting it to ``<branch>`` would
+silently pick one reading and could retarget the artifact authority. Resolving
+to zero refs is the *common* outcome, not the justification (Redmine #13883
+j#79995 F3).
+
+``git ls-remote`` matches a ref-name TAIL at ``/`` boundaries and this applies to
+full paths too: with a branch ``foo/refs/heads/main`` on the remote,
+``git ls-remote origin refs/heads/main`` returns BOTH it and ``refs/heads/main``.
+So no spelling is exactly-one by construction — ``refs/heads/<branch>`` is the
+canonical, least-ambiguous form, not a guaranteed-unique one. The exactly-one
+requirement is enforced dynamically here and identically server-side, so such a
+collision fails closed on both sides (j#79995 F1).
 
 Split out of ``release.py`` rather than grown inside it: that module is already
 over the module-health threshold, and ref-spelling policy is a self-contained,
@@ -42,8 +54,9 @@ from mozyo_bridge.shared.errors import die
 # server it mirrors.
 CHARSET_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
-# Git's LOCAL remote-tracking namespace. A ref spelled this way never exists
-# under that name on the remote itself.
+# Git's LOCAL remote-tracking namespace. Remotes publish branches under
+# `refs/heads/`, so this spelling names the local mirror of a ref rather than
+# the ref as the remote publishes it.
 LOCAL_TRACKING_PREFIX = "refs/remotes/"
 
 _GIT_HINT = "install git: https://git-scm.com/"
@@ -101,24 +114,25 @@ def validate(value: str, *, repo_root: Path) -> None:
         _, _, branch = tracked.partition("/")
         die(
             f"source_ref {value!r} names git's LOCAL remote-tracking namespace "
-            f"({LOCAL_TRACKING_PREFIX}*), which never exists under that name on "
-            "the remote, so `git ls-remote origin <source_ref>` resolves zero "
-            "refs. Nothing was dispatched. Pass the ref as origin spells it: "
-            f"--source-ref refs/heads/{branch or '<branch>'} (canonical) or "
-            f"--source-ref {branch or '<branch>'}"
+            f"({LOCAL_TRACKING_PREFIX}*), which mirrors a remote ref rather than "
+            "naming it the way the remote publishes it (remotes publish branches "
+            "under refs/heads/). Nothing was dispatched. Pass the ref as origin "
+            f"spells it: --source-ref refs/heads/{branch or '<branch>'} "
+            f"(canonical) or --source-ref {branch or '<branch>'}"
         )
     remote, sep, branch = value.partition("/")
     if sep and remote in configured_remotes(repo_root):
         die(
-            f"source_ref {value!r} is a LOCAL remote-tracking name ({remote!r} "
-            "is a configured remote, so this is git's local spelling of "
-            f"{LOCAL_TRACKING_PREFIX}{value}). It is not how the ref is spelled "
-            f"ON {remote}, so `git ls-remote origin <source_ref>` resolves zero "
-            "refs and the workflow fails only AFTER the run has started "
-            "(Redmine #13883). Nothing was dispatched. Pass the ref as origin "
-            f"spells it: --source-ref refs/heads/{branch} (canonical, always "
-            f"exactly one) or --source-ref {branch}. If you literally mean a "
-            f"branch NAMED {value!r} on {remote}, pass --source-ref "
+            f"source_ref {value!r} is ambiguous: {remote!r} is a configured "
+            f"remote, so this is git's local spelling of "
+            f"{LOCAL_TRACKING_PREFIX}{value} (the branch {branch!r} on "
+            f"{remote}) — but {remote} could also carry a branch literally NAMED "
+            f"{value!r}. Refusing rather than guessing, because guessing wrong "
+            "would silently build a different commit (Redmine #13883). Nothing "
+            "was dispatched. Say which you mean, as origin spells it:\n"
+            f"  the branch {branch!r} on {remote}:   --source-ref "
+            f"refs/heads/{branch}  (canonical) or --source-ref {branch}\n"
+            f"  a branch literally named {value!r}: --source-ref "
             f"refs/heads/{value}"
         )
 
@@ -135,7 +149,10 @@ def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
 
       * ``git ls-remote <pattern>`` matches a ref-name TAIL, it is not an exact
         lookup — a plain ``main`` also matches ``refs/heads/origin/main`` and
-        ``refs/tags/main``. Multi matches are refused, never ranked.
+        ``refs/tags/main``. This applies to full paths too: a branch
+        ``foo/refs/heads/main`` collides with ``refs/heads/main`` itself, so no
+        spelling is exactly-one by construction. Multi matches are refused,
+        never ranked, and the refusal names the colliding refs.
       * Peel lines (``^{}``) are dropped so an annotated tag counts once, which
         means a tag's non-peel tip is the TAG OBJECT rather than the commit; a
         tag ``source_ref`` therefore surfaces here as a mismatch, exactly as it
@@ -169,14 +186,32 @@ def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
             "spells it (canonical: refs/heads/<branch>)"
         )
     if len(matches) > 1:
-        listed = ", ".join(f"{name} -> {sha}" for sha, name in matches)
+        listed = "\n".join(f"  {name} -> {sha}" for sha, name in matches)
+        # `git ls-remote` matches a ref-name TAIL at `/` boundaries, so the
+        # recovery depends on what was passed. A short name can often be
+        # disambiguated by spelling the full path; a full path cannot — a ref
+        # like `foo/refs/heads/main` collides with `refs/heads/main` itself, so
+        # re-pasting the canonical form just reproduces this refusal (j#79995
+        # F1). Say which situation the operator is actually in.
+        if source_ref.startswith("refs/"):
+            recovery = (
+                "This is already a full ref path, so re-spelling it cannot "
+                "disambiguate: `git ls-remote` matches a ref-name TAIL, and the "
+                "refs above share this one. The exactly-one requirement is also "
+                "enforced server-side, so this ref cannot be dispatched while "
+                "the collision exists. Either rename/delete the colliding ref on "
+                "origin, or pass a different ref that resolves to exactly one."
+            )
+        else:
+            recovery = (
+                "`git ls-remote` matches a ref-name TAIL, so a short name can "
+                "also match refs/tags/<name> or refs/heads/<prefix>/<name>. If "
+                "one of the refs above is the one you mean, pass its full path "
+                "verbatim, e.g. --source-ref refs/heads/<branch>."
+            )
         die(
-            f"source_ref {source_ref!r} resolved to {len(matches)} origin refs "
-            f"({listed}); require exactly one. Nothing was dispatched. "
-            "`git ls-remote` matches a ref-name TAIL, so a plain name can also "
-            "match refs/tags/<name> or refs/heads/<prefix>/<name>; "
-            "disambiguate with the full path, e.g. --source-ref "
-            "refs/heads/<branch>"
+            f"source_ref {source_ref!r} resolved to {len(matches)} origin refs; "
+            f"require exactly one. Nothing was dispatched.\n{listed}\n{recovery}"
         )
     resolved_sha, resolved_name = matches[0]
     if resolved_sha != source_sha:
