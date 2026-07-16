@@ -444,6 +444,54 @@ class DispatchOutboxFence:
         """Record the reserved key as cancelled (a durable supersede confirmed before the send)."""
         return self._set_state(key, FENCE_CANCELLED, detail or "cancelled before send", now=now)
 
+    def record_uncertain(self, key: FenceKey, *, detail: str = "", now: Optional[str] = None) -> bool:
+        """Force the key to :data:`FENCE_UNCERTAIN`, INSERTING the row if it is missing.
+
+        Unlike :meth:`mark_uncertain` — an UPDATE that no-ops (rowcount 0) when the row is
+        gone — this **upserts**: it re-creates the row as ``uncertain`` when a prior reserve's
+        row has VANISHED (a store-level single-row loss between the reserve and the outcome
+        write). Re-asserting ``uncertain`` keeps the fence — the *sole* exactly-once authority
+        — holding a never-send state for the key, so a later reserve (even one driven by a
+        caller that re-read a stale durable pointer) sees ``uncertain`` and never sends. It can
+        only ever move a key TOWARD the fail-closed uncertain terminal: a positively resolved
+        row (:data:`FENCE_DELIVERED` / :data:`FENCE_CANCELLED`) is left untouched, so a real
+        delivery is never downgraded. Raises :class:`DispatchOutboxFenceError` only when the
+        WHOLE store is lost / corrupt (a re-run then fails closed on :meth:`_connect` anyway).
+        """
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO dispatch_outbox (workspace_id, lane_id, issue, journal, action_id, "
+                "target_assigned_name, state, detail, reserved_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id, lane_id, issue, journal, action_id, target_assigned_name) "
+                "DO UPDATE SET state=excluded.state, detail=excluded.detail, updated_at=excluded.updated_at "
+                "WHERE dispatch_outbox.state NOT IN (?, ?)",
+                (
+                    *key.as_row(),
+                    FENCE_UNCERTAIN,
+                    detail or "reserved row missing at outcome write; forced uncertain",
+                    stamp,
+                    stamp,
+                    FENCE_DELIVERED,
+                    FENCE_CANCELLED,
+                ),
+            )
+            conn.execute("COMMIT")
+            return True
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise DispatchOutboxFenceError(
+                f"dispatch outbox fence record_uncertain failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
     # -- reads -------------------------------------------------------------
 
     def state_of(self, key: FenceKey) -> str:

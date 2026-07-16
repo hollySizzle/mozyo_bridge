@@ -38,6 +38,12 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     cli_workflow,
+    operator_startup_resume_leg,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+    GATE_READ_CORRUPT,
+    GATE_READ_UNREADABLE,
+    LatestGateRead,
 )
 
 REPO = "/work/repo"
@@ -430,6 +436,49 @@ class HerdrForwardLegCliTest(unittest.TestCase):
         )
         self.assertEqual(leg_mock.call_count, 1)
         self.assertEqual(rc, 1)
+
+
+class StartupGateIndeterminateFailClosedTest(unittest.TestCase):
+    """review j#79524 F3: from the real ``cmd_workflow_step`` orchestration, an INDETERMINATE latest
+    startup gate (corrupt / unreadable / source error) must route to the dedicated resume leg and
+    fail closed — the generic ``_execute_primitive`` must NOT run, and the leg zero-actuates (no
+    fence / reserve / send / write). The candidates below would otherwise dispatch a normal
+    primitive, so this pins the top-level runtime-safety invariant of j#79214 Required impl 2.
+    """
+
+    def _run_indeterminate(self, gate_source):
+        # An executable outcome (project_gateway_consult) that WOULD dispatch _execute_primitive.
+        candidates = [_cand("%self"), _cand("%gw", project_scope=PROJECT)]
+        with patch.object(
+            operator_startup_resume_leg, "_default_gate_source", gate_source
+        ), patch.object(cli_workflow, "_execute_primitive") as exec_mock, patch.object(
+            cli_workflow,
+            "_execute_startup_resume_leg",
+            wraps=cli_workflow._execute_startup_resume_leg,
+        ) as leg_spy:
+            rc, text = _run(_args(issue="13760"), candidates)
+        # The generic primitive never ran; the dedicated resume leg ran exactly once, fail-closed.
+        exec_mock.assert_not_called()
+        self.assertEqual(leg_spy.call_count, 1)
+        self.assertEqual(rc, 1)
+        return text
+
+    def test_corrupt_latest_routes_to_leg_and_zero_actuation(self) -> None:
+        self._run_indeterminate(lambda repo_root, env: lambda issue: LatestGateRead(GATE_READ_CORRUPT))
+
+    def test_unreadable_latest_routes_to_leg_and_zero_actuation(self) -> None:
+        self._run_indeterminate(
+            lambda repo_root, env: lambda issue: LatestGateRead(GATE_READ_UNREADABLE)
+        )
+
+    def test_source_error_routes_to_leg_and_zero_actuation(self) -> None:
+        def _raising_source(repo_root, env):
+            def _read(issue):
+                raise RuntimeError("ticket provider down")
+
+            return _read
+
+        self._run_indeterminate(_raising_source)
 
 
 if __name__ == "__main__":

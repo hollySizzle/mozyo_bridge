@@ -234,5 +234,52 @@ class CorruptStoreTest(unittest.TestCase):
         self.assertEqual(r.prior_state, FENCE_DELIVERED)
 
 
+class RecordUncertainTest(unittest.TestCase):
+    """The fail-closed ``record_uncertain`` upsert (Redmine #13813 review j#79309 F1)."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        self.fence = DispatchOutboxFence(home=self.home)
+        self.fence.bootstrap()
+
+    def test_inserts_uncertain_when_row_missing(self):
+        # A key that was never reserved (or whose row vanished): record_uncertain INSERTs it
+        # as uncertain, so a later reserve never wins (blind re-reserve refused).
+        self.assertTrue(self.fence.record_uncertain(_key()))
+        self.assertEqual(self.fence.state_of(_key()), FENCE_UNCERTAIN)
+        r = self.fence.reserve(_key())
+        self.assertFalse(r.won)
+        self.assertEqual(r.prior_state, FENCE_UNCERTAIN)
+        self.assertTrue(r.needs_reconcile)
+
+    def test_upgrades_reserved_to_uncertain(self):
+        self.fence.reserve(_key())
+        self.assertTrue(self.fence.record_uncertain(_key()))
+        self.assertEqual(self.fence.state_of(_key()), FENCE_UNCERTAIN)
+
+    def test_never_downgrades_delivered(self):
+        # A positively delivered row is left untouched — a real delivery is never lost.
+        self.fence.reserve(_key())
+        self.fence.mark_delivered(_key())
+        self.fence.record_uncertain(_key())
+        self.assertEqual(self.fence.state_of(_key()), FENCE_DELIVERED)
+
+    def test_never_downgrades_cancelled(self):
+        self.fence.reserve(_key())
+        self.fence.mark_cancelled(_key())
+        self.fence.record_uncertain(_key())
+        self.assertEqual(self.fence.state_of(_key()), FENCE_CANCELLED)
+
+    def test_missing_store_fails_closed(self):
+        # A whole-store loss raises (a re-run then fails closed on _connect anyway).
+        self.fence.path.unlink()
+        with self.assertRaises(DispatchOutboxFenceError):
+            self.fence.record_uncertain(_key())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
