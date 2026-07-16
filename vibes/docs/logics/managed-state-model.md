@@ -447,6 +447,38 @@ Table naming:
       audit 可能にする。`--reconcile-hibernated-live` は `--execute` / `--migrate-hibernated-legacy` と競合する destructive intent ゆえ
       **2 つ以上の同時指定は command-time zero-write error**。process launch/resume・worktree/branch 削除・raw Herdr/tmux・
       origin/main・production は伴わない（唯一の process mutation は 自 lane の exact managed pair への pin-matched close）。
+    - **hibernated bound live-zero terminal retire** (`LaneBoundRetireStore.retire_released_hibernated_bound`,
+      #13845、live evidence #13810 j#79416)。#13841 / #13842 が **どちらも拒否**する側の隙間: **hibernated /
+      released** かつ `worktree_identity` が **非空**（#13754 / #13809 / #13810 で binding 記録済みの **bound**
+      row）で、live pair は **既に消滅**しているケース。3 契約の間に収束経路が無く恒久停止する: #13754 guarded
+      close は binding を attest した後 close 対象 0 を観測するが、zero-close が retire と認められるのは durable row が
+      **既に** `retired` の時だけ（#13754 zero-close fence）ゆえ `zero_close_unproven` / `closed=[]` /
+      `durable_retirement=""` を恒久的に返す。#13841 migration は `worktree_identity` **空**（legacy signature）を、
+      #13842 reconcile は worktree/`declared_slots` **空 かつ live pair 有り**を要求するので、bound row は双方で
+      `CAS_UNEXPECTED_STATE` zero-write。new pair を起動して再退役するのは不要な actuation ゆえ採らず、この surface は
+      該当 row を **直接** #13689 terminal `retired` へ 1 本の bounded CAS で移す — **metadata only**、process
+      launch/close/resume も worktree/branch 削除も伴わない。public high-level path
+      (`sublane retire --retire-hibernated-bound`) が **連言検証**する: exact issue+lane+workspace・**bound worktree
+      一致**（#13754 `attest_retire_target` を再利用。空 binding は `worktree_binding_unverified` で #13841 へ route、
+      別 token は `worktree_binding_mismatch`）・`--worktree` 実 branch==`--branch`・integration ancestry・
+      **readable live inventory の全 expected slot absent**・exact lifecycle revision。live 残存 / inventory
+      unreadable / foreign / branch mismatch / detached / unintegrated / revision race / pending replacement は
+      すべて zero-write。書込は「row 存在 かつ exact `expected_revision` 一致」かつ「`hibernated` /
+      `binding_kind='issue'` / この exact issue 所有 / project scope 無し / `worktree_identity` **非空 かつ caller の
+      attested token と一致**」かつ「`process_release='released'` / replacement settled」の全成立時のみ。
+      ★**worktree token は CAS 内（row lock 下）で再照合**する: action-time attestation は診断であって authority では
+      ない。★**declared pins / worktree identity / generation / release / replacement は保持**（#13845 acceptance）—
+      書くのは disposition + decision anchor + revision のみ。`reconcile_phase` も **空のまま**で、これが ordinary
+      terminal retire と #13842 reconcile-owed close を区別する正本であり続ける（review j#79320 R4 の
+      collision-proof 不変を維持）。★duplicate replay の冪等性は維持するが **success を返す前に live-inventory zero を
+      action-time 再確認**する（#13841 review j#79150 F2 と同じ不変）: persisted `retired` は現在の非稼働性を証明しない。
+      ★`transition_disposition` の generic edge を使わない理由は #13841 と同じ（release proof と bound-worktree
+      signature が **guard の一部**）。★#13841 / #13842 の CAS を共有 predicate へ一般化 **しない**: それぞれの guard は
+      自 ticket の evidence に対して review された安全契約であり、「空 or 一致」のような共有述語は sibling surface が
+      拒否するために存在する shape を 1 edit で通してしまう。各 surface が自らの signature を literal に述べ、他は
+      zero-write で拒否する。`--retire-hibernated-bound` は `--execute` / `--migrate-hibernated-legacy` /
+      `--reconcile-hibernated-live` と競合する destructive intent ゆえ **2 つ以上の同時指定は command-time zero-write
+      error**。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
@@ -516,7 +548,7 @@ The contract that prevents it, for a component whose rows are authority (e.g. `l
   mutation, announced before it happens, never an implicit side effect — and a read that precedes the write never migrates ahead
   of the preflight.
 - **The migration is auditable in each command's structured outcome, not only stderr.** The composing-store commands
-  (`sublane quarantine` / hibernated-legacy-retire / hibernated-live-reconcile) expose the wrapped store's `last_write_preparation`
+  (`sublane quarantine` / hibernated-legacy-retire / hibernated-live-reconcile / hibernated-bound-retire) expose the wrapped store's `last_write_preparation`
   and carry `lifecycle_migration_payload(...)` (from/to version, backup, peer-reader risk) in their JSON/text outcome, so a forward
   migration is legible in the command's audit record for replacement / retire / reconcile alike — matching the universal
   pre-migration stderr advisory above. `last_write_preparation` is **most-recent** (this write's), NOT a store-lifetime

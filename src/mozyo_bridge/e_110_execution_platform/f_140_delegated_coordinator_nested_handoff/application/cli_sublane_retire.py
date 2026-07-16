@@ -179,6 +179,26 @@ def register_sublane_retire(
             "--migrate-hibernated-legacy (passing more than one is a zero-write error)."
         ),
     )
+    sublane_retire.add_argument(
+        "--retire-hibernated-bound",
+        dest="retire_hibernated_bound",
+        action="store_true",
+        help=(
+            "Redmine #13845: metadata-only TERMINAL retire for a hibernated / released BOUND "
+            "owner row (non-empty worktree binding) whose live pair is already gone — the "
+            "#13810 j#79416 gap the #13754 guarded close leaves as a permanent "
+            "`zero_close_unproven` (nothing to close, yet the durable row is not `retired`), "
+            "and that the #13841 migration / #13842 reconcile both refuse because they require "
+            "an EMPTY binding. Only when the preflight permits retirement AND --worktree "
+            "attests against the row's recorded canonical binding AND the durable row is "
+            "hibernated + released + owns --issue AND the live inventory shows every expected "
+            "managed slot absent AND --branch is integrated, moves it directly to the terminal "
+            "`retired` disposition via a bounded CAS, preserving the row's declared pins and "
+            "worktree identity. Launches / closes / resumes NO process; removes no worktree / "
+            "branch. Mutually exclusive with --execute, --migrate-hibernated-legacy and "
+            "--reconcile-hibernated-live (passing more than one is a zero-write error)."
+        ),
+    )
     add_repo_option(sublane_retire)
     add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)
