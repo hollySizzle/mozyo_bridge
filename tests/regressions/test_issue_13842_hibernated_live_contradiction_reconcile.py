@@ -854,16 +854,61 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_r13844_v5_peer_migrating_blocked_reports_migration_and_honest_text(self) -> None:
-        # A faithful production reconcile on a shared v5 store with an active peer. The retire CAS
-        # is the reconcile's first store write, so its write gate migrates v5 -> v6 as part of the
-        # (retire-first) mutation. The pair then goes BUSY at close time, so the owed close is
-        # withheld and the run is BLOCKED-with-side-effects (retired but not fully closed). This is
-        # the reachable production "migrated + fail-closed" verdict (a migrated-but-CAS-refused
-        # state is a single-threaded impossibility — the migration and the CAS success are
-        # coupled). The verdict must report the migration and the text must NOT claim nothing
-        # happened.
+    def test_r13844_v5_peer_migrating_cas_refusal_reports_migration_and_honest_text(self) -> None:
+        # Redmine #13844 R6-F2: the migrated-but-lane-row-CAS-REFUSED production branch. The retire
+        # CAS opens (_connect_write) — migrating the shared store v5 -> v6 — THEN checks the
+        # expected_revision. A concurrent row move between the reconcile's verify and its CAS makes
+        # that revision stale (CAS_STALE_REVISION), so the CAS refuses AFTER the migration: retired
+        # is False, nothing is closed, but the schema DID migrate. The verdict must report the
+        # migration and its text must NOT claim "nothing was written or closed".
         self._seed_row()  # the exact empty-worktree reconcilable legacy signature
+        self._add_active_peer_and_rewind_to_v5()
+        self.assertEqual(self._schema_version(), 5)
+
+        def _race_move_revision() -> None:
+            # A concurrent row move AFTER the reconcile snapshotted its expected revision, applied
+            # via raw SQL so it does NOT itself migrate the store — the reconcile's OWN retire CAS
+            # remains the migrating write, and then finds the revision stale.
+            conn = sqlite3.connect(lane_lifecycle_path())
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET revision = revision + 1 "
+                    "WHERE repo_workspace_id = ? AND lane_id = ?",
+                    (_WORKSPACE_ID, _LANE),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        # Fire the race on the initial inventory read (call 0) — after the row snapshot, before
+        # the retire CAS.
+        ops = _FakeReconcileOps(lambda: self.rows, on_call={0: _race_move_revision})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_REVISION_RACE)
+        # the write gate migrated the shared store even though the retire CAS then refused.
+        self.assertEqual(self._schema_version(), 6)
+        self.assertFalse(result.retired)  # the lane ROW was NOT retired
+        self.assertEqual(result.closed, ())  # and nothing was closed
+        self.assertIsNotNone(result.lifecycle_migration)
+        self.assertEqual(result.lifecycle_migration["from_version"], 5)
+        self.assertEqual(result.lifecycle_migration["to_version"], 6)
+        self.assertIn(
+            "issue_13800_peer_lane", result.lifecycle_migration["peer_active_lanes"]
+        )
+        # the production text takes the lifecycle_migration-only branch: NOT "nothing written".
+        text = format_reconcile_text(result)
+        self.assertNotIn("nothing was written or closed", text)
+        self.assertIn("no lane-row write and no pane close", text)
+        self.assertIn("separate side effect", text)
+        self.assertIn("v5 -> v6", text)
+
+    def test_r13844_v5_peer_migrating_close_failure_is_honest_auxiliary(self) -> None:
+        # Auxiliary (Redmine #13844 R6-F2): a DIFFERENT production migrating-blocked branch — the
+        # retire CAS APPLIES (migrating v5 -> v6, retire-first) but the pair goes BUSY at close
+        # time, so the owed close is withheld: BLOCKED with retired=True. The retired-branch text
+        # reports the real side effects and never claims nothing happened.
+        self._seed_row()
         self._add_active_peer_and_rewind_to_v5()
         self.assertEqual(self._schema_version(), 5)
 
@@ -871,16 +916,9 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         result = self._run(ops=ops)
         self.assertEqual(result.state, RECONCILE_BLOCKED)
         self.assertEqual(result.reason, RECON_CLOSE_FAILED)
-        # the retire CAS applied (retire-first) — migrating the shared store v5 -> v6.
         self.assertEqual(self._schema_version(), 6)
         self.assertTrue(result.retired)
-        self.assertIsNotNone(result.lifecycle_migration)
         self.assertEqual(result.lifecycle_migration["from_version"], 5)
-        self.assertEqual(result.lifecycle_migration["to_version"], 6)
-        self.assertIn(
-            "issue_13800_peer_lane", result.lifecycle_migration["peer_active_lanes"]
-        )
-        # the production text reports the real side effects (retire + migration) — never "nothing".
         text = format_reconcile_text(result)
         self.assertNotIn("nothing was written or closed", text)
         self.assertIn("durable write: lane retired", text)

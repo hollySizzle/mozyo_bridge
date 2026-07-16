@@ -517,8 +517,10 @@ The contract that prevents it, for a component whose rows are authority (e.g. `l
   pre-migration stderr advisory above. `last_write_preparation` is **most-recent** (this write's), NOT a store-lifetime
   accumulator: a store instance may be reused across operations, so a lifetime accumulator would let a later read-only / intact
   action inherit a PAST migration and fabricate a side effect it did not perform. Preserving the migration across a *single*
-  command's several writes is the **use case's** job, **operation-scoped** — reset at the start of each run and captured after that
-  run's migrating write — so a preflight-only run, or a reused store whose earlier run migrated, reports nothing. A fail-closed
+  command's several writes is the **use case's** job, **operation-scoped** — reset at the start of each run and folded in after
+  **each** of that run's schema-needing writes (a command can migrate on any of them, e.g. a quarantine *redrive* of an existing
+  generation migrates on its first `record_replacement_outcome`, not on `request_replacement`) — so a preflight-only run, or a
+  reused store whose earlier run migrated, reports nothing. A fail-closed
   (CAS-refused) verdict that nonetheless migrated the store scopes its "zero-write" claim to the lane ROW and reports the schema
   migration as a separate side effect — an audit record must never deny a side effect that happened, nor invent one that did not.
 - **Fail-closed is preserved and made specific.** An unknown / newer / partial / malformed shape still fails closed (no

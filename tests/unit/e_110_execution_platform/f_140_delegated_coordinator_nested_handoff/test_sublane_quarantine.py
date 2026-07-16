@@ -891,6 +891,49 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         self.assertIsNone(third.lifecycle_migration)
         self.assertNotIn("forward-migrated", quarantine_module.format_quarantine_text(third))
 
+    def test_existing_pending_redrive_on_v5_carries_migration(self) -> None:
+        # Redmine #13844 R6-F1: a redrive of an EXISTING pending generation skips
+        # request_replacement and migrates on its first record_replacement_outcome. The migration
+        # must still reach the outcome (it is captured after EVERY write, not only request).
+        self._active_lane()
+        # First run on the (fresh, v6) store: close ok, launch fails -> durable PENDING.
+        self._run(_FakeOps(heal_error=RuntimeError("launch failed")))
+        self.assertEqual(self._row().replacement_state, REPLACEMENT_PENDING)
+
+        # Now the shared store is rewound to v5 with an active peer.
+        self._rewind_to_v5_with_peer()
+        self.assertEqual(self._recorded_version(), 5)
+
+        # The redrive resumes at the launch: its FIRST store write is the `replaced`
+        # record_replacement_outcome, which migrates v5 -> v6.
+        self.store = LaneReplacementStore(home=self.home)
+        redrive = self._run(_FakeOps(signal=_signal(generation_matches=False)))
+        self.assertEqual(redrive.replacement_state, REPLACEMENT_REPLACED)
+        self.assertEqual(self._recorded_version(), 6)
+        self.assertIsNotNone(redrive.lifecycle_migration)
+        self.assertEqual(redrive.lifecycle_migration["from_version"], 5)
+        self.assertEqual(redrive.as_payload()["lifecycle_migration"]["from_version"], 5)
+        self.assertIn("v5 -> v6", quarantine_module.format_quarantine_text(redrive))
+
+    def test_existing_requested_redrive_on_v5_carries_migration(self) -> None:
+        # Redmine #13844 R6-F1: a redrive of an EXISTING requested generation migrates on its
+        # first record_replacement_outcome (pending), NOT on request_replacement.
+        self._active_lane()
+        # First run: the old-receiver close fails -> durable REQUESTED (no launch).
+        self._run(_FakeOps(close=CloseReceiverResult(False, detail="close_failed")))
+        self.assertEqual(self._row().replacement_state, REPLACEMENT_REQUESTED)
+
+        self._rewind_to_v5_with_peer()
+        self.assertEqual(self._recorded_version(), 5)
+
+        self.store = LaneReplacementStore(home=self.home)
+        redrive = self._run(_FakeOps())  # close now succeeds -> pending -> replaced
+        self.assertEqual(redrive.replacement_state, REPLACEMENT_REPLACED)
+        self.assertEqual(self._recorded_version(), 6)
+        self.assertIsNotNone(redrive.lifecycle_migration)
+        self.assertEqual(redrive.lifecycle_migration["from_version"], 5)
+        self.assertIn("v5 -> v6", quarantine_module.format_quarantine_text(redrive))
+
 
 if __name__ == "__main__":
     unittest.main()

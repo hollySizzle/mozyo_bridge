@@ -301,11 +301,24 @@ class SublaneQuarantineUseCase:
             return "approval predates the current attested agent generation"
         return ""
 
+    def _capture_migration(self) -> None:
+        """Fold THIS run's schema migration into the operation-scoped accumulator (Redmine #13844
+        R6-F1). Call this immediately after EVERY schema-needing store write in this run — not
+        only the new-generation ``request_replacement``: a redrive of an EXISTING requested /
+        pending generation skips ``request_replacement`` and migrates on its first
+        ``record_replacement_outcome`` instead. The store is most-recent, so right after a write
+        its ``last_write_preparation`` reflects THAT write; ``or`` keeps the FIRST migration so a
+        later ``intact`` write never clears it. A non-migrating write folds ``None`` (no-op)."""
+        self._operation_migration = self._operation_migration or lifecycle_migration_payload(
+            getattr(self.store, "last_write_preparation", None)
+        )
+
     def run(self, request: QuarantineRequest, *, execute: bool) -> QuarantineOutcome:
         # Redmine #13844 R5-F1: the schema migration this ONE command performs is captured
         # operation-scoped — reset at the start of every run(), so a REUSED use case / store never
-        # carries a PAST run's migration into this action's audit. It is set only after this run's
-        # migrating write below (a read-only / preflight run never sets it).
+        # carries a PAST run's migration into this action's audit. It is folded in after EACH of
+        # this run's schema-needing writes (see :meth:`_capture_migration`); a read-only / preflight
+        # run never sets it.
         self._operation_migration: Optional[dict[str, Any]] = None
         inspection = self.ops.inspect(request)
         classification = inspection.classification
@@ -444,13 +457,7 @@ class SublaneQuarantineUseCase:
                 pins=(pin,),
                 decision=decision,
             )
-            # Redmine #13844 R5-F1: capture the migration THIS run's write gate performed (the
-            # store is most-recent, so read it right after the migrating write). ``or`` keeps the
-            # first migration if any later write in this run reads back ``intact``. request_replacement
-            # is this command's first (and only migration-capable) write on the shared store.
-            self._operation_migration = self._operation_migration or lifecycle_migration_payload(
-                self.store.last_write_preparation
-            )
+            self._capture_migration()
             if not opened.applied:
                 return self._base_outcome(
                     request,
@@ -503,6 +510,7 @@ class SublaneQuarantineUseCase:
                 expected_revision=current.revision,
                 target=REPLACEMENT_PENDING,
             )
+            self._capture_migration()  # Redmine #13844 R6-F1: a redrive migrates HERE, not at request
             if not pending.applied:
                 return self._base_outcome(
                     request,
@@ -555,6 +563,7 @@ class SublaneQuarantineUseCase:
             expected_revision=current.revision,
             target=REPLACEMENT_REPLACED,
         )
+        self._capture_migration()  # Redmine #13844 R6-F1: a pending redrive migrates HERE
         return self._base_outcome(
             request,
             classification,
