@@ -497,8 +497,13 @@ The contract that prevents it, for a component whose rows are authority (e.g. `l
   `readonly_compatible_select`), opened `mode=ro`: no DDL, no `ALTER`, no version re-stamp, no backup. A newer build reads an
   **older KNOWN additive shape** by padding the columns that shape lacks with their **in-memory migration defaults** (the same
   value a forward `ALTER … DEFAULT` would have written), so it interprets the older store faithfully without touching a byte. The
-  shared store stays at its current version and every concurrent older reader keeps working. (A read landing during a peer's
-  migration commit waits it out via `busy_timeout` rather than fail-closing on a transient lock.)
+  shared store stays at its current version and every concurrent older reader keeps working. The whole read — component status /
+  recorded version / table+index signature / compatible `SELECT` construction / the caller's row `SELECT` — runs inside **one
+  explicit read transaction**, begun before the first schema query and held until the connection closes, so every statement
+  observes the SAME committed store state (Redmine #13844 R9 j#79848: in autocommit each statement takes its own snapshot, and a
+  peer migration committing between the version read and the signature read yields a torn v5-metadata/v6-shape view that
+  misclassifies a healthy authority as partial/corrupt). `busy_timeout` remains only a lock-wait aid for a read landing during a
+  peer's migration commit — it is NOT the snapshot authority and does not make separate statements consistent.
 - **Every mutation migrates through ONE explicit write gate, preflight BEFORE the migration.** No CAS opens the store with a bare
   `ensure`. Every schema-needing mutation — declaration / incarnation AND disposition / supersede / release / replacement / retire
   / reconcile — opens via the single choke point `LaneLifecycleStore._connect_write(writer_key)`, in strict order: (1) read the

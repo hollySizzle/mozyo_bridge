@@ -100,18 +100,36 @@ def _open_and_project(path: Path) -> Optional[tuple[sqlite3.Connection, str]]:
 
     Raises :class:`_ReadClosed` (fail closed) for an unknown / newer / partial / malformed /
     unreadable store. It never migrates: only ``mode=ro`` + ``PRAGMA``/``sqlite_master`` reads.
+
+    The returned connection carries an **open read transaction**: the component status, the
+    recorded version, the table/index signature, the compatible ``SELECT`` construction, and
+    the caller's row ``SELECT`` all observe ONE committed store state until ``conn`` is closed
+    (Redmine #13844 R9, j#79848). Closing the connection ends the (read-only) transaction.
     """
     if not path.exists():
         return None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError as exc:
+        raise _ReadClosed(
+            f"lane lifecycle store {path} is unreadable ({type(exc).__name__})",
+            upgrade_required=False,
+        ) from exc
+    try:
         # Redmine #13844 F3: a read landing while a PEER lane runs an explicit backup-first
         # migration (which holds the write lock across its ``BEGIN IMMEDIATE`` section) must
-        # WAIT for that commit, not fail-closed on a transient "database is locked". Without a
-        # busy timeout a concurrent migration would spuriously break a read; with it the reader
-        # briefly blocks, then reads the settled (pre- or post-migration) committed shape.
+        # WAIT for that commit, not fail-closed on a transient "database is locked". The busy
+        # timeout is ONLY a lock-wait aid — it does not make separate statements consistent.
         conn.execute("PRAGMA busy_timeout = 2000")
+        # Redmine #13844 R9 (j#79848): every schema read below AND the caller's row SELECT
+        # must observe ONE committed store state. In autocommit each statement takes its own
+        # snapshot, so a peer migration committing between them yields a torn view (v5
+        # metadata + v6 table shape) that misclassifies a healthy authority as
+        # partial/corrupt. An explicit read transaction, begun BEFORE the first schema query
+        # and held until close, pins every statement on this connection to one snapshot.
+        conn.execute("BEGIN")
     except sqlite3.DatabaseError as exc:
+        conn.close()
         raise _ReadClosed(
             f"lane lifecycle store {path} is unreadable ({type(exc).__name__})",
             upgrade_required=False,

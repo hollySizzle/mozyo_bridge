@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state import lane_lifecycle as ll  # noqa: E402
+from mozyo_bridge.core.state import lane_lifecycle_readonly as rr  # noqa: E402
 from mozyo_bridge.core.state import lane_lifecycle_schema as sch  # noqa: E402
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     BINDING_KIND_ISSUE,
@@ -800,6 +801,137 @@ class FaithfulReviewAndConcurrencyTest(unittest.TestCase):
             again = ensure_lane_lifecycle_schema(path)
             self.assertEqual(again.action, SCHEMA_INTACT)
         self.assertEqual(len(list((self.home / "backups").glob("state-*"))), 1)
+
+
+# -- R9 (j#79848): the whole read path shares ONE committed snapshot ----------------------
+
+
+class TornSnapshotReadDuringMigrationTest(unittest.TestCase):
+    """Redmine #13844 R9 (j#79848): a concurrent migration must never yield a torn read.
+
+    Before the fix ``_open_and_project`` ran component status / recorded version / table
+    signature / row SELECT as separate autocommit statements, each on its own SQLite
+    snapshot. A peer migration committing between the version read (v5) and the signature
+    read (now v6 shape) made the reader misclassify a healthy authority as partial/corrupt
+    and fail-close a production status/handoff/review/callback/drain read. The fix pins the
+    whole read on ONE explicit read transaction snapshot.
+
+    The interleaving is DETERMINISTIC (events, not sleeps): the reader is paused exactly
+    after the ``_recorded_version`` call inside ``readonly_compatible_select`` observed v5,
+    the writer then commits the v5->v6 migration, and the reader resumes. The store is WAL
+    so the writer can commit while the paused reader holds its read snapshot.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _race(self, read_call):
+        """Run ``read_call(path)`` with the v5->v6 migration committed mid-read; return its result."""
+        path = _seed_v5(self.home)
+        wal = sqlite3.connect(path)
+        try:
+            wal.execute("PRAGMA journal_mode=WAL")
+        finally:
+            wal.close()
+        reader_pinned_v5 = threading.Event()
+        migration_committed = threading.Event()
+        original = sch._recorded_version
+        reader_ident: dict = {}
+        reader_calls = {"n": 0}
+        errors: list = []
+        results: list = []
+
+        def instrumented(conn):
+            version = original(conn)
+            if threading.get_ident() == reader_ident.get("id"):
+                reader_calls["n"] += 1
+                # Call #1 is readonly_component_status; call #2 is the one inside
+                # readonly_compatible_select — the exact point j#79848 identified.
+                if reader_calls["n"] == 2:
+                    if version != 5:
+                        errors.append(("read", AssertionError(f"pinned {version!r}, not v5")))
+                    reader_pinned_v5.set()
+                    if not migration_committed.wait(10):
+                        errors.append(("read", AssertionError("migration never committed")))
+            return version
+
+        def _read():
+            reader_ident["id"] = threading.get_ident()
+            try:
+                results.append(read_call(path))
+            except Exception as exc:  # noqa: BLE001 - surface the race failure to the assert
+                errors.append(("read", exc))
+
+        def _migrate():
+            try:
+                if not reader_pinned_v5.wait(10):
+                    raise AssertionError("reader never reached the pinned point")
+                ensure_lane_lifecycle_schema(path)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("migrate", exc))
+            finally:
+                migration_committed.set()
+
+        with patch.object(sch, "_recorded_version", side_effect=instrumented):
+            threads = [threading.Thread(target=_read), threading.Thread(target=_migrate)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(errors, [])  # a torn snapshot fails here as partial/corrupt
+        self.assertEqual(reader_calls["n"], 2)  # the pinned point was actually exercised
+        self.assertEqual(_recorded_version(self.home), 6)  # the migration committed
+        self.assertEqual(len(results), 1)
+        return results[0]
+
+    def test_get_returns_whole_v5_row_from_its_snapshot(self) -> None:
+        rec = self._race(
+            lambda path: LaneLifecycleReader(path=path).get(LaneLifecycleKey(WS, LANE))
+        )
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+        # The padded additive default proves the row was decoded via the v5 snapshot shape.
+        self.assertEqual(rec.reconcile_phase, "")
+
+    def test_records_returns_whole_v5_rows_from_its_snapshot(self) -> None:
+        records = self._race(lambda path: LaneLifecycleReader(path=path).records())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].lane_disposition, DISPOSITION_ACTIVE)
+        self.assertEqual(records[0].reconcile_phase, "")
+
+    def test_resolve_owner_resolves_from_its_snapshot(self) -> None:
+        resolution = self._race(
+            lambda path: LaneLifecycleReader(path=path).resolve_owner(WS, ISSUE)
+        )
+        self.assertEqual(resolution.status, OWNER_RESOLVED)
+        self.assertEqual(resolution.lane_id, LANE)
+
+    def test_projection_helpers_read_inside_the_read_transaction(self) -> None:
+        # The transaction must begin BEFORE the first schema query: both projection helpers
+        # (and therefore the version/signature reads inside them) observe an open transaction.
+        path = _seed_v5(self.home)
+        seen: list = []
+        orig_status = rr.readonly_component_status
+        orig_select = rr.readonly_compatible_select
+
+        def status_probe(conn):
+            seen.append(("status", conn.in_transaction))
+            return orig_status(conn)
+
+        def select_probe(conn):
+            seen.append(("select", conn.in_transaction))
+            return orig_select(conn)
+
+        with patch.object(rr, "readonly_component_status", side_effect=status_probe), \
+                patch.object(rr, "readonly_compatible_select", side_effect=select_probe):
+            rec = LaneLifecycleReader(path=path).get(LaneLifecycleKey(WS, LANE))
+        self.assertIsNotNone(rec)
+        self.assertEqual(seen, [("status", True), ("select", True)])
 
 
 # -- R2-F1: explicit write gate wired to EVERY mutation; reads never migrate --------------
