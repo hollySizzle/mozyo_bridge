@@ -147,15 +147,14 @@ class BuildV3RequiredGateTests(unittest.TestCase):
 
 
 class ReissueSupersedesNoteTests(unittest.TestCase):
-    def test_names_superseded_gate(self) -> None:
-        note = reissue_supersedes_note(superseded_gate_id="gate-1", superseded_generation=2)
-        self.assertIn("gate=gate-1", note)
-        self.assertIn("action_generation=2", note)
+    def test_names_superseded_journal(self) -> None:
+        note = reissue_supersedes_note(superseded_journal="79000")
+        self.assertIn("journal=79000", note)
         self.assertIn("no legacy backfill", note)
 
-    def test_blank_gate_id_fails_closed(self) -> None:
+    def test_blank_journal_fails_closed(self) -> None:
         with self.assertRaises(GateProducerError):
-            reissue_supersedes_note(superseded_gate_id="", superseded_generation=1)
+            reissue_supersedes_note(superseded_journal="")
 
 
 if __name__ == "__main__":

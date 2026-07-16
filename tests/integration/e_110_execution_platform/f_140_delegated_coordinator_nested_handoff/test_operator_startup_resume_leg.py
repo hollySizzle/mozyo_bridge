@@ -171,8 +171,9 @@ def _legacy_note(version: int) -> str:
 
 
 class _Entry:
-    def __init__(self, notes: str):
+    def __init__(self, notes: str, journal_id: str = ""):
         self.notes = notes
+        self.journal_id = journal_id
 
 
 class _Recorder:
@@ -309,6 +310,19 @@ class GateJournalSerializationTests(unittest.TestCase):
 
     def test_readable_legacy_v1_gate_is_legacy(self) -> None:
         self.assertEqual(parse_latest_gate([_Entry(_legacy_note(1))]).status, GATE_READ_LEGACY)
+
+    def test_legacy_read_carries_the_source_entry_journal_id(self) -> None:
+        # review j#79524 F1: the selected legacy entry's durable journal_id is carried, so the fresh
+        # v3 gate's supersedes marker can name the EXACT superseded journal.
+        read = parse_latest_gate([_Entry(_legacy_note(2), journal_id="79000")])
+        self.assertEqual(read.status, GATE_READ_LEGACY)
+        self.assertEqual(read.journal_id, "79000")
+        self.assertIsNotNone(read.legacy_record)
+
+    def test_legacy_read_journal_id_none_when_entry_lacks_one(self) -> None:
+        read = parse_latest_gate([_Entry(_legacy_note(2))])  # blank journal_id
+        self.assertEqual(read.status, GATE_READ_LEGACY)
+        self.assertIsNone(read.journal_id)
 
     def test_malformed_legacy_fragment_is_corrupt_not_legacy(self) -> None:
         # j#79481 F1: a bare {"schema_version": 2} fragment is NOT a readable legacy record — it is
@@ -547,7 +561,9 @@ class ResumeLegTests(unittest.TestCase):
         )
         legacy_record = {"gate_id": "gate-1", "action_generation": 1}
         result = self._run(
-            gate_source=lambda issue: LatestGateRead(GATE_READ_LEGACY, legacy_record=legacy_record),
+            gate_source=lambda issue: LatestGateRead(
+                GATE_READ_LEGACY, legacy_record=legacy_record, journal_id="79000"
+            ),
             target_resolver=lambda gate, env: (_ for _ in ()).throw(
                 AssertionError("resolver must not run on a legacy gate")
             ),
@@ -561,13 +577,55 @@ class ResumeLegTests(unittest.TestCase):
         self.assertEqual(len(rec.reissued), 1)  # fresh v3 gate durably recorded
         recorded_gate, supersedes_note = rec.reissued[0]
         self.assertEqual(recorded_gate, fresh)
-        self.assertIn("gate=gate-1", supersedes_note)
-        self.assertIn("action_generation=1", supersedes_note)  # names the superseded legacy gen
+        self.assertIn("journal=79000", supersedes_note)  # names the EXACT superseded journal
 
-    def test_default_legacy_reissuer_invokes_producer_from_observation(self) -> None:
-        # review j#79504 F2: the DEFAULT (production) reissuer is a real call-site of the producer.
-        # A seeded lifecycle observation + provider binding -> a fresh v3 required gate whose runtime
-        # identity comes from the declared pin (fail-closed sub-seams only: lifecycle / binding read).
+    def test_legacy_latest_gate_without_journal_id_is_manual_reapproval(self) -> None:
+        # review j#79524 F1: a readable legacy latest whose source entry has NO journal id cannot be
+        # uniquely superseded -> DO NOT auto-reissue; guide a manual reapproval (record nothing).
+        rec = _Recorder()
+        fresh = build_required_gate(
+            gate_id="gate-1",
+            action_generation=2,
+            original_request=_original(),
+            target=_target(),
+            classification=_classification(),
+        )
+        result = self._run(
+            gate_source=lambda issue: LatestGateRead(
+                GATE_READ_LEGACY, legacy_record={"gate_id": "gate-1"}, journal_id=None
+            ),
+            target_resolver=lambda gate, env: (_ for _ in ()).throw(
+                AssertionError("resolver must not run on a legacy gate")
+            ),
+            send_factory=_exploding_send_factory,
+            gate_recorder=rec,
+            legacy_reissuer=lambda lr, issue, repo_root: fresh,
+        )
+        self.assertEqual(result.result, RESUME_LEGACY_REAPPROVAL_REQUIRED)
+        self.assertEqual(len(rec.reissued), 0)  # no auto-reissue without a journal anchor
+
+    _LEGACY_REISSUE_RECORD = {
+        "gate_id": "gate-1",
+        "action_generation": 1,
+        "target": {
+            "workspace_id": "ws-alpha",
+            "lane_id": "lane-alpha",
+            "target_role": "implementation_worker",
+            "execution_root": ".",
+        },
+        "original_request": {
+            "source": "redmine", "issue": "13760", "journal": "77948", "delivery_id": "deliv-1"
+        },
+        "classification": {
+            "blocker_id": "first_run_theme",
+            "profile_version": "2",
+            "classifier_version": "1",
+            "observed_at": "x",
+        },
+    }
+
+    def _run_default_reissuer(self, *, lifecycle_row):
+        # Drive `_default_legacy_reissuer` with an injected lifecycle row + binding (leaf sub-seams).
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
             operator_startup_resume_leg as leg_mod,
             operator_startup_resume_target as tgt_mod,
@@ -578,51 +636,60 @@ class ResumeLegTests(unittest.TestCase):
             def provider_for(self, role):
                 return "claude"
 
-        record = SimpleNamespace(
+        orig_lc = tgt_mod._default_lifecycle_get
+        orig_bind = bind_mod.load_workflow_binding
+        tgt_mod._default_lifecycle_get = lambda ws, lane: lifecycle_row
+        bind_mod.load_workflow_binding = lambda repo_root=None: (_Binding(), ())
+        try:
+            return leg_mod._default_legacy_reissuer(
+                self._LEGACY_REISSUE_RECORD, "13813", str(self.home)
+            )
+        finally:
+            tgt_mod._default_lifecycle_get = orig_lc
+            bind_mod.load_workflow_binding = orig_bind
+
+    def _active_row(self, **overrides):
+        base = dict(
             repo_workspace_id="ws-alpha",
             lane_id="lane-alpha",
             lane_generation=3,
             revision=1,
+            lane_disposition=DISPOSITION_ACTIVE,
+            issue_id="13760",  # owns the legacy gate's original-request issue
             declared_pins=(
                 ProcessGenerationPin(
                     role="claude", provider="claude", assigned_name="worker-a", locator="w1:p1"
                 ),
             ),
         )
-        orig_lc = tgt_mod._default_lifecycle_get
-        orig_bind = bind_mod.load_workflow_binding
-        tgt_mod._default_lifecycle_get = lambda ws, lane: record
-        bind_mod.load_workflow_binding = lambda repo_root=None: (_Binding(), ())
-        try:
-            legacy_record = {
-                "gate_id": "gate-1",
-                "action_generation": 1,
-                "target": {
-                    "workspace_id": "ws-alpha",
-                    "lane_id": "lane-alpha",
-                    "target_role": "implementation_worker",
-                    "execution_root": ".",
-                },
-                "original_request": {
-                    "source": "redmine", "issue": "13760", "journal": "77948", "delivery_id": "deliv-1"
-                },
-                "classification": {
-                    "blocker_id": "first_run_theme",
-                    "profile_version": "2",
-                    "classifier_version": "1",
-                    "observed_at": "x",
-                },
-            }
-            fresh = leg_mod._default_legacy_reissuer(legacy_record, "13813", str(self.home))
-        finally:
-            tgt_mod._default_lifecycle_get = orig_lc
-            bind_mod.load_workflow_binding = orig_bind
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_default_legacy_reissuer_invokes_producer_from_observation(self) -> None:
+        # review j#79504 F2: the DEFAULT (production) reissuer is a real call-site of the producer.
+        # A valid fresh-authority row -> a fresh v3 required gate whose runtime identity comes from
+        # the declared pin (fail-closed sub-seams only: lifecycle / binding read).
+        fresh = self._run_default_reissuer(lifecycle_row=self._active_row())
         self.assertIsNotNone(fresh)
         assert fresh is not None
         self.assertEqual(fresh.state, "required")
         self.assertEqual(fresh.target.runtime_role, "claude")  # from the declared pin
         self.assertEqual(fresh.target.target_role, "implementation_worker")  # workflow role
         self.assertEqual(fresh.action_generation, 2)  # legacy generation + 1
+
+    def test_default_reissuer_rejects_inactive_lifecycle_row(self) -> None:
+        # review j#79524 F2: a retired / inactive row is not a valid fresh authority -> None.
+        self.assertIsNone(self._run_default_reissuer(lifecycle_row=self._active_row(lane_disposition="retired")))
+
+    def test_default_reissuer_rejects_foreign_issue_lifecycle_row(self) -> None:
+        # A row owning a DIFFERENT issue than the legacy gate's original request -> None.
+        self.assertIsNone(self._run_default_reissuer(lifecycle_row=self._active_row(issue_id="FOREIGN")))
+
+    def test_default_reissuer_rejects_missing_issue_binding(self) -> None:
+        self.assertIsNone(self._run_default_reissuer(lifecycle_row=self._active_row(issue_id="")))
+
+    def test_default_reissuer_none_when_lifecycle_absent(self) -> None:
+        self.assertIsNone(self._run_default_reissuer(lifecycle_row=None))
 
     def test_unsafe_execution_root_is_zero_send_before_reserve(self) -> None:
         # j#79405 §C: an execution_root that does not safely resolve under the action-time repo

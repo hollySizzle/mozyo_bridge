@@ -142,6 +142,11 @@ class LatestGateRead:
     #: The raw legacy record dict when ``status`` is :data:`GATE_READ_LEGACY` — the reapproval leg
     #: structurally extracts the work anchor / lane / classification to re-observe a fresh v3 gate.
     legacy_record: Optional[dict] = None
+    #: The durable ``journal_id`` of the selected legacy entry (the journal record's own id, not a
+    #: pointer the note mentions) — the fresh v3 gate's ``supersedes`` marker names THIS journal so
+    #: the reissue uniquely points at the superseded record (review j#79524 F1). None when the source
+    #: entry has no journal id (the leg then fails closed to a manual reapproval, never auto-reissue).
+    journal_id: Optional[str] = None
 
 
 def note_has_gate_marker(notes: object) -> bool:
@@ -272,10 +277,13 @@ def parse_latest_gate(entries: Sequence[object]) -> LatestGateRead:
             return LatestGateRead(status=GATE_READ_CORRUPT)
         version = schema_version_of(record)
         if version in OPERATOR_STARTUP_GATE_LEGACY_SCHEMA_VERSIONS:
-            # A readable legacy record -> reapproval (carry it for re-observation); a malformed
-            # legacy fragment -> corrupt.
+            # A readable legacy record -> reapproval (carry it + the entry's durable journal_id for
+            # re-observation and the supersedes pointer); a malformed legacy fragment -> corrupt.
             if _legacy_record_is_readable(record):
-                return LatestGateRead(status=GATE_READ_LEGACY, legacy_record=record)
+                journal_id = str(getattr(entry, "journal_id", "") or "").strip() or None
+                return LatestGateRead(
+                    status=GATE_READ_LEGACY, legacy_record=record, journal_id=journal_id
+                )
             return LatestGateRead(status=GATE_READ_CORRUPT)
         if version != OPERATOR_STARTUP_GATE_SCHEMA_VERSION:
             return LatestGateRead(status=GATE_READ_CORRUPT)
@@ -386,9 +394,14 @@ def execute_startup_resume(
     repo_root = str(repo_root_from_args(args))
     stamp = observed_at or _utc_now()
 
-    # 1. Re-read the latest durable gate + original anchor from the ticket-provider port.
+    # 1. Re-read the latest durable gate + original anchor from the ticket-provider port. A source
+    #    that raises is treated as UNREADABLE (indeterminate -> fail closed), never propagated as an
+    #    exception that could abort the whole workflow step (review j#79524 F3).
     source = gate_source if gate_source is not None else _default_gate_source(repo_root, environ)
-    read = source(str(issue).strip())
+    try:
+        read = source(str(issue).strip())
+    except Exception:  # noqa: BLE001 - a raising source is indeterminate -> UNREADABLE (zero-send)
+        read = LatestGateRead(status=GATE_READ_UNREADABLE)
     if read.status in (GATE_READ_CORRUPT, GATE_READ_UNREADABLE):
         # The newest gate record is malformed/schema-invalid, OR the ticket-provider read itself
         # failed (indeterminate): fail closed with zero actuation (review j#79309 F3 / j#79504 F1).
@@ -418,7 +431,10 @@ def execute_startup_resume(
         except Exception:  # noqa: BLE001 - reissue failure -> manual reapproval (never actuation)
             fresh = None
         reissued = False
-        if fresh is not None:
+        # The supersedes pointer must name the EXACT superseded journal id (review j#79524 F1). If
+        # the source entry carries no journal id, DO NOT auto-reissue (the fresh record could not
+        # unambiguously supersede the legacy one) — fall back to a manual reapproval.
+        if fresh is not None and read.journal_id:
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_gate_producer import (
                 reissue_supersedes_note,
             )
@@ -427,10 +443,7 @@ def execute_startup_resume(
                 issue, environ
             )
             if recorder.preflight():
-                note = reissue_supersedes_note(
-                    superseded_gate_id=str(legacy_record.get("gate_id") or ""),
-                    superseded_generation=legacy_record.get("action_generation"),
-                )
+                note = reissue_supersedes_note(superseded_journal=read.journal_id)
                 reissued = recorder.record_reissue(fresh, note)
         detail = (
             f"latest durable operator startup gate for issue {issue} is a legacy (v1/v2) record; "
@@ -642,8 +655,14 @@ def _default_legacy_reissuer(
     record + the repo's provider binding, and builds a fresh v3 gate through the production
     :func:`build_v3_required_gate_from_observation`. The fresh gate carries its runtime_role / provider
     / generation / revision / workspace from the CURRENT observation (Design Answer j#79405 §B — no
-    legacy backfill); its ``action_generation`` is the legacy generation + 1. Any missing field /
-    unreadable lifecycle / producer drift returns None so the leg guides manual reapproval instead.
+    legacy backfill); its ``action_generation`` is the legacy generation + 1.
+
+    The current lifecycle row must be a *valid fresh authority* — **active**, bound to the exact
+    workspace / lane, and owning the legacy gate's original-request issue (review j#79524 F2,
+    mirroring the resume resolver's ``record.issue_id == gate.original_request.issue`` gate) —
+    otherwise a retired or foreign-issue lane could mint an invalid approval target. Any missing
+    field / inactive / foreign-issue / unreadable lifecycle / producer drift returns None so the
+    leg guides a manual reapproval instead. ``issue`` (the read anchor) must be present.
     """
     target = legacy_record.get("target") or {}
     workspace_id = str(target.get("workspace_id") or "").strip()
@@ -651,13 +670,24 @@ def _default_legacy_reissuer(
     workflow_role = str(target.get("target_role") or "").strip()
     execution_root = str(target.get("execution_root") or "").strip()
     gate_id = str(legacy_record.get("gate_id") or "").strip()
+    original_issue = str((legacy_record.get("original_request") or {}).get("issue") or "").strip()
+    read_anchor = str(issue or "").strip()
     try:
         action_generation = int(legacy_record.get("action_generation"))
     except (TypeError, ValueError):
         return None
-    if not (workspace_id and lane_id and workflow_role and execution_root and gate_id):
+    if not (
+        workspace_id
+        and lane_id
+        and workflow_role
+        and execution_root
+        and gate_id
+        and original_issue
+        and read_anchor
+    ):
         return None
     try:
+        from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_gate_producer import (
             build_v3_required_gate_from_observation,
         )
@@ -674,6 +704,16 @@ def _default_legacy_reissuer(
 
         lifecycle = _default_lifecycle_get(workspace_id, lane_id)
         if lifecycle is None:
+            return None
+        # The row must be a valid fresh authority: active, exact workspace/lane, and owning the
+        # legacy gate's original-request issue (mirrors the resume resolver's binding gate).
+        if getattr(lifecycle, "lane_disposition", None) != DISPOSITION_ACTIVE:
+            return None
+        if str(getattr(lifecycle, "repo_workspace_id", "")).strip() != workspace_id:
+            return None
+        if str(getattr(lifecycle, "lane_id", "")).strip() != lane_id:
+            return None
+        if str(getattr(lifecycle, "issue_id", "")).strip() != original_issue:
             return None
         binding, _warnings = load_workflow_binding(repo_root)
         return build_v3_required_gate_from_observation(

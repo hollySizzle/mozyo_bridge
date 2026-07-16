@@ -637,11 +637,13 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     )
     outcome = reconciled.outcome
 
-    # Redmine #13813: a durable operator startup gate awaiting resume takes precedence — route
-    # this step to the exactly-once resume leg. The check reads the latest gate at action time
-    # and only overrides the outcome when it is resumable (``operator_reported_done``); any other
-    # state (no gate / corrupt / pre-clear / terminal / in-flight) leaves the normal outcome, and
-    # the read is fail-soft (an unreadable ticket provider never forces a resume).
+    # Redmine #13813: a durable operator startup gate takes precedence — route this step to the
+    # exactly-once resume leg. The check reads the latest gate at action time and overrides the
+    # outcome for a resumable gate (``operator_reported_done``), a readable legacy gate (reapproval),
+    # AND every INDETERMINATE read (corrupt / unreadable / source error), which route to the leg's
+    # zero-actuating fail-closed disposition so no normal primitive runs (review j#79504 / j#79524
+    # F1). Only a DEFINITIVE no_gate (or a pre-clear / terminal / in-flight v3 gate) leaves the
+    # normal outcome to execute.
     resume_outcome = _maybe_operator_startup_resume_outcome(args, outcome)
     if resume_outcome is not None:
         outcome = resume_outcome
