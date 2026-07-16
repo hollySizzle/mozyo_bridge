@@ -136,6 +136,7 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     LANE_LIFECYCLE_SCHEMA_VERSION,
     TABLE as _TABLE,
     LaneLifecycleError,
+    LifecycleSchemaOutcome,
     ensure_lane_lifecycle_schema,
     lane_lifecycle_path,
 )
@@ -149,7 +150,9 @@ from mozyo_bridge.core.state.lane_lifecycle_rows import (
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LaneLifecycleReader,
+    LaneLifecycleReaderUpgradeRequired,
     LifecycleMigrationPreflight,
+    LifecycleWritePreparation,
     lifecycle_migration_preflight,
     load_lane_lifecycle_readonly,
 )
@@ -163,16 +166,62 @@ class LaneLifecycleStore:
 
     def __init__(self, *, home: Path | None = None, path: Path | None = None) -> None:
         self.path = path if path is not None else lane_lifecycle_path(home)
+        #: The typed outcome of the LAST schema-ensuring write connect (Redmine #13844 F1). A
+        #: mutating open never SILENTLY discards what the schema gate did — created / intact /
+        #: migrated{from_version, backup_dir} is captured here for a caller / journal to read.
+        self._last_schema_outcome: Optional[LifecycleSchemaOutcome] = None
 
     # -- schema / connections ------------------------------------------------
 
-    def ensure_schema(self) -> "LifecycleSchemaOutcome":
+    @property
+    def last_schema_outcome(self) -> Optional[LifecycleSchemaOutcome]:
+        """The typed outcome of the most recent schema-ensuring write open (or ``None``)."""
+        return self._last_schema_outcome
+
+    def ensure_schema(self) -> LifecycleSchemaOutcome:
         """Create / validate this component's schema; return the typed outcome (see schema module)."""
-        return ensure_lane_lifecycle_schema(self.path)
+        outcome = ensure_lane_lifecycle_schema(self.path)
+        self._last_schema_outcome = outcome
+        return outcome
+
+    def prepare_write(
+        self,
+        *,
+        writer_workspace_id: Optional[str] = None,
+        writer_lane_id: Optional[str] = None,
+    ) -> LifecycleWritePreparation:
+        """The explicit schema-changing WRITE gate (Redmine #13844 design 3/6).
+
+        A mutating use case that needs the current schema calls this ONCE before its CAS,
+        instead of letting a bare connect migrate the shared store implicitly. It:
+
+        1. reads the compatibility **preflight FIRST** — the active peer lanes a forward
+           migration would fail-close — on the PRE-migration store (version-compatible,
+           read-only, never itself a migration trigger);
+        2. runs the backup-first migration (:func:`ensure_lane_lifecycle_schema`) and captures
+           its **typed outcome** (created / intact / migrated{from_version, backup_dir});
+        3. returns both as a :class:`LifecycleWritePreparation` so the caller / journal can
+           judge and surface the migration and its peer risk — the schema change is a visible,
+           typed act, never a silent side effect.
+
+        The preflight is read on ``self.path`` (the exact store this write targets), so a
+        path-scoped store reports its own peers, not the default home's.
+        """
+        preflight = lifecycle_migration_preflight(
+            path=self.path,
+            writer_workspace_id=writer_workspace_id,
+            writer_lane_id=writer_lane_id,
+        )
+        outcome = self.ensure_schema()
+        return LifecycleWritePreparation(outcome=outcome, preflight=preflight)
 
     def _connect(self) -> sqlite3.Connection:
-        """An autocommit connection for the CAS (the container guard's is not)."""
-        ensure_lane_lifecycle_schema(self.path)
+        """An autocommit connection for the CAS (the container guard's is not).
+
+        The schema-ensuring migration outcome is captured (Redmine #13844 F1), never silently
+        discarded — a mutating open records what the schema gate did on ``last_schema_outcome``.
+        """
+        self._last_schema_outcome = ensure_lane_lifecycle_schema(self.path)
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.execute("PRAGMA busy_timeout = 2000")
         return conn
@@ -844,7 +893,10 @@ __all__ = (
     "LaneLifecycleError",
     "LaneLifecycleStore",
     "LaneLifecycleReader",
+    "LaneLifecycleReaderUpgradeRequired",
     "LifecycleMigrationPreflight",
+    "LifecycleSchemaOutcome",
+    "LifecycleWritePreparation",
     "lane_lifecycle_path",
     "lifecycle_migration_preflight",
     "load_lane_lifecycle",

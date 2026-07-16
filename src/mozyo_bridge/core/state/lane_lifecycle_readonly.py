@@ -50,13 +50,28 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     READER_UPGRADE_REQUIRED,
     READONLY_COMPONENT_ABSENT,
     READONLY_COMPONENT_RECOGNIZED,
+    SCHEMA_MIGRATED,
     TABLE as _TABLE,
     LaneLifecycleError,
+    LifecycleSchemaOutcome,
     lane_lifecycle_path,
     readonly_compatible_select,
     readonly_component_status,
     reader_upgrade_required,
 )
+
+
+class LaneLifecycleReaderUpgradeRequired(LaneLifecycleError):
+    """The store is a NEWER schema than this build can read — route, don't downgrade.
+
+    The typed :data:`READER_UPGRADE_REQUIRED` sub-case of :class:`LaneLifecycleError` (Redmine
+    #13844 design 5): a concurrent newer-schema lane migrated the shared home store, so THIS
+    reader is stale. A caller distinguishes this from a generic unreadable/corrupt store and
+    routes the operation to the current compatible high-level facade (never a raw DB
+    downgrade). Because it subclasses :class:`LaneLifecycleError`, every existing
+    ``except LaneLifecycleError`` fail-closed path still catches it — only a caller that WANTS
+    the distinction (the handoff gate) inspects the concrete type.
+    """
 
 
 class _ReadClosed(Exception):
@@ -89,6 +104,12 @@ def _open_and_project(path: Path) -> Optional[tuple[sqlite3.Connection, str]]:
         return None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # Redmine #13844 F3: a read landing while a PEER lane runs an explicit backup-first
+        # migration (which holds the write lock across its ``BEGIN IMMEDIATE`` section) must
+        # WAIT for that commit, not fail-closed on a transient "database is locked". Without a
+        # busy timeout a concurrent migration would spuriously break a read; with it the reader
+        # briefly blocks, then reads the settled (pre- or post-migration) committed shape.
+        conn.execute("PRAGMA busy_timeout = 2000")
     except sqlite3.DatabaseError as exc:
         raise _ReadClosed(
             f"lane lifecycle store {path} is unreadable ({type(exc).__name__})",
@@ -146,6 +167,12 @@ class LaneLifecycleReader:
         self.path = path if path is not None else lane_lifecycle_path(home)
 
     def _fail_closed(self, exc: _ReadClosed) -> LaneLifecycleError:
+        # A NEWER-schema store fails closed with the TYPED subclass so the caller can route to
+        # the current facade (Redmine #13844 design 5); every other cause (malformed / partial /
+        # unreadable) stays the generic error. Both are LaneLifecycleError, so existing
+        # fail-closed catches are unaffected.
+        if exc.upgrade_required:
+            return LaneLifecycleReaderUpgradeRequired(str(exc))
         return LaneLifecycleError(str(exc))
 
     def get(self, key: LaneLifecycleKey) -> Optional[LaneLifecycleRecord]:
@@ -289,6 +316,7 @@ class LifecycleMigrationPreflight:
 def lifecycle_migration_preflight(
     *,
     home: Path | None = None,
+    path: Path | None = None,
     writer_workspace_id: Optional[str] = None,
     writer_lane_id: Optional[str] = None,
 ) -> LifecycleMigrationPreflight:
@@ -297,9 +325,11 @@ def lifecycle_migration_preflight(
     Reads the shared authority read-only / version-compatibly and returns the active lanes
     other than ``(writer_workspace_id, writer_lane_id)``. An unreadable store yields
     ``unreadable=True`` (the caller must not treat "no peers" as "safe"). It performs no
-    migration — the preflight for a migration must not itself trigger one.
+    migration — the preflight for a migration must not itself trigger one. ``path`` addresses an
+    explicit store file (what the write gate passes, from ``store.path``); ``home`` resolves the
+    default location.
     """
-    reader = LaneLifecycleReader(home=home)
+    reader = LaneLifecycleReader(home=home, path=path)
     try:
         records = reader.records()
     except (LaneLifecycleError, OSError):
@@ -314,15 +344,17 @@ def lifecycle_migration_preflight(
             norm(rec.repo_workspace_id) == writer_ws and norm(rec.lane_id) == writer_lane
         )
     )
-    version = _current_recorded_version(home=home)
+    version = _current_recorded_version(home=home, path=path)
     return LifecycleMigrationPreflight(
         current_version=version, peer_active_lanes=peers
     )
 
 
-def _current_recorded_version(*, home: Path | None = None) -> Optional[int]:
+def _current_recorded_version(
+    *, home: Path | None = None, path: Path | None = None
+) -> Optional[int]:
     """The shared store's recorded component version, read-only (``None`` if absent/unreadable)."""
-    path = lane_lifecycle_path(home)
+    path = path if path is not None else lane_lifecycle_path(home)
     if not path.exists():
         return None
     try:
@@ -345,9 +377,40 @@ def _current_recorded_version(*, home: Path | None = None) -> Optional[int]:
     return row[1]
 
 
+@dataclass(frozen=True)
+class LifecycleWritePreparation:
+    """The typed result of the explicit schema-changing WRITE gate (Redmine #13844 design 3/6).
+
+    A mutating use case that needs the current schema runs the explicit write gate
+    (:meth:`...lane_lifecycle.LaneLifecycleStore.prepare_write`) BEFORE its CAS: it reads the
+    peer compatibility preflight FIRST (on the pre-migration store), then runs the backup-first
+    migration, and returns BOTH here so the migration is a visible, typed act — never an
+    implicit side effect of opening the store. ``outcome`` is the
+    :class:`LifecycleSchemaOutcome` (created / intact / migrated{from_version, backup_dir});
+    ``preflight`` is the active peer lanes a forward migration would fail-close.
+    """
+
+    outcome: LifecycleSchemaOutcome
+    preflight: LifecycleMigrationPreflight
+
+    @property
+    def migrated(self) -> bool:
+        """This write actually forward-migrated the shared store (an authority-shape change)."""
+        return self.outcome.action == SCHEMA_MIGRATED
+
+    @property
+    def peer_reader_risk(self) -> bool:
+        """A migration happened AND active peer lanes may be older-schema readers of it."""
+        return self.migrated and (
+            self.preflight.unreadable or self.preflight.has_peers
+        )
+
+
 __all__ = (
     "LaneLifecycleReader",
+    "LaneLifecycleReaderUpgradeRequired",
     "LifecycleMigrationPreflight",
+    "LifecycleWritePreparation",
     "lifecycle_migration_preflight",
     "load_lane_lifecycle_readonly",
 )

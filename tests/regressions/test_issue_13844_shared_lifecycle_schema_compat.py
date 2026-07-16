@@ -30,6 +30,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleReader,
+    LaneLifecycleReaderUpgradeRequired,
     LaneLifecycleStore,
     OWNER_ABSENT,
     OWNER_RESOLVED,
@@ -54,6 +56,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     lifecycle_migration_preflight,
     load_lane_lifecycle_readonly,
 )
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore  # noqa: E402
 from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
     LANE_LIFECYCLE_COMPONENT,
     LANE_LIFECYCLE_SCHEMA_VERSION,
@@ -421,7 +424,7 @@ class StandardHandoffReadOnlyGuardBiteTest(unittest.TestCase):
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False):
             self.assertEqual(
                 _resolve_target_disposition(_Target(WS, LANE)),
-                (DISPOSITION_ACTIVE, False),
+                (DISPOSITION_ACTIVE, False, False),
             )
         self.assertEqual(_digest(path), before)
         self.assertEqual(_recorded_version(self.home), 5)
@@ -438,7 +441,7 @@ class StandardHandoffReadOnlyGuardBiteTest(unittest.TestCase):
                 # The read-only handoff lookup succeeds and never calls the migration API.
                 self.assertEqual(
                     _resolve_target_disposition(_Target(WS, LANE)),
-                    (DISPOSITION_ACTIVE, False),
+                    (DISPOSITION_ACTIVE, False, False),
                 )
                 m.assert_not_called()
                 # Adversarial: the old migrating read (store.get) DOES reach it — the guard bites.
@@ -510,6 +513,272 @@ class LiveShapedReviewDeliveryTest(unittest.TestCase):
             home=self.home, writer_workspace_id=WS, writer_lane_id=LANE
         )
         self.assertEqual(pf_self.peer_active_lanes, ())
+
+
+# -- F1: explicit write gate — preflight + typed outcome wired to production ------------
+
+
+class WriteGatePreparationTest(unittest.TestCase):
+    """Review j#79471 F1: the schema-changing WRITE gate runs the preflight and surfaces the
+    typed migration outcome; ``_connect`` never silently discards it."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_connect_captures_migration_outcome_not_discarded(self) -> None:
+        # Guard-bite: a mutating open (declare_active -> _connect) that migrates a v5 store must
+        # RECORD the typed outcome, never silently discard it.
+        _seed_v5(self.home)
+        store = LaneLifecycleStore(home=self.home)
+        self.assertIsNone(store.last_schema_outcome)  # nothing opened yet
+        store.get(LaneLifecycleKey(WS, LANE))  # a store read still uses the migrating connect
+        self.assertIsNotNone(store.last_schema_outcome)
+        self.assertEqual(store.last_schema_outcome.action, SCHEMA_MIGRATED)
+        self.assertEqual(store.last_schema_outcome.from_version, 5)
+
+    def test_prepare_write_reads_preflight_before_migrating(self) -> None:
+        # The explicit gate reads the peer preflight on the PRE-migration store, then migrates —
+        # returning both, typed, so the migration is a visible act.
+        _seed_v5(self.home)  # active LANE present, v5
+        store = LaneLifecycleStore(home=self.home)
+        prep = store.prepare_write(
+            writer_workspace_id=WS, writer_lane_id="a_different_writer_lane"
+        )
+        self.assertEqual(prep.outcome.action, SCHEMA_MIGRATED)
+        self.assertEqual(prep.outcome.from_version, 5)
+        self.assertIsNotNone(prep.outcome.backup_dir)
+        # the peer was read from the PRE-migration (v5) store, and version 5 recorded there
+        self.assertEqual(prep.preflight.current_version, 5)
+        self.assertEqual(prep.preflight.peer_active_lanes, (LANE,))
+        self.assertTrue(prep.migrated)
+        self.assertTrue(prep.peer_reader_risk)
+        # and the store is now migrated (the gate performed the mutation)
+        self.assertEqual(_recorded_version(self.home), 6)
+
+    def test_declare_lane_surfaces_write_preparation(self) -> None:
+        # Redmine #13844 F1: the production declaration write gate (LaneDeclarationStore) runs the
+        # preflight + typed outcome, reachable on last_write_preparation — lifecycle_migration_
+        # preflight now has a real production call site, not dead code.
+        _seed_v5(self.home)  # LANE active, v5
+        decl = LaneDeclarationStore(home=self.home)
+        self.assertIsNone(decl.last_write_preparation)
+        other = LaneLifecycleKey(WS, "issue_99999_other_lane")
+        decl.declare_lane(
+            other,
+            decision=DecisionPointer(source="redmine", issue_id="99999", journal_id="1"),
+            binding_kind=BINDING_KIND_ISSUE,
+            issue_id="99999",
+        )
+        prep = decl.last_write_preparation
+        self.assertIsNotNone(prep)
+        self.assertEqual(prep.outcome.action, SCHEMA_MIGRATED)
+        self.assertEqual(prep.outcome.from_version, 5)
+        # the pre-existing active LANE is surfaced as a peer at risk from this migration
+        self.assertIn(LANE, prep.preflight.peer_active_lanes)
+        self.assertTrue(prep.peer_reader_risk)
+
+    def test_prepare_write_on_current_store_is_intact_no_peer_risk(self) -> None:
+        LaneLifecycleStore(home=self.home).ensure_schema()  # a fresh current v6 store
+        store = LaneLifecycleStore(home=self.home)
+        prep = store.prepare_write(writer_workspace_id=WS, writer_lane_id=LANE)
+        self.assertEqual(prep.outcome.action, SCHEMA_INTACT)
+        self.assertFalse(prep.migrated)
+        self.assertFalse(prep.peer_reader_risk)  # no migration => no peer risk
+
+
+# -- F2: typed reader_upgrade_required routing (newer schema -> facade, not generic block) -
+
+
+class ReaderUpgradeRequiredRoutingTest(unittest.TestCase):
+    """Review j#79471 F2: a NEWER-schema store is a TYPED reader_upgrade_required — routed to
+    the current facade — distinct from a generic block; malformed/partial stays generic."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _current_store(self) -> Path:
+        LaneLifecycleStore(home=self.home).declare_active(
+            LaneLifecycleKey(WS, LANE), decision=_issue_decision(), issue_id=ISSUE
+        )
+        return lane_lifecycle_path(self.home)
+
+    def test_reader_raises_typed_subclass_for_newer_store(self) -> None:
+        self._current_store()  # a real v6 store
+        # Emulate a v5 build (recognizes only 1..5) reading the v6 store.
+        with patch.object(sch, "_RECOGNIZED_SCHEMA_VERSIONS", frozenset({1, 2, 3, 4, 5})):
+            reader = LaneLifecycleReader(home=self.home)
+            with self.assertRaises(LaneLifecycleReaderUpgradeRequired):
+                reader.get(LaneLifecycleKey(WS, LANE))
+
+    def test_malformed_store_is_generic_not_upgrade_required(self) -> None:
+        path = self._current_store()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 2.5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        reader = LaneLifecycleReader(home=self.home)
+        with self.assertRaises(LaneLifecycleError) as ctx:
+            reader.records()
+        # a malformed store is NOT the actionable upgrade case — it stays the generic error
+        self.assertNotIsInstance(ctx.exception, LaneLifecycleReaderUpgradeRequired)
+
+    def test_handoff_gate_emits_reader_upgrade_required_outcome(self) -> None:
+        # The end-to-end typed routing: a newer store yields a DISTINCT reader_upgrade_required
+        # outcome + die, NOT a generic gateway_route_blocked.
+        self._current_store()
+        emitted = []
+        with patch.object(sch, "_RECOGNIZED_SCHEMA_VERSIONS", frozenset({1, 2, 3, 4, 5})):
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+            ), patch.object(
+                gateway_route_gate,
+                "load_workflow_binding",
+                return_value=(_FakeBinding(), []),
+            ), patch.object(gateway_route_gate, "die", side_effect=_Die):
+                with self.assertRaises(_Die):
+                    enforce_gateway_route(
+                        kind="review_request",
+                        receiver="codex",
+                        preflight_target=_Target(WS, LANE),
+                        source="redmine",
+                        mode="queue-enter",
+                        anchor=None,
+                        target="wProj:p9",
+                        record_format="text",
+                        record_command=None,
+                        emit=lambda outcome, **kw: emitted.append(outcome),
+                        allow_direct_worker=False,
+                        sender_lane_unit=(None, None),
+                    )
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0].reason, "reader_upgrade_required")
+        self.assertNotEqual(emitted[0].reason, "gateway_route_blocked")
+
+    def test_resolve_disposition_flags_upgrade_required(self) -> None:
+        self._current_store()
+        with patch.object(sch, "_RECOGNIZED_SCHEMA_VERSIONS", frozenset({1, 2, 3, 4, 5})):
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+            ):
+                self.assertEqual(
+                    gateway_route_gate._resolve_target_disposition(_Target(WS, LANE)),
+                    (None, True, True),
+                )
+
+
+# -- F3: faithful review_request delivery + deterministic concurrency --------------------
+
+
+class FaithfulReviewAndConcurrencyTest(unittest.TestCase):
+    """Review j#79471 F3: exercise the CLAIMED paths — a same-lane review_request exact-route
+    delivery over a v5 store from a v6 source, and a real concurrent read + migration."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _enforce_review(self):
+        emitted = []
+        with patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+        ), patch.object(
+            gateway_route_gate, "load_workflow_binding", return_value=(_FakeBinding(), [])
+        ), patch.object(gateway_route_gate, "die", side_effect=_Die):
+            enforce_gateway_route(
+                kind="review_request",
+                receiver="codex",
+                preflight_target=_Target(WS, LANE),
+                source="redmine",
+                mode="standard",
+                anchor=None,
+                target="wProj:p9",
+                record_format="text",
+                record_command=None,
+                emit=lambda outcome, **kw: emitted.append(outcome),
+                allow_direct_worker=False,
+                sender_lane_unit=(None, None),
+            )
+        return emitted
+
+    def test_v6_source_review_request_routes_active_v5_lane_no_migrate(self) -> None:
+        # Faithful to the acceptance path: kind=review_request (not a stand-in), a v5 active
+        # lane, a v6 source command. The exact-route delivery is NOT blocked by the lifecycle
+        # authority, and the v6 read does NOT migrate the shared store — so the concurrent v5
+        # reader keeps working (version stays 5).
+        path = _seed_v5(self.home)
+        before = _digest(path)
+        emitted = self._enforce_review()
+        self.assertEqual(emitted, [])  # not blocked; delivery proceeds to the exact route
+        self.assertEqual(_digest(path), before)
+        self.assertEqual(_recorded_version(self.home), 5)
+        # a subsequent v5-shaped read still resolves the exact lane (transport not stalled)
+        rec = LaneLifecycleReader(home=self.home).get(LaneLifecycleKey(WS, LANE))
+        self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_concurrent_read_during_migration_is_consistent(self) -> None:
+        # A deterministic barrier-synchronized race: one thread runs the explicit v5->v6
+        # migration while another reads the same store. The reader must never see a torn shape
+        # (it waits out the migration commit via busy_timeout), and the store ends at v6.
+        path = _seed_v5(self.home)
+        barrier = threading.Barrier(2)
+        errors: list = []
+        read_dispositions: list = []
+
+        def _migrate():
+            try:
+                barrier.wait()
+                ensure_lane_lifecycle_schema(path)
+            except Exception as exc:  # noqa: BLE001 - surface any race failure to the assert
+                errors.append(("migrate", exc))
+
+        def _read():
+            try:
+                barrier.wait()
+                for _ in range(20):
+                    rec = LaneLifecycleReader(path=path).get(LaneLifecycleKey(WS, LANE))
+                    # whether it reads the pre- or post-migration committed shape, the record is
+                    # whole and the disposition is the same authoritative value.
+                    read_dispositions.append(rec.lane_disposition if rec else None)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("read", exc))
+
+        threads = [threading.Thread(target=_migrate), threading.Thread(target=_read)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])  # no torn read, no spurious lock failure
+        self.assertTrue(read_dispositions)
+        self.assertTrue(all(d == DISPOSITION_ACTIVE for d in read_dispositions))
+        self.assertEqual(_recorded_version(self.home), 6)  # the migration committed
+
+    def test_migration_restart_idempotent_under_repeated_ensure(self) -> None:
+        # Restart idempotency: repeated explicit ensures after the first migration are intact,
+        # never a second migration or a second backup.
+        path = _seed_v5(self.home)
+        first = ensure_lane_lifecycle_schema(path)
+        self.assertEqual(first.action, SCHEMA_MIGRATED)
+        for _ in range(3):
+            again = ensure_lane_lifecycle_schema(path)
+            self.assertEqual(again.action, SCHEMA_INTACT)
+        self.assertEqual(len(list((self.home / "backups").glob("state-*"))), 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

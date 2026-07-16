@@ -34,7 +34,30 @@ GATEWAY_ROUTE_BLOCKED_NARRATIVE: str = (
 )
 
 
+#: ``DeliveryOutcome.next_action`` for a ``reader_upgrade_required`` outcome (Redmine #13844
+#: design 5). The target lane's lifecycle authority is fine — THIS source CLI's schema reader
+#: is stale (the shared home store was migrated to a newer version by another lane), so the
+#: safe route is the current compatible facade, never a raw DB downgrade.
+READER_UPGRADE_REQUIRED_NEXT_ACTION: str = (
+    "the shared lifecycle authority is a NEWER schema than this source CLI can read; do NOT "
+    "downgrade or repair the DB. Re-run this send from the current up-to-date source CLI / "
+    "installed facade (the lane worktree whose build matches the newer schema), which reads "
+    "the authority natively. The store is left untouched (downgrade-safe)."
+)
+
+#: ``DeliveryOutcome`` narrative for a ``reader_upgrade_required`` outcome.
+READER_UPGRADE_REQUIRED_NARRATIVE: str = (
+    "Lifecycle reader-upgrade gate (Redmine #13844): the shared home lifecycle authority "
+    "carries a schema version newer than this source CLI understands (a concurrent newer-"
+    "schema lane migrated it). The read fails closed rather than downgrade / misread it; this "
+    "is distinct from a generic gateway route block and from a corrupt / partial store. Route "
+    "the send through the current compatible high-level facade. No notification was typed."
+)
+
+
 __all__ = (
     "GATEWAY_ROUTE_BLOCKED_NEXT_ACTION",
     "GATEWAY_ROUTE_BLOCKED_NARRATIVE",
+    "READER_UPGRADE_REQUIRED_NEXT_ACTION",
+    "READER_UPGRADE_REQUIRED_NARRATIVE",
 )
