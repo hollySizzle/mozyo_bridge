@@ -101,6 +101,20 @@ class RuntimeMatchTest(unittest.TestCase):
             "",
         )
 
+    def test_ambiguous_two_matches_fail_closed_blank(self):
+        # review R5-F2: a duplicate / replacement overlap (two matching agents) must NOT resolve
+        # to one runtime by iteration order and fabricate an edge -> blank (no edge).
+        dupes = [
+            _Agent("ws1", "lane-a", "claude", "turn_ended"),
+            _Agent("ws1", "lane-a", "claude", "busy"),  # overlapping duplicate
+        ]
+        self.assertEqual(
+            match_lane_worker_runtime(
+                dupes, workspace_id="ws1", lane_id="lane-a", provider="claude"
+            ),
+            "",
+        )
+
     def test_lane_worker_runtime_resolves_owner_role_to_provider(self):
         # the worker role -> claude slot's runtime, via an injected agents_fn (no live inventory).
         rt = lane_worker_runtime(

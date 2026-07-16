@@ -22,8 +22,11 @@ def match_lane_worker_runtime(
     """The runtime of the agent matching ``(workspace_id, lane_id, provider)`` (pure, fail-closed).
 
     The matching half of :func:`lane_worker_runtime`, split out so it is test-pinned against
-    production-shape observed-agent records without a live herdr inventory. Returns ``""`` when
-    no agent matches (no edge — never fabricated).
+    production-shape observed-agent records without a live herdr inventory. Requires EXACTLY ONE
+    matching agent (Redmine #13758 review R5-F2): ZERO matches OR TWO-OR-MORE (a duplicate /
+    replacement overlap) return ``""`` — an ambiguous inventory must never resolve to one
+    agent's runtime by iteration order and fabricate an edge (the acceptance's
+    route-ambiguity / original-recovery zero-send). ``""`` = no edge.
     """
     wsid, lane, prov = (
         str(workspace_id or "").strip(),
@@ -32,14 +35,14 @@ def match_lane_worker_runtime(
     )
     if not (wsid and lane and prov):
         return ""
-    for agent in agents or ():
-        if (
-            str(getattr(agent, "workspace_id", "") or "").strip() == wsid
-            and str(getattr(agent, "lane_id", "") or "").strip() == lane
-            and str(getattr(agent, "role", "") or "").strip() == prov
-        ):
-            return str(getattr(agent, "runtime_state", "") or "").strip()
-    return ""
+    matches = [
+        str(getattr(agent, "runtime_state", "") or "").strip()
+        for agent in agents or ()
+        if str(getattr(agent, "workspace_id", "") or "").strip() == wsid
+        and str(getattr(agent, "lane_id", "") or "").strip() == lane
+        and str(getattr(agent, "role", "") or "").strip() == prov
+    ]
+    return matches[0] if len(matches) == 1 else ""  # exactly one, else fail-closed blank
 
 
 def _live_observed_agents() -> "list":
