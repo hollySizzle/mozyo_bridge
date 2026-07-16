@@ -48,6 +48,7 @@ never points core -> provider.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -373,21 +374,69 @@ def create_schema(conn: sqlite3.Connection) -> None:
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
-def _new_backup_dir(path: Path) -> Path:
-    """Create the next free ``backups/<stem>-<ts>[-N]/`` directory (never overwriting)."""
-    base = path.parent / BACKUPS_DIRNAME / f"{path.stem}-{_backup_stamp(_utc_now())}"
-    backup_dir = base
+#: Staging directory name. It lives *beside* ``backups/`` rather than inside it, so a
+#: partial recovery point is never discoverable in the published namespace even if a
+#: cleanup itself fails (Redmine #13882 review j#80045 R3-F1).
+_STAGING_DIRNAME = ".backups-staging"
+
+
+def _stage_backup(path: Path) -> tuple:
+    """Reserve ``(staging_dir, final_dir)`` for a backup. Nothing is published yet.
+
+    ``backups/<ts>/`` is the namespace an operator trusts as a recovery point, so writing
+    directly into it means every failure *publishes a partial one* — measured (review
+    j#80045 R3-F1): a snapshot that raised mid-``backup()`` left an 8192-byte DB with
+    ``user_version=0`` sitting in ``backups/``, and a quarantine whose sidecar copy failed
+    left a "whole-artifact" recovery point holding only the main file. This module already
+    argues an incomplete-but-trusted recovery point is worse than none; producing one only
+    on the failure path is the same hazard, merely rarer.
+
+    Artifacts are therefore built under ``.backups-staging/`` — deliberately a sibling of
+    ``backups/``, not a child, so that even a failed cleanup leaves nothing discoverable in
+    the published namespace — and published by :func:`_publish_backup`.
+    """
+    root = path.parent
+    base = root / BACKUPS_DIRNAME / f"{path.stem}-{_backup_stamp(_utc_now())}"
+    final_dir = base
     suffix = 1
+    staging: Optional[Path] = None
     try:
-        while backup_dir.exists():
-            backup_dir = base.with_name(f"{base.name}-{suffix}")
+        while final_dir.exists():
+            final_dir = base.with_name(f"{base.name}-{suffix}")
             suffix += 1
-        backup_dir.mkdir(parents=True, exist_ok=False)
+        staging = root / _STAGING_DIRNAME / final_dir.name
+        shutil.rmtree(staging, ignore_errors=True)  # a prior crash's staging is not ours
+        staging.mkdir(parents=True, exist_ok=False)
     except OSError as exc:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
         raise StateStoreError(
             f"backup near {base} failed ({exc}); operation aborted (nothing was written)"
         ) from exc
-    return backup_dir
+    return staging, final_dir
+
+
+def _publish_backup(staging: Path, final_dir: Path) -> Path:
+    """Atomically publish a COMPLETE staging dir as the recovery point.
+
+    One ``os.replace`` of the directory, so a reader of ``backups/`` sees the whole
+    artifact set or nothing — never a half-written one.
+    """
+    try:
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, final_dir)
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise StateStoreError(
+            f"publishing the backup to {final_dir} failed ({exc}); the operation was "
+            f"aborted and no partial recovery point was published"
+        ) from exc
+    return final_dir
+
+
+def _discard_staging(staging: Path) -> None:
+    """Drop an incomplete staging tree. Outside the published namespace either way."""
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def backup_attestation_store(path: Path) -> Optional[Path]:
@@ -417,8 +466,8 @@ def backup_attestation_store(path: Path) -> Optional[Path]:
     """
     if not path.exists():
         return None
-    backup_dir = _new_backup_dir(path)
-    target = backup_dir / path.name
+    staging, final_dir = _stage_backup(path)
+    target = staging / path.name
     source: Optional[sqlite3.Connection] = None
     dest: Optional[sqlite3.Connection] = None
     try:
@@ -429,17 +478,22 @@ def backup_attestation_store(path: Path) -> Optional[Path]:
         source.backup(dest)
         dest.commit()
     except (sqlite3.DatabaseError, OSError) as exc:
+        for conn in (source, dest):
+            if conn is not None:
+                conn.close()
+        _discard_staging(staging)
         raise StateStoreError(
             f"logical snapshot of {path} failed ({exc.__class__.__name__}: {exc}); "
             f"refusing to migrate without a complete recovery point (the store is left "
-            f"untouched). A byte copy is NOT substituted here: it would silently drop any "
-            f"WAL-committed rows and produce a recovery point that looks valid"
+            f"untouched, and no partial recovery point was published). A byte copy is NOT "
+            f"substituted here: it would silently drop any WAL-committed rows and produce "
+            f"a recovery point that looks valid"
         ) from exc
     finally:
         for conn in (source, dest):
             if conn is not None:
                 conn.close()
-    return backup_dir
+    return _publish_backup(staging, final_dir)
 
 
 def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
@@ -459,29 +513,45 @@ def quarantine_attestation_store_artifacts(path: Path) -> Optional[Path]:
     """
     if not path.exists():
         return None
-    backup_dir = _new_backup_dir(path)
+    staging, final_dir = _stage_backup(path)
     try:
-        shutil.copy2(path, backup_dir / path.name)
+        shutil.copy2(path, staging / path.name)
         for suffix in _SIDECAR_SUFFIXES:
             sidecar = path.with_name(path.name + suffix)
             if sidecar.exists():
-                shutil.copy2(sidecar, backup_dir / sidecar.name)
+                shutil.copy2(sidecar, staging / sidecar.name)
     except OSError as exc:
+        _discard_staging(staging)
         raise StateStoreError(
-            f"quarantine of {path} failed ({exc}); rebuild aborted (nothing was removed)"
+            f"quarantine of {path} failed ({exc}); rebuild aborted (nothing was removed, "
+            f"and no partial recovery point was published)"
         ) from exc
-    return backup_dir
+    return _publish_backup(staging, final_dir)
 
 
 def remove_attestation_store_artifacts(path: Path) -> None:
-    """Remove the store and every sidecar (only after a successful quarantine).
+    """Remove every sidecar FIRST and the main store LAST (after a successful quarantine).
 
-    Leaving a ``-wal`` behind while removing the main DB would let a later open resurrect
-    a partial store from the orphaned sidecar, so the rotation must be whole-artifact too.
+    The order is the correctness property, not a detail (Redmine #13882 review j#80045
+    R3-F2). The main file is what :func:`probe_store_schema` uses to decide a store
+    *exists*, which makes it the rotation's **completion sentinel**. Removing it first
+    made a half-done rotation indistinguishable from a finished one: measured, a failing
+    ``-wal`` unlink left ``main`` gone and the sidecar orphaned, and the retry then probed
+    ``STORE_ABSENT`` and reported ``already_current`` ("no store exists") — so the public
+    command declared success while the orphan persisted, and no rerun could ever clear it.
+    An orphaned ``-wal`` is not inert either: a later open can resurrect a partial store
+    from it.
+
+    Sidecars-first inverts that. Any interruption leaves the main file present, so the
+    store still probes as existing, the rotation is still visibly incomplete, and the very
+    same command re-run finishes the job — which is what Acceptance 3's idempotency means.
     """
-    for candidate in (path, *(path.with_name(path.name + s) for s in _SIDECAR_SUFFIXES)):
-        if candidate.exists():
-            candidate.unlink()
+    for suffix in _SIDECAR_SUFFIXES:
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    if path.exists():
+        path.unlink()
 
 
 # --- Migration outcome vocabulary (the explicit operator command only). ---------------
