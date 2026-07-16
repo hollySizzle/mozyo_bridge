@@ -248,6 +248,7 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
     record, an unbootstrapped fence, a lost reserve, opaque post-anchor journals, a landed gate, or
     a superseded round all zero-send.
     """
+    from mozyo_bridge.core.state.callback_sweep_lease import CallbackSweepLease
     from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
         build_recovery_recorder,
@@ -292,6 +293,10 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
             "stall classification must be durably recorded before the pointer send (a silent "
             "re-poke is prohibited)"
         )
+    # The lease store is identity-pinned and never auto-creates (R6-F2), so the composition root
+    # bootstraps it explicitly; a store LOSS then fails closed instead of minting a duplicate lease.
+    lease = CallbackSweepLease(home=None)
+    lease.bootstrap()
     result = sweep_once(
         workspace_id=_attested_workspace_id(args),
         lane_id=lane,
@@ -299,6 +304,7 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
         lane_generation=generation,
         source=source,
         fence=DispatchOutboxFence(home=None),
+        lease=lease,
         target_assigned_name=target,
         send_fn=build_recovery_sender(issue=issue, target=target),
         record_fn=build_recovery_recorder(

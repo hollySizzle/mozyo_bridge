@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_sweep_lease import (
+    CallbackSweepLeaseError,
     LEASE_HELD,
     LEASE_RECLAIMED,
     CallbackSweepLease,
@@ -34,6 +36,7 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
     SWEEP_SOURCE_UNREADABLE,
     ZERO_SEND_ATTEMPT_HELD,
+    ZERO_SEND_OWNERSHIP_LOST,
     ZERO_SEND_RECORD_FAILED,
     ZERO_SEND_SOURCE_NOT_FRESH,
     ZERO_SEND_WORKSPACE_UNATTESTED,
@@ -104,6 +107,14 @@ def prose(jid, heading):
     return entry(jid, f"{heading}\n\n(prose body)")
 
 
+def _bootstrapped_lease(home=None):
+    """A ready-to-use attempt lease. The store is identity-pinned and never auto-creates (R6-F2),
+    so it must be bootstrapped explicitly -- exactly as the production composition root does."""
+    lease = CallbackSweepLease(home=home or Path(tempfile.mkdtemp()))
+    lease.bootstrap()
+    return lease
+
+
 class RaceSource:
     """A LIVE-shaped journal source whose record can advance between reads (the TOCTOU window).
 
@@ -155,6 +166,7 @@ class SweepFenceTest(unittest.TestCase):
         self.home = Path(self._tmp.name)
         self.fence = DispatchOutboxFence(home=self.home)
         self.fence.bootstrap()
+        self.lease = _bootstrapped_lease(self.home)
         self.sends = []
         self.recorder = FakeRecorder()
         self.addCleanup(self._tmp.cleanup)
@@ -165,7 +177,7 @@ class SweepFenceTest(unittest.TestCase):
     def sweep(self, source, **kw):
         kw.setdefault("send_fn", self.send)
         kw.setdefault("record_fn", self.recorder)
-        kw.setdefault("lease", CallbackSweepLease(home=Path(tempfile.mkdtemp())))
+        kw.setdefault("lease", _bootstrapped_lease())
         return sweep_once(
             workspace_id=WS,
             lane_id=LANE,
@@ -284,7 +296,7 @@ class SweepFenceTest(unittest.TestCase):
                              progress("201", "progress_log", generation=2)])
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=2,
-            source=source, fence=self.fence, target_assigned_name=TARGET, send_fn=self.send,
+            source=source, fence=self.fence, lease=self.lease, target_assigned_name=TARGET, send_fn=self.send,
             record_fn=self.recorder, callback=CALLBACK_SAME_LANE_ONLY,
         )
         # Sweeping generation 2 itself: its own progress is visible, so it is not a stall.
@@ -320,7 +332,7 @@ class SweepFenceTest(unittest.TestCase):
             source=RaceSource([ir("79990")]),
             fence=bare,
             target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())),
+            lease=_bootstrapped_lease(),
             send_fn=self.send,
             record_fn=self.recorder,
         )
@@ -364,7 +376,7 @@ class SweepFenceTest(unittest.TestCase):
             source=RaceSource([ir("79990")]),
             fence=self.fence,
             target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())),
+            lease=_bootstrapped_lease(),
             send_fn=None,
         )
         self.assertEqual(result["state"], STATE_NO_PROGRESS_AFTER_HANDOFF)
@@ -385,6 +397,7 @@ class SnapshotSourceRefusalTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
         self.fence.bootstrap()
+        self.lease = _bootstrapped_lease(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
     def test_the_real_snapshot_source_cannot_observe_a_later_landing(self):
@@ -417,7 +430,7 @@ class SnapshotSourceRefusalTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=MappingRedmineJournalSource(payload={"issue": {"id": ISSUE}, "journals": [
                 {"id": "79990", "notes": render_dispatch_note("IR", lane=LANE, lane_generation=GEN)}]}),
-            fence=self.fence, target_assigned_name=TARGET,
+            fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
             send_fn=lambda j: sends.append(j), record_fn=FakeRecorder(),
         )
         self.assertFalse(result["sent"])
@@ -443,7 +456,7 @@ class WorkspaceAttestationTest(unittest.TestCase):
             workspace_id=ws, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("79990")]), fence=self.fence,
             target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=lambda j: sends.append(j),
+            lease=_bootstrapped_lease(), send_fn=lambda j: sends.append(j),
             record_fn=FakeRecorder(),
         )
 
@@ -470,6 +483,7 @@ class RecoveryRecordTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
         self.fence.bootstrap()
+        self.lease = _bootstrapped_lease(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
     def sweep(self, *, record_fn, sends, source=None):
@@ -477,7 +491,7 @@ class RecoveryRecordTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=source or RaceSource([ir("79990")]), fence=self.fence,
             target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=lambda j: sends.append(j), record_fn=record_fn,
+            lease=_bootstrapped_lease(), send_fn=lambda j: sends.append(j), record_fn=record_fn,
         )
 
     def test_no_recorder_means_no_send(self):
@@ -501,7 +515,7 @@ class RecoveryRecordTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("79990")]), fence=self.fence,
             target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=send, record_fn=recorder,
+            lease=_bootstrapped_lease(), send_fn=send, record_fn=recorder,
         )
         self.assertEqual(order, ["record", "send->90001"])
 
@@ -568,7 +582,7 @@ class RecoveryRecordTest(unittest.TestCase):
         sends = []
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
-            source=LateGateSource(), fence=self.fence, target_assigned_name=TARGET,
+            source=LateGateSource(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
             send_fn=lambda j: sends.append(j), record_fn=FakeRecorder("99999"),
         )
         self.assertFalse(result["sent"])
@@ -595,7 +609,7 @@ class RecoveryRecordTest(unittest.TestCase):
         sends = []
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
-            source=AfterRecordSource(), fence=self.fence, target_assigned_name=TARGET,
+            source=AfterRecordSource(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
             send_fn=lambda j: sends.append(j), record_fn=FakeRecorder("90001"),
         )
         self.assertFalse(result["sent"])
@@ -618,7 +632,7 @@ class RecoveryRecordTest(unittest.TestCase):
 
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
-            source=PrecedingSource(), fence=self.fence, target_assigned_name=TARGET,
+            source=PrecedingSource(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
             send_fn=lambda j: None, record_fn=FakeRecorder("99999"),
         )
         self.assertFalse(result["sent"])
@@ -721,7 +735,7 @@ class ProductionRecorderTest(unittest.TestCase):
         self.fence.bootstrap()
         self.posted = []
         self.sends = []
-        self.lease = CallbackSweepLease(home=Path(self._tmp.name))
+        self.lease = _bootstrapped_lease(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
     def outcomes(self):
@@ -941,7 +955,7 @@ class ProductionRecorderTest(unittest.TestCase):
 
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
-            source=FailVerify(), fence=self.fence, target_assigned_name=TARGET,
+            source=FailVerify(), fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
             send_fn=lambda j: self.sends.append(j), record_fn=FakeRecorder("90001"),
         )
         self.assertFalse(result["sent"])
@@ -962,7 +976,7 @@ class AttemptLeaseTest(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.lease = CallbackSweepLease(home=Path(self._tmp.name))
+        self.lease = _bootstrapped_lease(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
     def key(self):
@@ -998,6 +1012,139 @@ class AttemptLeaseTest(unittest.TestCase):
         self.assertTrue(taken.owned)
         self.assertEqual(taken.status, LEASE_RECLAIMED)
         self.assertFalse(self.lease.release(self.key(), dead.token))
+
+
+class LeaseOwnershipFencingTest(unittest.TestCase):
+    """Review R6-F1/F2: acquiring is not owning. Ownership is re-verified at every durable act."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.lease = _bootstrapped_lease(self.home)
+        self.fence = DispatchOutboxFence(home=self.home)
+        self.fence.bootstrap()
+        self.posted = []
+        self.sends = []
+        self.addCleanup(self._tmp.cleanup)
+
+    def key(self):
+        return LeaseKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, anchor="79990")
+
+    def test_an_owner_that_lost_its_expired_lease_publishes_nothing_and_sends_nothing(self):
+        # R6-F1. My R6 safety argument -- "a dead owner provably has not sent, because the send is
+        # fence-gated after the leased work" -- only ever covered the SEND. Publication is gated by
+        # the lease ALONE, so an owner that is merely SLOW (not dead) could outlive its TTL, get
+        # reclaimed, and still publish: two durable records for one anchor.
+        held = self.lease.acquire(self.key())
+        # another sweep reclaims the anchor while this owner is still working
+        self.lease.acquire(self.key(), now=time.time() + 99999)
+        self.assertFalse(self.lease.owns(self.key(), held.token))
+
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=RaceSource([ir("79990")]), fence=self.fence, lease=self.lease,
+            target_assigned_name=TARGET, send_fn=lambda j: self.sends.append(j),
+            record_fn=build_recovery_recorder(
+                source=RaceSource([ir("79990")]), issue=ISSUE, lane=LANE, lane_generation=GEN,
+                post_note=lambda i, n: self.posted.append(n),
+            ),
+        )
+        # This sweep is a fresh attempt: it either owns the lease cleanly, or stands down. What it
+        # must never do is publish while a different owner holds the anchor.
+        self.assertLessEqual(len(self.posted), 1)
+        self.assertEqual(self.sends, [])
+
+    def test_a_lapsed_owner_records_no_stall_and_sends_nothing(self):
+        # R6-F1 on the path where it is load-bearing. The sweep acquires the lease and then does
+        # its Redmine reads; a slow owner can outlive its TTL right there and be reclaimed. Without
+        # a check at the durable act, this sweep and the new owner both publish -- two
+        # `no_progress_after_handoff` records for one anchor, which is what the auditor reproduced.
+        #
+        # The lease is stolen during the BOUNDARY re-read, i.e. after this sweep acquired and while
+        # it is still working: exactly the "slow, not dead" owner the TTL creates.
+        outer = self
+
+        class StealingSource:
+            fresh_read = True
+
+            def __init__(self):
+                self.n = 0
+
+            def read_entries(self, issue_id):
+                self.n += 1
+                if self.n == 2:  # the boundary re-read: the sweep already owns the lease
+                    outer.lease.acquire(outer.key(), now=time.time() + 99999)
+                return [ir("79990")]  # a genuinely silent lane -> the stall path
+
+        posted = []
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=StealingSource(), fence=self.fence, lease=self.lease,
+            target_assigned_name=TARGET, send_fn=lambda j: self.sends.append(j),
+            record_fn=lambda r, w: (posted.append(r["state"]), "90001")[1],
+        )
+        self.assertEqual(posted, [])                 # published nothing: it no longer owns it
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_OWNERSHIP_LOST)
+        self.assertEqual(self.sends, [])
+
+    def test_expiry_alone_ends_ownership_even_if_nobody_reclaims(self):
+        # Isolates the TTL check. The reclaim test cannot: reclaiming REPLACES the token, so it
+        # fails the identity comparison regardless of whether expiry is honoured -- a probe showed
+        # `owns` could ignore the deadline entirely with every test still green. An owner whose
+        # lease simply lapsed is not an owner, even with nobody waiting.
+        a = self.lease.acquire(self.key(), ttl_seconds=0.01)
+        self.assertTrue(self.lease.owns(self.key(), a.token))
+        time.sleep(0.05)
+        self.assertFalse(self.lease.owns(self.key(), a.token))
+
+    def test_a_lost_store_is_refused_as_a_store_loss_specifically(self):
+        # Distinguishes the two store-identity guards. Both fail closed, so an assertRaises alone
+        # cannot tell them apart; this pins that the MISSING-DB case is diagnosed as a store loss
+        # rather than falling through to the nonce mismatch by luck.
+        self.lease.acquire(self.key())
+        self.lease.path.unlink()
+        with self.assertRaises(CallbackSweepLeaseError) as ctx:
+            self.lease.acquire(self.key())
+        self.assertIn("store", str(ctx.exception).lower())
+        self.assertIn("missing", str(ctx.exception).lower())
+
+    def test_a_stale_owner_cannot_publish_after_reclaim(self):
+        # The invariant stated directly: a token that no longer owns the anchor is not owning,
+        # whatever it did earlier.
+        a = self.lease.acquire(self.key())
+        self.assertTrue(self.lease.owns(self.key(), a.token))
+        b = self.lease.acquire(self.key(), now=time.time() + 99999)
+        self.assertFalse(self.lease.owns(self.key(), a.token))   # A lost it
+        self.assertTrue(self.lease.owns(self.key(), b.token))    # B holds it
+        self.assertFalse(self.lease.release(self.key(), a.token))  # A cannot drop B's lease
+
+    def test_a_replaced_store_is_not_the_store_the_grant_came_from(self):
+        # R6-F2: a deleted / recreated store used to hand a second live owner the same anchor while
+        # the first still believed it held the lease. Store identity makes that detectable.
+        a = self.lease.acquire(self.key())
+        self.assertTrue(self.lease.owns(self.key(), a.token, store_nonce=a.store_nonce))
+        self.lease.path.unlink()                    # the store is lost underneath the owner
+        with self.assertRaises(CallbackSweepLeaseError):
+            self.lease.acquire(self.key())          # no silent re-create -> no second owner
+        with self.assertRaises(CallbackSweepLeaseError):
+            self.lease.owns(self.key(), a.token, store_nonce=a.store_nonce)
+
+    def test_a_recreated_store_invalidates_an_older_grant(self):
+        a = self.lease.acquire(self.key())
+        self.lease.path.unlink()
+        self.lease.sidecar_path.unlink()
+        fresh = _bootstrapped_lease(self.home)      # a deliberately re-bootstrapped store
+        b = fresh.acquire(self.key())
+        self.assertNotEqual(a.store_nonce, b.store_nonce)
+        # The old grant is not honoured against the new store identity.
+        self.assertFalse(fresh.owns(self.key(), a.token, store_nonce=a.store_nonce))
+
+    def test_bootstrap_refuses_a_lost_store(self):
+        # sidecar present, DB gone = store loss. Re-creating silently is what mints duplicates.
+        self.lease.path.unlink()
+        with self.assertRaises(CallbackSweepLeaseError):
+            _bootstrapped_lease(self.home)
 
 
 class ProducerWiringTest(unittest.TestCase):
@@ -1036,7 +1183,7 @@ class ProducerWiringTest(unittest.TestCase):
             source=RaceSource([ir("80000"), written]),
             fence=DispatchOutboxFence(home=Path(tempfile.mkdtemp())),
             target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=None, callback=CALLBACK_SAME_LANE_ONLY,
+            lease=_bootstrapped_lease(), send_fn=None, callback=CALLBACK_SAME_LANE_ONLY,
         )
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
         self.assertEqual(result["progress_journals"], [{"journal": "80002", "kind": "review_finding_verdict"}])
@@ -1110,7 +1257,7 @@ class RecoverySenderTest(unittest.TestCase):
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
                 source=RaceSource([ir("79990")]), fence=fence,
                 target_assigned_name=TARGET,
-            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=sender, record_fn=FakeRecorder(),
+            lease=_bootstrapped_lease(), send_fn=sender, record_fn=FakeRecorder(),
             )
         self.assertEqual(len(calls), 1)  # at most once per dispatch anchor
 
