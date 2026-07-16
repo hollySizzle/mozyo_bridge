@@ -8,22 +8,29 @@ The composition the issue's acceptance describes, in one ordered path:
 2. **re-read** immediately before any mutation and re-derive the watermark. A gate landing in the
    decision->send window (the 8-second j#79995 -> j#79996 evidence window) turns the verdict into
    ``progress_without_callback`` and the mutation is refused (acceptance 2/3);
-3. **fence** the surviving mutation on :class:`...dispatch_outbox_fence.DispatchOutboxFence`, keyed
-   on the dispatch anchor, so recovery is delivered **at most once per gate anchor** even across
-   crashes and concurrent sweeps (acceptance 5);
-4. **record** the classification durably, then point the one notification at THAT journal — a
-   re-poke with no journal behind it is invisible to the next coordinator and is prohibited.
+3. **record** the classification durably — before touching any authority (review R3-F3) — and
+   point the one notification at THAT journal; a re-poke with no journal behind it is invisible to
+   the next coordinator and is prohibited (review R2-F3);
+4. **verify** against the record's own journal id, then **fence** the send so recovery is delivered
+   **at most once per gate anchor** across crashes and concurrent sweeps (acceptance 5).
 
-Each guard covers a failure the others cannot, so all four are required:
+Each guard covers a failure the others cannot, and every one of them was, at some revision, present
+but ineffective — which is the lesson the ordering encodes:
 
 - the **re-read** stops a correct-but-stale verdict from mutating, but only if the source can
   actually return newer data. A frozen snapshot re-read is a no-op that merely *looks* like a guard
   (review R2-F1), so mutation requires a source that positively declares :func:`source_is_fresh`;
 - the **fence** is the at-most-once authority, but only if its key is real: the key is partitioned
-  by workspace, so an unattested (blank) id reserves a different row and the same recovery sends
-  again (review R2-F2). An unmeasured partition is not a fence;
-- the **record** makes the action auditable, and it is written *after* the reserve and *before* the
-  send — a send whose reason never landed durably is the prohibited silent re-poke (review R2-F3).
+  by workspace, so an unattested id reserves a different row and the same recovery sends again
+  (review R2-F2). An unmeasured partition is not a fence;
+- the **record** is written BEFORE the reserve (review R3-F3). Reserving first and cancelling on a
+  write failure looked like a clean rollback but was not: ``FENCE_CANCELLED`` is terminal to
+  ``reserve``, so a transient failure blocked that anchor's recovery permanently. The record is
+  idempotent, so writing it first costs nothing and leaves a failed attempt with no durable
+  side-effect to undo;
+- **no CAS exists** in Redmine, so the last window is closed by position rather than by locking:
+  the record's journal id ``R`` is a serialization point, and the sweep requires that no qualifying
+  gate PRECEDES ``R`` (review R3-F1). A gate before ``R`` proves the verdict was stale when written.
 
 Every failure degrades to **zero-send**: an unreadable source, a non-fresh source, an unattested
 workspace, an unwritable record, an unbootstrapped / replaced fence, or a lost reserve all refuse
@@ -43,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_RESERVED,
     SWEEP_RECOVERY_ACTION_ID,
     SWEEP_STATE_STALL_UNPROVABLE,
+    _journal_int,
     render_sweep_record_note,
     sweep_record_journals,
     ZERO_SEND_FENCE_HELD,
@@ -220,10 +228,61 @@ def sweep_once(
         _record_resolution(result, record_fn, decided)
         return result
 
-    # (2) Pre-mutation re-read: close the TOCTOU window the evidence lands in.
+    return _mutating_path(
+        result=result,
+        decided=decided,
+        source=source,
+        issue=issue_s,
+        lane=laneid,
+        lane_generation=lane_generation,
+        workspace_id=wsid,
+        fence=fence,
+        target_assigned_name=target_assigned_name,
+        send_fn=send_fn,
+        record_fn=record_fn,
+        now=now,
+    )
+
+
+def _mutating_path(
+    *,
+    result: dict[str, Any],
+    decided: SweepWatermark,
+    source: object,
+    issue: str,
+    lane: str,
+    lane_generation: object,
+    workspace_id: str,
+    fence: DispatchOutboxFence,
+    target_assigned_name: str,
+    send_fn: Callable[[str], object],
+    record_fn: Callable[[dict, SweepWatermark], str],
+    now: Optional[str],
+) -> dict[str, Any]:
+    """The stall path: re-read at the mutation boundary, record, verify, reserve, send once.
+
+    The ordering is the whole design, and each step is where a previous revision broke:
+
+    1. **re-read + re-classify** at the mutation boundary. A gate landing here folds the verdict to
+       a zero-send resolution (acceptance 2/3);
+    2. **record** the stall durably — BEFORE the reserve (review R3-F3). An earlier revision
+       reserved first and cancelled the key when the record failed, but ``FENCE_CANCELLED`` is
+       *terminal* to ``reserve``, so a transient write failure blocked that anchor's recovery
+       forever. The record is idempotent (marker pre-read), so it is safe to write before holding
+       the reservation, and a failed write now touches no durable authority at all: the retry is
+       simply the next sweep. The fence's job is narrowed to what it is actually good at — making
+       the **send** at-most-once;
+    3. **verify against the record's own position** (review R3-F1). Redmine offers no CAS, but the
+       record's journal id ``R`` is a durable serialization point: every qualifying gate is either
+       before ``R`` or after it. The invariant the sweep can and does enforce is *no qualifying gate
+       precedes our record*. A gate at ``< R`` means the record was already stale when written, so
+       the send is refused; a gate at ``> R`` genuinely landed after the sweep's recorded verdict;
+    4. **reserve**, then **send** exactly once, pointing at ``R``.
+    """
+    # (1) Mutation-boundary re-read: the last chance to notice the lane is not stalled.
     try:
         rechecked = read_watermark(
-            source, issue_s, lane=laneid, lane_generation=lane_generation
+            source, issue, lane=lane, lane_generation=lane_generation
         )
     except Exception as exc:  # noqa: BLE001 - an unreadable re-check must not mutate
         return _unreadable(exc)
@@ -236,11 +295,80 @@ def sweep_once(
         _record_resolution(folded, record_fn, rechecked)
         return folded
 
-    # (3) The one fenced mutation, keyed on the dispatch anchor -> at most once per gate anchor.
+    # (2) Record the stall durably BEFORE reserving anything (R3-F3).
+    try:
+        record_journal = str(record_fn(dict(result), rechecked) or "").strip()
+    except Exception as exc:  # noqa: BLE001 - an unwritable record must not become a silent poke
+        record_journal, record_error = "", type(exc).__name__
+    else:
+        record_error = ""
+    if not record_journal:
+        result["send_reason"] = ZERO_SEND_RECORD_FAILED
+        result["send_detail"] = (
+            f"the recovery classification could not be durably recorded "
+            f"({record_error or 'unresolved'}); nothing was sent and NO durable authority was "
+            f"touched, so the next sweep retries this anchor cleanly"
+        )
+        result["resolution_recorded"] = False
+        return result
+    result["recovery_record_journal"] = record_journal
+    result["resolution_recorded"] = True
+
+    # (3) The CAS-equivalent: no qualifying gate may PRECEDE our record (R3-F1).
+    try:
+        verified = read_watermark(
+            source, issue, lane=lane, lane_generation=lane_generation
+        )
+    except Exception as exc:  # noqa: BLE001 - an unverifiable position must not send
+        return _unreadable(exc)
+    if not verified.stall_provable:
+        # ANY qualifying progress refuses the send — a lane that is demonstrably advancing must not
+        # be poked, whenever the gate landed. The record's position does not change *whether* to
+        # send; it changes what the durable log now means, which is worth stating exactly:
+        #
+        # - progress PRECEDING j#R: the stall record was already false when written, so the log now
+        #   holds a wrong verdict that a reader must not trust (``record_stale_at_write``);
+        # - progress AFTER j#R: the record was true as of j#R and the lane simply advanced next —
+        #   an honest, ordered history that needs no correction.
+        preceding = [
+            (j, kind)
+            for j, kind in verified.progress
+            if _journal_int(j) < _journal_int(record_journal, default=-1)
+        ]
+        detail = (
+            f"qualifying progress at j#{preceding[0][0]} PRECEDES this sweep's own record "
+            f"j#{record_journal}: the stall verdict was already stale when it was written"
+            if preceding
+            else (
+                f"qualifying progress landed after this sweep's record j#{record_journal}: the "
+                f"record was true when written, but the lane is advancing now"
+                if verified.has_progress
+                else f"the record at j#{record_journal} is contradicted by unreadable post-anchor "
+                f"journals; the stall is unprovable"
+            )
+        )
+        folded = _apply_zero_send(
+            result,
+            RecoveryDecision(
+                send=False,
+                reason=(
+                    ZERO_SEND_PROGRESS_LANDED
+                    if verified.has_progress
+                    else ZERO_SEND_STALL_UNPROVABLE
+                ),
+                detail=f"{detail}; the recovery is refused",
+            ),
+            verified,
+        )
+        folded["record_stale_at_write"] = bool(preceding)
+        _record_resolution(folded, record_fn, verified)
+        return folded
+
+    # (4) Reserve the ONE send, then send it pointing at the record.
     key = FenceKey(
-        workspace_id=wsid,
-        lane_id=laneid,
-        issue=issue_s,
+        workspace_id=workspace_id,
+        lane_id=lane,
+        issue=issue,
         journal=rechecked.dispatch_journal,
         action_id=SWEEP_RECOVERY_ACTION_ID,
         target_assigned_name=str(target_assigned_name).strip(),
@@ -263,31 +391,6 @@ def sweep_once(
         )
         result["needs_reconcile"] = bool(reserve.needs_reconcile)
         return result
-
-    # (4) Record the stall classification DURABLY, before the pointer send (review R2-F3). The
-    #     notification then points at THIS journal, not at the original dispatch: the next
-    #     coordinator reads why the recovery happened, not merely that something was re-poked.
-    #     A record that cannot be written / resolved cancels the reservation — a send whose reason
-    #     is not on the record is the prohibited silent re-poke.
-    try:
-        record_journal = str(record_fn(dict(result), rechecked) or "").strip()
-    except Exception as exc:  # noqa: BLE001 - an unwritable record must not become a silent poke
-        record_journal = ""
-        record_error: object = type(exc).__name__
-    else:
-        record_error = ""
-    if not record_journal:
-        fence.mark_cancelled(
-            key, detail=f"recovery record not durable ({record_error or 'unresolved'})", now=now
-        )
-        result["send_reason"] = ZERO_SEND_RECORD_FAILED
-        result["send_detail"] = (
-            f"the recovery classification could not be durably recorded "
-            f"({record_error or 'unresolved'}); the send is cancelled rather than performed as a "
-            f"silent re-poke, and the fence key is released for a later attempt"
-        )
-        return result
-    result["recovery_record_journal"] = record_journal
 
     try:
         send_fn(record_journal)
@@ -316,22 +419,37 @@ def _record_resolution(
     record_fn: Optional[Callable[[dict, SweepWatermark], str]],
     watermark: SweepWatermark,
 ) -> None:
-    """Durably record a zero-send resolution, best-effort (acceptance 3 / review R2-F3).
+    """Durably record a resolution and report FAIL-CLOSED when it did not land (review R3-F4).
 
     A resolution (``progress_without_callback`` picked up first-pass, an abstention, a superseded
-    round) is a durable event the next coordinator must see — the whole point of acceptance 3 is
-    that no later correction journal is needed. Unlike the send path this is best-effort: nothing
-    was mutated, so a failed write degrades the audit trail rather than risking a duplicate.
+    round) is itself the durable event the workflow contract requires — the rule names the *stall
+    check and its classification*, not only the send, and acceptance 3 says to **record** the
+    first-pass resolution, not merely to compute it.
+
+    An earlier revision made this best-effort, which let the sweep return
+    ``state='progress_without_callback'`` as a "first-pass resolution" while nothing whatsoever had
+    been written. That is a claim the caller cannot distinguish from a real one, so the outcome now
+    carries ``resolution_recorded`` explicitly: ``False`` means the verdict stands but is NOT
+    durable, and the caller (CLI exit code, journal text) must surface it as incomplete rather than
+    as a resolved sweep.
     """
     if record_fn is None:
+        result["resolution_recorded"] = False
+        result["record_reason"] = "no_recorder"
         return
     try:
         journal = str(record_fn(dict(result), watermark) or "").strip()
-    except Exception as exc:  # noqa: BLE001 - a failed resolution record never fails the sweep
-        result["recovery_record_reason"] = type(exc).__name__
+    except Exception as exc:  # noqa: BLE001 - surfaced as incomplete, never swallowed as success
+        result["resolution_recorded"] = False
+        result["record_reason"] = type(exc).__name__
         return
-    if journal:
-        result["recovery_record_journal"] = journal
+    if not journal:
+        result["resolution_recorded"] = False
+        result["record_reason"] = "unresolved"
+        return
+    result["recovery_record_journal"] = journal
+    result["resolution_recorded"] = True
+    result["record_reason"] = ""
 
 
 def _apply_zero_send(

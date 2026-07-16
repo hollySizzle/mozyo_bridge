@@ -192,30 +192,42 @@ def _derive_from_journals(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _attested_workspace_id(args: argparse.Namespace) -> str:
-    """Resolve the attested partition workspace id from the durable anchor, or fail closed (R2-F2).
+    """MEASURE the partition workspace id from the canonical registry authority (review R3-F2).
 
-    The fence key is partitioned by workspace, so a blank / wrong id reserves a DIFFERENT row and
-    the same recovery sends twice. The id therefore has to be *measured*, not defaulted: it comes
-    from the repo's durable workspace anchor, and an explicit ``--workspace-id`` must MATCH it
-    rather than override it (an operator typo would otherwise mint a fresh fence partition).
+    The fence key is partitioned by workspace, so a wrong / invented id reserves a DIFFERENT row and
+    the same recovery sends twice. The id must therefore be measured, and an earlier revision only
+    *claimed* to measure it: it read ``read_anchor(repo_root)`` and then fell back to the
+    caller-supplied ``--workspace-id`` when that returned ``None`` — which is exactly what happens
+    in a **linked sublane worktree**, where anchors are untracked. So on every lane where this
+    command actually runs, the "measured" authority was absent and the CLI argument minted the fence
+    partition itself.
+
+    The authority is :func:`...workspace_registry.resolve_canonical_session`, the canonical resolver
+    that already handles the #13152 topology: registry row -> local anchor -> **linked worktree
+    inheriting its main checkout's identity** -> derivation. A sublane worktree resolves to its
+    parent workspace_id through that inheritance, which is the id the fence must partition on.
+
+    ``--workspace-id`` is an **equality assertion only** — it can confirm what was measured but can
+    never supply it. A blank / unreadable authority returns blank, and :func:`sweep_once` then
+    zero-sends rather than actuate on a partition nobody measured.
     """
     from mozyo_bridge.application.commands_common import repo_root_from_args
-    from mozyo_bridge.core.state.workspace_registry import read_anchor
+    from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
 
     try:
-        anchor = read_anchor(repo_root_from_args(args))
-    except Exception:  # noqa: BLE001 - an unreadable anchor is unattested, never assumed
-        anchor = None
-    resolved = ""
-    if isinstance(anchor, dict):
-        resolved = str(anchor.get("workspace_id", "") or "").strip()
+        resolved = str(
+            resolve_canonical_session(repo_root_from_args(args)).workspace_id or ""
+        ).strip()
+    except Exception:  # noqa: BLE001 - an unreadable authority is unattested, never assumed
+        resolved = ""
     asserted = str(getattr(args, "workspace_id", "") or "").strip()
-    if asserted and resolved and asserted != resolved:
+    if asserted and asserted != resolved:
         raise SystemExit(
-            f"--workspace-id {asserted!r} does not match the durable workspace anchor "
-            f"{resolved!r}; refusing to actuate on an unattested fence partition"
+            f"--workspace-id {asserted!r} does not match the measured workspace identity "
+            f"{resolved or '<unresolved>'!r}; refusing to actuate on an unattested fence "
+            f"partition (the flag asserts what was measured, it cannot supply it)"
         )
-    return resolved or asserted
+    return resolved
 
 
 def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
@@ -347,6 +359,14 @@ def format_callback_recovery_text(result: dict[str, Any]) -> str:
             "hand, so a gate that landed after your read is invisible here. Pass --journals-json "
             "with --lane/--lane-generation to derive it from the durable record instead."
         )
+    if result.get("resolution_recorded") is False:
+        lines.append(
+            f"  INCOMPLETE: the verdict was NOT durably recorded "
+            f"({result.get('record_reason') or 'unknown'}) — a stall check and its classification "
+            f"are themselves durable events, so this sweep is not resolved"
+        )
+    elif result.get("recovery_record_journal"):
+        lines.append(f"  recovery record: j#{result['recovery_record_journal']}")
     lines += [f"  summary: {result['summary']}", "  recovery:"]
     for i, step in enumerate(result["recovery"], 1):
         lines.append(f"    {i}. {step}")
@@ -363,6 +383,11 @@ def cmd_sublane_callback_recovery(args: argparse.Namespace) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_callback_recovery_text(result))
+    # An actuating sweep whose resolution never landed durably is INCOMPLETE, not resolved
+    # (review R3-F4): exit non-zero so a caller reading only the return code can never treat an
+    # unrecorded verdict as a finished sweep.
+    if result.get("resolution_recorded") is False:
+        return 1
     # A genuine stall returns non-zero so the coordinator can branch on it in
     # scripts; non-stall outcomes (complete / not-required / not-a-candidate)
     # return 0. Read-only either way.

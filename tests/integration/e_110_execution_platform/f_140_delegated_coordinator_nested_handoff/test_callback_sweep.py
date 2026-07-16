@@ -186,11 +186,13 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(self.sends, [self.recorder.journal])
         self.assertEqual(self.fence.state_of(self.anchor_key()), FENCE_DELIVERED)
 
-    def test_the_sweep_re_reads_before_mutating(self):
-        # Acceptance 2: the decision read and the pre-mutation re-check are SEPARATE durable reads.
+    def test_the_sweep_re_reads_before_and_after_recording(self):
+        # Acceptance 2 + review R3-F1: the decision read, the mutation-boundary re-check, and the
+        # post-record position verify are all SEPARATE durable reads. Closing one window used to
+        # just move it one step later, so the count is pinned deliberately.
         source = RaceSource([ir("79990")])
         self.sweep(source)
-        self.assertEqual(source.reads, 2)
+        self.assertEqual(source.reads, 3)
 
     def test_gate_landing_in_the_toctou_window_is_zero_send(self):
         # The #13883 evidence race: the decision read sees a silent lane; the review gate lands;
@@ -207,6 +209,12 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(self.sends, [])
         # Nothing was reserved, so a later legitimate round is not fenced out by this one.
         self.assertEqual(self.fence.state_of(self.anchor_key()), "absent")
+        # The mutation-boundary re-read and the post-record verify BOTH refuse this send, so
+        # asserting zero-send alone cannot tell them apart (a probe showed the boundary re-read
+        # could be deleted with every test still green). What only the boundary re-read buys is
+        # that no FALSE stall record is written into the durable log at all — the verify can only
+        # decline to send after one already landed. So pin the log, not just the send.
+        self.assertEqual(self.recorder.records, [STATE_PROGRESS_WITHOUT_CALLBACK])
 
     def test_worker_verdict_landing_in_the_window_is_zero_send(self):
         # Evidence 2 end-to-end: j#80002 review_finding_verdict lands mid-sweep -> no replay.
@@ -239,6 +247,8 @@ class SweepFenceTest(unittest.TestCase):
         self.assertEqual(result["opaque_journals"], ["80002"])
         self.assertEqual(self.sends, [])
         self.assertEqual(self.fence.state_of(self.anchor_key()), "absent")
+        # As above: only the boundary re-read prevents a false stall record from being written.
+        self.assertEqual(self.recorder.records, [SWEEP_STATE_STALL_UNPROVABLE])
 
     def test_prose_only_gate_present_from_the_start_is_never_a_stall_verdict(self):
         # The same real shape, already on the record at the decision read (the j#79995 case).
@@ -480,17 +490,124 @@ class RecoveryRecordTest(unittest.TestCase):
         )
         self.assertEqual(order, ["record", "send->90001"])
 
-    def test_an_unresolvable_record_cancels_the_send_and_releases_the_fence(self):
+    def test_an_unresolvable_record_is_zero_send(self):
         # A send whose reason never landed durably is the prohibited silent re-poke.
         sends = []
         result = self.sweep(record_fn=lambda r, w: "", sends=sends)
         self.assertFalse(result["sent"])
         self.assertEqual(result["send_reason"], ZERO_SEND_RECORD_FAILED)
+        self.assertFalse(result["resolution_recorded"])
         self.assertEqual(sends, [])
-        # Cancelled, not delivered: a later attempt is not permanently fenced out by this failure.
+
+    def test_a_record_failure_leaves_no_durable_authority_touched(self):
+        # Review R3-F3. The previous revision reserved first and marked the key `cancelled` on a
+        # record failure, claiming it was "released for a later attempt" -- but FENCE_CANCELLED is
+        # TERMINAL to reserve(), so that anchor's recovery was blocked forever. Recording before
+        # reserving means a failed attempt touches nothing.
+        self.sweep(record_fn=lambda r, w: "", sends=[])
         self.assertEqual(self.fence.state_of(FenceKey(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, journal="79990",
-            action_id=SWEEP_RECOVERY_ACTION_ID, target_assigned_name=TARGET)), "cancelled")
+            action_id=SWEEP_RECOVERY_ACTION_ID, target_assigned_name=TARGET)), "absent")
+
+    def test_a_transient_record_failure_is_retryable_and_then_sends_exactly_once(self):
+        # The reviewer's exact reproduction: attempt 1 fails to record, attempt 2 has a healthy
+        # writer. The old code returned `fence_held` here and could never send again.
+        sends = []
+        first = self.sweep(record_fn=lambda r, w: "", sends=sends)
+        self.assertEqual(first["send_reason"], ZERO_SEND_RECORD_FAILED)
+
+        second = self.sweep(record_fn=FakeRecorder("90002"), sends=sends)
+        self.assertTrue(second["sent"])
+        self.assertEqual(sends, ["90002"])
+
+        # ...and the retry is still at-most-once: a third healthy sweep does not re-send.
+        third = self.sweep(record_fn=FakeRecorder("90002"), sends=sends)
+        self.assertFalse(third["sent"])
+        self.assertEqual(third["send_reason"], ZERO_SEND_FENCE_HELD)
+        self.assertEqual(sends, ["90002"])
+
+    def test_a_gate_landing_after_the_boundary_read_but_before_the_record_is_zero_send(self):
+        # Review R3-F1, the exact seam: the decision read and the mutation-boundary re-read both
+        # see a silent lane, and the gate lands while the record is being written. The previous
+        # revision wrote a stall record and SENT; the recorder's own fresh read saw the gate but
+        # was only used to look for existing records, never to re-classify.
+        #
+        # Redmine has no CAS, so the window is closed by POSITION: the record's journal id is a
+        # serialization point, and a qualifying gate PRECEDING it proves the verdict was already
+        # stale when written.
+        gate_j = gate("79995", "review_result", conclusion="changes_requested")
+
+        class LateGateSource:
+            fresh_read = True
+
+            def __init__(self):
+                self.reads = 0
+
+            def read_entries(self, issue_id):
+                self.reads += 1
+                # reads 1-2: decision + mutation boundary -> silent.
+                # read 3+: the post-record verify -> the gate is now on the record, at j#79995,
+                # which precedes the record written at j#99999.
+                return [ir("79990")] if self.reads <= 2 else [ir("79990"), gate_j]
+
+        sends = []
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=LateGateSource(), fence=self.fence, target_assigned_name=TARGET,
+            send_fn=lambda j: sends.append(j), record_fn=FakeRecorder("99999"),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_PROGRESS_LANDED)
+        self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
+        self.assertEqual(sends, [])
+
+    def test_a_gate_landing_after_the_record_also_zero_sends_but_is_not_a_stale_record(self):
+        # The position check decides what the LOG means, not whether to send: any live lane is
+        # left alone. A gate after j#R means the record was true when written, so no correction is
+        # owed -- distinct from the preceding-gate case, where the log now holds a false verdict.
+        late = gate("99999", "review_result", conclusion="changes_requested")
+
+        class AfterRecordSource:
+            fresh_read = True
+
+            def __init__(self):
+                self.reads = 0
+
+            def read_entries(self, issue_id):
+                self.reads += 1
+                return [ir("79990")] if self.reads <= 2 else [ir("79990"), late]
+
+        sends = []
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=AfterRecordSource(), fence=self.fence, target_assigned_name=TARGET,
+            send_fn=lambda j: sends.append(j), record_fn=FakeRecorder("90001"),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["send_reason"], ZERO_SEND_PROGRESS_LANDED)
+        self.assertFalse(result["record_stale_at_write"])  # j#99999 > j#90001
+        self.assertEqual(sends, [])
+
+    def test_a_preceding_gate_flags_the_record_as_stale_at_write(self):
+        gate_j = gate("79995", "review_result", conclusion="changes_requested")
+
+        class PrecedingSource:
+            fresh_read = True
+
+            def __init__(self):
+                self.reads = 0
+
+            def read_entries(self, issue_id):
+                self.reads += 1
+                return [ir("79990")] if self.reads <= 2 else [ir("79990"), gate_j]
+
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=PrecedingSource(), fence=self.fence, target_assigned_name=TARGET,
+            send_fn=lambda j: None, record_fn=FakeRecorder("99999"),
+        )
+        self.assertFalse(result["sent"])
+        self.assertTrue(result["record_stale_at_write"])  # j#79995 < j#99999
 
     def test_a_zero_send_resolution_is_still_recorded(self):
         # Acceptance 3: the first-pass resolution is durable; no correction journal is needed.
@@ -503,6 +620,30 @@ class RecoveryRecordTest(unittest.TestCase):
         self.assertFalse(result["sent"])
         self.assertEqual(rec.records, [result["state"]])
         self.assertEqual(result["recovery_record_journal"], rec.journal)
+        self.assertTrue(result["resolution_recorded"])
+
+    def test_a_failed_resolution_record_is_reported_incomplete_not_resolved(self):
+        # Review R3-F4. A best-effort record let the sweep return state='progress_without_callback'
+        # -- presented as a first-pass resolution -- while nothing durable had been written. The
+        # caller could not tell that claim from a real one.
+        def boom(result, watermark):
+            raise RuntimeError("redmine write failed")
+
+        result = self.sweep(
+            record_fn=boom, sends=[],
+            source=RaceSource([ir("79990"), gate("79995", "implementation_done")]),
+        )
+        self.assertFalse(result["resolution_recorded"])
+        self.assertEqual(result["record_reason"], "RuntimeError")
+        self.assertNotIn("recovery_record_journal", result)
+
+    def test_a_blank_resolution_record_is_also_incomplete(self):
+        result = self.sweep(
+            record_fn=lambda r, w: "", sends=[],
+            source=RaceSource([ir("79990"), gate("79995", "implementation_done")]),
+        )
+        self.assertFalse(result["resolution_recorded"])
+        self.assertEqual(result["record_reason"], "unresolved")
 
     def test_the_sweep_record_is_recognized_but_never_progress(self):
         # The needle R2-F3 requires: the coordinator's own record must not clear a genuine stall
