@@ -305,8 +305,38 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         "--progress",
         dest="progress",
         action="store_true",
-        help="A newer durable gate / Progress Log journal appeared after the "
-        "dispatch (implementation_done, review_request, ...).",
+        help="ASSERTED (not dispatch-anchored): a newer durable gate / Progress "
+        "Log journal appeared after the dispatch. A hand-set boolean derived from "
+        "a read you already made, so a gate landing after that read is invisible "
+        "(Redmine #13889). Prefer --journals-json, which derives this from the "
+        "durable record. Ignored when --journals-json is supplied.",
+    )
+    sublane_callback.add_argument(
+        "--journals-json",
+        dest="journals_json",
+        help="Path to an `include=journals` issue snapshot (Redmine REST or MCP "
+        "shape). Derives the progress verdict from the durable record: anchored on "
+        "this lane+generation's exact dispatch marker and ordered by durable "
+        "journal id, so a gate that landed seconds before the sweep is still seen. "
+        "Use with --lane / --lane-generation.",
+    )
+    sublane_callback.add_argument(
+        "--issue",
+        dest="issue",
+        default="",
+        help="Issue id for the --journals-json snapshot (default: read from the payload).",
+    )
+    sublane_callback.add_argument(
+        "--lane",
+        dest="lane",
+        default="",
+        help="Lane id whose dispatch marker anchors the watermark (with --journals-json).",
+    )
+    sublane_callback.add_argument(
+        "--lane-generation",
+        dest="lane_generation",
+        default="",
+        help="Lane generation whose dispatch marker anchors the watermark (with --journals-json).",
     )
     sublane_callback.add_argument(
         "--callback",

@@ -111,6 +111,25 @@ def _parse_marker_fields(body: str) -> dict[str, str]:
     return fields
 
 
+def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
+    """Every ``[mozyo:<channel>:...]`` marker in a note as ``(channel, fields)``, in note order (pure).
+
+    The shared structured-token scan the marker readers are built on: it recognizes the token
+    grammar and parses the field list, but applies **no** vocabulary policy — each reader decides
+    which channel / kind it accepts. Unrecognized channels are dropped here so a reader never has
+    to know the channel set. Prose is never inspected; a note with no token yields ``()``.
+    """
+    if not notes:
+        return ()
+    found: list[tuple[str, dict[str, str]]] = []
+    for match in _MARKER_RE.finditer(notes):
+        channel = match.group("channel")
+        if channel not in _RECOGNIZED_CHANNELS:
+            continue
+        found.append((channel, _parse_marker_fields(match.group("body"))))
+    return tuple(found)
+
+
 @dataclass(frozen=True)
 class RedmineJournalEntry:
     """One Redmine journal entry the source yields (the durable event unit).
@@ -366,14 +385,12 @@ def dispatch_entry_journals(
         return ()
     found: set[str] = set()
     for entry in entries or ():
-        notes = getattr(entry, "notes", "") or ""
         entry_journal = str(getattr(entry, "journal_id", "") or "").strip()
         if not entry_journal:
             continue
-        for match in _MARKER_RE.finditer(notes):
-            if match.group("channel") != MARKER_CHANNEL_WORKFLOW_EVENT:
+        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
                 continue
-            fields = _parse_marker_fields(match.group("body"))
             if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
                 continue
             if str(fields.get("lane", "")).strip() != lane_s:
@@ -476,6 +493,7 @@ __all__ = (
     "MARKER_CHANNEL_WORKFLOW_EVENT",
     "GATE_BEARING_KINDS",
     "RedmineJournalEntry",
+    "marker_fields_in_note",
     "extract_markers_from_note",
     "extract_marker",
     "extract_markers",
