@@ -21,42 +21,76 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalEntry,
-    latest_dispatch_journal_from_entries,
+    render_dispatch_note,
+    resolve_dispatch_entry_journal,
 )
 
 
 class DispatchAnchorTest(unittest.TestCase):
-    """review R4-F3: the exact dispatch anchor is the latest implementation_request handoff journal."""
+    """j#79507 Q2: the anchor is the OWNING entry journal id of the current IR dispatch marker."""
 
-    def _entry(self, jid, kind, anchor_journal):
+    def _ir(self, jid, *, lane, generation):
+        # A canonical IR journal: prose body + the embedded dispatch marker (the writer).
         return RedmineJournalEntry(
             issue_id="13758",
             journal_id=str(jid),
-            notes=(
-                f"## Gate: Implementation Request\n"
-                f"[mozyo:handoff:source=redmine:issue=13758:journal={anchor_journal}:"
-                f"kind={kind}:to=claude]"
+            notes=render_dispatch_note(
+                "## Gate: Implementation Request\nbody...", lane=lane, lane_generation=generation
             ),
         )
 
-    def test_latest_implementation_request_journal_is_the_anchor(self):
-        entries = [
-            self._entry("78056", "implementation_request", "78056"),
-            self._entry("79337", "implementation_request", "79337"),  # a later re-dispatch
-            self._entry("79340", "review_request", "79340"),  # not a dispatch kind
-        ]
-        self.assertEqual(latest_dispatch_journal_from_entries(entries), "79337")
+    def test_owning_entry_journal_is_the_anchor(self):
+        # The anchor is the entry's OWN journal id (79337), NOT any self-reported field.
+        entries = [self._ir("79337", lane="lane-a", generation=1)]
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="lane-a", lane_generation=1), "79337"
+        )
 
-    def test_no_dispatch_marker_yields_blank(self):
-        entries = [self._entry("79340", "review_request", "79340")]
-        self.assertEqual(latest_dispatch_journal_from_entries(entries), "")
-
-    def test_prose_note_is_ignored(self):
+    def test_legacy_prose_only_ir_is_fail_closed_blank(self):
+        # review R5-F3: a real prose-only IR (no marker) is NEVER guessed -> blank.
         entries = [
-            RedmineJournalEntry(issue_id="13758", journal_id="1", notes="just prose, no marker"),
-            self._entry("79337", "implementation_request", "79337"),
+            RedmineJournalEntry(
+                issue_id="13758", journal_id="78056",
+                notes="## Gate: Implementation Request — event-driven reconciliation state machine",
+            )
         ]
-        self.assertEqual(latest_dispatch_journal_from_entries(entries), "79337")
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="lane-a", lane_generation=1), ""
+        )
+
+    def test_generation_or_lane_mismatch_is_blank(self):
+        entries = [self._ir("79337", lane="lane-a", generation=1)]
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="lane-a", lane_generation=2), ""
+        )
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="lane-b", lane_generation=1), ""
+        )
+
+    def test_two_distinct_entries_same_generation_is_ambiguous_blank(self):
+        # A foreign / duplicate structured dispatch for the same generation -> zero-send.
+        entries = [
+            self._ir("79337", lane="lane-a", generation=1),
+            self._ir("79999", lane="lane-a", generation=1),
+        ]
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="lane-a", lane_generation=1), ""
+        )
+
+    def test_same_entry_reread_dedups_to_one(self):
+        ir = self._ir("79337", lane="lane-a", generation=1)
+        self.assertEqual(
+            resolve_dispatch_entry_journal([ir, ir], lane="lane-a", lane_generation=1), "79337"
+        )
+
+    def test_new_ir_journal_new_generation_is_fresh_identity(self):
+        entries = [
+            self._ir("79337", lane="lane-a", generation=1),
+            self._ir("80001", lane="lane-a", generation=2),  # a new-generation re-dispatch
+        ]
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="lane-a", lane_generation=2), "80001"
+        )
 
 
 @dataclass(frozen=True)

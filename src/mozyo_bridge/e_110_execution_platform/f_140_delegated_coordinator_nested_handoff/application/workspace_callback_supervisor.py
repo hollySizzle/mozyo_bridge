@@ -869,7 +869,7 @@ def build_supervisor(
         build_reconcile_leg_fn,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-        latest_dispatch_journal,
+        dispatch_entry_journal_from_source,
         markers_from_source,
     )
 
@@ -929,17 +929,20 @@ def build_supervisor(
         disposition = str(getattr(record, "lane_disposition", "") or "").strip()
         return lane_id, generation, disposition
 
-    def _dispatch_anchor_fn(source: object, issue: str) -> str:
-        """The EXACT workflow dispatch anchor: the latest implementation_request handoff journal.
+    def _dispatch_anchor_fn(source: object, issue: str, lane: str, lane_generation: int) -> str:
+        """The EXACT workflow dispatch anchor: the owning journal of this lane+generation's IR marker.
 
-        Read from the issue's raw handoff markers (review R4-F3) — the gate reader filters
-        implementation_request out, and the lifecycle decision journal is the lane's lifecycle
-        decision, not each dispatch. ``None`` / unreadable source -> blank (fail-safe baseline).
+        Reads the durable ``[mozyo:workflow-event:kind=implementation_request:lane:lane_generation]``
+        marker and returns its OWNING entry journal id (review R5-F3 / j#79507 Q2), exactly-one /
+        verified / zero-send. A legacy prose-only IR (no marker) is fail-closed (blank baseline —
+        no reconcile until a structured IR round). ``None`` / unreadable source -> blank.
         """
         if source is None:
             return ""
         try:
-            return latest_dispatch_journal(source, str(issue).strip())
+            return dispatch_entry_journal_from_source(
+                source, str(issue).strip(), lane=lane, lane_generation=lane_generation
+            )
         except Exception:  # noqa: BLE001 - an unreadable dispatch anchor baselines fail-safe
             return ""
 

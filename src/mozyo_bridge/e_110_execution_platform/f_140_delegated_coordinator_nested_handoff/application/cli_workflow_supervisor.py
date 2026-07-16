@@ -282,8 +282,58 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     return 0 if performed else 1
 
 
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """Run the bounded supervisor event pump: Herdr turn events drive the reconcile passes.
+
+    The event-driven PRIMARY activation (Redmine #13758 Q1 / j#79507): the shared supervisor is
+    the sole reconcile owner, driven by a bounded multiplex Herdr ``wait agent-status --status
+    done`` per active-lane target. ``--max-iterations`` bounds the pump (never an unbounded poll);
+    the StartInterval one-shot ``--run-once`` remains the loss-recovery fallback.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_event_pump import (
+        build_event_pump_seams,
+        default_pump_targets,
+        run_event_pump,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
+        build_supervisor,
+    )
+
+    holder = (getattr(args, "holder", None) or "").strip() or _default_holder()
+    home = _home_from_args(args)
+    max_iterations = int(getattr(args, "max_iterations", None) or 1)
+    timeout_ms = int(getattr(args, "wait_timeout_ms", None) or 50000)
+    # release_after=False: the pump keeps the workspace lease across its bounded iterations (it
+    # is the single long-ish-lived reconcile owner), renewing rather than releasing each pass.
+    supervisor = build_supervisor(
+        holder=holder, home=home,
+        store_path=_store_path_from_args(args), release_after=False,
+    )
+    supervisor_pass, targets_fn, wait_multiplex_fn = build_event_pump_seams(
+        supervisor=supervisor,
+        targets_fn=lambda: default_pump_targets(home=home),
+        timeout_ms=timeout_ms,
+    )
+    results = run_event_pump(
+        supervisor_pass=supervisor_pass,
+        targets_fn=targets_fn,
+        wait_multiplex_fn=wait_multiplex_fn,
+        max_iterations=max_iterations,
+    )
+    as_json = bool(getattr(args, "as_json", False))
+    if as_json:
+        print(_json.dumps({"action": "watch", "iterations": results}, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"action: watch (bounded event pump, {len(results)} iteration(s))")
+        for i, r in enumerate(results):
+            print(f"  [{i}] mode={r['mode']} pass_ok={r['pass_ok']} wake={r['wake']} woke={r['woke_target']}")
+    return 0
+
+
 def cmd_workflow_supervisor(args: argparse.Namespace) -> int:
-    """Run one `workflow supervisor` action (run-once / status / service lifecycle contract)."""
+    """Run one `workflow supervisor` action (run-once / watch / status / service lifecycle contract)."""
+    if getattr(args, "watch", False):
+        return _cmd_watch(args)
     if getattr(args, "run_once", False):
         return _cmd_run_once(args)
     if getattr(args, "status", False):
@@ -329,6 +379,21 @@ def register_supervisor(workflow_sub) -> None:
     action.add_argument(
         "--run-once", dest="run_once", action="store_true",
         help="One bounded supervised sweep across the registry (supply events + deliver callbacks).",
+    )
+    action.add_argument(
+        "--watch", dest="watch", action="store_true",
+        help="Bounded event pump (Redmine #13758): Herdr turn events drive the reconcile passes "
+             "(supervisor is the sole reconcile owner). --max-iterations bounds it; --run-once is "
+             "the loss-recovery fallback.",
+    )
+    p.add_argument(
+        "--max-iterations", dest="max_iterations", type=int, default=1,
+        help="Event-pump bound: number of (pass + multiplex wait) iterations (--watch; default 1).",
+    )
+    p.add_argument(
+        "--wait-timeout-ms", dest="wait_timeout_ms", type=int, default=50000,
+        help="Per-target bounded Herdr wait window in ms (--watch; default 50000, within the "
+             "user-commentary SLA).",
     )
     action.add_argument(
         "--status", action="store_true",

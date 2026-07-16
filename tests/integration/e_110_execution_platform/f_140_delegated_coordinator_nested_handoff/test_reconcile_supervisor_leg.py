@@ -100,6 +100,14 @@ class SelfHealFlow(ReconcileLegHarness):
         self.assertEqual(rep["action"], "self_heal")
         self.assertEqual(rep["route"], "implementation_gateway")
 
+    def test_initial_await_with_blank_dispatch_anchor_is_fail_closed(self):
+        # review R5-F3 / j#79507 Q2: a legacy prose-only IR (no durable dispatch anchor) -> the
+        # initial await is fail-closed (no reconcile, no fabricated ``0`` baseline).
+        self._cycle(markers=[], runtime="busy", dispatch_anchor="")
+        rep = self._cycle(markers=[], runtime="turn_ended", dispatch_anchor="")
+        self.assertIsNone(rep)
+        self.assertEqual(len(self._rows()), 0)
+
     def test_non_edge_runtime_does_not_self_heal(self):
         # review R4-F1/F2: a busy runtime (no turn-end) does not self-heal.
         rep = self._cycle(markers=[], runtime="busy")

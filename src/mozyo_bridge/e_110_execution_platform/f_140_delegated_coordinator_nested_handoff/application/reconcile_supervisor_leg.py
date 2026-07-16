@@ -180,7 +180,10 @@ def reconcile_leg_once(
         str(issue).strip(),
     )
     generation = int(live_generation) if live_generation > 0 else 0
-    dispatch = str(dispatch_anchor or "").strip() or "0"
+    # The exact dispatch anchor (the owning journal of the current IR marker). Blank means a
+    # legacy prose-only IR with no durable dispatch identity (review R5-F3 / j#79507 Q2): the
+    # INITIAL await is then fail-closed (no reconcile), never baselined on a fabricated ``0``.
+    dispatch = str(dispatch_anchor or "").strip()
     latest = _latest_gate_marker(markers)
     latest_gate = str(getattr(latest, "gate", "")).strip() if latest is not None else ""
     latest_journal = _int(getattr(latest, "journal", ""), default=0) if latest is not None else 0
@@ -227,7 +230,14 @@ def reconcile_leg_once(
     if exp is None:
         return None  # no same-lane-owed next gate -> nothing to reconcile
     expected_gate, expected_owner = exp
-    baseline_journal = str(latest_journal) if latest_journal > 0 else dispatch
+    if latest_journal > 0:
+        baseline_journal = str(latest_journal)  # a subsequent await: baseline on the latest gate
+    elif dispatch:
+        baseline_journal = dispatch  # the initial await: baseline on the exact dispatch anchor
+    else:
+        # Initial await with no durable dispatch anchor (legacy prose-only IR) -> fail-closed:
+        # no reconcile, no fabricated ``0`` baseline (review R5-F3 / j#79507 Q2 point 7).
+        return None
     return _run_cycle(
         key=ReconcileStateKey(
             wsid, laneid, _anchor(issue_s, generation, baseline_journal, expected_gate)
@@ -375,7 +385,7 @@ def build_reconcile_leg_fn(
     outbox: CallbackOutbox,
     lane_facts_fn: Callable[[str, str], "tuple[str, int, str]"],
     markers_fn: Callable[[object, str], Iterable[object]],
-    dispatch_anchor_fn: Optional[Callable[[object, str], str]] = None,
+    dispatch_anchor_fn: Optional[Callable[[object, str, str, int], str]] = None,
     runtime_fn: Optional[Callable[[str, str, str], str]] = None,
 ) -> Callable[[str, str, object], Optional[dict]]:
     """Build the supervisor's ``reconcile_leg_fn`` closure.
@@ -383,8 +393,9 @@ def build_reconcile_leg_fn(
     - ``lane_facts_fn(workspace_id, issue) -> (lane_id, live_generation, lifecycle_disposition)``
       resolves the lane identity + generation + disposition from the lifecycle authority;
     - ``markers_fn(source, issue)`` reads the issue's structured gate markers;
-    - ``dispatch_anchor_fn(source, issue) -> str`` reads the EXACT workflow dispatch anchor (the
-      latest ``implementation_request`` handoff journal — review R4-F3); ``None`` -> blank;
+    - ``dispatch_anchor_fn(source, issue, lane_id, lane_generation) -> str`` reads the EXACT
+      workflow dispatch anchor (the owning journal id of the current implementation_request
+      dispatch marker for this lane + generation — review R5-F3 / j#79507 Q2); ``None`` -> blank;
     - ``runtime_fn(workspace_id, lane_id, expected_owner_role) -> str`` reads the EXPECTED
       OWNER's LIVE runtime from the herdr inventory (the source live-smoke edge feed — review
       R4-F1); ``None`` -> blank (fail-closed no-edge).
@@ -411,7 +422,9 @@ def build_reconcile_leg_fn(
         dispatch_anchor = ""
         if dispatch_anchor_fn is not None:
             try:
-                dispatch_anchor = str(dispatch_anchor_fn(source, issue) or "")
+                dispatch_anchor = str(
+                    dispatch_anchor_fn(source, issue, lane_id, int(live_generation)) or ""
+                )
             except Exception:  # noqa: BLE001 - a dispatch-anchor read failure baselines fail-safe
                 dispatch_anchor = ""
         runtime_lookup = None

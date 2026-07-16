@@ -308,54 +308,88 @@ def markers_from_source(
     return extract_markers(source.read_entries(issue_id))
 
 
-#: The dispatch handoff kind whose exact source journal is the reconciler's dispatch anchor.
+# ---------------------------------------------------------------------------
+# Dispatch marker — a SEPARATE closed vocabulary from the gate-bearing kinds (Redmine #13758
+# review R5-F3 / Design Answer j#79507 Q2). A dispatch (implementation_request) is NOT a
+# callback-required gate, so it must NOT widen GATE_BEARING_KINDS or be mis-promoted to a
+# callback event. The canonical Implementation Request writer embeds this marker in the IR
+# journal body; the reconciler reads the marker's OWNING Redmine entry journal_id as the exact
+# dispatch anchor (NOT the marker's self-reported ``journal=`` — no self-reference / chicken-
+# and-egg). A legacy prose-only IR (no marker) is fail-closed: never parse-guessed.
+# ---------------------------------------------------------------------------
 DISPATCH_KIND_IMPLEMENTATION_REQUEST = "implementation_request"
 
 
-def latest_dispatch_journal_from_entries(
+def render_dispatch_marker(lane: str, lane_generation: object) -> str:
+    """The structured dispatch marker for an IR journal (pure; the producer inverse of the reader).
+
+    ``[mozyo:workflow-event:kind=implementation_request:lane=<lane>:lane_generation=<n>]`` — the
+    canonical Implementation Request writer embeds this in the IR journal body so the reconciler
+    can resolve the exact dispatch anchor from the owning entry's journal id (Design Answer
+    j#79507 Q2). A separate closed vocabulary from :func:`render_workflow_event_marker` (which is
+    for callback gate kinds); this token names ``implementation_request`` and carries no gate.
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    return (
+        f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
+        f"kind={DISPATCH_KIND_IMPLEMENTATION_REQUEST}:lane={lane_s}:lane_generation={gen_s}]"
+    )
+
+
+def render_dispatch_note(body: str, *, lane: str, lane_generation: object) -> str:
+    """A canonical Implementation Request note: prose ``body`` + the embedded dispatch marker."""
+    marker = render_dispatch_marker(lane, lane_generation)
+    body = str(body or "").rstrip()
+    return f"{body}\n\n{marker}" if body else marker
+
+
+def resolve_dispatch_entry_journal(
     entries: "Iterable[RedmineJournalEntry]",
     *,
-    dispatch_kind: str = DISPATCH_KIND_IMPLEMENTATION_REQUEST,
+    lane: str,
+    lane_generation: object,
 ) -> str:
-    """The journal id of the latest ``handoff`` marker naming ``dispatch_kind`` (pure).
+    """The Redmine entry journal id of the CURRENT dispatch for ``(lane, lane_generation)`` (pure).
 
-    The EXACT workflow dispatch anchor the reconcile identity needs (Redmine #13758 review
-    R4-F3): the gate reader filters ``implementation_request`` out as non-gate-bearing, and the
-    lifecycle ``decision_journal`` is the lane's *lifecycle* decision, not each dispatch — so a
-    same-lane-generation re-dispatch (a fresh ``implementation_request`` handoff) is
-    distinguished only by its own ``journal`` anchor. Scans the ``[mozyo:handoff:...]`` markers
-    (all kinds, unlike :func:`markers_from_source`) for the highest ``journal`` naming
-    ``dispatch_kind``; returns ``""`` when none is found (the caller then baselines fail-safe).
+    The exact dispatch anchor (Design Answer j#79507 Q2): scans the ``[mozyo:workflow-event:...]``
+    markers for a ``kind=implementation_request`` token whose ``lane`` / ``lane_generation`` match,
+    and returns the OWNING entry's ``journal_id`` — the anchor authority is the durable entry, not
+    the marker's self-reported fields. Fail-closed to ``""`` (zero-send) unless EXACTLY ONE such
+    entry exists: zero matches (a legacy prose-only IR — never guessed), or two-or-more distinct
+    entries (an ambiguous / foreign generation) both return ``""``. A same-entry re-read dedups to
+    one journal id (a same IR-journal retry is the same dispatch).
     """
-    best_j = -1
-    best = ""
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    if not (lane_s and gen_s):
+        return ""
+    found: set[str] = set()
     for entry in entries or ():
         notes = getattr(entry, "notes", "") or ""
+        entry_journal = str(getattr(entry, "journal_id", "") or "").strip()
+        if not entry_journal:
+            continue
         for match in _MARKER_RE.finditer(notes):
-            if match.group("channel") != MARKER_CHANNEL_HANDOFF:
+            if match.group("channel") != MARKER_CHANNEL_WORKFLOW_EVENT:
                 continue
             fields = _parse_marker_fields(match.group("body"))
-            if str(fields.get("kind", "")).strip() != str(dispatch_kind).strip():
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
                 continue
-            raw = str(fields.get("journal", "") or getattr(entry, "journal_id", "")).strip()
-            try:
-                jn = int(raw)
-            except (TypeError, ValueError):
+            if str(fields.get("lane", "")).strip() != lane_s:
                 continue
-            if jn > best_j:
-                best_j, best = jn, raw
-    return best
+            if str(fields.get("lane_generation", "")).strip() != gen_s:
+                continue
+            found.add(entry_journal)
+    return next(iter(found)) if len(found) == 1 else ""
 
 
-def latest_dispatch_journal(
-    source: RedmineJournalSource,
-    issue_id: str,
-    *,
-    dispatch_kind: str = DISPATCH_KIND_IMPLEMENTATION_REQUEST,
+def dispatch_entry_journal_from_source(
+    source: RedmineJournalSource, issue_id: str, *, lane: str, lane_generation: object
 ) -> str:
-    """Read the issue's entries and return the latest dispatch-anchor journal (pure over ``source``)."""
-    return latest_dispatch_journal_from_entries(
-        source.read_entries(issue_id), dispatch_kind=dispatch_kind
+    """Read the issue's entries and resolve the current dispatch entry journal (over ``source``)."""
+    return resolve_dispatch_entry_journal(
+        source.read_entries(issue_id), lane=lane, lane_generation=lane_generation
     )
 
 
