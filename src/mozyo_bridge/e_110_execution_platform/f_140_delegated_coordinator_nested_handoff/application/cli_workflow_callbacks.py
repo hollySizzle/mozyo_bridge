@@ -546,6 +546,53 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         # can never treat an un-written gate as recorded. The structured receipt still prints above.
         return 0 if receipt.recorded else 1
 
+    if getattr(args, "emit_progress", False):
+        # #13889 review F2: the producer half of the sweep watermark. A worker-side progress gate
+        # (review_finding_verdict / progress_log / start / design_consultation) recorded through
+        # this path is marker-bearing, so the sweep can classify it structurally instead of
+        # abstaining from every stall verdict on the issue. Same opt-in / fail-closed contract as
+        # --emit-gate; the marker is round-scoped so it cannot be read as another round's progress.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
+            emit_progress_record,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
+            redmine_delivery_transport_from_env,
+        )
+
+        issue = (getattr(args, "issue", None) or "").strip()
+        kind = (getattr(args, "progress_kind", None) or "").strip()
+        lane = (getattr(args, "lane", None) or "").strip()
+        generation = (getattr(args, "lane_generation", None) or "").strip()
+        if not (issue and kind and lane and generation):
+            raise SystemExit(
+                "--emit-progress requires --issue, --progress-kind, --lane and --lane-generation "
+                "(an unscoped progress marker cannot be attributed to a dispatch round)"
+            )
+        transport = redmine_delivery_transport_from_env()
+        try:
+            receipt = emit_progress_record(
+                issue, kind, lane=lane, lane_generation=generation,
+                body=(getattr(args, "body", None) or ""), transport=transport,
+            )
+        except ValueError as exc:  # an out-of-vocabulary kind is a caller error, surfaced
+            raise SystemExit(str(exc)) from exc
+        payload = {"action": "emit-progress", "issue": issue, "kind": kind, "lane": lane,
+                   "lane_generation": generation, **receipt.as_payload()}
+        lines = [
+            "action: emit-progress",
+            f"issue: #{issue}",
+            f"kind: {kind}",
+            f"lane: {lane} generation: {generation}",
+            f"recorded: {receipt.recorded}",
+            f"reason: {receipt.reason}",
+        ]
+        if receipt.location:
+            lines.append(f"location: {receipt.location}")
+        _emit(payload, as_json=as_json, text_lines=lines)
+        # A progress gate owes no coordinator callback (that is the whole point of the separate
+        # vocabulary), so unlike --emit-gate this deliberately emits NO supervisor wake.
+        return 0 if receipt.recorded else 1
+
     if getattr(args, "recovery_plan", False):
         from mozyo_bridge.core.state.workflow_runtime_store import (
             CALLBACK_PENDING,
@@ -735,6 +782,15 @@ def register_callbacks(sub) -> None:
              "a caller cannot treat an un-written gate as recorded.",
     )
     action.add_argument(
+        "--emit-progress", dest="emit_progress", action="store_true",
+        help="The canonical governed PROGRESS-record writer (Redmine #13889): record a worker-side "
+             "progress gate that proves the lane is alive but owes NO coordinator callback "
+             "(--issue + --progress-kind + --lane + --lane-generation; credential-gated, opt-in). "
+             "Recorded this way the gate is marker-bearing, so the callback sweep can classify it "
+             "structurally instead of abstaining; recorded as prose it is invisible to the sweep. "
+             "Fail-closed: a not-recorded gate exits NON-ZERO.",
+    )
+    action.add_argument(
         "--recovery-plan", dest="recovery_plan", action="store_true",
         help="Emit the READ-ONLY host-restart recovery plan (reconciles Redmine/Git/registry/"
              "state-DB/runtime authorities; fail-closed + never-clobber). Measures at action-time: "
@@ -747,8 +803,20 @@ def register_callbacks(sub) -> None:
         "--anchor-readable", dest="anchor_readable", action="store_true",
         help="Assert the exact Redmine gate journal was verified readable (--recovery-plan; unset = unverified = fail-closed).",
     )
-    p.add_argument("--issue", help="Issue id for --emit-gate.")
+    p.add_argument("--issue", help="Issue id for --emit-gate / --emit-progress.")
     p.add_argument("--gate", help="Callback-required gate kind for --emit-gate (implementation_done | review_request | review_result | owner_close_approval_waiting | blocked).")
+    p.add_argument(
+        "--progress-kind", dest="progress_kind",
+        help="Worker-side progress gate kind for --emit-progress (start | progress_log | "
+             "review_finding_verdict | design_consultation). Deliberately DISJOINT from --gate: "
+             "these prove the lane advanced but wake no coordinator.",
+    )
+    p.add_argument("--lane", help="Lane id that scopes the --emit-progress marker to its dispatch round.")
+    p.add_argument(
+        "--lane-generation", dest="lane_generation",
+        help="Lane generation that scopes the --emit-progress marker to its dispatch round "
+             "(required: an unscoped progress marker cannot be attributed to a round).",
+    )
     p.add_argument(
         "--review-generation-json", dest="review_generation_json",
         help="#13518 R3-F2: durable review observation {issue, review_request_journal, target_head, "

@@ -88,6 +88,11 @@ QUALIFYING_PROGRESS_KINDS: frozenset[str] = frozenset(PROGRESS_BEARING_KINDS | G
 #: guessing (fail-closed; #13758 R5-F3 takes the same branch).
 SWEEP_STATE_ANCHOR_MISSING = "dispatch_anchor_missing"
 
+#: The sweep verdict when post-anchor journals exist that carry no recognized marker: the lane may
+#: have advanced in prose, so a stall cannot be PROVEN and none is asserted (review F2). Not a
+#: stall and never a mutation — declaring one on an unreadable record is the stale replay itself.
+SWEEP_STATE_STALL_UNPROVABLE = "stall_unprovable"
+
 #: The fence ``action_id`` every sweep recovery delivery reserves under. Combined with the fence
 #: key's ``journal`` (the dispatch anchor) this makes recovery **at most once per gate anchor**.
 SWEEP_RECOVERY_ACTION_ID = "callback_sweep_recovery"
@@ -97,6 +102,7 @@ SEND_RESERVED = "reserved"  # the single caller cleared to perform the one recov
 ZERO_SEND_NOT_A_STALL = "not_a_stall"
 ZERO_SEND_ANCHOR_MISSING = "dispatch_anchor_missing"
 ZERO_SEND_PROGRESS_LANDED = "progress_landed_after_decision"
+ZERO_SEND_STALL_UNPROVABLE = "stall_unprovable"
 ZERO_SEND_DISPATCH_ROUND_CHANGED = "dispatch_round_changed"
 ZERO_SEND_FENCE_HELD = "fence_held"
 ZERO_SEND_FENCE_UNAVAILABLE = "fence_unavailable"
@@ -110,38 +116,66 @@ def _journal_int(value: object, default: int = -1) -> int:
         return default
 
 
-def _entry_progress_kinds(entry: object) -> set[str]:
-    """The qualifying progress kinds a journal entry's structured markers name (pure).
+def _entry_progress_kinds(entry: object, *, lane: str, lane_generation: object) -> set[str]:
+    """The qualifying progress kinds a journal entry's markers name FOR THIS ROUND (pure).
 
-    Reads both marker channels: the ``gate=`` field (workflow-event gate marker) and the ``kind=``
-    field (workflow-event progress / handoff marker). A note with no recognized token contributes
-    nothing — prose is never interpreted.
+    Scoped to ``lane`` + ``lane_generation`` (review F3): a progress marker carries its own lane /
+    generation, so round N's watermark cannot absorb round N+1's progress. The dispatch marker was
+    already round-scoped this way; progress must match, or a superseded round looks alive because
+    its successor is working. A gate kind (:data:`GATE_BEARING_KINDS`) may arrive on either channel
+    and is accepted un-scoped **only** on the workflow-event channel — the handoff channel carries
+    *pointers to* gates, not gate landings, so counting one would let the coordinator's own dispatch
+    notification masquerade as the lane's progress.
     """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
     kinds: set[str] = set()
     for channel, fields in marker_fields_in_note(str(getattr(entry, "notes", "") or "")):
-        named = (fields.get("gate") or fields.get("kind") or "").strip()
-        if not named:
+        if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        if named in QUALIFYING_PROGRESS_KINDS:
-            # A progress-only kind is workflow-event scoped; a gate kind may arrive on either
-            # channel (the handoff marker carries the gate in ``kind``).
-            if named in PROGRESS_BEARING_KINDS and channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            kinds.add(named)
+        named = (fields.get("gate") or fields.get("kind") or "").strip()
+        if named not in QUALIFYING_PROGRESS_KINDS:
+            continue
+        marker_lane = str(fields.get("lane", "")).strip()
+        marker_gen = str(fields.get("lane_generation", "")).strip()
+        # A round-scoped marker must match this round exactly. An unscoped marker (a legacy gate
+        # note that predates scoping) is accepted for compatibility — it cannot be attributed to a
+        # different round because nothing on it names one.
+        if marker_lane and marker_lane != lane_s:
+            continue
+        if marker_gen and marker_gen != gen_s:
+            continue
+        kinds.add(named)
     return kinds
 
 
+def _entry_is_classified(entry: object) -> bool:
+    """True when the entry carries ANY recognized structured marker (pure).
+
+    The discriminator behind :data:`SWEEP_STATE_STALL_UNPROVABLE`: an entry the reader recognizes
+    (a gate, a progress note, a dispatch, a handoff pointer) is *understood*, whether or not it
+    counts as progress. An entry with no recognized token is **opaque** — it could be a worker's
+    prose gate or coordinator noise, and nothing on it says which.
+    """
+    return bool(marker_fields_in_note(str(getattr(entry, "notes", "") or "")))
+
+
 def progress_entries_after(
-    entries: Iterable[object], *, after_journal: object
+    entries: Iterable[object],
+    *,
+    after_journal: object,
+    lane: str = "",
+    lane_generation: object = "",
 ) -> tuple[tuple[str, str], ...]:
     """The ``(journal_id, kind)`` pairs strictly after the anchor that prove progress (pure, sorted).
 
     The **ordered durable journal id** compare at the heart of #13889 acceptance 1/2: an entry
     qualifies when its OWN journal id (the durable anchor authority — never the marker's
     self-reported ``journal=`` field) is numerically greater than ``after_journal`` and it carries a
-    :data:`QUALIFYING_PROGRESS_KINDS` marker. Sorted by journal id so the result is replay-stable.
-    An unparseable / blank anchor yields ``()`` — the caller must treat that as *unanchored*, not as
-    *no progress* (:func:`resolve_watermark` enforces the distinction).
+    :data:`QUALIFYING_PROGRESS_KINDS` marker for this ``lane`` / ``lane_generation``. Sorted by
+    journal id so the result is replay-stable. An unparseable / blank anchor yields ``()`` — the
+    caller must treat that as *unanchored*, not as *no progress* (:func:`resolve_watermark` enforces
+    the distinction).
     """
     anchor = _journal_int(after_journal)
     if anchor < 0:
@@ -151,23 +185,66 @@ def progress_entries_after(
         jid = _journal_int(getattr(entry, "journal_id", ""))
         if jid <= anchor:
             continue
-        kinds = _entry_progress_kinds(entry)
+        kinds = _entry_progress_kinds(entry, lane=lane, lane_generation=lane_generation)
         if not kinds:
             continue
         found[jid] = sorted(kinds)[0]
     return tuple((str(j), found[j]) for j in sorted(found))
 
 
+def opaque_entries_after(
+    entries: Iterable[object], *, after_journal: object
+) -> tuple[str, ...]:
+    """The journal ids strictly after the anchor that carry NO recognized marker (pure, sorted).
+
+    Review F2. The real #13883 records are **prose-only**: neither j#79995 (``## Gate: review —
+    changes_requested``) nor j#80002 (``## Gate: review_finding_verdict``) carries a marker. A
+    marker-only reader sees no progress there and, if it then declares a stall, performs exactly the
+    stale replay this issue exists to remove — the re-read cannot save it, because the re-read is
+    equally blind, and the fence only stops the *second* such send.
+
+    So the sweep must distinguish two very different situations it previously conflated:
+
+    - **nothing happened** — no post-anchor entries at all. A stall is *provable*.
+    - **something happened that I cannot read** — post-anchor entries with no recognized marker. The
+      lane may be advancing in prose. A stall is *unprovable*, and asserting one is a guess.
+
+    Declaring a stall requires proving silence, not merely failing to recognize speech. These ids
+    are that proof obligation: non-empty means the sweep must abstain
+    (:data:`SWEEP_STATE_STALL_UNPROVABLE`) rather than mutate on an unreadable record. As producers
+    are wired onto the canonical marker writers this set drains to empty and the sweep regains full
+    precision — without ever guessing at prose.
+    """
+    anchor = _journal_int(after_journal)
+    if anchor < 0:
+        return ()
+    found: list[int] = []
+    for entry in entries or ():
+        jid = _journal_int(getattr(entry, "journal_id", ""))
+        if jid <= anchor:
+            continue
+        if not _entry_is_classified(entry):
+            found.append(jid)
+    return tuple(str(j) for j in sorted(found))
+
+
 @dataclass(frozen=True)
 class SweepWatermark:
     """The dispatch-anchored progress watermark for one lane+generation's sweep (pure value).
 
-    ``dispatch_journal`` is the exact anchor (blank -> unanchored -> no verdict).
-    ``progress`` is the ordered ``(journal_id, kind)`` list of qualifying gates strictly after it.
+    ``dispatch_journal`` is the exact anchor (blank -> unanchored -> no verdict). ``progress`` is
+    the ordered ``(journal_id, kind)`` list of qualifying gates strictly after it. ``opaque`` is the
+    post-anchor entries carrying no recognized marker — non-empty means a stall is unprovable
+    (review F2). ``lane_generation`` is the round this watermark describes and ``latest_generation``
+    is the newest round the record shows for the lane; a newer one means this watermark is about a
+    superseded round (review F3).
     """
 
     dispatch_journal: str
     progress: tuple[tuple[str, str], ...] = ()
+    opaque: tuple[str, ...] = ()
+    lane_generation: int = 0
+    latest_generation: int = 0
 
     @property
     def anchored(self) -> bool:
@@ -176,6 +253,16 @@ class SweepWatermark:
     @property
     def has_progress(self) -> bool:
         return bool(self.progress)
+
+    @property
+    def stall_provable(self) -> bool:
+        """True only when the record proves silence: no progress AND nothing unreadable after it."""
+        return not self.progress and not self.opaque
+
+    @property
+    def superseded(self) -> bool:
+        """True when a newer dispatch round has opened since the round this watermark describes."""
+        return bool(self.latest_generation and self.latest_generation > self.lane_generation)
 
     @property
     def latest_progress_journal(self) -> str:
@@ -187,7 +274,12 @@ class SweepWatermark:
 
 
 def resolve_watermark(
-    entries: Iterable[object], *, dispatch_journal: object
+    entries: Iterable[object],
+    *,
+    dispatch_journal: object,
+    lane: str = "",
+    lane_generation: object = "",
+    latest_generation: object = 0,
 ) -> SweepWatermark:
     """Resolve the dispatch-anchored watermark from a journal snapshot (pure).
 
@@ -195,14 +287,26 @@ def resolve_watermark(
     :func:`...redmine_journal_source.resolve_dispatch_entry_journal`. A blank / unparseable anchor
     yields an **unanchored** watermark (``anchored=False``): the sweep then has no baseline and must
     abstain — it never falls back to a fabricated ``0``, which would make every journal on the issue
-    look like post-dispatch progress.
+    look like post-dispatch progress. ``latest_generation`` is the newest dispatch round on the
+    record (:func:`...redmine_journal_source.dispatch_generations`), which lets the caller detect
+    that it is reasoning about a superseded round.
     """
     anchor = str(dispatch_journal or "").strip()
+    gen = _journal_int(lane_generation, default=0)
     if _journal_int(anchor) < 0:
-        return SweepWatermark(dispatch_journal="")
+        return SweepWatermark(
+            dispatch_journal="",
+            lane_generation=gen,
+            latest_generation=_journal_int(latest_generation, default=0),
+        )
     return SweepWatermark(
         dispatch_journal=anchor,
-        progress=progress_entries_after(entries, after_journal=anchor),
+        progress=progress_entries_after(
+            entries, after_journal=anchor, lane=lane, lane_generation=lane_generation
+        ),
+        opaque=opaque_entries_after(entries, after_journal=anchor),
+        lane_generation=gen,
+        latest_generation=_journal_int(latest_generation, default=0),
     )
 
 
@@ -248,6 +352,38 @@ def classify_sweep(
             "progress_journals": [],
         }
 
+    if not watermark.has_progress and watermark.opaque:
+        # Review F2: post-anchor entries exist that carry no recognized marker (the real #13883
+        # j#79995 / j#80002 shape). "I found no progress marker" is not "nothing happened" — the
+        # lane may be advancing in prose. Declaring a stall here IS the stale replay this issue
+        # removes, so abstain instead of guessing.
+        return {
+            "state": SWEEP_STATE_STALL_UNPROVABLE,
+            "is_stall": False,
+            "dispatch_delivered": True,
+            "new_durable_progress": False,
+            "callback": callback,
+            "stale_cli": bool(stale_cli),
+            "summary": (
+                f"{len(watermark.opaque)} journal(s) landed after the dispatch anchor carrying no "
+                f"recognized structured marker (j#"
+                f"{', j#'.join(watermark.opaque)}) — the sweep cannot tell lane progress from "
+                f"unrelated noise, so a stall is UNPROVABLE and no recovery is sent"
+            ),
+            "recovery": [
+                "read the named journal(s) directly to see whether the lane advanced; the durable "
+                "record is the truth, the sweep only reports what it can prove",
+                "record the lane's gates through the canonical marker-bearing writers "
+                "(`workflow callbacks --emit-gate` / `--emit-progress`) so the sweep can classify "
+                "them structurally instead of abstaining",
+                "do NOT re-dispatch on this verdict — it is an abstention, not a stall",
+            ],
+            "invariants": [],
+            "dispatch_journal": watermark.dispatch_journal,
+            "progress_journals": [],
+            "opaque_journals": list(watermark.opaque),
+        }
+
     result = classify_callback_stall(
         dispatch_delivered=True,  # an exact dispatch anchor IS the delivered dispatch journal
         new_durable_progress=watermark.has_progress,
@@ -258,19 +394,25 @@ def classify_sweep(
     result["progress_journals"] = [
         {"journal": j, "kind": kind} for j, kind in watermark.progress
     ]
+    result["opaque_journals"] = list(watermark.opaque)
     return result
 
 
-def render_progress_marker(kind: str) -> str:
+def render_progress_marker(kind: str, *, lane: str, lane_generation: object) -> str:
     """Render the structured progress marker a worker-side durable gate embeds (pure).
 
     The **producer** inverse of :func:`progress_entries_after`, mirroring
-    :func:`...redmine_journal_source.render_workflow_event_marker` for the progress vocabulary: a
-    worker recording e.g. a ``review_finding_verdict`` gate embeds this token so the sweep can
-    DISCOVER the gate structurally. Without it the gate is prose, and a prose-only gate is
-    fail-closed (invisible to the watermark) — never parse-guessed. ``kind`` must be a
-    :data:`PROGRESS_BEARING_KINDS` member; a callback-required gate uses ``render_gate_note``
-    instead (it owes a callback, which this token deliberately does not signal).
+    :func:`...redmine_journal_source.render_dispatch_marker`: a worker recording e.g. a
+    ``review_finding_verdict`` gate embeds this token so the sweep can DISCOVER the gate
+    structurally. Without it the gate is prose and the sweep abstains
+    (:data:`SWEEP_STATE_STALL_UNPROVABLE`) — never parse-guessed.
+
+    ``lane`` / ``lane_generation`` are **required** and scope the marker to its round (review F3):
+    the dispatch marker is round-scoped, so progress must be too, or round N's watermark absorbs
+    round N+1's progress and a superseded round looks alive because its successor is working.
+    ``kind`` must be a :data:`PROGRESS_BEARING_KINDS` member; a callback-required gate uses
+    ``render_gate_note`` instead (it owes a callback, which this token deliberately does not
+    signal).
     """
     kind_s = str(kind).strip()
     if kind_s not in PROGRESS_BEARING_KINDS:
@@ -278,12 +420,24 @@ def render_progress_marker(kind: str) -> str:
             f"render_progress_marker kind must be one of {sorted(PROGRESS_BEARING_KINDS)}, "
             f"got {kind!r} (a callback-required gate uses render_gate_note)"
         )
-    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:kind={kind_s}]"
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    if not (lane_s and gen_s):
+        raise ValueError(
+            "render_progress_marker requires a lane and lane_generation: an unscoped progress "
+            "marker cannot be attributed to a dispatch round (Redmine #13889 review F3)"
+        )
+    return (
+        f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
+        f"kind={kind_s}:lane={lane_s}:lane_generation={gen_s}]"
+    )
 
 
-def render_progress_note(kind: str, *, body: str = "") -> str:
-    """A canonical progress-gate note: prose ``body`` + the embedded progress marker (pure)."""
-    marker = render_progress_marker(kind)
+def render_progress_note(
+    kind: str, *, lane: str, lane_generation: object, body: str = ""
+) -> str:
+    """A canonical progress-gate note: prose ``body`` + the round-scoped progress marker (pure)."""
+    marker = render_progress_marker(kind, lane=lane, lane_generation=lane_generation)
     body_s = str(body or "").rstrip()
     return f"{body_s}\n\n{marker}" if body_s else marker
 
@@ -331,13 +485,17 @@ def decide_recovery(
             reason=ZERO_SEND_ANCHOR_MISSING,
             detail="the re-read resolved no dispatch anchor; abstain rather than mutate",
         )
-    if rechecked.dispatch_journal != decided.dispatch_journal:
+    # Review F3: comparing the two reads' anchors could never detect a new round — both reads
+    # resolve the anchor for the SAME caller-fixed generation, so they always agree. The round
+    # authority is the newest dispatch generation on the record, read WITHOUT fixing a generation.
+    if rechecked.superseded or rechecked.dispatch_journal != decided.dispatch_journal:
         return RecoveryDecision(
             send=False,
             reason=ZERO_SEND_DISPATCH_ROUND_CHANGED,
             detail=(
-                f"dispatch anchor moved {decided.dispatch_journal} -> "
-                f"{rechecked.dispatch_journal} between the decision and the send; the verdict "
+                f"a newer dispatch round opened (generation {decided.lane_generation} -> "
+                f"{rechecked.latest_generation}; anchor {decided.dispatch_journal} -> "
+                f"{rechecked.dispatch_journal}) between the decision and the send; the verdict "
                 f"describes a superseded round"
             ),
         )
@@ -350,6 +508,18 @@ def decide_recovery(
                 f"{rechecked.latest_progress_journal} after the dispatch anchor "
                 f"{rechecked.dispatch_journal}; the lane is not stalled — record "
                 f"progress_without_callback, do NOT replay"
+            ),
+        )
+    if not rechecked.stall_provable:
+        # Opaque activity landed in the decision->send window: same obligation as at classify time
+        # (review F2) — the sweep cannot prove the lane is silent, so it must not mutate.
+        return RecoveryDecision(
+            send=False,
+            reason=ZERO_SEND_STALL_UNPROVABLE,
+            detail=(
+                f"journal(s) with no recognized marker landed after the anchor (j#"
+                f"{', j#'.join(rechecked.opaque)}); the lane may be advancing in prose, so the "
+                f"stall is unprovable — abstain rather than replay"
             ),
         )
     return RecoveryDecision(
@@ -367,11 +537,13 @@ __all__ = (
     "PROGRESS_BEARING_KINDS",
     "QUALIFYING_PROGRESS_KINDS",
     "SWEEP_STATE_ANCHOR_MISSING",
+    "SWEEP_STATE_STALL_UNPROVABLE",
     "SWEEP_RECOVERY_ACTION_ID",
     "SEND_RESERVED",
     "ZERO_SEND_NOT_A_STALL",
     "ZERO_SEND_ANCHOR_MISSING",
     "ZERO_SEND_PROGRESS_LANDED",
+    "ZERO_SEND_STALL_UNPROVABLE",
     "ZERO_SEND_DISPATCH_ROUND_CHANGED",
     "ZERO_SEND_FENCE_HELD",
     "ZERO_SEND_FENCE_UNAVAILABLE",
@@ -380,6 +552,7 @@ __all__ = (
     "render_progress_marker",
     "render_progress_note",
     "progress_entries_after",
+    "opaque_entries_after",
     "resolve_watermark",
     "classify_sweep",
     "decide_recovery",

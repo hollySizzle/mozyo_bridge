@@ -34,9 +34,11 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
     SEND_RESERVED,
     SWEEP_RECOVERY_ACTION_ID,
+    SWEEP_STATE_STALL_UNPROVABLE,
     ZERO_SEND_FENCE_HELD,
     ZERO_SEND_FENCE_UNAVAILABLE,
     ZERO_SEND_PROGRESS_LANDED,
+    ZERO_SEND_STALL_UNPROVABLE,
     RecoveryDecision,
     SweepWatermark,
     classify_sweep,
@@ -44,6 +46,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_watermark,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    dispatch_generations,
     resolve_dispatch_entry_journal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
@@ -66,12 +69,25 @@ def read_watermark(
     Called once for the decision and **again** for the pre-mutation re-check, so each call is a
     genuine fresh read of the durable record. Raises whatever the source raises; the caller maps an
     unreadable source to a fail-closed abstain.
+
+    The read resolves TWO things about rounds (review F3). ``resolve_dispatch_entry_journal`` answers
+    "where is round N's anchor" for the caller-fixed ``lane_generation`` — by construction it can
+    never reveal that round N+1 has opened, so two reads always agree and an anchor-vs-anchor
+    comparison is dead. ``dispatch_generations`` reads the newest round on the record WITHOUT fixing
+    a generation, which is the authority that actually detects a supersede.
     """
     entries = list(source.read_entries(str(issue).strip()))
     dispatch = resolve_dispatch_entry_journal(
         entries, lane=lane, lane_generation=lane_generation
     )
-    return resolve_watermark(entries, dispatch_journal=dispatch)
+    generations = dispatch_generations(entries, lane=lane)
+    return resolve_watermark(
+        entries,
+        dispatch_journal=dispatch,
+        lane=lane,
+        lane_generation=lane_generation,
+        latest_generation=generations[-1] if generations else 0,
+    )
 
 
 def sweep_once(
@@ -222,6 +238,23 @@ def _apply_zero_send(
         result["progress_journals"] = [
             {"journal": j, "kind": kind} for j, kind in rechecked.progress
         ]
+    elif decision.reason == ZERO_SEND_STALL_UNPROVABLE:
+        # The same honesty obligation: opaque activity landed in the window, so the recorded
+        # verdict must be the abstention we actually took — not a stall we declined to act on.
+        result["state"] = SWEEP_STATE_STALL_UNPROVABLE
+        result["is_stall"] = False
+        result["summary"] = (
+            "journal(s) with no recognized structured marker landed after the dispatch anchor "
+            "between the sweep's decision and its send — the lane may be advancing in prose, so "
+            "the stall is unprovable and no recovery was sent"
+        )
+        result["recovery"] = [
+            "read the named journal(s) directly to see whether the lane advanced",
+            "record the lane's gates through the canonical marker-bearing writers so the sweep "
+            "can classify them structurally instead of abstaining",
+            "do NOT re-dispatch on this verdict — it is an abstention, not a stall",
+        ]
+        result["opaque_journals"] = list(rechecked.opaque)
     return result
 
 
@@ -251,4 +284,68 @@ def _unreadable(exc: BaseException) -> dict[str, Any]:
     }
 
 
-__all__ = ("SWEEP_SOURCE_UNREADABLE", "SWEEP_READ_ONLY", "read_watermark", "sweep_once")
+class RecoverySendError(RuntimeError):
+    """The one recovery notification did not positively succeed (-> the fence marks it uncertain)."""
+
+
+def build_recovery_sender(
+    *,
+    issue: str,
+    journal: str,
+    target: str,
+    runner: Optional[Callable[[list], "tuple[int, str]"]] = None,
+    mozyo_bridge_bin: str = "mozyo-bridge",
+) -> Callable[[], object]:
+    """Build the production ``send_fn``: ONE ``handoff send`` re-notification of the durable anchor.
+
+    The composition seam that makes :func:`sweep_once` a real recovery path rather than a library
+    fixture (review F1). It mirrors :class:`...callback_send_port.HandoffCallbackSendPort` — the
+    established sender for this family — including its **injectable ``runner``**: production spawns
+    the CLI, tests inject a fake and exercise the whole fenced path with no external send. That
+    injectability is why the wiring does not need the (still unauthorized) live dogfood to be
+    verified.
+
+    The notification is only a pointer; the durable anchor named by ``issue`` / ``journal`` is the
+    truth the receiver must read. A non-zero exit raises :class:`RecoverySendError`, which
+    :func:`sweep_once` turns into a fence ``uncertain`` — an ambiguous send is never auto-retried.
+    """
+    argv = [
+        str(mozyo_bridge_bin), "handoff", "send",
+        "--to", "codex",
+        "--target", str(target),
+        "--source", "redmine",
+        "--issue", str(issue),
+        "--journal", str(journal),
+        "--kind", "reply",
+        "--mode", "standard",
+        "--target-repo", "auto",
+    ]
+
+    def _run() -> object:
+        run = runner if runner is not None else _default_recovery_runner
+        rc, detail = run(list(argv))
+        if int(rc) != 0:
+            raise RecoverySendError(f"handoff send exited {rc}: {str(detail)[:200]}")
+        return {"rc": rc}
+
+    return _run
+
+
+def _default_recovery_runner(argv: list) -> "tuple[int, str]":
+    """Spawn the sanctioned mozyo-bridge CLI for the one recovery send (fixed argv, no shell)."""
+    import subprocess  # noqa: S404 - the sanctioned CLI boundary, mirroring HandoffCallbackSendPort
+
+    proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        argv, capture_output=True, text=True
+    )
+    return proc.returncode, (proc.stderr or proc.stdout or "")
+
+
+__all__ = (
+    "SWEEP_SOURCE_UNREADABLE",
+    "SWEEP_READ_ONLY",
+    "RecoverySendError",
+    "read_watermark",
+    "sweep_once",
+    "build_recovery_sender",
+)

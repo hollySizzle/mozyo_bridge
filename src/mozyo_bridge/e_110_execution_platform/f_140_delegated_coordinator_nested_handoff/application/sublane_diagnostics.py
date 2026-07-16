@@ -30,14 +30,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+    read_watermark,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import sublane_callback
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
     classify_sweep,
-    resolve_watermark,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MappingRedmineJournalSource,
-    resolve_dispatch_entry_journal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODES,
@@ -161,25 +162,80 @@ PROGRESS_DERIVED = "derived_dispatch_anchored"
 PROGRESS_ASSERTED = "asserted_unanchored"
 
 
+def _snapshot_source(args: argparse.Namespace) -> MappingRedmineJournalSource:
+    payload = json.loads(Path(str(args.journals_json)).read_text(encoding="utf-8"))
+    return MappingRedmineJournalSource(payload=payload)
+
+
 def _derive_from_journals(args: argparse.Namespace) -> dict[str, Any]:
     """Derive the verdict from a durable journal snapshot, anchored on the exact dispatch marker.
 
-    The #13889 path: ``--journals-json`` supplies the ``include=journals`` snapshot, the dispatch
-    anchor is resolved from this lane+generation's structured IR marker, and progress is measured
-    strictly after it by ordered durable journal id. Pure — the snapshot is read from disk, never
-    from Redmine over the network (the live-source wiring is the supervisor's path).
+    The #13889 read-only path: ``--journals-json`` supplies the ``include=journals`` snapshot and the
+    verdict is derived through the SAME :func:`...callback_sweep.read_watermark` the actuating path
+    uses — anchored on this lane+generation's structured IR marker, ordered by durable journal id,
+    and round-aware. Classification only: no fence is reserved and nothing is sent.
     """
-    payload = json.loads(Path(str(args.journals_json)).read_text(encoding="utf-8"))
-    source = MappingRedmineJournalSource(payload=payload)
-    entries = source.read_entries(str(getattr(args, "issue", "") or "").strip() or None)
-    dispatch = resolve_dispatch_entry_journal(
-        entries,
+    source = _snapshot_source(args)
+    watermark = read_watermark(
+        source,
+        str(getattr(args, "issue", "") or "").strip(),
         lane=str(getattr(args, "lane", "") or "").strip(),
         lane_generation=getattr(args, "lane_generation", None),
     )
-    watermark = resolve_watermark(entries, dispatch_journal=dispatch)
     result = classify_sweep(
         watermark=watermark,
+        callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
+        stale_cli=bool(getattr(args, "stale_cli", False)),
+    )
+    result["progress_provenance"] = PROGRESS_DERIVED
+    return result
+
+
+def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
+    """The ACTUATING sweep: derive -> re-read -> fence -> at-most-once recovery (review F1).
+
+    The production caller :func:`...callback_sweep.sweep_once` was missing. Everything the
+    acceptance turns on — the pre-mutation re-read, the first-pass zero-send, the at-most-once fence
+    keyed on the dispatch anchor — only binds when a real recovery goes through this path, so this
+    is where the operator's recovery now runs.
+
+    ``--target`` is the pane the one re-notification is delivered to; the fence (a real home-scoped
+    store) gates it to at most once per dispatch anchor. Fail-closed throughout: an unbootstrapped
+    fence, a lost reserve, opaque post-anchor journals, a landed gate, or a superseded round all
+    zero-send.
+    """
+    from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+        build_recovery_sender,
+        sweep_once,
+    )
+
+    issue = str(getattr(args, "issue", "") or "").strip()
+    lane = str(getattr(args, "lane", "") or "").strip()
+    generation = getattr(args, "lane_generation", None)
+    target = str(getattr(args, "target", "") or "").strip()
+    if not (issue and lane and generation and target):
+        raise SystemExit(
+            "--execute requires --issue, --lane, --lane-generation and --target "
+            "(the recovery is fenced on the exact dispatch round and delivered to one target)"
+        )
+    source = _snapshot_source(args)
+    fence = DispatchOutboxFence(home=None)
+    dispatch_anchor = read_watermark(
+        source, issue, lane=lane, lane_generation=generation
+    ).dispatch_journal
+    sender = build_recovery_sender(
+        issue=issue, journal=dispatch_anchor or issue, target=target
+    )
+    result = sweep_once(
+        workspace_id=str(getattr(args, "workspace_id", "") or "").strip(),
+        lane_id=lane,
+        issue=issue,
+        lane_generation=generation,
+        source=source,
+        fence=fence,
+        target_assigned_name=target,
+        send_fn=sender,
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),
     )
@@ -200,7 +256,14 @@ def build_callback_recovery(args: argparse.Namespace) -> dict[str, Any]:
       so the verdict is tagged unanchored rather than being silently trusted as equivalent.
     """
     if getattr(args, "journals_json", None):
+        if getattr(args, "execute", False):
+            return _execute_sweep(args)
         return _derive_from_journals(args)
+    if getattr(args, "execute", False):
+        raise SystemExit(
+            "--execute requires --journals-json: an actuating sweep must derive its verdict from "
+            "the durable record, never from a hand-set --progress boolean (Redmine #13889)"
+        )
     result = sublane_callback.classify_callback_stall(
         dispatch_delivered=bool(getattr(args, "dispatch_delivered", False)),
         new_durable_progress=bool(getattr(args, "progress", False)),

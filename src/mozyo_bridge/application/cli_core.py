@@ -339,6 +339,29 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         help="Lane generation whose dispatch marker anchors the watermark (with --journals-json).",
     )
     sublane_callback.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help="ACTUATE the recovery: derive the verdict, re-read the durable record immediately "
+        "before mutating, and deliver AT MOST ONE recovery notification per dispatch anchor "
+        "(fenced on the home-scoped dispatch outbox fence). Requires --journals-json (an "
+        "actuating sweep never trusts a hand-set --progress), plus --issue / --lane / "
+        "--lane-generation / --target. Zero-sends on a landed gate, opaque post-anchor "
+        "journals, a superseded round, a held fence, or an unavailable fence.",
+    )
+    sublane_callback.add_argument(
+        "--target",
+        dest="target",
+        default="",
+        help="Pane target the single recovery notification is delivered to (with --execute).",
+    )
+    sublane_callback.add_argument(
+        "--workspace-id",
+        dest="workspace_id",
+        default="",
+        help="Workspace id that scopes the recovery fence key (with --execute).",
+    )
+    sublane_callback.add_argument(
         "--callback",
         dest="callback",
         choices=CALLBACK_CHOICES,
