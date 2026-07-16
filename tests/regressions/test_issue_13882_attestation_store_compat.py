@@ -28,6 +28,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -931,10 +932,10 @@ class ReviewJ80045FindingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             path = _seed_v1(home)
-            staging, final_dir = sch._stage_backup(path)
+            staging = sch._stage_backup(path)
             try:
-                self.assertNotIn("backups", staging.parts[-2:])
-                self.assertIn("backups", final_dir.parts)
+                self.assertNotIn("backups", staging.parts)
+                self.assertIn(sch._STAGING_DIRNAME, staging.parts)
             finally:
                 sch._discard_staging(staging)
 
@@ -1020,6 +1021,133 @@ class ReviewJ80045FindingsTest(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIn("untouched", result.detail)
             self.assertTrue(path.exists())
+
+
+class ReviewJ80081FindingsTest(unittest.TestCase):
+    """Review j#80081 R4-F1: the staging allocator must be concurrency-safe."""
+
+    _GENUINE = b"GENUINE-FULL-CORRUPT-STORE-CONTENT"
+
+    def _corrupt_store(self, home: Path) -> Path:
+        path = herdr_identity_attestation_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self._GENUINE)
+        return path
+
+    def test_r4f1_concurrent_quarantine_publishes_only_complete_artifacts(self) -> None:
+        # Deriving the staging name from a second-resolution stamp and rmtree-ing that
+        # guessed path let two same-second quarantines share one staging dir: the later
+        # deleted the earlier's active tree, and the earlier published the later's partial
+        # bytes as a complete recovery point while returning success. A published recovery
+        # point must be whole or absent — under concurrency too, not just sequentially.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt_store(home)
+            a_copied = threading.Event()
+            b_done = threading.Event()
+            real_copy = shutil.copy2
+
+            def _barrier_copy(src, dst, *a, **k):
+                result = real_copy(src, dst, *a, **k)
+                if threading.current_thread().name == "A":
+                    a_copied.set()      # A has copied main...
+                    b_done.wait(5)      # ...and waits while a peer runs the same rail
+                return result
+
+            results: dict = {}
+
+            def _run(name):
+                try:
+                    results[name] = sch.quarantine_attestation_store_artifacts(path)
+                except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+                    results[name] = exc
+
+            with mock.patch.object(sch, "_backup_stamp", lambda now: "SAME"), \
+                    mock.patch.object(sch.shutil, "copy2", _barrier_copy):
+                a = threading.Thread(target=_run, args=("A",), name="A")
+                a.start()
+                self.assertTrue(a_copied.wait(5))
+
+                def _run_b():
+                    try:
+                        _run("B")
+                    finally:
+                        b_done.set()
+
+                b = threading.Thread(target=_run_b, name="B")
+                b.start()
+                b.join(10)
+                a.join(10)
+
+            for name in ("A", "B"):
+                self.assertIsInstance(results[name], Path, f"{name}: {results[name]!r}")
+            published = sorted((home / "backups").iterdir())
+            self.assertEqual(len(published), 2, "each operation gets its own recovery point")
+            self.assertEqual(len({d.name for d in published}), 2, "no shared destination")
+            for directory in published:
+                self.assertEqual(
+                    (directory / path.name).read_bytes(),
+                    self._GENUINE,
+                    "a published artifact must never hold another operation's partial bytes",
+                )
+
+    def test_r4f1_staging_is_unique_per_operation(self) -> None:
+        # Unique by atomic reservation, not by a guessed name.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt_store(home)
+            with mock.patch.object(sch, "_backup_stamp", lambda now: "SAME"):
+                dirs = [sch._stage_backup(path) for _ in range(5)]
+            try:
+                self.assertEqual(len({str(d) for d in dirs}), 5)
+                for d in dirs:
+                    self.assertTrue(d.is_dir())
+            finally:
+                for d in dirs:
+                    sch._discard_staging(d)
+
+    def test_r4f1_staging_never_deletes_a_peers_tree(self) -> None:
+        # GUARD BITE: the old allocator rmtree'd the path it was about to use, which is
+        # how a live peer's staging got destroyed. Reserving must touch nothing existing.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt_store(home)
+            with mock.patch.object(sch, "_backup_stamp", lambda now: "SAME"):
+                peer = sch._stage_backup(path)
+                (peer / "peer-in-flight.bin").write_bytes(b"PEER WORK IN PROGRESS")
+                mine = sch._stage_backup(path)
+            try:
+                self.assertNotEqual(peer, mine)
+                self.assertTrue(
+                    (peer / "peer-in-flight.bin").exists(),
+                    "reserving staging must not delete another operation's active tree",
+                )
+            finally:
+                sch._discard_staging(peer)
+                sch._discard_staging(mine)
+
+    def test_r4f1_publish_never_overwrites_a_peers_recovery_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt_store(home)
+            with mock.patch.object(sch, "_backup_stamp", lambda now: "SAME"):
+                first = sch.quarantine_attestation_store_artifacts(path)
+                second = sch.quarantine_attestation_store_artifacts(path)
+            self.assertNotEqual(first, second)
+            self.assertEqual((first / path.name).read_bytes(), self._GENUINE)
+            self.assertEqual((second / path.name).read_bytes(), self._GENUINE)
+
+    def test_r4f1_logical_rail_shares_the_safe_allocator(self) -> None:
+        # Both rails use _stage_backup, so the concurrency property must hold there too.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1(home, rows=2)
+            with mock.patch.object(sch, "_backup_stamp", lambda now: "SAME"):
+                first = sch.backup_attestation_store(path)
+                second = sch.backup_attestation_store(path)
+            self.assertNotEqual(first, second)
+            self.assertEqual(_store_content(first / path.name), (1, 2))
+            self.assertEqual(_store_content(second / path.name), (1, 2))
 
 
 class ZeroSideEffectTest(unittest.TestCase):
