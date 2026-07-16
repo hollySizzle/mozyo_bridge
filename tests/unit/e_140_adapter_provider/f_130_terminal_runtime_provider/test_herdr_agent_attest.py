@@ -124,15 +124,65 @@ class PerformSelfAttestationTest(unittest.TestCase):
             self.assertEqual(rec.verdict, VERDICT_PRESENT)
 
 
+    def test_replacement_action_id_is_recorded(self) -> None:
+        # Redmine #13806 tranche D R2-F2: a replacement launch's action id reaches the record.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rec = perform_self_attestation(
+                assigned_name=NAME,
+                workspace_id="ws1",
+                role="claude",
+                lane="default",
+                env=_GOOD_ENV,
+                replacement_action_id="recover:l:worker:claude:wk:w2",
+                lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                home=home,
+            )
+            self.assertEqual(rec.replacement_action_id, "recover:l:worker:claude:wk:w2")
+
+    def test_normal_launch_records_empty_action_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = perform_self_attestation(
+                assigned_name=NAME, workspace_id="ws1", role="claude", lane="default",
+                env=_GOOD_ENV, lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                home=Path(tmp),
+            )
+            self.assertEqual(rec.replacement_action_id, "")
+
+
 class CmdAgentAttestTest(unittest.TestCase):
-    def _args(self, provider_argv):
+    def _args(self, provider_argv, replacement_action_id=""):
         return argparse.Namespace(
             assigned_name=NAME,
             workspace_id="ws1",
             role="claude",
             lane="default",
+            replacement_action_id=replacement_action_id,
             provider_argv=provider_argv,
         )
+
+    def test_replacement_action_id_flag_reaches_the_record(self) -> None:
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"MOZYO_BRIDGE_HOME": tmp, "MOZYO_HERDR_BINARY": "/x/herdr",
+             "MOZYO_WORKSPACE_ID": "ws1", "MOZYO_AGENT_ROLE": "claude", "MOZYO_LANE_ID": "default"},
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest._live_lister",
+            return_value=_lister({"name": NAME, "pane_id": "wY:p2"}),
+        ), patch("os.execvp") as execvp:
+            execvp.side_effect = SystemExit(0)
+            with self.assertRaises(SystemExit):
+                cmd_herdr_agent_attest(
+                    self._args(["--", "claude"], replacement_action_id="recover:xyz")
+                )
+            back = HerdrIdentityAttestationStore(home=Path(tmp)).read(NAME)
+            self.assertIsNotNone(back)
+            self.assertEqual(back.replacement_action_id, "recover:xyz")
 
     def test_execs_provider_after_stripping_separator(self) -> None:
         # The CLI records then execs the provider argv, dropping the argparse

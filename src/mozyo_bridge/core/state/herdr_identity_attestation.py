@@ -58,7 +58,11 @@ from typing import Mapping, Optional
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 HERDR_IDENTITY_ATTESTATION_FILENAME = "herdr-identity-attestation.sqlite"
-HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 1
+#: v2 (Redmine #13806 tranche D R2-F2): additive ``replacement_action_id`` — the fresh
+#: process's startup self-attestation records which replacement transaction ``action_id``
+#: launched it (empty on a normal launch). The bump is downgrade-safe: an older / newer
+#: schema is rejected fail-closed on write and read as ``None`` (never a silent field drop).
+HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 2
 
 #: Recovery policy (managed-state-model.md ``### recovery policy vocabulary``): a
 #: rebuildable projection. Losing the file degrades to fail-closed (adopt refuses,
@@ -138,6 +142,10 @@ class IdentityAttestationRecord:
     verdict: str
     detail: str = ""
     observed_at: Optional[str] = None
+    #: The replacement transaction ``action_id`` that launched this process (Redmine #13806
+    #: R2-F2), or empty on a normal (non-replacement) launch. A token only — never a secret /
+    #: env value. A replacement recovery verifies its fresh worker by matching this exactly.
+    replacement_action_id: str = ""
     schema_version: int = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
 
     def as_payload(self) -> dict:
@@ -150,6 +158,7 @@ class IdentityAttestationRecord:
             "verdict": self.verdict,
             "detail": self.detail,
             "observed_at": self.observed_at,
+            "replacement_action_id": self.replacement_action_id,
             "schema_version": self.schema_version,
         }
 
@@ -295,11 +304,15 @@ CREATE TABLE IF NOT EXISTS herdr_identity_attestations (
     locator TEXT NOT NULL,
     verdict TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
-    observed_at TEXT NOT NULL
+    observed_at TEXT NOT NULL,
+    replacement_action_id TEXT NOT NULL DEFAULT ''
 )
 """
 
-_COLUMNS = "assigned_name, workspace_id, role, lane_id, locator, verdict, detail, observed_at"
+_COLUMNS = (
+    "assigned_name, workspace_id, role, lane_id, locator, verdict, detail, observed_at, "
+    "replacement_action_id"
+)
 
 
 def _connect_rw(path: Path) -> sqlite3.Connection:
@@ -347,12 +360,13 @@ class HerdrIdentityAttestationStore:
             with conn:
                 conn.execute(
                     f"INSERT INTO herdr_identity_attestations ({_COLUMNS}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(assigned_name) DO UPDATE SET "
                     "workspace_id = excluded.workspace_id, role = excluded.role, "
                     "lane_id = excluded.lane_id, locator = excluded.locator, "
                     "verdict = excluded.verdict, detail = excluded.detail, "
-                    "observed_at = excluded.observed_at",
+                    "observed_at = excluded.observed_at, "
+                    "replacement_action_id = excluded.replacement_action_id",
                     (
                         record.assigned_name,
                         record.workspace_id,
@@ -362,6 +376,7 @@ class HerdrIdentityAttestationStore:
                         record.verdict,
                         record.detail,
                         observed_at,
+                        record.replacement_action_id,
                     ),
                 )
         finally:
@@ -375,6 +390,7 @@ class HerdrIdentityAttestationStore:
             verdict=record.verdict,
             detail=record.detail,
             observed_at=observed_at,
+            replacement_action_id=record.replacement_action_id,
         )
 
     def read(self, assigned_name: str) -> Optional[IdentityAttestationRecord]:
@@ -412,6 +428,7 @@ class HerdrIdentityAttestationStore:
             verdict=row[5],
             detail=row[6],
             observed_at=row[7],
+            replacement_action_id=row[8],
         )
 
 

@@ -869,6 +869,16 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     herdr_agent_attest.add_argument("--role", dest="role", default="")
     herdr_agent_attest.add_argument("--lane", dest="lane", default="")
     herdr_agent_attest.add_argument(
+        "--replacement-action-id",
+        dest="replacement_action_id",
+        default="",
+        help=(
+            "Redmine #13806 tranche D: the replacement transaction action_id that launched "
+            "this process (empty on a normal launch); recorded into the startup self-attestation "
+            "so a recovery can verify the exact action bound its fresh worker."
+        ),
+    )
+    herdr_agent_attest.add_argument(
         "provider_argv",
         nargs=argparse.REMAINDER,
         help="The provider command to exec, after a `--` separator.",

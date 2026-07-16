@@ -54,8 +54,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RecoveryRequest,
     StaleWorkerRecoveryOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+    WorkflowProviderUnresolved,
+    resolve_gateway_provider,
+    resolve_worker_provider,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ATTEST_BOUND,
+    ATTEST_MISMATCH,
     ATTEST_PENDING,
     CLOSE_DONE,
     CLOSE_ERROR,
@@ -69,8 +75,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     RecoveryObservation,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
-    _resolve_binary_or_die,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
+    HerdrSublaneActuatorOps,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
+    HerdrWorkerDispatchOps,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_BUSY,
@@ -89,11 +98,31 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
-    HerdrCliTransport,
     Runner,
 )
 
 _STATUS_KEYS = ("agent_status", "status", "state")
+
+
+def _recorded_after(recorded_at: object, boundary: str) -> bool:
+    """Is ``recorded_at`` strictly after ``boundary``? (parsed, fail-closed)
+
+    Both are ISO-8601 timestamps. An unparseable / empty either side returns ``False`` — a
+    ledger record whose ordering against the post-launch boundary cannot be established is
+    never treated as the redispatch (Redmine #13806 R2-F3).
+    """
+    from datetime import datetime
+
+    left = _norm(recorded_at)
+    right = _norm(boundary)
+    if not left or not right:
+        return False
+    try:
+        return datetime.fromisoformat(left.replace("Z", "+00:00")) > datetime.fromisoformat(
+            right.replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _row_runtime_state(row: Mapping[str, object]) -> str:
@@ -141,6 +170,9 @@ class LiveRecoveryActuatorPort:
     #: generation)`` against (Redmine #13806 R1-F2). ``None`` = the real state home; tests inject
     #: an isolated one.
     lifecycle_home: Optional[Path] = None
+    #: The startup-attestation store home the action-binding verify reads (Redmine #13806 R2-F2).
+    #: ``None`` = the real state home; tests inject an isolated one.
+    attestation_home: Optional[Path] = None
 
     def _q(self) -> LiveSublaneQuarantineOps:
         return LiveSublaneQuarantineOps(
@@ -254,21 +286,61 @@ class LiveRecoveryActuatorPort:
         return CLOSE_DONE if (result.closed or result.old_absent) else CLOSE_ERROR
 
     def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
+        """Relaunch the fresh worker carrying the exact ``action_id`` (Redmine #13806 R2-F2).
+
+        Constructs the herdr lane actuator with ``replacement_action_id=action_id`` so the
+        fresh process's startup self-attestation records it — the durable action binding
+        :meth:`verify_attestation` re-checks. Not the plain ``heal_receiver`` (which drops the
+        action id): a fresh relaunch that does not carry the exact replacement action can never
+        be verified as THIS recovery's worker.
+        """
         try:
-            self._q().heal_receiver(_quarantine_request(self.request))
+            HerdrSublaneActuatorOps(
+                repo_root=self.repo_root, lane_label=_norm(self.request.lane),
+                issue=_norm(self.request.issue), journal=_norm(self.request.journal),
+                env=self.env, runner=self.runner, timeout=self.timeout,
+                replacement_action_id=_norm(action_id),
+            ).heal_lane_column(str(self.repo_root))
         except Exception:  # noqa: BLE001 - a fixed launch failure, no body persisted
             return LAUNCH_ERROR
         return LAUNCH_DONE
 
     def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
+        """Verify the fresh worker is fresh AND bound to THIS action (Redmine #13806 R2-F2).
+
+        Fresh identity / locator / post-transaction freshness (the #13763 join) is necessary
+        but not sufficient — the fresh process's startup self-attestation must also record the
+        exact replacement ``action_id`` (option B, Design Answer j#79556):
+
+        - no fresh attestation yet (still booting / not fresh) -> :data:`ATTEST_PENDING`;
+        - fresh, but the ``replacement_action_id`` is missing / a different action ->
+          :data:`ATTEST_MISMATCH` (a fresh slot NOT launched by this recovery is never adopted);
+        - fresh AND exact action match -> :data:`ATTEST_BOUND`.
+        """
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+        )
+
         rec = self.store.get(self.key)
-        # The fresh receiver's attestation must post-date the recovery transaction's creation
-        # (a stable durable boundary across resumes) — reusing the #13763 fresh-attestation join.
         fresh_after = rec.created_at if rec is not None else ""
         verification = self._q().verify_fresh_receiver(
             _quarantine_request(self.request), fresh_after=fresh_after
         )
-        return ATTEST_BOUND if verification.ok else ATTEST_PENDING
+        if not verification.ok:
+            return ATTEST_PENDING  # fresh attestation not present / not fresh yet
+        try:
+            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
+                _norm(self.request.assigned_name)
+            )
+        except Exception:  # noqa: BLE001 - unreadable attestation fails closed (not bound)
+            return ATTEST_PENDING
+        if record is None:
+            return ATTEST_PENDING
+        if _norm(record.replacement_action_id) != _norm(action_id):
+            # A fresh, attested slot whose startup did NOT bind this exact action — a different
+            # (or no) replacement authority launched it. Never complete the participant on it.
+            return ATTEST_MISMATCH
+        return ATTEST_BOUND
 
 
 @dataclass
@@ -287,6 +359,9 @@ class LiveStaleWorkerRecoveryOps:
     runner: Optional[Runner] = None
     timeout: float = COMMAND_TIMEOUT_SECONDS
     ledger: Optional[HerdrDeliveryLedger] = None
+    #: The startup-attestation store home the redispatch post-launch boundary reads (Redmine
+    #: #13806 R2-F3). ``None`` = the real state home; tests inject an isolated one.
+    attestation_home: Optional[Path] = None
 
     def _ledger(self) -> HerdrDeliveryLedger:
         return self.ledger if self.ledger is not None else HerdrDeliveryLedger()
@@ -323,8 +398,19 @@ class LiveStaleWorkerRecoveryOps:
         )
         if not identity_resolved:
             return RecoveryObservation()
-        # a standard sublane worker: not the default coordinator lane, and the worker role
-        is_standard = _norm_lane(identity.lane_id) != "default"
+        # A STANDARD sublane WORKER (Redmine #13806 R2-F1): positively the configured worker
+        # (implementer) provider, NOT the lane gateway (coordinator) provider, NOT the default
+        # coordinator lane, and the approval itself must name the worker provider. A same-issue
+        # lane gateway (a non-``default`` lane but the gateway provider) is therefore rejected as
+        # ``gateway_or_foreign_protected``, never closed as a worker. An unresolvable provider
+        # binding fails closed (not a worker).
+        worker_provider, gateway_provider = self._worker_gateway_providers()
+        is_standard = bool(worker_provider) and (
+            _norm_lane(identity.lane_id) != "default"
+            and identity.role == worker_provider
+            and identity.role != gateway_provider
+            and _norm(request.role) == worker_provider
+        )
         # a live-generation revision match (a same-name recycle at a new revision is stale gen)
         revision_raw = row.get("revision")
         row_revision = (
@@ -350,6 +436,20 @@ class LiveStaleWorkerRecoveryOps:
             no_authority_conflict=no_conflict,
         )
 
+    def _worker_gateway_providers(self) -> tuple[str, str]:
+        """The configured ``(worker_provider, gateway_provider)`` or ``("", "")`` (fail-closed).
+
+        An unresolvable role→provider binding yields empty strings, so a slot can never be
+        classified as a standard worker without a positive binding (Redmine #13806 R2-F1).
+        """
+        try:
+            return (
+                resolve_worker_provider(str(self.repo_root)),
+                resolve_gateway_provider(str(self.repo_root)),
+            )
+        except WorkflowProviderUnresolved:
+            return "", ""
+
     @staticmethod
     def _issue_lane_matches(identity, request: RecoveryRequest) -> bool:
         # The lane id encodes the owning issue (``issue_<id>_...``); match it against the
@@ -367,15 +467,61 @@ class LiveStaleWorkerRecoveryOps:
         except Exception:  # noqa: BLE001 - unreadable worktree fails closed
             return False
 
-    # -- redispatch (exactly-once, ledger-confirmed) -------------------------
+    # -- redispatch (high-level rail + REAL delivery-ledger oracle, Redmine #13806 R2-F3) ----
+
+    def redispatch_gate(self, continuation: ContinuationPointer) -> str:
+        """Redispatch the ORIGINAL gate to the fresh worker via the high-level dispatch rail.
+
+        Uses the existing governed same-lane worker-forward rail
+        (:meth:`HerdrWorkerDispatchOps.dispatch_to_worker` = ``handoff send --mode queue-enter``),
+        which submit-completes to the fresh worker and records the delivery to the durable
+        ledger through the REAL writer (:func:`record_herdr_delivery`) — never a bare
+        ``send_text`` and never a self-authored ``status=sent`` record (R2-F3). Returns
+        :data:`DRAIN_SEND_OK` only when the delivery-ACK exit code is 0 (the send fired). Landing
+        is confirmed separately by :meth:`gate_redispatched` reading the real ledger — a
+        successful send here is only an attempt, never promoted to completion.
+        """
+        locator = self._fresh_worker_locator()
+        if not locator or locator == _norm(self.request.locator):
+            # No fresh worker resolved yet (or still the old locator) — never dispatch blind.
+            return DRAIN_SEND_ERROR
+        try:
+            ops = HerdrWorkerDispatchOps(
+                repo_root=self.repo_root, lane_label=_norm(self.request.lane),
+                issue=_norm(continuation.issue_id), env=self.env, runner=self.runner,
+                timeout=self.timeout,
+            )
+            rc = ops.dispatch_to_worker(
+                issue=_norm(continuation.issue_id), journal=_norm(continuation.journal_id),
+                worker_pane=locator, lane_label=_norm(self.request.lane),
+                gateway_callback_target=None, target_repo=str(self.repo_root),
+            )
+        except Exception:  # noqa: BLE001 - a fixed dispatch failure; the ledger is untouched
+            return DRAIN_SEND_ERROR
+        return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
 
     def gate_redispatched(self, continuation: ContinuationPointer) -> bool:
-        """Has the original gate already landed on the fresh worker? (durable idempotency)
+        """Has the original gate CONFIRMED-landed on the FRESH worker? (durable idempotency)
 
-        Reads the durable herdr delivery ledger for a delivered record of the continuation's
-        journal to this lane's worker — the oracle that lets a resume distinguish confirmed
-        from still-needed without a blind resend.
+        Reads the REAL herdr delivery ledger (written by the dispatch rail, never self-written)
+        and confirms only a record that is unmistakably the redispatch to the fresh worker
+        (Redmine #13806 R2-F3), matching ALL of:
+
+        - the exact anchor (``issue_id`` + ``journal_id`` of the continuation);
+        - the resolved worker ``receiver`` provider;
+        - ``status == "sent"`` AND an **accepted reason** (``ok`` — a landing-marker-observed
+          submit; a bare ``queue_enter`` / unconfirmed reason is NOT confirmed);
+        - recorded **after the fresh worker's startup attestation** (``recorded_at`` >
+          the fresh attestation ``observed_at``) — so the INITIAL delivery to the now-vanished
+          old worker (same anchor, before the recovery) can never be mistaken for the redispatch.
+
+        Any unreadable ledger / missing fresh attestation / only-``queue_enter`` record yields
+        ``False`` (the use case then reports ``uncertain`` and never blind-resends).
         """
+        fresh_observed_at = self._fresh_attestation_observed_at()
+        if not fresh_observed_at:
+            return False  # no fresh attested worker => cannot establish the post-launch boundary
+        worker_provider, _gateway = self._worker_gateway_providers()
         try:
             records = self._ledger().records_for_issue(_norm(continuation.issue_id))
         except Exception:  # noqa: BLE001 - unreadable ledger => not confirmed (never assume sent)
@@ -384,42 +530,12 @@ class LiveStaleWorkerRecoveryOps:
             if (
                 _norm(rec.journal_id) == _norm(continuation.journal_id)
                 and _norm(rec.status) == "sent"
-                and _norm(rec.disposition) == "redispatch"
+                and _norm(rec.reason) == "ok"  # accepted (marker-observed submit), not queue_enter
+                and (not worker_provider or _norm(rec.receiver) == worker_provider)
+                and _recorded_after(rec.recorded_at, fresh_observed_at)
             ):
                 return True
         return False
-
-    def redispatch_gate(self, continuation: ContinuationPointer) -> str:
-        """Resend the ORIGINAL gate to the fresh worker (high-level, once) + record it.
-
-        Resolves the fresh worker locator from the live inventory and sends the gate's
-        notification marker via the herdr transport, then records a ``redispatch`` delivery on
-        the durable ledger so :meth:`gate_redispatched` can confirm it. A failed send records
-        nothing and returns an error, so a resume re-checks the gate rather than assuming.
-        """
-        locator = self._fresh_worker_locator()
-        if not locator:
-            return DRAIN_SEND_ERROR
-        receiver = _norm(self.request.provider) or _norm(self.request.role) or "claude"
-        marker = (
-            f"[mozyo:handoff:source={_norm(continuation.source)}:"
-            f"issue={_norm(continuation.issue_id)}:journal={_norm(continuation.journal_id)}:"
-            f"kind={_norm(continuation.next_semantic_action)}:to={receiver}]"
-        )
-        try:
-            binary = _resolve_binary_or_die(self.env)
-            result = HerdrCliTransport(
-                binary, runner=self.runner, timeout=self.timeout
-            ).send_text(locator, marker)
-        except Exception:  # noqa: BLE001 - a fixed send failure
-            return DRAIN_SEND_ERROR
-        if not getattr(result, "ok", False):
-            return DRAIN_SEND_ERROR
-        try:
-            self._record_redispatch(continuation, locator)
-        except Exception:  # noqa: BLE001 - a ledger write failure is a fail-closed uncertain
-            return DRAIN_SEND_ERROR
-        return DRAIN_SEND_OK
 
     def _fresh_worker_locator(self) -> str:
         try:
@@ -435,21 +551,23 @@ class LiveStaleWorkerRecoveryOps:
             return ""
         return _agent_locator(matches[0])
 
-    def _record_redispatch(self, continuation: ContinuationPointer, locator: str) -> None:
-        from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedgerRecord
+    def _fresh_attestation_observed_at(self) -> str:
+        """The fresh worker's startup-attestation ``observed_at`` (the post-launch boundary).
 
-        self._ledger().append(
-            HerdrDeliveryLedgerRecord(
-                notification_marker=None,
-                receiver=_norm(self.request.provider) or "claude",
-                source=_norm(continuation.source),
-                issue_id=_norm(continuation.issue_id),
-                journal_id=_norm(continuation.journal_id),
-                target=locator,
-                status="sent",
-                disposition="redispatch",
-            )
+        Empty when no attestation exists / is unreadable — the redispatch cannot then be
+        distinguished from the initial old-worker delivery, so it is treated as unconfirmed.
+        """
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
         )
+
+        try:
+            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
+                _norm(self.request.assigned_name)
+            )
+        except Exception:  # noqa: BLE001 - unreadable attestation fails closed
+            return ""
+        return _norm(record.observed_at) if record is not None else ""
 
 
 __all__ = (

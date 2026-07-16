@@ -100,6 +100,7 @@ def perform_self_attestation(
     role: str,
     lane: str,
     env: Mapping[str, str],
+    replacement_action_id: str = "",
     lister: Optional[Lister] = None,
     home=None,
     now: Optional[str] = None,
@@ -129,6 +130,7 @@ def perform_self_attestation(
         verdict=verdict,
         detail=detail,
         observed_at=now,
+        replacement_action_id=_norm(replacement_action_id),
     )
     persisted = record_identity_attestation(record, home=home)
     return persisted or record
@@ -205,6 +207,7 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         role=_norm(getattr(args, "role", "")),
         lane=_norm(getattr(args, "lane", "")),
         env=env,
+        replacement_action_id=_norm(getattr(args, "replacement_action_id", "")),
         lister=_live_lister(env),
     )
     os.execvp(provider_argv[0], provider_argv)

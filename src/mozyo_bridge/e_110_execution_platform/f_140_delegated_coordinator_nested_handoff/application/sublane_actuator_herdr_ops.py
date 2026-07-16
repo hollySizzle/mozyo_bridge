@@ -183,6 +183,9 @@ class HerdrSublaneActuatorOps:
     #: ``repo_root``; tests inject a reader returning a drift fingerprint to prove the
     #: front door goes zero-write on a source/installed skew.
     runtime_fingerprint_reader: Optional[Callable[[], dict]] = None
+    #: The #13806 tranche D replacement ``action_id`` a worker-recovery relaunch carries into
+    #: the fresh process's startup self-attestation (empty on a normal heal = byte-invariant).
+    replacement_action_id: str = ""
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 
@@ -381,6 +384,8 @@ class HerdrSublaneActuatorOps:
                 # first permission prompt).
                 claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
                 agent_launch=agent_launch,
+                # #13806 R2-F2: carry the recovery's action_id into the fresh startup attestation.
+                replacement_action_id=self.replacement_action_id,
             )
         except HerdrSessionStartError as exc:
             raise RuntimeError(f"herdr lane slot creation failed: {exc}") from exc

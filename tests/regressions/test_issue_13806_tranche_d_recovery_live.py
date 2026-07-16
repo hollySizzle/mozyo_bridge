@@ -22,6 +22,10 @@ from mozyo_bridge.core.state.herdr_delivery_ledger import (  # noqa: E402
     HerdrDeliveryLedger,
     HerdrDeliveryLedgerRecord,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+)
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ContinuationPointer,
     DecisionPointer,
@@ -35,6 +39,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E402,E501
     ATTEST_BOUND,
+    ATTEST_MISMATCH,
     ATTEST_PENDING,
     CLOSE_DONE,
     CLOSE_ERROR,
@@ -56,6 +61,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     decide_recovery,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E402,E501
+    DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
@@ -126,6 +132,21 @@ class ObserveTargetTests(_LiveCase):
         name = encode_assigned_name(WS, ROLE, "default")
         obs = self._ops([_row(name=name)]).observe_target(
             _request(lane="default", assigned_name=name)
+        )
+        self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_GATEWAY_OR_FOREIGN)
+
+    def test_same_issue_lane_gateway_is_gateway_or_foreign(self):
+        # R2-F1: the same-issue-lane Codex GATEWAY sits in a non-default lane but is the gateway
+        # provider — it must be protected, never classified as a standard worker.
+        gw_name = encode_assigned_name(WS, "codex", LANE)
+        row = {
+            "name": gw_name, "pane_id": "w28:p34", "agent": "", "status": "unknown",
+            "revision": 3, "foreground_cwd": str(ROOT),
+        }
+        live.list_herdr_agent_rows = lambda env: [row]
+        ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
+        obs = ops.observe_target(
+            _request(role="codex", provider="codex", assigned_name=gw_name, locator="w28:p34")
         )
         self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_GATEWAY_OR_FOREIGN)
 
@@ -224,7 +245,7 @@ class ObserveOldSlotTests(_LiveCase):
 class ActuatorDelegationTests(_LiveCase):
     """close / launch / verify delegate to the reused #13763 live ops (injected fake here)."""
 
-    def _port(self, fake_q):
+    def _port(self, fake_q, *, attestation_home=None):
         store = ReplacementTransactionStore(home=Path(tempfile.mkdtemp()))
         store.plan_transaction(
             ReplacementTransactionKey(WS, "recover:k"),
@@ -242,6 +263,7 @@ class ActuatorDelegationTests(_LiveCase):
         port = live.LiveRecoveryActuatorPort(
             repo_root=ROOT, request=_request(), store=store,
             key=ReplacementTransactionKey(WS, "recover:k"),
+            attestation_home=attestation_home,
         )
         port._q = lambda: fake_q
         return port
@@ -277,14 +299,51 @@ class ActuatorDelegationTests(_LiveCase):
         self.assertEqual(self._port(FakeQ()).close_exact_generation(self._pin()), CLOSE_ERROR)
 
     def test_launch_error_on_exception(self):
-        class FakeQ:
-            def heal_receiver(self, req): raise RuntimeError("launch failed")
+        # launch_action_bound constructs the herdr lane actuator with the replacement action id
+        # (never the plain heal_receiver, which drops it). A launch failure => LAUNCH_ERROR.
+        class FailingActuator:
+            def __init__(self, **kwargs):
+                # the recovery MUST carry the exact action id into the fresh launch
+                assert kwargs.get("replacement_action_id") == "a"
+            def heal_lane_column(self, worktree_path):
+                raise RuntimeError("launch failed")
 
-        self.assertEqual(
-            self._port(FakeQ()).launch_action_bound("a", self._pin()), LAUNCH_ERROR
-        )
+        orig = live.HerdrSublaneActuatorOps
+        live.HerdrSublaneActuatorOps = FailingActuator
+        try:
+            self.assertEqual(
+                self._port(object()).launch_action_bound("a", self._pin()), LAUNCH_ERROR
+            )
+        finally:
+            live.HerdrSublaneActuatorOps = orig
 
-    def test_verify_bound_and_pending(self):
+    def test_launch_carries_action_id(self):
+        seen = {}
+
+        class CapturingActuator:
+            def __init__(self, **kwargs):
+                seen["action_id"] = kwargs.get("replacement_action_id")
+            def heal_lane_column(self, worktree_path):
+                return None
+
+        orig = live.HerdrSublaneActuatorOps
+        live.HerdrSublaneActuatorOps = CapturingActuator
+        try:
+            self.assertEqual(
+                self._port(object()).launch_action_bound("act-9", self._pin()), LAUNCH_DONE
+            )
+        finally:
+            live.HerdrSublaneActuatorOps = orig
+        self.assertEqual(seen["action_id"], "act-9")
+
+    def _seed_attestation(self, home, *, action_id):
+        HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
+            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator="w28:p88",
+            verdict="present", replacement_action_id=action_id,
+        ))
+
+    def test_verify_bound_on_exact_action_match(self):
+        # R2-F2: fresh identity AND the fresh startup attestation binds THIS action -> bound.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
             FreshReceiverVerification,
         )
@@ -293,75 +352,166 @@ class ActuatorDelegationTests(_LiveCase):
             def verify_fresh_receiver(self, req, *, fresh_after):
                 return FreshReceiverVerification(ok=True, locator="w28:p88")
 
+        att = Path(tempfile.mkdtemp())
+        self._seed_attestation(att, action_id="act-1")
+        port = self._port(OkQ(), attestation_home=att)
+        self.assertEqual(port.verify_attestation("act-1", self._pin()), ATTEST_BOUND)
+
+    def test_verify_mismatch_on_different_action(self):
+        # R2-F2: a fresh, attested slot whose startup bound a DIFFERENT action -> mismatch.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
+            FreshReceiverVerification,
+        )
+
+        class OkQ:
+            def verify_fresh_receiver(self, req, *, fresh_after):
+                return FreshReceiverVerification(ok=True, locator="w28:p88")
+
+        att = Path(tempfile.mkdtemp())
+        self._seed_attestation(att, action_id="other-action")
+        port = self._port(OkQ(), attestation_home=att)
+        self.assertEqual(port.verify_attestation("act-1", self._pin()), ATTEST_MISMATCH)
+
+    def test_verify_pending_when_no_attestation_record(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
+            FreshReceiverVerification,
+        )
+
+        class OkQ:
+            def verify_fresh_receiver(self, req, *, fresh_after):
+                return FreshReceiverVerification(ok=True, locator="w28:p88")
+
+        port = self._port(OkQ(), attestation_home=Path(tempfile.mkdtemp()))  # empty store
+        self.assertEqual(port.verify_attestation("act-1", self._pin()), ATTEST_PENDING)
+
+    def test_verify_pending_when_not_fresh(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
+            FreshReceiverVerification,
+        )
+
         class PendingQ:
             def verify_fresh_receiver(self, req, *, fresh_after):
                 return FreshReceiverVerification(ok=False, detail="not_fresh")
 
-        self.assertEqual(self._port(OkQ()).verify_attestation("a", self._pin()), ATTEST_BOUND)
-        self.assertEqual(
-            self._port(PendingQ()).verify_attestation("a", self._pin()), ATTEST_PENDING
-        )
+        att = Path(tempfile.mkdtemp())
+        self._seed_attestation(att, action_id="act-1")
+        port = self._port(PendingQ(), attestation_home=att)
+        self.assertEqual(port.verify_attestation("act-1", self._pin()), ATTEST_PENDING)
 
 
 class RedispatchLedgerTests(_LiveCase):
-    def _ops_with_ledger(self, rows, ledger):
-        live.list_herdr_agent_rows = lambda env: rows
+    """R2-F3: gate_redispatched confirms ONLY a real, fresh-target, post-launch, accepted send."""
+
+    ISSUE, JOURNAL = "13806", "79485"
+    LAUNCH_AT = "2026-07-15T12:00:00+00:00"
+    AFTER = "2026-07-15T12:05:00+00:00"
+    BEFORE = "2026-07-15T11:00:00+00:00"
+
+    def _ops(self, ledger, att_home):
+        live.list_herdr_agent_rows = lambda env: [_row()]
         return live.LiveStaleWorkerRecoveryOps(
-            repo_root=ROOT, request=_request(), ledger=ledger,
+            repo_root=ROOT, request=_request(), ledger=ledger, attestation_home=att_home,
         )
 
     def _continuation(self):
         return ContinuationPointer(
-            source="redmine", issue_id="13806", journal_id="79485",
+            source="redmine", issue_id=self.ISSUE, journal_id=self.JOURNAL,
             expected_gate="review_request", next_semantic_action="dispatch_once",
         )
 
-    def test_gate_redispatched_reads_durable_ledger(self):
-        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
-        ops = self._ops_with_ledger([_row()], ledger)
-        cont = self._continuation()
-        self.assertFalse(ops.gate_redispatched(cont))  # nothing recorded yet
-        ledger.append(HerdrDeliveryLedgerRecord(
-            issue_id="13806", journal_id="79485", status="sent",
-            disposition="redispatch", target=LOCATOR,
+    def _seed_launch(self, att_home, observed_at=LAUNCH_AT):
+        HerdrIdentityAttestationStore(home=att_home).upsert(IdentityAttestationRecord(
+            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=LOCATOR,
+            verdict="present", observed_at=observed_at, replacement_action_id="a",
         ))
-        self.assertTrue(ops.gate_redispatched(cont))
 
-    def test_gate_redispatched_ignores_unrelated_disposition(self):
+    def _delivered(self, **over):
+        base = dict(
+            issue_id=self.ISSUE, journal_id=self.JOURNAL, status="sent", reason="ok",
+            receiver=ROLE, target=LOCATOR, recorded_at=self.AFTER,
+        )
+        base.update(over)
+        return HerdrDeliveryLedgerRecord(**base)
+
+    def test_confirmed_when_accepted_delivery_after_launch(self):
         ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
-        ledger.append(HerdrDeliveryLedgerRecord(
-            issue_id="13806", journal_id="79485", status="sent",
-            disposition="review_request", target=LOCATOR,  # not a redispatch
-        ))
-        ops = self._ops_with_ledger([_row()], ledger)
-        self.assertFalse(ops.gate_redispatched(self._continuation()))
+        att = Path(tempfile.mkdtemp())
+        self._seed_launch(att)
+        ops = self._ops(ledger, att)
+        self.assertFalse(ops.gate_redispatched(self._continuation()))  # nothing yet
+        ledger.append(self._delivered())
+        self.assertTrue(ops.gate_redispatched(self._continuation()))
 
-    def test_redispatch_sends_and_records(self):
+    def test_queue_enter_reason_is_not_confirmed(self):
+        # A submit-unconfirmed (queue_enter) delivery is NOT a landing (R2-F3 cond 4).
         ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
-        ops = self._ops_with_ledger([_row()], ledger)
-        sent = {}
+        att = Path(tempfile.mkdtemp())
+        self._seed_launch(att)
+        ledger.append(self._delivered(reason="queue_enter"))
+        self.assertFalse(self._ops(ledger, att).gate_redispatched(self._continuation()))
 
-        class FakeResult:
-            ok = True
+    def test_delivery_before_launch_is_the_old_worker_not_confirmed(self):
+        # The INITIAL delivery to the now-vanished old worker (same anchor, before the recovery
+        # launch) must never be mistaken for the redispatch (R2-F3 cond 3 / "same anchor").
+        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
+        att = Path(tempfile.mkdtemp())
+        self._seed_launch(att)
+        ledger.append(self._delivered(recorded_at=self.BEFORE))
+        self.assertFalse(self._ops(ledger, att).gate_redispatched(self._continuation()))
 
-        class FakeTransport:
-            def __init__(self, *a, **k): pass
-            def send_text(self, target, text):
-                sent["target"] = target
-                sent["text"] = text
-                return FakeResult()
+    def test_no_fresh_attestation_is_not_confirmed(self):
+        # Without a fresh-launch boundary the redispatch cannot be distinguished => unconfirmed.
+        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
+        ledger.append(self._delivered())
+        self.assertFalse(
+            self._ops(ledger, Path(tempfile.mkdtemp())).gate_redispatched(self._continuation())
+        )
 
-        orig_tx, orig_bin = live.HerdrCliTransport, live._resolve_binary_or_die
-        live.HerdrCliTransport = FakeTransport
-        live._resolve_binary_or_die = lambda env: "herdr"
-        try:
-            result = ops.redispatch_gate(self._continuation())
-        finally:
-            live.HerdrCliTransport, live._resolve_binary_or_die = orig_tx, orig_bin
-        self.assertEqual(result, DRAIN_SEND_OK)
-        self.assertEqual(sent["target"], LOCATOR)
-        self.assertIn("issue=13806", sent["text"])
-        self.assertTrue(ops.gate_redispatched(self._continuation()))  # confirmed on the ledger
+    def test_wrong_receiver_is_not_confirmed(self):
+        ledger = HerdrDeliveryLedger(home=Path(tempfile.mkdtemp()))
+        att = Path(tempfile.mkdtemp())
+        self._seed_launch(att)
+        ledger.append(self._delivered(receiver="codex"))  # gateway, not the worker
+        self.assertFalse(self._ops(ledger, att).gate_redispatched(self._continuation()))
+
+    def test_redispatch_gate_without_fresh_worker_is_error(self):
+        # No fresh worker resolved (only the old locator) => never dispatch blind.
+        live.list_herdr_agent_rows = lambda env: []
+        ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
+        self.assertEqual(ops.redispatch_gate(self._continuation()), DRAIN_SEND_ERROR)
+
+
+class LaunchArgvActionIdTest(unittest.TestCase):
+    """R2-F2: the wrapper argv carries --replacement-action-id ONLY for a replacement launch."""
+
+    def _build(self, replacement_action_id):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
+            build_agent_start_argv,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (  # noqa: E501
+            ResolvedProviderLaunch,
+        )
+
+        return build_agent_start_argv(
+            assigned_name=NAME, provider=ROLE, repo_root=ROOT, workspace_id=WS, lane=LANE,
+            target_workspace="wZ", target_tab="", split="", focus=False, binary="/x/herdr",
+            attest_launcher="/x/mozyo-bridge", store_home="/tmp/h",
+            resolved=ResolvedProviderLaunch(
+                provider_id=ROLE, executable="/x/claude", managed_argv=("/x/claude",)
+            ),
+            launch_argv_extra=(),
+            replacement_action_id=replacement_action_id,
+        )
+
+    def test_replacement_launch_emits_flag(self):
+        argv = self._build("recover:xyz")
+        self.assertIn("--replacement-action-id", argv)
+        self.assertEqual(argv[argv.index("--replacement-action-id") + 1], "recover:xyz")
+        # the capability marker (--assigned-name) is still the first wrapper flag
+        self.assertLess(argv.index("--assigned-name"), argv.index("--replacement-action-id"))
+
+    def test_normal_launch_is_byte_invariant(self):
+        self.assertNotIn("--replacement-action-id", self._build(""))
 
 
 if __name__ == "__main__":
