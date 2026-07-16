@@ -21,10 +21,15 @@ from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     REASON_PAIR_SPLIT,
+    REASON_PARTIAL_PAIR_RECOVERY,
     REASON_RUNTIME_FINGERPRINT,
     STEP_BLOCKED,
+    STEP_EXECUTED,
     ActuationStep,
     SublaneActuationOutcome,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.pair_launch_attestation import (  # noqa: E501
+    decide_pair_launch_attestation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SUBLANE_STATE_PAIR_SPLIT,
@@ -119,4 +124,113 @@ def pair_split_admission(
     )
 
 
-__all__ = ("pair_split_admission", "runtime_placement_gate")
+def pair_attestation_admission(
+    use_case,
+    request,
+    *,
+    launch_action,
+    dispatch: bool,
+    adopted: bool,
+    gateway_pane,
+    worker_pane,
+    lane_runtime_root: str,
+    steps: list,
+    fill_decision,
+    fill_override_reason,
+) -> Optional[SublaneActuationOutcome]:
+    """Confirm BOTH freshly-launched slots self-attested, else fail closed (Redmine #13847).
+
+    A launch that returns a live locator is not proof the pair attested: an incompatible
+    launcher (schema skew — closed pre-launch by the capability preflight) or a failed env
+    injection leaves a slot **live but unattested / stale**, and promoting that to
+    ``executed`` is the false success #13847 closes (live evidence: gateway ``unattested``,
+    worker ``stale_named_slot``). This is the action-time confirmation *after* launch.
+
+    Scope: FRESH launches only (``adopted`` is False). An adopt of an already-live pair is
+    validated by the owner-declaration gate, and its slots attested at their own earlier
+    launch, so re-requiring a post-this-action attestation would wrongly block a healthy
+    adopt. Optional / herdr-only: the port exposes ``observe_pair_attestation`` only where
+    it can read the attestation store (the tmux + test ports omit it → no-op), so this is
+    back-compatible.
+
+    The self-attestation is written by the wrapper BEFORE the provider exec, so it lands
+    early; a bounded poll (reusing the gateway-readiness cadence) tolerates the herdr
+    registration lag. Both slots must reach the positive ``ATTEST_OK`` join (freshness for a
+    fresh launch is proven by the live-locator match); any non-ok slot after the window
+    yields a ``partial_pair_recovery_required`` block whose step names the bad roles and the
+    durable recovery pointer (the public ``sublane recover-pair`` surface), never
+    ``executed``.
+    """
+    if adopted:
+        return None
+    observe = getattr(use_case.ops, "observe_pair_attestation", None)
+    if not callable(observe):
+        return None
+    probes = max(1, use_case.gateway_ready_probes)
+    verdict = None
+    for attempt in range(probes):
+        observation = observe(lane_runtime_root)
+        if observation is None:
+            # Wrapping inactive (unwrapped byte-invariant launch, #13637): no attestation
+            # is expected, so there is nothing to confirm — proceed (the read side is the
+            # fail-closed net). Never treated as a partial failure.
+            return None
+        gateway_slot, worker_slot = observation
+        verdict = decide_pair_launch_attestation(gateway_slot, worker_slot)
+        if verdict.ok:
+            steps.append(
+                ActuationStep(
+                    order=3,
+                    title="confirm pair self-attestation",
+                    status=STEP_EXECUTED,
+                    detail="both slots produced a fresh, locator-matched startup "
+                    f"self-attestation after {attempt + 1} probe(s) "
+                    f"(gateway={gateway_slot.state} worker={worker_slot.state})",
+                    command=None,
+                )
+            )
+            return None
+        if attempt + 1 < probes:
+            use_case.sleep(use_case.gateway_ready_interval_seconds)
+    # Window elapsed with at least one slot unattested — never a success.
+    recover_cmd = (
+        f"mozyo-bridge sublane recover-pair --issue {request.issue} "
+        f"--lane {request.lane_label}"
+    )
+    steps.append(
+        ActuationStep(
+            order=3,
+            title="confirm pair self-attestation",
+            status=STEP_BLOCKED,
+            detail=(
+                "the launched pair did not confirm both slots' startup self-attestation "
+                f"({verdict.blocked_summary()}); the pair booted partially (live but "
+                "unattested/stale). Refusing to report a started lane — recover the exact "
+                "pair before resume/dispatch."
+            ),
+            command=recover_cmd,
+        )
+    )
+    return use_case._blocked(
+        request,
+        launch_action=launch_action,
+        reason="freshly-launched pair did not confirm both slots' post-launch "
+        f"self-attestation ({verdict.blocked_summary()}); fail-closed instead of a false "
+        "started lane — use the public exact-pair recovery",
+        reasons=(REASON_PARTIAL_PAIR_RECOVERY,)
+        + tuple(f"unattested:{role}" for role in verdict.blocked_roles),
+        dispatch=dispatch,
+        steps=tuple(steps),
+        gateway_pane=gateway_pane,
+        worker_pane=worker_pane,
+        adopted=adopted,
+        fill_decision=fill_decision,
+        fill_override_reason=fill_override_reason,
+    )
+
+
+__all__ = (
+    "pair_attestation_admission",
+    "pair_split_admission",
+    "runtime_placement_gate",
+)

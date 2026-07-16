@@ -104,6 +104,12 @@ REASON_PANE_CREATE_FAILED = "pane_create_failed"
 #: ``pane_create_failed`` so create/start surfaces the typed launcher-compat blocker with
 #: its schema-upgrade recovery, and never actuates a lane that cannot attest.
 REASON_LAUNCHER_INCOMPATIBLE = "launcher_runtime_incompatible"
+#: A freshly-launched pair did not confirm BOTH slots' post-launch self-attestation
+#: (Redmine #13847): a slot is absent / stale / missing / conflict / unobserved, so the
+#: pair booted partially (live-but-unattested — the live evidence). Create/start refuses to
+#: promote it to ``executed`` and returns this typed blocker with a durable recovery
+#: pointer to the public exact-pair recovery, never a false success.
+REASON_PARTIAL_PAIR_RECOVERY = "partial_pair_recovery_required"
 #: The appended / adopted lane did not carry the expected identity stamps (repo-root /
 #: lane) on read-back, so the lane could not be positively confirmed.
 REASON_STAMP_FAILED = "stamp_failed"
@@ -163,6 +169,7 @@ BLOCKED_REASONS = frozenset(
         REASON_PAIR_SPLIT,
         REASON_RUNTIME_FINGERPRINT,
         REASON_LAUNCHER_INCOMPATIBLE,
+        REASON_PARTIAL_PAIR_RECOVERY,
         REASON_FILL_STOP,
     }
 )

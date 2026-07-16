@@ -1326,24 +1326,45 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_use_case.py
-    lines: 1065
+    lines: 1086
     reason: >-
       Backend-agnostic sublane actuation choreography (create / adopt / confirm /
       dispatch). Already at 999 lines before #13810; the #13809 review (j#78890
-      R3-F3) required an owner-unbound fail-closed BLOCK on the adopt path (consume
-      the LaneDeclarationStore declaration outcome and stop before dispatch when the
-      lane is owner-unbound), which crossed it to 1036. Redmine #13847 adds a second
-      required fail-closed branch of the same shape: the managed-launch capability
-      preflight raises a typed launcher-incompatible error (attestation-store schema
-      skew) that must return a DISTINCT `launcher_runtime_incompatible` `_blocked`
-      result before dispatch (never a generic pane-create failure), which crossed it
-      to 1065. The pure capability decision itself lives in the sibling
-      `herdr_launcher_capability.py`; only the block-or-proceed control flow (which
-      must return the use case's `_blocked` result with the request context) lands
-      here. Splitting this shared orchestration mid-review-cycle for these fail-closed
-      branches is disproportionate risk; the decomposition of the `_execute` block-site
-      repetition (the several `_blocked` call sites share most kwargs and could route
-      through one thin `_block` helper) is deferred to a follow-up under this issue's
+      R3-F3) required an owner-unbound fail-closed BLOCK on the adopt path, which
+      crossed it to 1036. Redmine #13847 adds two more required fail-closed branches
+      of the same shape: (1) the managed-launch capability preflight raises a typed
+      launcher-incompatible error (attestation-store schema skew) that must return a
+      DISTINCT `launcher_runtime_incompatible` `_blocked` result before dispatch; and
+      (2) the post-launch pair self-attestation gate, which must NOT promote a
+      partially-booted (live-but-unattested) pair to `executed` and returns a
+      `partial_pair_recovery_required` block before the dispatch branch — which crossed
+      it to 1086. Both pure decisions live in the sibling `herdr_launcher_capability.py`
+      / `pair_launch_attestation.py`, and the attestation gate body itself is carved
+      into `sublane_actuator_gates.py`; only the block-or-proceed control flow (which
+      must return the use case's `_blocked` result with the request context) lands here.
+      Splitting this shared orchestration mid-review-cycle for these fail-closed branches
+      is disproportionate risk; the `_execute` block-site repetition decomposition is
+      deferred to a follow-up under this issue's Version.
+    owner_issue: "#13847"
+    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
+    expires: "2027-10-08"
+
+  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_herdr_ops.py
+    lines: 1032
+    reason: >-
+      herdr-backend creation-side actuation IO port for `sublane start --execute`
+      (the sibling of the tmux LiveSublaneActuatorOps). A cohesive IO adapter — launch
+      the pair via prepare_session, resolve the live lane from the herdr inventory,
+      probe gateway readiness, dispatch. Was at 998 lines; Redmine #13847 added the two
+      required additions its port must carry: (1) translate the managed-launch
+      capability-preflight failure (HerdrLauncherIncompatibleError) into the typed
+      `SublaneLauncherIncompatibleError` the use case maps to `launcher_runtime_incompatible`;
+      and (2) `observe_pair_attestation`, the read-only port method the post-launch
+      attestation gate polls (a thin delegation to the cohesive
+      `sublane_pair_attestation_ops.observe_lane_pair_attestation` helper — the real
+      store/inventory IO lives there, not here). Splitting this adapter mid-review-cycle
+      for two small required additions is disproportionate risk; the extraction of the
+      slot-resolution / read-back helpers is deferred to a follow-up under this issue's
       Version.
     owner_issue: "#13847"
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"

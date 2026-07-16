@@ -705,6 +705,38 @@ class HerdrSublaneActuatorOps:
             runner = subprocess.run
         return _list_rows(binary, runner, self.timeout)
 
+    def observe_pair_attestation(self, worktree_path: str):
+        """Redmine #13847: observe both slots' post-launch self-attestation (read-only).
+
+        The create post-launch gate / recovery verify decide on the pure ``(gateway,
+        worker)`` SlotAttestation pair this returns; the store/inventory IO is the cohesive
+        :func:`observe_lane_pair_attestation` helper (keyed on the binding-resolved pair).
+
+        Returns ``None`` when the managed launch did NOT wrap the provider (no attest
+        launcher resolved — the #13637 byte-invariant fallback): an unwrapped launch
+        produces no self-attestation by design, so there is nothing to confirm and the
+        create gate skips (the adopt / doctor read side stays the fail-closed net). With a
+        resolved launcher the capability preflight (item 2) has already proven it
+        schema-compatible, so a wrapped launch's attestation is meaningful to confirm.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
+            resolve_attest_launcher,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_pair_attestation_ops import (  # noqa: E501
+            observe_lane_pair_attestation,
+        )
+
+        if not resolve_attest_launcher(self.env):
+            return None
+        gateway_provider, worker_provider = self._launch_providers()
+        return observe_lane_pair_attestation(
+            worktree_path=worktree_path,
+            gateway_provider=gateway_provider,
+            worker_provider=worker_provider,
+            list_rows=self._live_rows,
+            resolve_slots=self._resolve_lane_slots,
+        )
+
     def _lane_slots(
         self,
         workspace_id: str,

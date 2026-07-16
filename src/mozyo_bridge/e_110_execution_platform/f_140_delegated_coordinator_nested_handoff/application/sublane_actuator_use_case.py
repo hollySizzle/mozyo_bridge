@@ -74,6 +74,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_lane_runtime_root,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
+    pair_attestation_admission,
     pair_split_admission,
     runtime_placement_gate,
 )
@@ -741,6 +742,26 @@ class SublaneActuateUseCase:
                 fill_decision=fill_decision,
                 fill_override_reason=fill_override_reason,
             )
+
+        # Step 3c — post-launch pair self-attestation gate (Redmine #13847): a fresh launch
+        # that does not confirm BOTH slots' startup self-attestation booted partially (live
+        # but unattested/stale) and must NOT be promoted to `executed`. Fires before the
+        # dispatch branch so it covers `--no-dispatch` create (the live-evidence case) too.
+        attest_outcome = pair_attestation_admission(
+            self,
+            request,
+            launch_action=launch.action,
+            dispatch=dispatch,
+            adopted=adopted,
+            gateway_pane=gateway_pane,
+            worker_pane=worker_pane,
+            lane_runtime_root=lane_runtime_root,
+            steps=steps,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+        if attest_outcome is not None:
+            return attest_outcome
 
         # Step 4 (--no-dispatch) — nothing to dispatch, so nothing to make ready.
         if not dispatch:
