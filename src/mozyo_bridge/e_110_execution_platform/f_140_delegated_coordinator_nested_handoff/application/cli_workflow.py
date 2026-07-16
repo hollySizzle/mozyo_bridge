@@ -781,6 +781,11 @@ def cmd_workflow_forward_fence(args: argparse.Namespace) -> int:
     return 0
 
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callback_lease import (
+    cmd_workflow_callback_lease,
+)
+
+
 def register(sub) -> None:
     """Register ``workflow`` (``step`` / ``fill-decision`` / ``admission`` / ...).
 
@@ -855,6 +860,28 @@ def register(sub) -> None:
         help="Deliberate loss recovery: mint a fresh store under a new nonce.",
     )
     fence_p.set_defaults(func=cmd_workflow_dispatch_fence)
+
+    lease_p = workflow_sub.add_parser(
+        "callback-lease",
+        description=(
+            "Operator surface for the callback-sweep attempt lease (Redmine #13889). "
+            "`--bootstrap` initializes it; `--recover` mints a fresh store after a loss, which "
+            "invalidates every outstanding grant (invoke ONLY after confirming no sweep is "
+            "mid-attempt); no flag reports status. `sublane callback-recovery --execute` never "
+            "auto-creates or auto-recovers the store: a silent re-create would hand a second live "
+            "owner the same anchor."
+        ),
+        help="Bootstrap / recover / status the callback-sweep attempt lease.",
+    )
+    lease_p.add_argument(
+        "--bootstrap", dest="lease_bootstrap", action="store_true",
+        help="Initialize the lease store (safe first init; refuses on a detected loss).",
+    )
+    lease_p.add_argument(
+        "--recover", dest="lease_recover", action="store_true",
+        help="Deliberate loss recovery: fresh store under a new nonce (invalidates all grants).",
+    )
+    lease_p.set_defaults(func=cmd_workflow_callback_lease)
 
     forward_fence_p = workflow_sub.add_parser(
         "forward-fence",
