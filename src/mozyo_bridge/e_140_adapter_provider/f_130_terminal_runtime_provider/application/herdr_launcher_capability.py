@@ -78,8 +78,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 ATTEST_CAPABILITY_CONTRACT_PREFIX = "mozyo_attest_capability_schema="
 
 #: Matches the advertised schema token in probe output. Anchored on the exact prefix so a
-#: stray digit elsewhere in the help can never be misread as the advertised schema.
-_CONTRACT_RE = re.compile(re.escape(ATTEST_CAPABILITY_CONTRACT_PREFIX) + r"(\d+)")
+#: stray digit elsewhere in the help can never be misread as the advertised schema, and —
+#: since review j#80000 finding 3 — bounded on BOTH sides so only a **whole, canonical**
+#: token is credited. Without the boundaries ``…schema=2x`` matched its leading ``2`` and
+#: was credited as a clean v2 advertisement: a malformed advertisement is *unprovable*,
+#: and an admission contract must not credit what a launcher did not clearly say.
+_CONTRACT_RE = re.compile(
+    r"(?:^|\s)" + re.escape(ATTEST_CAPABILITY_CONTRACT_PREFIX) + r"(\d+)(?=\s|$)"
+)
 
 #: The stable prefix advertising the set of **store shapes this launcher can write**
 #: (Redmine #13882). The #13847 token above advertises a single *native* schema, which
@@ -91,7 +97,15 @@ _CONTRACT_RE = re.compile(re.escape(ATTEST_CAPABILITY_CONTRACT_PREFIX) + r"(\d+)
 #: help wrapping breaks on hyphens and width, and underscores are not break points.
 ATTEST_CAPABILITY_STORES_PREFIX = "mozyo_attest_capability_stores="
 
-_STORES_RE = re.compile(re.escape(ATTEST_CAPABILITY_STORES_PREFIX) + r"([\d_]+)")
+#: The canonical writable-set grammar: ``<int>(_<int>)*``, bounded on both sides. It
+#: admits ``1_2`` and rejects every malformed spelling outright rather than salvaging a
+#: capability from it (review j#80000 finding 3): ``1__2`` / ``_1_2_`` (empty segments)
+#: and ``1_2junk`` (trailing garbage) previously yielded ``{1, 2}``, crediting a launcher
+#: with the v1-write capability that admits a v1 store — re-opening the very
+#: live-but-unattested launch #13882 exists to refuse.
+_STORES_RE = re.compile(
+    r"(?:^|\s)" + re.escape(ATTEST_CAPABILITY_STORES_PREFIX) + r"(\d+(?:_\d+)*)(?=\s|$)"
+)
 
 # --- Verdict vocabulary (fail-closed; only LAUNCHER_CAPABILITY_OK proceeds). ----------
 #: Subcommand marker present AND advertised schema == the required source schema.
@@ -182,17 +196,24 @@ def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation
     (the pre-#13847 installed launcher), or advertise a schema but no store set (a
     pre-#13882 build). Each unprovable fact stays ``None`` → fail closed, never a guessed
     default.
+
+    "Unprovable" is strict (review j#80000 finding 3). Only a **whole canonical token**
+    counts; a malformed spelling is not salvaged into a capability, and **conflicting**
+    advertisements of the same fact are not arbitrated — a launcher declaring two
+    different schemas has not clearly declared either, so the fact stays ``None`` and the
+    admission fails closed rather than picking whichever came first.
     """
     haystack = text or ""
-    match = _CONTRACT_RE.search(haystack)
-    advertised: Optional[int] = int(match.group(1)) if match else None
-    stores_match = _STORES_RE.search(haystack)
+    advertised: Optional[int] = None
+    schema_values = {int(m) for m in _CONTRACT_RE.findall(haystack)}
+    if len(schema_values) == 1:
+        advertised = schema_values.pop()
     stores: Optional[frozenset] = None
-    if stores_match:
-        parsed = {int(p) for p in stores_match.group(1).split("_") if p}
-        # An empty / malformed set is unprovable, not "supports nothing": leave it None so
-        # the native-schema fallback applies rather than inventing a capability.
-        stores = frozenset(parsed) if parsed else None
+    store_sets = {
+        frozenset(int(p) for p in m.split("_")) for m in _STORES_RE.findall(haystack)
+    }
+    if len(store_sets) == 1:
+        stores = store_sets.pop()
     return LauncherCapabilityObservation(
         subcommand_marker_present=ATTEST_CAPABILITY_MARKER in haystack,
         advertised_schema_version=advertised,

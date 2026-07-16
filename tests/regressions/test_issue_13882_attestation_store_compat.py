@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     IdentityAttestationRecord,
     herdr_identity_attestation_path,
 )
+import mozyo_bridge.core.state.herdr_identity_attestation_schema as sch  # noqa: E402
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (  # noqa: E402
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     RECOGNIZED_SCHEMA_VERSIONS,
@@ -56,6 +57,7 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.appl
     ALREADY_CURRENT,
     APPLIED,
     BLOCKED_CONSUMERS_LIVE,
+    BLOCKED_CONSUMERS_UNMEASURABLE,
     BLOCKED_INVENTORY_UNREADABLE,
     BLOCKED_MIGRATE_INSTEAD,
     PLANNED,
@@ -127,6 +129,42 @@ def _rec(**over) -> IdentityAttestationRecord:
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _store_content(path: Path) -> tuple:
+    """``(user_version, row_count)`` — what a recovery point must actually preserve."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        rows = conn.execute("SELECT count(*) FROM herdr_identity_attestations").fetchone()[0]
+    finally:
+        conn.close()
+    return version, rows
+
+
+def _seed_v1_wal(home: Path) -> tuple:
+    """A v1 store in WAL mode with a committed row still living in the ``-wal`` sidecar.
+
+    Returns ``(path, open_conn)`` — the caller MUST keep the connection open, because
+    closing the last connection checkpoints the WAL into the main DB and dissolves the
+    very condition under test (the first attempt to reproduce review j#80000 finding 1
+    failed for exactly that reason).
+    """
+    path = herdr_identity_attestation_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(_V1_DDL)
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # schema lands in the main DB
+    conn.execute(
+        "INSERT INTO herdr_identity_attestations VALUES (?,?,?,?,?,?,?,?)",
+        (_NAME, "ws1", "claude", "default", "wY:p2", "present", "", "t0"),
+    )
+    conn.commit()  # committed, but the page lives in -wal
+    return path, conn
 
 
 class _View:
@@ -413,18 +451,15 @@ class MaintenanceCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             path = _seed_v1(home, rows=3)
-            before = path.read_bytes()
             result = run_attestation_store_migrate(home=home, view=_NO_CONSUMERS, write=True)
             self.assertEqual(result.state, APPLIED)
             self.assertEqual(probe_store_schema(path).version, _V2)
-            self.assertEqual((result.backup_dir / path.name).read_bytes(), before)
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-            try:
-                self.assertEqual(
-                    conn.execute("SELECT count(*) FROM herdr_identity_attestations").fetchone()[0], 3
-                )
-            finally:
-                conn.close()
+            # Content equality, not byte equality (review j#80000 finding 1): the snapshot
+            # is a SQLite backup-API copy, so it is logically identical but not byte-wise.
+            # Content is the property that matters — a byte-equal snapshot that lost a
+            # WAL-committed row is worthless.
+            self.assertEqual(_store_content(result.backup_dir / path.name), (1, 3))
+            self.assertEqual(_store_content(path), (_V2, 3))
 
     def test_migrate_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,7 +611,8 @@ class PartialWriteAndReplayTest(unittest.TestCase):
             self.assertEqual(probe_store_schema(path).version, 1)
             backups = list((home / "backups").iterdir())
             self.assertEqual(len(backups), 1)
-            self.assertEqual(_digest(backups[0] / path.name), before)
+            # Content, not bytes: the snapshot is a SQLite backup-API copy (finding 1).
+            self.assertEqual(_store_content(backups[0] / path.name), _store_content(path))
 
     def test_replay_after_a_failed_migration_succeeds(self) -> None:
         import mozyo_bridge.core.state.herdr_identity_attestation_schema as sch
@@ -606,6 +642,148 @@ class PartialWriteAndReplayTest(unittest.TestCase):
                 second = sch.backup_attestation_store(path)
             self.assertNotEqual(first, second)
             self.assertTrue(first.exists() and second.exists())
+
+
+class ReviewJ80000FindingsTest(unittest.TestCase):
+    """The three code findings from review j#80000, each pinned by its own repro."""
+
+    # --- F1: the migration snapshot must preserve WAL-committed rows ------------------
+    def test_f1_wal_committed_rows_survive_the_migration_backup(self) -> None:
+        # A `shutil.copy2` duplicates only the main DB file, so a WAL store's committed
+        # pages (still in -wal) were silently absent from the recovery point: the backup
+        # read version=1 rows=0 while the live store held the row. A backup that is
+        # trusted and incomplete is worse than no backup.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path, conn = _seed_v1_wal(home)
+            try:
+                self.assertTrue(path.with_name(path.name + "-wal").exists())  # precondition
+                outcome = sch.migrate_attestation_store(path)
+                self.assertTrue(outcome.migrated)
+                self.assertEqual(_store_content(path), (_V2, 1))
+                self.assertEqual(_store_content(outcome.backup_dir / path.name), (1, 1))
+            finally:
+                conn.close()
+
+    def test_f1_backup_never_mutates_the_store_it_preserves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1(home, rows=2)
+            before = _digest(path)
+            sch.backup_attestation_store(path)
+            self.assertEqual(_digest(path), before)
+
+    def test_f1_corrupt_store_snapshot_preserves_bytes_for_rebuild(self) -> None:
+        # A non-SQLite file has no logical snapshot; the bytes ARE the evidence, so the
+        # rebuild rail must still preserve them exactly.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = b"corrupt, not a sqlite database"
+            path.write_bytes(payload)
+            backup = sch.backup_attestation_store(path)
+            self.assertEqual((backup / path.name).read_bytes(), payload)
+
+    # --- F2: unreadable store + live agents must not fail open ------------------------
+    def test_f2_unreadable_store_with_live_agents_refuses_destructive_rebuild(self) -> None:
+        # The rebuild path's entire target set is unreadable stores, so folding
+        # "cannot enumerate rows" into "no consumers" failed open exactly where it hurts.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt, not a sqlite database")
+            before = _digest(path)
+            result = run_attestation_store_rebuild(
+                home=home, view=_View(agents=[_Agent(_NAME)]), write=True
+            )
+            self.assertEqual(result.state, BLOCKED_CONSUMERS_UNMEASURABLE)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.live_consumers, (_NAME,))
+            self.assertEqual(_digest(path), before)
+            self.assertFalse((home / "backups").exists())
+
+    def test_f2_empty_fleet_proves_no_consumers_even_for_an_unreadable_store(self) -> None:
+        # The other half of the rule: nothing can consume a store when nothing is
+        # running, so rebuild stays usable rather than being permanently unreachable.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"corrupt, not a sqlite database")
+            result = run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+            self.assertEqual(result.state, APPLIED)
+            self.assertFalse(path.exists())
+
+    def test_f2_unmeasurable_store_is_distinct_from_proven_empty(self) -> None:
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore as S,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual(S(home=home).assigned_names(), frozenset())  # absent = proven empty
+            path = herdr_identity_attestation_path(home)
+            path.write_bytes(b"corrupt")
+            self.assertIsNone(S(home=home).assigned_names())  # unreadable = unmeasurable
+
+    # --- F3: only whole canonical capability tokens are credited ----------------------
+    def test_f3_malformed_capability_tokens_are_never_credited(self) -> None:
+        v1 = StoreSchemaObservation(STORE_RECOGNIZED, 1)
+        malformed = (
+            "mozyo_attest_capability_stores=1__2",     # empty segment
+            "mozyo_attest_capability_stores=_1_2_",    # leading/trailing separator
+            "mozyo_attest_capability_stores=1_2junk",  # trailing garbage
+        )
+        for token in malformed:
+            with self.subTest(token=token):
+                obs = parse_launcher_capability_output(
+                    f"usage: x --assigned-name N\nmozyo_attest_capability_schema=2\n{token}\n"
+                )
+                self.assertIsNone(obs.advertised_store_versions)
+                # Falls back to the native schema only -> a v1 store is refused.
+                verdict = decide_store_compatibility(
+                    obs, v1, required_schema_version=_V2, replacement_launch=False
+                )
+                self.assertFalse(verdict.ok)
+                self.assertEqual(verdict.reason, STORE_LAUNCHER_CANNOT_WRITE)
+
+    def test_f3_malformed_schema_token_is_unprovable(self) -> None:
+        obs = parse_launcher_capability_output(
+            "usage: x --assigned-name N\nmozyo_attest_capability_schema=2x\n"
+        )
+        self.assertIsNone(obs.advertised_schema_version)
+        self.assertEqual(obs.writable_store_versions, frozenset())
+
+    def test_f3_conflicting_advertisements_are_unprovable(self) -> None:
+        # A launcher declaring two different schemas has clearly declared neither; the
+        # admission must not arbitrate by picking whichever matched first.
+        obs = parse_launcher_capability_output(
+            "usage: x --assigned-name N\nmozyo_attest_capability_schema=2\n"
+            "mozyo_attest_capability_schema=3\n"
+        )
+        self.assertIsNone(obs.advertised_schema_version)
+        obs2 = parse_launcher_capability_output(
+            "usage: x --assigned-name N\nmozyo_attest_capability_schema=2\n"
+            "mozyo_attest_capability_stores=1_2\nmozyo_attest_capability_stores=2\n"
+        )
+        self.assertIsNone(obs2.advertised_store_versions)
+
+    def test_f3_prefix_glued_token_is_not_credited(self) -> None:
+        obs = parse_launcher_capability_output(
+            "usage: x --assigned-name N\nxmozyo_attest_capability_schema=2\n"
+        )
+        self.assertIsNone(obs.advertised_schema_version)
+
+    def test_f3_wellformed_token_is_still_credited(self) -> None:
+        # The strict grammar must not break the honest advertisement it exists to protect.
+        obs = parse_launcher_capability_output(
+            "usage: x --assigned-name N\nmozyo_attest_capability_schema=2\n"
+            "mozyo_attest_capability_stores=1_2\n"
+        )
+        self.assertEqual(obs.advertised_schema_version, 2)
+        self.assertEqual(obs.advertised_store_versions, frozenset({1, 2}))
 
 
 class ZeroSideEffectTest(unittest.TestCase):

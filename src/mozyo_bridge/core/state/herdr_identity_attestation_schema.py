@@ -368,28 +368,64 @@ def create_schema(conn: sqlite3.Connection) -> None:
 
 
 def backup_attestation_store(path: Path) -> Optional[Path]:
-    """Copy the store into ``backups/herdr-identity-attestation-<ts>/`` before a migration.
+    """Snapshot the store into ``backups/herdr-identity-attestation-<ts>/`` before a write.
 
-    Mirrors ``lane_lifecycle_schema.backup_state_container``: a copy failure raises so the
-    caller fails closed with the file byte-unchanged, and an existing snapshot is **never
-    overwritten** (a second-precision stamp can collide, so a taken directory takes a
-    numeric suffix). Returns ``None`` when there is nothing to preserve yet.
+    Uses SQLite's **backup API**, not a file copy (Redmine #13882 review j#80000 finding 1).
+    A ``shutil.copy2`` duplicates only the main DB file, so a store in WAL mode leaves its
+    committed pages in the ``-wal`` sidecar and the snapshot silently loses them —
+    reproduced: a v1 store with one committed row under ``journal_mode=WAL`` /
+    ``wal_autocheckpoint=0`` backed up to a recovery point reading ``version=1, rows=0``
+    while the live store held the row. A recovery point that is missing committed
+    attestations is worse than none, because it is *trusted*. ``Connection.backup()`` is
+    transaction-consistent and checkpoint-independent, so the snapshot carries every
+    committed row whatever the journal mode.
+
+    A failure raises :class:`StateStoreError` so the caller fails closed with the store
+    unchanged, and an existing snapshot is **never overwritten** (a second-precision stamp
+    can collide, so a taken directory takes a numeric suffix). Returns ``None`` when there
+    is nothing to preserve yet.
     """
     if not path.exists():
         return None
     base = path.parent / BACKUPS_DIRNAME / f"{path.stem}-{_backup_stamp(_utc_now())}"
+    backup_dir = base
+    suffix = 1
     try:
-        backup_dir = base
-        suffix = 1
         while backup_dir.exists():
             backup_dir = base.with_name(f"{base.name}-{suffix}")
             suffix += 1
         backup_dir.mkdir(parents=True, exist_ok=False)
-        shutil.copy2(path, backup_dir / path.name)
     except OSError as exc:
         raise StateStoreError(
             f"backup near {base} failed ({exc}); migration aborted (nothing was written)"
         ) from exc
+    target = backup_dir / path.name
+    source: Optional[sqlite3.Connection] = None
+    dest: Optional[sqlite3.Connection] = None
+    try:
+        # Read-only source: a snapshot must never be able to mutate the store it preserves.
+        source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        source.execute("PRAGMA busy_timeout = 2000")
+        dest = sqlite3.connect(target)
+        source.backup(dest)
+        dest.commit()
+    except (sqlite3.DatabaseError, OSError) as exc:
+        # A non-SQLite / corrupt file has no logical snapshot. Fall back to a byte copy so
+        # `rebuild` can still preserve the bytes it is about to rotate away — the only case
+        # where a file copy is the *correct* semantics, because there are no committed
+        # pages to miss and the bytes themselves are the evidence.
+        try:
+            shutil.copy2(path, target)
+        except OSError as copy_exc:
+            raise StateStoreError(
+                f"backup near {base} failed ({copy_exc}); migration aborted "
+                f"(nothing was written)"
+            ) from copy_exc
+        _ = exc
+    finally:
+        for conn in (source, dest):
+            if conn is not None:
+                conn.close()
     return backup_dir
 
 

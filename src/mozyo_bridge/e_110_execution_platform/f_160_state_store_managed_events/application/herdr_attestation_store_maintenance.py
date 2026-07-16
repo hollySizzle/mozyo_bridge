@@ -68,6 +68,9 @@ ALREADY_CURRENT = "already_current"
 BLOCKED_CONSUMERS_LIVE = "blocked_consumers_live"
 #: Refused: liveness could not be measured (an unreadable inventory is not an empty one).
 BLOCKED_INVENTORY_UNREADABLE = "blocked_inventory_unreadable"
+#: Refused: agents are live but the store's rows cannot be enumerated, so it cannot be
+#: proven none of them consume it (review j#80000 finding 2).
+BLOCKED_CONSUMERS_UNMEASURABLE = "blocked_consumers_unmeasurable"
 #: Refused: the store's shape is not one this intent can act on.
 BLOCKED_STORE_UNSUPPORTED = "blocked_store_unsupported"
 #: Refused: rebuild was asked for a store that ``migrate`` can handle without data loss.
@@ -115,33 +118,70 @@ class AttestationStoreMaintenanceResult:
         }
 
 
-def _live_consumer_names(view, home: Path) -> tuple:
-    """The live managed agents that are **proven consumers of this store**.
+#: Consumer measurement outcomes. Tri-state on purpose: "proven none" and "cannot tell"
+#: are different facts, and collapsing them is how a destructive path fails open.
+_CONSUMERS_NONE = "no_consumers"
+_CONSUMERS_PRESENT = "consumers"
+_CONSUMERS_UNMEASURABLE = "unmeasurable"
 
-    Scoped by evidence, not by guess. herdr exposes no surface returning a launched
-    process's environment, so which home a live agent was launched against is
-    unobservable from outside (the constraint the whole self-attestation design exists to
-    work around). A **stored row** is the only proof that ties a live agent to *this*
-    store — so a consumer is a managed agent that is both live AND carries a record here.
-    It is deliberately NOT repo-scoped: the store is shared across workspaces, so another
-    workspace's live pair counts exactly as much as this one's.
+
+def _measure_consumers(view, home: Path) -> tuple:
+    """Measure this store's live consumers -> ``(state, names)``. Never guesses.
+
+    Scoped by evidence. herdr exposes no surface returning a launched process's
+    environment, so which home a live agent was launched against is unobservable from
+    outside (the constraint the whole self-attestation design exists to work around). A
+    **stored row** is the only proof tying a live agent to *this* store, so a consumer is
+    an agent that is both live AND carries a record here — cross-workspace, never
+    repo-scoped, since the store is shared.
 
     A live agent with no row here is correctly excluded, and that is not a fail-open:
     attestation is a **one-shot write at boot** (``perform_self_attestation`` is the sole
     production writer and ``exec``s immediately after), so a live agent has already
     completed its only write. Either it uses a different home, or it already failed to
-    attest — in both cases changing this store's shape cannot degrade it further, because
-    it will never write again and has no record here for a concurrent reader to misread.
+    attest — in both cases this store's shape cannot degrade it further.
+
+    The precedence below is what closes review j#80000 finding 2. An **empty fleet** is
+    proof of no consumers whatever the store's state — nothing can be consuming a store
+    when nothing is running — so it is checked *before* the store is read. Only when
+    agents ARE live does the store's readability matter: if its rows cannot be enumerated,
+    the intersection is unknown, and the honest answer is :data:`_CONSUMERS_UNMEASURABLE`,
+    never "none". Previously this folded to an empty set and admitted a destructive
+    ``rebuild`` against an unreadable store while agents were live — fail-open on the one
+    path whose entire target set is unreadable stores.
     """
+    if not view.backend_selected:
+        # No herdr backend: no managed consumers of this store by construction.
+        return _CONSUMERS_NONE, ()
+    if not view.ok:
+        return _CONSUMERS_UNMEASURABLE, ()
     live = {agent.name for agent in view.managed_agents}
-    return tuple(sorted(live & HerdrIdentityAttestationStore(home=home).assigned_names()))
+    if not live:
+        return _CONSUMERS_NONE, ()
+    attested = HerdrIdentityAttestationStore(home=home).assigned_names()
+    if attested is None:
+        return _CONSUMERS_UNMEASURABLE, tuple(sorted(live))
+    matched = tuple(sorted(live & attested))
+    return (_CONSUMERS_PRESENT, matched) if matched else (_CONSUMERS_NONE, ())
 
 
 def _consumer_gate(view, intent: str, home: Path) -> Optional[AttestationStoreMaintenanceResult]:
     """Refuse a mutation while consumers are live / unmeasurable, else ``None``."""
-    if not view.backend_selected:
-        # No herdr backend: there are no managed consumers of this store by construction.
+    state, names = _measure_consumers(view, home)
+    if state == _CONSUMERS_NONE:
         return None
+    if state == _CONSUMERS_PRESENT:
+        return AttestationStoreMaintenanceResult(
+            intent=intent,
+            state=BLOCKED_CONSUMERS_LIVE,
+            detail=(
+                f"{len(names)} live managed agent(s) hold a startup self-attestation in "
+                f"this store ({', '.join(names)}); changing its shape would change what a "
+                f"concurrent older-runtime reader sees of their records. Retire / close "
+                f"them first, then re-run"
+            ),
+            live_consumers=names,
+        )
     if not view.ok:
         return AttestationStoreMaintenanceResult(
             intent=intent,
@@ -152,20 +192,18 @@ def _consumer_gate(view, intent: str, home: Path) -> Optional[AttestationStoreMa
                 f"empty one. Refusing to touch the store"
             ),
         )
-    live = _live_consumer_names(view, home)
-    if live:
-        return AttestationStoreMaintenanceResult(
-            intent=intent,
-            state=BLOCKED_CONSUMERS_LIVE,
-            detail=(
-                f"{len(live)} live managed agent(s) hold a startup self-attestation in "
-                f"this store ({', '.join(live)}); changing its shape would change what a "
-                f"concurrent older-runtime reader sees of their records. Retire / close "
-                f"them first, then re-run"
-            ),
-            live_consumers=live,
-        )
-    return None
+    return AttestationStoreMaintenanceResult(
+        intent=intent,
+        state=BLOCKED_CONSUMERS_UNMEASURABLE,
+        detail=(
+            f"{len(names)} managed agent(s) are live but this store's rows cannot be "
+            f"enumerated (it is unreadable / unsupported), so it cannot be proven that "
+            f"none of them attested into it ({', '.join(names)}). An unreadable store is "
+            f"not an empty one. Retire / close the live agent(s) first — with an empty "
+            f"fleet nothing can be consuming this store, and the operation is provably safe"
+        ),
+        live_consumers=names,
+    )
 
 
 def run_attestation_store_status(*, home: Path) -> AttestationStoreMaintenanceResult:
@@ -433,6 +471,7 @@ __all__ = (
     "ALREADY_CURRENT",
     "APPLIED",
     "BLOCKED_CONSUMERS_LIVE",
+    "BLOCKED_CONSUMERS_UNMEASURABLE",
     "BLOCKED_FAILED",
     "BLOCKED_INVENTORY_UNREADABLE",
     "BLOCKED_MIGRATE_INSTEAD",

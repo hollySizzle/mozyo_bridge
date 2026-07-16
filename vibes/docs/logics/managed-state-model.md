@@ -588,15 +588,37 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   **live-zero read runs before** the idempotent already-current success, so a replay never reports success while consumers are live
   (#13841 j#79150 finding 2). An **unreadable** inventory is not an empty one and refuses just as hard. Neither intent closes, sends
   to, or launches a process.
-- **"Active consumer" is scoped by evidence, not by guess.** herdr exposes no surface returning a launched process's environment
-  (the constraint this whole component exists to work around), so *which home a live agent was launched against is unobservable*. A
-  **stored row is the only proof** that ties a live agent to this store, so a consumer is an agent that is live **AND** carries a
-  record here — cross-workspace, never repo-scoped, since the store is shared. Counting every managed agent on the server instead is
-  not "more conservative", it is wrong in both directions: it refuses an unrelated home forever (measured: 18 live agents blocking a
-  scratch home none of them had ever written) without protecting anything extra. Excluding a live agent with no row here is not a
-  fail-open, because attestation is a **one-shot write at boot** (`perform_self_attestation` is the sole production writer and
-  `exec`s immediately after): a live agent has already completed its only write, so it either uses another home or already failed to
-  attest, and in neither case can this store's shape degrade it further.
+- **"Active consumer" is scoped by evidence, not by guess — and is tri-state.** herdr exposes no surface returning a launched
+  process's environment (the constraint this whole component exists to work around), so *which home a live agent was launched against
+  is unobservable*. A **stored row is the only proof** that ties a live agent to this store, so a consumer is an agent that is live
+  **AND** carries a record here — cross-workspace, never repo-scoped, since the store is shared. Counting every managed agent on the
+  server instead is not "more conservative", it is wrong in both directions: it refuses an unrelated home forever (measured: 18 live
+  agents blocking a scratch home none of them had ever written) without protecting anything extra. Excluding a live agent with no row
+  here is not a fail-open, because attestation is a **one-shot write at boot** (`perform_self_attestation` is the sole production
+  writer and `exec`s immediately after): a live agent has already completed its only write, so it either uses another home or already
+  failed to attest, and in neither case can this store's shape degrade it further.
+  The measurement is `no_consumers` / `consumers` / **`unmeasurable`**, and the precedence matters (#13882 review j#80000 finding 2).
+  An **empty fleet is proof of none** whatever the store's state — nothing can consume a store when nothing is running — so it is
+  checked *before* the store is read, which is what keeps `rebuild` reachable at all. Only when agents ARE live does readability
+  matter: an unreadable store's rows cannot be enumerated, so the intersection is unknown and the honest answer is `unmeasurable`,
+  never "none". Folding it to an empty set fails open on precisely the destructive `rebuild` path, whose entire target set *is*
+  unreadable stores — the same "unreadable is not empty" rule already applied to the inventory, which the first implementation
+  applied there but not to the store.
+- **The migration snapshot is a SQLite backup-API copy, not a file copy** (#13882 review j#80000 finding 1). `shutil.copy2`
+  duplicates only the main DB file, so a store in WAL mode leaves committed pages in `-wal` and the snapshot loses them —
+  reproduced: a v1 store with one committed row under `journal_mode=WAL` / `wal_autocheckpoint=0` produced a recovery point reading
+  `version=1, rows=0` while the live store held the row. A recovery point that is incomplete *and trusted* is worse than none.
+  `Connection.backup()` is transaction-consistent and checkpoint-independent, so the snapshot is judged by **content** (version +
+  rows), not bytes. The one exception is a non-SQLite / corrupt file, which has no logical snapshot: there `rebuild` falls back to a
+  byte copy, the correct semantics precisely because there are no committed pages to miss and the bytes themselves are the evidence.
+  (The sibling `lane_lifecycle_schema.backup_state_container` and `state_store._backup` still use the file-copy shape; that is
+  pre-existing and out of this component's scope, but shares the hazard.)
+- **Only a whole, canonical capability token is credited** (#13882 review j#80000 finding 3). Both advertisement tokens are bounded
+  on each side and matched against an exact grammar (`<int>` / `<int>(_<int>)*`); a malformed spelling is **not** salvaged into a
+  capability. Unbounded matching credited `…schema=2x` as a clean v2, and `stores=1__2` / `_1_2_` / `1_2junk` as `{1, 2}` — handing a
+  launcher the v1-write capability that admits a v1 store, re-opening the exact live-but-unattested launch this component refuses.
+  **Conflicting** advertisements of the same fact are not arbitrated either: a launcher declaring two different schemas has clearly
+  declared neither, so the fact stays unprovable rather than resolving to whichever matched first.
 - **Compatibility is judged by the shape table.** As in #13844, `_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFAULTS` — never a guessed
   version comparison. A recognized version whose on-disk columns disagree is partial / corrupt and fails closed rather than being
   silently repaired.
