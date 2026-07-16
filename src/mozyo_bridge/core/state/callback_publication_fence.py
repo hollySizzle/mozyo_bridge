@@ -81,6 +81,11 @@ _SEAL_OPERATIONAL = "operational"     # this fence has run here; a missing pair 
 #: upgrade, which is the very thing the seal was added to stop (R14-F1).
 _SEAL_LEGACY_OPERATIONAL = "legacy_operational"
 SEAL_LEGACY_OPERATIONAL = _SEAL_LEGACY_OPERATIONAL
+#: The SECOND legacy spelling: a bare lifecycle word on the first line, written by the build that
+#: introduced the lifecycle but not the format header. Missing it from the matrix left those stores
+#: permanently refused as unreadable (R16-F2) -- safe, but bricked on upgrade.
+_SEAL_LEGACY_INITIALIZING = "legacy_initializing"
+SEAL_LEGACY_INITIALIZING = _SEAL_LEGACY_INITIALIZING
 #: The seal exists but cannot be trusted — unknown content, wrong version, or unreadable. NEVER
 #: `absent`: "I cannot read the record of whether this fence operated" is not "it never did".
 _SEAL_INVALID = "invalid_or_unreadable"
@@ -88,6 +93,10 @@ SEAL_INVALID = _SEAL_INVALID
 #: Sentinel: the seal file genuinely does not exist (FileNotFoundError, and nothing else).
 _SEAL_ABSENT = "absent"
 SEAL_ABSENT = _SEAL_ABSENT
+#: Seals that mean "this fence has served, or could have served, publication rights here".
+_SEAL_OPERATED_STATES = (_SEAL_OPERATIONAL, _SEAL_LEGACY_OPERATIONAL)
+#: Seals that mean "a mint was in progress"; the two builds that wrote them differ only in spelling.
+_SEAL_INITIALIZING_STATES = (_SEAL_INITIALIZING, _SEAL_LEGACY_INITIALIZING)
 
 _SEAL_FORMAT = "mozyo-callback-publication-seal"
 _SEAL_FORMAT_VERSION = 1
@@ -302,6 +311,12 @@ class CallbackPublicationFence:
         first = text.splitlines()[0].strip() if text.strip() else ""
         if first.startswith(_LEGACY_SEAL_FIRST_LINE):
             return _SEAL_LEGACY_OPERATIONAL
+        # Every shipped spelling of this file is a known input, including the ones written by the
+        # two builds before this one. Each is a state some machine has on disk right now.
+        if first == _SEAL_OPERATIONAL:
+            return _SEAL_LEGACY_OPERATIONAL
+        if first == _SEAL_INITIALIZING:
+            return _SEAL_LEGACY_INITIALIZING
         # Exact format + version, not a prefix match: `startswith` would accept anything that
         # merely opened with the right word, and version drift would read as a valid state.
         # Literal equality on every token. Parsing the version with int() accepted `1`, `v01` and
@@ -352,7 +367,7 @@ class CallbackPublicationFence:
         whose seal said ``initializing``, which bootstrap would then re-mint underneath it (R14-F2).
         """
         state = self.seal_state()
-        if state in (_SEAL_OPERATIONAL, _SEAL_LEGACY_OPERATIONAL):
+        if state in _SEAL_OPERATED_STATES:
             return
         raise CallbackPublicationFenceError(
             f"callback publication fence {self.path} is not operational (seal: {state}): refusing "
@@ -363,7 +378,7 @@ class CallbackPublicationFence:
 
     def _seal_says_operated(self) -> bool:
         """True when the seal is any flavour of 'this fence has run here'."""
-        return self.seal_state() in (_SEAL_OPERATIONAL, _SEAL_LEGACY_OPERATIONAL)
+        return self.seal_state() in _SEAL_OPERATED_STATES
 
     def _write_seal(self, state: str) -> None:
         """Replace the seal in one step. This is a single-write atomicity, NOT mutual exclusion.
@@ -387,7 +402,18 @@ class CallbackPublicationFence:
         tmp.replace(self.seal_path)
 
     def has_store(self) -> bool:
-        """True when a usable store exists here, sealed or not (the adoption candidate)."""
+        """True when ANY store artifact exists here — usable or not.
+
+        Not the same question as :meth:`_pair_is_healthy`, and conflating them is R16-F1: a torn
+        store (DB without its sidecar, mismatched nonce, unreadable file) is unusable but NOT
+        empty. Its DB still holds whatever rows were reserved through it. "I cannot open this" is
+        not "there is nothing here" — so re-minting on `not healthy` destroyed live reservations
+        and re-granted their identities.
+        """
+        return self.path.exists() or self.sidecar_path.exists()
+
+    def has_usable_store(self) -> bool:
+        """True when the artifacts here actually work together (the adoption candidate)."""
         return self._pair_is_healthy()
 
     def has_operated(self) -> bool:
@@ -410,24 +436,24 @@ class CallbackPublicationFence:
         after the lock is held** — reading first and acting later is what let two processes both
         decide "fresh" and the loser re-mint the winner's operational store (R14-F2).
 
-        ================================  ==========================================================
-        seal + pair                       action
-        ================================  ==========================================================
-        operational/legacy + healthy      nothing to do (legacy is migrated to the current format,
-                                          in place, keeping its reservations).
-        operational/legacy + pair gone    REFUSE. It ran here, so this is a loss.
-        any seal + healthy pair           ADOPT in place. A store that EXISTS is never re-minted,
-                                          whatever its seal says: `initializing` only proves
-                                          "nothing was reserved" for stores this version made, and
-                                          older builds could reserve against an unsealed one
-                                          (R15-F1). A crashed init has no rows to keep anyway.
-        initializing + no usable store    re-mint. Here "nothing was reserved" is a fact about the
-                                          disk, not an inference about which build wrote it.
-        absent + no usable store          genuine first init.
-        absent + one side only            REFUSE. Torn store.
-        invalid/unreadable seal           REFUSE. Something is here and cannot be read; that is
-                                          not evidence it never ran.
-        ================================  ==========================================================
+        Decided on ARTIFACT PRESENCE, never on usability:
+
+        ==============================  ============================================================
+        state                           action
+        ==============================  ============================================================
+        invalid seal                    REFUSE. Something is here and cannot be read; that is not
+                                        evidence it never ran.
+        healthy pair (any seal)         ADOPT in place, keeping nonce and rows; legacy seals are
+                                        rewritten to the current format, the store untouched.
+        any artifact, not healthy       REFUSE. Unusable is not empty (R16-F1): a torn store's DB
+                                        still holds its rows. Operator restores or removes both.
+        no artifact + operated seal     REFUSE. It ran here and its store is gone: a loss.
+        no artifact + initializing      mint. Nothing on disk can hold a row.
+        no artifact + absent seal       mint. Genuine first init.
+        ==============================  ============================================================
+
+        Every legacy spelling of the seal maps onto these same states, so an older build's store
+        takes the same route as a current one.
 
         Known limit, stated rather than hidden: deleting the seal along with the pair is
         indistinguishable from a fresh install, as is a store copied from another machine. Neither
@@ -437,6 +463,7 @@ class CallbackPublicationFence:
         with self._lifecycle_lock():
             seal = self.seal_state()          # re-read UNDER the lock: any earlier read is stale
             pair_ok = self._pair_is_healthy()
+            artifacts = self.has_store()
 
             if seal == _SEAL_INVALID:
                 raise CallbackPublicationFenceError(
@@ -447,52 +474,46 @@ class CallbackPublicationFence:
                     f"re-mints a lost store and publishes its record twice"
                 )
 
-            if seal in (_SEAL_OPERATIONAL, _SEAL_LEGACY_OPERATIONAL):
-                if not pair_ok:
-                    raise CallbackPublicationFenceError(
-                        f"callback publication fence {self.path} is sealed as previously "
-                        f"operational, but its store and identity sidecar are gone: a total store "
-                        f"loss, not a fresh install. Re-creating it would forget any reservation a "
-                        f"suspended sweep still holds and publish its record a second time. "
-                        f"Restore the store from backup; there is deliberately no reset "
-                        f"(see {self.seal_path})"
-                    )
-                if seal == _SEAL_LEGACY_OPERATIONAL:
-                    # Migrate the format, never the store: its reservations must survive intact.
+            if pair_ok:
+                # ADOPT, never re-mint -- whatever the seal says. `initializing` only proves
+                # "nothing was reserved" for stores this version made; older builds could reserve
+                # against an unsealed one (R15-F1). A crashed init has no rows to keep anyway, so
+                # adoption is right in both cases and re-minting is right in neither.
+                if seal != _SEAL_OPERATIONAL:
                     self._write_seal(_SEAL_OPERATIONAL)
                 return
 
-            if pair_ok:
-                # ADOPT, never re-mint -- whatever the seal says. An `initializing` seal was
-                # supposed to prove "no reservation can exist here", but that inference only ever
-                # held for stores this version created: the code that shipped before the mutation
-                # guard could reserve against an unsealed store, so `initializing + healthy pair`
-                # may hold live rows, and re-minting silently dropped them and re-granted the same
-                # identity (R15-F1). A crashed init that got this far has no rows anyway, so
-                # adoption is right in both cases and re-minting is right in neither.
-                self._write_seal(_SEAL_OPERATIONAL)
-                return
+            if artifacts:
+                # Unusable is NOT empty (R16-F1). A torn store -- DB without its sidecar, nonce
+                # mismatch, unreadable file -- still holds every row that was reserved through it,
+                # and re-minting here destroyed live reservations and re-granted their identities.
+                # `_pair_is_healthy() == False` says "I cannot use this", never "there is nothing
+                # here", and only the second would justify a mint. So this stalls for an operator:
+                # an init that crashed mid-mint is now their restore/cleanup, which is the
+                # availability price of never guessing about rows we cannot read.
+                raise CallbackPublicationFenceError(
+                    f"callback publication fence {self.path} has store artifacts that cannot be "
+                    f"used together (only one of the DB / sidecar exists, their nonces differ, or "
+                    f"the DB is unreadable). Refusing to re-create it: an unusable store is not an "
+                    f"empty one, and its DB may still hold a reservation a suspended sweep is "
+                    f"about to publish against. Restore the store, or remove BOTH artifacts once "
+                    f"you have confirmed in Redmine that nothing is in flight"
+                )
 
-            if seal == _SEAL_INITIALIZING:
-                # Only now, with no usable store present, is "nothing was ever reserved" a fact
-                # about the disk rather than an inference about which code wrote it.
-                self._create_fresh(secrets.token_hex(16))
-                self._write_seal(_SEAL_OPERATIONAL)
-                return
+            # Nothing on disk can hold a row, so "nothing was ever reserved here" is an observation
+            # rather than an inference about which build wrote what.
+            if seal in _SEAL_OPERATED_STATES:
+                raise CallbackPublicationFenceError(
+                    f"callback publication fence {self.path} is sealed as previously operational, "
+                    f"but its store and identity sidecar are gone: a total store loss, not a fresh "
+                    f"install. Re-creating it would forget any reservation a suspended sweep still "
+                    f"holds and publish its record a second time. Restore the store from backup; "
+                    f"there is deliberately no reset (see {self.seal_path})"
+                )
 
-            if self._read_sidecar_nonce() is None and not self.path.exists():
-                self._write_seal(_SEAL_INITIALIZING)
-                self._create_fresh(secrets.token_hex(16))
-                self._write_seal(_SEAL_OPERATIONAL)
-                return
-
-            raise CallbackPublicationFenceError(
-                f"callback publication fence {self.path} is in an inconsistent state (only one of "
-                f"the DB / sidecar exists, or their nonces differ): a store loss or replacement. "
-                f"Refusing to silently re-create, which would forget that a record was already "
-                f"published and let it be published again. This fence has no recovery operation — "
-                f"see the module docstring; the sweep stays fail-closed until the store is restored."
-            )
+            self._write_seal(_SEAL_INITIALIZING)
+            self._create_fresh(secrets.token_hex(16))
+            self._write_seal(_SEAL_OPERATIONAL)
 
     # NO recover() — deliberately, and unlike every sibling store (R11-F1).
     #

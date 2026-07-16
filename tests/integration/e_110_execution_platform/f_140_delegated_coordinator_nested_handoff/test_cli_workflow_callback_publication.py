@@ -210,6 +210,34 @@ class CommandContractTest(unittest.TestCase):
         self.assertIn("cannot be read", out)
         self.assertNotIn("adopt", out)
 
+    def test_status_reports_torn_artifacts_as_damage_not_a_fresh_install(self):
+        # R16-F3: has_store() answered "is the pair healthy", so a DB without its sidecar reported
+        # "never initialized — run --bootstrap" while bootstrap itself refused that same state. The
+        # status told the operator to do the one thing that cannot work, about a store whose DB may
+        # still hold a live reservation.
+        for damage in ("db_only", "sidecar_only"):
+            with self.subTest(damage=damage):
+                home = Path(tempfile.mkdtemp())
+                fence = CallbackPublicationFence(home=home)
+                fence.bootstrap()
+                fence.seal_path.unlink()
+                (fence.sidecar_path if damage == "db_only" else fence.path).unlink()
+                with mock.patch(
+                    "mozyo_bridge.core.state.callback_publication_fence.CallbackPublicationFence",
+                    lambda *a, **k: CallbackPublicationFence(home=home),
+                ):
+                    rc, out = self._run([])
+                self.assertIn("inconsistent", out)
+                self.assertNotIn("never initialized", out)
+
+    def test_status_reports_a_lost_store_as_a_loss(self):
+        self.fence.path.unlink()
+        self.fence.sidecar_path.unlink()          # sealed operational, artifacts gone
+        rc, out = self._run([])
+        self.assertIn("GONE", out)
+        self.assertIn("restore", out)
+        self.assertNotIn("never initialized", out)
+
     def test_list_shows_blocked_anchors_and_says_what_to_do(self):
         self.fence.reserve(self._key())
         rc, out = self._run(["--list"])

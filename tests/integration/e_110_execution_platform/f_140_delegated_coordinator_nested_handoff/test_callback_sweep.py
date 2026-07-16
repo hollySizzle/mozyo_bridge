@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.core.state.callback_publication_fence import (
     _SEAL_INITIALIZING,
     _SEAL_INVALID,
+    _SEAL_LEGACY_INITIALIZING,
     _SEAL_LEGACY_OPERATIONAL,
     _SEAL_OPERATIONAL,
     PUBLICATION_PUBLISHED,
@@ -1572,22 +1573,81 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.assertTrue(fence.is_bootstrapped())
         self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
 
-    def test_an_init_torn_apart_mid_mint_resumes_rather_than_wedging(self):
-        # The last crash point: _create_fresh writes the DB and then the sidecar, so dying between
-        # them leaves a torn store. Torn is normally fatal -- it means a store was lost -- but
-        # under an `initializing` seal it means the opposite: nothing ever operated, so there is no
-        # reservation to lose and finishing the mint is safe. Without this distinction a first
-        # install that crashed at the wrong microsecond would be permanently fail-closed.
-        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
-        fence._write_seal(_SEAL_INITIALIZING)
-        fence._create_fresh("nonce-1")
-        fence.sidecar_path.unlink()                       # crash inside the mint
-        self.assertTrue(fence.path.exists())
-        self.assertFalse(fence.is_bootstrapped())
-
+    def test_a_torn_store_is_refused_even_under_an_initializing_seal(self):
+        # This test previously asserted the OPPOSITE, and I reported it as proof of crash-safety.
+        # It encoded the inference R15-F1 had already refuted: that `initializing` proves nothing
+        # was reserved. A torn store is unusable, not empty -- its DB still holds every row
+        # reserved through it, including by builds whose reserve() never checked the seal. So the
+        # mint that "resumed" the init destroyed live reservations and re-granted their identities
+        # (R16-F1). Recovering that store is now an operator's job, and that is the price.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
         fence.bootstrap()
-        self.assertTrue(fence.is_bootstrapped())
-        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)     # A reserves, then stalls pre-PUT
+        fence._write_seal(_SEAL_INITIALIZING)
+        fence.sidecar_path.unlink()                          # torn: the DB, and its rows, remain
+
+        self.assertFalse(fence._pair_is_healthy())           # unusable...
+        with closing(sqlite3.connect(fence.path)) as conn:   # ...but demonstrably NOT empty
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM publication_fence").fetchone()[0], 1)
+
+        with self.assertRaises(CallbackPublicationFenceError):
+            CallbackPublicationFence(home=home).bootstrap()
+        with closing(sqlite3.connect(fence.path)) as conn:
+            self.assertEqual(                                 # A's row survived the refusal
+                conn.execute("SELECT count(*) FROM publication_fence").fetchone()[0], 1)
+
+    def test_every_partial_artifact_state_is_refused_rather_than_re_minted(self):
+        # `not healthy` covers DB-only, sidecar-only and nonce mismatch alike. None of them means
+        # "nothing is here", so none of them may mint.
+        for damage in ("db_only", "sidecar_only", "nonce_mismatch"):
+            with self.subTest(damage=damage):
+                home = Path(tempfile.mkdtemp())
+                fence = CallbackPublicationFence(home=home)
+                fence.bootstrap()
+                if damage == "db_only":
+                    fence.sidecar_path.unlink()
+                elif damage == "sidecar_only":
+                    fence.path.unlink()
+                else:
+                    fence.sidecar_path.write_text("a-different-nonce", encoding="utf-8")
+                self.assertTrue(fence.has_store())
+                with self.assertRaises(CallbackPublicationFenceError):
+                    CallbackPublicationFence(home=home).bootstrap()
+
+    def test_the_seal_formats_every_shipped_build_wrote_are_all_recognized(self):
+        # Three spellings have shipped: prose, a bare lifecycle word, and the current header. Each
+        # is a state some machine has on disk right now; reading any of them as "never sealed"
+        # re-mints a lost store, and reading them as "unreadable" bricks the upgrade (R16-F2).
+        for text, expected in (
+            (_R13_SEAL_TEXT, _SEAL_LEGACY_OPERATIONAL),
+            ("operational\nsealed at 2026-07-16T00:00:00+00:00\nnote\n", _SEAL_LEGACY_OPERATIONAL),
+            ("initializing\nsealed at 2026-07-16T00:00:00+00:00\nnote\n", _SEAL_LEGACY_INITIALIZING),
+            ("mozyo-callback-publication-seal v1 operational\nx\n", _SEAL_OPERATIONAL),
+            ("mozyo-callback-publication-seal v1 initializing\nx\n", _SEAL_INITIALIZING),
+        ):
+            with self.subTest(seal=text.splitlines()[0]):
+                fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+                fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+                fence.seal_path.write_text(text, encoding="utf-8")
+                self.assertEqual(fence.seal_state(), expected)
+
+    def test_a_legacy_plain_seal_on_a_healthy_store_adopts_and_migrates(self):
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        fence.reserve(key)
+        for legacy in ("operational", "initializing"):
+            with self.subTest(seal=legacy):
+                fence.seal_path.write_text(f"{legacy}\nsealed at x\nnote\n", encoding="utf-8")
+                CallbackPublicationFence(home=home).bootstrap()
+                self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+                self.assertFalse(fence.reserve(key).may_publish)   # rows kept through the migrate
 
     def test_a_torn_store_without_an_initializing_seal_stays_fatal(self):
         # The same shape with an OPERATIONAL seal is a loss, and must not be repaired: a store that
