@@ -413,15 +413,22 @@ class HerdrIdentityAttestationStore:
             replacement_action_id=record.replacement_action_id,
         )
 
-    def assigned_names(self) -> frozenset:
-        """The assigned names carrying a record here (read-only; ``frozenset()`` on any
-        unreadable / unsupported store).
+    def assigned_names(self) -> Optional[frozenset]:
+        """The assigned names carrying a record here, or ``None`` when **unmeasurable**.
 
         Proves *which* agents actually attested into **this** home (Redmine #13882). herdr
         exposes no surface returning a launched process's environment, so the home a live
         agent was launched against is unobservable from outside — a stored row is the only
         evidence that ties a live agent to this specific store. The maintenance command's
         consumer gate joins this against the live inventory.
+
+        Tri-state, deliberately (review j#80000 finding 2). An absent store is an empty
+        ``frozenset()``: nothing attested here, and that is *proven*. But an unreadable /
+        unsupported store returns ``None``, **not** an empty set: its rows cannot be
+        enumerated, so the absence of a consumer cannot be proven either. Folding that into
+        "no consumers" is the same "unreadable is not empty" fail-open this component
+        rejects for the live inventory — and it fails open on exactly the destructive
+        ``rebuild`` path, whose whole target set *is* unreadable stores.
         """
         if not self.path.exists():
             return frozenset()
@@ -431,14 +438,14 @@ class HerdrIdentityAttestationStore:
                 conn.execute("PRAGMA busy_timeout = 2000")
                 conn.execute("BEGIN")
                 if readonly_compatible_select(conn) is None:
-                    return frozenset()
+                    return None  # recognized? no — cannot enumerate; unmeasurable
                 rows = conn.execute(
                     "SELECT assigned_name FROM herdr_identity_attestations"
                 ).fetchall()
             finally:
                 conn.close()
         except sqlite3.DatabaseError:
-            return frozenset()
+            return None
         return frozenset(row[0] for row in rows)
 
     def read(self, assigned_name: str) -> Optional[IdentityAttestationRecord]:
