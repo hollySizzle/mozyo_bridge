@@ -711,6 +711,34 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   `state=applied` (measured). The manifest is therefore fixed up front and becomes this operation's promise; any artifact from it
   that has since vanished is a hard failure — the quarantine fails closed and publishes nothing. So a published recovery point holds
   everything observed at its own start, or does not exist, and a racing peer fails closed rather than publishing a remainder.
+- **Three boundaries share one advisory lock; that exclusion — not any per-operation care — is what pins a generation** (#13882 review
+  j#80159 R7-F1, design answer j#80190, supersession j#80207). Every guard above still addressed the store **by path**, and no amount
+  of care inside one operation can pin a *generation*: the probe approved one store, a peer rotated it, a fresh one appeared at the
+  same path, and the stale run backed up and deleted that fresh, valid store, reporting `applied` (measured, both windows —
+  probe→quarantine and backup→remove). POSIX has no identity-conditioned unlink, and a `rename` "claim" is equally path-addressed, so
+  the fix is exclusion, at all three boundaries that touch the store:
+  - **managed-launch admission** (`prepare_session`) takes it **shared, non-blocking**, before the first attestation read and held
+    through the last actuation. Maintenance in progress therefore fails the launch **at acquisition** — no workspace / tab / agent —
+    and, because admission holds it for the whole run, maintenance can never overtake an in-flight launch.
+  - **self-attestation write** (`upsert`, whole region, before the store is even opened) takes it **shared, blocking**. It waits;
+    it does not degrade. Turning contention into a best-effort failure would drop the attestation and recreate this component's own
+    defect, so only a *genuine* store/platform failure (no `flock`, unopenable lock file) still degrades to an absent record —
+    contention never does. The #13637 contract that a store failure must not stop a boot is unchanged: waiting for a named peer is
+    coordination, not failure.
+  - **maintenance mutation** (`migrate --write` / `rebuild --write`) takes it **exclusive, non-blocking**, before the initial probe
+    and through the result decision. It never queues ahead of a live launch or write: it reports blocked, publishing and removing
+    nothing.
+  The lock is a home-scoped file of its own (`.herdr-identity-attestation.lock`, `0600`) — never store content, never part of a
+  backup manifest, never credential-bearing. A holder's crash releases it at the OS level, so no dead process can wedge the store.
+  Where `flock` is unavailable the protocol cannot be honored and the operation **fails closed** rather than proceeding unlocked: a
+  silent no-op would advertise a guarantee that is not there. Regressions for this live across **real processes** — a thread-level
+  mock proves nothing about a per-process kernel primitive.
+- **Residual, bounded and documented** (j#80190 Q2, j#80207): a runtime of another vintage does not know this protocol, so an
+  *uncooperative old-runtime launch concurrent with explicit maintenance* is not excluded, and this component must not be described
+  as "race-free" without that qualifier. The residual is bounded to exactly that case — normal mixed-runtime reads and writes are
+  unaffected, and the current lock-aware rail's races are closed. The operator-facing precondition is simply: do not start
+  non-lock-aware launchers while a maintenance command runs. Closing it mechanically would need a generation-directory layout or a
+  launch-admission fence, which is a separate scope, not a blocker here.
 - **"Nothing to preserve" after a non-absent probe means backup-first is UNPROVEN, not satisfied** (#13882 review j#80129 R6-F1). When
   the probe saw a store but the quarantine finds none, the store vanished in between — a peer's rotation, or something outside this
   rail. Treating that as "no backup needed" and continuing reported `state=applied`, `executed=True` and a detail claiming the store

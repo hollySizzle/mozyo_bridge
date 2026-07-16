@@ -69,6 +69,8 @@ from typing import Mapping, Optional
 
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     COLUMNS_V2,
+    AttestationStoreLockUnavailable,
+    attestation_store_lock,
     HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY,
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     RECOGNIZED_SCHEMA_VERSIONS,
@@ -366,6 +368,19 @@ class HerdrIdentityAttestationStore:
         the replacement transaction that a recovery matches on exactly.
         """
         observed_at = record.observed_at or _utc_now()
+        # Shared lock over the WHOLE write (Redmine #13882 j#80190 boundary 2), taken
+        # before the store is opened or classified — not merely around the create branch,
+        # which would still let a writer open the path while a rebuild has it pointing at
+        # the old corrupt generation. It BLOCKS rather than degrading: turning contention
+        # into a best-effort failure would drop the attestation and recreate this issue's
+        # own defect (j#80190 Q1), so the writer simply waits for maintenance and then
+        # writes. A holder's crash releases the lock at the OS level.
+        with attestation_store_lock(self.path.parent, exclusive=False, blocking=True):
+            return self._upsert_locked(record, observed_at)
+
+    def _upsert_locked(
+        self, record: IdentityAttestationRecord, observed_at: str
+    ) -> IdentityAttestationRecord:
         conn, version = _connect_rw(self.path)
         try:
             if write_drops_replacement_action_id(version, record.replacement_action_id):
@@ -510,7 +525,14 @@ def record_identity_attestation(
     """
     try:
         return HerdrIdentityAttestationStore(home=home).upsert(record)
-    except (HerdrIdentityAttestationError, sqlite3.DatabaseError, OSError):
+    except (
+        HerdrIdentityAttestationError,
+        AttestationStoreLockUnavailable,
+        sqlite3.DatabaseError,
+        OSError,
+    ):
+        # Contention is NOT in this list: the lock blocks instead (j#80190 Q1). Only a
+        # genuine store / platform failure degrades to an absent record here.
         return None
 
 

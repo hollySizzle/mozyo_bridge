@@ -53,6 +53,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,6 +160,92 @@ _VERSION_MALFORMED = -1
 
 class HerdrIdentityAttestationSchemaError(RuntimeError):
     """A user-actionable schema / migration error (fail-closed, file untouched)."""
+
+
+class AttestationStoreLockBusy(RuntimeError):
+    """The store lock is held by a peer, so this operation must not proceed."""
+
+
+class AttestationStoreLockUnavailable(RuntimeError):
+    """Advisory locking is not available, so the protocol cannot be honored."""
+
+
+#: Home-scoped advisory lock coordinating the three boundaries that touch this store
+#: (Redmine #13882 design consultation answer j#80190). Deliberately its own file: it is
+#: neither store content nor part of a backup manifest, carries no credential, and is
+#: private (0600).
+HERDR_IDENTITY_ATTESTATION_LOCK_FILENAME = ".herdr-identity-attestation.lock"
+
+
+def attestation_store_lock_path(home: Optional[Path] = None) -> Path:
+    from mozyo_bridge.shared.paths import mozyo_bridge_home
+
+    return (home or mozyo_bridge_home()) / HERDR_IDENTITY_ATTESTATION_LOCK_FILENAME
+
+
+@contextmanager
+def attestation_store_lock(home: Path, *, exclusive: bool, blocking: bool):
+    """Hold the home's attestation-store advisory lock (Redmine #13882 R7-F1 / j#80190).
+
+    R7-F1 showed that no amount of care inside one operation can pin a *generation*: the
+    probe approved one store, a peer rotated it, a fresh one appeared at the same path, and
+    the stale run then backed up and deleted that fresh, valid store — because every step
+    addressed the store **by path**, and POSIX offers no identity-conditioned unlink. A
+    rename "claim" does not fix it either (rename is equally path-addressed). The ruling
+    therefore coordinates the three boundaries that touch this store through one advisory
+    lock, so the generation cannot be replaced underneath an operation in the first place:
+
+    - **managed-launch admission** takes it shared, non-blocking — maintenance in progress
+      means the launch fails closed before creating any workspace / tab / agent;
+    - **self-attestation write** takes it shared, **blocking** — it waits for maintenance
+      rather than degrading, because turning lock contention into a best-effort failure
+      would drop the attestation and recreate #13882's own defect (j#80190 Q1);
+    - **maintenance mutation** takes it exclusive, non-blocking — it never queues ahead of
+      an in-flight launch or write; it reports blocked and leaves everything untouched.
+
+    A holder's crash releases the lock at the OS level, so no stale lock can wedge the
+    store. Where ``fcntl.flock`` is unavailable the protocol cannot be honored, so this
+    raises :class:`AttestationStoreLockUnavailable` rather than silently proceeding
+    unlocked — a silent no-op would advertise a guarantee that is not there.
+
+    **Residual, accepted and documented** (j#80190 Q2): a runtime of another vintage does
+    not know this protocol, so an *uncooperative old-runtime launch concurrent with explicit
+    maintenance* is not excluded. That residual is bounded to that case — normal
+    mixed-runtime reads and writes are unaffected — and the operator-facing rule is simply
+    not to launch non-lock-aware launchers while maintenance runs.
+    """
+    try:
+        import fcntl
+    except ImportError as exc:  # pragma: no cover - POSIX-only platforms in practice
+        raise AttestationStoreLockUnavailable(
+            "advisory file locking (fcntl.flock) is unavailable on this platform, so the "
+            "attestation-store lock protocol cannot be honored; refusing to proceed "
+            "unlocked"
+        ) from exc
+
+    path = attestation_store_lock_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 0600: operator-private, and never a store artifact.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (
+        0 if blocking else fcntl.LOCK_NB
+    )
+    try:
+        try:
+            fcntl.flock(fd, flags)
+        except OSError as exc:
+            if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise AttestationStoreLockBusy(
+                    "the attestation store is locked by another operation on this home "
+                    "(maintenance, a managed launch, or a self-attestation write)"
+                ) from exc
+            raise
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _utc_now() -> str:
@@ -751,6 +838,10 @@ __all__ = (
     "STORE_UNREADABLE",
     "STORE_UNSUPPORTED",
     "AttestationMigrationOutcome",
+    "AttestationStoreLockBusy",
+    "AttestationStoreLockUnavailable",
+    "attestation_store_lock",
+    "attestation_store_lock_path",
     "HerdrIdentityAttestationSchemaError",
     "StoreSchemaObservation",
     "backup_attestation_store",

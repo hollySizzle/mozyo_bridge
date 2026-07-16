@@ -119,6 +119,13 @@ from mozyo_bridge.core.state.workspace_registry import (
     read_anchor,
     register_workspace,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    AttestationStoreLockBusy,
+    attestation_store_lock,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+    STORE_MAINTENANCE_IN_PROGRESS,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
@@ -190,6 +197,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _list_rows,
     preflight_attest_launcher_capability,
     preflight_attest_store_schema,
+    HerdrLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
@@ -315,7 +323,44 @@ def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
     )
 
 
-def prepare_session(
+def prepare_session(**kwargs) -> SessionStartResult:
+    """Managed-launch admission under the store's shared lock (Redmine #13882 j#80190).
+
+    Boundary 1 of the three-boundary lock protocol, and the one that lets the other two be
+    safe. R7-F1 showed that a stale operation cannot pin a *generation* by path: the probe
+    approved one store, a peer rotated it, a fresh one appeared at the same path, and the
+    stale run then destroyed that fresh, valid store. The exclusion is what removes the
+    window; this end holds it **shared**, from before the first attestation read through
+    the last actuation, so a launch and an exclusive maintenance can never interleave.
+
+    Non-blocking on purpose (j#80190): if maintenance holds the store exclusively, the
+    launch fails closed **at acquisition** — before any workspace / tab / agent exists —
+    rather than queueing and actuating into a store being rebuilt underneath it. That is
+    the same zero-side-effect boundary the #13748 / #13847 / #13882 preflights already
+    honor. Conversely, because this end is held for the whole run, maintenance cannot
+    overtake an in-flight launch: its own acquisition is what fails.
+
+    A dry run takes no lock: it plans, actuates nothing, and creating a fail-closed path
+    for a read-only report would only make diagnosis harder during maintenance.
+    """
+    if kwargs.get("dry_run"):
+        return _prepare_session_locked(**kwargs)
+    try:
+        with attestation_store_lock(
+            mozyo_bridge_home(), exclusive=False, blocking=False
+        ):
+            return _prepare_session_locked(**kwargs)
+    except AttestationStoreLockBusy as exc:
+        raise HerdrLauncherIncompatibleError(
+            f"managed-launch admission refused: the selected attestation store is being "
+            f"maintained right now ({exc}), so this launch would attest into a store that "
+            f"is being rebuilt underneath it. No workspace / tab / agent was created. "
+            f"Re-run once the maintenance command finishes.",
+            reason=STORE_MAINTENANCE_IN_PROGRESS,
+        ) from exc
+
+
+def _prepare_session_locked(
     *,
     repo_root: Path,
     providers: Sequence[str],
@@ -913,78 +958,6 @@ def _execute_slot(
     )
 
 
-def _render_text(result: SessionStartResult) -> str:
-    lines = [
-        f"herdr session-start: workspace={result.workspace_id} lane={result.lane_id}"
-    ]
-    if result.herdr_tab_id:
-        lines[0] += f" tab={result.herdr_tab_id}"
-    for slot in result.slots:
-        lines.append(
-            f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
-            + (f" locator={slot.locator}" if slot.locator else "")
-        )
-    if result.base_pane_id:
-        state = (
-            "reclaimed"
-            if result.base_pane_reclaimed
-            else f"reclaim-failed ({result.base_pane_detail})"
-        )
-        lines.append(f"base pane {result.base_pane_id}: {state}")
-    if result.tab_pane_id:
-        state = (
-            "reclaimed"
-            if result.tab_pane_reclaimed
-            else f"reclaim-failed ({result.tab_pane_detail})"
-        )
-        lines.append(f"tab root pane {result.tab_pane_id}: {state}")
-    return "\n".join(lines)
-
-
-def cmd_herdr_session_start(args: argparse.Namespace) -> int:
-    """CLI entry: prepare durable herdr identities for the workspace's agents."""
-    from mozyo_bridge.application.commands_common import repo_root_from_args
-
-    from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
-    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
-        RepoLocalConfigError,
-    )
-
-    repo_root = repo_root_from_args(args)
-    agents = getattr(args, "agent", None) or [PROVIDER_CLAUDE, PROVIDER_CODEX]
-    lane_id = getattr(args, "lane", None) or ""
-    dry_run = bool(getattr(args, "dry_run", False))
-    # Config-driven launch argv (Redmine #13425) + pane placement (Redmine #13646):
-    # resolved from the repo the command runs in. lane_class is derived inside
-    # `prepare_session` from the resolved lane. One load serves both surfaces.
-    try:
-        repo_config = load_repo_local_config(repo_root)
-    except RepoLocalConfigError as exc:
-        die(f"herdr session-start failed: invalid repo-local config: {exc}")
-        raise AssertionError("unreachable")
-    agent_launch = repo_config.agent_launch
-    lane_placement = repo_config.lane_placement
-    try:
-        result = prepare_session(
-            repo_root=repo_root,
-            providers=list(agents),
-            lane_id=lane_id,
-            env=os.environ,
-            dry_run=dry_run,
-            claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-            agent_launch=agent_launch,
-            lane_placement=lane_placement,
-        )
-    except HerdrSessionStartError as exc:
-        die(f"herdr session-start failed: {exc}")
-        raise AssertionError("unreachable")
-    if getattr(args, "json", False):
-        print(json.dumps(result.as_payload(), ensure_ascii=False, sort_keys=True))
-    else:
-        print(_render_text(result))
-    return 0
-
-
 __all__ = (
     "SLOT_ADOPTED",
     "SLOT_LAUNCHED",
@@ -994,7 +967,6 @@ __all__ = (
     "HerdrSessionStartError",
     "SessionStartResult",
     "SlotResult",
-    "cmd_herdr_session_start",
     "herdr_workspace_segment",
     "prepare_session",
 )

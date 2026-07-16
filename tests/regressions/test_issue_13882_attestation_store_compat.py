@@ -26,9 +26,11 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1419,6 +1421,228 @@ class ReviewJ80129FindingsTest(unittest.TestCase):
             self.assertTrue(any(result.backup_dir.iterdir()))
 
 
+_HOLDER = """
+import sys, time
+sys.path.insert(0, {src!r})
+from pathlib import Path
+import mozyo_bridge.core.state.herdr_identity_attestation_schema as s
+with s.attestation_store_lock(Path({home!r}), exclusive={exclusive}, blocking=True):
+    print("HELD", flush=True)
+    time.sleep({hold})
+"""
+
+_PEER_REBUILD = """
+import sys, os
+sys.path.insert(0, {src!r})
+os.environ["MOZYO_BRIDGE_HOME"] = {home!r}
+from pathlib import Path
+import mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_attestation_store_maintenance as m
+class V:
+    backend_selected = True; ok = True; reason = None; detail = ""; managed_agents = ()
+r = m.run_attestation_store_rebuild(home=Path({home!r}), view=V(), write=True)
+print(r.state + "|" + str(r.executed) + "|" + str(r.backup_dir is not None), flush=True)
+"""
+
+_PEER_WRITE = """
+import sys, os, time
+sys.path.insert(0, {src!r})
+from pathlib import Path
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore, IdentityAttestationRecord)
+rec = IdentityAttestationRecord(assigned_name="fresh", workspace_id="ws", role="claude",
+                                lane_id="default", locator="w:9", verdict="present")
+t0 = time.time()
+out = HerdrIdentityAttestationStore(home=Path({home!r})).upsert(rec)
+print("WROTE|%.2f|%s" % (time.time() - t0, out is not None), flush=True)
+"""
+
+
+class ReviewJ80190LockProtocolTest(unittest.TestCase):
+    """j#80190 / j#80207 required regressions 1-7, exercised across REAL processes.
+
+    flock is a per-process kernel primitive: a thread-only mock would prove nothing about
+    it, so every contention here is produced by a genuine second process (the ruling's
+    explicit requirement).
+    """
+
+    _SRC = str(_ROOT.parent / "src")
+
+    def _spawn(self, script: str, **fmt) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, "-c", script.format(src=self._SRC, **fmt)],
+            stdout=subprocess.PIPE, text=True,
+        )
+
+    def _hold(self, home: Path, *, exclusive: bool, hold: float = 1.5) -> subprocess.Popen:
+        proc = self._spawn(_HOLDER, home=str(home), exclusive=exclusive, hold=hold)
+        self.assertEqual(proc.stdout.readline().strip(), "HELD", "holder failed to start")
+        return proc
+
+    def _corrupt(self, home: Path) -> Path:
+        path = herdr_identity_attestation_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"corrupt OLD generation")
+        return path
+
+    # --- 1: a live writer's shared lock blocks maintenance ----------------------------
+    def test_1_writer_shared_lock_blocks_maintenance_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt(home)
+            before = _digest(path)
+            holder = self._hold(home, exclusive=False)
+            try:
+                result = run_attestation_store_rebuild(
+                    home=home, view=_View(agents=[]), write=True
+                )
+            finally:
+                holder.wait()
+            self.assertEqual(result.state, BLOCKED_FAILED)
+            self.assertFalse(result.executed)
+            self.assertFalse((home / "backups").exists(), "no publish")
+            self.assertEqual(_digest(path), before, "no remove, no DDL")
+
+    def test_1b_writer_shared_lock_blocks_migrate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v1(home)
+            before = _digest(path)
+            holder = self._hold(home, exclusive=False)
+            try:
+                result = run_attestation_store_migrate(
+                    home=home, view=_View(agents=[]), write=True
+                )
+            finally:
+                holder.wait()
+            self.assertEqual(result.state, BLOCKED_FAILED)
+            self.assertEqual(_digest(path), before, "no DDL ran")
+
+    # --- 2: maintenance excludes managed-launch admission before any actuation --------
+    def test_2_maintenance_blocks_launch_admission_before_first_actuation(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            STORE_MAINTENANCE_IN_PROGRESS,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            holder = self._hold(home, exclusive=True)
+            try:
+                with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}):
+                    with self.assertRaises(HerdrLauncherIncompatibleError) as ctx:
+                        herdr_session_start.prepare_session(
+                            repo_root=repo, providers=["claude"], lane_id="x",
+                            env={"PATH": "/usr/bin"}, runner=None,
+                        )
+                self.assertEqual(ctx.exception.reason, STORE_MAINTENANCE_IN_PROGRESS)
+                self.assertIn("No workspace / tab / agent", str(ctx.exception))
+            finally:
+                holder.wait()
+
+    # --- 3: a contending writer waits and then writes; it never drops -----------------
+    def test_3_writer_waits_for_maintenance_and_still_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            holder = self._hold(home, exclusive=True, hold=1.0)
+            writer = self._spawn(_PEER_WRITE, home=str(home))
+            holder.wait()
+            out = writer.stdout.readline().strip()
+            writer.wait()
+            kind, waited, wrote = out.split("|")
+            self.assertEqual(kind, "WROTE")
+            self.assertEqual(wrote, "True", "the writer must not drop the attestation")
+            self.assertGreater(
+                float(waited), 0.3, "the writer must have WAITED for maintenance"
+            )
+            self.assertIsNotNone(
+                HerdrIdentityAttestationStore(home=home).read("fresh"),
+                "and the row must be durable",
+            )
+
+    # --- 4 / 5: R7-F1 repro A and B can no longer occur -------------------------------
+    def test_4_r7_repro_a_peer_rebuild_cannot_interleave_and_replace_the_generation(self) -> None:
+        # Repro A needed a peer to complete a rotation and a fresh generation to appear
+        # inside this run's probe->quarantine window. Holding the store exclusively for
+        # the whole run removes the window: the peer cannot rotate, so no fresh
+        # generation can take the path this run is operating on.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = self._corrupt(home)
+            peer_state: list = []
+            real_q = sch.quarantine_attestation_store_artifacts
+
+            def _peer_tries_mid_run(p):
+                proc = self._spawn(_PEER_REBUILD, home=str(home))
+                peer_state.append(proc.stdout.readline().strip())
+                proc.wait()
+                return real_q(p)
+
+            with mock.patch.object(mnt, "quarantine_attestation_store_artifacts", _peer_tries_mid_run):
+                mine = run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+
+            self.assertEqual(mine.state, APPLIED)
+            state, executed, had_backup = peer_state[0].split("|")
+            self.assertEqual(state, BLOCKED_FAILED, "the peer must be excluded mid-run")
+            self.assertEqual(executed, "False")
+            self.assertEqual(had_backup, "False", "the peer published no recovery point")
+            published = sorted((home / "backups").iterdir())
+            self.assertEqual(len(published), 1, "exactly this run's recovery point")
+            self.assertEqual(
+                (published[0] / path.name).read_bytes(), b"corrupt OLD generation",
+                "and it holds the generation this run probed — never a fresh one",
+            )
+
+    def test_5_r7_repro_b_fresh_generation_cannot_appear_before_removal(self) -> None:
+        # Repro B needed a fresh generation to appear between this run's backup and its
+        # removal. A writer is the only thing that creates one, and it takes the shared
+        # lock — which this run holds exclusively — so it waits until the rotation is done
+        # and its store is created AFTER, on a path this run has already finished with.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._corrupt(home)
+            writers: list = []
+            real_q = sch.quarantine_attestation_store_artifacts
+
+            def _writer_tries_mid_run(p):
+                out = real_q(p)
+                writers.append(self._spawn(_PEER_WRITE, home=str(home)))
+                time.sleep(0.4)  # the writer is blocked; it must not create a store yet
+                self.assertIsNone(
+                    writers[0].poll(), "the writer must still be waiting on the lock"
+                )
+                return out
+
+            with mock.patch.object(mnt, "quarantine_attestation_store_artifacts", _writer_tries_mid_run):
+                mine = run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+            self.assertEqual(mine.state, APPLIED)
+
+            out = writers[0].stdout.readline().strip()
+            writers[0].wait()
+            self.assertTrue(out.startswith("WROTE|"), out)
+            # The fresh store the writer created AFTER the rotation survives untouched.
+            fresh = HerdrIdentityAttestationStore(home=home).read("fresh")
+            self.assertIsNotNone(fresh, "the fresh generation must exist and be intact")
+            self.assertEqual(probe_store_schema(herdr_identity_attestation_path(home)).version, _V2)
+
+    # --- 6: a holder's crash releases the lock; retry converges ------------------------
+    def test_6_crashed_holder_releases_the_lock_and_retry_converges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self._corrupt(home)
+            holder = self._hold(home, exclusive=True, hold=30.0)
+            holder.kill()          # SIGKILL: no chance to unlock cooperatively
+            holder.wait()
+            # The OS released it, so maintenance is not wedged by a dead holder.
+            result = run_attestation_store_rebuild(home=home, view=_View(agents=[]), write=True)
+            self.assertEqual(result.state, APPLIED)
+            self.assertTrue(result.backup_dir.exists())
+
+
 class ZeroSideEffectTest(unittest.TestCase):
     """Acceptance 1: an incompatible store creates no workspace / tab / agent."""
 
@@ -1473,12 +1697,38 @@ class ZeroSideEffectTest(unittest.TestCase):
             herdr_session_start,
         )
 
-        src = inspect.getsource(herdr_session_start.prepare_session)
+        # The body moved under `_prepare_session_locked` when the launch-admission lock
+        # was added (j#80190 boundary 1 / j#80207 module split); the ordering it pins is
+        # unchanged, so the guard follows the body rather than being deleted.
+        src = inspect.getsource(herdr_session_start._prepare_session_locked)
         self.assertIn("preflight_attest_store_schema", src)
         self.assertLess(
             src.index("preflight_attest_store_schema"),
             src.index("_create_workspace"),
             "the store preflight must precede the first herdr workspace write",
+        )
+
+    def test_launch_admission_takes_the_shared_lock_around_the_whole_run(self) -> None:
+        # GUARD BITE for j#80190 boundary 1: admission must hold the store's shared lock
+        # from before the first attestation read through the last actuation. A refactor
+        # that acquired it later (or not at all) would re-open the R7-F1 window while
+        # every other test still passed.
+        import inspect
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+
+        wrapper = inspect.getsource(herdr_session_start.prepare_session)
+        self.assertIn("attestation_store_lock", wrapper)
+        self.assertIn("exclusive=False", wrapper)
+        self.assertIn("blocking=False", wrapper, "admission must fail closed, not queue")
+        self.assertIn("_prepare_session_locked", wrapper)
+        # The whole run happens inside the lock: the call is nested under the `with`.
+        self.assertLess(
+            wrapper.index("attestation_store_lock"),
+            wrapper.index("return _prepare_session_locked(**kwargs)", wrapper.index("with ")),
+            "the lock must be held across the entire run, not acquired after it",
         )
 
 
