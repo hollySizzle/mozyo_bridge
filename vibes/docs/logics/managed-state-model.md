@@ -477,10 +477,16 @@ Table naming:
       落とす** (review j#80148): (a) unexpected occupant、(b) **duplicate multiplicity** (role が set へ集約される)、
       (c) **locator 無し row** (無条件 skip)。ゆえに空の結果は「expected role が live でない」であって「unit が空」
       ではない。本 surface の契約は後者の強い命題を要するので、raw scan `expected_slot_rows` を併読して各軸を
-      fail-closed する: **duplicate** (同一 expected role の row が 2 件以上 → `duplicate_inventory`。herdr assigned
+      fail-closed する: **duplicate** (**同一 canonical slot** の row が 2 件以上 → `duplicate_inventory`。herdr assigned
       name は一意ゆえ ambiguity であり、`herdr_target_resolution` も `multiple_matches` で送信を拒否する。live check
       の **前**に置く — locator 付き duplicate を `live_pair_present` と呼ぶのは問題の名指しとして誤り)、
-      **locator 欠落** (`expected_identity_unresolved`)。★**進行の条件は deadness の positive な証明であって
+      **locator 欠落** (`expected_identity_unresolved`)。★**duplicate の key は role ではなく decoded
+      `(workspace_id, lane_id, role)`** (= canonical assigned name と 1 対 1、review j#80187 R3-F1): shared slot
+      `(project workspace, lane, role)` と legacy twin slot `(worktree token, default, role)` は **role を共有するが
+      別 slot** であり、共存は `test_legacy_twin_closes_alongside_shared_unit` が pin する正規の互換挙動である。
+      role で集約すると、この通常形を uniqueness 違反と誤読し、しかも locator-less stale twin は close 対象でもない
+      ため **恒久 terminalize 不能**を作る (= #13845 の defect を別 shape で再生産)。`unresolved` 判定も
+      **candidate ごと**に行い、role は表示用の集約にとどめる。★**進行の条件は deadness の positive な証明であって
       liveness の証明の不在ではない**: `classify_named_slot` は "conservative in the never-clobber direction" で
       minimal row を **live** と読むため、同 contract が `SLOT_STALE` と **積極的に判定した** row (detected agent が
       present かつ blank / status が present かつ unknown) のみを residue として通す。全 residue を block すると
