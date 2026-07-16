@@ -43,6 +43,8 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     resume (R11-F1). A lost store stays fail-closed and must be restored, not re-minted.
     """
     from mozyo_bridge.core.state.callback_publication_fence import (
+        SEAL_ABSENT,
+        SEAL_INVALID,
         CallbackPublicationFence,
         CallbackPublicationFenceError,
         PublicationKey,
@@ -100,16 +102,23 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
         print("this fence has no reset: forgetting a reservation is how a record gets published")
         print("twice. A lost store stays fail-closed until it is restored from backup.")
         return 1
-    # An unsealed store is not "absent" -- it is the R13-F1 case, and the operator needs to be told
-    # it is adoptable rather than left guessing why a healthy-looking store is refused.
+    # Compare against the states by name. `seal_state() is not None` was always true once the
+    # return type stopped being Optional, so every store reported as "seal present, store missing"
+    # and the adoption advice below could never print (R15-F3) -- the diagnostic surface has to
+    # name the actual next safe action, because bootstrap is the operator's job.
+    seal = fence.seal_state()
     if fence.is_bootstrapped():
         state = "ready (sealed operational)"
-    elif fence.seal_state() is not None:
-        state = f"NOT ready: seal is `{fence.seal_state()}`, store missing or incomplete"
-    elif fence._pair_is_healthy():
-        state = "NOT ready: store exists but is unsealed — run --bootstrap to adopt it in place"
+    elif seal == SEAL_INVALID:
+        state = "NOT ready: the seal exists but cannot be read — restore it; do not re-create"
+    elif seal == SEAL_ABSENT:
+        state = (
+            "NOT ready: store exists but is unsealed — run --bootstrap to adopt it in place"
+            if fence.has_store()
+            else "absent / never initialized — run --bootstrap"
+        )
     else:
-        state = "absent / never initialized — run --bootstrap"
+        state = f"NOT ready: seal is `{seal}` but the store is missing or incomplete"
     print(f"callback publication fence: {state} at {fence.path}")
     return 0
 
