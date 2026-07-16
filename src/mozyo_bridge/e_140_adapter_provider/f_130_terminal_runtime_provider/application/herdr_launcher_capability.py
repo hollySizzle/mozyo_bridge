@@ -286,6 +286,9 @@ STORE_UNSUPPORTED = "attestation_store_unsupported"
 #: The store is older than this runtime and the probed launcher cannot prove it writes
 #: that shape — the exact live-but-unattested class of #13882.
 STORE_LAUNCHER_CANNOT_WRITE = "attestation_store_launcher_cannot_write"
+#: Maintenance holds the store exclusively, so admission fails closed at acquisition
+#: (Redmine #13882 j#80190 boundary 1) — before any workspace / tab / agent exists.
+STORE_MAINTENANCE_IN_PROGRESS = "attestation_store_maintenance_in_progress"
 #: A replacement launch was requested against a store whose shape has no
 #: ``replacement_action_id`` column.
 STORE_REPLACEMENT_UNSUPPORTED = "attestation_store_replacement_unsupported"
@@ -398,6 +401,7 @@ __all__ = (
     "LAUNCHER_SCHEMA_VERSION_MISMATCH",
     "STORE_JOIN_OK",
     "STORE_LAUNCHER_CANNOT_WRITE",
+    "STORE_MAINTENANCE_IN_PROGRESS",
     "STORE_REPLACEMENT_UNSUPPORTED",
     "STORE_UNREADABLE",
     "STORE_UNSUPPORTED",

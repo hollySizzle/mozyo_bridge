@@ -49,7 +49,10 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     STORE_ABSENT,
     STORE_RECOGNIZED,
     AttestationMigrationOutcome,
+    AttestationStoreLockBusy,
+    AttestationStoreLockUnavailable,
     HerdrIdentityAttestationSchemaError,
+    attestation_store_lock,
     probe_store_schema,
     quarantine_attestation_store_artifacts,
     remove_attestation_store_artifacts,
@@ -246,7 +249,7 @@ def run_attestation_store_status(*, home: Path) -> AttestationStoreMaintenanceRe
     )
 
 
-def run_attestation_store_migrate(
+def _run_migrate_locked(
     *, home: Path, view, write: bool = False
 ) -> AttestationStoreMaintenanceResult:
     """Additive v1 -> v2 migration: backup-first, idempotent, consumer-gated."""
@@ -349,7 +352,7 @@ def _migrate(path: Path) -> AttestationMigrationOutcome:
     return migrate_attestation_store(path)
 
 
-def run_attestation_store_rebuild(
+def _run_rebuild_locked(
     *, home: Path, view, write: bool = False
 ) -> AttestationStoreMaintenanceResult:
     """Rotate an unmigratable store aside into ``backups/`` and start fresh.
@@ -489,6 +492,59 @@ def run_attestation_store_rebuild(
         ),
         backup_dir=backup_dir,
         executed=True,
+    )
+
+
+def _blocked_by_lock(intent: str, exc: Exception) -> AttestationStoreMaintenanceResult:
+    """Report a maintenance run that never started because the store was locked."""
+    return AttestationStoreMaintenanceResult(
+        intent=intent,
+        state=BLOCKED_FAILED,
+        detail=(
+            f"the attestation store is in use and this maintenance did not start ({exc}). "
+            f"Nothing was published and nothing was removed. Maintenance never queues "
+            f"ahead of an in-flight managed launch or self-attestation write; re-run once "
+            f"they finish"
+        ),
+    )
+
+
+def _with_exclusive_lock(intent: str, home: Path, run):
+    """Hold the exclusive store lock across a whole mutating maintenance run.
+
+    Redmine #13882 j#80190 boundary 3. Acquired BEFORE the initial probe and held through
+    the consumer gate, the backup / quarantine, the DDL / removal and the result decision,
+    so the generation the probe approved cannot be replaced underneath the operation —
+    the R7-F1 ABA that let a stale rebuild back up and delete a fresh, valid store. It is
+    **non-blocking on purpose**: maintenance must never queue ahead of a live launch or
+    write, so contention reports blocked with nothing published and nothing removed.
+    """
+    try:
+        with attestation_store_lock(home, exclusive=True, blocking=False):
+            return run()
+    except (AttestationStoreLockBusy, AttestationStoreLockUnavailable) as exc:
+        return _blocked_by_lock(intent, exc)
+
+
+def run_attestation_store_migrate(
+    *, home: Path, view, write: bool = False
+) -> AttestationStoreMaintenanceResult:
+    """Additive v1 -> v2 migration: backup-first, idempotent, consumer-gated."""
+    if not write:  # a read-only plan mutates nothing and takes no lock
+        return _run_migrate_locked(home=home, view=view, write=False)
+    return _with_exclusive_lock(
+        "migrate", home, lambda: _run_migrate_locked(home=home, view=view, write=True)
+    )
+
+
+def run_attestation_store_rebuild(
+    *, home: Path, view, write: bool = False
+) -> AttestationStoreMaintenanceResult:
+    """Rotate an unmigratable store aside into ``backups/`` and start fresh."""
+    if not write:
+        return _run_rebuild_locked(home=home, view=view, write=False)
+    return _with_exclusive_lock(
+        "rebuild", home, lambda: _run_rebuild_locked(home=home, view=view, write=True)
     )
 
 
