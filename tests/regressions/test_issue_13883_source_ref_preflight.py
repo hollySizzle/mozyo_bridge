@@ -459,6 +459,56 @@ class SourceRefPreflightTest(unittest.TestCase):
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
         self.assertIn("source_ref_resolved: refs/tags/release-candidate", out)
 
+    # -- static refusals must not depend on git ---------------------------
+
+    def test_value_only_refusals_never_reach_for_git(self) -> None:
+        """Static spelling refusals must not require git (j#80162 R5-F1).
+
+        A shell-unsafe value and a `refs/remotes/...` path are decidable from the
+        value alone. Sharing one spelling predicate with the citation path must
+        not drag `git remote` in front of them — otherwise the diagnostic an
+        operator sees depends on whether git is installed or `--repo` happens to
+        be a repository, and the exact correction is hidden behind an unrelated
+        environment error.
+        """
+        cases = (
+            ("main; touch /tmp/x", "must be a single plain ref name"),
+            ("refs/remotes/origin/main", "LOCAL remote-tracking namespace"),
+        )
+        for value, needle in cases:
+            with self.subTest(source_ref=value):
+                # Any read of the configured remotes is a failure here.
+                with patch.object(
+                    source_ref_mod,
+                    "configured_remotes",
+                    side_effect=AssertionError("remote lookup must not be reached"),
+                ) as remotes:
+                    err = self._assert_refused(value)
+                self.assertIn(needle, err)
+                self.assertEqual(0, remotes.call_count)
+
+    def test_remote_aware_refusal_still_consults_git(self) -> None:
+        # The other half of the contract: a value whose verdict genuinely
+        # depends on which remotes exist must still consult them, and keep the
+        # ambiguity message.
+        with patch.object(
+            source_ref_mod, "configured_remotes", wraps=source_ref_mod.configured_remotes
+        ) as remotes:
+            err = self._assert_refused("origin/main")
+        self.assertIn("is ambiguous", err)
+        self.assertGreaterEqual(remotes.call_count, 1)
+
+    def test_remote_lookup_is_memoized(self) -> None:
+        # The provider exists to defer the lookup, not to repeat it: the multi
+        # branch checks every candidate's spelling through the same predicate.
+        _git(self.clone, "tag", "main")
+        _git(self.clone, "push", "-q", "origin", "refs/tags/main")
+        with patch.object(
+            source_ref_mod, "configured_remotes", wraps=source_ref_mod.configured_remotes
+        ) as remotes:
+            self._assert_refused("main")
+        self.assertLessEqual(remotes.call_count, 1)
+
     # -- shell safety -----------------------------------------------------
 
     def test_shell_unsafe_and_glob_values_refuse_before_dispatch(self) -> None:

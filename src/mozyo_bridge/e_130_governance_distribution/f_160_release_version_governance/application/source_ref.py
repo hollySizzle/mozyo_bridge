@@ -43,6 +43,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from mozyo_bridge.shared.errors import die
 
@@ -96,13 +97,37 @@ def configured_remotes(repo_root: Path) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def spelling_refusal(value: str, *, remotes: set[str]) -> str | None:
+def remotes_provider(repo_root: Path) -> Callable[[], set[str]]:
+    """Return a memoized reader of the repo's configured remote names.
+
+    ``spelling_refusal`` takes a provider rather than a set so the checks that
+    need no git at all stay independent of it: a shell-unsafe value must be
+    refused with the shell-safety message whether or not git is installed or
+    ``--repo`` happens to be a repository (Redmine #13883 j#80162 R5-F1).
+    Memoized so a single invocation runs `git remote` at most once.
+    """
+    cached: list[set[str]] = []
+
+    def provider() -> set[str]:
+        if not cached:
+            cached.append(configured_remotes(repo_root))
+        return cached[0]
+
+    return provider
+
+
+def spelling_refusal(value: str, *, remotes: Callable[[], set[str]]) -> str | None:
     """Return why `value` is not an accepted `source_ref` spelling, else None.
 
     Split out of ``validate`` so the same policy can be applied without dying —
     ``preflight`` must know whether a ref it is about to CITE would itself be
     refused, rather than handing the operator an un-pasteable correction
     (Redmine #13883 j#80124 R4-F1).
+
+    The value-only refusals are decided first and `remotes` is called only if
+    the decision actually needs to know which remotes exist, so this stays the
+    single definition of "accepted" without dragging git into checks that never
+    needed it (j#80162 R5-F1).
     """
     if not CHARSET_RE.match(value):
         return (
@@ -122,8 +147,10 @@ def spelling_refusal(value: str, *, remotes: set[str]) -> str | None:
             f"spells it: --source-ref refs/heads/{branch or '<branch>'} "
             f"(canonical) or --source-ref {branch or '<branch>'}"
         )
+    # Only now does the verdict depend on which remotes are configured, so only
+    # now may the git lookup happen.
     remote, sep, branch = value.partition("/")
-    if sep and remote in remotes:
+    if sep and remote in remotes():
         return (
             f"source_ref {value!r} is ambiguous: {remote!r} is a configured "
             f"remote, so this is git's local spelling of "
@@ -146,7 +173,7 @@ def validate(value: str, *, repo_root: Path) -> None:
     Rejections carry the exact, pasteable correction to use. Nothing is
     rewritten: see the module docstring for why normalization is unsafe here.
     """
-    refusal = spelling_refusal(value, remotes=configured_remotes(repo_root))
+    refusal = spelling_refusal(value, remotes=remotes_provider(repo_root))
     if refusal is not None:
         die(refusal)
 
@@ -165,7 +192,7 @@ def _resolves_uniquely(name: str, matches: list[tuple[str, str]]) -> bool:
 
 
 def _actionable_corrections(
-    matches: list[tuple[str, str]], source_sha: str, *, remotes: set[str]
+    matches: list[tuple[str, str]], source_sha: str, *, remotes: Callable[[], set[str]]
 ) -> list[str]:
     """Return matched refs that could actually be passed as `source_ref`.
 
@@ -258,7 +285,7 @@ def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
         # refuses outright (j#80124 R4-F1). Where nothing qualifies, say so
         # rather than inventing a correction.
         actionable = _actionable_corrections(
-            matches, source_sha, remotes=configured_remotes(repo_root)
+            matches, source_sha, remotes=remotes_provider(repo_root)
         )
         if len(actionable) == 1:
             recovery = (
