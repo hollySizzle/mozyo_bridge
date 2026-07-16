@@ -1088,6 +1088,62 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.assertEqual(result["send_reason"], ZERO_SEND_OWNERSHIP_LOST)
         self.assertEqual(self.sends, [])
 
+    def test_a_reclaim_inside_the_recorder_publishes_nothing(self):
+        # R7-F1. Checking ownership before CALLING the recorder is not enough: the production
+        # recorder then does its own Redmine pre-read before post_note, so the gap between the
+        # check and the actual write is a whole network round-trip -- ample time for a slow owner's
+        # TTL to lapse. The reclaim is injected inside that gap, which is where it really happens.
+        outer = self
+        posted, sends, seen = [], [], {"n": 0}
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                return [ir("79990")] + [entry(str(96000 + k), n) for k, n in enumerate(posted)]
+
+        class RecorderSource:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                seen["n"] += 1
+                if seen["n"] == 1:            # the recorder's pre-read: steal the lease HERE
+                    outer.lease.acquire(outer.key(), now=time.time() + 99999)
+                return [ir("79990")] + [entry(str(96000 + k), n) for k, n in enumerate(posted)]
+
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=Src(),
+            fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
+            send_fn=lambda j: sends.append(j),
+            record_fn_factory=lambda live: build_recovery_recorder(
+                source=RecorderSource(), issue=ISSUE, lane=LANE, lane_generation=GEN,
+                post_note=lambda i, n: posted.append(n), grant_is_live=live,
+            ),
+        )
+        self.assertEqual(posted, [])          # zero-publication, not "published then declined to send"
+        self.assertEqual(sends, [])
+        self.assertEqual(result["send_reason"], ZERO_SEND_OWNERSHIP_LOST)
+
+    def test_bootstrap_refuses_a_sidecar_only_loss_and_recover_is_the_way_out(self):
+        # R7-F2. The production composition root bootstraps on EVERY --execute, so silently
+        # re-minting a nonce onto a live DB invalidates the grant of an owner that is still
+        # working. The sibling fence refuses this exact state; only half that contract had been
+        # copied (sidecar-present/DB-missing), leaving DB-present/sidecar-missing wide open.
+        a = self.lease.acquire(self.key())
+        self.lease.sidecar_path.unlink()                 # sidecar lost, DB (and the grant) live
+        with self.assertRaises(CallbackSweepLeaseError):
+            self.lease.bootstrap()
+        # ...and a fail-closed state needs a sanctioned way out, or it is a permanent stall.
+        self.lease.recover()
+        b = self.lease.acquire(self.key())
+        self.assertTrue(b.owned)
+        self.assertNotEqual(a.store_nonce, b.store_nonce)   # the old grant is invalidated
+
+    def test_bootstrap_is_idempotent_only_on_an_exact_identity_match(self):
+        a = self.lease.acquire(self.key())
+        self.lease.bootstrap()                            # DB + sidecar agree -> no-op
+        self.assertTrue(self.lease.owns(self.key(), a.token))
+
     def test_expiry_alone_ends_ownership_even_if_nobody_reclaims(self):
         # Isolates the TTL check. The reclaim test cannot: reclaiming REPLACES the token, so it
         # fails the identity comparison regardless of whether expiry is honoured -- a probe showed

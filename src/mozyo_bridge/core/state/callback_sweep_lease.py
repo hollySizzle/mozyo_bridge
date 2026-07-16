@@ -145,24 +145,11 @@ class CallbackSweepLease:
             return None
         return str(row[0]) if row else None
 
-    def bootstrap(self) -> None:
-        """Create the store and its DB-external identity sidecar together (initial only).
-
-        Idempotent when both already exist at the same nonce. Refuses (fail-closed) when the
-        sidecar exists but the DB does not -- that is a store LOSS, and silently minting a fresh DB
-        is exactly how a deleted store hands out a second live lease for an anchor someone already
-        owns (review R6-F2).
-        """
-        sidecar = self._read_sidecar_nonce()
-        if sidecar is not None and self.path.exists():
-            return
-        if sidecar is not None and not self.path.exists():
-            raise CallbackSweepLeaseError(
-                f"callback sweep lease {self.path} is missing while its identity sidecar remains "
-                f"(store loss); fail closed rather than auto-create and hand out a duplicate lease"
-            )
-        nonce = secrets.token_hex(16)
+    def _create_fresh(self, nonce: str) -> None:
+        """Create the DB and its sidecar together at ``nonce`` (the only creation path)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            self.path.unlink()
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             conn.execute(_TABLE_SQL)
@@ -175,6 +162,66 @@ class CallbackSweepLease:
         finally:
             conn.close()
         self.sidecar_path.write_text(nonce, encoding="utf-8")
+
+    def is_bootstrapped(self) -> bool:
+        """True when the DB and its sidecar co-exist at the SAME nonce (read-only)."""
+        sidecar = self._read_sidecar_nonce()
+        if sidecar is None or not self.path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(self.path, isolation_level=None)
+        except sqlite3.DatabaseError:
+            return False
+        try:
+            conn.execute(_META_TABLE_SQL)
+            return self._db_nonce(conn) == sidecar
+        except sqlite3.DatabaseError:
+            return False
+        finally:
+            conn.close()
+
+    def bootstrap(self) -> None:
+        """Initial-only creation of the lease store + its DB-external identity (review R7-F2).
+
+        Mirrors :meth:`...dispatch_outbox_fence.DispatchOutboxFence.bootstrap` exactly, because the
+        hazard is exactly the same and an earlier revision copied only half of it:
+
+        - **both** the DB and the sidecar absent (a genuine first bootstrap) -> mint a random
+          ``store_nonce`` and create the DB + sidecar together at that nonce;
+        - DB and sidecar co-exist at the same nonce -> idempotent no-op;
+        - **any** other state -- sidecar present but DB missing, **DB present but the sidecar
+          missing**, or a nonce mismatch -> **fail closed**.
+
+        The sidecar-only-loss case is why "half the contract" is not a partial fix but a hole: the
+        production composition root calls ``bootstrap()`` on EVERY ``--execute``, so silently
+        re-minting a nonce onto a live DB invalidates the grant of an owner that is still working
+        and hands the anchor to someone else. A single-sided store is a loss or a replacement, and
+        it must go through the deliberate, operator-gated :meth:`recover` -- never a silent
+        re-create.
+        """
+        sidecar_nonce = self._read_sidecar_nonce()
+        db_exists = self.path.exists()
+        if sidecar_nonce is None and not db_exists:
+            self._create_fresh(secrets.token_hex(16))  # both absent: the only genuine first init
+            return
+        if self.is_bootstrapped():
+            return  # DB + sidecar at the same nonce: already bootstrapped
+        raise CallbackSweepLeaseError(
+            f"callback sweep lease {self.path} is in an inconsistent state (only one of the DB / "
+            f"sidecar exists, or their nonces differ): a store loss or replacement. Refusing to "
+            f"silently re-create, which would invalidate a live owner's grant and hand the same "
+            f"anchor to a second owner. Use recover() for a deliberate, operator-gated recovery."
+        )
+
+    def recover(self) -> None:
+        """Deliberate, operator-gated loss recovery: mint a NEW nonce and a fresh store.
+
+        The sanctioned way OUT of the fail-closed state :meth:`bootstrap` raises — a guard with no
+        release path is a permanent stall, not a safety property. An operator invokes this after
+        confirming no sweep is mid-attempt; every lingering grant is invalidated by the new nonce,
+        which is the point.
+        """
+        self._create_fresh(secrets.token_hex(16))
 
     def _connect(self) -> sqlite3.Connection:
         """Open an EXISTING, identity-matched store, or fail closed (mirrors the outbox fence).

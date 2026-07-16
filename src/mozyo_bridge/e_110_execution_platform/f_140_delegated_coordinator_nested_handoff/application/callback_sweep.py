@@ -172,6 +172,7 @@ def sweep_once(
     lease: Optional[CallbackSweepLease] = None,
     send_fn: Optional[Callable[[str], object]] = None,
     record_fn: Optional[Callable[[dict, SweepWatermark], str]] = None,
+    record_fn_factory: Optional[Callable[[Callable[[], bool]], Callable[[dict, SweepWatermark], str]]] = None,
     callback: str = CALLBACK_ABSENT,
     stale_cli: bool = False,
     now: Optional[str] = None,
@@ -239,7 +240,7 @@ def sweep_once(
         return result
     # R2-F3: without a durable writer the send would be a silent re-poke, which the workflow
     # contract prohibits outright.
-    if record_fn is None:
+    if record_fn is None and record_fn_factory is None:
         result["send_reason"] = ZERO_SEND_RECORD_FAILED
         result["send_detail"] = (
             "no record_fn supplied: every stall check and re-notification must be recorded as a "
@@ -300,6 +301,11 @@ def sweep_once(
         result["resolution_recorded"] = False
         return result
 
+    # R7-F1: with the grant in hand, build the recorder around a live-grant predicate so the
+    # ownership check sits immediately before the WRITE rather than before the whole recorder.
+    if record_fn_factory is not None:
+        record_fn = record_fn_factory(_still_owns)
+
     if result["state"] != STATE_NO_PROGRESS_AFTER_HANDOFF:
         decision = decide_recovery(
             decided=decided, rechecked=decided, decided_state=result["state"]
@@ -356,34 +362,30 @@ def _mutating_path(
     record_fn: Callable[[dict, SweepWatermark], str],
     now: Optional[str],
 ) -> dict[str, Any]:
-    """The stall path: ONE reservation owns the whole attempt — read, record, verify, send.
+    """The stall path: publish the record under a live grant, then send exactly once.
 
-    Four review rounds of local re-ordering produced a design where the fence guarded only the
-    *send*, and every other step raced. This is the structure that follows from making the
-    reservation own the attempt end to end:
+    Order (the lease is already held by :func:`sweep_once`)::
 
-    ``reserve -> boundary read -> record -> final live read -> send -> mark_delivered``,
-    with :meth:`DispatchOutboxFence.release` on any abort.
+        boundary re-read -> record (published only while the grant is live)
+          -> final live read -> reserve the send fence -> send -> mark delivered
 
-    Why each position (and what broke when it was elsewhere):
+    - the **boundary re-read** is the last chance to notice the lane is not stalled; a gate landing
+      here folds to a first-pass zero-send resolution (acceptance 2/3);
+    - the **record** is durable and the notification points at it — a re-poke with no journal behind
+      it is the silent re-poke the workflow contract prohibits. It is published only while this
+      sweep still owns the attempt: the recorder itself re-checks the grant immediately before its
+      write, because the check must sit after the recorder's own Redmine reads, not before them
+      (review R7-F1);
+    - the **final live read** sits immediately before the send. The record's journal id is a
+      position, not a CAS against future writes, so it cannot substitute for reading late;
+    - the **send fence** (:class:`...dispatch_outbox_fence.DispatchOutboxFence`) is reserved here
+      and resolved immediately — short-lived, the only way its contract supports. It is NOT held
+      across the attempt; that is the attempt lease's job, and ``DispatchOutboxFence.release()``
+      does not exist (a reservation it cannot prove was never sent must not be droppable).
 
-    - **reserve first.** The fence's ``BEGIN IMMEDIATE`` row is the only real serialization
-      authority available — Redmine has none. Holding it across the *whole* attempt is what makes
-      the record publication atomic: a concurrent sweep loses the reserve and never writes, so two
-      sweeps cannot post duplicate records and strand the anchor in permanent ambiguity (R4-F3).
-      An earlier revision moved the reserve after the record to fix a retry block (R3-F3), which
-      bought retryability by giving up atomicity.
-    - **release, not cancel, on abort.** That retry block is instead fixed by
-      :meth:`DispatchOutboxFence.release`, which drops a still-reserved row: this attempt did not
-      happen, so the next one starts clean. ``mark_cancelled`` is terminal and would block the
-      anchor forever.
-    - **final live read immediately before the send** (R4-F2). The record's journal id is only a
-      *position*, not a CAS against future Redmine writes — an earlier revision claimed otherwise
-      and a gate landing during the reserve was still replayed. The window cannot be closed to
-      zero over a store with no CAS; it is narrowed to read->send and no wider claim is made.
-    - **the recorder aborts rather than write a stale verdict** (R4-F1): its own pre-write read is
-      an observation too, so a superseded stall raises :class:`RecordSupersededError` and folds to
-      the first-pass resolution instead of writing a false record and correcting it.
+    Any abort releases the lease and leaves no durable side effect, so the next sweep retries
+    cleanly. The read->transport window that remains is the documented residual of coordinator
+    disposition j#80302 (b)+(c); true receiver-side exactly-once is Redmine #13910.
     """
     key = FenceKey(
         workspace_id=workspace_id,
@@ -430,6 +432,9 @@ def _mutating_path(
         return ownership_lost("recording the stall")
     try:
         record_journal = str(record_fn(dict(result), rechecked) or "").strip()
+    except RecordOwnershipLostError:
+        _release()
+        return ownership_lost("the record write")
     except RecordSupersededError as exc:
         # R4-F1: the recorder's own pre-write read contradicted the verdict, so nothing was
         # written. Fold to the first-pass resolution — no false stall record, no correction.
@@ -601,6 +606,11 @@ def _record_resolution(
         return
     try:
         journal = str(record_fn(dict(result), watermark) or "").strip()
+    except RecordOwnershipLostError:
+        # R7-F1: the grant lapsed at the write. Nothing was published; the current owner will.
+        result["resolution_recorded"] = False
+        result["record_reason"] = "ownership_lost"
+        return
     except Exception as exc:  # noqa: BLE001 - surfaced as incomplete, never swallowed as success
         result["resolution_recorded"] = False
         result["record_reason"] = type(exc).__name__
@@ -695,6 +705,14 @@ class RecoverySendError(RuntimeError):
     """The one recovery notification did not positively succeed (-> the fence marks it uncertain)."""
 
 
+class RecordOwnershipLostError(RuntimeError):
+    """The attempt lease lapsed before the record write, so nothing was published (R7-F1).
+
+    Distinct from a write failure: nothing is broken and nothing was attempted — this sweep simply
+    no longer owns the anchor, and the owner that does will publish.
+    """
+
+
 class RecordSupersededError(RuntimeError):
     """The recorder's own pre-write read contradicts the verdict, so it wrote nothing (R4-F1).
 
@@ -759,6 +777,7 @@ def build_recovery_recorder(
     lane: str,
     lane_generation: object,
     post_note: Callable[[str, str], object],
+    grant_is_live: Optional[Callable[[], bool]] = None,
 ) -> Callable[[dict, SweepWatermark], str]:
     """Build the production ``record_fn``: write the sweep record, then RESOLVE its journal id.
 
@@ -773,6 +792,15 @@ def build_recovery_recorder(
     dispatch anchor, so a legitimately changed verdict (``stall_unprovable`` -> a landed gate) is
     recorded once each. Returns ``""`` when the record cannot be resolved — :func:`sweep_once` then
     cancels the send rather than perform an unrecorded one.
+
+    ``grant_is_live()`` conditions THE WRITE ITSELF on still holding the attempt lease (review
+    R7-F1). Checking ownership before *calling* the recorder is not enough and was the previous
+    defect: this function then performs a full Redmine pre-read before ``post_note``, so the gap
+    between that check and the actual publication is not microscopic — it is a whole network
+    round-trip, which is ample time for a slow owner's TTL to lapse and the anchor to be reclaimed.
+    The check therefore sits where it can be honest: immediately before the write, after every read
+    this function performs. A lapsed grant raises :class:`RecordOwnershipLostError` and writes
+    nothing.
     """
 
     def _record(result: dict, watermark: SweepWatermark) -> str:
@@ -808,6 +836,13 @@ def build_recovery_recorder(
                     f"{[j for j, _ in fresh.progress]} opaque={list(fresh.opaque)} "
                     f"superseded={fresh.superseded}); no stall record was written"
                 )
+        # R7-F1: the LAST thing before the write. Every read above has completed, so this is the
+        # narrowest point at which the grant can be checked; a lapse discovered here means the
+        # current owner will publish and this one must not.
+        if grant_is_live is not None and not grant_is_live():
+            raise RecordOwnershipLostError(
+                "the attempt lease lapsed before the record write; publishing nothing"
+            )
         post_note(str(issue), render_sweep_record_note(_record_body(result), **keys))
         written = sweep_record_journals(source.read_entries(str(issue)), **keys)
         return written[0] if len(written) == 1 else ""
@@ -872,6 +907,7 @@ __all__ = (
     "ZERO_SEND_OWNERSHIP_LOST",
     "RecoverySendError",
     "RecordSupersededError",
+    "RecordOwnershipLostError",
     "source_is_fresh",
     "read_watermark",
     "sweep_once",
