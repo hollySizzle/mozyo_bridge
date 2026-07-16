@@ -41,6 +41,7 @@ from typing import Optional
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 CALLBACK_SWEEP_LEASE_FILENAME = "callback-sweep-lease.sqlite"
+CALLBACK_SWEEP_LEASE_SIDECAR_SUFFIX = ".anchor"
 CALLBACK_SWEEP_LEASE_SCHEMA_VERSION = 1
 
 #: This caller now owns the attempt and must release it when done.
@@ -56,6 +57,15 @@ LEASE_RECLAIMED = "reclaimed"
 #: that a crashed owner does not strand the anchor. A crashed owner cannot have sent: the send
 #: happens under the outbox fence *after* the leased work.
 DEFAULT_LEASE_TTL_SECONDS = 120.0
+
+_META_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS store_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
+_STORE_NONCE_KEY = "store_nonce"
 
 _TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS sweep_lease (
@@ -95,6 +105,9 @@ class LeaseResult:
     status: str
     token: str = ""
     detail: str = ""
+    #: The store identity this grant was issued under (review R6-F2). An owner that later finds a
+    #: DIFFERENT nonce is holding a lease from a store that no longer exists, so it must stand down.
+    store_nonce: str = ""
 
     @property
     def owned(self) -> bool:
@@ -111,14 +124,91 @@ class CallbackSweepLease:
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
         self.path = Path(path) if path else callback_sweep_lease_path(home)
 
-    def _connect(self) -> sqlite3.Connection:
+    @property
+    def sidecar_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + CALLBACK_SWEEP_LEASE_SIDECAR_SUFFIX)
+
+    def _read_sidecar_nonce(self) -> Optional[str]:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            value = self.sidecar_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value or None
+
+    @staticmethod
+    def _db_nonce(conn: sqlite3.Connection) -> Optional[str]:
+        try:
+            row = conn.execute(
+                "SELECT value FROM store_meta WHERE key = ?", (_STORE_NONCE_KEY,)
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        return str(row[0]) if row else None
+
+    def bootstrap(self) -> None:
+        """Create the store and its DB-external identity sidecar together (initial only).
+
+        Idempotent when both already exist at the same nonce. Refuses (fail-closed) when the
+        sidecar exists but the DB does not -- that is a store LOSS, and silently minting a fresh DB
+        is exactly how a deleted store hands out a second live lease for an anchor someone already
+        owns (review R6-F2).
+        """
+        sidecar = self._read_sidecar_nonce()
+        if sidecar is not None and self.path.exists():
+            return
+        if sidecar is not None and not self.path.exists():
+            raise CallbackSweepLeaseError(
+                f"callback sweep lease {self.path} is missing while its identity sidecar remains "
+                f"(store loss); fail closed rather than auto-create and hand out a duplicate lease"
+            )
+        nonce = secrets.token_hex(16)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            conn.execute(_TABLE_SQL)
+            conn.execute(_META_TABLE_SQL)
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)",
+                (_STORE_NONCE_KEY, nonce),
+            )
+            conn.execute(f"PRAGMA user_version = {CALLBACK_SWEEP_LEASE_SCHEMA_VERSION}")
+        finally:
+            conn.close()
+        self.sidecar_path.write_text(nonce, encoding="utf-8")
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open an EXISTING, identity-matched store, or fail closed (mirrors the outbox fence).
+
+        Never creates the container. A deleted / replaced / recreated store is the #13889 R6-F2
+        split-brain: the old owner keeps its grant against a store that is gone while a new process
+        hands the same anchor to somebody else. The DB and its DB-external sidecar must co-exist at
+        the SAME nonce; a missing file, an empty swap-in, or a nonce mismatch all fail closed.
+        """
+        sidecar_nonce = self._read_sidecar_nonce()
+        if sidecar_nonce is None:
+            raise CallbackSweepLeaseError(
+                f"callback sweep lease {self.path} has no identity sidecar (never bootstrapped / "
+                f"lost); fail closed rather than run an unserialized attempt"
+            )
+        if not self.path.exists():
+            raise CallbackSweepLeaseError(
+                f"callback sweep lease {self.path} is missing while its sidecar remains (store "
+                f"loss); fail closed rather than auto-create and hand out a duplicate lease"
+            )
+        try:
             conn = sqlite3.connect(self.path, isolation_level=None)
             conn.execute("PRAGMA busy_timeout = 2000")
             conn.execute(_TABLE_SQL)
-            conn.execute(f"PRAGMA user_version = {CALLBACK_SWEEP_LEASE_SCHEMA_VERSION}")
+            conn.execute(_META_TABLE_SQL)
+            if self._db_nonce(conn) != sidecar_nonce:
+                conn.close()
+                raise CallbackSweepLeaseError(
+                    f"callback sweep lease {self.path} nonce does not match its sidecar "
+                    f"(replaced / recreated store); fail closed"
+                )
             return conn
+        except CallbackSweepLeaseError:
+            raise
         except (sqlite3.DatabaseError, OSError) as exc:
             raise CallbackSweepLeaseError(
                 f"callback sweep lease store {self.path} is unusable ({type(exc).__name__}); "
@@ -160,10 +250,12 @@ class CallbackSweepLease:
                 "acquired_at=excluded.acquired_at",
                 (*key.as_row(), token, stamp + float(ttl_seconds), stamp),
             )
+            nonce = self._db_nonce(conn) or ""
             conn.execute("COMMIT")
             return LeaseResult(
                 status=LEASE_RECLAIMED if reclaimed else LEASE_ACQUIRED,
                 token=token,
+                store_nonce=nonce,
                 detail="reclaimed an expired lease" if reclaimed else "acquired a fresh lease",
             )
         except sqlite3.DatabaseError as exc:
@@ -204,6 +296,36 @@ class CallbackSweepLease:
         finally:
             conn.close()
 
+    def owns(self, key: LeaseKey, token: str, *, store_nonce: str = "") -> bool:
+        """True only if ``token`` STILL owns a live lease on ``key`` in the SAME store (R6-F1/F2).
+
+        The check a caller must make immediately before every durable publication and before the
+        send. Acquiring is not enough: the TTL can expire while the owner is merely *slow* rather
+        than dead -- a few Redmine round-trips is all it takes -- and a new owner then reclaims the
+        anchor. Both would publish, producing exactly the duplicate durable record this issue
+        exists to remove. "The owner is dead so it cannot have sent" only ever covered the SEND
+        (which the outbox fence gates); it never covered the publication, which only the lease
+        gates.
+
+        Fail-closed by construction: an unreadable / lost / replaced store raises out of
+        :meth:`_connect`, an expired lease reads as not-owned, and a mismatched ``store_nonce``
+        means the grant came from a store that no longer exists.
+        """
+        conn = self._connect()
+        try:
+            if store_nonce and self._db_nonce(conn) != str(store_nonce):
+                return False
+            row = conn.execute(
+                "SELECT owner_token, expires_at FROM sweep_lease WHERE workspace_id=? AND "
+                "lane_id=? AND issue=? AND anchor=?",
+                key.as_row(),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or float(row[1]) <= time.time():
+            return False
+        return str(row[0]) == str(token)
+
     def owner_of(self, key: LeaseKey) -> str:
         """The current owner token, or ``""`` when unheld / expired (read-only, for tests+debug)."""
         conn = self._connect()
@@ -231,4 +353,5 @@ __all__ = (
     "LeaseResult",
     "CallbackSweepLease",
     "callback_sweep_lease_path",
+    "CALLBACK_SWEEP_LEASE_SIDECAR_SUFFIX",
 )

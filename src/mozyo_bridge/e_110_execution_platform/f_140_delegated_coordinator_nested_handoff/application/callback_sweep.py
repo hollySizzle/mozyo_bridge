@@ -1,40 +1,55 @@
-"""Callback sweep use case: fresh read -> re-read -> fence -> durable record -> one send (#13889).
+"""Callback sweep use case: derive the verdict, serialize the attempt, send at most once (#13889).
 
-The composition the issue's acceptance describes, in one ordered path:
+The sweep answers one question — *is this lane actually stalled?* — and, only if it is, performs one
+recovery notification. Both halves are durable acts, so the order is the design:
 
-1. **read** the durable record live and resolve the EXACT dispatch anchor for this lane+generation,
-   then derive the verdict from the anchored, ordered watermark (acceptance 1/2/4) — the sweep never
-   accepts an agent's asserted ``--progress`` boolean;
-2. **re-read** immediately before any mutation and re-derive the watermark. A gate landing in the
-   decision->send window (the 8-second j#79995 -> j#79996 evidence window) turns the verdict into
-   ``progress_without_callback`` and the mutation is refused (acceptance 2/3);
-3. **record** the classification durably — before touching any authority (review R3-F3) — and
-   point the one notification at THAT journal; a re-poke with no journal behind it is invisible to
-   the next coordinator and is prohibited (review R2-F3);
-4. **verify** against the record's own journal id, then **fence** the send so recovery is delivered
-   **at most once per gate anchor** across crashes and concurrent sweeps (acceptance 5).
+    acquire attempt lease
+      -> decision read      (anchored, ordered watermark; the verdict is DERIVED, never asserted)
+      -> boundary re-read   (a gate landing here folds to a first-pass zero-send resolution)
+      -> publish the record (durable; the notification will point at it)
+      -> final live read    (immediately before the send)
+      -> reserve the send fence -> send -> mark delivered
+    release the lease
 
-Each guard covers a failure the others cannot, and every one of them was, at some revision, present
-but ineffective — which is the lesson the ordering encodes:
+**Two authorities, deliberately separate** (reviews R5-F1 / R6-F1):
 
-- the **re-read** stops a correct-but-stale verdict from mutating, but only if the source can
-  actually return newer data. A frozen snapshot re-read is a no-op that merely *looks* like a guard
-  (review R2-F1), so mutation requires a source that positively declares :func:`source_is_fresh`;
-- the **fence** is the at-most-once authority, but only if its key is real: the key is partitioned
-  by workspace, so an unattested id reserves a different row and the same recovery sends again
-  (review R2-F2). An unmeasured partition is not a fence;
-- the **record** is written BEFORE the reserve (review R3-F3). Reserving first and cancelling on a
-  write failure looked like a clean rollback but was not: ``FENCE_CANCELLED`` is terminal to
-  ``reserve``, so a transient failure blocked that anchor's recovery permanently. The record is
-  idempotent, so writing it first costs nothing and leaves a failed attempt with no durable
-  side-effect to undo;
-- **no CAS exists** in Redmine, so the last window is closed by position rather than by locking:
-  the record's journal id ``R`` is a serialization point, and the sweep requires that no qualifying
-  gate PRECEDES ``R`` (review R3-F1). A gate before ``R`` proves the verdict was stale when written.
+- :class:`...callback_sweep_lease.CallbackSweepLease` serializes the **attempt**. It is the one that
+  may be *held* across slow Redmine I/O, because its rows name their owner: a loser is passive, and
+  release is owner-conditional. :class:`...dispatch_outbox_fence.DispatchOutboxFence` cannot play
+  that role — its contract assumes an instantaneous reservation and reads a lingering ``reserved``
+  row as crash residue, so holding one corrupts a live owner and blocks the anchor forever.
+- the outbox fence still serializes the **send**, reserved immediately around it, exactly the short
+  way its contract supports.
 
-Every failure degrades to **zero-send**: an unreadable source, a non-fresh source, an unattested
-workspace, an unwritable record, an unbootstrapped / replaced fence, or a lost reserve all refuse
-the mutation. A sweep that cannot prove a stall does not act on one.
+**Acquiring is not owning.** The lease has a TTL, so an owner that is merely *slow* — a few Redmine
+round-trips — can outlive it and be reclaimed while still running. Every durable act therefore
+re-verifies ownership at the authority first (:meth:`CallbackSweepLease.owns`), and a lost lease
+publishes nothing and sends nothing. "A dead owner cannot have sent" was only ever true of the
+*send*; publication is gated by the lease alone.
+
+**Every guard here was, at some revision, present but ineffective.** That is what the shape encodes:
+
+- a **re-read** only guards if the source can return new data. A frozen snapshot re-reads to the
+  identical payload, so mutation requires a source that positively declares
+  :func:`source_is_fresh` (R2-F1);
+- a **fence** only guards if its key is real. The key is workspace-partitioned, so an unattested id
+  reserves a different row and the same recovery sends twice (R2-F2);
+- a **record** must precede the pointer send, or the notification is a silent re-poke the workflow
+  contract prohibits outright (R2-F3);
+- **all** publications must be serialized, not just the stall record — zero-send resolutions are the
+  common case and were duplicating (R5-F2);
+- the store itself must be **identity-pinned**: a deleted / recreated lease DB otherwise hands a
+  second live owner the same anchor (R6-F2).
+
+**Documented residual** (coordinator disposition j#80302, option (b)+(c)): Redmine offers no CAS, so
+the window between the final live read and the transport call cannot be closed by the sender alone.
+It is narrowed to read->send and accepted as a documented residual — this covers the whole #13883
+evidence, which is seconds to minutes. True receiver-side exactly-once is Redmine **#13910** and is
+explicitly NOT claimed here.
+
+Everything degrades to **zero-send**: an unreadable or non-fresh source, an unattested workspace, an
+unavailable or lost lease, an unwritable record, an unbootstrapped fence, or a lost reserve. A sweep
+that cannot prove a stall does not act on one.
 """
 
 from __future__ import annotations
@@ -96,6 +111,10 @@ ZERO_SEND_RECORD_FAILED = "recovery_record_failed"
 ZERO_SEND_ATTEMPT_HELD = "attempt_held"
 #: The attempt lease store is unusable, so the attempt would not be serialized -> no mutation.
 ZERO_SEND_LEASE_UNAVAILABLE = "attempt_lease_unavailable"
+#: The attempt lease was LOST mid-attempt (TTL expired and another owner reclaimed it, or the store
+#: was replaced). Publication and send both stop (review R6-F1/F2): an owner that no longer owns the
+#: anchor must not write a durable record or send, because the new owner will.
+ZERO_SEND_OWNERSHIP_LOST = "attempt_ownership_lost"
 
 
 def source_is_fresh(source: object) -> bool:
@@ -259,6 +278,28 @@ def sweep_once(
         except CallbackSweepLeaseError:
             pass  # the lease expires on its own; a later sweep reclaims it
 
+    def _still_owns() -> bool:
+        """Re-verify ownership at the authority, immediately before a durable act (R6-F1).
+
+        Acquiring is not enough. The TTL can lapse while this owner is merely SLOW — a few Redmine
+        round-trips — and another sweep then reclaims the anchor. Without this check both would
+        publish, which is the duplicate durable record the issue exists to remove. Fail-closed: an
+        unreadable / replaced store is treated as ownership lost.
+        """
+        try:
+            return lease_store.owns(lease_key, held.token, store_nonce=held.store_nonce)
+        except CallbackSweepLeaseError:
+            return False
+
+    def _ownership_lost(where: str) -> dict[str, Any]:
+        result["send_reason"] = ZERO_SEND_OWNERSHIP_LOST
+        result["send_detail"] = (
+            f"the attempt lease was lost before {where} (expired and reclaimed, or the store was "
+            f"replaced); this sweep publishes nothing and sends nothing — the current owner acts"
+        )
+        result["resolution_recorded"] = False
+        return result
+
     if result["state"] != STATE_NO_PROGRESS_AFTER_HANDOFF:
         decision = decide_recovery(
             decided=decided, rechecked=decided, decided_state=result["state"]
@@ -267,7 +308,9 @@ def sweep_once(
         result["send_detail"] = decision.detail
         # Acceptance 3: a first-pass resolution (progress_without_callback / stall_unprovable) is a
         # durable event too — the design must not depend on a later correction journal. Published
-        # under the lease, then released.
+        # under the lease (re-verified at the authority), then released.
+        if not _still_owns():
+            return _ownership_lost("publishing the first-pass resolution")
         _record_resolution(result, record_fn, decided)
         _release()
         return result
@@ -284,6 +327,8 @@ def sweep_once(
         lease_key=lease_key,
         lease_token=held.token,
         release=_release,
+        still_owns=_still_owns,
+        ownership_lost=_ownership_lost,
         target_assigned_name=target_assigned_name,
         send_fn=send_fn,
         record_fn=record_fn,
@@ -304,6 +349,8 @@ def _mutating_path(
     lease_key: object,
     lease_token: str,
     release: Callable[[], None],
+    still_owns: Callable[[], bool],
+    ownership_lost: Callable[[str], dict],
     target_assigned_name: str,
     send_fn: Callable[[str], object],
     record_fn: Callable[[dict, SweepWatermark], str],
@@ -353,8 +400,11 @@ def _mutating_path(
 
         Order matters (R5-F2): releasing first would put the zero-send resolution publication back
         outside the serialized region, which is how two sweeps came to publish duplicate
-        `progress_without_callback` records.
+        `progress_without_callback` records. Ownership is re-verified first (R6-F1) — a lapsed
+        lease means the current owner will publish, so this one must not.
         """
+        if not still_owns():
+            return ownership_lost("publishing the resolution")
         _record_resolution(folded, record_fn, watermark)
         _release()
         return folded
@@ -374,7 +424,10 @@ def _mutating_path(
     if decision.zero_send:
         return _abort(_apply_zero_send(result, decision, rechecked), rechecked)
 
-    # (3) Record the stall durably, inside the reservation (R4-F3 atomicity).
+    # (3) Record the stall durably, inside the lease — after re-verifying we still hold it (R6-F1).
+    if not still_owns():
+        _release()
+        return ownership_lost("recording the stall")
     try:
         record_journal = str(record_fn(dict(result), rechecked) or "").strip()
     except RecordSupersededError as exc:
@@ -495,6 +548,10 @@ def _mutating_path(
         result["needs_reconcile"] = bool(reserve.needs_reconcile)
         return result
 
+    if not still_owns():
+        fence.mark_cancelled(key, detail="attempt lease lost before send", now=now)
+        _release()
+        return ownership_lost("the send")
     try:
         send_fn(record_journal)
     except Exception as exc:  # noqa: BLE001 - an ambiguous send is uncertain, never auto-retried
@@ -812,6 +869,7 @@ __all__ = (
     "ZERO_SEND_RECORD_FAILED",
     "ZERO_SEND_ATTEMPT_HELD",
     "ZERO_SEND_LEASE_UNAVAILABLE",
+    "ZERO_SEND_OWNERSHIP_LOST",
     "RecoverySendError",
     "RecordSupersededError",
     "source_is_fresh",
