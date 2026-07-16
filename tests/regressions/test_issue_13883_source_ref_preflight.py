@@ -310,6 +310,39 @@ class SourceRefPreflightTest(unittest.TestCase):
         self.assertEqual(release_mod.EXIT_CLEAN, rc)
         self.assertIn("source_ref_resolved: refs/heads/refs/foo", out)
 
+    def test_cited_recovery_is_never_a_dead_end(self) -> None:
+        """The cited correction must actually resolve (Redmine #13883 j#80090 R3-F1).
+
+        With `refs/heads/a` and `refs/heads/z/refs/heads/a` on origin, the short
+        name `a` matches both — and so does `refs/heads/a`, because it is itself
+        a tail of the nested ref. Citing the first match would hand the operator
+        a correction that reproduces the same refusal. The citation must be the
+        longest match, which provably re-resolves to exactly one.
+        """
+        _git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/a")
+        _git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/z/refs/heads/a")
+
+        err = self._assert_refused("a")
+        self.assertIn("resolved to 2 origin refs", err)
+        self.assertIn("is a tail pattern here", err)
+        # The dead-end candidate must NOT be the cited correction.
+        self.assertNotIn("--source-ref refs/heads/a resolves uniquely", err)
+        self.assertIn("--source-ref refs/heads/z/refs/heads/a resolves uniquely", err)
+
+        # Prove the citation is not a promise on paper: feeding it back must
+        # resolve to exactly one and reach dispatch.
+        rc, out = self._publish("refs/heads/z/refs/heads/a")
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertIn(
+            f"source_ref_resolved: refs/heads/z/refs/heads/a -> {self.head}", out
+        )
+
+        # And the dead-end candidate, if the operator picks it anyway, gets the
+        # correct advice for its situation rather than another citation loop.
+        dead_end = self._assert_refused("refs/heads/a")
+        self.assertIn("is itself one of the refs above", dead_end)
+        self.assertIn("rename/delete the colliding ref on origin", dead_end)
+
     def test_mismatch_refuses_before_dispatch(self) -> None:
         _git(self.clone, "checkout", "-q", "-b", "other")
         (self.clone / "c.txt").write_text("c\n", encoding="utf-8")

@@ -208,11 +208,21 @@ def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
                 "origin, or pass a different ref that resolves to exactly one."
             )
         else:
+            # Cite a candidate that PROVABLY re-resolves to exactly one: the
+            # longest matched name. If some other ref S matched it, S would end
+            # with `/` + that name and so be longer, and S would also end with
+            # the original pattern — so S would be in `matches` and longer than
+            # the longest. Contradiction. Citing matches[0] instead could cite a
+            # name that is itself a tail of another candidate, sending the
+            # operator straight back into this refusal (j#80090 R3-F1).
+            resolvable = max(matches, key=lambda item: (len(item[1]), item[1]))[1]
             recovery = (
                 f"{source_ref!r} is a tail pattern here — it names none of the "
                 "refs above exactly, so a more specific spelling exists. Pass "
-                "the full path of the one you mean, verbatim, e.g. --source-ref "
-                f"{matches[0][1]}"
+                f"the full path of the one you mean, verbatim: --source-ref "
+                f"{resolvable} resolves uniquely. A shorter path above may "
+                "itself be a tail of a longer one, in which case it cannot be "
+                "narrowed either and its collision has to be resolved on origin."
             )
         die(
             f"source_ref {source_ref!r} resolved to {len(matches)} origin refs; "

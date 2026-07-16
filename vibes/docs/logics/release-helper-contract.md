@@ -89,6 +89,8 @@ peel 行を落とす帰結として、**annotated tag の non-peel tip は tag o
 - exactly-one は **preflight と server gate が動的に検査する不変条件**である。衝突時は client / server の双方が同じ logic で refuse するため、fail-closed と parity は保たれる。
 - **回復手順は 2 通りあり、`ls-remote` の match facts で判定する** (入力の見た目で判定しない):
   - **入力が一致した ref のいずれとも完全一致しない** -> 入力は tail pattern であり、より特定的な綴りが存在する。列挙した ref の full path を verbatim で渡せば解消しうる。
+    - **例示する候補は「再指定すれば必ず exactly-one に解決する」ものを選ぶ** (Redmine #13883 j#80090 R3-F1)。具体的には **最長の matched ref name** を挙げる。候補の full path 自体が別候補の tail である場合 (例: `refs/heads/a` と `refs/heads/z/refs/heads/a` が並存し `a` を渡した場合)、その候補を再指定しても multi のままで **案内が行き止まりになる**ため、入力順の先頭 (`matches[0]`) を例示しない。最長性の根拠: 最長 matched ref R を pattern として別 ref S が match するなら S は `/` 境界で R を tail に持つので R より長く、かつ S は元 pattern も tail に持つため元の match 集合に含まれる。これは R の最長性に矛盾する。別方式を採る場合は、提示候補を再 query して exactly-one を保証すること。
+    - 併せて、**より短い候補は別候補の tail であり得て、その場合は origin 側で衝突解消が必要になる**ことを message に明示する (例示が解決することと、operator が意図した候補が解決することは別)。
   - **入力が一致した ref のいずれかと完全一致する** -> 入力は既にその ref の完全名であり、再提示では絞れない。回復は (a) origin 側の衝突 ref を rename / 削除する、(b) 一意に解決する別 ref を使う、のいずれか。
   - **`refs/` prefix を「full path である」の判定に使わない** (Redmine #13883 j#80048 R2-F1)。branch 短縮名は合法に `refs/` で始まれる (`refs/foo` は origin 上で `refs/heads/refs/foo` になる)。prefix で判定すると、この入力を full path と誤分類し、**実際に有効な full-path 訂正を隠して不要な origin 側 ref 削除を勧める**。判定は「入力と完全一致する ref が解決結果にあるか」で行う。
 
