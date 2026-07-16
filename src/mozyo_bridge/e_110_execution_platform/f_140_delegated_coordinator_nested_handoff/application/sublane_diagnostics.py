@@ -27,9 +27,18 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import sublane_callback
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+    classify_sweep,
+    resolve_watermark,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MappingRedmineJournalSource,
+    resolve_dispatch_entry_journal,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODES,
     SOURCE_ENV_INVALID,
@@ -147,13 +156,59 @@ def cmd_sublane_readiness(args: argparse.Namespace) -> int:
 # --- callback-recovery -------------------------------------------------------
 
 
+#: Provenance of the ``new_durable_progress`` input — the distinction Redmine #13889 turns on.
+PROGRESS_DERIVED = "derived_dispatch_anchored"
+PROGRESS_ASSERTED = "asserted_unanchored"
+
+
+def _derive_from_journals(args: argparse.Namespace) -> dict[str, Any]:
+    """Derive the verdict from a durable journal snapshot, anchored on the exact dispatch marker.
+
+    The #13889 path: ``--journals-json`` supplies the ``include=journals`` snapshot, the dispatch
+    anchor is resolved from this lane+generation's structured IR marker, and progress is measured
+    strictly after it by ordered durable journal id. Pure — the snapshot is read from disk, never
+    from Redmine over the network (the live-source wiring is the supervisor's path).
+    """
+    payload = json.loads(Path(str(args.journals_json)).read_text(encoding="utf-8"))
+    source = MappingRedmineJournalSource(payload=payload)
+    entries = source.read_entries(str(getattr(args, "issue", "") or "").strip() or None)
+    dispatch = resolve_dispatch_entry_journal(
+        entries,
+        lane=str(getattr(args, "lane", "") or "").strip(),
+        lane_generation=getattr(args, "lane_generation", None),
+    )
+    watermark = resolve_watermark(entries, dispatch_journal=dispatch)
+    result = classify_sweep(
+        watermark=watermark,
+        callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
+        stale_cli=bool(getattr(args, "stale_cli", False)),
+    )
+    result["progress_provenance"] = PROGRESS_DERIVED
+    return result
+
+
 def build_callback_recovery(args: argparse.Namespace) -> dict[str, Any]:
-    return sublane_callback.classify_callback_stall(
+    """Classify a delivered-but-quiet unit of work, deriving progress when a snapshot is supplied.
+
+    Two provenances, and the output always says which (#13889):
+
+    - ``--journals-json`` (+ ``--lane`` / ``--lane-generation``) -> **derived**: anchored on the
+      exact dispatch marker and ordered by durable journal id, so a gate that landed seconds before
+      the sweep is seen on the first pass;
+    - ``--progress`` / no snapshot -> **asserted**: the legacy hand-set boolean. It is the input
+      that produced the #13883 false stalls (an agent's earlier read is a coordinator-local cutoff),
+      so the verdict is tagged unanchored rather than being silently trusted as equivalent.
+    """
+    if getattr(args, "journals_json", None):
+        return _derive_from_journals(args)
+    result = sublane_callback.classify_callback_stall(
         dispatch_delivered=bool(getattr(args, "dispatch_delivered", False)),
         new_durable_progress=bool(getattr(args, "progress", False)),
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),
     )
+    result["progress_provenance"] = PROGRESS_ASSERTED
+    return result
 
 
 def format_callback_recovery_text(result: dict[str, Any]) -> str:
@@ -162,9 +217,22 @@ def format_callback_recovery_text(result: dict[str, Any]) -> str:
         f"  inputs: dispatch_delivered={result['dispatch_delivered']} "
         f"new_durable_progress={result['new_durable_progress']} "
         f"callback={result['callback']} stale_cli={result['stale_cli']}",
-        f"  summary: {result['summary']}",
-        "  recovery:",
     ]
+    provenance = result.get("progress_provenance", "")
+    if provenance == PROGRESS_DERIVED:
+        lines.append(
+            f"  watermark: derived, anchored on dispatch journal "
+            f"{result.get('dispatch_journal') or '-'} (ordered durable journal id)"
+        )
+        for entry in result.get("progress_journals", []):
+            lines.append(f"    progress: j#{entry['journal']} {entry['kind']}")
+    elif provenance == PROGRESS_ASSERTED:
+        lines.append(
+            "  watermark: ASSERTED (not dispatch-anchored) — new_durable_progress was supplied by "
+            "hand, so a gate that landed after your read is invisible here. Pass --journals-json "
+            "with --lane/--lane-generation to derive it from the durable record instead."
+        )
+    lines += [f"  summary: {result['summary']}", "  recovery:"]
     for i, step in enumerate(result["recovery"], 1):
         lines.append(f"    {i}. {step}")
     if result["invariants"]:

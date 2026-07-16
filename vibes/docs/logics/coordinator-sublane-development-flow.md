@@ -509,6 +509,19 @@ lane 数の叙述は `sublane_projection` (検証済み projection) からのみ
 
 callback は pointer なので、欠けても durable progress は消えない。管制塔は新しい sublane を開く前に active lane の Redmine journal を sweep し、`$callback_sweep()` の 4 状態 (`progress_without_callback / no_progress_after_handoff / callback_delivery_failed / callback_not_attempted`) へ分類して記録する。done な work は再 dispatch しない。この sweep は owner approval や close を self-authorize しない。
 
+#### sweep watermark contract (#13889)
+
+進捗の有無は **agent が事前 read から手で宣言しない**。宣言式 (`--progress` 相当) は「agent が read した時点」を cutoff にするため、read と判定の間に着地した durable gate を見落とし、false stall → 不要な recovery → duplicate replay を生む (#13883 j#79995→j#79996 は 8 秒差で誤判定)。sweep の progress は次の 4 規律で **導出** する。
+
+- **anchored**: 進捗は **exact dispatch anchor** (当該 lane+generation の `implementation_request` marker を持つ entry 自身の journal id) より後だけを見る。coordinator-local な「最後に読んだ journal」を cutoff にしない。anchor が無い (prose-only IR) 場合は **fail-closed** で abstain し、`0` を捏造しない。
+- **ordered**: 前後判定は **順序付き durable journal id の数値比較**であり wall-clock ではない。8 秒差は時刻 cutoff では解けず id 比較では厳密に解ける。
+- **re-read + zero-send**: recovery mutation の直前に **再読取**し、判定時点以降に qualifying gate が着地していれば mutation を実行せず、first pass で `progress_without_callback` を記録する (事後訂正 journal に頼らない)。dispatch anchor が別 round へ動いていた場合も zero-send。
+- **at-most-once**: 生き残った mutation は `DispatchOutboxFence` に dispatch anchor で reserve され、同一 gate anchor への recovery delivery は高々 1 回。fence 不在 / 読取不能は zero-send。
+
+**progress vocabulary は callback-required gate vocabulary と別**である。`GATE_BEARING_KINDS` (`implementation_done / review_request / review_result / owner_close_approval_waiting / blocked`) は *coordinator を起こす* state であり、`review_finding_verdict` / `progress_log` / `start` / `design_consultation` のような worker 側 durable gate は「lane は生きている」ことを示すが callback を負わない。後者を前者へ混ぜると全 verdict が coordinator wake になり、本 issue が消そうとしている重複通知そのものになる。よって progress は **別 closed vocabulary** として持ち、判定は「gate ∪ progress」の和で行う (`#13758` の dispatch marker が gate vocabulary を広げなかったのと同じ前例)。
+
+progress の判定は **structured marker のみ**を読む。coordinator 自身の stall check / recovery journal も同じ issue 上のより新しい entry であり、かつ観測 workspace では coordinator と worker が **同一 Redmine user** で journal を書く (#13883 evidence は全て同一 author) ため、author 識別では両者を分離できない。marker 方式のみがこの自己参照を原理的に防ぐ。prose-only の progress journal は fail-closed (progress 不成立) となるが、その残存 false stall は re-read + fence により duplicate replay へ波及しない。
+
 ### Redmine journal recovery と nagger の位置づけ
 
 handoff-worthy state の欠落検出は、pane 状態や Claude / Codex の自己申告ではなく、
