@@ -73,6 +73,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery import (  # noqa: E501
     register_sublane_recover_stale_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+    register_sublane_recover_pair_parser,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -798,6 +801,7 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     register_sublane_resume_parser(sublane_sub)
     register_sublane_quarantine_parser(sublane_sub)
     register_sublane_recover_stale_parser(sublane_sub)
+    register_sublane_recover_pair_parser(sublane_sub)
 
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
     # is the opt-in write side: it mints durable herdr assigned names for the
