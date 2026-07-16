@@ -85,6 +85,16 @@ class SourceRefPreflightTest(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
+    def _commit_on(self, clone: Path, branch: str, filename: str) -> str:
+        """Create `branch` with one extra commit and return its SHA."""
+        _git(clone, "checkout", "-q", "-b", branch)
+        (clone / filename).write_text(f"{filename}\n", encoding="utf-8")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-qm", filename)
+        sha = _git(clone, "rev-parse", "HEAD").strip()
+        _git(clone, "checkout", "-q", "-")
+        return sha
+
     def _args(self, source_ref: str, source_sha: str | None = None) -> argparse.Namespace:
         return argparse.Namespace(
             repo=str(self.clone),
@@ -257,9 +267,11 @@ class SourceRefPreflightTest(unittest.TestCase):
         self.assertIn("refs/heads/foo/refs/heads/main", err)
         self.assertIn(nested, err)
         # The input names a matched ref exactly, so no re-spelling can narrow
-        # it; the only real recovery is on origin.
+        # it; the only real recovery is on origin. `refs/heads/main` carries the
+        # SHA but is a tail of the nested ref, so nothing is citable here.
         self.assertIn("is itself one of the refs above", err)
-        self.assertIn("rename/delete the colliding ref on origin", err)
+        self.assertIn("cannot be named on their own here", err)
+        self.assertIn("Resolve the collision on origin", err)
 
     def test_short_name_collision_is_told_to_use_the_full_path(self) -> None:
         # The other branch of the recovery: a short name CAN often be
@@ -326,8 +338,10 @@ class SourceRefPreflightTest(unittest.TestCase):
         self.assertIn("resolved to 2 origin refs", err)
         self.assertIn("is a tail pattern here", err)
         # The dead-end candidate must NOT be the cited correction.
-        self.assertNotIn("--source-ref refs/heads/a resolves uniquely", err)
-        self.assertIn("--source-ref refs/heads/z/refs/heads/a resolves uniquely", err)
+        self.assertNotIn("--source-ref refs/heads/a carries source_sha", err)
+        self.assertIn(
+            "--source-ref refs/heads/z/refs/heads/a carries source_sha", err
+        )
 
         # Prove the citation is not a promise on paper: feeding it back must
         # resolve to exactly one and reach dispatch.
@@ -337,11 +351,77 @@ class SourceRefPreflightTest(unittest.TestCase):
             f"source_ref_resolved: refs/heads/z/refs/heads/a -> {self.head}", out
         )
 
-        # And the dead-end candidate, if the operator picks it anyway, gets the
-        # correct advice for its situation rather than another citation loop.
+        # And the dead-end candidate, if the operator picks it anyway, is told
+        # why re-spelling cannot help rather than looping on another citation.
         dead_end = self._assert_refused("refs/heads/a")
         self.assertIn("is itself one of the refs above", dead_end)
-        self.assertIn("rename/delete the colliding ref on origin", dead_end)
+
+    def test_citation_never_points_at_a_different_commit(self) -> None:
+        """A cited ref must carry source_sha (Redmine #13883 j#80124 R4-F1 repro A).
+
+        `refs/heads/a` holds the approved candidate; the longer
+        `refs/heads/z/refs/heads/a` holds something else. Selecting purely for
+        unique resolution would cite the longer one — a commit the operator never
+        approved — and pasting it back would still refuse on the SHA. A citation
+        must be dispatch-effective or absent.
+        """
+        other = self._commit_on(self.clone, "branch-other", "other.txt")
+        _git(self.clone, "push", "-q", "origin", f"{self.head}:refs/heads/a")
+        _git(
+            self.clone,
+            "push",
+            "-q",
+            "origin",
+            f"{other}:refs/heads/z/refs/heads/a",
+        )
+        self.assertNotEqual(self.head, other)
+
+        err = self._assert_refused("a")
+        # The unique-but-wrong-commit ref must not be advertised at all.
+        self.assertNotIn("--source-ref refs/heads/z/refs/heads/a", err)
+        # refs/heads/a does carry source_sha but is a tail of the other ref, so
+        # it cannot be named alone: say that instead of citing something.
+        self.assertIn("cannot be named on their own here", err)
+        self.assertIn("Resolve the collision on origin", err)
+
+    def test_citation_never_points_at_a_name_the_helper_would_refuse(self) -> None:
+        """A cited ref must pass the spelling policy (j#80124 R4-F1 repro B).
+
+        `refs/heads/x!/a` is a legal git ref but fails this helper's own charset,
+        so citing it would hand the operator a value the very next invocation
+        rejects.
+        """
+        self.assertEqual(
+            0,
+            subprocess.run(
+                ["git", "-C", str(self.clone), "check-ref-format", "refs/heads/x!/a"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode,
+            msg="premise: `refs/heads/x!/a` must be a legal git ref",
+        )
+        _git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/a")
+        _git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/x!/a")
+
+        err = self._assert_refused("a")
+        # Never advertise a name this helper would reject on sight.
+        self.assertNotIn("--source-ref refs/heads/x!/a", err)
+        # `refs/heads/a` is the one that qualifies (right SHA, accepted
+        # spelling, unique), so it is cited instead of the longer illegal name.
+        self.assertIn("--source-ref refs/heads/a carries source_sha", err)
+        rc, out = self._publish("refs/heads/a")
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertIn(f"source_ref_resolved: refs/heads/a -> {self.head}", out)
+
+    def test_no_listed_ref_carries_the_candidate_sha(self) -> None:
+        # When nothing on origin under this pattern carries source_sha, there is
+        # no correction to offer — say so rather than citing an unrelated ref.
+        other = self._commit_on(self.clone, "branch-two", "two.txt")
+        _git(self.clone, "push", "-q", "origin", f"{other}:refs/heads/a")
+        _git(self.clone, "push", "-q", "origin", f"{other}:refs/tags/a")
+        err = self._assert_refused("a")
+        self.assertIn(f"None of the refs above has source_sha {self.head}", err)
+        self.assertNotIn("carries source_sha and resolves uniquely", err)
 
     def test_mismatch_refuses_before_dispatch(self) -> None:
         _git(self.clone, "checkout", "-q", "-b", "other")

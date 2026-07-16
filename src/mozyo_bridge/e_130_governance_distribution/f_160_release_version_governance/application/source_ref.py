@@ -96,14 +96,16 @@ def configured_remotes(repo_root: Path) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def validate(value: str, *, repo_root: Path) -> None:
-    """Refuse `source_ref` spellings that cannot exist on origin.
+def spelling_refusal(value: str, *, remotes: set[str]) -> str | None:
+    """Return why `value` is not an accepted `source_ref` spelling, else None.
 
-    Rejections carry the exact, pasteable correction to use. Nothing is
-    rewritten: see the module docstring for why normalization is unsafe here.
+    Split out of ``validate`` so the same policy can be applied without dying —
+    ``preflight`` must know whether a ref it is about to CITE would itself be
+    refused, rather than handing the operator an un-pasteable correction
+    (Redmine #13883 j#80124 R4-F1).
     """
     if not CHARSET_RE.match(value):
-        die(
+        return (
             f"source_ref {value!r} must be a single plain ref name matching "
             "[A-Za-z0-9._/-]+ (no globs, refspec metacharacters, or "
             "whitespace); this mirrors the trusted workflow gate and keeps the "
@@ -112,7 +114,7 @@ def validate(value: str, *, repo_root: Path) -> None:
     if value.startswith(LOCAL_TRACKING_PREFIX):
         tracked = value[len(LOCAL_TRACKING_PREFIX) :]
         _, _, branch = tracked.partition("/")
-        die(
+        return (
             f"source_ref {value!r} names git's LOCAL remote-tracking namespace "
             f"({LOCAL_TRACKING_PREFIX}*), which mirrors a remote ref rather than "
             "naming it the way the remote publishes it (remotes publish branches "
@@ -121,8 +123,8 @@ def validate(value: str, *, repo_root: Path) -> None:
             f"(canonical) or --source-ref {branch or '<branch>'}"
         )
     remote, sep, branch = value.partition("/")
-    if sep and remote in configured_remotes(repo_root):
-        die(
+    if sep and remote in remotes:
+        return (
             f"source_ref {value!r} is ambiguous: {remote!r} is a configured "
             f"remote, so this is git's local spelling of "
             f"{LOCAL_TRACKING_PREFIX}{value} (the branch {branch!r} on "
@@ -135,6 +137,54 @@ def validate(value: str, *, repo_root: Path) -> None:
             f"  a branch literally named {value!r}: --source-ref "
             f"refs/heads/{value}"
         )
+    return None
+
+
+def validate(value: str, *, repo_root: Path) -> None:
+    """Refuse `source_ref` spellings that cannot be accepted as-is.
+
+    Rejections carry the exact, pasteable correction to use. Nothing is
+    rewritten: see the module docstring for why normalization is unsafe here.
+    """
+    refusal = spelling_refusal(value, remotes=configured_remotes(repo_root))
+    if refusal is not None:
+        die(refusal)
+
+
+def _resolves_uniquely(name: str, matches: list[tuple[str, str]]) -> bool:
+    """True if re-passing `name` would match only itself.
+
+    Decidable from `matches` alone, with no extra query: any ref S that matches
+    the pattern `name` ends with `/` + name, and `name` in turn ends with the
+    original pattern — so S ends with the original pattern too and is therefore
+    already in `matches`. Checking `matches` is thus complete.
+    """
+    return not any(
+        other != name and other.endswith("/" + name) for _, other in matches
+    )
+
+
+def _actionable_corrections(
+    matches: list[tuple[str, str]], source_sha: str, *, remotes: set[str]
+) -> list[str]:
+    """Return matched refs that could actually be passed as `source_ref`.
+
+    A citation is only useful if re-passing it reaches dispatch, which needs ALL
+    of: the tip is `source_sha` (it is the approved candidate's lineage, not
+    merely some ref), the name is an accepted spelling (the helper would not
+    refuse it), and it resolves uniquely. Selecting on any one of these alone —
+    "it's the longest", so it resolves uniquely — cites refs that carry a
+    different commit or that the helper itself rejects (Redmine #13883 j#80124
+    R4-F1). Nothing here guesses which ref the operator meant; it only removes
+    the ones that provably cannot work.
+    """
+    return [
+        name
+        for sha, name in matches
+        if sha == source_sha
+        and spelling_refusal(name, remotes=remotes) is None
+        and _resolves_uniquely(name, matches)
+    ]
 
 
 def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
@@ -187,46 +237,58 @@ def preflight(source_ref: str, source_sha: str, *, repo_root: Path) -> str:
         )
     if len(matches) > 1:
         listed = "\n".join(f"  {name} -> {sha}" for sha, name in matches)
-        # `git ls-remote` matches a ref-name TAIL at `/` boundaries, so the
-        # recovery depends on whether a MORE SPECIFIC spelling still exists.
-        # Decide that from the match facts, not from the shape of the input: a
-        # `refs/` prefix does not mean "full ref path", because a branch may
-        # legally be named `refs/foo` (which origin publishes as
-        # `refs/heads/refs/foo`), and telling its owner to delete refs would
-        # hide the full-path correction that actually works (j#80048 R2-F1).
-        # If the input already equals one of the matched ref names, it IS the
-        # full name and no re-spelling can narrow it further (j#79995 F1).
-        names_the_ref_exactly = any(name == source_ref for _, name in matches)
-        if names_the_ref_exactly:
-            recovery = (
+        # `git ls-remote` matches a ref-name TAIL at `/` boundaries. Why the
+        # input matched several refs is context; what the operator can DO about
+        # it comes from the match facts, never from the shape of the input (a
+        # `refs/` prefix does not mean "full ref path": a branch may legally be
+        # named `refs/foo`, j#80048 R2-F1).
+        if any(name == source_ref for _, name in matches):
+            context = (
                 f"{source_ref!r} is itself one of the refs above, so it is "
-                "already the ref's full name and re-spelling cannot narrow it: "
-                "`git ls-remote` matches a ref-name TAIL, and the refs above "
-                "share this one. The exactly-one requirement is also enforced "
-                "server-side, so this ref cannot be dispatched while the "
-                "collision exists. Either rename/delete the colliding ref on "
-                "origin, or pass a different ref that resolves to exactly one."
+                "already that ref's full name and re-spelling cannot narrow it."
             )
         else:
-            # Cite a candidate that PROVABLY re-resolves to exactly one: the
-            # longest matched name. If some other ref S matched it, S would end
-            # with `/` + that name and so be longer, and S would also end with
-            # the original pattern — so S would be in `matches` and longer than
-            # the longest. Contradiction. Citing matches[0] instead could cite a
-            # name that is itself a tail of another candidate, sending the
-            # operator straight back into this refusal (j#80090 R3-F1).
-            resolvable = max(matches, key=lambda item: (len(item[1]), item[1]))[1]
-            recovery = (
+            context = (
                 f"{source_ref!r} is a tail pattern here — it names none of the "
-                "refs above exactly, so a more specific spelling exists. Pass "
-                f"the full path of the one you mean, verbatim: --source-ref "
-                f"{resolvable} resolves uniquely. A shorter path above may "
-                "itself be a tail of a longer one, in which case it cannot be "
-                "narrowed either and its collision has to be resolved on origin."
+                "refs above exactly."
+            )
+        # Only cite refs that would actually reach dispatch if pasted back.
+        # "Resolves uniquely" alone is not enough: such a ref may carry a
+        # different commit than the approved candidate, or be a name this helper
+        # refuses outright (j#80124 R4-F1). Where nothing qualifies, say so
+        # rather than inventing a correction.
+        actionable = _actionable_corrections(
+            matches, source_sha, remotes=configured_remotes(repo_root)
+        )
+        if len(actionable) == 1:
+            recovery = (
+                f"--source-ref {actionable[0]} carries source_sha and resolves "
+                "uniquely — pass it verbatim."
+            )
+        elif actionable:
+            options = "\n".join(f"  --source-ref {name}" for name in actionable)
+            recovery = (
+                "These carry source_sha and resolve uniquely. Pass the approved "
+                f"one verbatim (they are not interchangeable):\n{options}"
+            )
+        elif any(sha == source_sha for sha, _ in matches):
+            recovery = (
+                f"The ref(s) above carrying source_sha {source_sha} cannot be "
+                "named on their own here — each is a tail of another listed ref, "
+                "or is not an accepted source_ref spelling — so no re-spelling "
+                "reaches this candidate. Resolve the collision on origin, or "
+                "push/name a ref that carries source_sha and can be named alone."
+            )
+        else:
+            recovery = (
+                f"None of the refs above has source_sha {source_sha} as its tip, "
+                "so none of them is this candidate's lineage. Push or name a ref "
+                "whose tip is that SHA."
             )
         die(
             f"source_ref {source_ref!r} resolved to {len(matches)} origin refs; "
-            f"require exactly one. Nothing was dispatched.\n{listed}\n{recovery}"
+            f"require exactly one. Nothing was dispatched.\n{listed}\n{context}\n"
+            f"{recovery}"
         )
     resolved_sha, resolved_name = matches[0]
     if resolved_sha != source_sha:
