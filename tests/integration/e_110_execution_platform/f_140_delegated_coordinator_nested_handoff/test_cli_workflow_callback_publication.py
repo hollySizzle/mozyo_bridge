@@ -19,6 +19,7 @@ from unittest import mock
 
 from mozyo_bridge.core.state.callback_publication_fence import (
     CallbackPublicationFence,
+    CallbackPublicationFenceError,
     PublicationKey,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callback_publication import (  # noqa: E501
@@ -229,6 +230,47 @@ class CommandContractTest(unittest.TestCase):
                     rc, out = self._run([])
                 self.assertIn("inconsistent", out)
                 self.assertNotIn("never initialized", out)
+
+    def test_status_matches_what_bootstrap_will_actually_do(self):
+        # R17-F3: status called a resumable first init a loss while bootstrap resumed it -- the
+        # same surface/behaviour split as R16-F3 under a different state name. Each row here pairs
+        # the message with the behaviour it describes.
+        from mozyo_bridge.core.state.callback_publication_fence import (
+            _SEAL_INITIALIZING, _SEAL_LEGACY_INITIALIZING,
+        )
+        cases = (
+            ("current initializing, no store", _SEAL_INITIALIZING, "interrupted", True),
+            ("legacy initializing, no store", _SEAL_LEGACY_INITIALIZING, "unknown owner", False),
+        )
+        for label, seal, needle, resumable in cases:
+            with self.subTest(case=label):
+                home = Path(tempfile.mkdtemp())
+                fence = CallbackPublicationFence(home=home)
+                if seal == _SEAL_LEGACY_INITIALIZING:
+                    fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+                    fence.seal_path.write_text("initializing\nsealed at x\n", encoding="utf-8")
+                else:
+                    fence._write_seal(_SEAL_INITIALIZING)
+                with mock.patch(
+                    "mozyo_bridge.core.state.callback_publication_fence.CallbackPublicationFence",
+                    lambda *a, **k: CallbackPublicationFence(home=home),
+                ):
+                    rc, out = self._run([])
+                self.assertIn(needle, out)
+                # ...and the claim is true: bootstrap agrees with the status.
+                if resumable:
+                    CallbackPublicationFence(home=home).bootstrap()
+                    self.assertTrue(CallbackPublicationFence(home=home).is_bootstrapped())
+                else:
+                    with self.assertRaises(CallbackPublicationFenceError):
+                        CallbackPublicationFence(home=home).bootstrap()
+
+    def test_status_never_advises_deleting_the_artifacts(self):
+        self.fence.sidecar_path.unlink()
+        rc, out = self._run([])
+        self.assertIn("Restore", out)
+        self.assertIn("NOT a recovery", out)
+        self.assertNotIn("remove BOTH", out)
 
     def test_status_reports_a_lost_store_as_a_loss(self):
         self.fence.path.unlink()

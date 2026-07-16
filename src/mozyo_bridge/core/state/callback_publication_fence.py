@@ -75,6 +75,7 @@ CALLBACK_PUBLICATION_FENCE_SEAL_SUFFIX = ".sealed"
 #: Seal lifecycle. The seal is written BEFORE the store it seals, so the crash window lands here
 #: rather than on an operational-but-unsealed store (R13-F1).
 _SEAL_INITIALIZING = "initializing"   # a store is being minted; it has never served a reservation
+SEAL_INITIALIZING = _SEAL_INITIALIZING
 _SEAL_OPERATIONAL = "operational"     # this fence has run here; a missing pair is now a LOSS
 #: A seal written by the first version to ship one (R13), before the lifecycle existed. It only ever
 #: meant "operational", and MUST be read as such: folding it into `absent` re-mints a lost store on
@@ -144,6 +145,11 @@ CREATE TABLE IF NOT EXISTS store_meta (
 """
 
 _STORE_NONCE_KEY = "store_nonce"
+
+#: SQLite keeps uncommitted rows OUTSIDE the main DB file: a rollback journal, or a WAL and its
+#: shared-memory index. Any of these alone can carry a live reservation, so none of them may be
+#: read as "nothing is here" (R17-F2).
+_SQLITE_AUXILIARY_SUFFIXES = ("-journal", "-wal", "-shm")
 
 
 class CallbackPublicationFenceError(RuntimeError):
@@ -401,6 +407,25 @@ class CallbackPublicationFence:
         )
         tmp.replace(self.seal_path)
 
+    def store_artifacts(self) -> list[Path]:
+        """Every directory entry here that could hold, or hide, a row.
+
+        The main DB is not the only file that carries reservations: SQLite writes a rollback
+        journal (``-journal``) or a write-ahead log (``-wal`` plus ``-shm``) alongside it, and an
+        in-flight transaction's rows live *there* until it commits. A live journal beside a deleted
+        DB is a reservation, not an absence (R17-F2).
+
+        ``lexists`` rather than ``exists``: a broken symlink is a directory entry someone put here
+        on purpose, and ``exists()`` follows the link and reports nothing at all — after which
+        minting writes straight through it to the target.
+        """
+        candidates = [self.path, self.sidecar_path]
+        candidates += [
+            self.path.with_name(self.path.name + suffix)
+            for suffix in _SQLITE_AUXILIARY_SUFFIXES
+        ]
+        return [c for c in candidates if os.path.lexists(c)]
+
     def has_store(self) -> bool:
         """True when ANY store artifact exists here — usable or not.
 
@@ -410,7 +435,7 @@ class CallbackPublicationFence:
         not "there is nothing here" — so re-minting on `not healthy` destroyed live reservations
         and re-granted their identities.
         """
-        return self.path.exists() or self.sidecar_path.exists()
+        return bool(self.store_artifacts())
 
     def has_usable_store(self) -> bool:
         """True when the artifacts here actually work together (the adoption candidate)."""
@@ -495,13 +520,32 @@ class CallbackPublicationFence:
                     f"callback publication fence {self.path} has store artifacts that cannot be "
                     f"used together (only one of the DB / sidecar exists, their nonces differ, or "
                     f"the DB is unreadable). Refusing to re-create it: an unusable store is not an "
-                    f"empty one, and its DB may still hold a reservation a suspended sweep is "
-                    f"about to publish against. Restore the store, or remove BOTH artifacts once "
-                    f"you have confirmed in Redmine that nothing is in flight"
+                    f"empty one, and its DB or its SQLite journal may still hold a reservation a "
+                    f"suspended sweep is about to publish against. Restore the store from backup. "
+                    f"Deleting the artifacts is NOT a recovery: Redmine showing nothing in flight "
+                    f"right now does not prove a stalled owner will not PUT later, which is the "
+                    f"same guess this fence exists to refuse. Artifacts: "
+                    f"{', '.join(a.name for a in self.store_artifacts())}"
                 )
 
-            # Nothing on disk can hold a row, so "nothing was ever reserved here" is an observation
-            # rather than an inference about which build wrote what.
+            # Nothing on disk can hold a row. That makes "no reservation survives HERE" an
+            # observation -- but it says nothing about an owner still running elsewhere, and only
+            # the seal can speak to that.
+            if seal == _SEAL_LEGACY_INITIALIZING:
+                # The build that wrote a bare `initializing` had no seal check in reserve(), so it
+                # could and did hand out publication rights under this very seal. The word is the
+                # same as the current one; the guarantee behind it is not. Recognizing an old
+                # format is not the same as reproducing what it meant (R17-F1).
+                raise CallbackPublicationFenceError(
+                    f"callback publication fence {self.path} carries an `initializing` seal from a "
+                    f"build that granted publication rights without checking it, and its store is "
+                    f"gone. Whether a sweep is still holding a grant from that store cannot be "
+                    f"determined from here, so this is a loss with an unknown owner, not an "
+                    f"interrupted first install. Restore the store; it cannot be re-created safely "
+                    f"without a protocol that proves the old owner cannot resume (see "
+                    f"{self.seal_path})"
+                )
+
             if seal in _SEAL_OPERATED_STATES:
                 raise CallbackPublicationFenceError(
                     f"callback publication fence {self.path} is sealed as previously operational, "

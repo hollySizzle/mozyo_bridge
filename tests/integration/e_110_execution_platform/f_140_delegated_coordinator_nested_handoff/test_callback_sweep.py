@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import os
 import sqlite3
 import unittest
 from contextlib import closing
@@ -1853,6 +1854,101 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.assertTrue(
             fence.seal_path.read_text(encoding="utf-8").startswith(
                 "mozyo-callback-publication-seal v1 operational"))
+
+    def test_a_legacy_initializing_seal_is_a_loss_not_an_interrupted_install(self):
+        # R17-F1: the build that wrote a bare `initializing` had no seal check in reserve(), so it
+        # handed out publication rights under this very seal. The word matches the current one; the
+        # guarantee behind it does not. Recognizing an old format is not reproducing what it meant,
+        # and minting here re-grants an identity whose owner is still out there.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)         # A, granted by the older build
+        fence.seal_path.write_text("initializing\nsealed at x\nnote\n", encoding="utf-8")
+        fence.path.unlink()
+        fence.sidecar_path.unlink()
+        self.assertEqual(fence.seal_state(), _SEAL_LEGACY_INITIALIZING)
+
+        reborn = CallbackPublicationFence(home=home)
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)                                  # B gets nothing
+
+    def test_a_current_initializing_seal_still_resumes(self):
+        # The distinction that makes the refusal above honest rather than blanket: this build's
+        # reserve() demands an operational seal, so its `initializing` really does mean no grant
+        # was ever issued -- and a first install interrupted there must not be bricked.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence._write_seal(_SEAL_INITIALIZING)
+        self.assertFalse(fence.has_store())
+        fence.bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+
+    def test_a_live_sqlite_journal_is_a_reservation_not_an_absence(self):
+        # R17-F2: uncommitted rows live in the rollback journal, not the main DB. A journal beside
+        # a deleted DB is a reservation in flight; counting only the DB and the anchor read that as
+        # "nothing here" and minted straight over it.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        conn = sqlite3.connect(fence.path)
+        self.addCleanup(conn.close)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO publication_fence VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (WS, LANE, ISSUE, str(GEN), "79990", STATE_NO_PROGRESS_AFTER_HANDOFF,
+             PUBLICATION_RESERVED, "tok", "", "", "t", "t"),
+        )                                                        # rows exist only in the journal
+        journal = fence.path.with_name(fence.path.name + "-journal")
+        self.assertTrue(journal.exists(), "this SQLite build did not produce a rollback journal")
+        fence.path.unlink()
+        fence.sidecar_path.unlink()
+        fence.seal_path.unlink()
+
+        reborn = CallbackPublicationFence(home=home)
+        self.assertTrue(reborn.has_store())                      # the journal IS the store
+        self.assertIn(journal, reborn.store_artifacts())
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()
+        self.assertTrue(journal.exists(), "the mint consumed the journal it should have refused")
+
+    def test_every_sqlite_auxiliary_file_counts_as_a_store_artifact(self):
+        for suffix in ("-journal", "-wal", "-shm"):
+            with self.subTest(suffix=suffix):
+                fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+                aux = fence.path.with_name(fence.path.name + suffix)
+                aux.parent.mkdir(parents=True, exist_ok=True)
+                aux.write_bytes(b"not empty")
+                self.assertTrue(fence.has_store())
+                with self.assertRaises(CallbackPublicationFenceError):
+                    fence.bootstrap()
+
+    def test_a_broken_directory_entry_is_presence_not_absence(self):
+        # exists() follows symlinks, so a dangling link reported "nothing here" -- and the mint
+        # then wrote through it to whatever the link pointed at.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink("/nonexistent/elsewhere.sqlite", fence.path)
+        self.assertFalse(fence.path.exists())
+        self.assertTrue(fence.has_store())
+        with self.assertRaises(CallbackPublicationFenceError):
+            fence.bootstrap()
+
+    def test_the_refusal_never_tells_an_operator_to_delete_the_artifacts(self):
+        # I wrote that advice into the error and the CLI while the cataloged rule I had just
+        # written says the opposite: Redmine showing zero now does not prove a stalled owner will
+        # not PUT later, so deleting the store is the guess this fence exists to refuse (R17-F1).
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        fence.sidecar_path.unlink()
+        with self.assertRaises(CallbackPublicationFenceError) as ctx:
+            CallbackPublicationFence(home=fence.path.parent).bootstrap()
+        message = str(ctx.exception)
+        self.assertIn("Restore", message)
+        self.assertIn("NOT a recovery", message)
 
     def test_readiness_always_implies_a_seal_across_every_reachable_state(self):
         # R13-F1 requirement 1, as a property rather than a case: whatever combination of seal and
