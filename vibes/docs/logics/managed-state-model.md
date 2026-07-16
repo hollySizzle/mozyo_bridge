@@ -480,6 +480,58 @@ Migration stance:
   leaves the DB untouched. For caches, it may continue using legacy files if present; for registry identity, it must fail closed
   rather than rewrite unknown state.
 
+#### read-compatible / write-migrating split (shared home, parallel-lane schema skew — #13844)
+
+The home-scoped `state.sqlite` is a **single shared authority** while parallel repo lanes each run a **source CLI of a different
+schema generation** (each issue worktree ships its own branch's code). If a newer-schema source CLI forward-migrates the shared
+store on a mere READ — a status / handoff / review / callback / drain routing lookup — it fail-closes every concurrent
+older-schema reader: the older reader (correctly) refuses to downgrade the now-newer store, so `standard` handoff stops with
+`gateway_route_blocked` and the transport rail stalls permanently (live: #13842 `56d3a32` migrated the shared store to v6, then a
+concurrent v5 reader could not send #13813 j#79382). A safe per-CLI fail-closed thus becomes a system-wide liveness failure.
+
+The contract that prevents it, for a component whose rows are authority (e.g. `lane_lifecycle`):
+
+- **Reads never migrate.** Status / handoff / review / callback / drain — any read-only projection (`workflow glance`), AND the
+  store's own read methods (`LaneLifecycleStore.get` / `records` / `resolve_owner`, even the ones a mutating flow calls before it
+  writes) — read the authority through a **read-only, version-compatible reader** (`LaneLifecycleReader` /
+  `readonly_compatible_select`), opened `mode=ro`: no DDL, no `ALTER`, no version re-stamp, no backup. A newer build reads an
+  **older KNOWN additive shape** by padding the columns that shape lacks with their **in-memory migration defaults** (the same
+  value a forward `ALTER … DEFAULT` would have written), so it interprets the older store faithfully without touching a byte. The
+  shared store stays at its current version and every concurrent older reader keeps working. (A read landing during a peer's
+  migration commit waits it out via `busy_timeout` rather than fail-closing on a transient lock.)
+- **Every mutation migrates through ONE explicit write gate, preflight BEFORE the migration.** No CAS opens the store with a bare
+  `ensure`. Every schema-needing mutation — declaration / incarnation AND disposition / supersede / release / replacement / retire
+  / reconcile — opens via the single choke point `LaneLifecycleStore._connect_write(writer_key)`, in strict order: (1) read the
+  compatibility **preflight** on the STILL-OLD store (the active peer lanes a forward migration would fail-close, the writer's own
+  lane excluded); (2) **BEFORE migrating**, emit the operator advisory (`emit_lifecycle_migration_advisory`) when a migration is
+  pending with peers at risk — a genuine PRE-migration warning while the store is still the old version, *not* a post-hoc notice
+  (at the moment it fires the recorded version is still the old one and no backup has been taken); (3) run the backup-first
+  migration; (4) capture BOTH the pre-migration preflight and the post `created` / `intact` / `migrated{from_version, backup_dir}`
+  outcome — kept distinct — on `last_write_preparation`. So a migration is a chosen, visible act with legible peer risk for *any*
+  mutation, announced before it happens, never an implicit side effect — and a read that precedes the write never migrates ahead
+  of the preflight.
+- **The migration is auditable in each command's structured outcome, not only stderr.** The composing-store commands
+  (`sublane quarantine` / hibernated-legacy-retire / hibernated-live-reconcile) expose the wrapped store's `last_write_preparation`
+  and carry `lifecycle_migration_payload(...)` (from/to version, backup, peer-reader risk) in their JSON/text outcome, so a forward
+  migration is legible in the command's audit record for replacement / retire / reconcile alike — matching the universal
+  pre-migration stderr advisory above. `last_write_preparation` is **most-recent** (this write's), NOT a store-lifetime
+  accumulator: a store instance may be reused across operations, so a lifetime accumulator would let a later read-only / intact
+  action inherit a PAST migration and fabricate a side effect it did not perform. Preserving the migration across a *single*
+  command's several writes is the **use case's** job, **operation-scoped** — reset at the start of each run and folded in after
+  **each** of that run's schema-needing writes (a command can migrate on any of them, e.g. a quarantine *redrive* of an existing
+  generation migrates on its first `record_replacement_outcome`, not on `request_replacement`) — so a preflight-only run, or a
+  reused store whose earlier run migrated, reports nothing. A fail-closed
+  (CAS-refused) verdict that nonetheless migrated the store scopes its "zero-write" claim to the lane ROW and reports the schema
+  migration as a separate side effect — an audit record must never deny a side effect that happened, nor invent one that did not.
+- **Fail-closed is preserved and made specific.** An unknown / newer / partial / malformed shape still fails closed (no
+  downgrade, no misread), judged only by the **shape / capability table** (`_ALLOWED_SHAPES_BY_VERSION` / `_COLUMN_DEFS`), never a
+  guessed compatibility. The specific NEWER sub-case is named `reader_upgrade_required`: the store is fine, THIS reader is stale,
+  so the caller routes to the **current compatible high-level facade** (the up-to-date source CLI) rather than a raw DB downgrade.
+- **Source CLI vs installed facade boundary.** An unintegrated issue-branch source CLI is a *reader* of the shared authority; it
+  must not implicitly migrate it. A schema-changing write (a mutating command) should surface the **compatibility preflight**
+  (`lifecycle_migration_preflight`) — read-only, version-compatible — which reports the other active lanes a forward migration
+  would fail-close, so the migration is a chosen, visible act rather than an accidental side effect of a background notification.
+
 ### corruption blast radius / backup
 
 Single file raises the blast radius, so recovery policy must be component-aware:

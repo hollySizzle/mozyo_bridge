@@ -37,6 +37,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
     GATEWAY_ROUTE_BLOCKED_NARRATIVE,
     GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
+    READER_UPGRADE_REQUIRED_NARRATIVE,
+    READER_UPGRADE_REQUIRED_NEXT_ACTION,
 )
 
 if TYPE_CHECKING:
@@ -721,6 +723,12 @@ Reason = Literal[
     "target_repo_mismatch",
     "gateway_route_blocked",
     "main_lane_implementation_blocked",
+    # Redmine #13844: the target lane's lifecycle authority is a NEWER schema than this
+    # source CLI can read (a concurrent newer-schema lane migrated the shared home store).
+    # A distinct, actionable block — route via the current compatible facade, never downgrade
+    # — kept apart from the generic `gateway_route_blocked` (an unreadable/corrupt store) so
+    # the operator is told the reader is stale, not that the route is wrong.
+    "reader_upgrade_required",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -1205,6 +1213,10 @@ def next_action_for(
         # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
         # in the f_140 enforcement module, which handoff cannot import back).
         return "sender", GATEWAY_ROUTE_BLOCKED_NEXT_ACTION
+    if reason == "reader_upgrade_required":
+        # Redmine #13844: the shared lifecycle authority is a newer schema than this reader.
+        # Route via the current compatible facade; never downgrade the DB.
+        return "sender", READER_UPGRADE_REQUIRED_NEXT_ACTION
     if reason == "main_lane_implementation_blocked":
         return (
             "sender",
@@ -1656,6 +1668,8 @@ def _outcome_narrative(
         )
     if reason == "gateway_route_blocked":
         return GATEWAY_ROUTE_BLOCKED_NARRATIVE
+    if reason == "reader_upgrade_required":
+        return READER_UPGRADE_REQUIRED_NARRATIVE
     if reason == "main_lane_implementation_blocked":
         return (
             "Main-lane dispatch guard (Redmine #12441): `--to claude --kind "

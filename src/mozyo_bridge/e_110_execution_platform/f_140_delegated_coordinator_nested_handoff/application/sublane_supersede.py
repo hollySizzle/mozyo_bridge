@@ -433,6 +433,8 @@ class SublaneSupersedeUseCase:
                 recovery_rec.revision if recovery_rec is not None else None
             ),
         )
+        # Redmine #13844 R3: supersede opens through the universal `_connect_write` gate, which
+        # emits the PRE-migration peer-reader advisory before the shared store is migrated.
         if not supersede.applied:
             return SupersedeOutcome(
                 executed=True,

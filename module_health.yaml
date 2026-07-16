@@ -1144,8 +1144,15 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2202
+    lines: 2216
     reason: >-
+      Baseline 2202 -> 2216 for #13844 (shared lifecycle schema reader-upgrade routing):
+      the additive `reader_upgrade_required` token on the closed `Reason` vocabulary plus
+      its one-line `next_action_for` / `_outcome_narrative` branches — the same additive-
+      Reason pattern as #12918's `gateway_route_blocked` and #13760's startup reason below.
+      The per-reason wording strings live in the f_130 sibling `gateway_route_wording.py`
+      (this module imports them); only the Reason token + its dispatch arms must live here,
+      because this module owns the closed vocabulary and all its per-reason dispatch.
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
       Redmine-numbered execution_platform layout by #12624 (US #12622); line

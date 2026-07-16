@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle_readonly import LifecycleWritePreparation
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
@@ -80,6 +81,17 @@ class LaneDeclarationStore:
     @property
     def path(self) -> Path:
         return self._lifecycle.path
+
+    @property
+    def last_write_preparation(self) -> Optional[LifecycleWritePreparation]:
+        """The explicit write gate's typed result from the last declaration / incarnation.
+
+        Redmine #13844 R2: the declaration / incarnation is a schema-needing mutation that opens
+        via the shared :meth:`...LaneLifecycleStore._connect_write` gate (preflight FIRST, then
+        backup-first migration). This delegates to the wrapped lifecycle store's captured
+        preparation so the adopt / declare command can surface a migration and its peer risk.
+        """
+        return self._lifecycle.last_write_preparation
 
     def declare_lane(
         self,
@@ -149,7 +161,11 @@ class LaneDeclarationStore:
                     "a project-gateway declaration requires its provider-bound slot set"
                 )
         stamp = now or _utc_now()
-        conn = self._lifecycle._connect()
+        # Redmine #13844 R2: a declaration is a schema-needing mutation — open through the shared
+        # explicit write gate (preflight peers FIRST, then backup-first migration, typed outcome
+        # captured on the wrapped store's last_write_preparation) so the shared store is never
+        # migrated implicitly and the outcome is surfaced, not discarded.
+        conn = self._lifecycle._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = _locked_row(conn, key)
@@ -275,7 +291,9 @@ class LaneDeclarationStore:
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
         stamp = now or _utc_now()
-        conn = self._lifecycle._connect()
+        # Redmine #13844 R2: a binding backfill is a schema-needing mutation — open via the shared
+        # explicit write gate (preflight FIRST, then backup-first migration).
+        conn = self._lifecycle._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)
@@ -390,7 +408,9 @@ class LaneDeclarationStore:
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
         stamp = now or _utc_now()
-        conn = self._lifecycle._connect()
+        # Redmine #13844 R2: an incarnation is a schema-needing mutation — open through the shared
+        # explicit write gate (preflight peers FIRST, then backup-first migration, typed outcome).
+        conn = self._lifecycle._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)

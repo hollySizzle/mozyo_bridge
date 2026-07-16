@@ -70,6 +70,7 @@ have a single import surface.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -130,25 +131,30 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     release_transition_allowed,
 )
 from mozyo_bridge.core.state.lane_lifecycle_schema import (
-    COLUMNS as _COLUMNS,
     LANE_LIFECYCLE_COMPONENT,
     LANE_LIFECYCLE_RECOVERY_POLICY,
     LANE_LIFECYCLE_SCHEMA_VERSION,
-    READONLY_COMPONENT_ABSENT,
-    READONLY_COMPONENT_RECOGNIZED,
     TABLE as _TABLE,
     LaneLifecycleError,
+    LifecycleSchemaOutcome,
     ensure_lane_lifecycle_schema,
     lane_lifecycle_path,
-    readonly_component_status,
 )
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _active_owner,
     _insert_active_row,
     _locked_row,
-    _record,
     _rollback,
     _utc_now,
+)
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    LaneLifecycleReader,
+    LaneLifecycleReaderUpgradeRequired,
+    LifecycleMigrationPreflight,
+    LifecycleWritePreparation,
+    emit_lifecycle_migration_advisory,
+    lifecycle_migration_preflight,
+    load_lane_lifecycle_readonly,
 )
 
 
@@ -160,88 +166,145 @@ class LaneLifecycleStore:
 
     def __init__(self, *, home: Path | None = None, path: Path | None = None) -> None:
         self.path = path if path is not None else lane_lifecycle_path(home)
+        #: The typed outcome of the LAST schema-ensuring write open (Redmine #13844 F1). A
+        #: mutating open never SILENTLY discards what the schema gate did — created / intact /
+        #: migrated{from_version, backup_dir} is captured here for a caller / journal to read.
+        self._last_schema_outcome: Optional[LifecycleSchemaOutcome] = None
+        #: The full explicit-write-gate result of the LAST mutating open (Redmine #13844 R2):
+        #: the compatibility preflight (peer old-reader lanes) + the typed schema outcome, so a
+        #: command can surface a migration and its peer risk regardless of WHICH mutation ran.
+        self._last_write_preparation: Optional[LifecycleWritePreparation] = None
 
     # -- schema / connections ------------------------------------------------
 
-    def ensure_schema(self) -> None:
-        """Create / validate this component's schema (see the schema module)."""
-        ensure_lane_lifecycle_schema(self.path)
+    @property
+    def last_schema_outcome(self) -> Optional[LifecycleSchemaOutcome]:
+        """The typed outcome of the most recent schema-ensuring write open (or ``None``)."""
+        return self._last_schema_outcome
 
-    def _connect(self) -> sqlite3.Connection:
-        """An autocommit connection for the CAS (the container guard's is not)."""
-        ensure_lane_lifecycle_schema(self.path)
+    @property
+    def last_write_preparation(self) -> Optional[LifecycleWritePreparation]:
+        """The explicit write gate's typed result from the most recent mutation (or ``None``)."""
+        return self._last_write_preparation
+
+    def ensure_schema(self) -> LifecycleSchemaOutcome:
+        """Create / validate this component's schema; return the typed outcome (see schema module)."""
+        outcome = ensure_lane_lifecycle_schema(self.path)
+        self._last_schema_outcome = outcome
+        return outcome
+
+    def _run_write_gate(
+        self,
+        writer_workspace_id: Optional[str],
+        writer_lane_id: Optional[str],
+        *,
+        emit_advisory: bool,
+    ) -> LifecycleWritePreparation:
+        """The explicit schema-changing WRITE gate shared by EVERY mutation (Redmine #13844 R2/R3).
+
+        The single production choke point for a schema-needing mutation, in strict order:
+
+        1. read the compatibility **preflight** on the STILL-OLD store (version-compatible,
+           read-only, never a migration trigger) — the active peer lanes a forward migration
+           would fail-close;
+        2. **BEFORE migrating**, when ``emit_advisory`` and a migration is pending with peers at
+           risk, emit the operator advisory to stderr — a genuine PRE-migration warning while the
+           shared store is still the old version (Redmine #13844 R3-F1), not a post-hoc notice;
+        3. run the backup-first migration and capture its **typed outcome** (created / intact /
+           migrated{from_version, backup_dir});
+        4. record BOTH — the pre-migration ``preflight`` and the post ``outcome``, kept distinct
+           (R3-F1) — on ``last_write_preparation``.
+
+        This covers disposition / supersede / release / declaration / replacement / retire /
+        reconcile alike, not only declaration.
+        """
+        preflight = lifecycle_migration_preflight(
+            path=self.path,
+            writer_workspace_id=writer_workspace_id,
+            writer_lane_id=writer_lane_id,
+        )
+        if emit_advisory:
+            # PRE-migration: the store is still the old version at this point (ensure_schema
+            # below has not run), so the operator sees the peer risk BEFORE it is realized.
+            emit_lifecycle_migration_advisory(preflight, stream=sys.stderr)
+        outcome = self.ensure_schema()
+        prep = LifecycleWritePreparation(outcome=outcome, preflight=preflight)
+        # ``last_write_preparation`` is MOST-RECENT (this write's) — NOT accumulated across the
+        # store's lifetime (Redmine #13844 R5-F1). A store instance may be reused across
+        # operations, so a lifetime accumulator would let a later read-only / intact action inherit
+        # a PAST migration and report a side effect that did not happen in the current action.
+        # Preserving a migration across a single command's several writes is the CALLER's job,
+        # scoped to that one operation (see e.g. the quarantine use case's run-scoped capture).
+        self._last_write_preparation = prep
+        return prep
+
+    def prepare_write(
+        self,
+        *,
+        writer_workspace_id: Optional[str] = None,
+        writer_lane_id: Optional[str] = None,
+        emit_advisory: bool = False,
+    ) -> LifecycleWritePreparation:
+        """Run the explicit write gate and return its typed result (Redmine #13844 design 3/6).
+
+        The public entry for a caller that wants to gate + inspect a migration; the CAS methods
+        take the same gate via :meth:`_connect_write`. ``emit_advisory`` (default off for the
+        programmatic entry) prints the PRE-migration advisory to stderr before migrating. The
+        preflight is read on ``self.path`` (the exact store this write targets).
+        """
+        return self._run_write_gate(
+            writer_workspace_id, writer_lane_id, emit_advisory=emit_advisory
+        )
+
+    def _open_autocommit_conn(self) -> sqlite3.Connection:
+        """A plain autocommit connection (no schema ensure) — the gate ran separately."""
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.execute("PRAGMA busy_timeout = 2000")
         return conn
 
-    # -- reads ---------------------------------------------------------------
+    def _connect_write(
+        self, writer_key: Optional[LaneLifecycleKey] = None
+    ) -> sqlite3.Connection:
+        """The universal mutating write open (Redmine #13844 R2/R3): run the explicit write gate
+        — read the preflight, emit the PRE-migration advisory, THEN migrate and capture the typed
+        outcome on ``last_write_preparation`` — BEFORE opening the autocommit connection. EVERY
+        schema-needing CAS goes through here, so no mutation migrates the shared store implicitly
+        and the peer-reader risk is surfaced to the operator BEFORE the migration (not after).
+        ``writer_key`` (the lane being written) is excluded from the peer set."""
+        self._run_write_gate(
+            writer_key.repo_workspace_id if writer_key is not None else None,
+            writer_key.lane_id if writer_key is not None else None,
+            emit_advisory=True,
+        )
+        return self._open_autocommit_conn()
+
+    # -- reads (NON-migrating: Redmine #13844 read-not-migrate) ---------------
 
     def get(self, key: LaneLifecycleKey) -> Optional[LaneLifecycleRecord]:
-        """The lane's row, or ``None`` when it has none. Raises when unreadable."""
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                f"SELECT {_COLUMNS} FROM {_TABLE} "
-                "WHERE repo_workspace_id = ? AND lane_id = ?",
-                key.as_row(),
-            ).fetchone()
-        except sqlite3.DatabaseError as exc:
-            raise LaneLifecycleError(
-                f"lane lifecycle read failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
-        return _record(row) if row is not None else None
+        """The lane's row, or ``None`` when it has none. Raises when unreadable.
+
+        Reads through the NON-migrating version-compatible reader (Redmine #13844 R2): a read —
+        even one inside a mutating flow — must never forward-migrate the shared store, so the
+        migration only ever happens at the actual write via :meth:`_connect_write` (after the
+        preflight). An absent store reads as "no row" without creating anything.
+        """
+        return LaneLifecycleReader(path=self.path).get(key)
 
     def records(self) -> tuple[LaneLifecycleRecord, ...]:
-        """Every row (the all-lifecycle diagnostic source). Raises when unreadable."""
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY repo_workspace_id, lane_id"
-            ).fetchall()
-        except sqlite3.DatabaseError as exc:
-            raise LaneLifecycleError(
-                f"lane lifecycle read failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
-        return tuple(_record(row) for row in rows)
+        """Every row via the NON-migrating reader (Redmine #13844 R2). Raises when unreadable."""
+        return LaneLifecycleReader(path=self.path).records()
 
     def resolve_owner(self, repo_workspace_id: str, issue_id: str) -> OwnerResolution:
-        """The issue's single active owning lane in this workspace, or fail closed.
+        """The issue's single active owning lane in this workspace, via the NON-migrating reader.
 
         Exactly one active row resolves. Zero (:data:`OWNER_ABSENT`), many
-        (:data:`OWNER_AMBIGUOUS`), or an empty query resolves to **no owner** — a
-        caller must not fall back to "the newest lane" or a provider / pane name.
+        (:data:`OWNER_AMBIGUOUS`), or an empty query resolves to **no owner** — a caller must
+        not fall back to "the newest lane" or a provider / pane name. Reads never migrate
+        (Redmine #13844 R2), so a resolve-then-write flow never migrates before its write gate.
         """
-        workspace = norm(repo_workspace_id)
-        issue = norm(issue_id)
-        if not workspace or not issue:
-            return OwnerResolution(
-                status=OWNER_ABSENT, detail="workspace or issue not supplied"
-            )
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                f"SELECT lane_id FROM {_TABLE} WHERE repo_workspace_id = ? "
-                "AND issue_id = ? AND lane_disposition = ?",
-                (workspace, issue, DISPOSITION_ACTIVE),
-            ).fetchall()
-        except sqlite3.DatabaseError as exc:
-            raise LaneLifecycleError(
-                f"lane lifecycle read failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
-        if not rows:
-            return OwnerResolution(status=OWNER_ABSENT, detail="no active owner")
-        if len(rows) > 1:
-            return OwnerResolution(
-                status=OWNER_AMBIGUOUS,
-                detail=f"{len(rows)} active owners; the owner index is not holding",
-            )
-        return OwnerResolution(status=OWNER_RESOLVED, lane_id=str(rows[0][0]))
+        return LaneLifecycleReader(path=self.path).resolve_owner(
+            repo_workspace_id, issue_id
+        )
 
     # -- writes (CAS) --------------------------------------------------------
 
@@ -283,7 +346,7 @@ class LaneLifecycleStore:
             )
         worktree = norm(worktree_identity)
         stamp = now or _utc_now()
-        conn = self._connect()
+        conn = self._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = _locked_row(conn, key)
@@ -349,7 +412,7 @@ class LaneLifecycleStore:
         if target not in DISPOSITIONS:
             raise ValueError(f"unknown lane disposition {target!r}")
         stamp = now or _utc_now()
-        conn = self._connect()
+        conn = self._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)
@@ -506,7 +569,8 @@ class LaneLifecycleStore:
                 f"{superseded.repo_workspace_id!r} != {recovery.repo_workspace_id!r}"
             )
         stamp = now or _utc_now()
-        conn = self._connect()
+        # The superseded lane is this workspace's writer; exclude it from the peer set.
+        conn = self._connect_write(superseded)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, superseded)
@@ -656,7 +720,7 @@ class LaneLifecycleStore:
         # may appear twice (R1-F4); an unusable pin is refused, never stored.
         pinned = validate_release_pins(tuple(pins))
         stamp = now or _utc_now()
-        conn = self._connect()
+        conn = self._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)
@@ -739,7 +803,7 @@ class LaneLifecycleStore:
             raise ValueError(f"a release outcome is partial or released, not {target!r}")
         action = norm(action_id)
         stamp = now or _utc_now()
-        conn = self._connect()
+        conn = self._connect_write(key)
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = _locked_row(conn, key)
@@ -820,50 +884,6 @@ def load_lane_lifecycle(
         return None
 
 
-def load_lane_lifecycle_readonly(
-    *, home: Path | None = None
-) -> Optional[tuple[LaneLifecycleRecord, ...]]:
-    """Every lifecycle row via a **non-creating** read (Redmine #13681 R2-F2, j#77292).
-
-    Unlike :func:`load_lane_lifecycle` (which opens read-write and runs the schema
-    ensure, creating the container / table when absent), this never writes: an absent
-    state file, or an existing store with no lifecycle component yet, yields ``()`` (no
-    rows, nothing created).
-
-    It still honours the **same downgrade guard** as the write path (R3-F1, j#77307):
-    the component's recorded ``schema_version`` is validated read-only via
-    :func:`readonly_component_status`, so an unknown / newer / malformed / partial
-    component schema yields ``None`` (fail closed) rather than reading authority rows
-    whose newer semantics this build does not agree to — never silently reading them the
-    way a bare ``SELECT`` would. It is the read a read-only projection uses —
-    ``workflow glance --snapshot-json`` must not create ``state.sqlite`` just to fold a
-    diagnostic (the command's store-free / read-only contract).
-    """
-    path = lane_lifecycle_path(home)
-    if not path.exists():
-        return ()
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.DatabaseError:
-        return None
-    try:
-        status = readonly_component_status(conn)
-        if status == READONLY_COMPONENT_ABSENT:
-            return ()
-        if status != READONLY_COMPONENT_RECOGNIZED:
-            # Unsupported / partial / malformed component schema -> fail closed, exactly
-            # like the guarded write path's LaneLifecycleError.
-            return None
-        rows = conn.execute(
-            f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY repo_workspace_id, lane_id"
-        ).fetchall()
-    except sqlite3.DatabaseError:
-        return None
-    finally:
-        conn.close()
-    return tuple(_record(row) for row in rows)
-
-
 __all__ = (
     "DECISION_SOURCES",
     "DECISION_SOURCE_REDMINE",
@@ -884,7 +904,13 @@ __all__ = (
     "LANE_LIFECYCLE_SCHEMA_VERSION",
     "LaneLifecycleError",
     "LaneLifecycleStore",
+    "LaneLifecycleReader",
+    "LaneLifecycleReaderUpgradeRequired",
+    "LifecycleMigrationPreflight",
+    "LifecycleSchemaOutcome",
+    "LifecycleWritePreparation",
     "lane_lifecycle_path",
+    "lifecycle_migration_preflight",
     "load_lane_lifecycle",
     "load_lane_lifecycle_readonly",
     "resolve_lane_owner",

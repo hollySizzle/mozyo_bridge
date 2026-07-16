@@ -32,6 +32,9 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ReleasePin,
     ReleasePinError,
 )
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    lifecycle_migration_payload,
+)
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     REPLACEMENT_NOT_REQUESTED,
     REPLACEMENT_PENDING,
@@ -185,6 +188,10 @@ class QuarantineOutcome:
     closed_old_receiver: bool = False
     fresh_locator: str = ""
     detail: str = ""
+    #: The shared-store schema migration this quarantine's replacement write gate performed, if
+    #: any (Redmine #13844 R3-F2): the typed audit record so the migration is legible in JSON/text,
+    #: not only the pre-migration stderr advisory.
+    lifecycle_migration: Optional[dict[str, Any]] = None
 
     @property
     def is_blocked(self) -> bool:
@@ -205,6 +212,7 @@ class QuarantineOutcome:
             "fresh_locator": self.fresh_locator or None,
             "is_blocked": self.is_blocked,
             "detail": self.detail,
+            "lifecycle_migration": self.lifecycle_migration,
         }
 
 
@@ -250,6 +258,15 @@ class SublaneQuarantineUseCase:
         classification: PendingComposerClassification,
         **changes: Any,
     ) -> QuarantineOutcome:
+        # Redmine #13844 R5-F1: carry the schema migration THIS run performed into the outcome at
+        # EVERY return, read from the OPERATION-SCOPED capture (reset at run() start, set only
+        # after this run's migrating write) — NOT from the store's mutable / potentially reused
+        # ``last_write_preparation``. So a preflight-only run, or a reused store whose earlier run
+        # migrated, reports ``None`` here (no side effect fabricated); a run that actually migrated
+        # keeps it across its later ``intact`` writes.
+        changes.setdefault(
+            "lifecycle_migration", getattr(self, "_operation_migration", None)
+        )
         return QuarantineOutcome(
             issue=_norm(request.issue),
             lane=_norm_lane(request.lane),
@@ -284,7 +301,25 @@ class SublaneQuarantineUseCase:
             return "approval predates the current attested agent generation"
         return ""
 
+    def _capture_migration(self) -> None:
+        """Fold THIS run's schema migration into the operation-scoped accumulator (Redmine #13844
+        R6-F1). Call this immediately after EVERY schema-needing store write in this run — not
+        only the new-generation ``request_replacement``: a redrive of an EXISTING requested /
+        pending generation skips ``request_replacement`` and migrates on its first
+        ``record_replacement_outcome`` instead. The store is most-recent, so right after a write
+        its ``last_write_preparation`` reflects THAT write; ``or`` keeps the FIRST migration so a
+        later ``intact`` write never clears it. A non-migrating write folds ``None`` (no-op)."""
+        self._operation_migration = self._operation_migration or lifecycle_migration_payload(
+            getattr(self.store, "last_write_preparation", None)
+        )
+
     def run(self, request: QuarantineRequest, *, execute: bool) -> QuarantineOutcome:
+        # Redmine #13844 R5-F1: the schema migration this ONE command performs is captured
+        # operation-scoped — reset at the start of every run(), so a REUSED use case / store never
+        # carries a PAST run's migration into this action's audit. It is folded in after EACH of
+        # this run's schema-needing writes (see :meth:`_capture_migration`); a read-only / preflight
+        # run never sets it.
+        self._operation_migration: Optional[dict[str, Any]] = None
         inspection = self.ops.inspect(request)
         classification = inspection.classification
         if not execute:
@@ -422,6 +457,7 @@ class SublaneQuarantineUseCase:
                 pins=(pin,),
                 decision=decision,
             )
+            self._capture_migration()
             if not opened.applied:
                 return self._base_outcome(
                     request,
@@ -474,6 +510,7 @@ class SublaneQuarantineUseCase:
                 expected_revision=current.revision,
                 target=REPLACEMENT_PENDING,
             )
+            self._capture_migration()  # Redmine #13844 R6-F1: a redrive migrates HERE, not at request
             if not pending.applied:
                 return self._base_outcome(
                     request,
@@ -526,6 +563,7 @@ class SublaneQuarantineUseCase:
             expected_revision=current.revision,
             target=REPLACEMENT_REPLACED,
         )
+        self._capture_migration()  # Redmine #13844 R6-F1: a pending redrive migrates HERE
         return self._base_outcome(
             request,
             classification,
@@ -824,6 +862,13 @@ def format_quarantine_text(outcome: QuarantineOutcome) -> str:
         lines.append("  candidate only; --execute requires exact positive approval fields")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
+    if outcome.lifecycle_migration:
+        mig = outcome.lifecycle_migration
+        lines.append(
+            "  - shared lifecycle store forward-migrated "
+            f"v{mig['from_version']} -> v{mig['to_version']} "
+            f"(peer lanes at read-fail-closed risk: {mig['peer_active_lanes'] or 'none'})"
+        )
     return "\n".join(lines)
 
 
@@ -845,6 +890,9 @@ def cmd_sublane_quarantine(args: argparse.Namespace) -> int:
         ops=LiveSublaneQuarantineOps(repo_root=repo_root),
         store=LaneReplacementStore(),
     )
+    # Redmine #13844 R4-F1: the use case already carries the schema migration (from the store's
+    # ACCUMULATED preparation) in ``outcome.lifecycle_migration`` — the CLI does NOT re-read the
+    # mutable "last write" (which a later ``intact`` write would have cleared).
     outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))

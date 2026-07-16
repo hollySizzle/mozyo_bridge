@@ -82,21 +82,22 @@ class DispositionGateWiringTest(unittest.TestCase):
             home = Path(tmp)
             self._seed(home, DISPOSITION_SUPERSEDED)
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                # Redmine #13844: 3-tuple (disposition, unreadable, reader_upgrade_required).
                 self.assertEqual(
                     _resolve_target_disposition(_Target(WS, LANE)),
-                    (DISPOSITION_SUPERSEDED, False),
+                    (DISPOSITION_SUPERSEDED, False, False),
                 )
-                # Owner-unbound / absent lane -> (None, False) (byte-invariant compat).
+                # Owner-unbound / absent lane -> (None, False, False) (byte-invariant compat).
                 self.assertEqual(
-                    _resolve_target_disposition(_Target(WS, "other")), (None, False)
+                    _resolve_target_disposition(_Target(WS, "other")), (None, False, False)
                 )
-                # Missing unit fields -> (None, False), never a raised key error.
+                # Missing unit fields -> (None, False, False), never a raised key error.
                 self.assertEqual(
-                    _resolve_target_disposition(_Target("", LANE)), (None, False)
+                    _resolve_target_disposition(_Target("", LANE)), (None, False, False)
                 )
 
     def test_resolve_disposition_unreadable_store_fails_closed(self) -> None:
-        # R1 F3 (j#77247): a store read failure resolves to (None, True) — distinct from
+        # R1 F3 (j#77247): a store read failure resolves to (None, True, False) — distinct from
         # an absent row — so the send gate fails closed instead of assuming active.
         from mozyo_bridge.core.state import lane_lifecycle as ll
 
@@ -106,12 +107,15 @@ class DispositionGateWiringTest(unittest.TestCase):
             with patch.dict(
                 os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
             ), patch.object(
-                ll.LaneLifecycleStore,
+                # Redmine #13844: the standard-handoff lookup reads through the read-only
+                # LaneLifecycleReader (never the migrating store), so an action-time read
+                # failure is injected on the reader's get.
+                ll.LaneLifecycleReader,
                 "get",
                 side_effect=ll.LaneLifecycleError("boom"),
             ):
                 self.assertEqual(
-                    _resolve_target_disposition(_Target(WS, LANE)), (None, True)
+                    _resolve_target_disposition(_Target(WS, LANE)), (None, True, False)
                 )
 
     def _enforce(self, home: Path, target: _Target):
@@ -165,7 +169,8 @@ class DispositionGateWiringTest(unittest.TestCase):
             home = Path(tmp)
             self._seed(home, DISPOSITION_ACTIVE)
             with patch.object(
-                ll.LaneLifecycleStore,
+                # Redmine #13844: read failure injected on the read-only reader seam.
+                ll.LaneLifecycleReader,
                 "get",
                 side_effect=ll.LaneLifecycleError("boom"),
             ), self.assertRaises(_Die):
