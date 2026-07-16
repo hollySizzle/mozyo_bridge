@@ -339,9 +339,17 @@ def probe_store_schema(path: Path) -> StoreSchemaObservation:
     The missing input of the #13847 capability preflight, which joined the launcher's
     advertised schema against the source runtime's required schema — both *code* — and so
     never noticed a shared home holding a different shape on *disk*. Read-only and
-    fail-closed: it creates nothing (an absent store is a legitimate fresh home), and an
-    unopenable file reports :data:`STORE_UNREADABLE` rather than being folded into
-    "absent" — an unreadable store is not an empty one.
+    fail-closed: it never creates or modifies a **store** (an absent store is a legitimate
+    fresh home and stays absent), and an unopenable file reports :data:`STORE_UNREADABLE`
+    rather than being folded into "absent" — an unreadable store is not an empty one.
+
+    One honest caveat, since this module's contracts are load-bearing: opening a store that
+    has a ``-wal`` beside it makes **SQLite itself** materialize the ``-shm`` index, even
+    under ``mode=ro`` (measured). That is SQLite's own bookkeeping, not store content — no
+    row, shape, or version changes — and the quarantine rail treats the resulting ``-shm``
+    as part of the artifact set, which is correct. ``immutable=1`` would suppress it but is
+    deliberately NOT used: it tells SQLite to ignore the ``-wal`` entirely, which would
+    read a stale shape and resurrect exactly the WAL blindness of finding F1.
     """
     if not path.exists():
         return StoreSchemaObservation(STORE_ABSENT, None)
