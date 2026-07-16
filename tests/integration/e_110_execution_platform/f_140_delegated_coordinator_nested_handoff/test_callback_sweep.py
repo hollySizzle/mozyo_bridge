@@ -18,6 +18,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.callback_sweep_lease import (
+    LEASE_HELD,
+    LEASE_RECLAIMED,
+    CallbackSweepLease,
+    LeaseKey,
+)
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
     FENCE_DELIVERED,
@@ -27,6 +33,7 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
     SWEEP_SOURCE_UNREADABLE,
+    ZERO_SEND_ATTEMPT_HELD,
     ZERO_SEND_RECORD_FAILED,
     ZERO_SEND_SOURCE_NOT_FRESH,
     ZERO_SEND_WORKSPACE_UNATTESTED,
@@ -158,6 +165,7 @@ class SweepFenceTest(unittest.TestCase):
     def sweep(self, source, **kw):
         kw.setdefault("send_fn", self.send)
         kw.setdefault("record_fn", self.recorder)
+        kw.setdefault("lease", CallbackSweepLease(home=Path(tempfile.mkdtemp())))
         return sweep_once(
             workspace_id=WS,
             lane_id=LANE,
@@ -312,6 +320,7 @@ class SweepFenceTest(unittest.TestCase):
             source=RaceSource([ir("79990")]),
             fence=bare,
             target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())),
             send_fn=self.send,
             record_fn=self.recorder,
         )
@@ -355,6 +364,7 @@ class SweepFenceTest(unittest.TestCase):
             source=RaceSource([ir("79990")]),
             fence=self.fence,
             target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())),
             send_fn=None,
         )
         self.assertEqual(result["state"], STATE_NO_PROGRESS_AFTER_HANDOFF)
@@ -432,7 +442,8 @@ class WorkspaceAttestationTest(unittest.TestCase):
         return sweep_once(
             workspace_id=ws, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("79990")]), fence=self.fence,
-            target_assigned_name=TARGET, send_fn=lambda j: sends.append(j),
+            target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=lambda j: sends.append(j),
             record_fn=FakeRecorder(),
         )
 
@@ -465,7 +476,8 @@ class RecoveryRecordTest(unittest.TestCase):
         return sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=source or RaceSource([ir("79990")]), fence=self.fence,
-            target_assigned_name=TARGET, send_fn=lambda j: sends.append(j), record_fn=record_fn,
+            target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=lambda j: sends.append(j), record_fn=record_fn,
         )
 
     def test_no_recorder_means_no_send(self):
@@ -488,7 +500,8 @@ class RecoveryRecordTest(unittest.TestCase):
         sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("79990")]), fence=self.fence,
-            target_assigned_name=TARGET, send_fn=send, record_fn=recorder,
+            target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=send, record_fn=recorder,
         )
         self.assertEqual(order, ["record", "send->90001"])
 
@@ -708,6 +721,7 @@ class ProductionRecorderTest(unittest.TestCase):
         self.fence.bootstrap()
         self.posted = []
         self.sends = []
+        self.lease = CallbackSweepLease(home=Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
     def outcomes(self):
@@ -744,41 +758,117 @@ class ProductionRecorderTest(unittest.TestCase):
         src = LateSource()
         result = sweep_once(
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
-            fence=self.fence, target_assigned_name=TARGET,
+            fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
             send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
         )
         self.assertEqual(self.outcomes(), [STATE_PROGRESS_WITHOUT_CALLBACK])  # no stall record
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
         self.assertEqual(self.sends, [])
 
-    def test_a_gate_landing_during_the_reserve_is_not_replayed(self):
-        # R4-F2: the record's journal id is a POSITION, not a CAS against future writes. A gate
-        # becoming durable while the reservation is taken was still replayed until the final live
-        # read moved to immediately before the send.
+    def test_a_gate_landing_before_the_final_live_read_is_not_replayed(self):
+        # R4-F2: the record's journal id is a POSITION, not a CAS against future writes, so the
+        # guarantee comes from the final live read sitting immediately before the send. Any gate
+        # durable by that read is caught -- which covers the whole #13883 evidence (seconds to
+        # minutes).
+        #
+        # Deliberately NOT asserted here: a gate landing AFTER that final read (e.g. during the
+        # send itself) is the disclosed read->send window. Redmine has no CAS, so the sweep alone
+        # cannot close it; whether that satisfies j#80058 Acceptance 2 is a coordinator/owner
+        # decision under design consultation j#80273. This test pins what is actually guaranteed
+        # rather than a guarantee that does not exist.
         gate_j = gate("79995", "review_result", conclusion="changes_requested")
-        landed = []
+        outer = self
+
+        class LateGateSource:
+            fresh_read = True
+
+            def __init__(self):
+                self.n = 0
+
+            def read_entries(self, issue_id):
+                self.n += 1
+                # silent through the boundary read; durable by the final live read.
+                base = [ir("79990")] if self.n <= 2 else [ir("79990"), gate_j]
+                return base + outer._published()
+
+        src = LateGateSource()
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
+            fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
+            send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
+        )
+        self.assertFalse(result["sent"])
+        self.assertEqual(self.sends, [])
+
+    def test_the_zero_send_resolution_is_published_while_the_lease_is_still_held(self):
+        # R5-F2 pinned DETERMINISTICALLY. `_abort` released the lease before recording, so the
+        # zero-send resolution -- the most common outcome -- was published outside the serialized
+        # region. A concurrency test cannot pin that reliably: the loser now stands down at the
+        # lease and never reaches the recorder, so the two orderings look identical unless a very
+        # tight interleaving is forced. Asserting the invariant directly is stronger and stable:
+        # at record time, the lease MUST still be ours.
+        held_at_record = []
+        key = LeaseKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, anchor="79990")
+
+        def recorder(result, watermark):
+            held_at_record.append(self.lease.owner_of(key))
+            return "90001"
+
+        result = sweep_once(
+            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
+            source=RaceSource([ir("79990"), gate("79995", "review_result",
+                                                 conclusion="changes_requested")]),
+            fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
+            send_fn=lambda j: self.sends.append(j), record_fn=recorder,
+            callback=CALLBACK_SAME_LANE_ONLY,
+        )
+        self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
+        self.assertEqual(len(held_at_record), 1)
+        self.assertNotEqual(held_at_record[0], "")  # the lease was still held when we published
+        # ...and it is released afterwards, so the next sweep is not blocked.
+        self.assertEqual(self.lease.owner_of(key), "")
+
+    def test_two_sweeps_that_both_see_progress_publish_one_resolution(self):
+        # R5-F2: `_abort` released the lease BEFORE recording, so the zero-send resolution -- the
+        # most common outcome -- was published outside the serialized region and two sweeps posted
+        # duplicate `progress_without_callback` records.
+        gate_j = gate("79995", "review_result", conclusion="changes_requested")
+        lock = threading.Lock()
+        start = threading.Event()
         outer = self
 
         class Src:
             fresh_read = True
 
             def read_entries(self, issue_id):
-                return [ir("79990")] + list(landed) + outer._published()
+                with lock:
+                    return [ir("79990"), gate_j] + outer._published()
 
-        class LateFence(DispatchOutboxFence):
-            def reserve(self, key, *, now=None):
-                landed.append(gate_j)  # becomes durable DURING the reserve
-                return super().reserve(key, now=now)
+        def publish(issue_id, note):
+            with lock:
+                outer.posted.append(note)
 
-        fence = LateFence(home=Path(tempfile.mkdtemp()))
-        fence.bootstrap()
-        src = Src()
-        result = sweep_once(
-            workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
-            fence=fence, target_assigned_name=TARGET,
-            send_fn=lambda j: self.sends.append(j), record_fn=self.recorder(src),
-        )
-        self.assertFalse(result["sent"])
+        def run():
+            start.wait()
+            src = Src()
+            sweep_once(
+                workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
+                fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
+                send_fn=lambda j: self.sends.append(j), callback=CALLBACK_SAME_LANE_ONLY,
+                record_fn=build_recovery_recorder(
+                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish
+                ),
+            )
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        start.set()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.outcomes(), [STATE_PROGRESS_WITHOUT_CALLBACK])
         self.assertEqual(self.sends, [])
 
     def test_two_concurrent_sweeps_publish_one_record_and_send_at_most_once(self):
@@ -807,7 +897,7 @@ class ProductionRecorderTest(unittest.TestCase):
             src = Src()
             r = sweep_once(
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN, source=src,
-                fence=self.fence, target_assigned_name=TARGET,
+                fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
                 send_fn=lambda j: self.sends.append(j),
                 record_fn=build_recovery_recorder(
                     source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish
@@ -822,9 +912,17 @@ class ProductionRecorderTest(unittest.TestCase):
         for t in threads:
             t.join(timeout=10)
 
-        self.assertEqual(len(self.posted), 1)          # one durable record
-        self.assertLessEqual(len(self.sends), 1)       # one send budget
-        self.assertIn(ZERO_SEND_FENCE_HELD, reasons)   # the loser stood down
+        # The invariants, which hold regardless of interleaving:
+        self.assertEqual(len(self.posted), 1)             # one durable record
+        self.assertLessEqual(len(self.sends), 1)          # one send budget
+        self.assertEqual(len(reasons), 2)
+        # Exactly one sweep proceeded; the other stood down. WHICH authority stopped it is
+        # timing-dependent -- the lease if the attempts overlap, the fence if the first had already
+        # finished and released -- so asserting a specific one makes this test flaky rather than
+        # stronger. The passive-loser behaviour itself is pinned deterministically in
+        # `AttemptLeaseTest.test_a_concurrent_loser_is_passive_and_never_touches_the_live_owner`.
+        stood_down = [r for r in reasons if r in (ZERO_SEND_ATTEMPT_HELD, ZERO_SEND_FENCE_HELD)]
+        self.assertEqual(len(stood_down), 1, f"exactly one sweep must stand down; got {reasons}")
 
     def test_a_post_record_read_failure_keeps_the_pointer_and_reports_incomplete(self):
         # R4-F4: the record IS durable, so returning a bare unreadable result dropped the pointer
@@ -852,36 +950,54 @@ class ProductionRecorderTest(unittest.TestCase):
         self.assertEqual(self.sends, [])
 
 
-class FenceReleaseTest(unittest.TestCase):
-    """`release()` drops only a still-reserved row -- the abort that `cancelled` cannot express."""
+class AttemptLeaseTest(unittest.TestCase):
+    """The owner-token attempt lease (review R5-F1).
+
+    `DispatchOutboxFence` could not be this authority: its `reserve` reads a lingering `reserved`
+    row as crash residue and rewrites it to `uncertain`, so holding a reservation across slow I/O
+    let any concurrent sweep corrupt a live owner and block the anchor forever. Adding a `release`
+    to it was rejected -- `state == reserved` does not prove the send never happened, because the
+    row has no owner identity. These pin the property that fixes it: every row names its owner.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
-        self.fence.bootstrap()
+        self.lease = CallbackSweepLease(home=Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
     def key(self):
-        return FenceKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, journal="79990",
-                        action_id=SWEEP_RECOVERY_ACTION_ID, target_assigned_name=TARGET)
+        return LeaseKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, anchor="79990")
 
-    def test_release_drops_a_reserved_row_so_a_later_attempt_can_reserve(self):
-        self.assertTrue(self.fence.reserve(self.key()).won)
-        self.assertTrue(self.fence.release(self.key()))
-        self.assertEqual(self.fence.state_of(self.key()), "absent")
-        self.assertTrue(self.fence.reserve(self.key()).won)  # clean retry
+    def test_a_concurrent_loser_is_passive_and_never_touches_the_live_owner(self):
+        won = self.lease.acquire(self.key())
+        self.assertTrue(won.owned)
+        loser = self.lease.acquire(self.key())
+        self.assertFalse(loser.owned)
+        self.assertEqual(loser.status, LEASE_HELD)
+        self.assertEqual(loser.token, "")
+        # The owner's lease is untouched -- the exact thing the shared fence could not promise.
+        self.assertEqual(self.lease.owner_of(self.key()), won.token)
 
-    def test_release_never_drops_a_recorded_outcome(self):
-        # A row whose fate IS recorded must survive: release must not erase a delivery, nor
-        # resurrect an action whose outcome is unknown.
-        for mark in ("mark_delivered", "mark_uncertain", "mark_cancelled"):
-            fence = DispatchOutboxFence(home=Path(tempfile.mkdtemp()))
-            fence.bootstrap()
-            fence.reserve(self.key())
-            getattr(fence, mark)(self.key())
-            before = fence.state_of(self.key())
-            self.assertFalse(fence.release(self.key()), f"{mark} row must not be released")
-            self.assertEqual(fence.state_of(self.key()), before)
+    def test_the_owner_can_stand_down_and_the_next_attempt_is_clean(self):
+        won = self.lease.acquire(self.key())
+        self.assertTrue(self.lease.release(self.key(), won.token))
+        self.assertEqual(self.lease.owner_of(self.key()), "")
+        self.assertTrue(self.lease.acquire(self.key()).owned)  # clean retry, no permanent block
+
+    def test_release_is_owner_conditional(self):
+        won = self.lease.acquire(self.key())
+        self.assertFalse(self.lease.release(self.key(), "not-the-owner"))
+        self.assertEqual(self.lease.owner_of(self.key()), won.token)
+
+    def test_an_expired_lease_is_reclaimable_so_a_crashed_owner_never_blocks_the_anchor(self):
+        dead = self.lease.acquire(self.key(), ttl_seconds=10, now=1000.0)
+        # Still live at t+5: a slow-but-live owner is never stolen from.
+        self.assertFalse(self.lease.acquire(self.key(), now=1005.0).owned)
+        # Past the deadline: reclaimable, and the dead owner's token no longer releases anything.
+        taken = self.lease.acquire(self.key(), now=1011.0)
+        self.assertTrue(taken.owned)
+        self.assertEqual(taken.status, LEASE_RECLAIMED)
+        self.assertFalse(self.lease.release(self.key(), dead.token))
 
 
 class ProducerWiringTest(unittest.TestCase):
@@ -919,7 +1035,8 @@ class ProducerWiringTest(unittest.TestCase):
             workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
             source=RaceSource([ir("80000"), written]),
             fence=DispatchOutboxFence(home=Path(tempfile.mkdtemp())),
-            target_assigned_name=TARGET, send_fn=None, callback=CALLBACK_SAME_LANE_ONLY,
+            target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=None, callback=CALLBACK_SAME_LANE_ONLY,
         )
         self.assertEqual(result["state"], STATE_PROGRESS_WITHOUT_CALLBACK)
         self.assertEqual(result["progress_journals"], [{"journal": "80002", "kind": "review_finding_verdict"}])
@@ -992,7 +1109,8 @@ class RecoverySenderTest(unittest.TestCase):
             sweep_once(
                 workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=GEN,
                 source=RaceSource([ir("79990")]), fence=fence,
-                target_assigned_name=TARGET, send_fn=sender, record_fn=FakeRecorder(),
+                target_assigned_name=TARGET,
+            lease=CallbackSweepLease(home=Path(tempfile.mkdtemp())), send_fn=sender, record_fn=FakeRecorder(),
             )
         self.assertEqual(len(calls), 1)  # at most once per dispatch anchor
 

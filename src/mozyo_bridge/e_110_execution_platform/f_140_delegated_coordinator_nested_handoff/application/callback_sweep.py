@@ -41,6 +41,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from mozyo_bridge.core.state.callback_sweep_lease import (
+    CallbackSweepLease,
+    CallbackSweepLeaseError,
+    LeaseKey,
+)
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
     DispatchOutboxFenceError,
@@ -86,6 +91,11 @@ ZERO_SEND_WORKSPACE_UNATTESTED = "workspace_unattested"
 #: The durable recovery record could not be written / resolved, so a send would be a silent
 #: re-poke (review R2-F3).
 ZERO_SEND_RECORD_FAILED = "recovery_record_failed"
+#: Another sweep owns this attempt's lease. The loser stands down PASSIVELY (review R5-F1): it does
+#: not touch the owner's state, so a live owner is never mistaken for a crash.
+ZERO_SEND_ATTEMPT_HELD = "attempt_held"
+#: The attempt lease store is unusable, so the attempt would not be serialized -> no mutation.
+ZERO_SEND_LEASE_UNAVAILABLE = "attempt_lease_unavailable"
 
 
 def source_is_fresh(source: object) -> bool:
@@ -140,6 +150,7 @@ def sweep_once(
     source: object,
     fence: DispatchOutboxFence,
     target_assigned_name: str,
+    lease: Optional[CallbackSweepLease] = None,
     send_fn: Optional[Callable[[str], object]] = None,
     record_fn: Optional[Callable[[dict, SweepWatermark], str]] = None,
     callback: str = CALLBACK_ABSENT,
@@ -217,6 +228,37 @@ def sweep_once(
         )
         return result
 
+    # Take the attempt lease BEFORE any durable publication (review R5-F2). EVERY resolution is a
+    # durable publication — including the zero-send ones, which are the common case — so they all
+    # have to be serialized, not just the stall record. An earlier revision leased only the stall
+    # path and let two sweeps publish duplicate `progress_without_callback` records.
+    lease_store = lease or CallbackSweepLease()
+    lease_key = LeaseKey(
+        workspace_id=wsid, lane_id=laneid, issue=issue_s, anchor=decided.dispatch_journal
+    )
+    try:
+        held = lease_store.acquire(lease_key)
+    except CallbackSweepLeaseError as exc:
+        result["send_reason"] = ZERO_SEND_LEASE_UNAVAILABLE
+        result["send_detail"] = (
+            f"the attempt lease is unavailable ({exc}); zero-send rather than run an "
+            f"unserialized attempt that could publish a duplicate record"
+        )
+        return result
+    if not held.owned:
+        result["send_reason"] = ZERO_SEND_ATTEMPT_HELD
+        result["send_detail"] = (
+            f"another sweep owns this attempt ({held.detail}); standing down WITHOUT touching its "
+            f"state — a live owner is never reclassified as a crash"
+        )
+        return result
+
+    def _release() -> None:
+        try:
+            lease_store.release(lease_key, held.token)  # owner-conditional: only our own lease
+        except CallbackSweepLeaseError:
+            pass  # the lease expires on its own; a later sweep reclaims it
+
     if result["state"] != STATE_NO_PROGRESS_AFTER_HANDOFF:
         decision = decide_recovery(
             decided=decided, rechecked=decided, decided_state=result["state"]
@@ -224,8 +266,10 @@ def sweep_once(
         result["send_reason"] = decision.reason
         result["send_detail"] = decision.detail
         # Acceptance 3: a first-pass resolution (progress_without_callback / stall_unprovable) is a
-        # durable event too — the design must not depend on a later correction journal.
+        # durable event too — the design must not depend on a later correction journal. Published
+        # under the lease, then released.
         _record_resolution(result, record_fn, decided)
+        _release()
         return result
 
     return _mutating_path(
@@ -237,6 +281,9 @@ def sweep_once(
         lane_generation=lane_generation,
         workspace_id=wsid,
         fence=fence,
+        lease_key=lease_key,
+        lease_token=held.token,
+        release=_release,
         target_assigned_name=target_assigned_name,
         send_fn=send_fn,
         record_fn=record_fn,
@@ -254,6 +301,9 @@ def _mutating_path(
     lane_generation: object,
     workspace_id: str,
     fence: DispatchOutboxFence,
+    lease_key: object,
+    lease_token: str,
+    release: Callable[[], None],
     target_assigned_name: str,
     send_fn: Callable[[str], object],
     record_fn: Callable[[dict, SweepWatermark], str],
@@ -296,34 +346,17 @@ def _mutating_path(
         action_id=SWEEP_RECOVERY_ACTION_ID,
         target_assigned_name=str(target_assigned_name).strip(),
     )
-
-    # (1) Take ownership of the whole attempt before any durable work.
-    try:
-        reserve = fence.reserve(key, now=now)
-    except DispatchOutboxFenceError as exc:
-        result["send_reason"] = ZERO_SEND_FENCE_UNAVAILABLE
-        result["send_detail"] = (
-            f"the idempotency authority is unavailable ({exc}); zero-send rather than risk a "
-            f"duplicate replay"
-        )
-        return result
-    if not reserve.won:
-        result["send_reason"] = ZERO_SEND_FENCE_HELD
-        result["send_detail"] = (
-            f"recovery for dispatch anchor {decided.dispatch_journal} is already "
-            f"{reserve.current_state}; at most one recovery attempt per gate anchor "
-            f"({reserve.detail})"
-        )
-        result["needs_reconcile"] = bool(reserve.needs_reconcile)
-        return result
+    _release = release
 
     def _abort(folded: dict[str, Any], watermark: SweepWatermark) -> dict[str, Any]:
-        """Stand down without having sent: drop the reservation so a later sweep may retry."""
-        try:
-            fence.release(key)
-        except DispatchOutboxFenceError:
-            pass  # the row stays reserved; a re-entry surfaces it as uncertain for reconcile
+        """Stand down without having sent: record the resolution, THEN drop our own lease.
+
+        Order matters (R5-F2): releasing first would put the zero-send resolution publication back
+        outside the serialized region, which is how two sweeps came to publish duplicate
+        `progress_without_callback` records.
+        """
         _record_resolution(folded, record_fn, watermark)
+        _release()
         return folded
 
     # (2) Mutation-boundary re-read: the last chance to notice the lane is not stalled.
@@ -332,10 +365,7 @@ def _mutating_path(
             source, issue, lane=lane, lane_generation=lane_generation
         )
     except Exception as exc:  # noqa: BLE001 - an unreadable re-check must not mutate
-        try:
-            fence.release(key)
-        except DispatchOutboxFenceError:
-            pass
+        _release()
         return _unreadable(exc)
 
     decision = decide_recovery(
@@ -371,15 +401,12 @@ def _mutating_path(
     else:
         record_error = ""
     if not record_journal:
-        try:
-            fence.release(key)
-        except DispatchOutboxFenceError:
-            pass
+        _release()
         result["send_reason"] = ZERO_SEND_RECORD_FAILED
         result["send_detail"] = (
             f"the recovery classification could not be durably recorded "
-            f"({record_error or 'unresolved'}); nothing was sent and the reservation was released, "
-            f"so the next sweep retries this anchor cleanly"
+            f"({record_error or 'unresolved'}); nothing was sent and the attempt lease was "
+            f"released, so the next sweep retries this anchor cleanly"
         )
         result["resolution_recorded"] = False
         return result
@@ -394,10 +421,7 @@ def _mutating_path(
     except Exception as exc:  # noqa: BLE001 - an unverifiable position must not send
         # R4-F4: a durable record already landed. Keep its pointer and report the sweep INCOMPLETE
         # rather than returning a bare unreadable result that drops the mutation from view.
-        try:
-            fence.release(key)
-        except DispatchOutboxFenceError:
-            pass
+        _release()
         result["send_reason"] = SWEEP_SOURCE_UNREADABLE
         result["send_detail"] = (
             f"the post-record verification read failed ({type(exc).__name__}): a recovery record "
@@ -448,11 +472,34 @@ def _mutating_path(
         folded["record_stale_at_write"] = bool(preceding)
         return _abort(folded, verified)
 
-    # (5) Send exactly once, pointing at the record. The reservation has been held since step (1).
+    # (5) Reserve the send on the shared fence -- SHORT-LIVED, the way its contract intends: it
+    #     is taken here and resolved immediately, never held across I/O (R5-F1).
+    try:
+        reserve = fence.reserve(key, now=now)
+    except DispatchOutboxFenceError as exc:
+        _release()
+        result["send_reason"] = ZERO_SEND_FENCE_UNAVAILABLE
+        result["send_detail"] = (
+            f"the idempotency authority is unavailable ({exc}); zero-send rather than risk a "
+            f"duplicate replay"
+        )
+        return result
+    if not reserve.won:
+        _release()
+        result["send_reason"] = ZERO_SEND_FENCE_HELD
+        result["send_detail"] = (
+            f"recovery for dispatch anchor {decided.dispatch_journal} is already "
+            f"{reserve.current_state}; at most one recovery delivery per gate anchor "
+            f"({reserve.detail})"
+        )
+        result["needs_reconcile"] = bool(reserve.needs_reconcile)
+        return result
+
     try:
         send_fn(record_journal)
     except Exception as exc:  # noqa: BLE001 - an ambiguous send is uncertain, never auto-retried
         fence.mark_uncertain(key, detail=f"send raised {type(exc).__name__}", now=now)
+        _release()
         result["send_reason"] = "send_uncertain"
         result["send_detail"] = (
             f"the recovery send raised {type(exc).__name__}; the fence key is marked uncertain "
@@ -462,6 +509,7 @@ def _mutating_path(
         return result
 
     fence.mark_delivered(key, detail="callback sweep recovery delivered", now=now)
+    _release()
     result["sent"] = True
     result["send_reason"] = SEND_RESERVED
     result["send_detail"] = (
@@ -762,6 +810,8 @@ __all__ = (
     "ZERO_SEND_SOURCE_NOT_FRESH",
     "ZERO_SEND_WORKSPACE_UNATTESTED",
     "ZERO_SEND_RECORD_FAILED",
+    "ZERO_SEND_ATTEMPT_HELD",
+    "ZERO_SEND_LEASE_UNAVAILABLE",
     "RecoverySendError",
     "RecordSupersededError",
     "source_is_fresh",

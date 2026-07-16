@@ -359,7 +359,17 @@ def format_callback_recovery_text(result: dict[str, Any]) -> str:
             "hand, so a gate that landed after your read is invisible here. Pass --journals-json "
             "with --lane/--lane-generation to derive it from the durable record instead."
         )
-    if result.get("resolution_recorded") is False:
+    if result.get("sweep_complete") is False:
+        # R5-F4: this field previously existed but NOTHING read it — the exit code only happened to
+        # be non-zero because `is_stall` was true. A durable mutation landed and the sweep did not
+        # finish, so it must be visible on the surface an operator actually reads.
+        lines.append(
+            f"  INCOMPLETE: a durable recovery record (j#"
+            f"{result.get('recovery_record_journal') or '?'}) WAS written but the sweep did not "
+            f"finish ({result.get('send_reason') or 'unknown'}) — re-run it; do not treat this as "
+            f"a resolved sweep"
+        )
+    elif result.get("resolution_recorded") is False:
         lines.append(
             f"  INCOMPLETE: the verdict was NOT durably recorded "
             f"({result.get('record_reason') or 'unknown'}) — a stall check and its classification "
@@ -383,10 +393,11 @@ def cmd_sublane_callback_recovery(args: argparse.Namespace) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_callback_recovery_text(result))
-    # An actuating sweep whose resolution never landed durably is INCOMPLETE, not resolved
-    # (review R3-F4): exit non-zero so a caller reading only the return code can never treat an
-    # unrecorded verdict as a finished sweep.
-    if result.get("resolution_recorded") is False:
+    # An actuating sweep that did not finish, or whose resolution never landed durably, is
+    # INCOMPLETE rather than resolved (reviews R3-F4 / R5-F4): exit non-zero explicitly, so a
+    # caller reading only the return code can never treat it as a finished sweep. Relying on
+    # `is_stall` to happen to be true here was the R5-F4 defect.
+    if result.get("sweep_complete") is False or result.get("resolution_recorded") is False:
         return 1
     # A genuine stall returns non-zero so the coordinator can branch on it in
     # scripts; non-stall outcomes (complete / not-required / not-a-candidate)
