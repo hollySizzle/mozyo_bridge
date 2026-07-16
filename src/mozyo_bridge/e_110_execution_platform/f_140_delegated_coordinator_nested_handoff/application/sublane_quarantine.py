@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
@@ -31,6 +31,9 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleKey,
     ReleasePin,
     ReleasePinError,
+)
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    lifecycle_migration_payload,
 )
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     REPLACEMENT_NOT_REQUESTED,
@@ -255,6 +258,18 @@ class SublaneQuarantineUseCase:
         classification: PendingComposerClassification,
         **changes: Any,
     ) -> QuarantineOutcome:
+        # Redmine #13844 R4-F1: carry the schema migration the replacement write gate performed
+        # into the use-case outcome at EVERY return, read from the store's ACCUMULATED
+        # preparation (which preserves the first ``migrated`` across this command's multiple
+        # writes). The CLI must not re-read the mutable "last write" — the typed migration is
+        # threaded through the outcome here, so a quarantine that migrated the shared store on its
+        # first write still reports it after later ``intact`` writes.
+        changes.setdefault(
+            "lifecycle_migration",
+            lifecycle_migration_payload(
+                getattr(self.store, "last_write_preparation", None)
+            ),
+        )
         return QuarantineOutcome(
             issue=_norm(request.issue),
             lane=_norm_lane(request.lane),
@@ -857,18 +872,10 @@ def cmd_sublane_quarantine(args: argparse.Namespace) -> int:
         ops=LiveSublaneQuarantineOps(repo_root=repo_root),
         store=LaneReplacementStore(),
     )
+    # Redmine #13844 R4-F1: the use case already carries the schema migration (from the store's
+    # ACCUMULATED preparation) in ``outcome.lifecycle_migration`` — the CLI does NOT re-read the
+    # mutable "last write" (which a later ``intact`` write would have cleared).
     outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
-    # Redmine #13844 R3-F2: surface, in the structured outcome, any shared-store schema migration
-    # the replacement write gate performed (the pre-migration advisory already went to stderr).
-    from mozyo_bridge.core.state.lane_lifecycle_readonly import (
-        lifecycle_migration_payload,
-    )
-
-    migration = lifecycle_migration_payload(
-        getattr(use_case.store, "last_write_preparation", None)
-    )
-    if migration is not None:
-        outcome = replace(outcome, lifecycle_migration=migration)
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:

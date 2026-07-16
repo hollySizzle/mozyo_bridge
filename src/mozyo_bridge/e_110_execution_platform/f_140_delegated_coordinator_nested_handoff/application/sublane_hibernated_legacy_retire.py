@@ -492,7 +492,19 @@ def format_migration_text(result: HibernatedLegacyRetireVerdict) -> str:
     if result.detail:
         lines.append(f"    {result.detail}")
     if not result.ok:
-        lines.append("    -> fail-closed: lane NOT retired; nothing was written")
+        # Redmine #13844 R4-F2: "nothing was written" is scoped to the lane-lifecycle ROW CAS —
+        # a forward schema migration is a SEPARATE side effect the write gate may already have
+        # committed, so a blocked run that migrated must not claim nothing happened.
+        if result.lifecycle_migration:
+            lines.append(
+                "    -> fail-closed: the lane-lifecycle row was NOT retired (the row CAS did not "
+                "apply); the shared-store SCHEMA was already forward-migrated by the write gate — "
+                "see below"
+            )
+        else:
+            lines.append(
+                "    -> fail-closed: lane NOT retired; no lane-row write and no schema migration"
+            )
     if result.expected_live:
         lines.append(
             "    live expected managed slots: " + ", ".join(result.expected_live)

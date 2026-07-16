@@ -229,7 +229,16 @@ class LaneLifecycleStore:
             emit_lifecycle_migration_advisory(preflight, stream=sys.stderr)
         outcome = self.ensure_schema()
         prep = LifecycleWritePreparation(outcome=outcome, preflight=preflight)
-        self._last_write_preparation = prep
+        # Redmine #13844 R4-F1: PRESERVE the migration across a command's multiple writes on this
+        # store. A command that mutates the row several times (e.g. quarantine: request_replacement
+        # then record_replacement_outcome) migrates the shared store on its FIRST write (v5 -> v6);
+        # every LATER write finds it already current (``intact``). ``last_write_preparation`` must
+        # remain the migration event that actually happened for this store's lifetime — so a
+        # ``migrated`` preparation is never clobbered by a subsequent ``intact`` one (migrations are
+        # monotonic: v5 -> v6 happens once). ``last_schema_outcome`` still reflects the raw last
+        # write; only this audit bundle accumulates the migration.
+        if self._last_write_preparation is None or not self._last_write_preparation.migrated:
+            self._last_write_preparation = prep
         return prep
 
     def prepare_write(

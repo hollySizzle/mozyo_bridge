@@ -887,8 +887,11 @@ class UniversalWriteGateTest(unittest.TestCase):
             action_id="act-1",
             pins=[ReleasePin(role="codex", assigned_name="n", locator="wProj:p2")],
         )
-        self.assertIsNotNone(store.last_write_preparation)
-        self.assertEqual(store.last_write_preparation.outcome.action, SCHEMA_INTACT)
+        # The raw last-write outcome is INTACT (the store was already v6 by the release write) ...
+        self.assertEqual(store.last_schema_outcome.action, SCHEMA_INTACT)
+        # ... but last_write_preparation PRESERVES the earlier migration (Redmine #13844 R4-F1):
+        # a command's later intact write must not erase the migration it did on its first write.
+        self.assertTrue(store.last_write_preparation.migrated)
 
     def test_composing_store_mutation_runs_gate(self) -> None:
         # A composing store (declaration) mutation also opens through the shared gate and
@@ -1265,6 +1268,74 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
         self.assertEqual(v2.as_payload()["lifecycle_migration"], rec)
         # QuarantineOutcome carries it too (its as_payload includes the key); verified end-to-end
         # by the quarantine command suite. The reconcile / retire verdicts are checked here.
+
+
+# -- R4-F2: blocked text must not deny the schema-migration side effect --------------------
+
+
+class BlockedTextMigrationHonestyTest(unittest.TestCase):
+    """Review R4 j#79605 F2: a fail-closed (CAS-refused) verdict that STILL migrated the shared
+    store must not print "nothing was written" — the schema migration is a real side effect and
+    the "zero-write" claim is scoped to the lane row."""
+
+    _MIGRATION = {
+        "from_version": 5,
+        "to_version": 6,
+        "backup_dir": "/b",
+        "peer_active_lanes": ["issue_13800_peer_lane"],
+        "peer_reader_risk": True,
+    }
+
+    def test_legacy_retire_blocked_with_migration_does_not_claim_nothing_written(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
+            HibernatedLegacyRetireVerdict,
+            MIGRATE_BLOCKED,
+            format_migration_text,
+        )
+
+        # A CAS-refused (blocked) verdict whose write gate already forward-migrated the store.
+        blocked = HibernatedLegacyRetireVerdict(
+            state=MIGRATE_BLOCKED,
+            reason="legacy_state_not_matched",
+            workspace_id=WS,
+            lane_id=LANE,
+            lifecycle_migration=self._MIGRATION,
+        )
+        text = format_migration_text(blocked)
+        self.assertNotIn("nothing was written", text)  # would deny the migration
+        self.assertIn("row CAS did not apply", text)  # side effects separated
+        self.assertIn("SCHEMA was already forward-migrated", text)
+        self.assertIn("v5 -> v6", text)
+        # ... but a genuinely zero-write blocked verdict (no migration) still says so.
+        clean = HibernatedLegacyRetireVerdict(
+            state=MIGRATE_BLOCKED, reason="x", workspace_id=WS, lane_id=LANE
+        )
+        self.assertIn("no lane-row write and no schema migration", format_migration_text(clean))
+
+    def test_live_reconcile_blocked_with_migration_scopes_zero_write(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile import (  # noqa: E501
+            HibernatedLiveReconcileVerdict,
+            RECONCILE_BLOCKED,
+            format_reconcile_text,
+        )
+
+        blocked = HibernatedLiveReconcileVerdict(
+            state=RECONCILE_BLOCKED,
+            reason="not_reconcilable_state",
+            workspace_id=WS,
+            lane_id=LANE,
+            lifecycle_migration=self._MIGRATION,
+        )
+        text = format_reconcile_text(blocked)
+        self.assertNotIn("nothing was written or closed", text)  # would deny the migration
+        self.assertIn("no lane-row write and no pane close", text)  # scoped to the lane row
+        self.assertIn("separate side effect", text)
+        self.assertIn("v5 -> v6", text)
+        # a genuinely zero-write, zero-migration blocked verdict still says so.
+        clean = HibernatedLiveReconcileVerdict(
+            state=RECONCILE_BLOCKED, reason="x", workspace_id=WS, lane_id=LANE
+        )
+        self.assertIn("nothing was written or closed", format_reconcile_text(clean))
 
 
 if __name__ == "__main__":  # pragma: no cover

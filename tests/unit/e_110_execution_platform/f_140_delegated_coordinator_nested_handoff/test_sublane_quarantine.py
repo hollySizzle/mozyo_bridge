@@ -32,13 +32,18 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+import json
+import sqlite3
+
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
     ReleasePin,
+    lane_lifecycle_path,
 )
+from mozyo_bridge.core.state.lane_lifecycle_schema import LANE_LIFECYCLE_COMPONENT
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     REPLACEMENT_NOT_REQUESTED,
     REPLACEMENT_PENDING,
@@ -799,6 +804,67 @@ class CloseReceiverTest(unittest.TestCase):
         self.assertFalse(result.old_absent)
         self.assertEqual(result.detail, "assigned_name_recycled")
         self.executed.assert_not_called()
+
+
+class QuarantineMigrationAuditTest(_QuarantineCase):
+    """Redmine #13844 R4-F1: a real quarantine SUCCESS (which mutates the row several times)
+    on a shared v5 store with an active peer must carry the v5 -> v6 schema migration in its
+    structured outcome (JSON + text), not lose it to the later ``intact`` writes."""
+
+    def _rewind_to_v5_with_peer(self) -> None:
+        # An active peer lane sharing this home, then rewind the shared store to a v5 signature.
+        self.lifecycle.declare_active(
+            LaneLifecycleKey(WS, "issue_13800_peer_lane"),
+            decision=DecisionPointer(
+                source="redmine", issue_id="13800", journal_id=JOURNAL
+            ),
+            issue_id="13800",
+        )
+        path = lane_lifecycle_path(self.home)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _recorded_version(self) -> int:
+        conn = sqlite3.connect(lane_lifecycle_path(self.home))
+        try:
+            return conn.execute(
+                "SELECT schema_version FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_multi_write_success_carries_v5_to_v6_migration_in_json_and_text(self) -> None:
+        self._active_lane()
+        self._rewind_to_v5_with_peer()
+        self.assertEqual(self._recorded_version(), 5)
+
+        # A fresh replacement store on the v5 home; the successful quarantine mutates the row
+        # several times (request_replacement -> record_replacement_outcome x2).
+        self.store = LaneReplacementStore(home=self.home)
+        outcome = self._run(_FakeOps(), execute=True)
+
+        self.assertEqual(outcome.replacement_state, REPLACEMENT_REPLACED)
+        self.assertEqual(self._recorded_version(), 6)  # the first write migrated the store
+        # The migration is NOT lost to the later intact writes (R4-F1): the outcome carries it.
+        self.assertIsNotNone(outcome.lifecycle_migration)
+        self.assertEqual(outcome.lifecycle_migration["from_version"], 5)
+        self.assertEqual(outcome.lifecycle_migration["to_version"], 6)
+        self.assertIn("issue_13800_peer_lane", outcome.lifecycle_migration["peer_active_lanes"])
+        # JSON payload carries it ...
+        self.assertEqual(outcome.as_payload()["lifecycle_migration"]["from_version"], 5)
+        # ... and the text renderer surfaces it.
+        text = quarantine_module.format_quarantine_text(outcome)
+        self.assertIn("forward-migrated", text)
+        self.assertIn("v5 -> v6", text)
 
 
 if __name__ == "__main__":

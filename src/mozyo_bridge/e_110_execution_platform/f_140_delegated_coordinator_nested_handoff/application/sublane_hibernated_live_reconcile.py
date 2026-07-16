@@ -883,7 +883,8 @@ def run_hibernated_live_reconcile(
             detail=(
                 f"the reconcile retire CAS refused ({outcome.reason}); the row moved since the "
                 "reconcile verified its revision, or is not the exact hibernated / released "
-                "legacy signature — zero-write and zero-close"
+                "legacy signature — zero lane-row write and zero-close (any shared-store schema "
+                "migration is reported separately)"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
@@ -945,6 +946,14 @@ def format_reconcile_text(result: HibernatedLiveReconcileVerdict) -> str:
             lines.append(
                 "    -> fail-closed: the owed close is INCOMPLETE (side effects above); "
                 "the reconcile re-runs its own owed close"
+            )
+        elif result.lifecycle_migration:
+            # Redmine #13844 R4-F2: the lane row was NOT reconciled/closed, but the write gate
+            # already forward-migrated the shared-store SCHEMA (a separate side effect above) —
+            # "nothing was written" would deny it, so scope the claim to the lane row.
+            lines.append(
+                "    -> fail-closed: lane NOT reconciled; no lane-row write and no pane close "
+                "(the shared-store schema migration above is a separate side effect)"
             )
         else:
             lines.append(
