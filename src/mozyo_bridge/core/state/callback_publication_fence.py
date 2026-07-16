@@ -47,7 +47,11 @@ State machine
 - and there is no ``recover()`` at all, unlike every sibling store (R11-F1). Minting a fresh store
   forgets live reservations, which is a reclaim of everything at once — the one thing this fence
   exists to refuse. A lost store therefore stays fail-closed. See the comment where the sibling
-  stores' ``recover()`` would be.
+  stores' ``recover()`` would be;
+- nor can :meth:`bootstrap` stand in for one (R12-F1). Its both-absent branch *was* the same
+  reclaim, reachable from ordinary execute, because "no DB and no sidecar" reads identically for a
+  fresh install and a total loss. A first-init seal (:attr:`seal_path`) now separates the two, and
+  ordinary execute never bootstraps — it checks, and stops if the store is not there.
 """
 
 from __future__ import annotations
@@ -64,6 +68,8 @@ from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 CALLBACK_PUBLICATION_FENCE_FILENAME = "callback-publication-fence.sqlite"
 CALLBACK_PUBLICATION_FENCE_SIDECAR_SUFFIX = ".anchor"
+#: First-init seal: proof the fence has operated here, so a both-absent pair reads as loss (R12-F1).
+CALLBACK_PUBLICATION_FENCE_SEAL_SUFFIX = ".sealed"
 CALLBACK_PUBLICATION_FENCE_SCHEMA_VERSION = 1
 
 #: This caller won the single reservation and MAY perform the one PUT.
@@ -224,12 +230,55 @@ class CallbackPublicationFence:
         finally:
             conn.close()
 
+    @property
+    def seal_path(self) -> Path:
+        """The first-init seal: proof this fence has ever operated, kept outside the DB+sidecar pair.
+
+        Without it, "DB and sidecar are both absent" is indistinguishable from a fresh install, so
+        the both-absent branch of :meth:`bootstrap` re-mints the store and forgets every live
+        reservation — the same store-wide reclaim ``recover()`` performed, reachable from ordinary
+        operation (R12-F1). The seal is what makes total loss *detectable*: once written, absence of
+        the pair means loss, not first run.
+        """
+        return self.path.with_suffix(self.path.suffix + CALLBACK_PUBLICATION_FENCE_SEAL_SUFFIX)
+
+    def has_operated(self) -> bool:
+        """True once this fence has been initialized here, whether or not its store still exists."""
+        return self.seal_path.exists()
+
     def bootstrap(self) -> None:
-        """Initial-only creation of the store + its identity sidecar; any single-sided state fails closed."""
+        """Operator-only first init. NEVER call from ordinary execute (R12-F1).
+
+        Sound exactly once, on a machine where this fence has never run. After that the seal makes
+        every both-absent state a detected store loss, and a lost store cannot be re-minted: a
+        suspended owner's reservation would be forgotten and its record published twice. There is
+        no reset here and no operator override — restoring availability needs a protocol that can
+        prove the old owner cannot resume, which is follow-up work (j#80398 coordinator
+        disposition), not a flag.
+
+        Known limit, stated rather than hidden: deleting the seal along with the pair is
+        indistinguishable from a fresh install. Nothing local can close that — the seal is the
+        outermost durable thing this fence has. What it does close is every path reachable from
+        ordinary operation and from this command.
+        """
         sidecar_nonce = self._read_sidecar_nonce()
         db_exists = self.path.exists()
         if sidecar_nonce is None and not db_exists:
+            if self.has_operated():
+                raise CallbackPublicationFenceError(
+                    f"callback publication fence {self.path} is sealed as previously initialized, "
+                    f"but its store and identity sidecar are both gone: a total store loss, not a "
+                    f"fresh install. Re-creating it would forget any reservation a suspended sweep "
+                    f"still holds and publish its record a second time. Restore the store from "
+                    f"backup; there is deliberately no reset (see {self.seal_path})"
+                )
             self._create_fresh(secrets.token_hex(16))
+            self.seal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.seal_path.write_text(
+                f"callback publication fence first initialized at {_utc_now()}\n"
+                f"presence of this file means a both-absent store is a LOSS, never a fresh install\n",
+                encoding="utf-8",
+            )
             return
         if self.is_bootstrapped():
             return

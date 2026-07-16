@@ -298,10 +298,19 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
     # bootstraps it explicitly; a store LOSS then fails closed instead of minting a duplicate lease.
     lease = CallbackSweepLease(home=None)
     lease.bootstrap()
-    # The publication authority (j#80383 option (d)). Like the lease it never auto-creates: a
-    # forgotten store would let an already-published record be published again.
+    # The publication authority (j#80383 option (d)). Ordinary execute must NEVER bootstrap it:
+    # bootstrap's both-absent branch re-mints the store, and a re-minted store forgets the
+    # reservation a suspended sweep still holds -- the same store-wide reclaim that `recover()`
+    # performed, just reachable from the normal path (R12-F1). So this only ever *checks*, and an
+    # absent or lost store stops the sweep instead of quietly rebuilding the fence around it.
     publication_fence = CallbackPublicationFence(home=None)
-    publication_fence.bootstrap()
+    if not publication_fence.is_bootstrapped():
+        raise SystemExit(
+            "callback publication fence is not initialized (or its store was lost): refusing to "
+            "sweep, because publishing without the fence can duplicate a recovery record. "
+            "Run `mozyo-bridge workflow callback-publication --bootstrap` on first use; a store "
+            "loss after that is fail-closed by design and needs the store restored."
+        )
     result = sweep_once(
         workspace_id=_attested_workspace_id(args),
         lane_id=lane,
