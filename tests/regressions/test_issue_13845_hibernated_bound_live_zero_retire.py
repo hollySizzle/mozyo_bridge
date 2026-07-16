@@ -31,8 +31,15 @@ never the shared ``$HOME/.mozyo_bridge`` and never a live pane / process / route
    absent row) is refused zero-write; and
 2. the command boundary (``sublane retire --retire-hibernated-bound``): the JSON verdict +
    exit code over real roots, with the bound-worktree attestation, the live-inventory zero
-   read, the head-integration probe, idempotent replay, and non-regression of the #13754
-   guarded close / #13841 migration (mutually exclusive, disjoint signatures).
+   read, the **foreign-occupant fence** (review j#80115 F1), the head-integration probe,
+   idempotent replay, and non-regression of the #13754 guarded close / #13841 migration
+   (mutually exclusive, disjoint signatures).
+
+The two inventory axes are deliberately pinned apart, because conflating them is exactly the
+j#80115 F1 defect: ``expected_live_slots`` aggregates only the MANAGED roles, so "no expected
+slot is live" does NOT mean "the unit is quiescent". A unit occupied solely by an unexpected
+provider measures zero live and, before the fix, terminalized the row while that process kept
+running.
 
 Boundary (Redmine #13845): no process launch / close / resume, no worktree / branch removal,
 no raw Herdr / tmux, no origin/main, no production / tag / publish.
@@ -113,6 +120,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_retire import (  # noqa: E402,E501
     BOUND_RETIRE_ALREADY_RETIRED,
     BOUND_RETIRE_BLOCKED,
+    BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT,
     BOUND_RETIRE_HEAD_NOT_INTEGRATED,
     BOUND_RETIRE_LIVE_PAIR_PRESENT,
     BOUND_RETIRE_RETIRED,
@@ -893,6 +901,83 @@ class BoundRetireCommandTests(unittest.TestCase):
         self.assertTrue(self._bound(payload)["expected_live"])
         self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
         self.assertEqual(self.executed_closes, [])
+
+    # -- the foreign-occupant axis (review j#80115 F1) --------------------
+
+    def test_foreign_only_live_inventory_blocks_zero_write(self) -> None:
+        """A unit occupied ONLY by an unexpected provider must not terminalize (j#80115 F1).
+
+        The regression for the review's reproduction: ``expected_live_slots`` aggregates only
+        the MANAGED roles, so a foreign-only unit measures zero live. Before the fix this
+        exited 0 and recorded the row ``retired`` while the foreign process kept running.
+        Distinct from ``test_foreign_worktree_binding_blocks_zero_write``, which covers the
+        foreign *worktree binding* axis — this is the foreign *provider inventory* axis.
+        """
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "gemini", _LANE, "w28:pFOREIGN"))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        verdict = self._bound(payload)
+        self.assertEqual(verdict["state"], BOUND_RETIRE_BLOCKED)
+        self.assertEqual(verdict["reason"], BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT)
+        # The measurement that refused is named: zero managed slots live, yet NOT quiescent.
+        self.assertEqual(verdict["expected_live"], [])
+        self.assertTrue(verdict["foreign_names"])
+        self.assertFalse(payload["retire_ok"])
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual(self.executed_closes, [])
+
+    def test_foreign_occupant_alongside_live_pair_blocks(self) -> None:
+        # Both axes non-empty: still zero-write (the live check fires first, and the foreign
+        # occupants are reported alongside it rather than dropped).
+        self._seed_row()
+        self._add_live_pair()
+        self.rows.append(_row(_WORKSPACE_ID, "gemini", _LANE, "w28:pFOREIGN"))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        verdict = self._bound(payload)
+        self.assertEqual(verdict["reason"], BOUND_RETIRE_LIVE_PAIR_PRESENT)
+        self.assertTrue(verdict["foreign_names"])
+        self.assertEqual(self._disposition(), DISPOSITION_HIBERNATED)
+        self.assertEqual(self.executed_closes, [])
+
+    def test_foreign_occupant_blocks_the_idempotent_replay_too(self) -> None:
+        """An already-retired row must not report success while a foreign occupant runs.
+
+        Same shape as the #13841 review j#79150 F2 invariant for relaunched pairs: a persisted
+        ``retired`` does not prove the unit is quiescent now, so the replay is only a verified
+        no-op once the unit is measured empty.
+        """
+        self._seed_row()
+        self.assertEqual(self._retire()[0], 0)
+        self.rows.append(_row(_WORKSPACE_ID, "gemini", _LANE, "w28:pFOREIGN"))
+        code, payload = self._retire()
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self._bound(payload)["reason"], BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT
+        )
+        self.assertFalse(payload["retire_ok"])
+
+    def test_foreign_occupant_in_another_lane_does_not_block(self) -> None:
+        # The fence is scoped to the TARGETED units: a foreign provider sitting in a different
+        # lane's unit is none of this retire's business and must not block it.
+        self._seed_row()
+        self.rows.append(_row(_WORKSPACE_ID, "gemini", "issue_99999_other_lane", "w28:pOTHER"))
+        code, payload = self._retire()
+        self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
+        self.assertEqual(self._bound(payload)["state"], BOUND_RETIRE_RETIRED)
+        self.assertEqual(self._bound(payload)["foreign_names"], [])
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
+
+    def test_coordinator_default_lane_pair_is_not_foreign(self) -> None:
+        # Non-regression for the green path: the project workspace's default-lane coordinator
+        # pair is always in the inventory and must never be read as a foreign occupant of the
+        # lane unit (that would make every terminal retire permanently blocked).
+        self._seed_row()
+        code, payload = self._retire()
+        self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
+        self.assertEqual(self._bound(payload)["foreign_names"], [])
+        self.assertEqual(self._disposition(), DISPOSITION_RETIRED)
 
     def test_unreadable_inventory_is_not_an_empty_one(self) -> None:
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501

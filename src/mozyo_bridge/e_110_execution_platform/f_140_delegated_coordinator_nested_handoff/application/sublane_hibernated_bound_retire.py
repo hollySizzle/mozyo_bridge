@@ -42,8 +42,14 @@ Action-time verification, every axis fail-closed (nothing is written unless ALL 
 - **live-zero** — the live herdr inventory is read (read-only) and MUST show **every** expected
   managed slot absent for the lane unit. A live slot is :data:`BOUND_RETIRE_LIVE_PAIR_PRESENT`
   — a durable ``released`` record is *not* liveness (``lane_lifecycle`` boundary), so the
-  durable proof is paired with this live-zero read. An unreadable / foreign / duplicate
-  inventory is NOT an empty one (:data:`REASON_INVENTORY_UNREADABLE`).
+  durable proof is paired with this live-zero read. An unreadable inventory is NOT an empty
+  one (:data:`REASON_INVENTORY_UNREADABLE`).
+- **unoccupied** — the targeted units must additionally carry **no foreign / unexpected
+  occupant** (:data:`BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT`, review j#80115 F1). ``expected
+  live slots absent`` and ``the unit is empty`` are DIFFERENT facts: ``expected_live_slots``
+  measures only the *managed* roles, so a unit occupied solely by an unexpected provider
+  measures zero live and would otherwise terminalize the row while that process is still
+  running. The lane unit is not provably quiescent while anything occupies it.
 - **released bound state** — the bounded CAS additionally requires ``hibernated`` + durable
   ``released`` + a **non-empty, matching** ``worktree_identity`` + settled replacement, guarded
   on the row's exact revision (a revision race loses :data:`BOUND_RETIRE_REVISION_RACE`).
@@ -85,6 +91,13 @@ BOUND_RETIRE_BLOCKED = "blocked"
 #: reused from the guarded close (:mod:`...sublane_herdr_retire`) so an operator reads one
 #: vocabulary across every retire intent.
 BOUND_RETIRE_LIVE_PAIR_PRESENT = "live_pair_present"
+#: A foreign / unexpected provider occupies one of the targeted units (review j#80115 F1).
+#: Distinct from :data:`BOUND_RETIRE_LIVE_PAIR_PRESENT`, which names an *expected managed*
+#: slot: ``expected_live_slots`` only aggregates the managed roles, so a unit holding solely
+#: an unexpected provider measures zero live. Terminalizing then would record the lane as
+#: permanently gone while a real process is still running in its unit — the acceptance's
+#: "foreign inventory is zero-write" axis.
+BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT = "foreign_inventory_present"
 BOUND_RETIRE_HEAD_NOT_INTEGRATED = "head_not_integrated"
 #: The caller's ``--worktree`` is not actually checked out on the caller's ``--branch`` (a
 #: mismatch, a detached HEAD, or an unresolvable checkout). The clean / integrated evidence
@@ -122,6 +135,11 @@ class HibernatedBoundRetireVerdict:
     workspace_id: str = ""
     lane_id: str = ""
     expected_live: tuple[str, ...] = ()
+    #: The foreign / unexpected occupants observed in the targeted units (review j#80115 F1).
+    #: Surfaced next to ``expected_live`` because the two are different measurements and the
+    #: blocked verdict must say WHICH one refused: an operator reading ``expected_live: []``
+    #: alone cannot tell a quiescent unit from one occupied by an unexpected provider.
+    foreign_names: tuple[str, ...] = ()
     #: The shared-store schema migration this retire's write gate performed, if any (Redmine
     #: #13844 R3-F2): the typed audit record (from/to version, backup, peer-reader risk) so the
     #: migration is legible in JSON/text, not only the pre-migration stderr advisory.
@@ -139,6 +157,7 @@ class HibernatedBoundRetireVerdict:
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
             "expected_live": list(self.expected_live),
+            "foreign_names": list(self.foreign_names),
             "lifecycle_migration": self.lifecycle_migration,
         }
 
@@ -150,6 +169,7 @@ def _blocked(
     workspace_id: str = "",
     lane_id: str = "",
     expected_live: tuple[str, ...] = (),
+    foreign_names: tuple[str, ...] = (),
     lifecycle_migration: Optional[dict] = None,
 ) -> HibernatedBoundRetireVerdict:
     return HibernatedBoundRetireVerdict(
@@ -159,6 +179,7 @@ def _blocked(
         workspace_id=workspace_id,
         lane_id=lane_id,
         expected_live=expected_live,
+        foreign_names=foreign_names,
         lifecycle_migration=lifecycle_migration,
     )
 
@@ -433,6 +454,30 @@ def run_hibernated_bound_retire(
             workspace_id=workspace_id,
             lane_id=lane_label,
             expected_live=live,
+            foreign_names=plan.foreign_names,
+        )
+    # No foreign / unexpected occupant may remain either (review j#80115 F1, the acceptance's
+    # "foreign inventory is zero-write" axis). ``expected_live_slots`` above aggregates ONLY the
+    # managed roles, so a unit occupied solely by an unexpected provider measures zero live and
+    # would sail past that check — recording the lane permanently ``retired`` while a real
+    # process still runs in its unit. "No expected slot is live" and "the unit is quiescent" are
+    # different facts, and only the second licenses a terminal disposition. Refused zero-write
+    # here rather than coerced: this surface closes nothing, so it cannot make the unit empty,
+    # and the occupant is a foreign process it must never touch. The #13842 reconcile gates the
+    # same class through its own ``foreign_at_position`` observation.
+    if plan.foreign_names:
+        return _blocked(
+            BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT,
+            detail=(
+                "foreign / unexpected occupant(s) are live in the lane unit "
+                f"({', '.join(plan.foreign_names)}); the unit is not quiescent, so a terminal "
+                "retire would record the lane gone while a real process still runs there. "
+                "This surface never closes a foreign agent — resolve the occupant first"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            expected_live=live,
+            foreign_names=plan.foreign_names,
         )
     if record.lane_disposition == DISPOSITION_RETIRED and (
         record.issue_id or ""
@@ -563,6 +608,13 @@ def format_bound_retire_text(result: HibernatedBoundRetireVerdict) -> str:
         lines.append(
             "    live expected managed slots: " + ", ".join(result.expected_live)
         )
+    if result.foreign_names:
+        # Named separately from the managed slots (review j#80115 F1): an operator must be able
+        # to tell "no expected slot is live" from "the unit is empty".
+        lines.append(
+            "    foreign / unexpected occupants in the lane unit (never closed here): "
+            + ", ".join(result.foreign_names)
+        )
     if result.lifecycle_migration:
         mig = result.lifecycle_migration
         lines.append(
@@ -578,6 +630,7 @@ __all__ = (
     "BOUND_RETIRE_ALREADY_RETIRED",
     "BOUND_RETIRE_BLOCKED",
     "BOUND_RETIRE_LIVE_PAIR_PRESENT",
+    "BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT",
     "BOUND_RETIRE_HEAD_NOT_INTEGRATED",
     "BOUND_RETIRE_WORKTREE_BRANCH_MISMATCH",
     "BOUND_RETIRE_LIFECYCLE_UNREADABLE",
