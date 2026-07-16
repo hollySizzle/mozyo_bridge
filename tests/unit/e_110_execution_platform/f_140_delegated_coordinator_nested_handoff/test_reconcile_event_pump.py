@@ -117,69 +117,130 @@ def _t(ws, issue, lane, target):
     return EventPumpTarget(workspace_id=ws, issue=issue, lane_id=lane, target=target)
 
 
+class _FakeWait:
+    """A test CancellableWait: blocks until it wakes/times out, or until cancel() releases it."""
+
+    def __init__(self, *, wake: bool = False, block: bool = False, raises: bool = False):
+        import threading
+
+        self._wake = wake
+        self._block = block
+        self._raises = raises
+        self._released = threading.Event()
+        self.cancelled = False
+        self.ran = False
+        if not block:
+            self._released.set()  # non-blocking waits complete at once
+
+    def run(self):
+        self.ran = True
+        if self._raises:
+            raise HerdrWaitError("boom")
+        self._released.wait(10.0)  # a blocking wait parks here until cancel() (or the 10s bound)
+        return self._wake
+
+    def cancel(self):
+        self.cancelled = True
+        self._released.set()  # release a blocked run() at once -> deterministic reap
+
+
 class MultiplexWaitTest(unittest.TestCase):
     def test_first_woke_target_wins(self):
-        # target A times out, target B wakes -> B is returned (A did not block B).
-        outcomes = {"tA": False, "tB": True}  # False->timeout, True->woke
-
-        def wait_builder(t):
-            return lambda: outcomes[t.target]
-
+        waits = {"tA": _FakeWait(wake=False), "tB": _FakeWait(wake=True)}
         targets = [_t("ws1", "1", "la", "tA"), _t("ws1", "2", "lb", "tB")]
-        signal, woken = multiplex_wait(targets, wait_builder=wait_builder)
+        signal, woken = multiplex_wait(targets, wait_builder=lambda t: waits[t.target])
         self.assertEqual(signal.kind, WAKE_WOKE)
         self.assertEqual(woken.target, "tB")
 
     def test_all_timeout_returns_timeout_no_target(self):
-        def wait_builder(t):
-            return lambda: False
-
         targets = [_t("ws1", "1", "la", "tA"), _t("ws1", "2", "lb", "tB")]
-        signal, woken = multiplex_wait(targets, wait_builder=wait_builder)
+        signal, woken = multiplex_wait(targets, wait_builder=lambda t: _FakeWait(wake=False))
         self.assertEqual(signal.kind, WAKE_TIMED_OUT)
         self.assertIsNone(woken)
 
     def test_empty_targets_is_benign_timeout(self):
-        signal, woken = multiplex_wait([], wait_builder=lambda t: (lambda: True))
+        signal, woken = multiplex_wait([], wait_builder=lambda t: _FakeWait(wake=True))
         self.assertEqual(signal.kind, WAKE_TIMED_OUT)
         self.assertIsNone(woken)
 
     def test_wait_error_is_surfaced_when_no_woke(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_wake import (
-            HerdrWaitError,
+        signal, woken = multiplex_wait(
+            [_t("ws1", "1", "la", "tA")], wait_builder=lambda t: _FakeWait(raises=True)
         )
-
-        def wait_builder(t):
-            def _w():
-                raise HerdrWaitError("boom")
-            return _w
-
-        signal, woken = multiplex_wait([_t("ws1", "1", "la", "tA")], wait_builder=wait_builder)
         self.assertEqual(signal.kind, WAKE_ERROR)
         self.assertIsNone(woken)
 
     def test_blocking_first_target_does_not_block_a_second_wake(self):
-        # review R6-F2: the waits are armed CONCURRENTLY. Target A blocks on its whole bounded
-        # window; target B wakes immediately. A truly-multiplex wait returns B promptly instead of
-        # serializing behind A's block (a serial loop would deadlock this test on A).
-        import threading
+        # review R6-F2: waits are armed CONCURRENTLY. Target A blocks its whole window; target B
+        # wakes at once -> B is returned promptly (a serial loop would wait out A first).
         import time
 
-        release = threading.Event()
-        self.addCleanup(release.set)  # never leak the blocked worker thread
-
-        def wait_builder(t):
-            if t.target == "tA":
-                return lambda: release.wait(5.0)  # blocks up to 5s -> falsy (timeout) if not woken
-            return lambda: True  # tB wakes at once
-
+        waits = {"tA": _FakeWait(block=True, wake=False), "tB": _FakeWait(wake=True)}
         targets = [_t("ws1", "1", "la", "tA"), _t("ws1", "2", "lb", "tB")]
         started = time.monotonic()
-        signal, woken = multiplex_wait(targets, wait_builder=wait_builder)
+        signal, woken = multiplex_wait(targets, wait_builder=lambda t: waits[t.target])
         elapsed = time.monotonic() - started
         self.assertEqual(signal.kind, WAKE_WOKE)
         self.assertEqual(woken.target, "tB")
-        self.assertLess(elapsed, 2.0)  # did NOT wait out A's 5s block (would be ~5s if serial)
+        self.assertLess(elapsed, 2.0)
+
+    def test_losing_waits_are_cancelled_and_reaped(self):
+        # review R7-F1: after the first wake, every losing wait is cancelled and its thread joined
+        # (deterministic reap) — no blocked herdr wait survives into the next arm / the CLI exit.
+        import threading
+
+        waits = {
+            "tA": _FakeWait(block=True, wake=False),  # would block ~10s if not cancelled
+            "tB": _FakeWait(wake=True),
+        }
+        targets = [_t("ws1", "1", "la", "tA"), _t("ws1", "2", "lb", "tB")]
+        signal, woken = multiplex_wait(targets, wait_builder=lambda t: waits[t.target])
+        self.assertEqual(woken.target, "tB")
+        self.assertTrue(waits["tA"].cancelled)  # the losing wait was cancelled
+        # no reconcile-wait worker thread is still alive (all deterministically joined).
+        alive = [th for th in threading.enumerate() if th.name.startswith("reconcile-wait-")]
+        self.assertEqual(alive, [])
+
+
+class ProcessExitTimeTest(unittest.TestCase):
+    """review R7-F1: a losing wait must not pin the CLI *process* exit time (daemon + bounded reap)."""
+
+    def test_process_exits_promptly_despite_a_stuck_losing_wait(self):
+        import subprocess
+        import time
+
+        # A losing wait whose cancel() does NOT release it (a pathological stuck herdr child): the
+        # bounded join times out and the daemon thread is abandoned, so the interpreter still exits
+        # at once (a ThreadPoolExecutor would have atexit-joined it for the full ~30s).
+        script = (
+            "import sys; sys.path.insert(0, 'src')\n"
+            "import time, threading\n"
+            "from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+            ".application.reconcile_event_pump import EventPumpTarget, multiplex_wait\n"
+            "class Stuck:\n"
+            "    def run(self):\n"
+            "        time.sleep(30)\n"
+            "        return False\n"
+            "    def cancel(self):\n"
+            "        pass\n"  # cancel cannot release this one -> relies on daemon + bounded reap
+            "class Woke:\n"
+            "    def run(self):\n"
+            "        return True\n"
+            "    def cancel(self):\n"
+            "        pass\n"
+            "def b(t):\n"
+            "    return Stuck() if t.target == 'stuck' else Woke()\n"
+            "ts = [EventPumpTarget('ws1','1','la','stuck'), EventPumpTarget('ws1','2','lb','woke')]\n"
+            "sig, woken = multiplex_wait(ts, wait_builder=b, reap_timeout=0.5)\n"
+            "print(woken.target)\n"
+        )
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(ROOT), capture_output=True, text=True, timeout=15
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.stdout.strip(), "woke")
+        self.assertLess(elapsed, 5.0)  # NOT the stuck wait's 30s (a ThreadPoolExecutor would join it)
 
 
 class RunEventPumpTest(unittest.TestCase):

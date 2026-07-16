@@ -26,8 +26,9 @@ from pathlib import Path
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_dispatch_writer import (
     DISPATCH_ROLE_PROFILE,
-    DISPATCH_WRITTEN,
-    build_ir_handoff_command,
+    DISPATCH_SENDABLE,
+    DispatchRoute,
+    build_live_handoff_send,
     build_live_ir_dispatch,
     dispatch_implementation_request,
 )
@@ -50,12 +51,25 @@ def _dispatch_body(args: argparse.Namespace) -> str:
     return ""
 
 
-def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
-    """Write the canonical marker-bearing IR journal and print its anchored handoff (or preview it).
+def _route_from_args(args: argparse.Namespace, lane: str) -> DispatchRoute:
+    """Build the handoff route identity from args (validated non-empty in the use case, R7-F4)."""
+    return DispatchRoute(
+        to=str(getattr(args, "to", None) or "claude"),
+        target=str(getattr(args, "target", "") or ""),
+        target_repo=str(getattr(args, "target_repo", "") or ""),
+        lane=lane,
+        role_profile=str(getattr(args, "role_profile", None) or DISPATCH_ROLE_PROFILE),
+        source=str(getattr(args, "source", None) or "redmine"),
+    )
 
-    Exit codes: 0 on a dry-run preview or a resolved ``--execute`` dispatch; 2 on a fail-closed
-    ``--execute`` (write / readback failure or an unresolved / ambiguous anchor — never a guessed
-    anchor, never a handoff).
+
+def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
+    """Write the canonical marker-bearing IR journal, resolve its anchor, and EXECUTE the handoff.
+
+    Exit codes: 0 on a dry-run preview or a delivered ``--execute`` dispatch (fresh or idempotently
+    recovered); 2 on a fail-closed ``--execute`` — missing route identity, write / readback failure,
+    an unresolved / ambiguous anchor, or a handoff that did not deliver (never a guessed anchor,
+    never a silent no-op).
     """
     issue = str(getattr(args, "issue", "") or "").strip()
     lane = str(getattr(args, "lane", "") or "").strip()
@@ -64,44 +78,37 @@ def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
 
     if not getattr(args, "execute", False):
         note = render_dispatch_note(body, lane=lane, lane_generation=generation)
-        print("dispatch-ir (dry-run: no Redmine write). Marker-bearing IR journal body:")
+        print("dispatch-ir (dry-run: no Redmine write, no handoff). Marker-bearing IR journal body:")
         print(note)
         print(
-            "\nRun with --execute to write this journal and resolve the dispatch anchor for handoff."
+            "\nRun with --execute to write this journal, resolve the dispatch anchor, and hand off."
         )
         return 0
 
+    route = _route_from_args(args, lane)
     post_note, read_entries = build_live_ir_dispatch()
-
-    def _handoff(anchor: str) -> str:
-        return build_ir_handoff_command(
-            issue=issue,
-            target=str(getattr(args, "target", "") or ""),
-            target_repo=str(getattr(args, "target_repo", "") or ""),
-            dispatch_journal=anchor,
-            role_profile=str(getattr(args, "role_profile", None) or DISPATCH_ROLE_PROFILE),
-            source=str(getattr(args, "source", None) or "redmine"),
-            to=str(getattr(args, "to", None) or "claude"),
-        )
+    handoff_send = build_live_handoff_send(issue=issue, route=route)
 
     result = dispatch_implementation_request(
         issue=issue,
         lane=lane,
         lane_generation=generation,
         body=body,
+        route=route,
         post_note=post_note,
         read_entries=read_entries,
-        handoff_builder=_handoff,
+        handoff_send=handoff_send,
     )
-    if result.status != DISPATCH_WRITTEN or not result.sendable:
+    if result.status not in DISPATCH_SENDABLE or not result.sendable:
         print(
-            f"mozyo-bridge workflow dispatch-ir: dispatch not sent ({result.status}): "
+            f"mozyo-bridge workflow dispatch-ir: dispatch not delivered ({result.status}): "
             f"{result.detail}",
             file=sys.stderr,
         )
         return 2
+    print(f"status: {result.status}")
     print(f"dispatch_journal: {result.dispatch_journal}")
-    print(f"handoff: {result.handoff_command}")
+    print(f"handoff_delivered: {result.handoff_delivered}")
     return 0
 
 
@@ -133,11 +140,13 @@ def register_dispatch_ir(workflow_sub) -> None:
     body.add_argument("--body-file", dest="body_file", help="Read the IR prose body from a file.")
     p.add_argument(
         "--target",
-        help="The worker target for the gated handoff command (--execute; the actual send stays gated).",
+        help="The worker target for the handoff (REQUIRED for --execute; a missing value fails "
+             "closed as input_invalid before any write).",
     )
     p.add_argument(
         "--target-repo", dest="target_repo",
-        help="The --target-repo identity gate value for the gated handoff command (--execute).",
+        help="The --target-repo identity gate value (REQUIRED for --execute; a missing value fails "
+             "closed as input_invalid before any write).",
     )
     p.add_argument(
         "--role-profile", dest="role_profile", default=DISPATCH_ROLE_PROFILE,
