@@ -118,16 +118,23 @@ def _t(ws, issue, lane, target):
 
 
 class _FakeWait:
-    """A test CancellableWait: blocks until it wakes/times out, or until cancel() releases it."""
+    """A test CancellableWait: blocks until it wakes/times out, or until cancel()/kill() releases it.
 
-    def __init__(self, *, wake: bool = False, block: bool = False, raises: bool = False):
+    ``terminate_resistant=True`` models a SIGTERM-ignoring child: ``cancel()`` does NOT release it;
+    only ``kill()`` does — so the reap ladder must escalate to kill() to join it (review R8-F2).
+    """
+
+    def __init__(self, *, wake: bool = False, block: bool = False, raises: bool = False,
+                 terminate_resistant: bool = False):
         import threading
 
         self._wake = wake
         self._block = block
         self._raises = raises
+        self._terminate_resistant = terminate_resistant
         self._released = threading.Event()
         self.cancelled = False
+        self.killed = False
         self.ran = False
         if not block:
             self._released.set()  # non-blocking waits complete at once
@@ -136,12 +143,17 @@ class _FakeWait:
         self.ran = True
         if self._raises:
             raise HerdrWaitError("boom")
-        self._released.wait(10.0)  # a blocking wait parks here until cancel() (or the 10s bound)
+        self._released.wait(10.0)  # a blocking wait parks here until cancel()/kill() (or the 10s bound)
         return self._wake
 
     def cancel(self):
         self.cancelled = True
-        self._released.set()  # release a blocked run() at once -> deterministic reap
+        if not self._terminate_resistant:
+            self._released.set()  # a SIGTERM-responsive child exits on cancel()
+
+    def kill(self):
+        self.killed = True
+        self._released.set()  # SIGKILL always releases -> deterministic reap
 
 
 class MultiplexWaitTest(unittest.TestCase):
@@ -201,6 +213,52 @@ class MultiplexWaitTest(unittest.TestCase):
         alive = [th for th in threading.enumerate() if th.name.startswith("reconcile-wait-")]
         self.assertEqual(alive, [])
 
+    def test_terminate_resistant_wait_is_escalated_to_kill_and_reaped(self):
+        # review R8-F2: a losing wait that IGNORES cancel() (SIGTERM) must be escalated to kill()
+        # (SIGKILL) and joined — not abandoned as a daemon. The reap ladder proves the worker exited.
+        import threading
+
+        waits = {
+            "tA": _FakeWait(block=True, wake=False, terminate_resistant=True),
+            "tB": _FakeWait(wake=True),
+        }
+        targets = [_t("ws1", "1", "la", "tA"), _t("ws1", "2", "lb", "tB")]
+        signal, woken = multiplex_wait(
+            targets, wait_builder=lambda t: waits[t.target], cancel_grace=0.05
+        )
+        self.assertEqual(woken.target, "tB")
+        self.assertTrue(waits["tA"].cancelled)  # SIGTERM tried first
+        self.assertTrue(waits["tA"].killed)     # then escalated to SIGKILL (it ignored SIGTERM)
+        alive = [th for th in threading.enumerate() if th.name.startswith("reconcile-wait-")]
+        self.assertEqual(alive, [])  # the worker was deterministically joined, not abandoned
+
+
+class HerdrChildReapTest(unittest.TestCase):
+    """review R8-F2: a real SIGTERM-ignoring OS child is force-killed and reaped (poll not None)."""
+
+    def test_sigterm_ignoring_child_is_killed_and_reaped(self):
+        import sys as _sys
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_event_pump import (
+            HerdrCancellableWait,
+        )
+
+        # A real child that installs a SIGTERM handler (ignoring it) then sleeps: cancel() (SIGTERM)
+        # cannot stop it; only kill() (SIGKILL) can. The wait must reap it via communicate().
+        child_src = "import signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n"
+        argv = [_sys.executable, "-c", child_src]
+        loser = HerdrCancellableWait(argv, outer_timeout=60.0)
+        woke = _FakeWait(wake=True)
+        targets = [_t("ws1", "1", "la", "loser"), _t("ws1", "2", "lb", "woke")]
+        builder = {"loser": loser, "woke": woke}
+        signal, woken = multiplex_wait(
+            targets, wait_builder=lambda t: builder[t.target], cancel_grace=0.3, reap_timeout=5.0
+        )
+        self.assertEqual(woken.target, "woke")
+        # the SIGTERM-ignoring child was SIGKILL'd and reaped (its Popen has an exit code now).
+        self.assertIsNotNone(loser._proc)
+        self.assertIsNotNone(loser._proc.poll())  # reaped, not left running
+
 
 class ProcessExitTimeTest(unittest.TestCase):
     """review R7-F1: a losing wait must not pin the CLI *process* exit time (daemon + bounded reap)."""
@@ -222,11 +280,15 @@ class ProcessExitTimeTest(unittest.TestCase):
             "        time.sleep(30)\n"
             "        return False\n"
             "    def cancel(self):\n"
-            "        pass\n"  # cancel cannot release this one -> relies on daemon + bounded reap
+            "        pass\n"  # neither cancel nor kill can release this one -> daemon + bounded reap
+            "    def kill(self):\n"
+            "        pass\n"
             "class Woke:\n"
             "    def run(self):\n"
             "        return True\n"
             "    def cancel(self):\n"
+            "        pass\n"
+            "    def kill(self):\n"
             "        pass\n"
             "def b(t):\n"
             "    return Stuck() if t.target == 'stuck' else Woke()\n"

@@ -59,12 +59,19 @@ DISPATCH_SENDABLE = frozenset({DISPATCH_WRITTEN, DISPATCH_RECOVERED})
 
 @dataclass(frozen=True)
 class DispatchRoute:
-    """The route identity the gated IR handoff needs — validated non-empty before any write (R7-F4)."""
+    """The route identity the gated IR handoff needs — validated before any write (R7-F4 / R8-F3).
+
+    ``gateway_callback_target`` is the same-lane gateway the ``implementation_worker`` role template
+    requires (its ``<gateway_callback_target>`` placeholder); without it the emitted profile carries
+    an unresolved placeholder (review R8-F3). ``durable_anchor`` is NOT carried here — the handoff
+    auto-fills it from the anchor pointer.
+    """
 
     to: str
     target: str
     target_repo: str
     lane: str
+    gateway_callback_target: str
     role_profile: str = DISPATCH_ROLE_PROFILE
     source: str = "redmine"
 
@@ -72,9 +79,55 @@ class DispatchRoute:
         """The required identity fields that are empty (a non-empty result blocks the dispatch)."""
         required = {
             "to": self.to, "target": self.target, "target_repo": self.target_repo,
-            "lane": self.lane, "role_profile": self.role_profile,
+            "lane": self.lane, "gateway_callback_target": self.gateway_callback_target,
+            "role_profile": self.role_profile,
         }
         return tuple(k for k, v in required.items() if not str(v or "").strip())
+
+
+@dataclass(frozen=True)
+class DispatchVocabulary:
+    """The handoff vocabularies + role placeholders a route is validated against BEFORE any write.
+
+    Reuses the f_130 handoff contract (``receiver_choices`` / ``SOURCES`` / ``ROLE_PROFILE_TOKENS`` /
+    ``template_placeholders``) so a route the handoff parser would reject never writes a marker
+    journal first (review R8-F3). ``required_placeholders`` maps a role to its template placeholders;
+    ``autofilled_placeholders`` are the ones the handoff resolves itself (``durable_anchor`` /
+    ``redmine_project``), so they are not required on the route.
+    """
+
+    receivers: frozenset
+    sources: frozenset
+    role_profiles: frozenset
+    required_placeholders: dict
+    autofilled_placeholders: frozenset
+
+
+def validate_dispatch_route(route: DispatchRoute, vocab: DispatchVocabulary) -> "tuple[str, ...]":
+    """The route problems that must block a dispatch BEFORE any write (pure; empty tuple == valid).
+
+    Non-empty identity (:meth:`DispatchRoute.missing`) PLUS semantic validation against the handoff
+    vocabulary (review R8-F3): an unknown ``role_profile`` / ``to`` / ``source`` — which the handoff
+    parser would reject only AFTER the marker journal was written — and any REQUIRED role-template
+    placeholder that is neither auto-filled nor carried on the route (e.g. an implementation_worker
+    dispatch missing ``gateway_callback_target``) are all problems. Deterministically ordered.
+    """
+    problems = list(route.missing())
+    role = str(route.role_profile or "").strip()
+    if role and role not in vocab.role_profiles:
+        problems.append(f"role_profile:{role}")
+        return tuple(problems)  # can't resolve placeholders for an unknown role
+    if route.to and str(route.to).strip() not in vocab.receivers:
+        problems.append(f"to:{route.to}")
+    if route.source and str(route.source).strip() not in vocab.sources:
+        problems.append(f"source:{route.source}")
+    supplied = {"lane": route.lane, "gateway_callback_target": route.gateway_callback_target}
+    for placeholder in vocab.required_placeholders.get(role, ()):
+        if placeholder in vocab.autofilled_placeholders:
+            continue  # the handoff resolves durable_anchor / redmine_project itself
+        if not str(supplied.get(placeholder, "") or "").strip():
+            problems.append(f"placeholder:{placeholder}")
+    return tuple(problems)
 
 
 @dataclass(frozen=True)
@@ -123,6 +176,7 @@ def build_ir_handoff_argv(anchor: str, route: DispatchRoute, *, issue: str) -> "
         "--kind", "implementation_request",
         "--role-profile", str(route.role_profile),
         "--profile-field", f"lane={route.lane}",
+        "--profile-field", f"gateway_callback_target={route.gateway_callback_target}",
     ]
 
 
@@ -133,6 +187,7 @@ def dispatch_implementation_request(
     lane_generation: object,
     body: str,
     route: DispatchRoute,
+    vocab: DispatchVocabulary,
     post_note: Callable[[str, str], object],
     read_entries: Callable[[str], "Iterable[RedmineJournalEntry]"],
     handoff_send: Callable[[str], HandoffOutcome],
@@ -142,7 +197,9 @@ def dispatch_implementation_request(
     The production write -> readback -> handoff sequence (Design Answer j#79507 Q2; review R7),
     injected so it is test-pinned against real Redmine journal shapes:
 
-    - **R7-F4** — ``route.missing()`` non-empty -> :data:`DISPATCH_INPUT_INVALID`, no write, not sendable;
+    - **R7-F4 / R8-F3** — :func:`validate_dispatch_route` (non-empty identity + handoff vocabulary +
+      required role placeholders, incl. ``gateway_callback_target``) non-empty -> :data:`DISPATCH_INPUT_INVALID`,
+      no write, not sendable (a route the handoff parser would reject never writes a marker first);
     - **R7-F3** — a PRE-READ counts current dispatch markers for ``(lane, lane_generation)``: exactly
       one -> recover that owning journal id with NO new write; two-or-more -> :data:`DISPATCH_ANCHOR_UNRESOLVED`
       (never add a further marker); a pre-read failure -> :data:`DISPATCH_READBACK_FAILED` with NO write
@@ -162,10 +219,12 @@ def dispatch_implementation_request(
             dispatch_journal=dispatch_journal, handoff_delivered=handoff_delivered, detail=detail,
         )
 
-    # R7-F4: a request the handoff primitive could not accept never writes and is never sendable.
-    missing = route.missing()
-    if missing:
-        return _result(DISPATCH_INPUT_INVALID, detail=f"missing_route_identity:{','.join(missing)}")
+    # R7-F4 / R8-F3: a route the handoff parser would reject (empty identity, an unknown
+    # receiver/source/role vocabulary, or an unresolved required role placeholder) never writes a
+    # marker journal first and is never sendable.
+    problems = validate_dispatch_route(route, vocab)
+    if problems:
+        return _result(DISPATCH_INPUT_INVALID, detail=f"invalid_route:{','.join(problems)}")
 
     # R7-F3: pre-read idempotency — never write a duplicate marker.
     try:
@@ -242,6 +301,43 @@ def build_live_ir_dispatch() -> "tuple[Callable[[str, str], object], Callable[[s
     return _post_note, _read_entries
 
 
+def build_live_vocabulary() -> DispatchVocabulary:
+    """Build the live route vocabulary from the f_130 handoff contract (review R8-F3).
+
+    Reuses the SINGLE source of truth for the handoff receiver / source / role vocabularies and the
+    role-template placeholders, so a route this validator accepts is one the handoff parser accepts
+    (no drift): a rejected route fails closed BEFORE writing a marker journal. ``durable_anchor`` /
+    ``redmine_project`` are the handoff's own send-time auto-fills, so they are not required on the route.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import SOURCES
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
+        ROLE_PROFILE_TOKENS,
+        template_placeholders,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_receiver_vocab import (
+        receiver_choices,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (
+        DURABLE_ANCHOR_FIELD,
+        REDMINE_PROJECT_FIELD,
+    )
+
+    roles = frozenset(ROLE_PROFILE_TOKENS)
+    required: dict = {}
+    for role in roles:
+        try:
+            required[role] = template_placeholders(role)
+        except Exception:  # noqa: BLE001 - an unknown role has no resolvable placeholders
+            required[role] = ()
+    return DispatchVocabulary(
+        receivers=frozenset(receiver_choices()),
+        sources=frozenset(SOURCES),
+        role_profiles=roles,
+        required_placeholders=required,
+        autofilled_placeholders=frozenset({DURABLE_ANCHOR_FIELD, REDMINE_PROJECT_FIELD}),
+    )
+
+
 def build_live_handoff_send(*, issue: str, route: DispatchRoute) -> Callable[[str], HandoffOutcome]:
     """Build the live handoff port: drive the gated ``handoff send`` in-process, return its outcome.
 
@@ -254,16 +350,23 @@ def build_live_handoff_send(*, issue: str, route: DispatchRoute) -> Callable[[st
 
     def _send(anchor: str) -> HandoffOutcome:
         from mozyo_bridge.application.cli import build_parser, normalize_paths
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (
+            delivery_was_positive,
+        )
 
         argv = build_ir_handoff_argv(anchor, route, issue=issue)
         try:
             args = normalize_paths(build_parser().parse_args(argv))
-            rc = int(args.func(args))
+            args.func(args)  # rc is NOT delivery proof (review R8-F1); read the structured outcome
         except SystemExit as exc:  # argparse / gate refusal -> non-delivery, never crash the caller
             return HandoffOutcome(delivered=False, detail=f"handoff_exit:{exc.code}")
         except Exception as exc:  # noqa: BLE001 - a drive failure is a fail-closed non-delivery
             return HandoffOutcome(delivered=False, detail=f"handoff_error:{type(exc).__name__}")
-        return HandoffOutcome(delivered=(rc == 0), detail="" if rc == 0 else f"handoff_rc:{rc}")
+        # Positive delivery is the published structured outcome (status=sent AND reason=ok), NOT
+        # rc == 0: a pending_input (Enter never pressed) and a marker-unobserved queue_enter both
+        # exit 0 without the worker actually receiving the input (review R8-F1).
+        delivered = delivery_was_positive(args)
+        return HandoffOutcome(delivered=delivered, detail="" if delivered else "not_positively_delivered")
 
     return _send
 
@@ -280,10 +383,13 @@ __all__ = (
     "DISPATCH_HANDOFF_FAILED",
     "DISPATCH_SENDABLE",
     "DispatchRoute",
+    "DispatchVocabulary",
     "HandoffOutcome",
     "IrDispatchResult",
+    "validate_dispatch_route",
     "build_ir_handoff_argv",
     "dispatch_implementation_request",
     "build_live_ir_dispatch",
+    "build_live_vocabulary",
     "build_live_handoff_send",
 )

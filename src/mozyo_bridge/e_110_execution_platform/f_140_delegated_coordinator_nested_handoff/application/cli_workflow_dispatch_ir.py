@@ -3,19 +3,21 @@
 `mozyo-bridge workflow dispatch-ir` is the production entry point that makes the reconciler's exact
 dispatch anchor durable: it writes the Implementation Request journal with the machine dispatch
 marker embedded (Design Answer j#79507 Q2), reads back the marker's OWNING journal id, and — only on
-a single resolved anchor — prints the gated `handoff send ... --journal <anchor>` command anchored on
-that journal id. The write -> readback -> handoff sequence and its fail-closed cases live in the pure
+a single resolved anchor — SENDS the gated `handoff send ... --journal <anchor>` to the worker
+agent. The write -> readback -> handoff sequence and its fail-closed cases live in the pure
 :func:`...application.reconcile_dispatch_writer.dispatch_implementation_request`; this is the thin CLI
-that owns argv, stdout, and the live-transport composition.
+that owns argv, stdout, and the live composition.
 
 Modes:
 
 - default (dry-run) — compose the marker-bearing note and print it for preview; **no** Redmine write,
-  no handoff. The operator sees the exact journal body (marker included) that ``--execute`` would post.
-- ``--execute`` — write the note as a Redmine journal via the opt-in-gated live transport, read the
-  journal back, resolve the anchor, and print the gated handoff command. A write / readback failure or
-  an unresolved / ambiguous anchor fails closed (exit 2, an explicit redacted reason on stderr, no
-  handoff) — the durable dispatch intent still persists for a later readback-recovery.
+  **no** handoff send. The operator sees the exact journal body (marker included) ``--execute`` would post.
+- ``--execute`` — performs SIDE EFFECTS: it writes the note as a Redmine journal (opt-in-gated live
+  transport), reads the journal back, resolves the anchor, and then **sends a live handoff to the
+  worker agent** (the gated `handoff send`). Only a positively-delivered handoff is reported success;
+  a missing/invalid route, a write / readback failure, an unresolved / ambiguous anchor, or a
+  non-delivered handoff fails closed (exit 2, an explicit redacted reason on stderr) — the durable
+  dispatch intent still persists for a later readback-recovery.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DispatchRoute,
     build_live_handoff_send,
     build_live_ir_dispatch,
+    build_live_vocabulary,
     dispatch_implementation_request,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
@@ -52,12 +55,13 @@ def _dispatch_body(args: argparse.Namespace) -> str:
 
 
 def _route_from_args(args: argparse.Namespace, lane: str) -> DispatchRoute:
-    """Build the handoff route identity from args (validated non-empty in the use case, R7-F4)."""
+    """Build the handoff route identity from args (validated against the vocabulary in the use case)."""
     return DispatchRoute(
         to=str(getattr(args, "to", None) or "claude"),
         target=str(getattr(args, "target", "") or ""),
         target_repo=str(getattr(args, "target_repo", "") or ""),
         lane=lane,
+        gateway_callback_target=str(getattr(args, "gateway_callback_target", "") or ""),
         role_profile=str(getattr(args, "role_profile", None) or DISPATCH_ROLE_PROFILE),
         source=str(getattr(args, "source", None) or "redmine"),
     )
@@ -78,14 +82,15 @@ def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
 
     if not getattr(args, "execute", False):
         note = render_dispatch_note(body, lane=lane, lane_generation=generation)
-        print("dispatch-ir (dry-run: no Redmine write, no handoff). Marker-bearing IR journal body:")
+        print("dispatch-ir (dry-run: no Redmine write, no handoff send). Marker-bearing IR journal body:")
         print(note)
         print(
-            "\nRun with --execute to write this journal, resolve the dispatch anchor, and hand off."
+            "\nRun with --execute to write this journal, resolve the anchor, and SEND the live handoff."
         )
         return 0
 
     route = _route_from_args(args, lane)
+    vocab = build_live_vocabulary()
     post_note, read_entries = build_live_ir_dispatch()
     handoff_send = build_live_handoff_send(issue=issue, route=route)
 
@@ -95,6 +100,7 @@ def cmd_workflow_dispatch_ir(args: argparse.Namespace) -> int:
         lane_generation=generation,
         body=body,
         route=route,
+        vocab=vocab,
         post_note=post_note,
         read_entries=read_entries,
         handoff_send=handoff_send,
@@ -118,15 +124,17 @@ def register_dispatch_ir(workflow_sub) -> None:
         "dispatch-ir",
         description=(
             "Canonical Implementation Request writer (Redmine #13758). Writes the IR journal with "
-            "the durable dispatch marker embedded, reads back the marker's owning journal id, and "
-            "prints the gated `handoff send --journal <anchor>` command anchored on it — so the "
-            "reconciler can correlate the Herdr turn edge against the exact dispatch anchor. Default "
-            "is a dry-run preview (no Redmine write); --execute writes + resolves + emits. A write / "
-            "readback failure or an unresolved / ambiguous anchor fails closed (no handoff)."
+            "the durable dispatch marker embedded, reads back the marker's owning journal id, and — "
+            "with --execute — SENDS the gated `handoff send --journal <anchor>` live to the worker "
+            "agent, so the reconciler can correlate the Herdr turn edge against the exact dispatch "
+            "anchor. Default is a dry-run preview (no Redmine write, no handoff send). --execute "
+            "performs SIDE EFFECTS: the Redmine journal write AND the live agent handoff. A missing/"
+            "invalid route, a write / readback failure, an unresolved / ambiguous anchor, or a "
+            "non-delivered handoff all fail closed (exit 2)."
         ),
         help=(
-            "Write the canonical marker-bearing Implementation Request journal and print its "
-            "anchored handoff command (dry-run preview by default; --execute to write)."
+            "Write the canonical marker-bearing Implementation Request journal and SEND its anchored "
+            "live handoff to the worker (dry-run preview by default; --execute performs the side effects)."
         ),
     )
     p.add_argument("--issue", required=True, help="The Redmine issue id the IR journal is written on.")
@@ -149,6 +157,11 @@ def register_dispatch_ir(workflow_sub) -> None:
              "closed as input_invalid before any write).",
     )
     p.add_argument(
+        "--gateway-callback-target", dest="gateway_callback_target",
+        help="The same-lane gateway callback target the implementation_worker role profile requires "
+             "(REQUIRED for --execute; an unresolved placeholder fails closed before any write).",
+    )
+    p.add_argument(
         "--role-profile", dest="role_profile", default=DISPATCH_ROLE_PROFILE,
         help=f"The handoff role profile (--execute; default {DISPATCH_ROLE_PROFILE}).",
     )
@@ -156,7 +169,8 @@ def register_dispatch_ir(workflow_sub) -> None:
     p.add_argument("--to", default="claude", help="The handoff --to receiver (--execute; default claude).")
     p.add_argument(
         "--execute", action="store_true",
-        help="Write the IR journal + resolve the anchor + emit the handoff (default: dry-run preview).",
+        help="SIDE EFFECTS: write the IR journal, resolve the anchor, and SEND the live agent handoff "
+             "(default: dry-run preview, no write, no send).",
     )
     p.set_defaults(func=cmd_workflow_dispatch_ir)
 

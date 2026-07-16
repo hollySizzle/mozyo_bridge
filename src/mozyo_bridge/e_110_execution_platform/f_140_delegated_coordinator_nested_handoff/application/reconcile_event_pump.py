@@ -63,21 +63,24 @@ class EventPumpTarget:
     target: str  # the stable assigned Herdr agent name/id for ``wait agent-status``
 
 
-#: The bounded join each detached wait thread gets when the multiplex reaps it after a first wake.
-#: A cancel() terminates the child, so the thread normally exits well inside this; the bound only
-#: caps a pathological stuck child (a daemon thread, so it never blocks interpreter exit either).
+#: The grace a SIGTERM'd wait gets to exit before the reap escalates to SIGKILL (review R8-F2).
+WAIT_CANCEL_GRACE_SECONDS = 0.5
+#: The bounded join a SIGKILL'd wait thread gets to finish its reap. SIGKILL cannot be ignored, so
+#: the child dies and ``communicate()`` returns well inside this; the bound only caps a pathological
+#: post-kill hang (a daemon thread, so it never blocks interpreter exit either).
 WAIT_REAP_TIMEOUT_SECONDS = 5.0
 
 
 class CancellableWait:
-    """A bounded Herdr wait that can be CANCELLED (review R7-F1).
+    """A bounded Herdr wait that can be CANCELLED and force-KILLED (review R7-F1 / R8-F2).
 
     ``run()`` blocks on the wait and returns truthy (observed the change / woke), falsy (bounded
-    timeout), or raises :class:`HerdrWaitError`. ``cancel()`` deterministically stops the underlying
-    child so :func:`multiplex_wait` can reap the losing waits after a first wake instead of leaking
-    a ~50s ``herdr wait`` per idle target (the old ``ThreadPoolExecutor.shutdown(wait=False)`` could
-    neither stop a running future nor avoid the interpreter's atexit join). Subclasses implement the
-    concrete child; both methods are idempotent and thread-safe.
+    timeout), or raises :class:`HerdrWaitError`. ``cancel()`` requests a graceful stop (SIGTERM) and
+    ``kill()`` forces it (SIGKILL) so :func:`multiplex_wait` can DETERMINISTICALLY reap the losing
+    waits after a first wake — even a terminate-resistant child — instead of leaking a ~50s ``herdr
+    wait`` per idle target (the old ``ThreadPoolExecutor.shutdown(wait=False)`` could neither stop a
+    running future nor avoid the interpreter's atexit join). ``kill()`` defaults to ``cancel()``;
+    all methods are idempotent and thread-safe.
     """
 
     def run(self) -> object:  # pragma: no cover - abstract
@@ -85,6 +88,10 @@ class CancellableWait:
 
     def cancel(self) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def kill(self) -> None:
+        """Force-stop (default: escalate to :meth:`cancel`); overridden for a real child (SIGKILL)."""
+        self.cancel()
 
 
 class _TimeoutOnlyWait(CancellableWait):
@@ -98,14 +105,16 @@ class _TimeoutOnlyWait(CancellableWait):
 
 
 class HerdrCancellableWait(CancellableWait):
-    """A cancellable ``herdr wait agent-status`` over a killable :class:`subprocess.Popen` (R7-F1).
+    """A cancellable ``herdr wait agent-status`` over a killable :class:`subprocess.Popen` (R7-F1/R8-F2).
 
-    ``run()`` spawns the child and blocks on it (bounded by the outer timeout); ``cancel()``
-    terminates it so a losing wait is reaped in ~ms after the winning target wakes, rather than
-    running out its full ``--timeout``. Distinguishes the same outcomes as the shared
-    ``build_herdr_event_wait`` (rc 0 -> woke; a herdr bounded-timeout stderr -> falsy; any other
-    non-zero / spawn / outer-timeout -> :class:`HerdrWaitError`), but owns the ``Popen`` so it is
-    interruptible. ``runner`` stays injectable for a hermetic argv-capture test.
+    ``run()`` spawns the child and blocks on it (bounded by the outer timeout); ``cancel()`` sends
+    SIGTERM and ``kill()`` sends SIGKILL, so a losing wait is reaped in ~ms after the winning target
+    wakes rather than running out its full ``--timeout`` — and a child that IGNORES SIGTERM is still
+    forcibly reaped (review R8-F2). The blocking ``communicate()`` in ``run()`` performs the actual
+    reap once the signal lands, so :func:`multiplex_wait` joining the worker thread proves the child
+    exited. Distinguishes the same outcomes as the shared ``build_herdr_event_wait`` (rc 0 -> woke; a
+    herdr bounded-timeout stderr -> falsy; any other non-zero / spawn / outer-timeout ->
+    :class:`HerdrWaitError`). ``runner`` stays injectable for a hermetic argv-capture test.
     """
 
     _TIMEOUT_TOKENS = ("timed out", "timeout", "no change", "deadline")
@@ -130,13 +139,13 @@ class HerdrCancellableWait(CancellableWait):
             )
         proc = self._proc
         try:
-            _, stderr = proc.communicate(timeout=self._outer)
+            _, stderr = proc.communicate(timeout=self._outer)  # reaps the child when it exits
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.communicate()
+            proc.communicate()  # reap the hung child
             raise HerdrWaitError("herdr wait outer timeout (hung child killed)")
         if self._cancelled:
-            return False  # a cancel() raced the completion -> treat as a benign timeout
+            return False  # a cancel()/kill() raced the completion -> treat as a benign timeout
         return self._interpret(proc.returncode, stderr or "")
 
     def _interpret(self, rc: int, stderr: str) -> object:
@@ -147,34 +156,44 @@ class HerdrCancellableWait(CancellableWait):
             return False
         raise HerdrWaitError(f"herdr wait exited {rc} without a timeout indicator")
 
-    def cancel(self) -> None:
+    def _signal(self, force: bool) -> None:
         with self._lock:
             self._cancelled = True
             proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001 - already-exited child; nothing to reap
+                proc.kill() if force else proc.terminate()
+            except Exception:  # noqa: BLE001 - already-exited child; nothing to signal
                 pass
+
+    def cancel(self) -> None:
+        self._signal(force=False)  # SIGTERM (graceful)
+
+    def kill(self) -> None:
+        self._signal(force=True)  # SIGKILL (a terminate-resistant child cannot ignore this)
 
 
 def multiplex_wait(
     targets: Sequence[EventPumpTarget],
     *,
     wait_builder: Callable[[EventPumpTarget], CancellableWait],
+    cancel_grace: float = WAIT_CANCEL_GRACE_SECONDS,
     reap_timeout: float = WAIT_REAP_TIMEOUT_SECONDS,
 ) -> "tuple[WakeSignal, Optional[EventPumpTarget]]":
     """Arm every target's bounded wait CONCURRENTLY, return the FIRST that wakes, then REAP the rest.
 
-    Review R6-F2 / R7-F1: a serial loop would block every other target's ``busy -> turn_ended`` edge
-    behind the first target's whole bounded wait, so all target waits are armed together (one daemon
-    thread each — NOT a ``ThreadPoolExecutor``, whose atexit join would pin the process to the
-    slowest idle wait) and the FIRST target that observes the change (``WAKE_WOKE``) wins. The losing
-    waits are then **cancelled and reaped deterministically**: ``cancel()`` terminates each child so
-    its thread exits in ~ms, and every thread is joined (bounded) before returning — no ~50s
-    ``herdr wait`` lingers into the next iteration or the CLI's exit. If none woke, the LAST observed
-    non-woke signal (timeout / error) and no target are returned — the pump then still runs the
-    bounded whole-roster reconciliation. Empty targets -> a benign timeout signal.
+    Review R6-F2 / R7-F1 / R8-F2: a serial loop would block every other target's ``busy ->
+    turn_ended`` edge behind the first target's whole bounded wait, so all target waits are armed
+    together (one daemon thread each — NOT a ``ThreadPoolExecutor``, whose atexit join would pin the
+    process to the slowest idle wait) and the FIRST target that observes the change (``WAKE_WOKE``)
+    wins. The losing waits are then reaped with an **escalating, deterministic ladder**: ``cancel()``
+    (SIGTERM) every wait, join each thread for ``cancel_grace``; any thread still alive gets
+    ``kill()`` (SIGKILL — a terminate-resistant child cannot ignore it) and a further bounded join.
+    ``communicate()`` in the wait reaps the child once the signal lands, so a joined thread proves
+    its child exited — no ~50s ``herdr wait`` (or a SIGTERM-ignoring one) survives into the next
+    iteration or the CLI's exit. If none woke, the LAST observed non-woke signal (timeout / error)
+    and no target are returned — the pump then still runs the bounded whole-roster reconciliation.
+    Empty targets -> a benign timeout signal.
     """
     tlist = [t for t in (targets or ())]
     if not tlist:
@@ -206,16 +225,25 @@ def multiplex_wait(
             won = (signal, t)  # first observed turn-end edge wins
             break
         last = signal
-    # Deterministic reap: cancel every wait (idempotent no-op for the finished one), then join the
-    # detached threads (bounded) so no losing herdr child survives into the next arm.
-    for w in waits:
-        try:
-            w.cancel()
-        except Exception:  # noqa: BLE001 - a cancel failure must not block the reap of the others
-            pass
-    for th in threads:
-        th.join(timeout=reap_timeout)
+    _reap_waits(waits, threads, cancel_grace=cancel_grace, reap_timeout=reap_timeout)
     return won if won is not None else (last, None)
+
+
+def _reap_waits(waits, threads, *, cancel_grace: float, reap_timeout: float) -> None:
+    """Deterministically stop + join every wait: SIGTERM, grace, then SIGKILL the stragglers (R8-F2)."""
+    def _safe(fn) -> None:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 - a signal failure must not block reaping the others
+            pass
+
+    for w in waits:
+        _safe(w.cancel)  # SIGTERM every wait (idempotent no-op for the finished one)
+    for th, w in zip(threads, waits):
+        th.join(timeout=cancel_grace)
+        if th.is_alive():
+            _safe(w.kill)  # a child that ignored SIGTERM: escalate to SIGKILL, then reap
+            th.join(timeout=reap_timeout)
 
 
 def _run_supervisor_pass(

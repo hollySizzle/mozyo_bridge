@@ -34,6 +34,7 @@ def _args(**kw):
     base = dict(
         issue="13758", lane="lane-a", generation="1", body="## Gate: Implementation Request",
         body_file=None, target="mzb1_ws1_claude_la", target_repo="/repos/mozyo",
+        gateway_callback_target="mzb1_ws1_codex_la",
         role_profile="implementation_worker", source="redmine", to="claude", execute=False,
     )
     base.update(kw)

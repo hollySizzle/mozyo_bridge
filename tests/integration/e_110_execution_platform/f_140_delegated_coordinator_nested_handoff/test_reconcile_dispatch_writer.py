@@ -34,7 +34,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DispatchRoute,
     HandoffOutcome,
     build_ir_handoff_argv,
+    build_live_vocabulary,
     dispatch_implementation_request,
+    validate_dispatch_route,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalEntry,
@@ -42,8 +44,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_dispatch_marker,
 )
 
+# Use the REAL handoff vocabulary (packaged role templates + receiver/source sets) so the tests
+# pin the production route contract, not a hand-rolled stand-in (review R8-F3).
+_VOCAB = build_live_vocabulary()
 _ROUTE = DispatchRoute(
     to="claude", target="mzb1_ws1_claude_la", target_repo="/repos/mozyo", lane="lane-a",
+    gateway_callback_target="mzb1_ws1_codex_la",
 )
 
 
@@ -83,11 +89,11 @@ class _Handoff:
         return HandoffOutcome(delivered=self._delivered, detail="" if self._delivered else "blocked")
 
 
-def _dispatch(redmine, handoff, *, route=_ROUTE, lane="lane-a", generation=1, issue="13758"):
+def _dispatch(redmine, handoff, *, route=_ROUTE, vocab=_VOCAB, lane="lane-a", generation=1, issue="13758"):
     return dispatch_implementation_request(
         issue=issue, lane=lane, lane_generation=generation,
         body="## Gate: Implementation Request\nevent-driven reconcile",
-        route=route, post_note=redmine.post_note, read_entries=redmine.read_entries,
+        route=route, vocab=vocab, post_note=redmine.post_note, read_entries=redmine.read_entries,
         handoff_send=handoff,
     )
 
@@ -178,7 +184,7 @@ class FailClosedTest(unittest.TestCase):
             raise RuntimeError("redmine write down")
 
         result = dispatch_implementation_request(
-            issue="13758", lane="lane-a", lane_generation=1, body="body", route=_ROUTE,
+            issue="13758", lane="lane-a", lane_generation=1, body="body", route=_ROUTE, vocab=_VOCAB,
             post_note=boom_post, read_entries=redmine.read_entries, handoff_send=handoff,
         )
         self.assertEqual(result.status, DISPATCH_WRITE_FAILED)
@@ -188,13 +194,72 @@ class FailClosedTest(unittest.TestCase):
     def test_missing_route_identity_fails_closed_no_write(self):
         # review R7-F4: an empty --target / --target-repo never writes and is never sendable.
         redmine, handoff = _FakeRedmine(), _Handoff()
-        bad = DispatchRoute(to="claude", target="", target_repo="", lane="lane-a")
+        bad = DispatchRoute(
+            to="claude", target="", target_repo="", lane="lane-a", gateway_callback_target="gw",
+        )
         result = _dispatch(redmine, handoff, route=bad)
         self.assertEqual(result.status, DISPATCH_INPUT_INVALID)
         self.assertFalse(result.sendable)
         self.assertEqual(redmine.posted, [])  # validated BEFORE any write
         self.assertEqual(handoff.calls, [])
         self.assertIn("target", result.detail)
+
+    def test_missing_gateway_callback_target_fails_closed_no_write(self):
+        # review R8-F3: the implementation_worker role template requires <gateway_callback_target>;
+        # omitting it is an unresolved placeholder that must fail closed BEFORE any write.
+        redmine, handoff = _FakeRedmine(), _Handoff()
+        bad = DispatchRoute(
+            to="claude", target="mzb1_ws1_claude_la", target_repo="/repos/mozyo", lane="lane-a",
+            gateway_callback_target="",
+        )
+        result = _dispatch(redmine, handoff, route=bad)
+        self.assertEqual(result.status, DISPATCH_INPUT_INVALID)
+        self.assertEqual(redmine.posted, [])
+        self.assertIn("gateway_callback_target", result.detail)
+
+    def test_invalid_vocabulary_fails_closed_before_write(self):
+        # review R8-F3: an unknown receiver/source/role the handoff parser would reject must NOT
+        # write a marker journal first (the old non-empty-only check let it through).
+        redmine, handoff = _FakeRedmine(), _Handoff()
+        for bad in (
+            DispatchRoute(to="not-a-provider", target="t", target_repo="/r", lane="lane-a",
+                          gateway_callback_target="gw"),
+            DispatchRoute(to="claude", target="t", target_repo="/r", lane="lane-a",
+                          gateway_callback_target="gw", source="not-a-source"),
+            DispatchRoute(to="claude", target="t", target_repo="/r", lane="lane-a",
+                          gateway_callback_target="gw", role_profile="not-a-role"),
+        ):
+            redmine.posted.clear()
+            result = _dispatch(redmine, handoff, route=bad)
+            self.assertEqual(result.status, DISPATCH_INPUT_INVALID)
+            self.assertEqual(redmine.posted, [])  # never wrote a marker for a parser-rejected route
+        self.assertEqual(handoff.calls, [])
+
+
+class DeliveryOutcomeTest(unittest.TestCase):
+    def test_only_a_positively_delivered_handoff_is_sendable(self):
+        # review R8-F1: a handoff whose structured outcome is not positive (e.g. pending_input /
+        # queue_enter, both rc 0) must NOT be reported delivered — the worker never got the input.
+        redmine, handoff = _FakeRedmine(), _Handoff(delivered=False)
+        result = _dispatch(redmine, handoff)
+        self.assertEqual(result.status, DISPATCH_HANDOFF_FAILED)
+        self.assertFalse(result.sendable)
+        self.assertFalse(result.handoff_delivered)
+        self.assertEqual(result.dispatch_journal, "79600")  # marker persists for a retry
+        self.assertEqual(handoff.calls, ["79600"])
+
+
+class RouteValidationTest(unittest.TestCase):
+    """review R8-F3: validate_dispatch_route pins the vocabulary + placeholder contract (pure)."""
+
+    def test_valid_worker_route_has_no_problems(self):
+        self.assertEqual(validate_dispatch_route(_ROUTE, _VOCAB), ())
+
+    def test_unknown_role_short_circuits(self):
+        bad = DispatchRoute(to="claude", target="t", target_repo="/r", lane="lane-a",
+                            gateway_callback_target="gw", role_profile="not-a-role")
+        problems = validate_dispatch_route(bad, _VOCAB)
+        self.assertIn("role_profile:not-a-role", problems)
 
 
 class HandoffArgvTest(unittest.TestCase):
@@ -205,8 +270,11 @@ class HandoffArgvTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--journal") + 1], "79600")
         self.assertEqual(argv[argv.index("--target-repo") + 1], "/repos/mozyo")
         self.assertEqual(argv[argv.index("--role-profile") + 1], "implementation_worker")
-        self.assertEqual(argv[argv.index("--profile-field") + 1], "lane=lane-a")
         self.assertEqual(argv[argv.index("--kind") + 1], "implementation_request")
+        # both role placeholders are carried (lane + the required gateway_callback_target).
+        pf = [argv[i + 1] for i, v in enumerate(argv) if v == "--profile-field"]
+        self.assertIn("lane=lane-a", pf)
+        self.assertIn("gateway_callback_target=mzb1_ws1_codex_la", pf)
 
 
 if __name__ == "__main__":
