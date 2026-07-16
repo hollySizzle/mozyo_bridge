@@ -22,7 +22,9 @@ the fix regress silently:
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import inspect
 import os
 import shutil
 import sqlite3
@@ -1643,6 +1645,79 @@ class ReviewJ80190LockProtocolTest(unittest.TestCase):
             self.assertTrue(result.backup_dir.exists())
 
 
+class ReviewJ80305FindingsTest(unittest.TestCase):
+    """j#80305: the module split must not break the surfaces it claimed to preserve."""
+
+    def test_r8f1_old_import_path_still_resolves_to_the_same_callable(self) -> None:
+        # The split was declared "public CLI / import preserving", then removed the symbol
+        # from the old module and from its __all__. Passing CLI tests never proved the old
+        # import path still worked — nothing pinned it, which is not the same as nothing
+        # depending on it.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as old_module,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            cmd_herdr_session_start as via_old_path,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_cli import (  # noqa: E501
+            cmd_herdr_session_start as via_new_path,
+        )
+
+        self.assertIn("cmd_herdr_session_start", old_module.__all__)
+        # Both paths must reach ONE handler: the facade forwards rather than duplicating.
+        args = argparse.Namespace()
+        seen: list = []
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start_cli.cmd_herdr_session_start",
+            lambda a: seen.append(a) or 0,
+        ):
+            via_old_path(args)
+        self.assertEqual(seen, [args], "the old path must delegate to the relocated handler")
+        self.assertTrue(callable(via_new_path))
+
+    def test_r8f2_public_signature_is_explicit_not_kwargs(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+
+        sig = inspect.signature(herdr_session_start.prepare_session)
+        params = sig.parameters
+        self.assertNotIn("kwargs", params, "the public contract must not collapse to **kwargs")
+        for required in ("repo_root", "providers", "lane_id", "env"):
+            self.assertIn(required, params)
+            self.assertIs(params[required].default, inspect.Parameter.empty)
+        for name, default in (
+            ("runner", None), ("dry_run", False), ("replacement_action_id", ""),
+        ):
+            self.assertEqual(params[name].default, default, f"{name} default changed")
+        self.assertTrue(
+            all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values()),
+            "the baseline contract is keyword-only",
+        )
+
+    def test_r8f2_invalid_call_is_rejected_before_any_side_effect(self) -> None:
+        # Argument binding at the public entry is what rejects a malformed call BEFORE the
+        # lock file exists. With **kwargs the bad call created the lock first and only then
+        # raised from the inner function — a side effect ahead of validation.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}):
+                with self.assertRaises(TypeError):
+                    herdr_session_start.prepare_session(unknown_argument=True)
+                with self.assertRaises(TypeError):
+                    herdr_session_start.prepare_session(repo_root=Path(tmp))  # missing args
+            self.assertFalse(
+                (home / ".herdr-identity-attestation.lock").exists(),
+                "a rejected call must not have created the lock file",
+            )
+            self.assertFalse(home.exists(), "nor the home")
+
+
 class ZeroSideEffectTest(unittest.TestCase):
     """Acceptance 1: an incompatible store creates no workspace / tab / agent."""
 
@@ -1725,9 +1800,10 @@ class ZeroSideEffectTest(unittest.TestCase):
         self.assertIn("blocking=False", wrapper, "admission must fail closed, not queue")
         self.assertIn("_prepare_session_locked", wrapper)
         # The whole run happens inside the lock: the call is nested under the `with`.
+        with_at = wrapper.index("with attestation_store_lock")
         self.assertLess(
-            wrapper.index("attestation_store_lock"),
-            wrapper.index("return _prepare_session_locked(**kwargs)", wrapper.index("with ")),
+            with_at,
+            wrapper.index("_prepare_session_locked(**call)", with_at),
             "the lock must be held across the entire run, not acquired after it",
         )
 
