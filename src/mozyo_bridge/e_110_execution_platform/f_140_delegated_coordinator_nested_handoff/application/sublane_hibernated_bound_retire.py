@@ -50,6 +50,22 @@ Action-time verification, every axis fail-closed (nothing is written unless ALL 
   measures only the *managed* roles, so a unit occupied solely by an unexpected provider
   measures zero live and would otherwise terminalize the row while that process is still
   running. The lane unit is not provably quiescent while anything occupies it.
+- **unambiguous** — no expected managed role may appear on more than one row
+  (:data:`BOUND_RETIRE_DUPLICATE_INVENTORY`) and no expected slot's row may lack a readable
+  locator unless the shared liveness contract positively calls it dead
+  (:data:`BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED`) — review j#80148.
+
+``expected_live_slots`` is an AGGREGATE and three facts fall out of it: unexpected occupants,
+duplicate multiplicity (roles collapse into a set), and rows with no locator (skipped). Its
+empty result therefore means "no expected role is live", never "the unit is empty". This
+surface's contract needs the second, stronger statement, so it reads ``expected_slot_rows``
+(the raw scan) alongside it and fails closed on each dropped fact. Reading the aggregate's
+empty result as absence is precisely the j#80115 / j#80148 fail-open, twice over.
+
+The bar for proceeding is **positive proof of deadness, never absence of proof of liveness**:
+``classify_named_slot`` is documented "conservative in the never-clobber direction" and reads a
+minimal row as live, so only a row it positively calls ``SLOT_STALE`` (a present-but-blank
+detected agent, or a present ``unknown`` status) counts as residue rather than a blocker.
 - **released bound state** — the bounded CAS additionally requires ``hibernated`` + durable
   ``released`` + a **non-empty, matching** ``worktree_identity`` + settled replacement, guarded
   on the row's exact revision (a revision race loses :data:`BOUND_RETIRE_REVISION_RACE`).
@@ -98,6 +114,20 @@ BOUND_RETIRE_LIVE_PAIR_PRESENT = "live_pair_present"
 #: permanently gone while a real process is still running in its unit — the acceptance's
 #: "foreign inventory is zero-write" axis.
 BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT = "foreign_inventory_present"
+#: More than one row in the targeted units carries the SAME expected managed role (review
+#: j#80148). A herdr assigned name is unique by construction, so a duplicate is a corrupt /
+#: ambiguous inventory — ``herdr_target_resolution`` refuses to *send* to one
+#: (``multiple_matches``: "refuse to guess"), and this refuses to terminalize off one. The
+#: aggregated ``expected_live_slots`` collapses roles into a set and cannot express it.
+BOUND_RETIRE_DUPLICATE_INVENTORY = "duplicate_inventory"
+#: An expected managed slot's row exists in the targeted units but carries NO locator, and the
+#: shared liveness contract does not positively call it dead (review j#80148).
+#: ``classify_named_slot`` returns ``SLOT_STALE`` only on a positive shell-residue signal and
+#: reads a minimal row as LIVE, so such a row is "cannot be resolved", never "absent" —
+#: ``herdr_target_resolution`` likewise refuses to send to it (``missing_locator``).
+#: Terminalizing off it would record the lane permanently gone on the *absence of proof of
+#: liveness* rather than on proof of absence.
+BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED = "expected_identity_unresolved"
 BOUND_RETIRE_HEAD_NOT_INTEGRATED = "head_not_integrated"
 #: The caller's ``--worktree`` is not actually checked out on the caller's ``--branch`` (a
 #: mismatch, a detached HEAD, or an unresolvable checkout). The clean / integrated evidence
@@ -219,7 +249,12 @@ def run_hibernated_bound_retire(
         REASON_PROVIDER_UNRESOLVED,
         REASON_WORKSPACE_UNRESOLVED,
         expected_live_slots,
+        expected_slot_rows,
         plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+        SLOT_STALE,
+        classify_named_slot,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
         attest_retire_target,
@@ -442,6 +477,37 @@ def run_hibernated_bound_retire(
         legacy_workspace_id=legacy_token,
         managed_roles=managed_roles,
     )
+    # The RAW scan of the targeted units, before the aggregation drops what this surface's
+    # contract needs (review j#80148). `expected_live_slots` answers "which expected roles are
+    # live?"; the acceptance asks "is every expected slot absent?" — a strictly stronger
+    # question the aggregate cannot answer, because it collapses roles into a set (losing
+    # duplicate multiplicity) and skips rows with no locator entirely.
+    candidates = expected_slot_rows(rows, plan, managed_roles=managed_roles)
+    # A herdr assigned name is unique by construction, so two rows claiming the same expected
+    # role is a corrupt / ambiguous inventory, not two slots. Checked BEFORE the live read: a
+    # duplicate pair carrying locators would otherwise be reported as an ordinary
+    # `live_pair_present`, which names the wrong problem — the inventory itself is unsound and
+    # no measurement taken from it can license a terminal write. `herdr_target_resolution`
+    # refuses to send to such a unit (`multiple_matches`: "refuse to guess"); this refuses to
+    # terminalize it, for the same reason.
+    seen_roles: dict[str, int] = {}
+    for role, _locator, _row in candidates:
+        seen_roles[role] = seen_roles.get(role, 0) + 1
+    duplicates = sorted(role for role, count in seen_roles.items() if count > 1)
+    if duplicates:
+        return _blocked(
+            BOUND_RETIRE_DUPLICATE_INVENTORY,
+            detail=(
+                "the lane unit's inventory carries more than one row for expected managed "
+                f"role(s) ({', '.join(duplicates)}); a herdr assigned name is unique, so this "
+                "is an ambiguous / corrupt inventory and no reading of it can prove the lane "
+                "quiescent — resolve the duplicate before a terminal retire"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            expected_live=expected_live_slots(rows, plan, managed_roles=managed_roles),
+            foreign_names=plan.foreign_names,
+        )
     live = expected_live_slots(rows, plan, managed_roles=managed_roles)
     if live:
         return _blocked(
@@ -450,6 +516,39 @@ def run_hibernated_bound_retire(
                 f"expected managed slot(s) are still live ({', '.join(live)}); the lane unit "
                 "is not live-zero, so this metadata-only terminal retire fails closed "
                 "(release / hibernate the pair first, or reconcile it)"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            expected_live=live,
+            foreign_names=plan.foreign_names,
+        )
+    # An expected slot's row with NO locator is the third thing the aggregate drops (review
+    # j#80148). It is NOT absence: the row is right there in the inventory, and the shared
+    # liveness contract reads a minimal one as LIVE — `classify_named_slot` returns SLOT_STALE
+    # *only* on a positive shell-residue signal (a present-but-blank detected agent, or a
+    # present `unknown` status), and is documented "conservative in the never-clobber
+    # direction". `herdr_target_resolution` refuses to send to such a row too
+    # (`missing_locator`: "refuse to send to a blank target").
+    #
+    # So the bar for proceeding is positive proof of DEADNESS, never absence of proof of
+    # liveness. A positively-stale row is genuine residue and does not block — blocking it
+    # would recreate this ticket's own defect (a lane stuck un-terminalizable forever) in a new
+    # shape. Anything else fails closed.
+    unresolved = sorted(
+        {
+            role
+            for role, locator, row in candidates
+            if not locator and classify_named_slot(row) != SLOT_STALE
+        }
+    )
+    if unresolved:
+        return _blocked(
+            BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED,
+            detail=(
+                f"expected managed slot(s) ({', '.join(unresolved)}) have a row in the lane "
+                "unit but no readable locator, and the shared liveness contract does not call "
+                "them dead; their identity cannot be resolved, so absence is unproven and the "
+                "terminal retire fails closed"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
@@ -631,6 +730,8 @@ __all__ = (
     "BOUND_RETIRE_BLOCKED",
     "BOUND_RETIRE_LIVE_PAIR_PRESENT",
     "BOUND_RETIRE_FOREIGN_INVENTORY_PRESENT",
+    "BOUND_RETIRE_DUPLICATE_INVENTORY",
+    "BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED",
     "BOUND_RETIRE_HEAD_NOT_INTEGRATED",
     "BOUND_RETIRE_WORKTREE_BRANCH_MISMATCH",
     "BOUND_RETIRE_LIFECYCLE_UNREADABLE",
