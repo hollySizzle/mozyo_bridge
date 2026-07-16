@@ -43,13 +43,18 @@ State machine
 - a PUT whose fate is unknown (timeout / exception / unresolved read-back) is ``uncertain`` and is
   never auto-retried;
 - there is no TTL and no reclaim. Recovery from ``reserved``/``uncertain`` is an operator act,
-  because only a human can tell whether the record actually landed.
+  because only a human can tell whether the record actually landed;
+- and there is no ``recover()`` at all, unlike every sibling store (R11-F1). Minting a fresh store
+  forgets live reservations, which is a reclaim of everything at once — the one thing this fence
+  exists to refuse. A lost store therefore stays fail-closed. See the comment where the sibling
+  stores' ``recover()`` would be.
 """
 
 from __future__ import annotations
 
 import secrets
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -232,17 +237,29 @@ class CallbackPublicationFence:
             f"callback publication fence {self.path} is in an inconsistent state (only one of the "
             f"DB / sidecar exists, or their nonces differ): a store loss or replacement. Refusing "
             f"to silently re-create, which would forget that a record was already published and "
-            f"let it be published again. Use recover() after reconciling against Redmine."
+            f"let it be published again. This fence has no recovery operation — see the module "
+            f"docstring; the sweep stays fail-closed until the store is restored."
         )
 
-    def recover(self) -> None:
-        """Deliberate, operator-gated loss recovery: a fresh store under a new nonce.
-
-        This FORGETS every reservation, so any record already published becomes publishable again.
-        Invoke only after reconciling the affected anchors against Redmine — the store cannot tell
-        you what landed; only Redmine can.
-        """
-        self._create_fresh(secrets.token_hex(16))
+    # NO recover() — deliberately, and unlike every sibling store (R11-F1).
+    #
+    # `CallbackSweepLease.recover()` and `DispatchOutboxFence.recover()` are sound because those
+    # stores are reclaimable by contract: the lease has a TTL and expects to be taken from a slow
+    # owner, and the outbox fence treats a lingering reservation as crash residue. This fence's
+    # entire contract is the opposite — a reservation is NEVER reclaimed — so "mint a fresh store
+    # and forget every reservation" is not recovery here. It is a reclaim of everything at once,
+    # performed on exactly the state that must not be reclaimed.
+    #
+    # It read as safe because it was spelled `--recover` and its help asked the operator to confirm
+    # no sweep was mid-attempt. But a request is not a fence: an owner suspended between its reserve
+    # and its PUT is invisible and unstoppable, and nothing local proves it will not resume. The
+    # probe in j#80395 ran exactly that sequence through a *healthy* store and got two records.
+    #
+    # So a lost store leaves this fence permanently fail-closed, and so does an owner that crashed
+    # while holding a reservation. That is the honest cost of the guarantee, not an oversight.
+    # Restoring availability needs a quiescence / owner-termination protocol that can actually prove
+    # the old owner cannot resume; that is follow-up work (j#80393 requirement 4), and until it
+    # exists there is no safe reset to offer.
 
     def _connect(self) -> sqlite3.Connection:
         sidecar_nonce = self._read_sidecar_nonce()
@@ -390,7 +407,7 @@ class CallbackPublicationFence:
         the two apart, which is exactly why it refuses to guess. ``uncertain`` means a PUT was
         started and its fate is unknown. Both stall their anchor until someone looks at Redmine.
         """
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT workspace_id, lane_id, issue, lane_generation, dispatch_anchor, outcome, "
                 "state, journal_id, detail FROM publication_fence WHERE state IN (?, ?) "
@@ -429,7 +446,7 @@ class CallbackPublicationFence:
         Raises :class:`CallbackPublicationFenceError` on any refused transition; the row is left
         exactly as it was.
         """
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT state FROM publication_fence WHERE workspace_id=? AND lane_id=? AND "

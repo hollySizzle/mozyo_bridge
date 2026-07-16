@@ -1306,17 +1306,83 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.assertTrue(self.pubfence.reserve(progress).may_publish)   # a distinct identity
         self.assertFalse(self.pubfence.reserve(stall).may_publish)     # but each only once
 
-    def test_publication_fence_store_loss_fails_closed_and_recover_is_the_way_out(self):
+    def test_a_lost_publication_store_stays_fail_closed_with_no_reset_offered(self):
+        # This test previously asserted that recover() was "the way out". It was the way BACK IN:
+        # minting a fresh store forgets live reservations, so the suspended owner and its
+        # replacement both publish (R11-F1). The sibling stores can offer recover() because they
+        # are reclaimable by contract; this one's contract is that a reservation is never
+        # reclaimed, so there is no safe reset to offer and a lost store stays closed.
         key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
                              dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
         self.pubfence.reserve(key)
         self.pubfence.sidecar_path.unlink()
+        self.assertFalse(hasattr(self.pubfence, "recover"), "a reset would forget live reservations")
         with self.assertRaises(CallbackPublicationFenceError):
             self.pubfence.bootstrap()
         with self.assertRaises(CallbackPublicationFenceError):
-            self.pubfence.reserve(key)              # forgetting a reservation would republish
-        self.pubfence.recover()
-        self.assertTrue(self.pubfence.reserve(key).may_publish)
+            self.pubfence.reserve(key)
+        with self.assertRaises(CallbackPublicationFenceError):
+            self.pubfence.pending()
+
+    def test_no_operator_reset_can_let_a_suspended_owner_be_double_published(self):
+        # j#80393 requirement 3, at the recorder level: A reserves and suspends before its PUT, an
+        # operator tries every reset the surface exposes, B attempts the same record, A resumes.
+        # Total publications must stay <= 1 no matter what the operator reached for.
+        posted = []
+        a_reserved = threading.Event()
+        b_done = threading.Event()
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                return [ir("79990")] + [entry(str(99000 + k), n) for k, n in enumerate(posted)]
+
+        wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
+                               lane_generation=GEN, latest_generation=GEN)
+        res = {"state": STATE_NO_PROGRESS_AFTER_HANDOFF, "dispatch_journal": "79990"}
+        a_grant = self.lease.acquire(self.key())
+
+        def a_put(issue_id, note):
+            a_reserved.set()
+            self.assertTrue(b_done.wait(timeout=5))
+            posted.append(note)
+
+        def operator_then_b():
+            self.assertTrue(a_reserved.wait(timeout=5))
+            # Every reset an operator can reach for, while A holds a live reservation:
+            self.assertFalse(hasattr(self.pubfence, "recover"))
+            with self.assertRaises(CallbackPublicationFenceError):
+                self.pubfence.reconcile(                       # "Redmine shows zero right now"
+                    PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE,
+                                   lane_generation=str(GEN), dispatch_anchor="79990",
+                                   outcome=STATE_NO_PROGRESS_AFTER_HANDOFF),
+                    published_journal=None,
+                )
+            self.lease.acquire(self.key(), now=time.time() + 99999)
+            try:
+                build_recovery_recorder(
+                    source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
+                    post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
+                    publication_fence=self.pubfence, workspace_id=WS,
+                )(res, wm)
+            except (RecordPublicationHeldError, RecordPublicationUncertainError):
+                pass
+            finally:
+                b_done.set()
+
+        t = threading.Thread(target=operator_then_b)
+        t.start()
+        try:
+            build_recovery_recorder(
+                source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=a_put,
+                grant_is_live=lambda: self.lease.owns(self.key(), a_grant.token),
+                publication_fence=self.pubfence, workspace_id=WS,
+            )(res, wm)
+        except (RecordPublicationHeldError, RecordPublicationUncertainError):
+            pass
+        t.join(timeout=5)
+        self.assertLessEqual(len(posted), 1)
 
     def test_a_blocked_anchor_is_visible_and_reconcilable_by_an_operator(self):
         # The fence stalls an anchor rather than risk a duplicate. That trade is only coherent if

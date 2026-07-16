@@ -11,7 +11,8 @@ letting the stalled owner and its replacement both publish. The fence decides wh
 permits; this command only carries the operator's intent to it, and reports the refusal.
 
 Split out of :mod:`...cli_workflow` to keep that module under the health gate; the shape follows the
-sibling ``dispatch-fence`` / ``callback-lease`` surfaces.
+sibling ``dispatch-fence`` / ``callback-lease`` surfaces — minus their ``--recover``, which this
+fence cannot safely offer (R11-F1).
 """
 
 from __future__ import annotations
@@ -33,9 +34,10 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     is not proof it will not PUT later. An operator surface that could override that would just be
     a hand-operated version of the reclaim this fence exists to refuse.
 
-    ``--bootstrap`` is a safe first init (DB + sidecar both absent); ``--recover`` is deliberate
-    loss recovery under a fresh nonce, which forgets every reservation and so can republish — only
-    after confirming no sweep is mid-attempt.
+    ``--bootstrap`` is a safe first init (DB + sidecar both absent). There is deliberately no
+    ``--recover`` counterpart to the sibling stores': forgetting a reservation is precisely how a
+    record gets published twice, and no confirmation prompt can prove that a sweep suspended
+    between its reserve and its PUT will not resume (R11-F1). A lost store stays fail-closed.
     """
     from mozyo_bridge.core.state.callback_publication_fence import (
         CallbackPublicationFence,
@@ -45,11 +47,6 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
 
     fence = CallbackPublicationFence()
     try:
-        if getattr(args, "pub_recover", False):
-            fence.recover()
-            print(f"callback publication fence recovered (fresh store) at {fence.path}")
-            print("every reservation is forgotten; a stalled anchor may now publish again")
-            return 0
         if getattr(args, "pub_bootstrap", False):
             fence.bootstrap()
             print(f"callback publication fence bootstrapped at {fence.path}")
@@ -97,7 +94,8 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
             return 0
     except CallbackPublicationFenceError as exc:
         print(f"callback publication fence error: {exc}")
-        print("a store loss/replacement needs `workflow callback-publication --recover`")
+        print("this fence has no reset: forgetting a reservation is how a record gets published")
+        print("twice. A lost store stays fail-closed until it is restored from backup.")
         return 1
     state = "bootstrapped" if fence.is_bootstrapped() else "absent / not bootstrapped"
     print(f"callback publication fence: {state} at {fence.path}")
@@ -113,7 +111,9 @@ def register_callback_publication_parser(workflow_sub) -> None:
             "reserves each record identity and NEVER reclaims it: a lingering reservation may be an "
             "owner mid-PUT, so a crashed owner stalls its anchor instead of risking a duplicate "
             "record. `--list` shows blocked anchors; `--reconcile` is the operator disposition for "
-            "one, taken after reading the issue journal in Redmine."
+            "one, taken after reading the issue journal in Redmine. Unlike the sibling fence/lease "
+            "surfaces this command has NO `--recover`: a store-wide reset forgets live "
+            "reservations, which is exactly the duplicate this fence exists to prevent."
         ),
         help="List / reconcile / bootstrap / recover the callback-sweep publication fence.",
     )
@@ -132,10 +132,6 @@ def register_callback_publication_parser(workflow_sub) -> None:
     action.add_argument(
         "--bootstrap", dest="pub_bootstrap", action="store_true",
         help="Initialize the fence store (safe first init; refuses on a detected loss).",
-    )
-    action.add_argument(
-        "--recover", dest="pub_recover", action="store_true",
-        help="Deliberate loss recovery: fresh store under a new nonce (forgets all reservations).",
     )
     disposition = pub_p.add_mutually_exclusive_group()
     disposition.add_argument(
