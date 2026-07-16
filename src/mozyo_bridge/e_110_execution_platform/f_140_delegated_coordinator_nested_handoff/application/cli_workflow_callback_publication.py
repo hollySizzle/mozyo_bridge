@@ -21,7 +21,7 @@ import argparse
 
 
 def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
-    """Status / bootstrap / recover / reconcile the callback-sweep publication fence (#13889).
+    """Status / list / reconcile / first-init the callback-sweep publication fence (#13889).
 
     ``--list`` shows every anchor the fence is currently blocking. ``--reconcile`` is the operator
     disposition for one of them, taken AFTER reading the issue's journal: ``--landed <journal_id>``
@@ -34,10 +34,12 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     is not proof it will not PUT later. An operator surface that could override that would just be
     a hand-operated version of the reclaim this fence exists to refuse.
 
-    ``--bootstrap`` is a safe first init (DB + sidecar both absent). There is deliberately no
-    ``--recover`` counterpart to the sibling stores': forgetting a reservation is precisely how a
-    record gets published twice, and no confirmation prompt can prove that a sweep suspended
-    between its reserve and its PUT will not resume (R11-F1). A lost store stays fail-closed.
+    ``--bootstrap`` is first init, and only that: it succeeds on a machine where this fence has
+    never run, and afterwards a first-init seal makes "store and sidecar both gone" a detected loss
+    rather than a fresh start (R12-F1). There is deliberately no ``--recover`` counterpart to the
+    sibling stores': forgetting a reservation is precisely how a record gets published twice, and no
+    confirmation prompt can prove that a sweep suspended between its reserve and its PUT will not
+    resume (R11-F1). A lost store stays fail-closed and must be restored, not re-minted.
     """
     from mozyo_bridge.core.state.callback_publication_fence import (
         CallbackPublicationFence,
@@ -111,11 +113,11 @@ def register_callback_publication_parser(workflow_sub) -> None:
             "reserves each record identity and NEVER reclaims it: a lingering reservation may be an "
             "owner mid-PUT, so a crashed owner stalls its anchor instead of risking a duplicate "
             "record. `--list` shows blocked anchors; `--reconcile` is the operator disposition for "
-            "one, taken after reading the issue journal in Redmine. Unlike the sibling fence/lease "
-            "surfaces this command has NO `--recover`: a store-wide reset forgets live "
-            "reservations, which is exactly the duplicate this fence exists to prevent."
+            "one, taken after reading the issue journal in Redmine. `--bootstrap` is first init "
+            "only: once this fence has run, a missing store is a detected loss, and it stays "
+            "fail-closed until the store is restored — there is no reset, by design."
         ),
-        help="List / reconcile / bootstrap / recover the callback-sweep publication fence.",
+        help="List / reconcile / first-init the callback-sweep publication fence.",
     )
     # Exactly one action, and at most one disposition: an operator who types two intents at once
     # has not decided which they mean, and this command must never pick for them (R10-F1).
@@ -131,7 +133,7 @@ def register_callback_publication_parser(workflow_sub) -> None:
     )
     action.add_argument(
         "--bootstrap", dest="pub_bootstrap", action="store_true",
-        help="Initialize the fence store (safe first init; refuses on a detected loss).",
+        help="First init on a machine where this fence has never run; refuses on a detected loss.",
     )
     disposition = pub_p.add_mutually_exclusive_group()
     disposition.add_argument(

@@ -36,7 +36,9 @@ LANE = "lane-1"
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mozyo-bridge workflow")
-    register_callback_publication_parser(p.add_subparsers(dest="workflow_command"))
+    sub = p.add_subparsers(dest="workflow_command")
+    register_callback_publication_parser(sub)
+    p._pub_choices = sub.choices  # noqa: SLF001  (the test needs the subparser it just registered)
     return p
 
 
@@ -66,6 +68,35 @@ class ParserContractTest(unittest.TestCase):
         # surfaces all have it.
         self._rejects(["callback-publication", "--recover"])
         self.assertFalse(hasattr(CallbackPublicationFence, "recover"))
+
+
+class HelpContractTest(unittest.TestCase):
+    """Help must not advertise an operation that was removed for a safety reason (R12-F2)."""
+
+    def test_operator_facing_help_never_advertises_recover(self):
+        # The subparser rejected --recover, but `workflow --help` still listed it, so an operator
+        # reading the help would go hunting for a reset that must not exist.
+        #
+        # Scope note: this checks rendered help only. The module docstring and code comment DO
+        # discuss --recover, deliberately -- they explain to the next developer why this fence
+        # lacks an operation all its siblings have, which is what stops it being "restored" as an
+        # oversight. Help lists what exists; docstrings explain why it doesn't.
+        p = _parser()
+        self.assertNotIn("recover", p.format_help().lower())
+        self.assertNotIn("recover", p._pub_choices["callback-publication"].format_help().lower())
+
+
+class ProductionWiringTest(unittest.TestCase):
+    def test_ordinary_execute_never_bootstraps_the_publication_fence(self):
+        # R12-F1's real weight: bootstrap() re-mints a lost store, and production called it on
+        # every execute -- so the ordinary path could rebuild the fence around a live reservation.
+        # Bootstrapping is an operator act; execute may only check.
+        src = Path(
+            "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+            "/application/sublane_diagnostics.py"
+        ).read_text()
+        self.assertNotIn("publication_fence.bootstrap()", src)
+        self.assertIn("publication_fence.is_bootstrapped()", src)
 
 
 class CommandContractTest(unittest.TestCase):
@@ -163,6 +194,17 @@ class CommandContractTest(unittest.TestCase):
         rc, out = self._run(["--list"])
         self.assertEqual(rc, 1)
         self.assertIn("no reset", out)
+
+    def test_bootstrap_refuses_to_re_mint_a_lost_store(self):
+        # The seal makes a both-absent pair a detected loss rather than a fresh install, and the
+        # operator command must surface that as a failure rather than silently rebuilding (R12-F1).
+        self.fence.reserve(self._key())
+        self.fence.path.unlink()
+        self.fence.sidecar_path.unlink()
+        rc, out = self._run(["--bootstrap"])
+        self.assertEqual(rc, 1)
+        self.assertIn("total store loss", out)
+        self.assertNotIn("--recover", out)
 
 
 if __name__ == "__main__":

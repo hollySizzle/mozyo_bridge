@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_publication_fence import (
     PUBLICATION_PUBLISHED,
+    CallbackPublicationFence,
     PUBLICATION_RESERVED,
     PUBLICATION_UNCERTAIN,
     CallbackPublicationFenceError,
@@ -1452,6 +1453,33 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.pubfence.reconcile(key, published_journal="80500")
         self.assertEqual(self.pubfence.state_of(key), PUBLICATION_PUBLISHED)
         self.assertFalse(self.pubfence.reserve(key).may_publish)
+
+    def test_a_total_store_loss_cannot_be_re_minted_as_a_fresh_install(self):
+        # R12-F1, the exact bypass: `recover()` was removed, but bootstrap()'s both-absent branch
+        # did the same store-wide reclaim -- and production called bootstrap() on EVERY execute.
+        # The R11 regression missed it by only trying `recover` and `reconcile`: the reset that
+        # mattered was the ordinary path, not the operator one.
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(self.pubfence.reserve(key).may_publish)     # A reserves, stalls pre-PUT
+        self.pubfence.path.unlink()
+        self.pubfence.sidecar_path.unlink()                          # total store loss
+
+        reborn = CallbackPublicationFence(home=self.pubfence.path.parent)
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()                    # the seal says this fence has already operated
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)                   # so B gets no reservation from a rebuilt store
+
+    def test_a_genuine_first_install_still_bootstraps(self):
+        # The seal must not make the product uninstallable: a machine where the fence has never run
+        # has no seal, and first init is exactly what bootstrap is for.
+        fresh = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        self.assertFalse(fresh.has_operated())
+        fresh.bootstrap()
+        self.assertTrue(fresh.is_bootstrapped())
+        self.assertTrue(fresh.has_operated())
+        fresh.bootstrap()                                            # idempotent while healthy
 
     def test_actuation_refuses_a_grant_less_raw_writer(self):
         # R8-F2: the unsafe shape must be unrepresentable, not merely discouraged. A raw writer
