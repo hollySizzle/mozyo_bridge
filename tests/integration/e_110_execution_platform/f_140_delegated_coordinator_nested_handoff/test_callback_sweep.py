@@ -14,12 +14,15 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_publication_fence import (
+    _SEAL_INITIALIZING,
+    _SEAL_OPERATIONAL,
     PUBLICATION_PUBLISHED,
     CallbackPublicationFence,
     PUBLICATION_RESERVED,
@@ -1470,6 +1473,139 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
             reborn.bootstrap()                    # the seal says this fence has already operated
         with self.assertRaises(CallbackPublicationFenceError):
             reborn.reserve(key)                   # so B gets no reservation from a rebuilt store
+
+    def test_an_unsealed_store_is_not_production_ready(self):
+        # R13-F1: the seal was a key attached to no lock -- is_bootstrapped() never consulted it,
+        # so a healthy-but-unsealed store (every store predating the seal) was accepted, held real
+        # reservations, and re-minted on pair loss. Readiness must include the seal.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        fence.seal_path.unlink()                    # a store from before the seal existed
+        self.assertTrue(fence._pair_is_healthy())   # the store itself is fine...
+        self.assertFalse(fence.is_bootstrapped())   # ...but it is not ready, and execute stops
+        self.assertFalse(fence.has_operated())
+
+    def test_adoption_seals_an_existing_store_without_re_minting_it(self):
+        # The migration path: an unsealed store may already hold live reservations, so it has to be
+        # sealed exactly where it stands. Re-minting here would BE the bug (R13-F1 requirement 2).
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        fence.reserve(key)                          # a reservation from before the upgrade
+        fence.seal_path.unlink()
+
+        fence.bootstrap()                           # operator adopts it
+        self.assertTrue(fence.is_bootstrapped())
+        self.assertFalse(fence.reserve(key).may_publish)   # the reservation SURVIVED adoption
+
+        fence.path.unlink()
+        fence.sidecar_path.unlink()
+        with self.assertRaises(CallbackPublicationFenceError):
+            CallbackPublicationFence(home=fence.path.parent).bootstrap()   # now loss is fatal
+
+    def test_no_interruption_of_first_init_leaves_an_operational_unsealed_store(self):
+        # The seal is written BEFORE the pair, so every crash point leaves either "nothing" or
+        # "initializing" -- never a store that serves reservations without recording it exists.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+
+        fence._write_seal(_SEAL_INITIALIZING)                    # crash: seal only
+        self.assertFalse(fence.is_bootstrapped())
+        fence._create_fresh("nonce-abc")                          # crash: pair made, not sealed op
+        self.assertTrue(fence._pair_is_healthy())
+        self.assertFalse(fence.is_bootstrapped(), "an unsealed pair must never be operational")
+
+        fence.bootstrap()                                         # resumable: it never served one
+        self.assertTrue(fence.is_bootstrapped())
+        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+
+    def test_a_reservation_survives_a_pair_loss_that_an_unsealed_store_would_have_forgotten(self):
+        # The exact R13-F1 probe: A reserves through an unsealed store, the pair is lost, and B
+        # must not get a reservation for the same identity from a rebuilt store.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        fence.seal_path.unlink()                                  # unsealed, as before this fix
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)           # A reserves, then stalls pre-PUT
+        fence.path.unlink()
+        fence.sidecar_path.unlink()
+
+        reborn = CallbackPublicationFence(home=home)
+        self.assertFalse(reborn.is_bootstrapped())
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)                                   # B gets nothing from a dead store
+
+    def test_bootstrap_seals_before_it_mints_so_a_crash_cannot_leave_an_unsealed_store(self):
+        # The ordering IS the crash-safety property: seal first, then mint. If the store were made
+        # first, dying before the seal would leave a healthy unsealed store -- production-ready
+        # under the old readiness check, and re-mintable after a pair loss. Fault-inject the mint
+        # to prove the seal is already down when it runs.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        with mock.patch.object(
+            CallbackPublicationFence, "_create_fresh", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                fence.bootstrap()
+        self.assertEqual(fence.seal_state(), _SEAL_INITIALIZING)   # the seal went down first
+        self.assertFalse(fence.is_bootstrapped())                  # and nothing is operational
+
+    def test_an_init_interrupted_before_its_store_existed_still_resumes(self):
+        # The other side of the same coin: `initializing` must not be mistaken for a loss, or a
+        # first install that died at the wrong moment would be permanently fail-closed -- safety
+        # bought at the price of an unusable product, which is not a trade worth making.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence._write_seal(_SEAL_INITIALIZING)                      # crash: seal only, no store
+        self.assertFalse(fence.path.exists())
+        fence.bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+
+    def test_an_init_torn_apart_mid_mint_resumes_rather_than_wedging(self):
+        # The last crash point: _create_fresh writes the DB and then the sidecar, so dying between
+        # them leaves a torn store. Torn is normally fatal -- it means a store was lost -- but
+        # under an `initializing` seal it means the opposite: nothing ever operated, so there is no
+        # reservation to lose and finishing the mint is safe. Without this distinction a first
+        # install that crashed at the wrong microsecond would be permanently fail-closed.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence._write_seal(_SEAL_INITIALIZING)
+        fence._create_fresh("nonce-1")
+        fence.sidecar_path.unlink()                       # crash inside the mint
+        self.assertTrue(fence.path.exists())
+        self.assertFalse(fence.is_bootstrapped())
+
+        fence.bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
+
+    def test_a_torn_store_without_an_initializing_seal_stays_fatal(self):
+        # The same shape with an OPERATIONAL seal is a loss, and must not be repaired: a store that
+        # served reservations is gone, and re-minting it republishes.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.bootstrap()
+        fence.sidecar_path.unlink()                       # torn AFTER it operated
+        with self.assertRaises(CallbackPublicationFenceError):
+            fence.bootstrap()
+
+    def test_readiness_always_implies_a_seal_across_every_reachable_state(self):
+        # R13-F1 requirement 1, as a property rather than a case: whatever combination of seal and
+        # store a machine is found in, a fence that can serve a reservation has recorded that it
+        # exists. That implication is the whole defence against a lost store being re-minted.
+        for seal in (None, _SEAL_INITIALIZING, _SEAL_OPERATIONAL):
+            for pair in ("healthy", "absent", "torn"):
+                with self.subTest(seal=seal, pair=pair):
+                    fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+                    if pair in ("healthy", "torn"):
+                        fence._create_fresh("nonce-1")
+                        if pair == "torn":
+                            fence.sidecar_path.unlink()
+                    if seal:
+                        fence._write_seal(seal)
+                    if fence.is_bootstrapped():
+                        self.assertTrue(fence.has_operated())
+                        self.assertEqual(fence.seal_state(), _SEAL_OPERATIONAL)
 
     def test_a_genuine_first_install_still_bootstraps(self):
         # The seal must not make the product uninstallable: a machine where the fence has never run

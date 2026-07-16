@@ -70,6 +70,10 @@ CALLBACK_PUBLICATION_FENCE_FILENAME = "callback-publication-fence.sqlite"
 CALLBACK_PUBLICATION_FENCE_SIDECAR_SUFFIX = ".anchor"
 #: First-init seal: proof the fence has operated here, so a both-absent pair reads as loss (R12-F1).
 CALLBACK_PUBLICATION_FENCE_SEAL_SUFFIX = ".sealed"
+#: Seal lifecycle. The seal is written BEFORE the store it seals, so the crash window lands here
+#: rather than on an operational-but-unsealed store (R13-F1).
+_SEAL_INITIALIZING = "initializing"   # a store is being minted; it has never served a reservation
+_SEAL_OPERATIONAL = "operational"     # this fence has run here; a missing pair is now a LOSS
 CALLBACK_PUBLICATION_FENCE_SCHEMA_VERSION = 1
 
 #: This caller won the single reservation and MAY perform the one PUT.
@@ -212,6 +216,18 @@ class CallbackPublicationFence:
         self.sidecar_path.write_text(nonce, encoding="utf-8")
 
     def is_bootstrapped(self) -> bool:
+        """True only when the store is usable AND sealed — readiness includes the seal (R13-F1).
+
+        The seal was originally written *after* the pair and never consulted here, which made it a
+        key attached to no lock: a healthy-but-unsealed store (every store created before the seal
+        existed, and any first init interrupted before its seal landed) passed this check, held
+        real reservations, and then re-minted on pair loss because nothing recorded that it had run.
+        That is R12-F1 again. So an unsealed store is *not ready*, and the adoption path in
+        :meth:`bootstrap` — not ordinary execute — is what makes it so.
+        """
+        return self._pair_is_healthy() and self.seal_state() == _SEAL_OPERATIONAL
+
+    def _pair_is_healthy(self) -> bool:
         """True when DB + sidecar co-exist at the same nonce AND schema version (read-only probe)."""
         sidecar_nonce = self._read_sidecar_nonce()
         if sidecar_nonce is None or not self.path.exists():
@@ -232,56 +248,111 @@ class CallbackPublicationFence:
 
     @property
     def seal_path(self) -> Path:
-        """The first-init seal: proof this fence has ever operated, kept outside the DB+sidecar pair.
+        """The first-init seal: proof this fence has operated here, kept outside the DB+sidecar pair.
 
         Without it, "DB and sidecar are both absent" is indistinguishable from a fresh install, so
-        the both-absent branch of :meth:`bootstrap` re-mints the store and forgets every live
-        reservation — the same store-wide reclaim ``recover()`` performed, reachable from ordinary
-        operation (R12-F1). The seal is what makes total loss *detectable*: once written, absence of
-        the pair means loss, not first run.
+        bootstrap re-mints the store and forgets every live reservation — the same store-wide
+        reclaim ``recover()`` performed, reachable from ordinary operation (R12-F1). The seal is
+        what makes total loss *detectable*: once operational, absence of the pair means loss.
+
+        It carries a lifecycle rather than mere existence, so that an interrupted first init is
+        resumable while an operational store's loss stays fatal (R13-F1).
         """
         return self.path.with_suffix(self.path.suffix + CALLBACK_PUBLICATION_FENCE_SEAL_SUFFIX)
 
+    def seal_state(self) -> Optional[str]:
+        """``initializing`` / ``operational`` / ``None`` (never sealed here)."""
+        try:
+            text = self.seal_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for state in (_SEAL_OPERATIONAL, _SEAL_INITIALIZING):
+            if text.startswith(state):
+                return state
+        return None
+
+    def _write_seal(self, state: str) -> None:
+        self.seal_path.parent.mkdir(parents=True, exist_ok=True)
+        note = {
+            _SEAL_INITIALIZING: "a store is being minted here; it has never served a reservation, "
+                                "so re-minting it is safe",
+            _SEAL_OPERATIONAL: "this fence has operated here; a missing store is a LOSS, never a "
+                               "fresh install, and must be restored rather than re-created",
+        }[state]
+        tmp = self.seal_path.with_suffix(self.seal_path.suffix + ".tmp")
+        tmp.write_text(f"{state}\nsealed at {_utc_now()}\n{note}\n", encoding="utf-8")
+        tmp.replace(self.seal_path)          # atomic: the seal is never observed half-written
+
     def has_operated(self) -> bool:
-        """True once this fence has been initialized here, whether or not its store still exists."""
-        return self.seal_path.exists()
+        """True once this fence has been sealed here, whether or not its store still exists.
+
+        Invariant, and the point of R13-F1: ``is_bootstrapped()`` implies this. A store that can
+        serve a reservation has always recorded that it exists.
+        """
+        return self.seal_state() is not None
 
     def bootstrap(self) -> None:
-        """Operator-only first init. NEVER call from ordinary execute (R12-F1).
+        """Operator-only init / adoption. NEVER call from ordinary execute (R12-F1).
 
-        Sound exactly once, on a machine where this fence has never run. After that the seal makes
-        every both-absent state a detected store loss, and a lost store cannot be re-minted: a
-        suspended owner's reservation would be forgotten and its record published twice. There is
-        no reset here and no operator override — restoring availability needs a protocol that can
-        prove the old owner cannot resume, which is follow-up work (j#80398 coordinator
-        disposition), not a flag.
+        Six states, and each answers one question: could this store already be holding a
+        reservation that a re-mint would forget?
+
+        ==========================  ============================================================
+        seal + pair                 action
+        ==========================  ============================================================
+        operational + healthy       nothing to do.
+        operational + pair gone     REFUSE. It ran here, so this is a loss; re-creating it would
+                                    forget a suspended owner's reservation and publish twice.
+        initializing + anything     re-mint. It never became operational, so no sanctioned reserve
+                                    can have happened through it — an interrupted first init is
+                                    resumable, not a loss.
+        unsealed + healthy pair     ADOPT in place. Every store made before the seal existed looks
+                                    like this, and it may hold live reservations, so it must be
+                                    sealed *without* re-minting (R13-F1 requirement 2).
+        unsealed + both absent      genuine first init.
+        unsealed + one side only    REFUSE. Torn store, as before.
+        ==========================  ============================================================
+
+        The seal is written BEFORE the pair it seals, so a crash leaves ``initializing`` — safe to
+        resume — instead of an operational-but-unsealed store, which is what let R12-F1 come back.
 
         Known limit, stated rather than hidden: deleting the seal along with the pair is
-        indistinguishable from a fresh install. Nothing local can close that — the seal is the
-        outermost durable thing this fence has. What it does close is every path reachable from
-        ordinary operation and from this command.
+        indistinguishable from a fresh install. Nothing local can close that; the coordinator has
+        assigned it to the external-lifecycle / quiescence follow-up (j#80403). What is closed is
+        every path reachable from ordinary execute and from this command.
         """
-        sidecar_nonce = self._read_sidecar_nonce()
-        db_exists = self.path.exists()
-        if sidecar_nonce is None and not db_exists:
-            if self.has_operated():
-                raise CallbackPublicationFenceError(
-                    f"callback publication fence {self.path} is sealed as previously initialized, "
-                    f"but its store and identity sidecar are both gone: a total store loss, not a "
-                    f"fresh install. Re-creating it would forget any reservation a suspended sweep "
-                    f"still holds and publish its record a second time. Restore the store from "
-                    f"backup; there is deliberately no reset (see {self.seal_path})"
-                )
-            self._create_fresh(secrets.token_hex(16))
-            self.seal_path.parent.mkdir(parents=True, exist_ok=True)
-            self.seal_path.write_text(
-                f"callback publication fence first initialized at {_utc_now()}\n"
-                f"presence of this file means a both-absent store is a LOSS, never a fresh install\n",
-                encoding="utf-8",
+        seal = self.seal_state()
+        pair_ok = self._pair_is_healthy()
+
+        if seal == _SEAL_OPERATIONAL:
+            if pair_ok:
+                return
+            raise CallbackPublicationFenceError(
+                f"callback publication fence {self.path} is sealed as previously operational, but "
+                f"its store and identity sidecar are gone: a total store loss, not a fresh "
+                f"install. Re-creating it would forget any reservation a suspended sweep still "
+                f"holds and publish its record a second time. Restore the store from backup; "
+                f"there is deliberately no reset (see {self.seal_path})"
             )
+
+        if seal == _SEAL_INITIALIZING:
+            # It never served a reservation, so nothing can be lost by finishing the job.
+            self._create_fresh(secrets.token_hex(16))
+            self._write_seal(_SEAL_OPERATIONAL)
             return
-        if self.is_bootstrapped():
+
+        if pair_ok:
+            # Adoption: a store from before the seal existed. It may hold live reservations, so it
+            # is sealed exactly where it stands -- re-minting here would be the very bug.
+            self._write_seal(_SEAL_OPERATIONAL)
             return
+
+        if self._read_sidecar_nonce() is None and not self.path.exists():
+            self._write_seal(_SEAL_INITIALIZING)
+            self._create_fresh(secrets.token_hex(16))
+            self._write_seal(_SEAL_OPERATIONAL)
+            return
+
         raise CallbackPublicationFenceError(
             f"callback publication fence {self.path} is in an inconsistent state (only one of the "
             f"DB / sidecar exists, or their nonces differ): a store loss or replacement. Refusing "

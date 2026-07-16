@@ -34,9 +34,10 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     is not proof it will not PUT later. An operator surface that could override that would just be
     a hand-operated version of the reclaim this fence exists to refuse.
 
-    ``--bootstrap`` is first init, and only that: it succeeds on a machine where this fence has
-    never run, and afterwards a first-init seal makes "store and sidecar both gone" a detected loss
-    rather than a fresh start (R12-F1). There is deliberately no ``--recover`` counterpart to the
+    ``--bootstrap`` initializes the fence on first use and adopts an existing unsealed store in
+    place, keeping any reservation it already holds (R13-F1). What it never does is re-mint: once
+    the store is sealed as operational, "store and sidecar both gone" is a diagnosed loss rather
+    than a fresh start (R12-F1). There is deliberately no ``--recover`` counterpart to the
     sibling stores': forgetting a reservation is precisely how a record gets published twice, and no
     confirmation prompt can prove that a sweep suspended between its reserve and its PUT will not
     resume (R11-F1). A lost store stays fail-closed and must be restored, not re-minted.
@@ -51,7 +52,7 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     try:
         if getattr(args, "pub_bootstrap", False):
             fence.bootstrap()
-            print(f"callback publication fence bootstrapped at {fence.path}")
+            print(f"callback publication fence ready at {fence.path} (seal: {fence.seal_state()})")
             return 0
         stray = getattr(args, "pub_landed", None) or getattr(args, "pub_none_landed", False)
         if stray and not getattr(args, "pub_reconcile", None):
@@ -99,7 +100,16 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
         print("this fence has no reset: forgetting a reservation is how a record gets published")
         print("twice. A lost store stays fail-closed until it is restored from backup.")
         return 1
-    state = "bootstrapped" if fence.is_bootstrapped() else "absent / not bootstrapped"
+    # An unsealed store is not "absent" -- it is the R13-F1 case, and the operator needs to be told
+    # it is adoptable rather than left guessing why a healthy-looking store is refused.
+    if fence.is_bootstrapped():
+        state = "ready (sealed operational)"
+    elif fence.seal_state() is not None:
+        state = f"NOT ready: seal is `{fence.seal_state()}`, store missing or incomplete"
+    elif fence._pair_is_healthy():
+        state = "NOT ready: store exists but is unsealed — run --bootstrap to adopt it in place"
+    else:
+        state = "absent / never initialized — run --bootstrap"
     print(f"callback publication fence: {state} at {fence.path}")
     return 0
 
@@ -133,7 +143,7 @@ def register_callback_publication_parser(workflow_sub) -> None:
     )
     action.add_argument(
         "--bootstrap", dest="pub_bootstrap", action="store_true",
-        help="First init on a machine where this fence has never run; refuses on a detected loss.",
+        help="First init, or adopt an existing unsealed store in place; refuses on a loss.",
     )
     disposition = pub_p.add_mutually_exclusive_group()
     disposition.add_argument(
