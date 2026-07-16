@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_publication_fence import (
+    _SEAL_ABSENT,
     _SEAL_INITIALIZING,
     _SEAL_INVALID,
     _SEAL_LEGACY_INITIALIZING,
@@ -1949,6 +1950,97 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("Restore", message)
         self.assertIn("NOT a recovery", message)
+
+    def test_an_operational_seal_temp_left_by_a_crashed_adoption_is_authority_evidence(self):
+        # R18-F1, the exact interleaving: adoption of a pre-seal store crashes between writing the
+        # operational seal and replacing it, then the pair is lost. The temp is the only surviving
+        # record that this store could grant -- and I had built that temp myself (R14-F2) and then
+        # left it out of the inventory, because I counted row-bearing files and never noticed that
+        # authority-bearing ones are a category too.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)          # A holds a grant
+        fence.seal_path.unlink()                                  # a store from before the seal
+        with mock.patch.object(Path, "replace", side_effect=OSError("crash")):
+            with self.assertRaises(OSError):
+                CallbackPublicationFence(home=home).bootstrap()   # adoption dies mid-seal
+        fence.path.unlink()
+        fence.sidecar_path.unlink()                               # pair loss; the temp remains
+
+        reborn = CallbackPublicationFence(home=home)
+        self.assertEqual(reborn.seal_state(), _SEAL_ABSENT)
+        self.assertEqual(reborn.seal_temp_states(), [_SEAL_OPERATIONAL])
+        self.assertTrue(reborn.lifecycle_artifacts())
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)                                   # B gets nothing
+
+    def test_a_first_init_interrupted_while_writing_its_seal_still_resumes(self):
+        # The availability this must not cost: only THIS build's `initializing`, alone, walks past.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        temp = fence.seal_path.with_suffix(fence.seal_path.suffix + ".4321.tmp")
+        temp.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text("mozyo-callback-publication-seal v1 initializing\nx\n", encoding="utf-8")
+        self.assertEqual(fence.seal_temp_states(), [_SEAL_INITIALIZING])
+        fence.bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+
+    def test_an_ambiguous_seal_temp_is_never_read_as_nothing_was_here(self):
+        for label, temps in (
+            ("unreadable", ["garbage from somewhere"]),
+            ("legacy", ["operational\nsealed at x\n"]),
+            ("conflicting", ["mozyo-callback-publication-seal v1 initializing\nx\n",
+                             "mozyo-callback-publication-seal v1 operational\nx\n"]),
+        ):
+            with self.subTest(case=label):
+                fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+                fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+                for i, body in enumerate(temps):
+                    fence.seal_path.with_suffix(
+                        f"{fence.seal_path.suffix}.{i}.tmp").write_text(body, encoding="utf-8")
+                with self.assertRaises(CallbackPublicationFenceError):
+                    fence.bootstrap()
+
+    def test_a_broken_seal_temp_entry_is_presence_not_absence(self):
+        # The temp scan must use lexists for the same reason the store scan does: exists() follows
+        # the link, so a dangling temp disappears from the inventory entirely and the mint proceeds
+        # as if no one had ever sealed anything here.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink("/nonexistent/elsewhere", str(fence.seal_path) + ".9.tmp")
+        self.assertTrue(fence.seal_temp_paths(), "a broken temp entry vanished from the inventory")
+        with self.assertRaises(CallbackPublicationFenceError):
+            fence.bootstrap()
+
+    def test_a_seal_temp_beside_a_healthy_store_still_adopts_and_keeps_rows(self):
+        # A leftover temp must not brick a store that is perfectly usable.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        fence.reserve(key)
+        fence.seal_path.unlink()
+        fence.seal_path.with_suffix(fence.seal_path.suffix + ".77.tmp").write_text(
+            "mozyo-callback-publication-seal v1 operational\nx\n", encoding="utf-8")
+
+        CallbackPublicationFence(home=home).bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+        self.assertFalse(fence.reserve(key).may_publish)          # rows survived
+
+    def test_no_surface_offers_deleting_the_store_as_a_recovery(self):
+        # R18-F2: I removed this advice from the error and the CLI, reported all three surfaces
+        # done, and left it in the docstring -- the surface the next implementer reads first. The
+        # check now covers the source itself, by meaning rather than by the one phrase I grepped.
+        import mozyo_bridge.core.state.callback_publication_fence as fence_module
+
+        text = Path(fence_module.__file__).read_text(encoding="utf-8").lower()
+        for phrase in ("removes both", "remove both", "delete both", "restore/cleanup"):
+            self.assertNotIn(phrase, text, f"the source still offers deletion: {phrase!r}")
 
     def test_readiness_always_implies_a_seal_across_every_reachable_state(self):
         # R13-F1 requirement 1, as a property rather than a case: whatever combination of seal and
