@@ -40,6 +40,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_authority_projection import (
+    AuthorityFacts,
+    ExecutionSurfaceFacts,
+    ReconcileFacts,
+    facts_from_lifecycle_record,
+    reconcile_facts_from_record,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
     ANOMALY_NONE,
     ANOMALY_STAGED_NOT_SUBMITTED,
@@ -633,7 +640,92 @@ def enumerate_lifecycle_diagnostic(repo_root=None) -> tuple:
     return rows, None
 
 
-def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=None) -> GlanceCollection:
+#: Reconcile phases that are terminal — a record here owes no further reconcile action, so
+#: an active (non-terminal) record for the same issue is preferred when projecting.
+_RECONCILE_TERMINAL_PHASES = frozenset({"notified", "closed"})
+
+
+def _reconcile_index(reconcile_store) -> dict[str, ReconcileFacts]:
+    """Index the reconcile-state store by issue -> the most relevant record's facts. (fail-open)
+
+    A store read failure or an unreadable component degrades to an empty index (every lane
+    projects the fail-closed empty reconcile facts — never a fabricated attempt count). Among
+    an issue's records, a non-terminal (active reconcile) record wins over a terminal one, and
+    among equals the most recently updated; so the projection surfaces the live self-heal
+    ladder rather than a stale closed cycle.
+    """
+    if reconcile_store is None:
+        return {}
+    try:
+        records = reconcile_store.records()
+    except Exception:  # noqa: BLE001 - the reconcile store is a rebuildable_cache; degrade
+        return {}
+    best: dict[str, object] = {}
+    for rec in records:
+        issue = str(getattr(rec, "issue_id", "") or "").strip()
+        if not issue:
+            continue
+        current = best.get(issue)
+        if current is None or _reconcile_more_relevant(rec, current):
+            best[issue] = rec
+    return {issue: reconcile_facts_from_record(rec) for issue, rec in best.items()}
+
+
+def _reconcile_more_relevant(candidate, incumbent) -> bool:
+    """Is ``candidate`` a better projection than ``incumbent`` for the same issue? (pure)"""
+    cand_active = str(getattr(candidate, "phase", "")).strip() not in _RECONCILE_TERMINAL_PHASES
+    inc_active = str(getattr(incumbent, "phase", "")).strip() not in _RECONCILE_TERMINAL_PHASES
+    if cand_active != inc_active:
+        return cand_active  # a live reconcile wins over a terminal one
+    return str(getattr(candidate, "updated_at", "")) > str(getattr(incumbent, "updated_at", ""))
+
+
+def authority_execution_index() -> dict:
+    """``{issue_id: (AuthorityFacts, ExecutionSurfaceFacts)}`` from the lane lifecycle. (fail-open)
+
+    The NON-LIVE authority / execution-surface producer (Redmine #13758 review R2-F4 / R3-F3):
+    reads the active lifecycle records (the non-creating readonly read) and projects each onto
+    the DURABLE authority + execution-surface provenance (authority anchor / generation, the
+    managed-sublane surface + verified identity + revision) — the live-actor facts stay
+    fail-closed (see :func:`...glance_authority_projection.facts_from_lifecycle_record`).
+
+    Workspace-scoped join safety (review R3-F3): an issue that maps to MORE THAN ONE active
+    lifecycle record — an original/recovery pair, or the same issue number in two workspaces —
+    is **ambiguous** and gets NO projection (fail-closed unknown), so a cross-workspace /
+    cross-lane record is never silently joined onto the wrong lane. A store read failure
+    degrades to an empty index (every lane's group stays the fail-closed unknown facts).
+    """
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
+
+        records = load_lane_lifecycle_readonly()
+    except Exception:  # noqa: BLE001 - a lifecycle read never raises out of the glance
+        return {}
+    by_issue: dict = {}
+    for rec in records or ():
+        issue = str(getattr(rec, "issue_id", "") or "").strip()
+        if not issue:
+            continue
+        if str(getattr(rec, "lane_disposition", "") or "").strip() != _DISPOSITION_ACTIVE:
+            continue
+        by_issue.setdefault(issue, []).append(rec)
+    out: dict = {}
+    for issue, recs in by_issue.items():
+        if len(recs) != 1:
+            continue  # ambiguous (original/recovery or cross-workspace) -> fail-closed unknown
+        out[issue] = facts_from_lifecycle_record(recs[0])
+    return out
+
+
+def active_lane_snapshots(
+    roster,
+    *,
+    redmine_source=None,
+    store=None,
+    ledger=None,
+    reconcile_store=None,
+    authority_index=None,
+) -> GlanceCollection:
     """Fold every active-lane roster entry into a snapshot (Redmine grammar + advisory store).
 
     ``roster`` is a sequence of ``(issue_id, lane_label)`` (the authoritative active-lane
@@ -653,6 +745,8 @@ def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=Non
     """
     notes: list = []
     store_index = _store_gate_index(store)
+    reconcile_index = _reconcile_index(reconcile_store)
+    authority_map = dict(authority_index) if authority_index else {}
     ordered_issues = [str(issue or "").strip() for issue, _ in roster]
     deliveries = _issue_deliveries([i for i in ordered_issues if i], ledger)
 
@@ -715,6 +809,11 @@ def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=Non
                 latest_gate_journal=gate_journal,
                 delivery=deliveries.get(issue, DeliveryObservation()),
                 durable_facts_available=not degraded,
+                reconcile=reconcile_index.get(issue, ReconcileFacts()),
+                authority=authority_map.get(issue, (AuthorityFacts(), None))[0]
+                or AuthorityFacts(),
+                execution=(authority_map.get(issue) or (None, ExecutionSurfaceFacts()))[1]
+                or ExecutionSurfaceFacts(),
             )
         )
     return GlanceCollection(snapshots=tuple(snaps), notes=tuple(notes))

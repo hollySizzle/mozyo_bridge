@@ -85,6 +85,46 @@ def _store_from_args(args: argparse.Namespace):
     return WorkflowRuntimeStore(path=path)
 
 
+def _reconcile_store_from_args(args: argparse.Namespace):
+    """Build the reconcile-state store (state.sqlite) for the central projection, or None.
+
+    The reconcile projection (Redmine #13758) reads the home-scoped ``reconcile_state``
+    native component; a ``--reconcile-store-path`` override is a test/debug seam. Fail-open: an
+    unavailable / unreadable store degrades to no reconcile projection (every lane's reconcile
+    group stays the fail-closed empty facts), never a hard error on the read-only glance.
+    """
+    from mozyo_bridge.core.state.reconcile_state import (
+        ReconcileStateStore,
+        reconcile_state_path,
+    )
+
+    raw = (getattr(args, "reconcile_store_path", None) or "").strip()
+    try:
+        path = Path(raw) if raw else reconcile_state_path()
+        return ReconcileStateStore(path=path)
+    except Exception:  # noqa: BLE001 - a missing/unreadable reconcile store degrades to no join
+        return None
+
+
+def _authority_index(args: argparse.Namespace):
+    """The non-live authority / execution-surface index for the central projection (fail-open).
+
+    Redmine #13758 review R2-F4: projects the lane lifecycle records onto the ``authority`` /
+    ``execution_surface`` glance groups so the active role / provider / authority anchor /
+    generation + execution-surface provenance are visible in the central query WITHOUT pane
+    inspection. Fail-open: an unreadable lifecycle store degrades to no join (unknown facts).
+    The live-pane dispatch states connect at #13492.
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (
+            authority_execution_index,
+        )
+
+        return authority_execution_index()
+    except Exception:  # noqa: BLE001 - a lifecycle read never breaks the read-only glance
+        return {}
+
+
 def _ledger_from_args(args: argparse.Namespace):
     """Build the herdr delivery ledger, or None when disabled / unavailable (fail-open)."""
     if getattr(args, "no_ledger", False):
@@ -179,6 +219,8 @@ def _collect(args: argparse.Namespace):
             redmine_source=_redmine_source(args),
             store=_store_from_args(args),
             ledger=_ledger_from_args(args),
+            reconcile_store=_reconcile_store_from_args(args),
+            authority_index=_authority_index(args),
         )
         _extend(collection.snapshots)
         notes.extend(collection.notes)

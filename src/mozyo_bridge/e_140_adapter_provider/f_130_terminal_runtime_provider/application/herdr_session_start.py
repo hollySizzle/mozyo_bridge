@@ -327,6 +327,7 @@ def prepare_session(
     agent_launch: "Optional[AgentLaunchConfig]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
+    replacement_action_id: str = "",
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
 
@@ -712,6 +713,7 @@ def prepare_session(
                 resolved=resolved_launches.get(plan.provider),
                 launch_argv_extra=launch_argv_extra,
                 order_deferred=order_deferred,
+                replacement_action_id=replacement_action_id,
             )
         )
         if plan.kind == "launch":
@@ -757,6 +759,7 @@ def _execute_slot(
     resolved: Optional[ResolvedProviderLaunch] = None,
     launch_argv_extra: Sequence[str] = (),
     order_deferred: bool = False,
+    replacement_action_id: str = "",
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -830,6 +833,7 @@ def _execute_slot(
         store_home=store_home,
         resolved=resolved,
         launch_argv_extra=launch_argv_extra,
+        replacement_action_id=replacement_action_id,
     )
     started = _invoke(
         binary,

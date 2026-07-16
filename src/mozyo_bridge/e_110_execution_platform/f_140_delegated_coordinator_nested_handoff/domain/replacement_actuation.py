@@ -103,6 +103,12 @@ ATTESTATION_VERDICTS = frozenset({ATTEST_BOUND, ATTEST_PENDING, ATTEST_MISMATCH}
 #: ``self_close_armed`` — the tranche B boundary. The self coordinator's close, the fresh
 #: coordinator claim, and the continuation drain are tranche C.
 ACTUATION_ARMED = "armed"
+#: A coordinator-alive **worker recovery** (Redmine #13806 tranche D) has replaced every
+#: non-self participant of a no-self transaction — the stale standard-sublane worker is
+#: closed, relaunched, and action-attested. The transaction stays at ``replacing_nonself``
+#: (it has no self-close leg); the exactly-once redispatch of the original gate is the
+#: recovery use case's next leg. Distinct from ``armed`` so the two flows never conflate.
+ACTUATION_RECOVERED = "recovered"
 #: The actuator made progress but a participant is not yet complete (e.g. attestation still
 #: ``pending``) — a later re-run resumes from the durable owed state.
 ACTUATION_IN_PROGRESS = "in_progress"
@@ -133,6 +139,7 @@ ACTUATION_INVALID_TOPOLOGY = "invalid_topology"
 ACTUATION_STATUSES = frozenset(
     {
         ACTUATION_ARMED,
+        ACTUATION_RECOVERED,
         ACTUATION_IN_PROGRESS,
         ACTUATION_PRESERVATION_BLOCKED,
         ACTUATION_RECYCLED,
@@ -219,6 +226,21 @@ def is_self_replacement_topology(pins: Sequence[ParticipantPin]) -> bool:
     return len(self_participants(pins)) == 1
 
 
+def is_worker_recovery_topology(pins: Sequence[ParticipantPin]) -> bool:
+    """Is this a coordinator-alive worker-recovery manifest? (pure, Redmine #13806 tranche D)
+
+    A worker recovery replaces one or more stale standard-sublane workers WITHOUT touching
+    the current coordinator, so it carries **zero** self participants and at least one
+    non-self participant. Exactly the complement of a self-replacement plan for the
+    self axis: the destructive worker-recovery driver refuses any manifest that carries a
+    self participant (that is a self-replacement, driven by :func:`is_self_replacement_topology`
+    via the actuator's ``run`` / ``drive_self_participant`` path), and refuses an empty
+    manifest (nothing to recover).
+    """
+    pinned = tuple(pins)
+    return len(self_participants(pinned)) == 0 and any(not p.is_self for p in pinned)
+
+
 def is_default_companion(pin: ParticipantPin) -> bool:
     """A NON-self participant sitting in the default coordinator lane. (pure)
 
@@ -263,6 +285,7 @@ __all__ = (
     "ATTEST_MISMATCH",
     "ATTESTATION_VERDICTS",
     "ACTUATION_ARMED",
+    "ACTUATION_RECOVERED",
     "ACTUATION_IN_PROGRESS",
     "ACTUATION_PRESERVATION_BLOCKED",
     "ACTUATION_RECYCLED",
@@ -279,6 +302,7 @@ __all__ = (
     "bounded_recovery_available",
     "is_default_companion",
     "is_self_replacement_topology",
+    "is_worker_recovery_topology",
     "is_zero_actuation_observation",
     "new_close_required",
     "nonself_actuation_order",

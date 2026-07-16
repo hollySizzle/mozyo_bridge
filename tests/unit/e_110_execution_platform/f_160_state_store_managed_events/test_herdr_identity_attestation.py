@@ -215,6 +215,8 @@ class StoreRoundTripTest(unittest.TestCase):
     def test_no_env_value_column_exists(self) -> None:
         # Privacy invariant (refinement 3): the schema stores tokens / identity /
         # locator / a variable-name detail only — never an env value column.
+        # ``replacement_action_id`` (Redmine #13806 tranche D R2-F2) is a token id, not an
+        # env value, so it belongs to the token-only set.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             record_identity_attestation(_rec(), home=home)
@@ -240,6 +242,7 @@ class StoreRoundTripTest(unittest.TestCase):
                     "verdict",
                     "detail",
                     "observed_at",
+                    "replacement_action_id",
                 },
             )
 
@@ -253,6 +256,47 @@ class StoreRoundTripTest(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(version, HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION)
+
+    def test_replacement_action_id_round_trips(self) -> None:
+        # Redmine #13806 tranche D R2-F2: the additive replacement action id persists.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = HerdrIdentityAttestationStore(home=home)
+            store.upsert(_rec(replacement_action_id="recover:l:worker:claude:wk:w2"))
+            back = store.read("mzb1_ws1_claude_default")
+            self.assertEqual(back.replacement_action_id, "recover:l:worker:claude:wk:w2")
+
+    def test_normal_launch_leaves_action_id_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HerdrIdentityAttestationStore(home=Path(tmp))
+            store.upsert(_rec())  # no replacement_action_id
+            self.assertEqual(store.read("mzb1_ws1_claude_default").replacement_action_id, "")
+
+    def test_old_schema_version_is_fail_closed(self) -> None:
+        # An older (v1) attestation file is rejected fail-closed: the read returns None
+        # (adopt / doctor then fail closed) rather than decoding a record missing the field.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = herdr_identity_attestation_path(home)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path))
+            try:
+                conn.execute("PRAGMA user_version = 1")  # a stale pre-#13806 schema
+                conn.execute(
+                    "CREATE TABLE herdr_identity_attestations ("
+                    "assigned_name TEXT PRIMARY KEY, workspace_id TEXT, role TEXT, "
+                    "lane_id TEXT, locator TEXT, verdict TEXT, detail TEXT, observed_at TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO herdr_identity_attestations VALUES "
+                    "('mzb1_ws1_claude_default','ws1','claude','default','wY:p2','present','','t')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertIsNone(
+                HerdrIdentityAttestationStore(home=home).read("mzb1_ws1_claude_default")
+            )
 
     def test_record_best_effort_never_raises_on_unwritable_home(self) -> None:
         # A store failure must never block an agent boot: it degrades to None.

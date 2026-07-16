@@ -42,6 +42,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_authority_projection import (
+    AuthorityFacts,
+    ExecutionSurfaceFacts,
+    ReconcileFacts,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     GATE_NONE,
     LaneSignal,
@@ -275,6 +280,12 @@ class IssueGlanceSnapshot:
     #: instead of a state derived from the (empty / unread) signal, so a degraded lane is a
     #: visible unknown, never a fabricated ``idle`` (Redmine #13435 j#74307).
     durable_facts_available: bool = True
+    #: The event-driven reconciler's central-query projection groups (Redmine #13758). Each
+    #: defaults to its fail-closed empty facts, so an existing snapshot (a producer that does
+    #: not yet fill them) folds to ``unknown`` / blank tokens, never a fabricated authority.
+    reconcile: ReconcileFacts = field(default_factory=ReconcileFacts)
+    authority: AuthorityFacts = field(default_factory=AuthorityFacts)
+    execution: ExecutionSurfaceFacts = field(default_factory=ExecutionSurfaceFacts)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +319,14 @@ class WorkflowGlanceRow:
     delivery_source: str
     runtime_state: str
     receive_method: str
+    #: The event-driven reconciler's projection groups (Redmine #13758), joined without pane
+    #: inspection — the reconcile ladder, the active execution role / provider / authority
+    #: transition, and the execution-surface provenance. Each is a fail-closed fixed-token
+    #: sub-record; the JSON contract emits them as the ``reconcile`` / ``authority`` /
+    #: ``execution_surface`` payload groups.
+    reconcile: ReconcileFacts = field(default_factory=ReconcileFacts)
+    authority: AuthorityFacts = field(default_factory=AuthorityFacts)
+    execution: ExecutionSurfaceFacts = field(default_factory=ExecutionSurfaceFacts)
 
     @property
     def has_active_anomaly(self) -> bool:
@@ -331,6 +350,9 @@ class WorkflowGlanceRow:
             "runtime_state": self.runtime_state,
             "receive_method": self.receive_method,
             "has_active_anomaly": self.has_active_anomaly,
+            "reconcile": self.reconcile.as_payload(),
+            "authority": self.authority.as_payload(),
+            "execution_surface": self.execution.as_payload(),
         }
 
 
@@ -416,6 +438,12 @@ def fold_glance_row(snapshot: IssueGlanceSnapshot) -> WorkflowGlanceRow:
         delivery_source=source,
         runtime_state=runtime_state,
         receive_method=receive_method,
+        # The reconciler projection groups are validated (fail-closed to unknown / blank
+        # tokens) and joined as separate dimensions — like the delivery observation, they
+        # never demote the durable-record workflow_state.
+        reconcile=snapshot.reconcile.validated(),
+        authority=snapshot.authority.validated(),
+        execution=snapshot.execution.validated(),
     )
 
 

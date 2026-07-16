@@ -308,6 +308,109 @@ def markers_from_source(
     return extract_markers(source.read_entries(issue_id))
 
 
+# ---------------------------------------------------------------------------
+# Dispatch marker — a SEPARATE closed vocabulary from the gate-bearing kinds (Redmine #13758
+# review R5-F3 / Design Answer j#79507 Q2). A dispatch (implementation_request) is NOT a
+# callback-required gate, so it must NOT widen GATE_BEARING_KINDS or be mis-promoted to a
+# callback event. The canonical Implementation Request writer embeds this marker in the IR
+# journal body; the reconciler reads the marker's OWNING Redmine entry journal_id as the exact
+# dispatch anchor (NOT the marker's self-reported ``journal=`` — no self-reference / chicken-
+# and-egg). A legacy prose-only IR (no marker) is fail-closed: never parse-guessed.
+# ---------------------------------------------------------------------------
+DISPATCH_KIND_IMPLEMENTATION_REQUEST = "implementation_request"
+
+
+def render_dispatch_marker(lane: str, lane_generation: object) -> str:
+    """The structured dispatch marker for an IR journal (pure; the producer inverse of the reader).
+
+    ``[mozyo:workflow-event:kind=implementation_request:lane=<lane>:lane_generation=<n>]`` — the
+    canonical Implementation Request writer embeds this in the IR journal body so the reconciler
+    can resolve the exact dispatch anchor from the owning entry's journal id (Design Answer
+    j#79507 Q2). A separate closed vocabulary from :func:`render_workflow_event_marker` (which is
+    for callback gate kinds); this token names ``implementation_request`` and carries no gate.
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    return (
+        f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
+        f"kind={DISPATCH_KIND_IMPLEMENTATION_REQUEST}:lane={lane_s}:lane_generation={gen_s}]"
+    )
+
+
+def render_dispatch_note(body: str, *, lane: str, lane_generation: object) -> str:
+    """A canonical Implementation Request note: prose ``body`` + the embedded dispatch marker."""
+    marker = render_dispatch_marker(lane, lane_generation)
+    body = str(body or "").rstrip()
+    return f"{body}\n\n{marker}" if body else marker
+
+
+def dispatch_entry_journals(
+    entries: "Iterable[RedmineJournalEntry]",
+    *,
+    lane: str,
+    lane_generation: object,
+) -> "tuple[str, ...]":
+    """The DISTINCT owning entry journal ids that carry a current dispatch marker (pure, sorted).
+
+    Scans the ``[mozyo:workflow-event:kind=implementation_request:...]`` markers whose ``lane`` /
+    ``lane_generation`` match and returns each OWNING entry's ``journal_id`` (deduped, sorted). The
+    length distinguishes the three cases the writer's idempotency needs (Redmine #13758 R7-F3):
+    ``0`` — no current dispatch (a legacy prose-only IR — never guessed, and the point to write a
+    fresh marker); ``1`` — the exact current dispatch (recover / anchor); ``>=2`` — an ambiguous /
+    foreign duplicate (zero-send, and never add a further marker). A same-entry re-read dedups to
+    one id (a same IR-journal retry is the same dispatch).
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    if not (lane_s and gen_s):
+        return ()
+    found: set[str] = set()
+    for entry in entries or ():
+        notes = getattr(entry, "notes", "") or ""
+        entry_journal = str(getattr(entry, "journal_id", "") or "").strip()
+        if not entry_journal:
+            continue
+        for match in _MARKER_RE.finditer(notes):
+            if match.group("channel") != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            fields = _parse_marker_fields(match.group("body"))
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
+                continue
+            if str(fields.get("lane", "")).strip() != lane_s:
+                continue
+            if str(fields.get("lane_generation", "")).strip() != gen_s:
+                continue
+            found.add(entry_journal)
+    return tuple(sorted(found))
+
+
+def resolve_dispatch_entry_journal(
+    entries: "Iterable[RedmineJournalEntry]",
+    *,
+    lane: str,
+    lane_generation: object,
+) -> str:
+    """The Redmine entry journal id of the CURRENT dispatch for ``(lane, lane_generation)`` (pure).
+
+    The exact dispatch anchor (Design Answer j#79507 Q2): the OWNING entry's ``journal_id`` of the
+    single current ``kind=implementation_request`` marker — the anchor authority is the durable
+    entry, not the marker's self-reported fields. Fail-closed to ``""`` (zero-send) unless EXACTLY
+    ONE such entry exists (see :func:`dispatch_entry_journals`): zero matches (a legacy prose-only
+    IR — never guessed) or two-or-more distinct entries (ambiguous / foreign) both return ``""``.
+    """
+    journals = dispatch_entry_journals(entries, lane=lane, lane_generation=lane_generation)
+    return journals[0] if len(journals) == 1 else ""
+
+
+def dispatch_entry_journal_from_source(
+    source: RedmineJournalSource, issue_id: str, *, lane: str, lane_generation: object
+) -> str:
+    """Read the issue's entries and resolve the current dispatch entry journal (over ``source``)."""
+    return resolve_dispatch_entry_journal(
+        source.read_entries(issue_id), lane=lane, lane_generation=lane_generation
+    )
+
+
 def render_workflow_event_marker(
     gate: str,
     *,
@@ -381,4 +484,10 @@ __all__ = (
     "markers_from_source",
     "render_workflow_event_marker",
     "render_gate_note",
+    "DISPATCH_KIND_IMPLEMENTATION_REQUEST",
+    "render_dispatch_marker",
+    "render_dispatch_note",
+    "dispatch_entry_journals",
+    "resolve_dispatch_entry_journal",
+    "dispatch_entry_journal_from_source",
 )

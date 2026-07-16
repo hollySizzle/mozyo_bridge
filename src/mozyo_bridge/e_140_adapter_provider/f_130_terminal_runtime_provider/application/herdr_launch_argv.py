@@ -200,6 +200,7 @@ def build_agent_start_argv(
     store_home: str,
     resolved: ResolvedProviderLaunch,
     launch_argv_extra: Sequence[str],
+    replacement_action_id: str = "",
 ) -> list[str]:
     """Assemble the full ``herdr agent start`` argv for one launched slot (pure).
 
@@ -271,9 +272,13 @@ def build_agent_start_argv(
             provider,
             "--lane",
             lane,
-            "--",
-            *provider_cmd,
         ]
+        # Redmine #13806 tranche D R2-F2: a REPLACEMENT launch carries the exact transaction
+        # action_id into the fresh process's startup self-attestation. Emitted ONLY when
+        # non-empty, so a normal (non-replacement) launch stays byte-invariant.
+        if (replacement_action_id or "").strip():
+            run_cmd += ["--replacement-action-id", replacement_action_id.strip()]
+        run_cmd += ["--", *provider_cmd]
     else:
         run_cmd = provider_cmd
     env_flags = [

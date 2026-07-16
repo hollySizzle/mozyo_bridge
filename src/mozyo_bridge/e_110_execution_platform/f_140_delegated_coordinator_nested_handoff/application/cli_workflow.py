@@ -62,6 +62,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_dispatch_plan,
     register_dispatch_plan,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_dispatch_ir import (
+    cmd_workflow_dispatch_ir,
+    register_dispatch_ir,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_lane_admission import (
     cmd_workflow_lane_admission,
     register_lane_admission,
@@ -92,6 +96,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
     PRIMITIVE_HERDR_DISPATCH_WORKER,
+    PRIMITIVE_OPERATOR_STARTUP_RESUME,
     PRIMITIVE_TICKETLESS_CALLBACK,
     PendingCallback,
     WorkflowAnchor,
@@ -365,6 +370,122 @@ def _execute_herdr_dispatch_leg(
     return (0 if result.ok else 1), text
 
 
+def _is_startup_resume_leg(outcome: WorkflowStepOutcome) -> bool:
+    """True when the outcome is the executable startup-clear exactly-once resume leg (#13813).
+
+    Like the herdr dispatch leg, this is NOT part of the generic ``executable`` set: it rides
+    the resume leg's own ``DispatchOutboxFence`` reserve+send+outcome and a dedicated CLI
+    executor, never the ``_primitive_argv`` rail.
+    """
+    return (
+        outcome.primitive == PRIMITIVE_OPERATOR_STARTUP_RESUME
+        and outcome.execution == EXECUTION_READY
+    )
+
+
+def _execute_startup_resume_leg(
+    outcome: WorkflowStepOutcome, args: argparse.Namespace
+) -> tuple[int, str]:
+    """Run the fenced startup-clear exactly-once resume; return (rc, summary text).
+
+    Delegates to :func:`...operator_startup_resume_leg.execute_startup_resume`, which re-reads
+    the durable gate at action time, re-resolves the exact live target / generation, preflights
+    the durable writer, and drives the exactly-once fence around one high-level send. ``rc`` is
+    ``0`` for a delivered / never-send (skipped) outcome and ``1`` otherwise (uncertain /
+    fence- or writer-unavailable / not-resumable — the operator reconciles).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+        execute_startup_resume,
+    )
+
+    issue = _anchor_issue_of(outcome.durable_anchor) or ""
+    result = execute_startup_resume(args, issue)
+    text = (
+        f"resume_result: {result.result}\n"
+        f"fence_state: {result.fence_state}\n"
+        f"sent: {result.sent}\n"
+        f"record_failed: {result.record_failed}\n"
+        f"needs_reconcile: {result.needs_reconcile}\n"
+        f"detail: {result.detail}"
+    )
+    # An operator-reconcile-required outcome must surface a non-zero process status even when
+    # the delivery itself was positive (review j#79366 F2): a `record_failed` durable append or
+    # any `needs_reconcile` state (uncertain / fence row lost) is NOT a success for automation,
+    # independent of the delivery receipt.
+    rc = 0 if (result.ok and not result.needs_reconcile) else 1
+    return rc, text
+
+
+def _maybe_operator_startup_resume_outcome(
+    args: argparse.Namespace, outcome: WorkflowStepOutcome
+) -> "WorkflowStepOutcome | None":
+    """A resume-primitive outcome iff a durable startup gate awaits resume (#13813), else None.
+
+    Reads the latest durable operator startup gate for the step's issue at action time. It routes
+    to the exactly-once resume leg (:data:`PRIMITIVE_OPERATOR_STARTUP_RESUME`, which re-reads and
+    re-resolves authoritatively) in two cases so NO other primitive runs while a startup gate is
+    outstanding:
+
+    * a resumable ``operator_reported_done`` v3 gate -> the leg reserves + re-issues exactly once;
+    * a READABLE legacy v1/v2 gate (:data:`GATE_READ_LEGACY`) -> the leg runs the fixed
+      ``legacy_gate_reapproval_required`` disposition (reserve/send 0) and guides reapproval
+      (review j#79481 F1 — a legacy latest must not let a normal primitive execute).
+
+    Only a DEFINITIVE ``no_gate`` read (the journal read succeeded and carries no gate marker) — or
+    a pre-clear / terminal / in-flight v3 gate — leaves the normal outcome unchanged (returns None,
+    the normal primitive runs). Every INDETERMINATE / outstanding read — a corrupt newest gate, an
+    UNREADABLE ticket-provider read, or a source error — is ALSO routed to the resume leg, which
+    zero-actuates (RESUME_NOT_RESUMABLE) so no normal primitive, reserve, send, or write occurs
+    (review j#79504 F1: an indeterminate startup state must fail closed at the top level, per
+    j#79214 Required implementation 2, not fall through to a normal primitive).
+    """
+    issue = (_anchor_issue_of(outcome.durable_anchor) or "").strip()
+    if not issue:
+        issue = (getattr(args, "issue", None) or "").strip()
+    if not issue:
+        return None
+
+    def _route(journal_fallback: str) -> WorkflowStepOutcome:
+        anchor = outcome.durable_anchor
+        if not anchor or anchor == "none":
+            journal = (getattr(args, "journal", None) or journal_fallback or "").strip()
+            anchor = f"redmine:issue={issue}:journal={journal}"
+        return dataclasses.replace(
+            outcome,
+            primitive=PRIMITIVE_OPERATOR_STARTUP_RESUME,
+            execution=EXECUTION_READY,
+            durable_anchor=anchor,
+        )
+
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+            _default_gate_source,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+            GATE_READ_GATE,
+            GATE_READ_NONE,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (
+            STATE_OPERATOR_REPORTED_DONE,
+        )
+        import os
+
+        read = _default_gate_source("", os.environ)(issue)
+    except Exception:  # noqa: BLE001 - a source error is INDETERMINATE -> fail closed (route to leg)
+        return _route("")
+    if read.status == GATE_READ_NONE:
+        return None  # definitively no startup gate -> proceed with the normal primitive.
+    if read.status == GATE_READ_GATE and read.gate is not None:
+        if read.gate.state != STATE_OPERATOR_REPORTED_DONE:
+            # A pre-clear / terminal / in-flight v3 gate is not a resume candidate; the #13760
+            # pre-send admission gate guards a normal primitive's actuation, so proceed.
+            return None
+        return _route(read.gate.original_request.journal)  # resumable v3 gate.
+    # GATE_READ_LEGACY (reapproval), GATE_READ_CORRUPT, GATE_READ_UNREADABLE, or any unknown status:
+    # route to the (zero-actuating) resume leg so no normal primitive executes.
+    return _route("")
+
+
 def _is_herdr_forward_leg(outcome: WorkflowStepOutcome) -> bool:
     """True when the outcome is the executable Increment-3 herdr coordinator-forward leg (#13583).
 
@@ -520,17 +641,36 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     )
     outcome = reconciled.outcome
 
+    # Redmine #13813: a durable operator startup gate takes precedence — route this step to the
+    # exactly-once resume leg. The check reads the latest gate at action time and overrides the
+    # outcome for a resumable gate (``operator_reported_done``), a readable legacy gate (reapproval),
+    # AND every INDETERMINATE read (corrupt / unreadable / source error), which route to the leg's
+    # zero-actuating fail-closed disposition so no normal primitive runs (review j#79504 / j#79524
+    # F1). Only a DEFINITIVE no_gate (or a pre-clear / terminal / in-flight v3 gate) leaves the
+    # normal outcome to execute.
+    resume_outcome = _maybe_operator_startup_resume_outcome(args, outcome)
+    if resume_outcome is not None:
+        outcome = resume_outcome
+
     # The increment-2 herdr worker-dispatch leg and the increment-3 herdr coordinator-forward leg
     # are executable but ride their own dedicated fences, not the generic `executable` set (Redmine
-    # #13489 / #13583). Treat each as an executable leg here.
+    # #13489 / #13583). The #13813 resume leg is the same shape. Treat each as an executable leg.
     is_herdr_dispatch = _is_herdr_dispatch_leg(outcome)
     is_herdr_forward = _is_herdr_forward_leg(outcome)
+    is_startup_resume = _is_startup_resume_leg(outcome)
 
     # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work
     # no-op): report the resolved outcome, mutate nothing.
-    if dry_run or (not outcome.executable and not is_herdr_dispatch and not is_herdr_forward):
+    if dry_run or (
+        not outcome.executable
+        and not is_herdr_dispatch
+        and not is_herdr_forward
+        and not is_startup_resume
+    ):
         reported = outcome
-        if dry_run and (outcome.executable or is_herdr_dispatch or is_herdr_forward):
+        if dry_run and (
+            outcome.executable or is_herdr_dispatch or is_herdr_forward or is_startup_resume
+        ):
             # Reflect that the executable leg was not actually run.
             reported = dataclasses.replace(outcome, execution=EXECUTION_DRY_RUN)
         if as_json:
@@ -549,6 +689,8 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         rc, primitive_out = _execute_herdr_dispatch_leg(outcome, args)
     elif is_herdr_forward:
         rc, primitive_out = _execute_herdr_forward_leg(outcome, args)
+    elif is_startup_resume:
+        rc, primitive_out = _execute_startup_resume_leg(outcome, args)
     else:
         rc, primitive_out = _execute_primitive(outcome, args, session=session)
     executed = dataclasses.replace(outcome, execution=EXECUTION_EXECUTED)
@@ -686,6 +828,7 @@ def register(sub) -> None:
     register_admission(workflow_sub)
     register_lane_admission(workflow_sub)
     register_dispatch_plan(workflow_sub)
+    register_dispatch_ir(workflow_sub)
     register_runtime(workflow_sub)
     register_resume(workflow_sub)
     register_watch(workflow_sub)
@@ -812,6 +955,7 @@ __all__ = (
     "cmd_workflow_admission",
     "cmd_workflow_lane_admission",
     "cmd_workflow_dispatch_plan",
+    "cmd_workflow_dispatch_ir",
     "cmd_workflow_runtime",
     "cmd_workflow_resume",
     "cmd_workflow_watch",
