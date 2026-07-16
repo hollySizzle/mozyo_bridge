@@ -44,7 +44,9 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     """
     from mozyo_bridge.core.state.callback_publication_fence import (
         SEAL_ABSENT,
+        SEAL_INITIALIZING,
         SEAL_INVALID,
+        SEAL_LEGACY_INITIALIZING,
         CallbackPublicationFence,
         CallbackPublicationFenceError,
         PublicationKey,
@@ -113,12 +115,21 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
         state = "NOT ready: the seal exists but cannot be read — restore it; do not re-create"
     elif not fence.has_store():
         # No artifact at all: the only state where --bootstrap is a first init rather than a
-        # decision about existing rows.
-        state = (
-            "absent / never initialized — run --bootstrap"
-            if seal == SEAL_ABSENT
-            else f"NOT ready: sealed `{seal}` but the store is GONE — a loss; restore it"
-        )
+        # decision about existing rows. Which of these applies depends on the seal, and the status
+        # must say what bootstrap will actually DO -- reporting a resumable init as a loss (R17-F3)
+        # is the same surface/behaviour split as R16-F3, wearing a different state name.
+        if seal == SEAL_ABSENT:
+            state = "absent / never initialized — run --bootstrap"
+        elif seal == SEAL_INITIALIZING:
+            state = "NOT ready: a first init was interrupted — run --bootstrap to finish it"
+        elif seal == SEAL_LEGACY_INITIALIZING:
+            state = (
+                "NOT ready: sealed `initializing` by a build that granted rights without checking "
+                "the seal, and the store is GONE — a loss with an unknown owner. Restore it; it "
+                "cannot be re-created safely"
+            )
+        else:
+            state = f"NOT ready: sealed `{seal}` but the store is GONE — a loss; restore it"
     elif fence.has_usable_store():
         state = (
             "NOT ready: store exists but is unsealed — run --bootstrap to adopt it in place"
@@ -128,11 +139,12 @@ def cmd_workflow_callback_publication(args: argparse.Namespace) -> int:
     else:
         # Artifacts exist but do not work together. NOT a fresh install, and not adoptable: the DB
         # may still hold rows (R16-F1/F3), so the honest report is damage, not "never initialized".
+        found = ", ".join(a.name for a in fence.store_artifacts())
         state = (
-            "NOT ready: store artifacts are inconsistent (only one of DB / sidecar, mismatched "
-            "nonce, or an unreadable DB). This is damage, not a fresh install — the DB may still "
-            "hold a live reservation. Restore it, or remove BOTH artifacts once Redmine confirms "
-            "nothing is in flight"
+            f"NOT ready: store artifacts are inconsistent ({found}). This is damage, not a fresh "
+            f"install — the DB or its SQLite journal may still hold a live reservation. Restore "
+            f"from backup; deleting the artifacts is NOT a recovery, because Redmine showing "
+            f"nothing in flight now does not prove a stalled owner will not PUT later"
         )
     print(f"callback publication fence: {state} at {fence.path}")
     return 0
