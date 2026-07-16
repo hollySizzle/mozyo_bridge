@@ -11,21 +11,25 @@ recovery notification. Both halves are durable acts, so the order is the design:
       -> reserve the send fence -> send -> mark delivered
     release the lease
 
-**Two authorities, deliberately separate** (reviews R5-F1 / R6-F1):
+**Three authorities, deliberately separate** (reviews R5-F1 / R6-F1 / R9-F1):
 
 - :class:`...callback_sweep_lease.CallbackSweepLease` serializes the **attempt**. It is the one that
   may be *held* across slow Redmine I/O, because its rows name their owner: a loser is passive, and
   release is owner-conditional. :class:`...dispatch_outbox_fence.DispatchOutboxFence` cannot play
   that role — its contract assumes an instantaneous reservation and reads a lingering ``reserved``
   row as crash residue, so holding one corrupts a live owner and blocks the anchor forever.
+- :class:`...callback_publication_fence.CallbackPublicationFence` serializes the **record**, keyed
+  by its exact identity. It has no TTL and is never reclaimed, because a reclaimable reservation is
+  no reservation at all against a slow owner (R9-F1). See :mod:`.callback_recovery_record`.
 - the outbox fence still serializes the **send**, reserved immediately around it, exactly the short
   way its contract supports.
 
 **Acquiring is not owning.** The lease has a TTL, so an owner that is merely *slow* — a few Redmine
 round-trips — can outlive it and be reclaimed while still running. Every durable act therefore
 re-verifies ownership at the authority first (:meth:`CallbackSweepLease.owns`), and a lost lease
-publishes nothing and sends nothing. "A dead owner cannot have sent" was only ever true of the
-*send*; publication is gated by the lease alone.
+publishes nothing and sends nothing. But that check is not itself a guarantee: an owner can pass it
+and *then* be reclaimed mid-write, so neither durable act is gated by the lease alone — each has its
+own never-reclaimed fence, and the lease only decides who gets to try.
 
 **Every guard here was, at some revision, present but ineffective.** That is what the shape encodes:
 
@@ -56,8 +60,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from mozyo_bridge.core.state.callback_publication_fence import (
+    PUBLICATION_PUBLISHED,
+    CallbackPublicationFence,
+    PublicationKey,
+)
 from mozyo_bridge.core.state.callback_sweep_lease import (
-    LEASE_ACTION_MARGIN_SECONDS,
     CallbackSweepLease,
     CallbackSweepLeaseError,
     LeaseKey,
@@ -116,6 +124,10 @@ ZERO_SEND_LEASE_UNAVAILABLE = "attempt_lease_unavailable"
 #: was replaced). Publication and send both stop (review R6-F1/F2): an owner that no longer owns the
 #: anchor must not write a durable record or send, because the new owner will.
 ZERO_SEND_OWNERSHIP_LOST = "attempt_ownership_lost"
+#: This exact record is already reserved / uncertain / published by someone. Never republished.
+ZERO_SEND_PUBLICATION_HELD = "publication_held"
+#: A record PUT of unknown fate. Never auto-retried; an operator reconciles against Redmine.
+ZERO_SEND_PUBLICATION_UNCERTAIN = "publication_uncertain"
 
 
 def source_is_fresh(source: object) -> bool:
@@ -284,23 +296,6 @@ def sweep_once(
         except CallbackSweepLeaseError:
             pass  # the lease expires on its own; a later sweep reclaims it
 
-    def _may_act() -> bool:
-        """May this sweep START a durable act? Ownership plus enough lease left to finish it.
-
-        R8-F1: `owns()` alone answers "do I own it *now*", and a bool check plus an HTTP write are
-        not one transaction — the lease could lapse and be reclaimed between them, and then two
-        owners publish. The margin closes that by construction: an act only starts when the lease
-        outlives the act's worst case, so no instant exists at which this sweep is writing and
-        another may reclaim.
-        """
-        try:
-            return lease_store.owns(
-                lease_key, held.token, store_nonce=held.store_nonce,
-                min_remaining=LEASE_ACTION_MARGIN_SECONDS,
-            )
-        except CallbackSweepLeaseError:
-            return False
-
     def _still_owns() -> bool:
         """Re-verify ownership at the authority, immediately before a durable act (R6-F1).
 
@@ -326,7 +321,7 @@ def sweep_once(
     # R7-F1 / R8-F1: with the grant in hand, build the recorder around the live-grant predicate so
     # the ownership check lands immediately before the WRITE -- and requires a MARGIN, so the lease
     # cannot lapse while the write is still in flight.
-    record_fn = record_fn_factory(_may_act)
+    record_fn = record_fn_factory(_still_owns)
 
     if result["state"] != STATE_NO_PROGRESS_AFTER_HANDOFF:
         decision = decide_recovery(
@@ -355,7 +350,7 @@ def sweep_once(
         lease_key=lease_key,
         lease_token=held.token,
         release=_release,
-        still_owns=_may_act,
+        still_owns=_still_owns,
         ownership_lost=_ownership_lost,
         target_assigned_name=target_assigned_name,
         send_fn=send_fn,
@@ -457,6 +452,24 @@ def _mutating_path(
     except RecordOwnershipLostError:
         _release()
         return ownership_lost("the record write")
+    except RecordPublicationHeldError as exc:
+        # Another owner holds (or already completed) this exact record's publication. Never retry:
+        # a lingering reservation may be an owner mid-PUT (R9-F1 / j#80383).
+        _release()
+        result["send_reason"] = ZERO_SEND_PUBLICATION_HELD
+        result["send_detail"] = f"{exc}"
+        result["resolution_recorded"] = False
+        result["needs_reconcile"] = True
+        return result
+    except RecordPublicationUncertainError as exc:
+        # A PUT of unknown fate. Safety over availability: stop, and let an operator reconcile.
+        _release()
+        result["send_reason"] = ZERO_SEND_PUBLICATION_UNCERTAIN
+        result["send_detail"] = f"{exc}"
+        result["resolution_recorded"] = False
+        result["sweep_complete"] = False
+        result["needs_reconcile"] = True
+        return result
     except RecordSupersededError as exc:
         # R4-F1: the recorder's own pre-write read contradicted the verdict, so nothing was
         # written. Fold to the first-pass resolution — no false stall record, no correction.
@@ -633,6 +646,17 @@ def _record_resolution(
         result["resolution_recorded"] = False
         result["record_reason"] = "ownership_lost"
         return
+    except RecordPublicationHeldError:
+        result["resolution_recorded"] = False
+        result["record_reason"] = "publication_held"
+        result["needs_reconcile"] = True
+        return
+    except RecordPublicationUncertainError:
+        result["resolution_recorded"] = False
+        result["record_reason"] = "publication_uncertain"
+        result["sweep_complete"] = False
+        result["needs_reconcile"] = True
+        return
     except Exception as exc:  # noqa: BLE001 - surfaced as incomplete, never swallowed as success
         result["resolution_recorded"] = False
         result["record_reason"] = type(exc).__name__
@@ -727,22 +751,13 @@ class RecoverySendError(RuntimeError):
     """The one recovery notification did not positively succeed (-> the fence marks it uncertain)."""
 
 
-class RecordOwnershipLostError(RuntimeError):
-    """The attempt lease lapsed before the record write, so nothing was published (R7-F1).
-
-    Distinct from a write failure: nothing is broken and nothing was attempted — this sweep simply
-    no longer owns the anchor, and the owner that does will publish.
-    """
-
-
-class RecordSupersededError(RuntimeError):
-    """The recorder's own pre-write read contradicts the verdict, so it wrote nothing (R4-F1).
-
-    Distinct from a write failure: nothing went wrong and nothing is broken — the lane simply is
-    not stalled after all, discovered at the last durable read before the write. The caller folds
-    it into the first-pass resolution, which is what acceptance 3 asks for: no false stall record
-    to correct later.
-    """
+from .callback_recovery_record import (  # noqa: E402  (re-exported: the public API is unchanged)
+    RecordOwnershipLostError,
+    RecordPublicationHeldError,
+    RecordPublicationUncertainError,
+    RecordSupersededError,
+    build_recovery_recorder,
+)
 
 
 def build_recovery_sender(
@@ -792,122 +807,6 @@ def build_recovery_sender(
     return _run
 
 
-def build_recovery_recorder(
-    *,
-    source: object,
-    issue: str,
-    lane: str,
-    lane_generation: object,
-    post_note: Callable[[str, str], object],
-    grant_is_live: Callable[[], bool],
-) -> Callable[[dict, SweepWatermark], str]:
-    """Build the production ``record_fn``: write the sweep record, then RESOLVE its journal id.
-
-    Review R2-F3. Redmine's note write returns ``204 No Content`` with no journal id, so the writer
-    cannot learn where its own record landed. This uses the same write -> re-read -> resolve-by-
-    marker pattern :mod:`...reconcile_dispatch_writer` established for the IR anchor: the record
-    carries an identifying marker, and its OWNING entry's journal id (the durable authority, never a
-    self-reported field) is read back afterwards.
-
-    Idempotent by pre-read: an already-recorded resolution is recovered rather than duplicated, so
-    repeated sweeps at the same verdict do not spam the issue. Keyed by ``outcome`` as well as the
-    dispatch anchor, so a legitimately changed verdict (``stall_unprovable`` -> a landed gate) is
-    recorded once each. Returns ``""`` when the record cannot be resolved — :func:`sweep_once` then
-    cancels the send rather than perform an unrecorded one.
-
-    ``grant_is_live()`` conditions THE WRITE ITSELF on still holding the attempt lease (review
-    R7-F1). Checking ownership before *calling* the recorder is not enough and was the previous
-    defect: this function then performs a full Redmine pre-read before ``post_note``, so the gap
-    between that check and the actual publication is not microscopic — it is a whole network
-    round-trip, which is ample time for a slow owner's TTL to lapse and the anchor to be reclaimed.
-    The check therefore sits where it can be honest: immediately before the write, after every read
-    this function performs. A lapsed grant raises :class:`RecordOwnershipLostError` and writes
-    nothing.
-    """
-
-    def _record(result: dict, watermark: SweepWatermark) -> str:
-        outcome = str(result.get("state", "") or "").strip()
-        anchor = str(watermark.dispatch_journal or "").strip()
-        if not (outcome and anchor):
-            return ""
-        keys = dict(
-            lane=lane, lane_generation=lane_generation, dispatch_anchor=anchor, outcome=outcome
-        )
-        pre = list(source.read_entries(str(issue)))
-        existing = sweep_record_journals(pre, **keys)
-        if len(existing) == 1:
-            return existing[0]  # already recorded this resolution: recover, write nothing
-        if len(existing) >= 2:
-            return ""  # ambiguous: fail closed rather than pick one
-        # Review R4-F1: this pre-read is a durable OBSERVATION, not just an idempotency lookup.
-        # Writing a stall record while it already shows a landed gate produces exactly the
-        # false-verdict-then-correction pair acceptance 3 forbids, so the verdict is re-checked
-        # against the very entries about to be written against, and a superseded stall aborts
-        # BEFORE the write. The caller folds this into the first-pass resolution.
-        if outcome == STATE_NO_PROGRESS_AFTER_HANDOFF:
-            fresh = resolve_watermark(
-                pre,
-                dispatch_journal=anchor,
-                lane=lane,
-                lane_generation=lane_generation,
-                latest_generation=(dispatch_generations(pre, lane=lane) or (0,))[-1],
-            )
-            if not fresh.stall_provable or fresh.superseded:
-                raise RecordSupersededError(
-                    f"the stall verdict no longer holds at write time (progress="
-                    f"{[j for j, _ in fresh.progress]} opaque={list(fresh.opaque)} "
-                    f"superseded={fresh.superseded}); no stall record was written"
-                )
-        # R7-F1: the LAST thing before the write. Every read above has completed, so this is the
-        # narrowest point at which the grant can be checked; a lapse discovered here means the
-        # current owner will publish and this one must not.
-        if not grant_is_live():
-            raise RecordOwnershipLostError(
-                "the attempt lease lapsed before the record write; publishing nothing"
-            )
-        post_note(str(issue), render_sweep_record_note(_record_body(result), **keys))
-        written = sweep_record_journals(source.read_entries(str(issue)), **keys)
-        return written[0] if len(written) == 1 else ""
-
-    return _record
-
-
-def _record_body(result: dict) -> str:
-    """The human-readable sweep record: the classification, what was missing, the retry target."""
-    lines = [
-        "## Gate: progress_log — callback sweep record",
-        "",
-        f"- **state**: `{result.get('state', '')}`",
-        f"- **is_stall**: {result.get('is_stall', False)}",
-        f"- **dispatch_anchor**: j#{result.get('dispatch_journal', '') or '-'}",
-        f"- **callback**: `{result.get('callback', '')}`",
-        f"- **send_reason**: `{result.get('send_reason', '') or 'pending'}`",
-        "",
-        f"{result.get('summary', '')}",
-    ]
-    progress = result.get("progress_journals") or []
-    if progress:
-        lines += ["", "### 観測した durable progress"] + [
-            f"- j#{p['journal']} `{p['kind']}`" for p in progress
-        ]
-    opaque = result.get("opaque_journals") or []
-    if opaque:
-        lines += [
-            "",
-            "### marker を持たない post-anchor journal (分類不能)",
-            "- " + ", ".join(f"j#{j}" for j in opaque),
-        ]
-    steps = result.get("recovery") or []
-    if steps:
-        lines += ["", "### recovery"] + [f"{i}. {s}" for i, s in enumerate(steps, 1)]
-    lines += [
-        "",
-        "本 record は coordinator の sweep 記録であり、worker progress ではない "
-        "(marker kind は `callback_sweep_record`)。",
-    ]
-    return "\n".join(lines)
-
-
 def _default_recovery_runner(argv: list) -> "tuple[int, str]":
     """Spawn the sanctioned mozyo-bridge CLI for the one recovery send (fixed argv, no shell)."""
     import subprocess  # noqa: S404 - the sanctioned CLI boundary, mirroring HandoffCallbackSendPort
@@ -927,6 +826,10 @@ __all__ = (
     "ZERO_SEND_ATTEMPT_HELD",
     "ZERO_SEND_LEASE_UNAVAILABLE",
     "ZERO_SEND_OWNERSHIP_LOST",
+    "ZERO_SEND_PUBLICATION_HELD",
+    "ZERO_SEND_PUBLICATION_UNCERTAIN",
+    "RecordPublicationHeldError",
+    "RecordPublicationUncertainError",
     "RecoverySendError",
     "RecordSupersededError",
     "RecordOwnershipLostError",

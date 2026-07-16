@@ -248,6 +248,7 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
     record, an unbootstrapped fence, a lost reserve, opaque post-anchor journals, a landed gate, or
     a superseded round all zero-send.
     """
+    from mozyo_bridge.core.state.callback_publication_fence import CallbackPublicationFence
     from mozyo_bridge.core.state.callback_sweep_lease import CallbackSweepLease
     from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
@@ -297,6 +298,10 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
     # bootstraps it explicitly; a store LOSS then fails closed instead of minting a duplicate lease.
     lease = CallbackSweepLease(home=None)
     lease.bootstrap()
+    # The publication authority (j#80383 option (d)). Like the lease it never auto-creates: a
+    # forgotten store would let an already-published record be published again.
+    publication_fence = CallbackPublicationFence(home=None)
+    publication_fence.bootstrap()
     result = sweep_once(
         workspace_id=_attested_workspace_id(args),
         lane_id=lane,
@@ -313,6 +318,8 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
         record_fn_factory=lambda grant_is_live: build_recovery_recorder(
             source=source, issue=issue, lane=lane, lane_generation=generation,
             post_note=transport.post_issue_note, grant_is_live=grant_is_live,
+            publication_fence=publication_fence,
+            workspace_id=_attested_workspace_id(args),
         ),
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),

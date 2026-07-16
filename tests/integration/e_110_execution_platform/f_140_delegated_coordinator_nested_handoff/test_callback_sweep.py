@@ -19,8 +19,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.callback_publication_fence import (
+    PUBLICATION_RESERVED,
+    PUBLICATION_UNCERTAIN,
+    CallbackPublicationFenceError,
+    PublicationKey,
+)
 from mozyo_bridge.core.state.callback_sweep_lease import (
-    LEASE_ACTION_MARGIN_SECONDS,
     CallbackSweepLeaseError,
     LEASE_HELD,
     LEASE_RECLAIMED,
@@ -42,6 +47,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND_SOURCE_NOT_FRESH,
     ZERO_SEND_WORKSPACE_UNATTESTED,
     RecordOwnershipLostError,
+    RecordPublicationHeldError,
+    RecordPublicationUncertainError,
     build_recovery_recorder,
     build_recovery_sender,
     source_is_fresh,
@@ -107,6 +114,15 @@ def progress(jid, kind, generation=GEN):
 def prose(jid, heading):
     """A journal in the REAL #13883 shape: a gate heading with no structured marker."""
     return entry(jid, f"{heading}\n\n(prose body)")
+
+
+def _bootstrapped_pubfence(home=None):
+    """A ready-to-use publication fence. Like the lease store it never auto-creates."""
+    from mozyo_bridge.core.state.callback_publication_fence import CallbackPublicationFence
+
+    f = CallbackPublicationFence(home=home or Path(tempfile.mkdtemp()))
+    f.bootstrap()
+    return f
 
 
 def _bootstrapped_lease(home=None):
@@ -180,6 +196,7 @@ class SweepFenceTest(unittest.TestCase):
         self.home = Path(self._tmp.name)
         self.fence = DispatchOutboxFence(home=self.home)
         self.fence.bootstrap()
+        self.pubfence = _bootstrapped_pubfence(getattr(self, 'home', Path(self._tmp.name)))
         self.lease = _bootstrapped_lease(self.home)
         self.sends = []
         self.recorder = FakeRecorder()
@@ -411,6 +428,7 @@ class SnapshotSourceRefusalTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
         self.fence.bootstrap()
+        self.pubfence = _bootstrapped_pubfence(getattr(self, 'home', Path(self._tmp.name)))
         self.lease = _bootstrapped_lease(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
@@ -463,6 +481,7 @@ class WorkspaceAttestationTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
         self.fence.bootstrap()
+        self.pubfence = _bootstrapped_pubfence(getattr(self, 'home', Path(self._tmp.name)))
         self.addCleanup(self._tmp.cleanup)
 
     def sweep(self, ws, sends):
@@ -497,6 +516,7 @@ class RecoveryRecordTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
         self.fence.bootstrap()
+        self.pubfence = _bootstrapped_pubfence(getattr(self, 'home', Path(self._tmp.name)))
         self.lease = _bootstrapped_lease(Path(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
 
@@ -723,6 +743,7 @@ class RecoveryRecordTest(unittest.TestCase):
         recorder = build_recovery_recorder(
             source=src, issue=ISSUE, lane=LANE, lane_generation=GEN,
             post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
+            publication_fence=self.pubfence, workspace_id=WS,
         )
         wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
                                lane_generation=GEN, latest_generation=GEN)
@@ -747,6 +768,7 @@ class ProductionRecorderTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.fence = DispatchOutboxFence(home=Path(self._tmp.name))
         self.fence.bootstrap()
+        self.pubfence = _bootstrapped_pubfence(getattr(self, 'home', Path(self._tmp.name)))
         self.posted = []
         self.sends = []
         self.lease = _bootstrapped_lease(Path(self._tmp.name))
@@ -761,6 +783,7 @@ class ProductionRecorderTest(unittest.TestCase):
         return lambda grant_is_live: build_recovery_recorder(
             source=source, issue=ISSUE, lane=LANE, lane_generation=GEN,
             post_note=lambda i, n: self.posted.append(n), grant_is_live=grant_is_live,
+            publication_fence=self.pubfence, workspace_id=WS,
         )
 
     def _published(self):
@@ -885,7 +908,8 @@ class ProductionRecorderTest(unittest.TestCase):
                 fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
                 send_fn=lambda j: self.sends.append(j), callback=CALLBACK_SAME_LANE_ONLY,
                 record_fn_factory=lambda live: build_recovery_recorder(
-                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live
+                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live,
+                    publication_fence=self.pubfence, workspace_id=WS,
                 ),
             )
 
@@ -929,7 +953,8 @@ class ProductionRecorderTest(unittest.TestCase):
                 fence=self.fence, lease=self.lease, target_assigned_name=TARGET,
                 send_fn=lambda j: self.sends.append(j),
                 record_fn_factory=lambda live: build_recovery_recorder(
-                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live
+                    source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live,
+                    publication_fence=self.pubfence, workspace_id=WS,
                 ),
             )
             reasons.append(r["send_reason"])
@@ -1038,6 +1063,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.lease = _bootstrapped_lease(self.home)
         self.fence = DispatchOutboxFence(home=self.home)
         self.fence.bootstrap()
+        self.pubfence = _bootstrapped_pubfence(getattr(self, 'home', Path(self._tmp.name)))
         self.posted = []
         self.sends = []
         self.addCleanup(self._tmp.cleanup)
@@ -1062,6 +1088,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
             record_fn_factory=lambda live: build_recovery_recorder(
                 source=RaceSource([ir("79990")]), issue=ISSUE, lane=LANE, lane_generation=GEN,
                 post_note=lambda i, n: self.posted.append(n), grant_is_live=live,
+                publication_fence=self.pubfence, workspace_id=WS,
             ),
         )
         # This sweep is a fresh attempt: it either owns the lease cleanly, or stands down. What it
@@ -1133,6 +1160,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
             record_fn_factory=lambda live: build_recovery_recorder(
                 source=RecorderSource(), issue=ISSUE, lane=LANE, lane_generation=GEN,
                 post_note=lambda i, n: posted.append(n), grant_is_live=live,
+                publication_fence=self.pubfence, workspace_id=WS,
             ),
         )
         self.assertEqual(posted, [])          # zero-publication, not "published then declined to send"
@@ -1159,35 +1187,120 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         self.lease.bootstrap()                            # DB + sidecar agree -> no-op
         self.assertTrue(self.lease.owns(self.key(), a.token))
 
-    def test_a_write_never_starts_without_enough_lease_left_to_finish_it(self):
-        # R8-F1. A bool check and an HTTP write are not one transaction: the reviewer showed
-        # check-True -> B reclaims -> B publishes -> A publishes = 2 records. Moving the check
-        # closer cannot fix that; with no CAS at the resource the sound rule is the classic lease
-        # discipline -- do not START an act unless the lease outlives the act's worst case. Then no
-        # instant exists at which A writes and B may reclaim.
+    def test_the_r9_sequence_publishes_exactly_once(self):
+        # The R9-F1 sequence, verbatim: A reserves -> A is suspended past the attempt TTL -> B
+        # reclaims the lease and attempts the SAME record -> A resumes holding a stale check.
+        # Previously this produced posted_count=2. The publication fence never reclaims, so
+        # whoever reserved the record identity is the only one who can ever write it.
+        posted = []
+        outer = self
+
+        class Src:
+            fresh_read = True
+
+            def read_entries(self, issue_id):
+                return [ir("79990")] + [entry(str(99000 + k), n) for k, n in enumerate(posted)]
+
+        def mk(grant):
+            return build_recovery_recorder(
+                source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
+                post_note=lambda i, n: posted.append(n), grant_is_live=grant,
+                publication_fence=self.pubfence, workspace_id=WS,
+            )
+
+        wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
+                               lane_generation=GEN, latest_generation=GEN)
+        res = {"state": STATE_NO_PROGRESS_AFTER_HANDOFF, "dispatch_journal": "79990"}
+        a = self.lease.acquire(self.key())
+
+        def a_grant():
+            ok = self.lease.owns(self.key(), a.token)
+            # A is suspended here, past its TTL. B reclaims and attempts the same record.
+            self.lease.acquire(self.key(), now=time.time() + 99999)
+            try:
+                mk(lambda: True)(res, wm)
+            except (RecordPublicationHeldError, RecordPublicationUncertainError):
+                pass
+            return ok      # A resumes, still holding the check it already passed
+
+        try:
+            mk(a_grant)(res, wm)
+        except (RecordPublicationHeldError, RecordPublicationUncertainError):
+            pass
+        self.assertEqual(len(posted), 1)
+
+    def test_a_reservation_is_never_reclaimed_so_a_crashed_owner_blocks_rather_than_duplicates(self):
+        # A reserved and then crashed (no published/uncertain mark). A re-entry must NOT take over:
+        # the owner may be mid-PUT, and reclaiming is exactly what created duplicates. The anchor
+        # stalls and an operator reconciles -- availability traded for safety, deliberately.
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        first = self.pubfence.reserve(key)
+        self.assertTrue(first.may_publish)
+        second = self.pubfence.reserve(key)                 # a re-entry, any time later
+        self.assertFalse(second.may_publish)
+        self.assertEqual(second.prior_state, PUBLICATION_RESERVED)
+        self.assertTrue(second.needs_reconcile)
+        self.assertEqual(self.pubfence.state_of(key), PUBLICATION_RESERVED)  # owner's row intact
+
+    def test_an_uncertain_put_is_never_auto_retried(self):
         posted = []
 
         class Src:
             fresh_read = True
 
             def read_entries(self, issue_id):
-                return [ir("79990")] + [entry(str(98000 + k), n) for k, n in enumerate(posted)]
+                return [ir("79990")]
 
-        a = self.lease.acquire(self.key(), ttl_seconds=LEASE_ACTION_MARGIN_SECONDS - 5)
-        self.assertTrue(self.lease.owns(self.key(), a.token))          # live...
-        recorder = build_recovery_recorder(
-            source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
-            post_note=lambda i, n: posted.append(n),
-            grant_is_live=lambda: self.lease.owns(
-                self.key(), a.token, store_nonce=a.store_nonce,
-                min_remaining=LEASE_ACTION_MARGIN_SECONDS,
-            ),
+        def boom(issue_id, note):
+            posted.append(note)                             # the PUT may well have landed...
+            raise RuntimeError("connection reset")          # ...but its fate is unknown
+
+        rec = build_recovery_recorder(
+            source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=boom,
+            grant_is_live=lambda: True, publication_fence=self.pubfence, workspace_id=WS,
         )
         wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
                                lane_generation=GEN, latest_generation=GEN)
-        with self.assertRaises(RecordOwnershipLostError):              # ...but too near expiry
-            recorder({"state": STATE_NO_PROGRESS_AFTER_HANDOFF, "dispatch_journal": "79990"}, wm)
-        self.assertEqual(posted, [])
+        res = {"state": STATE_NO_PROGRESS_AFTER_HANDOFF, "dispatch_journal": "79990"}
+        with self.assertRaises(RecordPublicationUncertainError):
+            rec(res, wm)
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertEqual(self.pubfence.state_of(key), PUBLICATION_UNCERTAIN)
+        # A later sweep must NOT try again: only Redmine knows whether that PUT landed.
+        with self.assertRaises(RecordPublicationHeldError):
+            build_recovery_recorder(
+                source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
+                post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
+                publication_fence=self.pubfence, workspace_id=WS,
+            )(res, wm)
+        self.assertEqual(len(posted), 1)
+
+    def test_the_stall_and_zero_send_outcomes_are_fenced_separately(self):
+        # Both outcomes go through the same contract, but they are DIFFERENT records: a lane whose
+        # verdict legitimately changes must still be able to record the new one.
+        stall = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE,
+                               lane_generation=str(GEN), dispatch_anchor="79990",
+                               outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        progress = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE,
+                                  lane_generation=str(GEN), dispatch_anchor="79990",
+                                  outcome=STATE_PROGRESS_WITHOUT_CALLBACK)
+        self.assertTrue(self.pubfence.reserve(stall).may_publish)
+        self.assertTrue(self.pubfence.reserve(progress).may_publish)   # a distinct identity
+        self.assertFalse(self.pubfence.reserve(stall).may_publish)     # but each only once
+
+    def test_publication_fence_store_loss_fails_closed_and_recover_is_the_way_out(self):
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.pubfence.reserve(key)
+        self.pubfence.sidecar_path.unlink()
+        with self.assertRaises(CallbackPublicationFenceError):
+            self.pubfence.bootstrap()
+        with self.assertRaises(CallbackPublicationFenceError):
+            self.pubfence.reserve(key)              # forgetting a reservation would republish
+        self.pubfence.recover()
+        self.assertTrue(self.pubfence.reserve(key).may_publish)
 
     def test_actuation_refuses_a_grant_less_raw_writer(self):
         # R8-F2: the unsafe shape must be unrepresentable, not merely discouraged. A raw writer
