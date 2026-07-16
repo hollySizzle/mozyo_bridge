@@ -192,7 +192,7 @@ class _RecoveryCase(unittest.TestCase):
             provider=WORKER["provider"], assigned_name=WORKER["assigned_name"],
             locator=WORKER["old_locator"], journal="79485", action_id=ACTION_ID,
             action_generation=GEN, lane_revision="3", lane_generation="2",
-            expected_gate="review_request", next_semantic_action="dispatch_once",
+            expected_gate="implementation_request", next_semantic_action="dispatch_once",
         )
         base.update(overrides)
         return RecoveryRequest(**base)
@@ -395,6 +395,18 @@ class ApprovalFenceTests(_RecoveryCase):
         self.assertEqual(outcome.status, RECOVERY_REFUSED)
         self.assertEqual(self.port.closed, [])
 
+    def test_non_implementation_request_gate_is_zero_send(self):
+        # R3-F1: the redispatch only delivers an implementation_request to the worker, so a
+        # continuation pointing at a different gate is a zero-send typed blocker (the send kind
+        # and the pointer gate kind must be one token).
+        ops = FakeRecoveryOps(_all_clear())
+        outcome = self._use_case(ops).run(
+            self._request(expected_gate="review_request"), execute=True
+        )
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("redispatchable worker gate", outcome.detail)
+        self.assertEqual(self.port.closed, [])
+
     def test_authority_conflict_when_foreign_generation_already_planned(self):
         # A DIFFERENT approved generation already owns this worker's transaction key.
         key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
@@ -423,7 +435,7 @@ class ApprovalFenceTests(_RecoveryCase):
             decision=DecisionPointer(source="redmine", issue_id="13806", journal_id="79485"),
             continuation=ContinuationPointer(
                 source="redmine", issue_id="13806", journal_id="79485",
-                expected_gate="review_request", next_semantic_action="dispatch_once",
+                expected_gate="implementation_request", next_semantic_action="dispatch_once",
             ),
             participants=[ParticipantPin(**WORKER, lane_revision="99", lane_generation="99")],
         )

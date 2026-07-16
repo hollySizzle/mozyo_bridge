@@ -509,16 +509,26 @@ class LiveStaleWorkerRecoveryOps:
     def _redispatch_marker(self, continuation: ContinuationPointer, worker_provider: str) -> str:
         """The EXACT ``[mozyo:handoff:...]`` marker ``dispatch_to_worker`` writes (byte-for-byte).
 
-        The governed worker-forward rail always sends ``--source redmine --kind
-        implementation_request --to <worker_provider>`` (:mod:`...sublane_worker_dispatcher`),
-        so the redispatch's marker is deterministic. ``gate_redispatched`` matches it exactly —
-        a delivery of a *different* gate kind / anchor / receiver produces a different marker
-        and can never be mistaken for THIS redispatch (Redmine #13806 R2-R2).
+        Built through the CANONICAL :func:`...handoff.build_marker` from the continuation's
+        immutable ``expected_gate`` (Redmine #13806 R3-F1) + the exact Redmine anchor + the
+        resolved worker provider — the same authority the rail uses, so it stays byte-identical
+        even if the marker format evolves. The use case has already fenced ``expected_gate ==
+        implementation_request`` (the only kind the worker-forward rail sends), so the marker
+        kind, the send kind, and the pointer's gate kind are one closed token. A delivery of a
+        different gate kind / anchor / receiver produces a different marker and can never be
+        mistaken for THIS redispatch (R2-R2).
         """
-        return (
-            f"[mozyo:handoff:source=redmine:issue={_norm(continuation.issue_id)}:"
-            f"journal={_norm(continuation.journal_id)}:kind=implementation_request:"
-            f"to={worker_provider}]"
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            RedmineAnchor,
+            build_marker,
+        )
+
+        return build_marker(
+            RedmineAnchor(
+                issue=_norm(continuation.issue_id), journal=_norm(continuation.journal_id)
+            ),
+            _norm(continuation.expected_gate),
+            worker_provider,
         )
 
     def gate_redispatched(self, continuation: ContinuationPointer) -> bool:
@@ -536,6 +546,13 @@ class LiveStaleWorkerRecoveryOps:
           kind / anchor / receiver is a different marker;
         - the ledger anchor (``source=redmine`` / ``issue_id`` / ``journal_id``), ``receiver``
           == the worker provider, ``backend=herdr``, ``rail=queue_enter_rail``;
+        - the ``provider`` column as a **compatibility-aware optional assertion** (Design Answer
+          j#79584): ``_norm(rec.provider) in ("", worker_provider)``. The generic herdr send path
+          leaves ``provider`` empty (only ``receiver`` carries the binding-resolved provider), so
+          the canonical real record's empty ``provider`` is honoured; a *present-but-contradictory*
+          ``provider`` (e.g. ``codex``) is rejected. Empty-allowed is generic-writer
+          compatibility, NOT fail-open — the positive provider authority is the exact marker's
+          ``to=<worker_provider>`` and the populated ``receiver``;
         - ``target`` == the **current fresh worker locator** — so a delivery to any other pane
           (incl. the pre-recovery delivery to the now-vanished old worker) is rejected;
         - ``status=sent`` AND an **accepted reason** (``ok`` — a landing-marker-observed submit;
@@ -564,6 +581,9 @@ class LiveStaleWorkerRecoveryOps:
                 and _norm(rec.issue_id) == _norm(continuation.issue_id)
                 and _norm(rec.journal_id) == _norm(continuation.journal_id)
                 and _norm(rec.receiver) == worker_provider
+                # provider is caller-supplied optional metadata the generic writer leaves empty;
+                # a present-but-contradictory value is rejected (Design Answer j#79584).
+                and _norm(rec.provider) in ("", worker_provider)
                 and _norm(rec.backend) == "herdr"
                 and _norm(rec.rail) == "queue_enter_rail"
                 and _norm(rec.target) == fresh_locator

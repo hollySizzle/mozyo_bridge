@@ -92,7 +92,7 @@ def _request(**overrides):
     base = dict(
         issue="13806", lane=LANE, role=ROLE, provider=ROLE, assigned_name=NAME,
         locator=LOCATOR, journal="79485", action_id="", action_generation=7,
-        lane_revision="3", lane_generation="2", expected_gate="review_request",
+        lane_revision="3", lane_generation="2", expected_gate="implementation_request",
         next_semantic_action="dispatch_once",
     )
     base.update(overrides)
@@ -436,7 +436,7 @@ class RedispatchLedgerTests(_LiveCase):
     def _continuation(self):
         return ContinuationPointer(
             source="redmine", issue_id=self.ISSUE, journal_id=self.JOURNAL,
-            expected_gate="review_request", next_semantic_action="dispatch_once",
+            expected_gate="implementation_request", next_semantic_action="dispatch_once",
         )
 
     def _seed_launch(self, att_home, observed_at=LAUNCH_AT):
@@ -504,6 +504,18 @@ class RedispatchLedgerTests(_LiveCase):
             self._fixture(notification_marker=bad).gate_redispatched(self._continuation())
         )
 
+    def test_continuation_gate_kind_binds_the_marker(self):
+        # R3-F1: the oracle marker is built from continuation.expected_gate, so a pointer naming
+        # a different gate reconstructs a different marker and never confirms the (correct
+        # implementation_request) ledger record.
+        ops = self._fixture()  # ledger holds the real implementation_request marker
+        other = ContinuationPointer(
+            source="redmine", issue_id=self.ISSUE, journal_id=self.JOURNAL,
+            expected_gate="review_request", next_semantic_action="dispatch_once",
+        )
+        self.assertFalse(ops.gate_redispatched(other))
+        self.assertTrue(ops.gate_redispatched(self._continuation()))  # the aligned pointer does
+
     def test_wrong_target_is_not_confirmed(self):
         self.assertFalse(self._fixture(target="w99:p1").gate_redispatched(self._continuation()))
 
@@ -515,6 +527,18 @@ class RedispatchLedgerTests(_LiveCase):
 
     def test_wrong_receiver_is_not_confirmed(self):
         self.assertFalse(self._fixture(receiver="codex").gate_redispatched(self._continuation()))
+
+    def test_contradictory_provider_metadata_is_not_confirmed(self):
+        # R3-F1 part2 / Design Answer j#79584: a present-but-wrong provider column is rejected.
+        self.assertFalse(self._fixture(provider="codex").gate_redispatched(self._continuation()))
+
+    def test_explicit_worker_provider_metadata_is_confirmed(self):
+        # an optional provider column that DOES name the worker provider is accepted.
+        self.assertTrue(self._fixture(provider=ROLE).gate_redispatched(self._continuation()))
+
+    def test_empty_provider_metadata_is_confirmed(self):
+        # the canonical real record leaves provider empty (generic writer compatibility).
+        self.assertTrue(self._fixture(provider=None).gate_redispatched(self._continuation()))
 
     def test_delivery_before_launch_is_not_confirmed(self):
         # the same-anchor pre-recovery delivery to the old worker is temporally rejected too

@@ -87,6 +87,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 # -- recovery / redispatch status vocabulary (closed) ---------------------------
 
+#: The ONLY gate kind a worker recovery may redispatch (Redmine #13806 R3-F1). The governed
+#: same-lane worker-forward rail (``handoff send --kind implementation_request``) delivers an
+#: implementation_request to the worker, so the continuation pointer's ``expected_gate`` must be
+#: exactly this — a pointer naming any other gate is a zero-send typed blocker (the send kind,
+#: the redispatch marker kind, and the pointer's gate kind are thereby all one closed token).
+RECOVERY_REDISPATCH_GATE = "implementation_request"
+
 #: Preflight only — no ``--execute`` was requested (read-only classification).
 RECOVERY_PREFLIGHT = "preflight"
 #: ``--execute`` refused before any actuation because the target is not actionable (a typed
@@ -333,6 +340,20 @@ class StaleWorkerRecoveryUseCase:
                 request, verdict, status=RECOVERY_REFUSED, executed=True,
                 observation=observation,
                 detail="redispatch continuation pointer is incomplete",
+            )
+        # The redispatch delivers an implementation_request to the fresh worker (the only kind
+        # the governed worker-forward rail sends), so the immutable continuation ``expected_gate``
+        # must name exactly that (Redmine #13806 R3-F1). A pointer naming a different gate would
+        # send one kind while the transaction header points at another — zero-send typed blocker,
+        # never advanced to completed on a mismatched gate.
+        if continuation.expected_gate != RECOVERY_REDISPATCH_GATE:
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation,
+                detail=(
+                    f"continuation gate {continuation.expected_gate!r} is not a redispatchable "
+                    f"worker gate ({RECOVERY_REDISPATCH_GATE!r}); zero send"
+                ),
             )
         try:
             worker = ParticipantPin(
