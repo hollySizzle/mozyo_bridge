@@ -44,5 +44,3 @@ def cmd_workflow_callback_lease(args: argparse.Namespace) -> int:
     state = "bootstrapped" if lease.is_bootstrapped() else "absent / not bootstrapped"
     print(f"callback sweep lease: {state} at {lease.path}")
     return 0
-
-
