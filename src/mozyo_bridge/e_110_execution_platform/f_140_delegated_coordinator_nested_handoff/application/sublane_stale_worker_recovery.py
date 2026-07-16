@@ -94,6 +94,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: the redispatch marker kind, and the pointer's gate kind are thereby all one closed token).
 RECOVERY_REDISPATCH_GATE = "implementation_request"
 
+#: The ONLY continuation semantic action a worker recovery may drive (Redmine #13806 R4-F1).
+#: The redispatch performs a fixed "dispatch the gate to the fresh worker exactly once" effect,
+#: so the pointer's ``next_semantic_action`` must name exactly that — a pointer declaring any
+#: other action would let the transaction header point at one action while a different fixed
+#: effect runs. Fenced together with :data:`RECOVERY_REDISPATCH_GATE` before any close / send.
+RECOVERY_REDISPATCH_ACTION = "dispatch_once"
+
 #: Preflight only — no ``--execute`` was requested (read-only classification).
 RECOVERY_PREFLIGHT = "preflight"
 #: ``--execute`` refused before any actuation because the target is not actionable (a typed
@@ -341,11 +348,13 @@ class StaleWorkerRecoveryUseCase:
                 observation=observation,
                 detail="redispatch continuation pointer is incomplete",
             )
-        # The redispatch delivers an implementation_request to the fresh worker (the only kind
-        # the governed worker-forward rail sends), so the immutable continuation ``expected_gate``
-        # must name exactly that (Redmine #13806 R3-F1). A pointer naming a different gate would
-        # send one kind while the transaction header points at another — zero-send typed blocker,
-        # never advanced to completed on a mismatched gate.
+        # The immutable continuation authority is the (gate kind, semantic action) PAIR: the
+        # redispatch delivers an implementation_request to the fresh worker and drives the fixed
+        # dispatch-once effect (the only kind/action the governed worker-forward rail performs),
+        # so BOTH ``expected_gate`` and ``next_semantic_action`` must name exactly those
+        # (Redmine #13806 R3-F1 / R4-F1). A pointer declaring a different gate OR action would let
+        # the transaction header point at one thing while a fixed effect runs another — a
+        # zero-close / zero-send typed blocker, never advanced to completed on a mismatch.
         if continuation.expected_gate != RECOVERY_REDISPATCH_GATE:
             return self._outcome(
                 request, verdict, status=RECOVERY_REFUSED, executed=True,
@@ -353,6 +362,15 @@ class StaleWorkerRecoveryUseCase:
                 detail=(
                     f"continuation gate {continuation.expected_gate!r} is not a redispatchable "
                     f"worker gate ({RECOVERY_REDISPATCH_GATE!r}); zero send"
+                ),
+            )
+        if continuation.next_semantic_action != RECOVERY_REDISPATCH_ACTION:
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation,
+                detail=(
+                    f"continuation action {continuation.next_semantic_action!r} is not the "
+                    f"redispatchable worker action ({RECOVERY_REDISPATCH_ACTION!r}); zero send"
                 ),
             )
         try:

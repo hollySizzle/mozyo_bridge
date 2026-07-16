@@ -407,6 +407,20 @@ class ApprovalFenceTests(_RecoveryCase):
         self.assertIn("redispatchable worker gate", outcome.detail)
         self.assertEqual(self.port.closed, [])
 
+    def test_wrong_semantic_action_is_zero_close_send_write(self):
+        # R4-F1: the redispatch drives a fixed dispatch-once effect, so a continuation declaring
+        # a different next_semantic_action is a zero-close / zero-send typed blocker; nothing is
+        # closed, sent, or planned to the durable transaction.
+        ops = FakeRecoveryOps(_all_clear())
+        outcome = self._use_case(ops).run(
+            self._request(next_semantic_action="not_dispatch_once"), execute=True
+        )
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("redispatchable worker action", outcome.detail)
+        self.assertEqual(self.port.closed, [])
+        self.assertEqual(ops.sends, [])
+        self.assertIsNone(self.store.get(ReplacementTransactionKey(self.workspace_id, ACTION_ID)))
+
     def test_authority_conflict_when_foreign_generation_already_planned(self):
         # A DIFFERENT approved generation already owns this worker's transaction key.
         key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
