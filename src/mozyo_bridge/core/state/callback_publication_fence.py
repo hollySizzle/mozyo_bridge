@@ -103,6 +103,11 @@ _SEAL_FORMAT = "mozyo-callback-publication-seal"
 _SEAL_FORMAT_VERSION = 1
 #: The version token exactly as it must appear on disk. Compared literally, never parsed.
 _SEAL_VERSION_TOKEN = "v1"
+#: Temp filenames this project has shipped. The FIRST build to write one used a fixed name; only a
+#: later build made it process-unique. A format history is spelled in filenames as much as in file
+#: bodies, and counting only the current spelling leaves the older machines' evidence invisible
+#: (R19-F1).
+_LEGACY_SEAL_TEMP_SUFFIX = ".tmp"
 #: Exactly how R13 spelled its seal. Matched in full, not by prefix.
 _LEGACY_SEAL_FIRST_LINE = "callback publication fence first initialized at "
 CALLBACK_PUBLICATION_FENCE_SCHEMA_VERSION = 1
@@ -312,7 +317,11 @@ class CallbackPublicationFence:
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return _SEAL_ABSENT
+            # A dangling symlink raises this too, though its entry is right there. The docstring
+            # above promises that only a file which genuinely does not exist reads as absent, and
+            # for two rounds this line quietly broke that promise (R19-F2). Ask the directory, not
+            # the reader: lexists sees the entry, read_text sees through it.
+            return _SEAL_ABSENT if not os.path.lexists(path) else _SEAL_INVALID
         except OSError:
             return _SEAL_INVALID      # unreadable is not absent
         except UnicodeDecodeError:
@@ -398,17 +407,23 @@ class CallbackPublicationFence:
         parent = self.seal_path.parent
         if not parent.is_dir():
             return []
-        return sorted(
-            c for c in parent.glob(self.seal_path.name + ".*.tmp") if os.path.lexists(c)
-        )
+        candidates = set(parent.glob(self.seal_path.name + ".*.tmp"))     # <seal>.<pid>.tmp
+        candidates.add(self.seal_path.with_name(                          # <seal>.tmp (shipped)
+            self.seal_path.name + _LEGACY_SEAL_TEMP_SUFFIX))
+        return sorted(c for c in candidates if os.path.lexists(c))
 
     def seal_temp_states(self) -> list[str]:
         """What each leftover temp claims, read by the same exact rules as the main seal."""
         return [self._read_seal_file(p) for p in self.seal_temp_paths()]
 
     def lifecycle_artifacts(self) -> list[Path]:
-        """Everything here that carries a row OR an authority claim."""
-        return self.store_artifacts() + self.seal_temp_paths()
+        """Everything here that carries a row OR an authority claim — including the seal itself.
+
+        The main seal was missing from this list while the docstring said "everything", which is
+        how a dangling seal entry read as an empty machine (R19-F2).
+        """
+        seal = [self.seal_path] if os.path.lexists(self.seal_path) else []
+        return self.store_artifacts() + seal + self.seal_temp_paths()
 
     def _seal_says_operated(self) -> bool:
         """True when the seal is any flavour of 'this fence has run here'."""
@@ -510,12 +525,17 @@ class CallbackPublicationFence:
                                               store could grant; unknown owner (R18-F1).
         no store + ambiguous seal temps       REFUSE. "Cannot tell" is not "nothing was here".
         no store + current initializing       mint. This build's reserve() demands an operational
-        (main seal or its lone temp)          seal, so no grant can have been issued under it.
+        (main seal, or temps that ALL say     seal, so no grant can have been issued under it --
+        exactly this, however many)           however many times the crash was recorded.
         no store + absent seal                mint. First init -- see the limit below.
         ====================================  ======================================================
 
         Legacy spellings map onto these states, EXCEPT legacy `initializing`, whose build attached
         a different guarantee to the same word.
+
+        The seal's own history is spelled in FILENAMES as well as bodies: the first build to write
+        a temp used a fixed name, a later one made it process-unique, and both are enumerated here
+        (R19-F1).
 
         Known limit, stated rather than hidden: a store from before the seal existed, whose files
         are all gone, is indistinguishable from a fresh install, as is one copied from another
@@ -558,15 +578,22 @@ class CallbackPublicationFence:
                         f"not a fresh install. Restore the store from backup"
                     )
                 if set(temp_states) != {_SEAL_INITIALIZING}:
-                    # Unknown, unreadable, legacy, or several claims at once: not a fact we can act
-                    # on, and "cannot tell" must never collapse into "nothing was here".
+                    # Unknown, unreadable, legacy, or CONFLICTING claims: not a fact we can act on,
+                    # and "cannot tell" must never collapse into "nothing was here". Several temps
+                    # that all say this build's `initializing` are NOT conflicting -- they are one
+                    # fact recorded more than once, and this build's reserve() demands an
+                    # operational seal, so none of them can have granted anything. Refusing those
+                    # would brick a machine for having crashed twice, with no safety bought (the
+                    # contract this now states, after claiming "lone only" while doing this --
+                    # R19-F3).
                     raise CallbackPublicationFenceError(
                         f"callback publication fence {self.path} has no seal and leftover seal "
                         f"claims that cannot be trusted ({', '.join(temp_states)}). Refusing to "
                         f"decide whether this store ever operated. Restore it from backup"
                     )
-                # else: an interrupted FIRST init (this build's initializing, nothing else) --
-                # fall through and finish the job, which is the availability this must not cost.
+                # else: an interrupted FIRST init -- every claim here is this build's `initializing`
+                # and nothing else. Fall through and finish the job; that is the availability this
+                # must not cost, and no count of identical claims changes what they mean.
 
             if pair_ok:
                 # ADOPT, never re-mint -- whatever the seal says. `initializing` only proves

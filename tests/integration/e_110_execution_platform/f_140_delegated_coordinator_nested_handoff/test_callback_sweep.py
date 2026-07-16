@@ -1979,8 +1979,70 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         with self.assertRaises(CallbackPublicationFenceError):
             reborn.reserve(key)                                   # B gets nothing
 
+    def test_the_seal_temp_name_this_project_shipped_first_is_still_counted(self):
+        # R19-F1: the FIRST build to write a temp used a fixed `<seal>.tmp`; only a later one made
+        # it process-unique. A format history lives in filenames as much as in bodies, and my glob
+        # only knew the current spelling -- so a machine carrying that older evidence looked empty.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)      # A holds a grant
+        fence.seal_path.unlink()
+        fence.path.unlink()
+        fence.sidecar_path.unlink()
+        Path(str(fence.seal_path) + ".tmp").write_text(      # the exact R14 name and body
+            "operational\nsealed at 2026-07-16T00:00:00+00:00\nnote\n", encoding="utf-8")
+
+        reborn = CallbackPublicationFence(home=home)
+        self.assertEqual(reborn.seal_temp_states(), [_SEAL_LEGACY_OPERATIONAL])
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)                              # winner stays at one
+
+    def test_a_dangling_main_seal_entry_is_not_an_empty_machine(self):
+        # R19-F2: read_text() raises FileNotFoundError for a dangling link, so the seal that was
+        # sitting right there read as `absent` -- while the docstring promised that only a file
+        # which genuinely does not exist reads that way. I had already learned to use lexists for
+        # the store and for the temps, and applied it to neither the seal nor its inventory entry.
+        home = Path(tempfile.mkdtemp())
+        fence = CallbackPublicationFence(home=home)
+        fence.bootstrap()
+        key = PublicationKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, lane_generation=str(GEN),
+                             dispatch_anchor="79990", outcome=STATE_NO_PROGRESS_AFTER_HANDOFF)
+        self.assertTrue(fence.reserve(key).may_publish)
+        fence.seal_path.unlink()
+        fence.path.unlink()
+        fence.sidecar_path.unlink()
+        os.symlink("/nonexistent/elsewhere", fence.seal_path)
+
+        reborn = CallbackPublicationFence(home=home)
+        self.assertEqual(reborn.seal_state(), _SEAL_INVALID)
+        self.assertIn(reborn.seal_path, reborn.lifecycle_artifacts())
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.bootstrap()
+        with self.assertRaises(CallbackPublicationFenceError):
+            reborn.reserve(key)
+
+    def test_several_identical_current_initializing_temps_still_resume(self):
+        # R19-F3: I claimed "lone temp only" in the docs and tests while the code accepted any
+        # number of identical ones. The code was right and the claim was wrong: this build's
+        # reserve() demands an operational seal, so no `initializing` temp can have granted
+        # anything, and refusing a machine for having crashed twice buys no safety at all.
+        fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
+        fence.seal_path.parent.mkdir(parents=True, exist_ok=True)
+        for pid in (111, 222, 333):
+            Path(f"{fence.seal_path}.{pid}.tmp").write_text(
+                "mozyo-callback-publication-seal v1 initializing\nx\n", encoding="utf-8")
+        self.assertEqual(fence.seal_temp_states(), [_SEAL_INITIALIZING] * 3)
+        fence.bootstrap()
+        self.assertTrue(fence.is_bootstrapped())
+
     def test_a_first_init_interrupted_while_writing_its_seal_still_resumes(self):
-        # The availability this must not cost: only THIS build's `initializing`, alone, walks past.
+        # The availability this must not cost: THIS build's `initializing` walks past (alone or
+        # repeated -- see the sibling test; what matters is that nothing else is claimed).
         fence = CallbackPublicationFence(home=Path(tempfile.mkdtemp()))
         temp = fence.seal_path.with_suffix(fence.seal_path.suffix + ".4321.tmp")
         temp.parent.mkdir(parents=True, exist_ok=True)
