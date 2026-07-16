@@ -146,6 +146,47 @@ def assess_preservation(observation: PreservationObservation) -> PreservationVer
     )
 
 
+def assess_worker_recovery_preservation(
+    observation: PreservationObservation,
+) -> PreservationVerdict:
+    """The close fence for a **coordinator-alive worker recovery** (Redmine #13806 tranche D).
+
+    A worker recovery closes a *stale standard-sublane worker* (a dead-agent shell residue)
+    and relaunches a fresh worker in the SAME worktree — the design's explicit requirement is
+    to **byte-preserve the worktree whether clean or dirty** (j#79485 §4: never reset / stash /
+    recreate / delete). So the self-replacement fences that protect a coordinator's *in-flight*
+    work do NOT apply here and must not block the recovery:
+
+    - a **dirty diff** is exactly what the recovery preserves (the un-durable-ized work the
+      vanished worker left behind) — closing the dead pane never touches the worktree, so it
+      is not a blocker;
+    - an **unrecorded journal** is the very condition the recovery exists to repair (the fresh
+      worker re-durable-izes it) — not a blocker;
+    - the old stale slot has **no fresh attestation** by definition (that staleness is why it
+      is being recovered) — requiring a fresh attestation of the *old* slot would block every
+      recovery, so it is not a blocker here.
+
+    What still fails closed is the pair that would make a close *destructive of live work or of
+    the wrong slot*: a **running process** (the worker is actually working, not residue — a
+    defence-in-depth beyond the preflight ``not_productive`` gate) and an **identity mismatch**
+    (the observed live slot is not the pinned worker — a same-name recycle / foreign slot).
+    A ``pending_approval`` in the scope is also honoured as a block (a competing owner action).
+    """
+    reasons: list[str] = []
+    if observation.running_process:
+        reasons.append(PRESERVE_RUNNING_PROCESS)
+    if observation.pending_approval:
+        reasons.append(PRESERVE_PENDING_APPROVAL)
+    if not observation.identity_matches:
+        reasons.append(PRESERVE_IDENTITY_MISMATCH)
+    ordered = tuple(r for r in PRESERVATION_REASONS if r in reasons)
+    return PreservationVerdict(
+        may_close=not ordered,
+        reasons=ordered,
+        detail=norm(observation.detail),
+    )
+
+
 def identity_observation_for(
     pin: ParticipantPin,
     *,
@@ -194,5 +235,6 @@ __all__ = (
     "PreservationObservation",
     "PreservationVerdict",
     "assess_preservation",
+    "assess_worker_recovery_preservation",
     "identity_observation_for",
 )

@@ -29,7 +29,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from mozyo_bridge.core.state.replacement_preservation import assess_preservation
+from mozyo_bridge.core.state.replacement_preservation import (
+    PreservationObservation,
+    PreservationVerdict,
+    assess_preservation,
+)
 from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
 from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_GENERATION_MISMATCH,
@@ -62,12 +66,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATION_LEASE_LOST,
     ACTUATION_NOT_FOUND,
     ACTUATION_PRESERVATION_BLOCKED,
+    ACTUATION_RECOVERED,
     ATTEST_MISMATCH,
     CLOSE_DONE,
     LAUNCH_DONE,
     attestation_completes,
     bounded_recovery_available,
     is_self_replacement_topology,
+    is_worker_recovery_topology,
     is_zero_actuation_observation,
     new_close_required,
     nonself_actuation_order,
@@ -127,11 +133,20 @@ class ReplacementActuatorUseCase:
         *,
         clock: Callable[[], str] = _utc_now,
         lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+        preservation_policy: Callable[
+            [PreservationObservation], PreservationVerdict
+        ] = assess_preservation,
     ) -> None:
         self._store = store
         self._port = port
         self._clock = clock
         self._ttl = lease_ttl_seconds
+        # The close fence applied before a NEW close. Defaults to the self-replacement fence
+        # (:func:`assess_preservation`); a coordinator-alive worker recovery injects
+        # :func:`assess_worker_recovery_preservation`, which byte-preserves (does not block on)
+        # a dirty / unrecorded worktree while still refusing to close a live-working or
+        # wrong-identity slot (Redmine #13806 tranche D, j#79485 §4).
+        self._preservation_policy = preservation_policy
 
     def run(
         self,
@@ -288,6 +303,127 @@ class ReplacementActuatorUseCase:
             status=ACTUATION_EFFECT_FAILED, detail="self-drive iteration cap exceeded"
         )
 
+    def drive_worker_recovery(
+        self,
+        key: ReplacementTransactionKey,
+        *,
+        holder: str,
+        expected_action_generation: int,
+    ) -> ActuationResult:
+        """Drive a coordinator-alive **worker recovery** to ``recovered`` (Redmine #13806 tranche D).
+
+        The public entry for recovering one or more stale standard-sublane workers *while the
+        current coordinator keeps running*: the transaction carries only NON-self participants
+        (no self coordinator to replace — :func:`is_worker_recovery_topology`). It reuses the
+        exact same per-participant owed progression as the self-replacement's non-self path
+        (``close_owed -> launch_owed -> verify_owed -> replaced``), with the identical
+        evidence gates, pre-effect lease re-authentication (R1/R2/R3), and CAS discipline — the
+        old exact worker generation is closed, a fresh slot launched, and its startup
+        attestation confirmed to bind THIS replacement action.
+
+        Unlike :meth:`run` it drives ``planned -> claimed -> replacing_nonself`` and then
+        **stops** once every worker is ``replaced`` (it does NOT advance to
+        ``awaiting_self_turn_end`` — there is no self-close leg). It returns
+        :data:`ACTUATION_RECOVERED` holding the lease, so the recovery use case's next leg can
+        redispatch the original durable gate exactly once (``replacing_nonself ->
+        draining_continuation -> completed``) under the same holder. A resume at
+        ``draining_continuation`` / ``completed`` (the redispatch leg already advanced) also
+        returns ``recovered`` without re-actuating any worker. Refuses a self-bearing manifest
+        (that is a self-replacement) or an empty one with :data:`ACTUATION_INVALID_TOPOLOGY`,
+        zero effect.
+        """
+        rec = self._store.get(key)
+        if rec is None:
+            return ActuationResult(status=ACTUATION_NOT_FOUND)
+        if rec.action_generation != expected_action_generation:
+            return ActuationResult(
+                status=ACTUATION_GENERATION_MISMATCH, phase=rec.phase,
+                revision=rec.revision,
+            )
+        if not is_worker_recovery_topology(rec.participants):
+            # A worker recovery carries zero self participants and >=1 non-self. A self-bearing
+            # manifest is a self-replacement (driven by run / drive_self_participant); refuse it
+            # here BEFORE any claim or effect so the coordinator-alive path never closes a self.
+            return ActuationResult(
+                status=ACTUATION_INVALID_TOPOLOGY, phase=rec.phase, revision=rec.revision,
+                detail=(
+                    "a worker recovery requires zero self participants and at least one "
+                    "non-self participant"
+                ),
+            )
+        now = self._clock()
+        claim = self._store.claim(
+            key,
+            expected_revision=rec.revision,
+            expected_action_generation=expected_action_generation,
+            holder=holder,
+            lease_expires_at=self._expiry(now),
+            now=now,
+        )
+        if not claim.applied:
+            status = (
+                ACTUATION_GENERATION_MISMATCH
+                if claim.reason == CAS_GENERATION_MISMATCH
+                else ACTUATION_LEASE_LOST
+            )
+            return ActuationResult(
+                status=status, phase=rec.phase, revision=claim.revision,
+                detail=claim.reason,
+            )
+        return self._drive_recovery(key, holder, expected_action_generation)
+
+    def _drive_recovery(self, key, holder, gen) -> ActuationResult:
+        rec0 = self._store.get(key)
+        max_iterations = 16 + 8 * len(rec0.participants if rec0 else ())
+        for _ in range(max_iterations):
+            now = self._clock()
+            rec = self._store.get(key)
+            if rec is None:
+                return ActuationResult(status=ACTUATION_NOT_FOUND)
+            if rec.action_generation != gen:
+                return ActuationResult(
+                    status=ACTUATION_GENERATION_MISMATCH, phase=rec.phase,
+                    revision=rec.revision,
+                )
+            if rec.lease_holder != holder or not rec.lease_is_live(now):
+                return ActuationResult(
+                    status=ACTUATION_LEASE_LOST, phase=rec.phase, revision=rec.revision,
+                    detail="lease not live",
+                )
+            phase = rec.phase
+            if phase == PHASE_PLANNED:
+                terminal = self._advance_phase(key, rec, PHASE_CLAIMED, holder, gen, now)
+            elif phase == PHASE_CLAIMED:
+                terminal = self._advance_phase(
+                    key, rec, PHASE_REPLACING_NONSELF, holder, gen, now
+                )
+            elif phase == PHASE_REPLACING_NONSELF:
+                pending = [
+                    p
+                    for p in nonself_actuation_order(rec.participants)
+                    if p.phase != PARTICIPANT_REPLACED
+                ]
+                if not pending:
+                    # Every stale worker is replaced. Stop at replacing_nonself holding the
+                    # lease — the redispatch leg (the recovery use case) advances from here.
+                    return ActuationResult(
+                        status=ACTUATION_RECOVERED, phase=rec.phase, revision=rec.revision,
+                    )
+                terminal = self._actuate_participant(
+                    key, rec, pending[0], holder, gen, now
+                )
+            else:
+                # draining_continuation / completed: the redispatch leg already advanced past
+                # replacing_nonself — the workers are replaced. Report recovered (idempotent).
+                return ActuationResult(
+                    status=ACTUATION_RECOVERED, phase=rec.phase, revision=rec.revision,
+                )
+            if terminal is not None:
+                return terminal
+        return ActuationResult(
+            status=ACTUATION_EFFECT_FAILED, detail="recovery iteration cap exceeded"
+        )
+
     # -- driver --------------------------------------------------------------
 
     def _drive(self, key, holder, gen) -> ActuationResult:
@@ -384,7 +520,9 @@ class ReplacementActuatorUseCase:
             )
         if new_close_required(observation):
             # A genuinely new close — re-evaluate the preservation fence first (j#78384 §3).
-            verdict = assess_preservation(self._port.observe_preservation(pin))
+            # The fence is the injected policy: the self-replacement fence by default, or the
+            # worker-recovery fence (byte-preserving a dirty worktree) for tranche D.
+            verdict = self._preservation_policy(self._port.observe_preservation(pin))
             if verdict.blocked:
                 return ActuationResult(
                     status=ACTUATION_PRESERVATION_BLOCKED, phase=rec.phase,

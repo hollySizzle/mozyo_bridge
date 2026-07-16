@@ -101,10 +101,24 @@ TRANSACTION_PHASES = frozenset(
 #: There are deliberately no self-loops: a resuming lease holder re-reads the current
 #: phase and continues from it, so a duplicate transition simply loses the
 #: expected-phase guard (:data:`CAS_UNEXPECTED_STATE`) rather than silently re-running.
+#:
+#: ``replacing_nonself`` has TWO successors (Redmine #13806 tranche D). The self-replacement
+#: flow takes ``-> awaiting_self_turn_end`` (the current coordinator waits for its turn to
+#: end before arming its self-close). A **coordinator-alive worker recovery** — a transaction
+#: with no self participant, recovering a stale standard-sublane worker while the coordinator
+#: keeps running — has no self-close leg, so once its worker(s) are ``replaced`` it takes
+#: ``-> draining_continuation`` directly and redispatches the original gate. That second edge
+#: is guarded by the ``-> draining_continuation`` cross-axis prerequisite (**every**
+#: participant ``replaced``, :func:`transaction_phase_prerequisite_met`): a self-replacement
+#: at ``replacing_nonself`` always carries an un-replaced self (the self is only ever actuated
+#: in ``self_close_armed``), so it can never satisfy that prerequisite here and is forced
+#: through the self-close phases — the worker-recovery shortcut is unrepresentable for it.
 _TRANSACTION_EDGES: dict[str, frozenset[str]] = {
     PHASE_PLANNED: frozenset({PHASE_CLAIMED}),
     PHASE_CLAIMED: frozenset({PHASE_REPLACING_NONSELF}),
-    PHASE_REPLACING_NONSELF: frozenset({PHASE_AWAITING_SELF_TURN_END}),
+    PHASE_REPLACING_NONSELF: frozenset(
+        {PHASE_AWAITING_SELF_TURN_END, PHASE_DRAINING_CONTINUATION}
+    ),
     PHASE_AWAITING_SELF_TURN_END: frozenset({PHASE_SELF_CLOSE_ARMED}),
     PHASE_SELF_CLOSE_ARMED: frozenset({PHASE_FRESH_COORDINATOR_CLAIMED}),
     PHASE_FRESH_COORDINATOR_CLAIMED: frozenset({PHASE_DRAINING_CONTINUATION}),
@@ -226,19 +240,29 @@ def transaction_phase_prerequisite_met(
       ``replaced`` (Redmine #13806 R2-F1) — a fresh coordinator can only claim once the old
       self is closed, relaunched, and attested, so an un-replaced self is never carried into
       this phase.
+    - ``-> draining_continuation``: **every** participant must be ``replaced``. On the
+      self-replacement flow this is entered from ``fresh_coordinator_claimed`` (self replaced,
+      non-self replaced earlier), so the check is a no-op there. On the coordinator-alive
+      **worker-recovery** flow (Redmine #13806 tranche D) it is the guard on the direct
+      ``replacing_nonself -> draining_continuation`` shortcut: a self-replacement at
+      ``replacing_nonself`` still has an un-replaced self (the self is only actuated in
+      ``self_close_armed``), so it can never take the shortcut — only a no-self recovery whose
+      worker is already ``replaced`` can.
     - ``-> completed``: **every** participant, including the self coordinator, must be
       ``replaced``.
 
     All other edges carry no participant prerequisite. This is what makes ``completed`` with
-    a ``close_owed`` participant, a self-close before the non-self participants, or a
-    ``fresh_coordinator_claimed`` with an un-replaced self, unrepresentable rather than
-    merely discouraged.
+    a ``close_owed`` participant, a self-close before the non-self participants, a
+    ``fresh_coordinator_claimed`` with an un-replaced self, or a worker-recovery shortcut on
+    a self-replacement, unrepresentable rather than merely discouraged.
     """
     marker = norm(target)
     if marker == PHASE_AWAITING_SELF_TURN_END:
         return _all_replaced(participants, non_self_only=True)
     if marker == PHASE_FRESH_COORDINATOR_CLAIMED:
         return _self_replaced(participants)
+    if marker == PHASE_DRAINING_CONTINUATION:
+        return _all_replaced(participants, non_self_only=False)
     if marker == PHASE_COMPLETED:
         return _all_replaced(participants, non_self_only=False)
     return True
