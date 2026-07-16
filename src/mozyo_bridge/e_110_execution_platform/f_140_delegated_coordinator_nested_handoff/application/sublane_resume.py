@@ -378,6 +378,8 @@ class SublaneResumeUseCase:
         # Commit point: CAS hibernated -> active, clearing the settled release generation on
         # rehydrate. Guarded on the lane's exact state + revision and the durable anchor.
         assert rec is not None  # guaranteed by lane_hibernated
+        # Redmine #13844 R3: resume opens through the universal `_connect_write` gate, which emits
+        # the PRE-migration peer-reader advisory before the shared store is migrated.
         transition = self.store.transition_disposition(
             key,
             expected_disposition=DISPOSITION_HIBERNATED,

@@ -35,6 +35,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     LaneLifecycleStore,
     ProcessGenerationPin,
     ReleasePin,
+    lane_lifecycle_path,
+)
+from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
+    LANE_LIFECYCLE_COMPONENT,
 )
 from mozyo_bridge.core.state.lane_reconcile_binding import (  # noqa: E402
     LaneReconcileBindingStore,
@@ -819,6 +824,105 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             worktree_branch=worktree_branch,
             ops=ops if ops is not None else _FakeReconcileOps(lambda: self.rows),
         )
+
+    # -- Redmine #13844 R5-F2: v5 + active peer + CAS refusal via the PRODUCTION entrypoint --
+
+    def _add_active_peer_and_rewind_to_v5(self) -> None:
+        LaneLifecycleStore().declare_active(
+            LaneLifecycleKey(_WORKSPACE_ID, "issue_13800_peer_lane"),
+            decision=_decision("13800"),
+            issue_id="13800",
+        )
+        conn = sqlite3.connect(lane_lifecycle_path())
+        try:
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _schema_version(self) -> int:
+        conn = sqlite3.connect(lane_lifecycle_path())
+        try:
+            return conn.execute(
+                "SELECT schema_version FROM state_schema_components WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_r13844_v5_peer_migrating_cas_refusal_reports_migration_and_honest_text(self) -> None:
+        # Redmine #13844 R6-F2: the migrated-but-lane-row-CAS-REFUSED production branch. The retire
+        # CAS opens (_connect_write) — migrating the shared store v5 -> v6 — THEN checks the
+        # expected_revision. A concurrent row move between the reconcile's verify and its CAS makes
+        # that revision stale (CAS_STALE_REVISION), so the CAS refuses AFTER the migration: retired
+        # is False, nothing is closed, but the schema DID migrate. The verdict must report the
+        # migration and its text must NOT claim "nothing was written or closed".
+        self._seed_row()  # the exact empty-worktree reconcilable legacy signature
+        self._add_active_peer_and_rewind_to_v5()
+        self.assertEqual(self._schema_version(), 5)
+
+        def _race_move_revision() -> None:
+            # A concurrent row move AFTER the reconcile snapshotted its expected revision, applied
+            # via raw SQL so it does NOT itself migrate the store — the reconcile's OWN retire CAS
+            # remains the migrating write, and then finds the revision stale.
+            conn = sqlite3.connect(lane_lifecycle_path())
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET revision = revision + 1 "
+                    "WHERE repo_workspace_id = ? AND lane_id = ?",
+                    (_WORKSPACE_ID, _LANE),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        # Fire the race on the initial inventory read (call 0) — after the row snapshot, before
+        # the retire CAS.
+        ops = _FakeReconcileOps(lambda: self.rows, on_call={0: _race_move_revision})
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_REVISION_RACE)
+        # the write gate migrated the shared store even though the retire CAS then refused.
+        self.assertEqual(self._schema_version(), 6)
+        self.assertFalse(result.retired)  # the lane ROW was NOT retired
+        self.assertEqual(result.closed, ())  # and nothing was closed
+        self.assertIsNotNone(result.lifecycle_migration)
+        self.assertEqual(result.lifecycle_migration["from_version"], 5)
+        self.assertEqual(result.lifecycle_migration["to_version"], 6)
+        self.assertIn(
+            "issue_13800_peer_lane", result.lifecycle_migration["peer_active_lanes"]
+        )
+        # the production text takes the lifecycle_migration-only branch: NOT "nothing written".
+        text = format_reconcile_text(result)
+        self.assertNotIn("nothing was written or closed", text)
+        self.assertIn("no lane-row write and no pane close", text)
+        self.assertIn("separate side effect", text)
+        self.assertIn("v5 -> v6", text)
+
+    def test_r13844_v5_peer_migrating_close_failure_is_honest_auxiliary(self) -> None:
+        # Auxiliary (Redmine #13844 R6-F2): a DIFFERENT production migrating-blocked branch — the
+        # retire CAS APPLIES (migrating v5 -> v6, retire-first) but the pair goes BUSY at close
+        # time, so the owed close is withheld: BLOCKED with retired=True. The retired-branch text
+        # reports the real side effects and never claims nothing happened.
+        self._seed_row()
+        self._add_active_peer_and_rewind_to_v5()
+        self.assertEqual(self._schema_version(), 5)
+
+        ops = _FakeReconcileOps(lambda: self.rows, busy_from_call=1)  # idle at obs 0, busy after
+        result = self._run(ops=ops)
+        self.assertEqual(result.state, RECONCILE_BLOCKED)
+        self.assertEqual(result.reason, RECON_CLOSE_FAILED)
+        self.assertEqual(self._schema_version(), 6)
+        self.assertTrue(result.retired)
+        self.assertEqual(result.lifecycle_migration["from_version"], 5)
+        text = format_reconcile_text(result)
+        self.assertNotIn("nothing was written or closed", text)
+        self.assertIn("durable write: lane retired", text)
+        self.assertIn("v5 -> v6", text)
 
     # -- the happy path ---------------------------------------------------
 

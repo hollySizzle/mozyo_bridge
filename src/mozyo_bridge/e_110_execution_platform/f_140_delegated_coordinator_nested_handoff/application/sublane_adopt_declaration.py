@@ -303,6 +303,11 @@ def declare_adopted_owner_row(
     # the completeness anchor: a lane is "already established" (safe to dispatch on a gate /
     # CAS refusal) only when the state DB owner row is bound to THIS exact token.
     worktree_token = _worktree_token(repo_root, worktree_path, lane_label)
+    # Redmine #13844 F1: the declaration store this adopt writes through — created ONCE so the
+    # command can read the explicit write gate's typed result (``last_write_preparation``) after
+    # the declare, and surface a schema migration + its peer-reader risk to the operator instead
+    # of migrating the shared home store implicitly.
+    adopt_store = store_factory()
 
     def _attempt() -> str:
         if attestation_store_factory is not None:
@@ -343,7 +348,7 @@ def declare_adopted_owner_row(
         except (DecisionPointerError, ValueError):
             return ADOPT_DECL_BAD_ANCHOR
         try:
-            store = store_factory()
+            store = adopt_store
             result = store.declare_lane(
                 key,
                 decision=decision,
@@ -382,6 +387,9 @@ def declare_adopted_owner_row(
         return ADOPT_DECL_OWNER_CONFLICT
 
     outcome = _attempt()
+    # Redmine #13844 R3: the declaration write opens through the universal `_connect_write` gate,
+    # which emits the PRE-migration peer-reader advisory before the shared store is migrated (no
+    # per-command emit needed here; the migration is surfaced BEFORE it happens for every surface).
     if outcome in (ADOPT_DECL_DECLARED, ADOPT_DECL_BACKFILLED):
         # Owner-bound: a fresh declaration, an idempotent duplicate, or a legacy row whose
         # missing worktree binding was just filled — all leave the lane the active owner.
