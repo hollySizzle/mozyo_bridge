@@ -359,6 +359,42 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
 
+    def test_present_null_is_malformed_not_absent(self):
+        # Redmine #13967 R5-F1: an explicit JSON null is a present non-string value (malformed
+        # -> hold), NOT the same as an absent key (which takes the default). An absent field
+        # still yields the default and stays evaluable.
+        malformed = [
+            {"lanes": [{"issue": "1", "state_class": "idle", "lane": None, "release_pending": True}]},
+        ]
+        for env in malformed:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "s.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(snapshot_json=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+        glance_null = [
+            {"rows": [{"issue_id": "1", "workflow_state": "idle", "lane": None}]},
+            {"rows": [{"issue_id": "1", "workflow_state": "review_waiting", "next_owner": None}]},
+            {"rows": [], "lifecycle_diagnostic": [{"process_release": None, "issue": "1", "lane": "l"}]},
+        ]
+        for env in glance_null:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+        # An absent optional lane is still evaluable (default), not forced to hold.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s2.json"
+            path.write_text(
+                json.dumps({"lanes": [{"issue": "1", "state_class": LANE_STATE_IMPLEMENTING}]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+
     def test_snapshot_type_confusion_fails_closed(self):
         cases = [
             {"lanes": 1},
