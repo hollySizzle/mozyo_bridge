@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_WORKTREE_UNSAFE,
     BoundSlot,
     ConvergenceVerdict,
+    TransactionPlanObservation,
     STATE_ACTIONABLE,
     STATE_ALREADY_CONVERGED,
     STATE_BLOCKED,
@@ -131,7 +132,7 @@ class BoundPairConvergenceOps(Protocol):
         self,
         request: ConvergeBoundPairRequest,
         expectation: ApprovalExpectation,
-        slots: Sequence[BoundSlot],
+        observation: BoundPairObservation,
     ) -> ReplacementDrive: ...
     def final_pins(
         self, request: ConvergeBoundPairRequest, *, action_id: str
@@ -254,6 +255,43 @@ def _may_need_transaction_close_proof(obs: BoundPairObservation) -> bool:
     )
 
 
+def transaction_plan_observation(
+    request: ConvergeBoundPairRequest,
+    observation: BoundPairObservation,
+) -> TransactionPlanObservation:
+    """Project the complete application observation into the pure plan decision."""
+
+    pair_safe = bool(
+        len(observation.slots) == 2
+        and {slot.role for slot in observation.slots} == {"gateway", "worker"}
+        and all(
+            slot.provider
+            and slot.assigned_name
+            and (slot.locator or slot.close_proven)
+            and slot.disposition in (SLOT_RECOVER, SLOT_HEALTHY)
+            for slot in observation.slots
+        )
+    )
+    return TransactionPlanObservation(
+        issue=request.issue,
+        lane=request.lane,
+        workspace_id=observation.workspace_id,
+        worktree_path=observation.worktree_path,
+        worktree_identity=observation.worktree_identity,
+        branch=observation.branch,
+        revision=observation.revision,
+        generation=observation.generation,
+        lifecycle_exact=observation.lifecycle_exact,
+        pins_empty=observation.pins_empty,
+        inventory_readable=observation.inventory_readable,
+        worktree_readable=observation.worktree_readable,
+        worktree_clean=observation.worktree_clean,
+        branch_matches=observation.branch_matches,
+        pair_safe=pair_safe,
+        slot_digest=slot_digest(observation.slots),
+    )
+
+
 def run_bound_pair_convergence(
     request: ConvergeBoundPairRequest,
     *,
@@ -362,7 +400,7 @@ def run_bound_pair_convergence(
             request, BLOCK_APPROVAL_MISMATCH, detail="action-time observation changed",
             action_id=approved.action_id, slots=current.slots, executed=True,
         )
-    drive = ops.drive_replacement(request, approved, current.slots)
+    drive = ops.drive_replacement(request, approved, current)
     if not drive.ok:
         reason = BLOCK_TRANSACTION_CONFLICT if drive.status == "transaction_conflict" else BLOCK_REPLACEMENT_STOPPED
         return _blocked(
@@ -475,4 +513,5 @@ __all__ = (
     "ConvergenceOutcome", "PinRepairResult", "ReplacementDrive",
     "cmd_sublane_converge_bound_pair", "format_convergence_text",
     "register_sublane_converge_bound_pair_parser", "run_bound_pair_convergence",
+    "transaction_plan_observation",
 )

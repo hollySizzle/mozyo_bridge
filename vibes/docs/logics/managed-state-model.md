@@ -579,8 +579,12 @@ Table naming:
         `ReplacementActuatorUseCase.drive_worker_recovery` を使う。対象は positive-fact classifier が
         `recover_bad_generation` とした exact locator のみ。inventory unreadable / duplicate / foreign / busy /
         pending composer / dirty-or-unreadable worktree / branch mismatch / revision race は transaction plan・close 前に
-        fail-closed。partial close の absent slot は **同じ transaction participant が close 済みと証明する場合だけ**
-        replay でき、名前や cache から absent proof を捏造しない。
+        fail-closed。transaction plan 直前に full observation を取り直してdomain decisionへ再投入し、初回writeは
+        owner markerが束縛したinitial snapshotと完全一致する場合だけ許す。既存immutable transactionのretryは
+        `plan_transaction` を再実行しない。さらにclose直前にも既存 `identity_observation_for` で participantの
+        lifecycle revision/generationとslot identityを再照合し、hibernated/released/bound/settled signatureおよび
+        clean exact branchを再確認する。partial close の absent slot は **同じ transaction participant がclose済みと
+        証明する場合だけ** replayでき、名前やcacheからabsent proofを捏造しない。
       - fresh launch は replacement `action_id` を startup self-attestationへ binding する。最終 pair は両 slot が
         unique / live / idle / composer-settled / locator-bound attested で、replacement participant はさらに exact
         action-bound でなければ pins を作らない。pins はこの最終 live pairだけから構築し、

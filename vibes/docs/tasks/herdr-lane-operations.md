@@ -120,7 +120,9 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 2. execute:
    同じ command に `--execute` を加える。command は `--journal` を credential-gated live Redmine で fresh readし、
    structured marker が exact 一致する場合だけ、bad generation を guarded close → action-bound relaunch → fresh pair
-   attestation → bounded pins CAS の順で進める。raw Herdr/tmux、DB/store直接編集、pins推測は代替にしない。
+   attestation → bounded pins CAS の順で進める。transaction plan直前と各close直前にlifecycle revision/generation、
+   hibernated/released/bound signature、inventory、clean exact branchを再読するため、その間のraceはzero-writeまたは
+   zero-closeで停止する。raw Herdr/tmux、DB/store直接編集、pins推測は代替にしない。
 3. outcome:
    成功しても lane は `hibernated` のままで、work dispatch / resume は起きない。`sublane repair-pins` または
    lifecycle readで pins を再確認し、その lane の本来の next action（通常 recovery / hibernate release / retire）へ

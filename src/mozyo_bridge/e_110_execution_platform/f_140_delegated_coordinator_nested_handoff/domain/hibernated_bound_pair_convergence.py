@@ -38,6 +38,11 @@ BLOCK_REPLACEMENT_STOPPED = "replacement_stopped"
 BLOCK_FRESH_PAIR_UNPROVEN = "fresh_pair_unproven"
 BLOCK_PIN_CAS_REFUSED = "pin_cas_refused"
 
+PLAN_ADMITTED = "admitted"
+PLAN_OBSERVATION_UNSAFE = "fresh_observation_unsafe"
+PLAN_OBSERVATION_CHANGED = "fresh_observation_changed"
+PLAN_APPROVAL_SNAPSHOT_MISMATCH = "approval_snapshot_mismatch"
+
 
 def _digest(value: object) -> str:
     body = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -143,6 +148,105 @@ def approval_matches(fields: Mapping[str, str], expected: ApprovalExpectation) -
 
 
 @dataclass(frozen=True)
+class TransactionPlanObservation:
+    """The complete read-only observation admitted immediately before transaction plan.
+
+    ``slot_digest`` binds the stable pair identity, old locators and per-slot dispositions;
+    ``pair_safe`` is the closed-set pair/cardinality decision made from those slots.  The
+    remaining fields make lifecycle, worktree and inventory races explicit domain inputs.
+    """
+
+    issue: str
+    lane: str
+    workspace_id: str
+    worktree_path: str
+    worktree_identity: str
+    branch: str
+    revision: int
+    generation: int
+    lifecycle_exact: bool
+    pins_empty: bool
+    inventory_readable: bool
+    worktree_readable: bool
+    worktree_clean: bool
+    branch_matches: bool
+    pair_safe: bool
+    slot_digest: str
+
+    def approval_worktree_digest(self) -> str:
+        return worktree_digest(
+            resolved_path=self.worktree_path,
+            identity=self.worktree_identity,
+            branch=self.branch,
+        )
+
+
+@dataclass(frozen=True)
+class TransactionPlanVerdict:
+    allowed: bool
+    reason: str
+    detail: str = ""
+
+
+def decide_transaction_plan(
+    expected: ApprovalExpectation,
+    initial: TransactionPlanObservation,
+    fresh: TransactionPlanObservation,
+    *,
+    transaction_exists: bool,
+) -> TransactionPlanVerdict:
+    """Admit a transaction plan/resume only from a stable, fully-safe fresh snapshot.
+
+    A first write additionally requires byte-equal equivalence to the owner-approved initial
+    snapshot.  A retry may have a progressed (fresh/action-bound) pair, so an already-existing
+    immutable transaction does not require the old slot digest; it still requires the complete
+    observation to remain stable across the caller read and this plan-boundary re-read.
+    """
+
+    for label, observed in (("initial", initial), ("fresh", fresh)):
+        if (
+            norm(observed.issue) != norm(expected.issue)
+            or norm(observed.lane) != norm(expected.lane)
+            or observed.revision != expected.revision
+            or observed.generation != expected.generation
+            or observed.approval_worktree_digest() != expected.worktree_digest
+        ):
+            return TransactionPlanVerdict(
+                False, PLAN_APPROVAL_SNAPSHOT_MISMATCH, f"{label} approval identity changed",
+            )
+        if not (
+            observed.workspace_id
+            and observed.worktree_path
+            and observed.worktree_identity
+            and observed.branch
+            and observed.lifecycle_exact
+            and observed.pins_empty
+            and observed.inventory_readable
+            and observed.worktree_readable
+            and observed.worktree_clean
+            and observed.branch_matches
+            and observed.pair_safe
+        ):
+            return TransactionPlanVerdict(
+                False, PLAN_OBSERVATION_UNSAFE, f"{label} full observation is not actionable",
+            )
+    if initial != fresh:
+        return TransactionPlanVerdict(
+            False, PLAN_OBSERVATION_CHANGED, "observation changed at transaction boundary",
+        )
+    if not transaction_exists and (
+        initial.slot_digest != expected.slot_digest
+        or fresh.slot_digest != expected.slot_digest
+    ):
+        return TransactionPlanVerdict(
+            False,
+            PLAN_APPROVAL_SNAPSHOT_MISMATCH,
+            "first transaction plan no longer equals the approved old-pair snapshot",
+        )
+    return TransactionPlanVerdict(True, PLAN_ADMITTED)
+
+
+@dataclass(frozen=True)
 class ConvergenceVerdict:
     state: str
     reason: str = ""
@@ -177,6 +281,8 @@ __all__ = (
     "BLOCK_LIFECYCLE_UNREADABLE", "BLOCK_NOT_BOUND_SIGNATURE", "BLOCK_INVENTORY_UNREADABLE",
     "BLOCK_PAIR_AMBIGUOUS", "BLOCK_PAIR_PRESERVED", "BLOCK_WORKTREE_UNSAFE",
     "BLOCK_TRANSACTION_CONFLICT", "BLOCK_REPLACEMENT_STOPPED", "BLOCK_FRESH_PAIR_UNPROVEN",
-    "BLOCK_PIN_CAS_REFUSED", "approval_matches", "convergence_action_id", "slot_digest",
-    "worktree_digest",
+    "BLOCK_PIN_CAS_REFUSED", "PLAN_ADMITTED", "PLAN_OBSERVATION_UNSAFE",
+    "PLAN_OBSERVATION_CHANGED", "PLAN_APPROVAL_SNAPSHOT_MISMATCH",
+    "TransactionPlanObservation", "TransactionPlanVerdict", "approval_matches",
+    "convergence_action_id", "decide_transaction_plan", "slot_digest", "worktree_digest",
 )

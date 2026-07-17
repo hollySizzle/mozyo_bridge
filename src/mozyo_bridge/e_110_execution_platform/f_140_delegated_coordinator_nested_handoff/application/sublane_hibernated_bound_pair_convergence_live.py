@@ -30,7 +30,11 @@ from mozyo_bridge.core.state.lane_lifecycle import (
 )
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore
 from mozyo_bridge.core.state.lane_pin_role import PIN_ROLE_GATEWAY, PIN_ROLE_WORKER
-from mozyo_bridge.core.state.replacement_preservation import PreservationObservation, assess_preservation
+from mozyo_bridge.core.state.replacement_preservation import (
+    PreservationObservation,
+    assess_preservation,
+    identity_observation_for,
+)
 from mozyo_bridge.core.state.replacement_transaction import (
     CAS_ALREADY_DECLARED,
     ContinuationPointer,
@@ -58,6 +62,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ConvergeBoundPairRequest,
     PinRepairResult,
     ReplacementDrive,
+    transaction_plan_observation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (
     LiveHibernatedPairRecoveryOps,
@@ -76,7 +81,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     APPROVAL_GATE,
     ApprovalExpectation,
     BoundSlot,
-    slot_digest,
+    decide_transaction_plan,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (
     SLOT_HEALTHY,
@@ -185,6 +190,11 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
         record = self.owner._lifecycle(self.request)
         if record is None:
             return PreservationObservation(detail="lifecycle_unreadable")
+        worktree, workspace, identity = self.owner._worktree(self.request)
+        if worktree is None or not workspace or not identity:
+            return PreservationObservation(detail="worktree_identity_unreadable")
+        ok_branch, branch = _git(worktree, "branch", "--show-current")
+        worktree_ok, status = _git(worktree, "status", "--porcelain=v1")
         observation, locator, assigned = self.live.observe_slot(
             role=pin.role,
             provider=pin.provider,
@@ -195,12 +205,22 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
         disposition = decide_slot_recovery(observation)
         safe_identity = bool(
             disposition == SLOT_RECOVER
-            and norm(locator) == norm(pin.old_locator)
-            and norm(assigned) == norm(pin.assigned_name)
+            and norm(workspace) == norm(self.live.workspace_id())
+            and self.owner._lifecycle_exact(self.request, record, identity)
+            and identity_observation_for(
+                pin,
+                observed_lane_id=self.request.lane,
+                observed_role=pin.role,
+                observed_provider=pin.provider,
+                observed_assigned_name=assigned,
+                observed_locator=locator,
+                observed_lane_revision=str(record.revision),
+                observed_lane_generation=str(record.lane_generation),
+            )
         )
-        worktree_ok, status = _git(Path(self.request.worktree).expanduser().resolve(), "status", "--porcelain=v1")
+        branch_safe = bool(ok_branch and norm(branch) == norm(self.request.branch))
         return PreservationObservation(
-            dirty_diff=not worktree_ok or bool(status),
+            dirty_diff=not worktree_ok or bool(status) or not branch_safe,
             running_process=not observation.not_productive,
             pending_approval=not observation.no_pending_composer,
             identity_matches=safe_identity,
@@ -208,7 +228,11 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
             # the positive bad-generation classifier is its close authority; action-bound
             # attestation is required of the NEW slot in verify_attestation below.
             attestation_fresh=True,
-            detail=disposition,
+            detail=(
+                disposition
+                if safe_identity and branch_safe and worktree_ok and not status
+                else f"{disposition}; lifecycle_or_branch_authority_changed"
+            ),
         )
 
     def close_exact_generation(self, pin: ParticipantPin) -> str:
@@ -297,6 +321,19 @@ class LiveBoundPairConvergenceOps:
         except Exception:  # noqa: BLE001
             return None
 
+    @staticmethod
+    def _lifecycle_exact(request: ConvergeBoundPairRequest, record, identity: str) -> bool:
+        return bool(
+            record.lane_disposition == DISPOSITION_HIBERNATED
+            and norm(record.binding_kind) == BINDING_KIND_ISSUE
+            and norm(record.issue_id) == norm(request.issue)
+            and not record.project_scope
+            and bool(norm(record.worktree_identity))
+            and norm(record.worktree_identity) == norm(identity)
+            and record.process_release == RELEASE_RELEASED
+            and replacement_settled(record.replacement_state)
+        )
+
     def _transaction(self, workspace: str, action_id: str):
         if not action_id:
             return None
@@ -327,15 +364,7 @@ class LiveBoundPairConvergenceOps:
                 branch=branch, worktree_readable=ok_status, worktree_clean=ok_status and not status,
                 branch_matches=ok_branch and branch == request.branch, detail="lifecycle absent",
             )
-        exact = bool(
-            record.lane_disposition == DISPOSITION_HIBERNATED
-            and norm(record.binding_kind) == BINDING_KIND_ISSUE
-            and norm(record.issue_id) == norm(request.issue)
-            and not record.project_scope
-            and norm(record.worktree_identity) == norm(identity)
-            and record.process_release == RELEASE_RELEASED
-            and replacement_settled(record.replacement_state)
-        )
+        exact = self._lifecycle_exact(request, record, identity)
         try:
             rows = tuple(list_herdr_agent_rows(self.env))
             inventory_readable = True
@@ -432,63 +461,94 @@ class LiveBoundPairConvergenceOps:
         self,
         request: ConvergeBoundPairRequest,
         expectation: ApprovalExpectation,
-        slots: Sequence[BoundSlot],
+        initial_observation: BoundPairObservation,
     ) -> ReplacementDrive:
-        recover = [slot for slot in slots if slot.disposition == SLOT_RECOVER]
-        observation = self.observe(request, action_id=expectation.action_id)
-        if observation.revision != expectation.revision or observation.generation != expectation.generation:
-            return ReplacementDrive(False, "transaction_conflict", "lifecycle revision/generation changed")
         try:
-            key = ReplacementTransactionKey(observation.workspace_id, expectation.action_id)
+            key = ReplacementTransactionKey(
+                initial_observation.workspace_id, expectation.action_id
+            )
             existing = self.transaction_store.get(key)
-            # A first plan must match the exact approved old-pair digest.  A retry is allowed to
-            # observe fresh locators only because the immutable transaction already holds the
-            # original participant pins and action id.
-            if existing is None and slot_digest(slots) != expectation.slot_digest:
-                return ReplacementDrive(False, "transaction_conflict", "approved slot digest changed")
-            if not recover:
-                return (
-                    ReplacementDrive(True, "already_healthy")
-                    if existing is not None
-                    else ReplacementDrive(False, "transaction_conflict", "no bad generation and no transaction proof")
-                )
-            decision = DecisionPointer(source="redmine", issue_id=request.issue, journal_id=request.journal)
-            continuation = ContinuationPointer(
-                source="redmine", issue_id=request.issue, journal_id=request.journal,
-                expected_gate=APPROVAL_GATE, next_semantic_action="repair_pins",
-            )
-            participants = [
-                ParticipantPin(
-                    lane_id=request.lane,
-                    role=slot.role,
-                    provider=slot.provider,
-                    assigned_name=slot.assigned_name,
-                    old_locator=slot.locator,
-                    is_self=False,
-                    lane_revision=str(expectation.revision),
-                    lane_generation=str(expectation.generation),
-                )
-                for slot in recover
-            ]
-            plan = self.transaction_store.plan_transaction(
-                key,
-                action_generation=expectation.action_generation,
-                decision=decision,
-                continuation=continuation,
-                participants=participants,
-            )
-            current = self.transaction_store.get(key)
         except Exception as exc:  # noqa: BLE001
             return ReplacementDrive(False, "transaction_conflict", type(exc).__name__)
-        if current is None or (not plan.applied and plan.reason != CAS_ALREADY_DECLARED):
-            return ReplacementDrive(False, "transaction_conflict", plan.reason)
-        identities = {participant.identity for participant in participants}
-        stored = {participant.identity for participant in current.participants}
+
+        # F2: this is the final read-only boundary before any transaction plan write.  Feed the
+        # complete observation back through the pure decision and require stability with the
+        # caller's approval-bound snapshot.  An existing immutable transaction may have a
+        # progressed pair digest; it is resumed without calling plan_transaction again.
+        observation = self.observe(request, action_id=expectation.action_id)
+        admission = decide_transaction_plan(
+            expectation,
+            transaction_plan_observation(request, initial_observation),
+            transaction_plan_observation(request, observation),
+            transaction_exists=existing is not None,
+        )
+        if not admission.allowed:
+            return ReplacementDrive(False, "transaction_conflict", admission.reason)
+
+        recover = [slot for slot in observation.slots if slot.disposition == SLOT_RECOVER]
+        decision = DecisionPointer(source="redmine", issue_id=request.issue, journal_id=request.journal)
+        continuation = ContinuationPointer(
+            source="redmine", issue_id=request.issue, journal_id=request.journal,
+            expected_gate=APPROVAL_GATE, next_semantic_action="repair_pins",
+        )
+        try:
+            planned_participants: tuple[ParticipantPin, ...] | None = None
+            if existing is None:
+                if not recover:
+                    return ReplacementDrive(
+                        False, "transaction_conflict", "no bad generation and no transaction proof"
+                    )
+                participants = [
+                    ParticipantPin(
+                        lane_id=request.lane,
+                        role=slot.role,
+                        provider=slot.provider,
+                        assigned_name=slot.assigned_name,
+                        old_locator=slot.locator,
+                        is_self=False,
+                        lane_revision=str(expectation.revision),
+                        lane_generation=str(expectation.generation),
+                    )
+                    for slot in recover
+                ]
+                planned_participants = tuple(participants)
+                plan = self.transaction_store.plan_transaction(
+                    key,
+                    action_generation=expectation.action_generation,
+                    decision=decision,
+                    continuation=continuation,
+                    participants=participants,
+                )
+                current = self.transaction_store.get(key)
+                if current is None or (not plan.applied and plan.reason != CAS_ALREADY_DECLARED):
+                    return ReplacementDrive(False, "transaction_conflict", plan.reason)
+            else:
+                current = existing
+        except Exception as exc:  # noqa: BLE001
+            return ReplacementDrive(False, "transaction_conflict", type(exc).__name__)
         if (
             current.action_generation != expectation.action_generation
             or current.decision != decision
             or current.continuation != continuation
-            or stored != identities
+            or not current.participants
+            or any(
+                participant.is_self
+                or norm(participant.lane_id) != norm(request.lane)
+                or participant.lane_revision != str(expectation.revision)
+                or participant.lane_generation != str(expectation.generation)
+                for participant in current.participants
+            )
+            or (
+                planned_participants is not None
+                and {
+                    (participant.identity, participant.old_locator)
+                    for participant in current.participants
+                }
+                != {
+                    (participant.identity, participant.old_locator)
+                    for participant in planned_participants
+                }
+            )
         ):
             return ReplacementDrive(False, "transaction_conflict", "immutable header mismatch")
         try:
