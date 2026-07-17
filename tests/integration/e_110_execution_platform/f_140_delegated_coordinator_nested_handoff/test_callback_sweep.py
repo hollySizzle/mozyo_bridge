@@ -70,6 +70,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveRedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+    SWEEP_RECOVERY_RECEIVER,
     SEND_RESERVED,
     SWEEP_RECOVERY_ACTION_ID,
     SWEEP_STATE_STALL_UNPROVABLE,
@@ -108,6 +109,8 @@ _R13_SEAL_TEXT = (
 ISSUE = "13883"
 GEN = 1
 TARGET = "claude-worker-1"
+#: The record's `receiver_identity` must equal the sender's `--to` (one constant, #13910).
+RECEIVER = SWEEP_RECOVERY_RECEIVER
 
 
 def entry(jid, notes):
@@ -768,6 +771,7 @@ class RecoveryRecordTest(unittest.TestCase):
             source=src, issue=ISSUE, lane=LANE, lane_generation=GEN,
             post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
             publication_fence=self.pubfence, workspace_id=WS,
+            route_identity=TARGET, receiver_identity=RECEIVER,
         )
         wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
                                lane_generation=GEN, latest_generation=GEN)
@@ -808,6 +812,7 @@ class ProductionRecorderTest(unittest.TestCase):
             source=source, issue=ISSUE, lane=LANE, lane_generation=GEN,
             post_note=lambda i, n: self.posted.append(n), grant_is_live=grant_is_live,
             publication_fence=self.pubfence, workspace_id=WS,
+            route_identity=TARGET, receiver_identity=RECEIVER,
         )
 
     def _published(self):
@@ -934,6 +939,7 @@ class ProductionRecorderTest(unittest.TestCase):
                 record_fn_factory=lambda live: build_recovery_recorder(
                     source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live,
                     publication_fence=self.pubfence, workspace_id=WS,
+                    route_identity=TARGET, receiver_identity=RECEIVER,
                 ),
             )
 
@@ -979,6 +985,7 @@ class ProductionRecorderTest(unittest.TestCase):
                 record_fn_factory=lambda live: build_recovery_recorder(
                     source=src, issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=publish, grant_is_live=live,
                     publication_fence=self.pubfence, workspace_id=WS,
+                    route_identity=TARGET, receiver_identity=RECEIVER,
                 ),
             )
             reasons.append(r["send_reason"])
@@ -1113,6 +1120,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                 source=RaceSource([ir("79990")]), issue=ISSUE, lane=LANE, lane_generation=GEN,
                 post_note=lambda i, n: self.posted.append(n), grant_is_live=live,
                 publication_fence=self.pubfence, workspace_id=WS,
+                route_identity=TARGET, receiver_identity=RECEIVER,
             ),
         )
         # This sweep is a fresh attempt: it either owns the lease cleanly, or stands down. What it
@@ -1185,6 +1193,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                 source=RecorderSource(), issue=ISSUE, lane=LANE, lane_generation=GEN,
                 post_note=lambda i, n: posted.append(n), grant_is_live=live,
                 publication_fence=self.pubfence, workspace_id=WS,
+                route_identity=TARGET, receiver_identity=RECEIVER,
             ),
         )
         self.assertEqual(posted, [])          # zero-publication, not "published then declined to send"
@@ -1246,6 +1255,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                     source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
                     post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
                     publication_fence=self.pubfence, workspace_id=WS,
+                    route_identity=TARGET, receiver_identity=RECEIVER,
                 )(res, wm)
                 self.b_outcome = "published"
             except (RecordPublicationHeldError, RecordPublicationUncertainError) as exc:
@@ -1260,6 +1270,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                 source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=a_put,
                 grant_is_live=lambda: self.lease.owns(self.key(), a_grant.token),
                 publication_fence=self.pubfence, workspace_id=WS,
+                route_identity=TARGET, receiver_identity=RECEIVER,
             )(res, wm)
         except (RecordPublicationHeldError, RecordPublicationUncertainError):
             pass
@@ -1298,6 +1309,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         rec = build_recovery_recorder(
             source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=boom,
             grant_is_live=lambda: True, publication_fence=self.pubfence, workspace_id=WS,
+            route_identity=TARGET, receiver_identity=RECEIVER,
         )
         wm = resolve_watermark([ir("79990")], dispatch_journal="79990", lane=LANE,
                                lane_generation=GEN, latest_generation=GEN)
@@ -1313,6 +1325,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                 source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
                 post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
                 publication_fence=self.pubfence, workspace_id=WS,
+                route_identity=TARGET, receiver_identity=RECEIVER,
             )(res, wm)
         self.assertEqual(len(posted), 1)
 
@@ -1388,6 +1401,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                     source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN,
                     post_note=lambda i, n: posted.append(n), grant_is_live=lambda: True,
                     publication_fence=self.pubfence, workspace_id=WS,
+                    route_identity=TARGET, receiver_identity=RECEIVER,
                 )(res, wm)
             except (RecordPublicationHeldError, RecordPublicationUncertainError):
                 pass
@@ -1401,6 +1415,7 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
                 source=Src(), issue=ISSUE, lane=LANE, lane_generation=GEN, post_note=a_put,
                 grant_is_live=lambda: self.lease.owns(self.key(), a_grant.token),
                 publication_fence=self.pubfence, workspace_id=WS,
+                route_identity=TARGET, receiver_identity=RECEIVER,
             )(res, wm)
         except (RecordPublicationHeldError, RecordPublicationUncertainError):
             pass
@@ -2346,7 +2361,7 @@ class RecoverySenderTest(unittest.TestCase):
 
 
 class AttestedWorkspaceIdTest(unittest.TestCase):
-    """Direct regression for the `_attested_workspace_id` caller (R4 coverage note).
+    """Direct regression for the `attested_workspace_id` caller (R4 coverage note).
 
     R3-F2 was that the "measured" authority did not exist where the command runs: `read_anchor`
     returns None in a linked sublane worktree, so the CLI flag silently became the authority. These
@@ -2374,7 +2389,7 @@ class AttestedWorkspaceIdTest(unittest.TestCase):
         original = reg.resolve_canonical_session
         reg.resolve_canonical_session = fake_resolve
         try:
-            return sd._attested_workspace_id(
+            return sd.attested_workspace_id(
                 argparse.Namespace(workspace_id=workspace_id, repo=None)
             )
         finally:

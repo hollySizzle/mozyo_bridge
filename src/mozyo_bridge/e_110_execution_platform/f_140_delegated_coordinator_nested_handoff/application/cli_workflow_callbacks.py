@@ -747,7 +747,17 @@ _NULL_SOURCE = _NullSource()
 
 
 def register_callbacks(sub) -> None:
-    """Register ``workflow callbacks`` (Redmine #13520 zero-wait callback outbox facade)."""
+    """Register the callback family: ``workflow callbacks`` + ``workflow callback-admit``.
+
+    ``callback-admit`` (#13910) is registered here, next to its sibling, rather than from
+    :mod:`.cli_workflow`: that aggregator sits exactly at the module-health threshold, so the four
+    lines an import + call would cost there are a real design constraint, not an inconvenience to
+    allowlist around. This is the callback family's own registrar and a receiver admission rail is
+    a callback subcommand, so the registration is cohesive here.
+    """
+    from .cli_workflow_recovery_admission import register_callback_admit
+
+    register_callback_admit(sub)
     p = sub.add_parser(
         "callbacks",
         description=(
