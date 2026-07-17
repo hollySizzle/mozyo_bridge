@@ -365,19 +365,21 @@ def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
     return verdicts, inventory_readable
 
 
-def _action_fingerprint(action) -> tuple:
-    """The identity a rollback is scoped to: phase, revision, and each participant's
-    role/name/locator/closed. Two reads with the same fingerprint saw the same action;
-    any difference is a concurrent change the operator's command must not act through
-    (review j#81244 R8-F1)."""
-    return (
-        action.phase,
-        action.revision,
-        tuple(
-            (p.role, p.assigned_name, p.locator, p.closed)
-            for p in action.participants
-        ),
-    )
+def _action_fingerprint(action):
+    """The action's WHOLE authority content, so no field can be omitted (review j#81254
+    R9-F1).
+
+    A hand-picked subset was the R8 mistake: it left out the unit identity
+    (``workspace_id`` / ``lane_id`` / ``providers``) — which is the very scope
+    ``ops.close`` runs against — and the participant ``receipt``, so a concurrent change to
+    either passed the comparison and a rollback closed against a different unit. The
+    fingerprint is now the complete durable record (``as_payload``): action id, unit,
+    phase, revision, every participant field including receipt, and the timestamps. Two
+    reads whose payloads are equal saw the byte-identical authority; any difference at all
+    is a concurrent change the operator's command was not scoped to. The rollback's own
+    writes happen AFTER this comparison, so a healthy run and a partial resume both match.
+    """
+    return action.as_payload()
 
 
 def _rollback_locked(action_id, pre_lock, ops, fence, *, execute: bool):

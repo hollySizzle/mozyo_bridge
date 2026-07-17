@@ -1723,6 +1723,84 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertEqual(verdict.reason, REASON_BLOCKED)
         self.assertFalse(ops.close_calls, "closed a participant added after the operator ran")
 
+    def test_an_authority_change_of_any_field_between_read_and_lock_is_refused(self):
+        # Review j#81254 R9-F1: the R8 fingerprint was a hand-picked subset (phase, revision,
+        # role/name/locator/closed) and omitted the unit identity and the participant
+        # receipt — so a concurrent change to either passed and a rollback closed against a
+        # DIFFERENT unit. The fingerprint is now the whole authority record, so a change to
+        # ANY field (all done here with the revision left unchanged, so only the whole-record
+        # compare can catch it) refuses with close 0.
+        from unittest.mock import patch as _patch
+        import sqlite3
+
+        changed_receipt = (
+            '[{"role":"claude","assigned_name":"mzb1_ws1_claude_lane-1",'
+            '"locator":"w2G:p3","receipt":"workspace=DIFFERENT","closed":false}]'
+        )
+        mutations = {
+            "unit_workspace_lane": "UPDATE startup_actions SET workspace_id='ws2', "
+            "lane_id='lane-2' WHERE action_id=?",
+            "participant_receipt": (
+                f"UPDATE startup_actions SET participants='{changed_receipt}' "
+                "WHERE action_id=?"
+            ),
+        }
+        for label, sql in mutations.items():
+            with self.subTest(field=label):
+                # a claude-only action with a receipt-bearing participant
+                fence = StartupTransactionFence(home=Path(self._tmp.name) / f"authchg_{label}")
+                unit = StartupUnit(
+                    workspace_id="ws1", lane_id="lane-1", providers=("claude",)
+                )
+                action = fence.reserve(unit, "n1")
+                fence.record_participant(
+                    action.action_id,
+                    Participant(
+                        role="claude",
+                        assigned_name="mzb1_ws1_claude_lane-1",
+                        locator="w2G:p3",
+                        receipt="workspace=w2G",
+                    ),
+                )
+                fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+
+                ops = _RollbackOps(
+                    [
+                        {
+                            "name": "mzb1_ws1_claude_lane-1",
+                            "pane_id": "w2G:p3",
+                            "agent": "claude",
+                            "agent_status": "idle",
+                        }
+                    ]
+                )
+                real_read = StartupTransactionFence.read
+                calls = {"n": 0}
+
+                def _mutate_between_read_and_lock(fence_self, aid, _sql=sql):
+                    calls["n"] += 1
+                    result = real_read(fence_self, aid)
+                    if calls["n"] == 1:
+                        conn = sqlite3.connect(fence_self.path, isolation_level=None)
+                        conn.execute(_sql, (aid,))
+                        conn.close()
+                    return result
+
+                with _patch.object(
+                    StartupTransactionFence, "read", _mutate_between_read_and_lock
+                ):
+                    verdict = run_session_rollback(
+                        action_id=action.action_id,
+                        ops=ops,
+                        fence=fence,
+                        execute=True,
+                    )
+                self.assertEqual(verdict.reason, REASON_BLOCKED)
+                self.assertFalse(
+                    ops.close_calls,
+                    f"closed after a concurrent {label} change of the authority",
+                )
+
     def test_an_action_deleted_between_read_and_lock_closes_nothing(self):
         # Review j#81244 R8-F1: the action vanishing between the pre-lock read and the lock
         # is a change too — the under-lock read finds nothing, so it refuses.
