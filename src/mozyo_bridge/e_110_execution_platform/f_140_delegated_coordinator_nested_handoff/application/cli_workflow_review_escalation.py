@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json as _json
+import re
 from pathlib import Path
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_escalation import (
@@ -29,24 +30,41 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_review_escalation_table,
 )
 
+# A declared provenance must LOOK like a durable anchor that references an id, not any
+# free-form non-empty string (Redmine #13967 R3-F3). It must be a string that names a
+# ticket / journal reference: a `#<id>`, `j#<id>`, a `<scheme>:<...>:<digits>` anchor, or a
+# recognized source word plus a digit. This is a shape gate, not proof the anchor resolves.
+_PROVENANCE_ANCHOR = re.compile(
+    r"(#\s*\d+|j#\s*\d+|\b(redmine|asana)\b[^\n]*\d+|:\s*\d+)", re.IGNORECASE
+)
+
+
+def _valid_provenance(value: object) -> bool:
+    """True when ``value`` is a non-empty string shaped like a durable anchor (R3-F3)."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(text) and bool(_PROVENANCE_ANCHOR.search(text))
+
 
 def _finding_from_mapping(raw: object) -> tuple[SubsystemFinding | None, str]:
     """``(finding, subsystem)``. finding is None when the entry is malformed; the subsystem
     (if extractable) is returned so the caller can fail it closed to escalation rather than
-    silently dropping it (Redmine #13967 F4 / R2-F3).
+    silently dropping it (Redmine #13967 F4 / R2-F3 / R3-F3).
 
     ``authority_bearing``, ``late`` and ``round_index`` are **required and exact-typed**: a
     missing key, or a value that is not an exact JSON bool (``"false"`` must not coerce to
-    True) / exact int, makes the entry malformed. No coercion, no defaulting of a required
-    authority field to a valid ``false``."""
+    True) / an exact int ``>= 1`` (rounds are 1-based; ``0`` / negative is invalid), makes
+    the entry malformed. No coercion, no defaulting of a required authority field to a valid
+    ``false``."""
     if not isinstance(raw, dict):
         return None, ""
     subsystem = str(raw.get("subsystem", "") or "").strip()
     if not subsystem:
         return None, ""
     ri = raw.get("round_index")
-    if isinstance(ri, bool) or not isinstance(ri, int):
-        return None, subsystem  # round_index required, exact int (not bool/str/float/missing)
+    if isinstance(ri, bool) or not isinstance(ri, int) or ri < 1:
+        return None, subsystem  # round_index required, exact int >= 1 (1-based rounds)
     authority = raw.get("authority_bearing")
     late = raw.get("late")
     if not isinstance(authority, bool) or not isinstance(late, bool):
@@ -94,30 +112,40 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
                 f"--snapshot-json {raw!r} could not be read as JSON: {exc}"
             ) from exc
 
-    provenance = ""
+    provenance_raw: object = ""
     indeterminate_reasons: list[str] = []
+    snapshot_threshold: object = None
+    raw_entries: object = []
+    snapshot_unreadable: object = []
     if isinstance(data, dict):
         raw_entries = data.get("findings", [])
-        snapshot_unreadable = data.get("unreadable_subsystems", []) or []
+        snapshot_unreadable = data.get("unreadable_subsystems", [])
         snapshot_threshold = data.get("threshold")
-        provenance = str(data.get("provenance", "") or "").strip()
+        provenance_raw = data.get("provenance", "")
     else:
         raw_entries = data
-        snapshot_unreadable = []
-        snapshot_threshold = None
+    provenance = provenance_raw.strip() if isinstance(provenance_raw, str) else ""
 
     if not history_provided:
         indeterminate_reasons.append("no_history_provided")
-    if history_provided and not provenance:
-        # Authority-bearing projection requires a declared durable/verified provenance.
-        indeterminate_reasons.append("no_snapshot_provenance")
+    if history_provided and not _valid_provenance(provenance_raw):
+        # Authority-bearing projection requires a declared durable-anchor-shaped provenance
+        # — a free-form or non-string value is not a verified source (Redmine #13967 R3-F3).
+        indeterminate_reasons.append("no_or_invalid_provenance")
     if history_provided and not isinstance(raw_entries, list):
         indeterminate_reasons.append("findings_not_a_list")
         raw_entries = []
+    # `unreadable_subsystems` must be a list; a non-list is a malformed envelope, reported
+    # as indeterminate rather than crashing on `list(...)` (Redmine #13967 R3-F3d).
+    if snapshot_unreadable in (None, ""):
+        snapshot_unreadable = []
+    if not isinstance(snapshot_unreadable, list):
+        indeterminate_reasons.append("unreadable_subsystems_not_a_list")
+        snapshot_unreadable = []
 
     findings: list = []
     malformed_subsystems: list[str] = []
-    for raw_f in raw_entries or []:
+    for raw_f in (raw_entries if isinstance(raw_entries, list) else []):
         f, subsystem = _finding_from_mapping(raw_f)
         if f is not None:
             findings.append(f)
@@ -130,12 +158,19 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
             # projection indeterminate (we cannot claim we read the history).
             indeterminate_reasons.append("unattributable_malformed_entry")
 
-    cli_threshold = getattr(args, "threshold", None)
-    threshold = (
-        int(cli_threshold)
-        if cli_threshold is not None
-        else (int(snapshot_threshold) if snapshot_threshold is not None else DEFAULT_ESCALATION_THRESHOLD)
-    )
+    # Threshold must be an exact int (a snapshot `"100"` string is NOT coerced — R3-F3c).
+    cli_threshold = getattr(args, "threshold", None)  # argparse already enforces int
+    threshold = DEFAULT_ESCALATION_THRESHOLD
+    if cli_threshold is not None:
+        threshold = int(cli_threshold)
+    elif snapshot_threshold is not None:
+        if isinstance(snapshot_threshold, bool) or not isinstance(snapshot_threshold, int):
+            indeterminate_reasons.append("threshold_not_an_int")
+        else:
+            threshold = snapshot_threshold
+    if threshold < 1:
+        indeterminate_reasons.append("threshold_below_one")
+        threshold = DEFAULT_ESCALATION_THRESHOLD
 
     unreadable = (
         list(snapshot_unreadable)
@@ -161,6 +196,11 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
     payload["evaluated"] = evaluated
     payload["escalation_decision"] = decision
     payload["indeterminate_reasons"] = sorted(set(indeterminate_reasons))
+    # Redefine the boolean verdict so a legacy consumer keying on `any_escalation` can NEVER
+    # read a confident False from an indeterminate history — it is True for BOTH `escalate`
+    # and `indeterminate` (fail-closed toward review), only False for an evaluated
+    # `no_escalation` (Redmine #13967 R3-F3a).
+    payload["any_escalation"] = decision != DECISION_NO_ESCALATION
     if getattr(args, "as_json", False):
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:

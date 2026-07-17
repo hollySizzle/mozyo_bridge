@@ -16,18 +16,22 @@ substrate, exactly mirroring ``sublane supersede`` minus the ownership handover:
 1. **preflight (fail-closed)** — the lane's identity is known and *actively* owns the
    issue, an **affirmative park basis** holds, and every durable idle gate the operator
    asserts from the Redmine record holds: no coordinator callback is owed, no review /
-   owner-approval / integration is pending, no composer input is pending, and no work is
-   in flight. There are two park bases (Redmine #13967 item 1): the original **dependency
-   park** (the issue is explicitly parked/blocked on a wait) and the standardized **early
-   hibernate** (a same-lane review-approved + staging-integrated + required-CI-green
-   feature lane whose TestPyPI / installed dogfood execution/evidence is delegated to the
-   dedicated release issue (close authority stays with the coordinator) — so the lane hibernates without waiting for ticket close or installed
-   dogfood; unpushed commits fail closed here, since an early hibernate presupposes
-   integrated work). A dirty worktree does **not** block (hibernate preserves the
-   worktree) but its uncommitted diff / resume next-action must be captured in a boundary
-   journal first — asserted via ``worktree_clean`` OR ``boundary_recorded`` (Design Answer
-   Q2). Any unmet gate blocks with a reason and mutates nothing; each flag defaults to the
-   unsatisfied (safe-failing) value.
+   integration is pending, no composer input is pending, and no work is in flight. There
+   are two park bases (Redmine #13967 item 1): the original **dependency park** (the issue
+   is explicitly parked/blocked on a wait) and the standardized **early hibernate** (a
+   same-lane review-approved + staging-integrated + required-CI-green feature lane whose
+   TestPyPI / installed dogfood execution/evidence is delegated to the dedicated release
+   issue — so the lane hibernates without waiting for ticket close or installed dogfood;
+   unpushed commits fail closed here, since an early hibernate presupposes integrated work).
+   **Owner close approval pending is basis-dependent**: it blocks a dependency park, but is
+   NOT a blocker for early hibernate — the source issue's close authority + owner close
+   approval stay with the coordinator's normal path (NOT delegated), so an early hibernate
+   runs while owner approval is still outstanding (the ``owner_waiting`` state it serves).
+   A dirty worktree does **not** block (hibernate preserves the worktree) but its
+   uncommitted diff / resume next-action must be captured in a boundary journal first —
+   asserted via ``worktree_clean`` OR ``boundary_recorded`` (Design Answer Q2). Any unmet
+   gate blocks with a reason and mutates nothing; each flag defaults to the unsatisfied
+   (safe-failing) value.
 2. **commit point** — :meth:`LaneLifecycleStore.transition_disposition` CAS-moves the lane
    ``active -> hibernated``. After this the lane draws zero active capacity (W4 roster
    join) and an explicit send to it is a zero-send (W3 gate, ``lane_hibernated``).
@@ -124,9 +128,13 @@ class HibernateAssertions:
 
     - :attr:`explicitly_parked` — the issue is open AND explicitly parked/blocked (the
       *dependency* park basis; hibernate is never an idle-timeout kill, j#77485).
-    - :attr:`callbacks_drained` / :attr:`no_review_pending` /
-      :attr:`no_owner_approval_pending` / :attr:`no_integration_pending` — no coordinator
-      callback, review, owner approval, or integration is due on this lane.
+    - :attr:`callbacks_drained` / :attr:`no_review_pending` / :attr:`no_integration_pending`
+      — no coordinator callback, review, or integration is due on this lane (required by
+      every basis).
+    - :attr:`no_owner_approval_pending` — no owner close approval is due. This is
+      **basis-dependent** (see :attr:`obligations_satisfied`): required by a dependency
+      park, but NOT by an early hibernate (whose close authority + owner approval stay with
+      the coordinator's normal path, so it runs in the ``owner_waiting`` state).
     - :attr:`no_pending_prompt` — no composer input is pending.
     - :attr:`not_working` — no work is in flight (no running turn to interrupt).
     - :attr:`worktree_clean` / :attr:`boundary_recorded` — a dirty worktree does not block
@@ -768,7 +776,8 @@ def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
             "/ durable callback route (tombstone-free — never closes the issue, removes a "
             "worktree, or deletes a branch). Fail-closed preflight (lane actively owns the "
             "issue; an affirmative park basis — dependency park or early hibernate; no "
-            "callback/review/owner/integration due; no pending composer; no work in "
+            "callback/review/integration due (owner approval is required only for a "
+            "dependency park, not early hibernate); no pending composer; no work in "
             "flight; a dirty worktree needs a boundary journal). Not an idle-timeout kill. "
             "Default is preflight only; --execute performs the hibernate. Exits non-zero "
             "when blocked. Resume with `sublane resume`."
@@ -797,7 +806,8 @@ def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
         ("--no-review-pending", "no_review_pending",
          "The lane has no review awaiting a result."),
         ("--no-owner-approval-pending", "no_owner_approval_pending",
-         "The lane has no owner close approval pending."),
+         "The lane has no owner close approval pending. Required for a dependency park; "
+         "NOT required for early hibernate (owner approval stays on the coordinator path)."),
         ("--no-integration-pending", "no_integration_pending",
          "The lane has no integration disposition pending."),
         ("--no-pending-prompt", "no_pending_prompt",
