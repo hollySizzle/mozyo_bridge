@@ -598,8 +598,14 @@ Table naming:
       ★deadness の positive 証明のみで進む: `classify_named_slot` が `SLOT_STALE` と積極判定した shell residue は agent 不在ゆえ
       turn / composer を持たず close 可 (runtime `unknown` だけで block すると residue が恒久残留する)。process mutation は
       **自 pair の pin-matched close のみ**で、worktree/branch 削除・launch/resume・store 直接 mutation は伴わない。
-      ★#13918 の歴史的 owner-unbound 収束はこの signature / fence / close を再利用し、**pending composer だけ**を exact
-      Redmine `ISSUE:JOURNAL` owner-approval pointer で明示的に破棄できる。approval があっても agent not idle、foreign / duplicate /
+      ★#13918 の歴史的 owner-unbound 収束はこの signature / fence / close を再利用し、**pending composer だけ**を Redmine
+      `ISSUE:JOURNAL` で locator された owner approval により明示的に破棄できる。ただし pointer syntax は authority ではない。
+      credential-gated live source が exact journal を毎実行 fresh read し、structured `pending_composer_discard_approval` marker の
+      `direct_owner` / `approved` / effect と exact workspace / lane / assigned-name-set digest / current role+locator digest をすべて照合する。
+      missing / unreadable / wrong gate / foreign target / stale locator は reserve 前に zero-close。verified journal anchor + notes hash + target
+      identity の canonical evidence は `scratch_retirement_fence` の **同じ pending/completed attempt row** に reserve 前から保存し、retry は
+      fresh evidence の byte equality を要求する。したがって completion write failure 後の approval 無し・別 pointer retry は repair せず、
+      `managed_events` audit failure があっても completed row から exact pointer を復元できる。approval があっても agent not idle、foreign / duplicate /
       unreadable、locator ambiguity、durable obligation、record-present は従来どおり zero-close。`issue_<id>_...` lane では approval
       issue一致と action-time Git `status` clean / current branch==lane も必須で、未保存 worktree と composer を同時に失う経路を
       作らない。non-issue scratch dogfood は Git worktree authorityを持たないためこの追加Git gateの対象外だが、exact

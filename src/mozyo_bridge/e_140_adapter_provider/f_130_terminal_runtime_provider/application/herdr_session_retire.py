@@ -76,6 +76,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     ScratchSlotObservation,
     decide_scratch_pair_retire,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.composer_discard_approval import (  # noqa: E501
+    ComposerDiscardApprovalError,
+    ComposerDiscardApprovalEvidence,
+)
 
 #: The herdr runtime receiver-states a settled, drivable agent may be in. ``busy`` /
 #: ``blocked`` / ``unknown`` are NOT settled — never close over an in-flight or unreadable
@@ -128,6 +132,8 @@ REASON_PIN_DRIFT = "pin_drift"
 #: The only opt-in that may discard unsent composer input is a strict Redmine
 #: ``ISSUE:JOURNAL`` pointer. Missing / malformed authority stays zero-close (#13918).
 REASON_COMPOSER_DISCARD_APPROVAL_INVALID = "composer_discard_approval_invalid"
+#: A pending destructive attempt may only resume under byte-identical verified evidence.
+REASON_COMPOSER_DISCARD_APPROVAL_MISMATCH = "composer_discard_approval_mismatch"
 #: A historical ``issue_<id>_...`` lane may only use an approval from that same issue.
 REASON_COMPOSER_DISCARD_ISSUE_MISMATCH = "composer_discard_issue_mismatch"
 #: Historical worktree evidence is action-time authority, never a caller assertion.
@@ -317,6 +323,21 @@ def run_session_retire(
             lane_id=lane_id,
         )
 
+    try:
+        unit = RetirementUnit(
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            slot_digest=slot_digest(expected_names),
+        )
+    except ValueError as exc:
+        return _blocked(
+            REASON_IDENTITY_UNENCODABLE,
+            str(exc),
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            expected_names=expected_names,
+        )
+
     live_ops = ops or LiveSessionRetireOps(repo_root=resolved_root)
     historical = _ISSUE_LANE_RE.match(lane_id)
     if approval is not None and historical is not None:
@@ -375,12 +396,6 @@ def run_session_retire(
         expected_names=expected_names,
         foreign_names=tuple(observation.foreign_names),
     )
-    base = dict(
-        workspace_id=workspace_id,
-        lane_id=lane_id,
-        expected_names=expected_names,
-        foreign_names=tuple(observation.foreign_names),
-    )
     if verdict.state == STATE_BLOCKED:
         return _blocked(verdict.reason, verdict.detail, **base)
 
@@ -388,35 +403,67 @@ def run_session_retire(
     pair_is_live = bool(live_targets)
     live_by_role = {role: locator for role, locator in live_targets}
 
-    try:
-        unit = RetirementUnit(
-            workspace_id=workspace_id,
-            lane_id=lane_id,
-            slot_digest=slot_digest(expected_names),
-        )
-    except ValueError as exc:
-        return _blocked(REASON_IDENTITY_UNENCODABLE, str(exc), **base)
-
     execute = bool(getattr(args, "execute", False))
+
+    # The ISSUE:JOURNAL CLI value is only a locator.  Read the attempt first without writing,
+    # choose the exact current/pending pins, then require a fresh credentialed Redmine read of
+    # one structured owner approval for THIS unit.  No reserve or close occurs before this.
+    prior_hint = None
+    if approval is not None or not execute:
+        try:
+            prior_hint = live_ops.peek_retirement(unit)
+        except ScratchRetirementFenceError as exc:
+            return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+
+    approval_evidence: Optional[ComposerDiscardApprovalEvidence] = None
+    if approval is not None:
+        if prior_hint is not None and prior_hint.pending:
+            approval_pins = prior_hint.pinned
+        elif pair_is_live:
+            approval_pins = live_targets
+        elif prior_hint is not None:
+            approval_pins = prior_hint.pinned
+        else:
+            approval_pins = ()
+        try:
+            approval_evidence = live_ops.composer_discard_approval(
+                issue=approval.issue,
+                journal=approval.journal,
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                slot_digest=unit.slot_digest,
+                pinned=approval_pins,
+            )
+        except ComposerDiscardApprovalError as exc:
+            return _blocked(
+                REASON_COMPOSER_DISCARD_APPROVAL_INVALID,
+                str(exc),
+                **base,
+            )
 
     # A read-only preflight observes the authority and writes NOTHING — no lock file, no DB,
     # no seal (review j#80523 R3-F4). It must never bootstrap: an authority created by a
     # `--execute`-less run would both break the command's own contract and silently re-create
     # a *lost* store, erasing the evidence of prior retirements.
     if not execute:
-        try:
-            prior = live_ops.peek_retirement(unit)
-        except ScratchRetirementFenceError as exc:
-            return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+        retry_refusal = _approval_retry_refusal(
+            prior_hint,
+            approval_evidence=approval_evidence,
+            base=base,
+        )
+        if retry_refusal is not None:
+            return retry_refusal
         return _preflight_verdict(
             live_ops,
-            prior=prior,
+            prior=prior_hint,
             pair_is_live=pair_is_live,
             live_targets=live_targets,
             workspace_id=workspace_id,
             expected_names=expected_names,
             base=base,
-            approval_token=approval.token if approval is not None else "",
+            approval_token=(
+                approval_evidence.token if approval_evidence is not None else ""
+            ),
         )
 
     # The retirement transaction (design j#80526). Everything from the authority read through
@@ -427,13 +474,32 @@ def run_session_retire(
         with live_ops.retirement_transaction(unit, live_pair_present=pair_is_live) as txn:
             prior = txn.current()
 
+            retry_refusal = _approval_retry_refusal(
+                prior,
+                approval_evidence=approval_evidence,
+                base=base,
+            )
+            if retry_refusal is not None:
+                return retry_refusal
+
             if not pair_is_live:
                 if prior is not None and prior.completed:
+                    try:
+                        prior_token = _attempt_approval_token(prior)
+                    except ComposerDiscardApprovalError as exc:
+                        return _blocked(
+                            REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base
+                        )
                     return SessionRetireVerdict(
                         state=STATE_ALREADY_RETIRED,
                         detail=(
                             "this exact pair was proven retired by a prior run and no slot is "
                             "live now"
+                            + (
+                                f" under Redmine {prior_token}"
+                                if prior_token
+                                else ""
+                            )
                         ),
                         closed=prior.closed,
                         durable_retirement="already_completed",
@@ -446,7 +512,6 @@ def run_session_retire(
                     return _finish_retirement(
                         live_ops,
                         txn,
-                        args=args,
                         attempt=prior,
                         closed=prior.closed,
                         workspace_id=workspace_id,
@@ -476,7 +541,14 @@ def run_session_retire(
                     return plan
                 remaining = plan
             else:
-                attempt = txn.reserve(pinned=live_targets)
+                attempt = txn.reserve(
+                    pinned=live_targets,
+                    approval_evidence=(
+                        approval_evidence.canonical_json()
+                        if approval_evidence is not None
+                        else ""
+                    ),
+                )
                 remaining = live_targets
 
             # Now that the pending intent is durable and visible, read what is owed. A dispatch
@@ -491,7 +563,6 @@ def run_session_retire(
                 return _finish_retirement(
                     live_ops,
                     txn,
-                    args=args,
                     attempt=attempt,
                     closed=attempt.closed,
                     workspace_id=workspace_id,
@@ -523,7 +594,6 @@ def run_session_retire(
             return _finish_retirement(
                 live_ops,
                 txn,
-                args=args,
                 attempt=attempt,
                 closed=closed,
                 workspace_id=workspace_id,
@@ -537,6 +607,39 @@ def run_session_retire(
         return _blocked(REASON_RETIREMENT_BUSY, str(exc), **base)
     except ScratchRetirementFenceError as exc:
         return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+
+
+def _attempt_approval_token(attempt) -> str:
+    """Recover the exact durable pointer from the load-bearing attempt evidence."""
+    raw = getattr(attempt, "approval_evidence", "") or ""
+    if not raw:
+        return ""
+    return ComposerDiscardApprovalEvidence.from_json(raw).token
+
+
+def _approval_retry_refusal(prior, *, approval_evidence, base):
+    """Require byte-identical verified evidence before resuming a pending attempt."""
+    if prior is None or not prior.pending:
+        return None
+    stored = getattr(prior, "approval_evidence", "") or ""
+    current = (
+        approval_evidence.canonical_json() if approval_evidence is not None else ""
+    )
+    if stored:
+        try:
+            ComposerDiscardApprovalEvidence.from_json(stored)
+        except ComposerDiscardApprovalError as exc:
+            return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+    if stored == current:
+        return None
+    if not stored and not current:
+        return None
+    return _blocked(
+        REASON_COMPOSER_DISCARD_APPROVAL_MISMATCH,
+        "the pending retirement attempt is bound to different composer-discard approval "
+        "evidence; a destructive retry requires the same freshly verified journal bytes",
+        **base,
+    )
 
 
 def _resume_plan(attempt, live_by_role, base):
@@ -667,7 +770,6 @@ def _finish_retirement(
     live_ops,
     txn,
     *,
-    args,
     attempt,
     closed,
     workspace_id,
@@ -743,7 +845,7 @@ def _finish_retirement(
         return replace(blocked, closed=closed, executed=True)
 
     try:
-        txn.mark_completed(
+        completed = txn.mark_completed(
             attempt_id=attempt.attempt_id,
             closed=closed,
             detail=f"{len(closed)} slot(s) closed; unit re-measured empty",
@@ -766,8 +868,18 @@ def _finish_retirement(
     # The fence row IS the durable outcome (acceptance 4). `managed_events` is appended only
     # AFTER it, purely as lossy narrative audit: its failure is reported but never invalidates
     # a proven retirement, because the load-bearing authority is the fence, not the audit log.
-    approval, _ = _composer_discard_approval(args)
-    approval_token = approval.token if approval is not None else ""
+    try:
+        approval_token = _attempt_approval_token(completed)
+    except ComposerDiscardApprovalError as exc:
+        return SessionRetireVerdict(
+            state=STATE_BLOCKED,
+            reason=REASON_RETIREMENT_AUTHORITY_UNAVAILABLE,
+            detail=str(exc),
+            closed=closed,
+            durable_retirement="fence_completed",
+            executed=True,
+            **base,
+        )
     intent = {
         "lane_id": lane_id,
         "expected_names": list(expected_names),

@@ -9,13 +9,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mozyo_bridge.core.state.scratch_retirement_fence import ScratchRetirementFence
+from mozyo_bridge.core.state.scratch_retirement_fence import (
+    RetirementUnit,
+    ScratchRetirementFence,
+    ScratchRetirementFenceError,
+    slot_digest,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    RedmineJournalEntry,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire import (  # noqa: E501
     REASON_COMPOSER_DISCARD_APPROVAL_INVALID,
+    REASON_COMPOSER_DISCARD_APPROVAL_MISMATCH,
     REASON_COMPOSER_DISCARD_ISSUE_MISMATCH,
+    REASON_COMPLETION_UNPROVEN,
     REASON_HISTORICAL_BRANCH_MISMATCH,
     REASON_HISTORICAL_WORKTREE_DIRTY,
     REASON_HISTORICAL_WORKTREE_UNREADABLE,
@@ -35,6 +45,17 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.composer_discard_approval import (  # noqa: E501
+    APPROVAL_DECISION,
+    APPROVAL_EFFECT,
+    APPROVAL_GATE,
+    APPROVAL_SOURCE,
+    APPROVAL_VERSION,
+    ComposerDiscardApprovalError,
+    ComposerDiscardApprovalEvidence,
+    pin_digest,
+    verify_composer_discard_approval,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.scratch_pair_retire import (  # noqa: E501
     REASON_AGENT_NOT_IDLE,
     REASON_DUPLICATE_INVENTORY,
@@ -49,22 +70,106 @@ from tests.support.herdr_workspace_fixtures import anchored_repo_root
 
 
 LANE = "issue_13918_owner_unbound_convergence"
-APPROVAL = "13918:80789"
+APPROVAL = "13918:90001"
+WRONG_GATE_APPROVAL = "13918:80789"
 GATEWAY = "codex"
 WORKER = "claude"
+
+
+def _approval_note(
+    *, issue, workspace_id, lane_id, pair_slot_digest, pinned, gate=APPROVAL_GATE
+):
+    fields = {
+        "gate": gate,
+        "version": APPROVAL_VERSION,
+        "approval_source": APPROVAL_SOURCE,
+        "decision": APPROVAL_DECISION,
+        "effect": APPROVAL_EFFECT,
+        "issue": issue,
+        "workspace": workspace_id,
+        "lane": lane_id,
+        "slot_digest": pair_slot_digest,
+        "pin_digest": pin_digest(pinned),
+    }
+    body = ":".join(f"{key}={value}" for key, value in fields.items())
+    return f"[mozyo:workflow-event:{body}]"
 
 
 class HistoricalOps(FakeOps):
     """The #13892 seam plus action-time Git facts introduced by #13918."""
 
-    def __init__(self, rows, *, worktree=(True, True, LANE), **kwargs):
+    def __init__(
+        self,
+        rows,
+        *,
+        worktree=(True, True, LANE),
+        approval_mode="valid",
+        **kwargs,
+    ):
         super().__init__(rows, **kwargs)
         self._worktree = worktree
+        self._approval_mode = approval_mode
         self.worktree_calls = 0
+        self.approval_calls = []
 
     def worktree_facts(self):
         self.worktree_calls += 1
         return self._worktree
+
+    def composer_discard_approval(
+        self,
+        *,
+        issue,
+        journal,
+        workspace_id,
+        lane_id,
+        slot_digest,
+        pinned,
+    ):
+        self.approval_calls.append((issue, journal, workspace_id, lane_id, pinned))
+        if self._approval_mode == "unreadable":
+            raise ComposerDiscardApprovalError("live Redmine read failed")
+        if self._approval_mode == "missing":
+            entries = []
+        else:
+            note_workspace = (
+                "foreign-workspace"
+                if self._approval_mode == "foreign_target"
+                else workspace_id
+            )
+            note_pins = (
+                ((GATEWAY, "%old1"), (WORKER, "%old2"))
+                if self._approval_mode == "stale_target"
+                else pinned
+            )
+            gate = (
+                "codex_direct_edit"
+                if self._approval_mode == "wrong_gate"
+                else APPROVAL_GATE
+            )
+            entries = [
+                RedmineJournalEntry(
+                    issue_id=issue,
+                    journal_id=journal,
+                    notes=_approval_note(
+                        issue=issue,
+                        workspace_id=note_workspace,
+                        lane_id=lane_id,
+                        pair_slot_digest=slot_digest,
+                        pinned=note_pins,
+                        gate=gate,
+                    ),
+                )
+            ]
+        return verify_composer_discard_approval(
+            entries,
+            issue=issue,
+            journal=journal,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            slot_digest=slot_digest,
+            pinned=pinned,
+        )
 
 
 class OwnerApprovedConvergenceTest(unittest.TestCase):
@@ -116,6 +221,38 @@ class OwnerApprovedConvergenceTest(unittest.TestCase):
                 self.assertEqual(result.reason, REASON_COMPOSER_DISCARD_APPROVAL_INVALID)
                 self.assertEqual(ops.close_calls, [])
                 self.assertEqual(ops.worktree_calls, 0)
+
+    def test_live_approval_must_exist_be_owner_gate_and_target_this_exact_pair(self):
+        cases = (
+            ("missing", APPROVAL),
+            ("unreadable", APPROVAL),
+            ("wrong_gate", WRONG_GATE_APPROVAL),
+            ("foreign_target", APPROVAL),
+            ("stale_target", APPROVAL),
+        )
+        for mode, token in cases:
+            with self.subTest(mode=mode):
+                ops = HistoricalOps(
+                    self._rows(), composer=(True, True), approval_mode=mode
+                )
+                result = self._run(ops, approval=token)
+                self.assertEqual(
+                    result.reason, REASON_COMPOSER_DISCARD_APPROVAL_INVALID
+                )
+                self.assertEqual(ops.close_calls, [])
+                self.assertFalse(
+                    ops.fence.path.exists(),
+                    "an invalid live approval must fail before reserve/bootstrap",
+                )
+
+    def test_old_direct_edit_journal_80789_is_not_owner_approval(self):
+        ops = HistoricalOps(
+            self._rows(), composer=(True, True), approval_mode="wrong_gate"
+        )
+        result = self._run(ops, approval=WRONG_GATE_APPROVAL)
+        self.assertEqual(result.reason, REASON_COMPOSER_DISCARD_APPROVAL_INVALID)
+        self.assertIn("structured composer-discard owner approval", result.detail)
+        self.assertEqual(ops.close_calls, [])
 
     def test_historical_lane_requires_matching_issue(self):
         ops = HistoricalOps(self._rows(), composer=(True, True))
@@ -226,6 +363,84 @@ class OwnerApprovedConvergenceTest(unittest.TestCase):
             ops.recorded[0]["pending_composer_discard_approval"], APPROVAL
         )
 
+    def test_completion_failure_retry_requires_same_fresh_approval_evidence(self):
+        ops = HistoricalOps(self._rows(), composer=(True, True))
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        fence = ScratchRetirementFence(home=home)
+        ops.fence = fence
+        real_transaction = fence.transaction
+
+        class BreakComplete:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                self._txn = self._inner.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._inner.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self._txn, name)
+
+            def mark_completed(self, **kwargs):
+                raise ScratchRetirementFenceError("simulated completion failure")
+
+        fence.transaction = lambda unit, **kw: BreakComplete(  # type: ignore[method-assign]
+            real_transaction(unit, **kw)
+        )
+        first = self._run(ops, approval=APPROVAL)
+        self.assertEqual(first.reason, REASON_COMPLETION_UNPROVEN)
+        self.assertEqual(len(first.closed), 2)
+
+        fence.transaction = real_transaction  # type: ignore[method-assign]
+        without = HistoricalOps([], composer=(True, False))
+        without.fence = fence
+        no_approval = self._run(without)
+        self.assertEqual(
+            no_approval.reason, REASON_COMPOSER_DISCARD_APPROVAL_MISMATCH
+        )
+
+        different = HistoricalOps([], composer=(True, False))
+        different.fence = fence
+        other_approval = self._run(different, approval="13918:90002")
+        self.assertEqual(
+            other_approval.reason, REASON_COMPOSER_DISCARD_APPROVAL_MISMATCH
+        )
+
+        exact = HistoricalOps([], composer=(True, False))
+        exact.fence = fence
+        repaired = self._run(exact, approval=APPROVAL)
+        self.assertEqual(repaired.state, STATE_GREEN, repaired.detail)
+        self.assertEqual(exact.close_calls, [])
+        self.assertEqual(
+            exact.recorded[0]["pending_composer_discard_approval"], APPROVAL
+        )
+
+    def test_completed_fence_keeps_exact_approval_when_audit_append_fails(self):
+        ops = HistoricalOps(self._rows(), composer=(True, True))
+        ops.record_retirement = lambda **kwargs: "not_recorded:append_failed"
+        result = self._run(ops, approval=APPROVAL)
+        self.assertEqual(result.state, STATE_GREEN, result.detail)
+        self.assertEqual(result.audit_record, "not_recorded:append_failed")
+
+        unit = RetirementUnit(
+            self.ws,
+            LANE,
+            slot_digest([self._name(GATEWAY), self._name(WORKER)]),
+        )
+        completed = ops.fence.peek(unit)
+        self.assertIsNotNone(completed)
+        self.assertTrue(completed.completed)
+        evidence = ComposerDiscardApprovalEvidence.from_json(
+            completed.approval_evidence
+        )
+        self.assertEqual(evidence.token, APPROVAL)
+        self.assertEqual(evidence.workspace_id, self.ws)
+        self.assertEqual(evidence.lane_id, LANE)
+
     def test_non_issue_scratch_pair_skips_git_gate(self):
         lane = "dogfood13918"
 
@@ -284,6 +499,50 @@ class LiveWorktreeFactsTest(unittest.TestCase):
             LiveSessionRetireOps(repo_root=other).worktree_facts(),
             (False, False, ""),
         )
+
+    def test_live_ops_fetches_the_exact_journal_fresh_on_every_verification(self):
+        workspace = "e13918"
+        lane = LANE
+        names = [
+            encode_assigned_name(workspace, GATEWAY, lane),
+            encode_assigned_name(workspace, WORKER, lane),
+        ]
+        pair_slot_digest = slot_digest(names)
+        pins = ((GATEWAY, "%1"), (WORKER, "%2"))
+        note = _approval_note(
+            issue="13918",
+            workspace_id=workspace,
+            lane_id=lane,
+            pair_slot_digest=pair_slot_digest,
+            pinned=pins,
+        )
+
+        class FreshSource:
+            def __init__(self):
+                self.reads = 0
+
+            def read_entries(self, issue):
+                self.reads += 1
+                return [RedmineJournalEntry(issue, "90001", note)]
+
+        source = FreshSource()
+
+        class TestOps(LiveSessionRetireOps):
+            def _redmine_source(self):
+                return source
+
+        ops = TestOps(repo_root=self.repo)
+        for _ in range(2):
+            evidence = ops.composer_discard_approval(
+                issue="13918",
+                journal="90001",
+                workspace_id=workspace,
+                lane_id=lane,
+                slot_digest=pair_slot_digest,
+                pinned=pins,
+            )
+            self.assertEqual(evidence.token, APPROVAL)
+        self.assertEqual(source.reads, 2)
 
 
 if __name__ == "__main__":

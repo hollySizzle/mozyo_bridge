@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import json
 import os
 import secrets
 import sqlite3
@@ -170,6 +171,9 @@ class RetirementAttempt:
     revision: int = 1
     pinned: tuple[tuple[str, str], ...] = ()
     closed: tuple[tuple[str, str], ...] = ()
+    #: Canonical, caller-verified destructive-approval evidence.  The core store treats this
+    #: as opaque bytes; the composer-discard domain owns its schema and comparison semantics.
+    approval_evidence: str = ""
     detail: str = ""
     reserved_at: str = ""
     updated_at: str = ""
@@ -192,6 +196,7 @@ class RetirementAttempt:
             "revision": self.revision,
             "pinned": [{"role": r, "locator": loc} for r, loc in self.pinned],
             "closed": [{"role": r, "locator": loc} for r, loc in self.closed],
+            "approval_evidence": self.approval_evidence,
             "detail": self.detail,
             "reserved_at": self.reserved_at,
             "updated_at": self.updated_at,
@@ -582,7 +587,52 @@ class ScratchRetirementFence:
         return out
 
 
+_DETAIL_ENVELOPE_PREFIX = "mozyo-retirement-attempt-v1:"
+
+
+def _encode_attempt_detail(*, approval_evidence: str, detail: str) -> str:
+    """Persist approval and narrative in the existing load-bearing attempt row.
+
+    The fence schema stays at v1 so already-deployed authorities remain readable.  Old rows
+    keep their plain-text ``detail`` representation; only approval-bearing attempts use this
+    unambiguous canonical envelope.
+    """
+    if not approval_evidence:
+        return detail
+    payload = json.dumps(
+        {"approval_evidence": approval_evidence, "detail": detail},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return _DETAIL_ENVELOPE_PREFIX + payload
+
+
+def _decode_attempt_detail(value: str) -> tuple[str, str]:
+    raw = str(value or "")
+    if not raw.startswith(_DETAIL_ENVELOPE_PREFIX):
+        return "", raw
+    try:
+        payload = json.loads(raw[len(_DETAIL_ENVELOPE_PREFIX) :])
+    except (TypeError, ValueError) as exc:
+        raise ScratchRetirementFenceError(
+            "the retirement attempt's approval envelope is unreadable; fail closed"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"approval_evidence", "detail"}
+        or not isinstance(payload.get("approval_evidence"), str)
+        or not payload["approval_evidence"]
+        or not isinstance(payload.get("detail"), str)
+    ):
+        raise ScratchRetirementFenceError(
+            "the retirement attempt's approval envelope has an invalid schema; fail closed"
+        )
+    return payload["approval_evidence"], payload["detail"]
+
+
 def _row_to_attempt(unit: "RetirementUnit", row) -> "RetirementAttempt":
+    approval_evidence, detail = _decode_attempt_detail(row[5])
     return RetirementAttempt(
         unit=unit,
         state=str(row[0]),
@@ -590,7 +640,8 @@ def _row_to_attempt(unit: "RetirementUnit", row) -> "RetirementAttempt":
         revision=int(row[2]),
         pinned=_decode_pairs(row[3]),
         closed=_decode_pairs(row[4]),
-        detail=str(row[5] or ""),
+        approval_evidence=approval_evidence,
+        detail=detail,
         reserved_at=str(row[6] or ""),
         updated_at=str(row[7] or ""),
     )
@@ -714,7 +765,11 @@ class _RetirementTransaction:
         return _row_to_attempt(self._unit, row) if row is not None else None
 
     def reserve(
-        self, *, pinned: Sequence[tuple[str, str]], now: Optional[str] = None
+        self,
+        *,
+        pinned: Sequence[tuple[str, str]],
+        approval_evidence: str = "",
+        now: Optional[str] = None,
     ) -> RetirementAttempt:
         """Authorize a retirement for this unit BEFORE any close.
 
@@ -727,6 +782,9 @@ class _RetirementTransaction:
         a pair that is running now.
         """
         stamp = now or _utc_now()
+        stored_detail = _encode_attempt_detail(
+            approval_evidence=approval_evidence, detail=""
+        )
         conn = self._fence._connect_rw()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -741,13 +799,14 @@ class _RetirementTransaction:
                 conn.execute(
                     "INSERT INTO scratch_retirement (workspace_id, lane_id, slot_digest, "
                     "attempt_id, revision, state, pinned_json, closed_json, detail, "
-                    "reserved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?)",
+                    "reserved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)",
                     (
                         *self._unit.as_row(),
                         attempt,
                         revision,
                         RETIRE_PENDING,
                         _encode_pairs(pinned),
+                        stored_detail,
                         stamp,
                         stamp,
                     ),
@@ -756,13 +815,14 @@ class _RetirementTransaction:
                 revision = int(row[1]) + 1
                 conn.execute(
                     "UPDATE scratch_retirement SET attempt_id=?, revision=?, state=?, "
-                    "pinned_json=?, closed_json='', detail='', reserved_at=?, updated_at=? "
+                    "pinned_json=?, closed_json='', detail=?, reserved_at=?, updated_at=? "
                     "WHERE workspace_id=? AND lane_id=? AND slot_digest=?",
                     (
                         attempt,
                         revision,
                         RETIRE_PENDING,
                         _encode_pairs(pinned),
+                        stored_detail,
                         stamp,
                         stamp,
                         *self._unit.as_row(),
@@ -785,6 +845,7 @@ class _RetirementTransaction:
             attempt_id=attempt,
             revision=revision,
             pinned=tuple(pinned),
+            approval_evidence=approval_evidence,
             reserved_at=stamp,
             updated_at=stamp,
         )
@@ -838,6 +899,27 @@ class _RetirementTransaction:
         conn = self._fence._connect_rw()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT revision, pinned_json, reserved_at, detail FROM scratch_retirement "
+                "WHERE workspace_id=? AND lane_id=? AND slot_digest=? AND attempt_id=? "
+                "AND state=?",
+                (
+                    *self._unit.as_row(),
+                    attempt_id,
+                    RETIRE_PENDING,
+                ),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise ScratchRetirementFenceError(
+                    "the retirement could not be completed: this attempt is no longer the "
+                    "pending one for the unit (a concurrent run or a store change); the "
+                    "closes that committed are reported, but no completion is claimed"
+                )
+            approval_evidence, _ = _decode_attempt_detail(row[3])
+            stored_detail = _encode_attempt_detail(
+                approval_evidence=approval_evidence, detail=detail
+            )
             cur = conn.execute(
                 "UPDATE scratch_retirement SET state=?, closed_json=?, detail=?, updated_at=? "
                 "WHERE workspace_id=? AND lane_id=? AND slot_digest=? AND attempt_id=? "
@@ -845,7 +927,7 @@ class _RetirementTransaction:
                 (
                     RETIRE_COMPLETED,
                     _encode_pairs(closed),
-                    detail,
+                    stored_detail,
                     stamp,
                     *self._unit.as_row(),
                     attempt_id,
@@ -874,8 +956,12 @@ class _RetirementTransaction:
             unit=self._unit,
             state=RETIRE_COMPLETED,
             attempt_id=attempt_id,
+            revision=int(row[0]),
+            pinned=_decode_pairs(row[1]),
             closed=tuple(closed),
+            approval_evidence=approval_evidence,
             detail=detail,
+            reserved_at=str(row[2] or ""),
             updated_at=stamp,
         )
 

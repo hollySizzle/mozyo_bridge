@@ -57,6 +57,18 @@ class SessionRetireOps(Protocol):
     def worktree_facts(self) -> tuple[bool, bool, str]:
         """Action-time ``(readable, clean, branch)`` for this repo root."""
 
+    def composer_discard_approval(
+        self,
+        *,
+        issue: str,
+        journal: str,
+        workspace_id: str,
+        lane_id: str,
+        slot_digest: str,
+        pinned: Sequence[tuple[str, str]],
+    ):
+        """Freshly read and verify exact owner approval for this destructive target."""
+
     def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
         """EVERY covered source's blocking obligations; ``None`` = unreadable (fail closed).
 
@@ -164,6 +176,43 @@ class LiveSessionRetireOps:
         if not readable:
             return (False, False, "")
         return (True, not bool(status.stdout.strip()), branch.stdout.strip())
+
+    def composer_discard_approval(
+        self,
+        *,
+        issue: str,
+        journal: str,
+        workspace_id: str,
+        lane_id: str,
+        slot_digest: str,
+        pinned: Sequence[tuple[str, str]],
+    ):
+        """Read Redmine NOW and validate one structured, exact-target owner approval."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.composer_discard_approval import (  # noqa: E501
+            ComposerDiscardApprovalError,
+            verify_composer_discard_approval,
+        )
+
+        source = self._redmine_source()
+        if source is None:
+            raise ComposerDiscardApprovalError(
+                "the credential-gated live Redmine approval source is unavailable"
+            )
+        try:
+            entries = list(source.read_entries(issue))
+        except Exception as exc:  # noqa: BLE001 - unreadable authority is zero-close
+            raise ComposerDiscardApprovalError(
+                "the exact Redmine approval journal could not be read live"
+            ) from exc
+        return verify_composer_discard_approval(
+            entries,
+            issue=issue,
+            journal=journal,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            slot_digest=slot_digest,
+            pinned=pinned,
+        )
 
     def open_obligations(self, workspace_id: str, assigned_names):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.scratch_pair_obligations import (  # noqa: E501
