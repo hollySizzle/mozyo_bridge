@@ -33,6 +33,7 @@ there would silently re-create a lost authority and then close panes on the stre
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -111,6 +112,10 @@ CREATE TABLE IF NOT EXISTS store_meta (
 """
 _STORE_NONCE_KEY = "store_nonce"
 
+#: The exact key set of a persisted participant (review j#81202 R6-F1). A read-back
+#: participant must carry exactly these — no missing key defaulted, no extra key ignored.
+_PARTICIPANT_KEYS = frozenset({"role", "assigned_name", "locator", "receipt", "closed"})
+
 #: The table/column shape that IS part of schema version 1 (review j#81092 R3-F1). A store
 #: at the right `user_version` but missing any of these is a partial schema and fails
 #: closed, rather than raising `no such table` / `no such column` out of a read.
@@ -140,6 +145,35 @@ class StartupTransactionBusy(StartupTransactionError):
 
 def _norm(value: object) -> str:
     return str(value or "").strip()
+
+
+def _close_quietly(conn) -> None:
+    """Close a connection during error cleanup, swallowing a secondary close failure.
+
+    Used only on the failure path (an exception is already propagating): a close error
+    here must not mask the original fault. The success path closes through
+    :meth:`StartupTransactionFence._connection`, which DOES surface a close failure.
+    """
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except (sqlite3.DatabaseError, OSError):
+        pass
+
+
+def _close_os_fd_quietly(fd) -> None:
+    """Close an OS fd during error cleanup, swallowing a secondary close failure.
+
+    The lock's acquire-failure path (review j#81202 R6-F2): a close error while an acquire
+    failure is already propagating must not mask it with a raw OSError.
+    """
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def _utc_now() -> str:
@@ -253,31 +287,48 @@ class Participant:
                 f"startup action {action_id!r} has a non-object participant "
                 f"({type(raw).__name__}); the authority row is malformed"
             )
-        for key in ("role", "assigned_name", "locator"):
-            value = raw.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise StartupTransactionError(
-                    f"startup action {action_id!r} participant {key} is missing or not a "
-                    f"non-empty string ({value!r}); the authority row is malformed"
-                )
-        receipt = raw.get("receipt", "")
-        if not isinstance(receipt, str):
+        # EXACT key set — no missing, no extra (review j#81202 R6-F1). Defaulting a missing
+        # receipt to "" or a missing closed to False was still coercion: it turned a
+        # participant the schema never fully recorded into a plausible one, and an extra key
+        # is a shape this version does not write. A read-back participant is byte-exact or
+        # it is a malformed authority.
+        if set(raw) != _PARTICIPANT_KEYS:
             raise StartupTransactionError(
-                f"startup action {action_id!r} participant receipt is not a string "
-                f"({receipt!r}); the authority row is malformed"
+                f"startup action {action_id!r} participant keys {sorted(raw)} are not the "
+                f"exact set {sorted(_PARTICIPANT_KEYS)}; the authority row is malformed"
             )
-        closed = raw.get("closed", False)
-        if not isinstance(closed, bool):
+        for key in ("role", "assigned_name", "locator", "receipt"):
+            value = raw[key]
+            if not isinstance(value, str):
+                raise StartupTransactionError(
+                    f"startup action {action_id!r} participant {key} is not a string "
+                    f"({value!r}); the authority row is malformed"
+                )
+        for key in ("role", "assigned_name", "locator"):
+            value = raw[key]
+            # An identity field is a canonical token: non-empty AND already stripped. A
+            # whitespace-wrapped value is a corrupt authority, not a value to normalize —
+            # stripping it to match a live pane was the R6-F1 coercion. `strip()` here is a
+            # VALIDATION comparison, never a mutation: the stored bytes are used verbatim.
+            if not value or value != value.strip():
+                raise StartupTransactionError(
+                    f"startup action {action_id!r} participant {key} is empty or has "
+                    f"surrounding whitespace ({value!r}); the authority row is malformed"
+                )
+        if not isinstance(raw["closed"], bool):
             raise StartupTransactionError(
                 f"startup action {action_id!r} participant closed is not a boolean "
-                f"({closed!r}); refusing to coerce a corrupt flag into a close verdict"
+                f"({raw['closed']!r}); refusing to coerce a corrupt flag into a verdict"
             )
+        # The read-back identity bytes are preserved verbatim — no _norm strip. A
+        # whitespace-wrapped locator is a DIFFERENT authority value, and stripping it to
+        # match a live pane (R6-F1) is exactly the coercion this contract forbids.
         return Participant(
-            role=_norm(raw.get("role")),
-            assigned_name=_norm(raw.get("assigned_name")),
-            locator=_norm(raw.get("locator")),
-            receipt=_norm(receipt),
-            closed=closed,
+            role=raw["role"],
+            assigned_name=raw["assigned_name"],
+            locator=raw["locator"],
+            receipt=raw["receipt"],
+            closed=raw["closed"],
         )
 
 
@@ -369,18 +420,35 @@ class StartupTransactionFence:
             ("temp", self.temp_path),
         )
 
-    def store_shape(self) -> StoreShape:
-        """Classify the artifact set. ``lexists``: a broken symlink is still evidence.
+    @staticmethod
+    def _artifact_present(path: Path) -> bool:
+        """Probe one artifact with a raw ``lstat``, three-valued (review j#81202 R6-F3.1).
 
-        The artifact probe is normalized (review j#81171 authority-surface inventory):
-        ``os.path.lexists`` can raise ``OSError`` (a permission-denied parent, an embedded
-        NUL), and this runs BEFORE the connect/lock guards on every read and reserve, so a
-        raw error here escaped the public rail's "never raises". An unprobeable artifact
-        set is a damaged authority, not an absent one — fail closed, never bootstrap over it.
+        ``os.path.lexists`` is NOT usable here: it swallows the ``lstat`` ``OSError``
+        internally and returns ``False``, so a permission-denied artifact reads as absent —
+        and an absent store bootstraps / an absent action is "unknown", both of which act
+        on a store we could not actually read. ``lstat`` directly lets not-found
+        (``FileNotFoundError`` / ``NotADirectoryError`` → genuinely absent) be told apart
+        from unreadable (any other ``OSError`` → the store is there but unprobeable), which
+        the caller raises as a damaged authority.
+        """
+        try:
+            os.lstat(path)
+            return True
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+
+    def store_shape(self) -> StoreShape:
+        """Classify the artifact set (absent / present / damaged), fail-closed on unreadable.
+
+        The probe distinguishes genuinely-absent from unreadable via a raw ``lstat``
+        (review j#81202 R6-F3.1): this runs BEFORE the connect/lock guards on every read
+        and reserve, and an unprobeable artifact must never read as absent (which would
+        bootstrap over it, or answer "action unknown" for a store that is really there).
         """
         try:
             present = tuple(
-                name for name, p in self._artifact_paths() if os.path.lexists(p)
+                name for name, p in self._artifact_paths() if self._artifact_present(p)
             )
         except OSError as exc:
             raise StartupTransactionError(
@@ -436,13 +504,24 @@ class StartupTransactionFence:
 
     @staticmethod
     def _db_nonce(conn: sqlite3.Connection) -> Optional[str]:
-        try:
-            row = conn.execute(
-                "SELECT value FROM store_meta WHERE key = ?", (_STORE_NONCE_KEY,)
-            ).fetchone()
-        except sqlite3.DatabaseError:
+        row = conn.execute(
+            "SELECT value FROM store_meta WHERE key = ?", (_STORE_NONCE_KEY,)
+        ).fetchone()
+        if row is None:
             return None
-        return str(row[0]) if row is not None else None
+        value = row[0]
+        # The nonce is text, and it is compared to a text seal — NOT coerced (review j#81202
+        # R6-F3.2). `str(b"abc")` is `"b'abc'"`, which a seal literally holding `b'abc'`
+        # would then MATCH, letting a BLOB-nonce store pass its own identity check. A
+        # non-text nonce is a corrupt authority, surfaced by the caller's guard as
+        # unreadable rather than silently made to match. (sqlite3.DatabaseError from the
+        # query itself is normalized by the caller's `_open` / `_verify` guard.)
+        if not isinstance(value, str):
+            raise StartupTransactionError(
+                "the startup transaction store nonce is not text "
+                f"({type(value).__name__}); the authority identity is corrupt"
+            )
+        return value
 
     def _verify_shape(self, conn: sqlite3.Connection) -> None:
         """The table/column shape IS part of the schema (review j#81092 R3-F1).
@@ -518,16 +597,41 @@ class StartupTransactionFence:
             conn.execute("PRAGMA busy_timeout = 2000")
             return self._verify(conn)
         except StartupTransactionError:
-            if conn is not None:
-                conn.close()
+            _close_quietly(conn)
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-            if conn is not None:
-                conn.close()
+            _close_quietly(conn)
             raise StartupTransactionError(
                 f"the startup transaction authority {self.path} is unreadable ({exc}); "
                 "fail closed rather than treat an unreadable store as an empty one"
             ) from exc
+
+    @contextlib.contextmanager
+    def _connection(self, mode: str):
+        """Open a connection, yield it, and GUARANTEE a normalized close (R6-F3.3).
+
+        The single funnel that fixes the whole "connection close" surface at once instead
+        of one call site at a time: every read / reserve / write goes through here, so a
+        ``close()`` that raises is normalized in ONE place rather than leaking raw from
+        each ``finally``. A ``close`` failure never overwrites the body's own exception
+        (that is the real fault); it is only surfaced when the body itself succeeded.
+        """
+        conn = self._connect_ro() if mode == "ro" else self._connect_rw()
+        body_failed = False
+        try:
+            yield conn
+        except BaseException:
+            body_failed = True
+            raise
+        finally:
+            try:
+                conn.close()
+            except (sqlite3.DatabaseError, OSError) as exc:
+                if not body_failed:
+                    raise StartupTransactionError(
+                        f"the startup transaction authority {self.path} connection could "
+                        f"not be closed ({exc}); fail closed"
+                    ) from exc
 
     def _connect_ro(self) -> sqlite3.Connection:
         """A strict read-only, existing-only connection (never fabricates the store)."""
@@ -553,29 +657,29 @@ class StartupTransactionFence:
                 "the startup transaction store is damaged (a partial artifact set); "
                 "refusing to read an authority whose shape cannot be trusted"
             )
-        conn = self._connect_ro()
-        try:
-            row = conn.execute(
-                "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
-                " participants, reserved_at, updated_at FROM startup_actions"
-                " WHERE action_id = ?",
-                (_norm(action_id),),
-            ).fetchone()
-            # The row read AND its decode are inside the guard (review j#81092 R3-F1 /
-            # R4-F1): a query against a partial schema raises OperationalError here, and a
-            # malformed cell raises StartupTransactionError from `_row_to_action` (which
-            # now validates the row's shape, not just decodes it) — that already-structured
-            # error passes through untouched, while a raw DB error normalizes below. Either
-            # way the authority is unreadable, not the action absent, so the public rail's
-            # "never raises" holds.
-            return _row_to_action(row) if row else None
-        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-            raise StartupTransactionError(
-                f"the startup transaction authority {self.path} could not be read "
-                f"({exc}); fail closed rather than treat it as empty"
-            ) from exc
-        finally:
-            conn.close()
+        with self._connection("ro") as conn:
+            try:
+                row = conn.execute(
+                    "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
+                    " participants, reserved_at, updated_at FROM startup_actions"
+                    " WHERE action_id = ?",
+                    (_norm(action_id),),
+                ).fetchone()
+                # The row read AND its decode are inside the guard (R3-F1 / R4-F1): a query
+                # against a partial schema raises OperationalError, and a malformed cell
+                # raises StartupTransactionError from `_row_to_action` — the latter passes
+                # through untouched, the former normalizes here. The connection close is
+                # guaranteed and normalized by `_connection` (R6-F3.3).
+                from mozyo_bridge.core.state.startup_transaction_row import (
+                    _row_to_action,
+                )
+
+                return _row_to_action(row) if row else None
+            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} could not be read "
+                    f"({exc}); fail closed rather than treat it as empty"
+                ) from exc
 
     # -- writes ------------------------------------------------------------
 
@@ -607,46 +711,44 @@ class StartupTransactionFence:
                     f"the startup transaction authority {self.path} could not be created "
                     f"({exc}); nothing was started"
                 ) from exc
-            conn = self._connect_rw()
-            try:
-                existing = conn.execute(
-                    "SELECT phase FROM startup_actions WHERE action_id = ?", (action_id,)
-                ).fetchone()
-                if existing is not None:
-                    raise StartupTransactionError(
-                        f"startup action {action_id!r} already exists (phase "
-                        f"{existing[0]!r}); a nonce must never be reused — refusing to "
-                        "reserve over a recorded action"
+            with self._connection("rw") as conn:
+                try:
+                    existing = conn.execute(
+                        "SELECT phase FROM startup_actions WHERE action_id = ?",
+                        (action_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        raise StartupTransactionError(
+                            f"startup action {action_id!r} already exists (phase "
+                            f"{existing[0]!r}); a nonce must never be reused — refusing to "
+                            "reserve over a recorded action"
+                        )
+                    conn.execute(
+                        "INSERT INTO startup_actions (action_id, workspace_id, lane_id,"
+                        " providers, phase, revision, participants, reserved_at,"
+                        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            action_id,
+                            canonical.workspace_id,
+                            canonical.lane_id,
+                            ",".join(canonical.providers),
+                            PHASE_PLANNED,
+                            1,
+                            json.dumps([]),
+                            now,
+                            now,
+                        ),
                     )
-                conn.execute(
-                    "INSERT INTO startup_actions (action_id, workspace_id, lane_id,"
-                    " providers, phase, revision, participants, reserved_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        action_id,
-                        canonical.workspace_id,
-                        canonical.lane_id,
-                        ",".join(canonical.providers),
-                        PHASE_PLANNED,
-                        1,
-                        json.dumps([]),
-                        now,
-                        now,
-                    ),
-                )
-            except StartupTransactionError:
-                raise
-            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-                # The SELECT/INSERT are normalized like `_write` (review j#81122 R4-F2): a
-                # raw IntegrityError here left the caller unable to tell "reserved" from
-                # "refused", and reserve is the reserve-before-effect anchor of the whole
-                # transaction — it must fail closed, not leak SQLite internals.
-                raise StartupTransactionError(
-                    f"the startup transaction authority {self.path} could not record the "
-                    f"reserve ({exc}); nothing was started"
-                ) from exc
-            finally:
-                conn.close()
+                except StartupTransactionError:
+                    raise
+                except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                    # The SELECT/INSERT are normalized (R4-F2); the connection close is
+                    # guaranteed and normalized by `_connection` (R6-F3.3). reserve is the
+                    # reserve-before-effect anchor — it must fail closed, not leak internals.
+                    raise StartupTransactionError(
+                        f"the startup transaction authority {self.path} could not record "
+                        f"the reserve ({exc}); nothing was started"
+                    ) from exc
         return StartupAction(
             action_id=action_id,
             unit=canonical,
@@ -717,25 +819,25 @@ class StartupTransactionFence:
         return action
 
     def _write(self, action_id: str, *, phase: str, participants) -> None:
-        conn = self._connect_rw()
-        try:
-            conn.execute(
-                "UPDATE startup_actions SET phase = ?, participants = ?, updated_at = ?,"
-                " revision = revision + 1 WHERE action_id = ?",
-                (
-                    phase,
-                    json.dumps([p.as_payload() for p in participants]),
-                    _utc_now(),
-                    _norm(action_id),
-                ),
-            )
-        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-            raise StartupTransactionError(
-                f"the startup transaction authority {self.path} could not be written "
-                f"({exc}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
+        with self._connection("rw") as conn:
+            try:
+                conn.execute(
+                    "UPDATE startup_actions SET phase = ?, participants = ?, updated_at ="
+                    " ?, revision = revision + 1 WHERE action_id = ?",
+                    (
+                        phase,
+                        json.dumps([p.as_payload() for p in participants]),
+                        _utc_now(),
+                        _norm(action_id),
+                    ),
+                )
+            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                # Write normalized here; connection close guaranteed + normalized by
+                # `_connection` (R6-F3.3).
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} could not be written "
+                    f"({exc}); fail closed"
+                ) from exc
 
 
 class _FenceLock:
@@ -757,11 +859,11 @@ class _FenceLock:
             fence._lock_depth += 1
             self._nested = True
             return self
-        # The directory-create AND the open are inside the guard (review j#81166 R5-F2):
-        # a `mkdir` / `os.open` that fails on permissions or a bad path is the authority
-        # being unavailable, and it escaped the public rail's "never raises" as a raw
-        # OSError. flock contention stays `StartupTransactionBusy`; every other lock I/O
-        # failure is a structured `StartupTransactionError`, never a stack trace.
+        # Acquire lifecycle (review j#81202 R6-F2). mkdir / open / flock are all inside the
+        # guard, and the failure-path `os.close(fd)` is done through `_close_os_fd_quietly`
+        # so a SECONDARY close failure during cleanup cannot mask the acquire failure with a
+        # raw OSError. flock contention (a live fd + EAGAIN/EACCES) is `StartupTransactionBusy`;
+        # a failed open — where fd is None — is authority-unavailable, never mistaken for it.
         fd = None
         try:
             lock = fence.lock_path
@@ -769,12 +871,12 @@ class _FenceLock:
             fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
-            if fd is not None:
-                os.close(fd)
-            if getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN) and fd is not None:
-                # EACCES/EAGAIN from flock is contention (another holder). EACCES from the
-                # open itself is not — but we only reach here with fd set when flock is the
-                # failing call, so a set fd narrows this to the contention case.
+            contention = (
+                fd is not None
+                and getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN)
+            )
+            _close_os_fd_quietly(fd)
+            if contention:
                 raise StartupTransactionBusy(
                     "another startup transaction holds this authority; refusing to wait "
                     "or steal it — nothing was started or closed"
@@ -786,7 +888,7 @@ class _FenceLock:
         fence._lock_depth = 1
         return self
 
-    def __exit__(self, *_exc) -> None:
+    def __exit__(self, exc_type, exc, tb) -> None:
         fence = self._fence
         if self._nested:
             fence._lock_depth -= 1
@@ -796,110 +898,25 @@ class _FenceLock:
         fd = fence._lock_fd
         fence._lock_fd = None
         fence._lock_depth = 0
-        # Release I/O is normalized too (review j#81166 R5-F2): an unlock / close that
-        # raises must not escape the public rail as a raw OSError. The fd is always closed.
+        # Release lifecycle (review j#81202 R6-F2): unlock and close are BOTH normalized,
+        # the fd is always closed, and a release failure is surfaced only when the body
+        # succeeded (`exc_type is None`). A body exception is the real fault and must not be
+        # overwritten by a secondary unlock/close error — so on the body-failure path the
+        # release error is swallowed and the body exception propagates unchanged.
+        release_error = None
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError as exc:
+        except OSError as unlock_exc:
+            release_error = unlock_exc
+        try:
+            os.close(fd)
+        except OSError as close_exc:
+            release_error = release_error or close_exc
+        if release_error is not None and exc_type is None:
             raise StartupTransactionError(
-                f"could not release the startup transaction lock ({exc}); fail closed"
-            ) from exc
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-def _require_text(value: object, action_id: str, field: str) -> str:
-    """A cell the schema declares NOT NULL text. NULL / non-string is a corrupt row.
-
-    Non-empty is required for the identity fields; ``NULL`` slipping through as an empty
-    string is precisely how a byte-exact workspace / lane was lost (review j#81166 R5-F1).
-    """
-    if not isinstance(value, str) or not value.strip():
-        raise StartupTransactionError(
-            f"startup action {action_id!r} field {field!r} is missing or not a non-empty "
-            f"string ({value!r}); the authority row is malformed"
-        )
-    return value
-
-
-def _row_to_action(row) -> StartupAction:
-    """Validate a row as a versioned authority record, field by field (fail-closed).
-
-    Every cell is a strict typed contract, not a value to coerce (review j#81166 R5-F1).
-    The earlier "validate" only rejected the shapes that happened to crash — it still let
-    ``participants`` NULL/"" read as an empty set, ``closed="false"`` coerce to ``True``,
-    ``workspace_id`` NULL pass, and ``revision=1.5`` truncate. Each of those turned a
-    CORRUPT authority row into a plausible "all participants absent" record, so the public
-    rail erased a real rollback debt into a terminal ``completed_rolled_back``. A row read
-    from the store is byte-exact authority (j#80989 Q1/Q3) or it is unreadable; there is
-    no lenient middle that closes — or forgets — panes.
-    """
-    if row is None or len(row) != 9:
-        raise StartupTransactionError(
-            "a startup action row does not have the 9 expected columns; malformed"
-        )
-    action_id = _require_text(row[0], "<unknown>", "action_id")
-    workspace_id = _require_text(row[1], action_id, "workspace_id")
-    lane_id = _require_text(row[2], action_id, "lane_id")
-    providers_cell = _require_text(row[3], action_id, "providers")
-    phase = row[4]
-    revision_cell = row[5]
-    participants_cell = row[6]
-    _require_text(row[7], action_id, "reserved_at")
-    _require_text(row[8], action_id, "updated_at")
-
-    if phase not in PHASES:
-        raise StartupTransactionError(
-            f"startup action {action_id!r} has an unknown phase {phase!r}; a corrupt "
-            "phase is an unreadable authority, not a no-op action"
-        )
-    # revision must be an EXACT integer — a stored float (1.5) truncating to 1 is silent
-    # authority drift, so bool / float / non-numeric string are all rejected (bool is an
-    # int subclass, hence the explicit guard).
-    if isinstance(revision_cell, bool) or not isinstance(revision_cell, int):
-        raise StartupTransactionError(
-            f"startup action {action_id!r} has a non-integer revision {revision_cell!r}; "
-            "the authority row is malformed"
-        )
-    revision = revision_cell
-
-    if not isinstance(participants_cell, str):
-        raise StartupTransactionError(
-            f"startup action {action_id!r} participants cell is not text "
-            f"({type(participants_cell).__name__}); a NULL / non-text cell is malformed, "
-            "not an empty participant set"
-        )
-    try:
-        raw_participants = json.loads(participants_cell)
-    except (TypeError, ValueError) as exc:
-        raise StartupTransactionError(
-            f"startup action {action_id!r} has a participants cell that is not JSON; "
-            "the authority row is malformed"
-        ) from exc
-    if not isinstance(raw_participants, list):
-        raise StartupTransactionError(
-            f"startup action {action_id!r} participants is not a JSON array "
-            f"({type(raw_participants).__name__}); the authority row is malformed"
-        )
-    participants = tuple(
-        Participant.strict_from_payload(entry, action_id) for entry in raw_participants
-    )
-    return StartupAction(
-        action_id=action_id,
-        unit=StartupUnit(
-            workspace_id=workspace_id,
-            lane_id=lane_id,
-            providers=tuple(p for p in providers_cell.split(",") if p),
-        ),
-        phase=phase,
-        revision=revision,
-        participants=participants,
-        reserved_at=row[7],
-        updated_at=row[8],
-    )
+                f"could not release the startup transaction lock ({release_error}); "
+                "fail closed"
+            ) from release_error
 
 
 __all__ = (
