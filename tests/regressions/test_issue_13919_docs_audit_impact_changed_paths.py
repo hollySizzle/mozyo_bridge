@@ -8,9 +8,10 @@ reported the real set (#13892 j#80495 observed 7 staged files vs 0). A
 verification gate that reads "nothing changed" when everything changed is
 worse than no gate, so each source of the union is pinned here.
 
-These drive a real `git` against a temp repo (real collaborator + resolver,
-hermetic), which places them under `integration/` per
-vibes/docs/logics/tests-placement-discovery-policy.md `## 配置決定木`.
+Placement per vibes/docs/logics/tests-placement-discovery-policy.md
+`## 配置決定木`: branch 3 (a fixed defect's re-occurrence pin) settles this
+file and precedes the real-collaborator branch, so driving a real `git`
+against a temp repo does not move it to `integration/`.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.docs_tools.impact import (  # noqa: E402
