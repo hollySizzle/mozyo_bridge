@@ -76,6 +76,9 @@ class PreparationObservation:
     discard_roles: tuple[str, ...] = ()
     #: Typed axes of the bound signature this row fails (#13933 j#81046 Decision 2).
     bound_faults: tuple[str, ...] = ()
+    #: Was the lifecycle row actually read?  ``pins_empty`` is meaningful only when True; an
+    #: unread row leaves the pin state unknown, never "non-empty" (Redmine #13933 R7 F1).
+    pins_known: bool = False
     detail: str = ""
 
 
@@ -184,9 +187,17 @@ def _classify(
         # the failed axes is what turns "the row is wrong somehow" into a diagnosis: the live
         # a7 block read as a partial-effect defect for a whole round while the actual fault
         # was a worktree identity mismatch (#13846 j#81024 -> #13933 j#81043).
-        faults = observation.bound_faults + (
-            () if observation.pins_empty else (FAULT_PINS_NOT_EMPTY,)
+        #
+        # ``pins_not_empty`` is added only from a POSITIVE read (``pins_known``): an unread row
+        # (worktree unresolved, lifecycle unreadable / absent) leaves the pin state unknown, so
+        # reporting it non-empty would fabricate a fault and mislead the operator (R7 F1).  The
+        # block still fires via ``lifecycle_exact`` and the detail falls back to the real reason.
+        pin_fault = (
+            (FAULT_PINS_NOT_EMPTY,)
+            if observation.pins_known and not observation.pins_empty
+            else ()
         )
+        faults = observation.bound_faults + pin_fault
         return _blocked(
             request, BLOCK_NOT_BOUND_SIGNATURE,
             detail=bound_signature_detail(faults) or observation.detail,

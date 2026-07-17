@@ -53,7 +53,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     APPROVAL_GATE,
     BLOCK_APPROVAL_MISSING,
     BLOCK_NO_DISCARDABLE_COMPOSER,
+    BLOCK_NOT_BOUND_SIGNATURE,
     BLOCK_PAIR_PRESERVED,
+    BLOCK_REPLACEMENT_STOPPED,
+    RESUME_ADOPTED,
+    RESUME_APPROVAL_UNREADABLE,
+    RESUME_NO_OWNED_PROGRESS,
+    RESUME_NO_OWNING_APPROVAL,
+    RESUME_PROJECTED_BLOCKED,
     STATE_ACTIONABLE,
     STATE_PREPARED,
     PreparationExpectation,
@@ -786,6 +793,149 @@ class PartialProgressPreflightTests(unittest.TestCase):
 
         self.assertEqual(outcome.reason, BLOCK_NO_DISCARDABLE_COMPOSER)
         self.assertFalse(outcome.resuming)
+
+
+class ResumeDiagnosticAndPublicStatusTests(unittest.TestCase):
+    """Every declined resume names WHY, and a launch failure is typed in the public payload.
+
+    Redmine #13933 R7 (design answer j#81046 Decision 2/3, review finding F2 j#81182). The four
+    silent ``return None`` paths made an unreadable credential and a pair with no owning action
+    produce byte-identical output; each now carries a typed ``resume_diagnostic``.
+    """
+
+    def _blocking_initial(self) -> PreparationObservation:
+        # A pair that is otherwise bound but has no discardable composer: the terminal block
+        # that invites the resume preflight to look for an owning action.
+        return _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=(),
+        )
+
+    def _partial_progress_ops(self):
+        approved = _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("gateway", "worker"),
+        )
+        expectation = _expectation(approved)
+        gateway = _participant("gateway", phase=PARTICIPANT_LAUNCH_OWED)
+        raw = _observation(
+            slots=(
+                BoundSlot("gateway", gateway.provider, gateway.assigned_name, "", SLOT_RECOVER),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=(),
+        )
+        projected = _observation(
+            slots=(
+                BoundSlot(
+                    "gateway", gateway.provider, gateway.assigned_name,
+                    gateway.old_locator, SLOT_RECOVER, close_proven=True,
+                ),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("worker",),
+        )
+
+        class _Ops(FakeOps):
+            def observe(self, request, *, action_id=""):
+                self.calls.append(("observe", action_id))
+                return projected if action_id == expectation.action_id else raw
+
+        ops = _Ops(raw)
+        ops.markers = (expectation.marker_fields(),)
+        return ops, expectation
+
+    def test_adopted_diagnostic_on_owned_replay(self):
+        ops, _expectation = self._partial_progress_ops()
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+        self.assertTrue(outcome.resuming)
+        self.assertEqual(outcome.resume_diagnostic, RESUME_ADOPTED)
+        self.assertEqual(outcome.as_payload()["resume_diagnostic"], RESUME_ADOPTED)
+
+    def test_no_matching_approval_marker_diagnostic(self):
+        ops, _expectation = self._partial_progress_ops()
+        ops.markers = ()
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+        self.assertFalse(outcome.resuming)
+        self.assertEqual(outcome.resume_diagnostic, RESUME_NO_OWNING_APPROVAL)
+
+    def test_no_action_owned_progress_diagnostic(self):
+        # The approval resolves, but re-observing under its id changes nothing.
+        blocked = self._blocking_initial()
+        ops = FakeOps(blocked)
+        ops.markers = (_expectation(_observation()).marker_fields(),)
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+        self.assertFalse(outcome.resuming)
+        self.assertEqual(outcome.resume_diagnostic, RESUME_NO_OWNED_PROGRESS)
+
+    def test_projected_still_blocked_diagnostic_carries_the_projected_reason(self):
+        # The action owns progress (projection differs), but the projected pair is still blocked
+        # on its own merits -- a preserved slot the approval does not cover.
+        raw = self._blocking_initial()
+        projected = _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("gateway",),  # worker still preserved, not approved -> PAIR_PRESERVED
+        )
+
+        class _Ops(FakeOps):
+            def observe(self, request, *, action_id=""):
+                self.calls.append(("observe", action_id))
+                return projected if action_id else raw
+
+        ops = _Ops(raw)
+        ops.markers = (_expectation(_observation()).marker_fields(),)
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+        self.assertFalse(outcome.resuming)
+        self.assertTrue(outcome.resume_diagnostic.startswith(RESUME_PROJECTED_BLOCKED + ":"))
+        self.assertIn(BLOCK_PAIR_PRESERVED, outcome.resume_diagnostic)
+
+    def test_unreadable_approval_source_reports_type_only_no_message_leak(self):
+        ops, _expectation = self._partial_progress_ops()
+
+        def _raise(issue, journal):
+            raise RuntimeError("SECRET-CREDENTIAL-abc123")
+
+        ops.approval_fields = _raise
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+        self.assertFalse(outcome.resuming)
+        self.assertEqual(
+            outcome.resume_diagnostic, f"{RESUME_APPROVAL_UNREADABLE}:RuntimeError"
+        )
+        # The exception's MESSAGE (which may quote credential/journal content) never escapes.
+        self.assertNotIn("SECRET-CREDENTIAL-abc123", outcome.resume_diagnostic)
+        self.assertNotIn("SECRET", str(outcome.as_payload()))
+
+    def test_effect_failed_is_typed_in_the_public_replacement_status(self):
+        # Decision 3: a launch failure at --execute is observable in the public JSON, not a
+        # bare block.  ``replacement_status`` carries the actuator's typed stop reason.
+        ops = FakeOps()
+        _preflight, _fields = _authorize(ops)
+        ops.drive_result = PreparationDrive(False, "effect_failed")
+        outcome = run_bound_pair_preparation(REQ, execute=True, ops=ops)
+        self.assertTrue(outcome.is_blocked)
+        self.assertEqual(outcome.reason, BLOCK_REPLACEMENT_STOPPED)
+        self.assertEqual(outcome.replacement_status, "effect_failed")
+        self.assertEqual(outcome.as_payload()["replacement_status"], "effect_failed")
+
+    def test_resume_execute_replays_the_same_action_without_a_new_marker(self):
+        # Decision 3: the resume reaches the drive under the approval already recorded -- the
+        # same immutable transaction id, no fresh marker minted.  Re-closing the already-closed
+        # role is prevented by the close-proof classifier (PartialEffectPairCoherenceTests).
+        ops, expectation = self._partial_progress_ops()
+        ops.drive_result = PreparationDrive(True, ACTUATION_RECOVERED)
+        outcome = run_bound_pair_preparation(REQ, execute=True, ops=ops)
+        drive_calls = [c for c in ops.calls if c[0] == "drive"]
+        self.assertEqual(drive_calls, [("drive", expectation.action_id)])
+        self.assertEqual(outcome.action_id, expectation.action_id)
 
 
 class VerifyAndCompletionAuthorityTests(unittest.TestCase):

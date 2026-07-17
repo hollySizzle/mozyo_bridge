@@ -74,6 +74,11 @@ class BoundPairObservation:
     lifecycle_exact: bool = False
     pins_empty: bool = False
     pins_exact: bool = False
+    #: Was the lifecycle row actually read?  ``pins_empty`` / ``pins_exact`` are only
+    #: meaningful when this is True.  When the row was never read (worktree unresolved,
+    #: lifecycle unreadable / absent) the pin state is UNKNOWN, not "non-empty" -- reporting
+    #: ``pins_not_empty`` from the default would fabricate a fault (Redmine #13933 R7 F1).
+    pins_known: bool = False
     inventory_readable: bool = False
     worktree_readable: bool = False
     worktree_clean: bool = False
@@ -206,7 +211,11 @@ def _classify(
 ) -> tuple[ConvergenceOutcome | None, ApprovalExpectation | None]:
     if not all((request.issue.strip(), request.journal.strip(), request.lane.strip(), request.worktree.strip(), request.branch.strip())):
         return _blocked(request, BLOCK_IDENTITY_INCOMPLETE), None
-    pins_unsafe = not obs.pins_empty and not obs.pins_exact
+    # ``pins_unsafe`` is a POSITIVE read of a bad pin snapshot -- only when the row was
+    # actually read (``pins_known``).  An unread row leaves the pin state unknown, so it never
+    # contributes the pin axis; the block still fires via ``lifecycle_exact`` and the detail
+    # falls back to the real reason (Redmine #13933 R7 F1).
+    pins_unsafe = obs.pins_known and not obs.pins_empty and not obs.pins_exact
     if not obs.lifecycle_exact or pins_unsafe:
         # Name the axes that broke.  The collapsed reason alone sent #13846 j#81024 chasing a
         # partial-effect defect while the real fault (worktree identity) stayed unnamed.  This
