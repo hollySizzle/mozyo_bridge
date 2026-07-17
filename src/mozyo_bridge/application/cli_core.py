@@ -78,6 +78,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pin_repair import register_sublane_repair_pins_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import register_sublane_converge_bound_pair_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import register_sublane_prepare_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -856,14 +857,13 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     add_repo_option(sublane_hibernate)
     _add_lifecycle_json(sublane_hibernate)
     sublane_hibernate.set_defaults(func=cmd_sublane_hibernate)
-
     register_sublane_resume_parser(sublane_sub)
     register_sublane_quarantine_parser(sublane_sub)
     register_sublane_recover_stale_parser(sublane_sub)
     register_sublane_recover_pair_parser(sublane_sub)
     register_sublane_repair_pins_parser(sublane_sub)
     register_sublane_converge_bound_pair_parser(sublane_sub)
-
+    register_sublane_prepare_bound_pair_parser(sublane_sub)
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
     # is the opt-in write side: it mints durable herdr assigned names for the
     # workspace's `claude` / `codex` agents and injects their self-identity env so the

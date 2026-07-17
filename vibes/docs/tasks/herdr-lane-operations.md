@@ -111,6 +111,23 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 `hibernated_record_missing_pins` を返す場合は、一方の guard を緩めたり locator を手入力せず、専用の
 `sublane converge-bound-pair` (#13933) を使う。
 
+### pending composer がpairをpreserveしている場合
+
+`converge-bound-pair` が `pair_contains_preserved_slot` / `preserve_pending_composer` を返したら、そのcommandへ
+forceやpending overrideを加えない。pending generationが本当に破棄可能かを別のread-only railで測る。
+
+1. `mozyo-bridge sublane prepare-bound-pair --issue <id> --journal <decision-journal> --lane <lane> --worktree <path> --branch <exact-branch> --repo <target-root> --json`
+   - `state=actionable` の場合だけ、出力された `bound_pair_composer_discard_approval` markerをowner approval
+     journalへそのまま記録する。markerはlifecycle revision/generation、worktree+branch、full slot snapshot、discard
+     role setを束縛する。旧active-lane `sublane quarantine` のapprovalやproseは代用できない。
+   - correlated markerは既存delivery railで処理する。busy/tool-child、unknown/ambiguous/foreign/newer、dirty worktree、
+     branch mismatchはzero-closeのまま原因を解消する。
+2. 同じcommandへ `--execute`を加える。credential-gated live Redmine readでexact markerが一致したときだけ、承認された
+   uncorrelated pending roleをguarded closeしaction-bound relaunchする。pins write、resume、dispatch、sendは行わない。
+   partial retryは同じimmutable transactionのclose proofだけを使い、別 locatorや任意のabsent slotを成功扱いしない。
+3. `state=prepared` 後に `converge-bound-pair` のpreflightを**取り直す**。その新しいslot snapshotに対する別approval
+   markerで通常convergenceを実行する。prepare用markerをconvergence authorityへ流用しない。
+
 1. read-only preflight:
    `mozyo-bridge sublane converge-bound-pair --issue <id> --journal <decision-journal> --lane <lane> --worktree <path> --branch <exact-branch> --repo <target-root> --json`
    - `state=actionable` のときだけ、出力の `approval_marker` を owner approval journal に**そのまま**記録する。

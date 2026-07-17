@@ -593,6 +593,24 @@ Table naming:
         **hibernated のまま**。resume / redispatch / callback send は行わない。次 action は既存 public hibernate /
         retire/recovery rail が所有する。replay は exact transaction + byte-equal pins のみ idempotentで、他 lane / default
         coordinator / worktree / branch を変更しない。
+    - **hibernated bound pending-composer preparation** (`sublane prepare-bound-pair`, #13933)。
+      上記 convergence は pending composer を常に preserve する。この hard block は緩めず、live dogfood で確認した
+      `hibernated` / `released` / issue-bound / worktree-bound / pins-empty pair の pending generation だけを事前に
+      action-bound relaunchする別 rail。default preflight は exact lifecycle revision+generation、resolved worktree identity+
+      branch、full pair slot digest、discard role set を束縛する structured marker を返す。`--execute` は
+      `LiveRedmineJournalSource` で exact journal を fresh readし、`direct_owner` marker の byte-exact 一致を要求する。
+      - 対象 role は positive-fact classifier が `preserve_pending_composer` とした slotのうち、exact assigned name+
+        locatorが一意、non-productive、composer readable、delivery ledgerと相関する markerが無い generationだけ。
+        correlated / ambiguous / unreadable input、busy provider / tool-child、foreign / duplicate / newer generationは
+        approvalがあっても zero-close。
+      - active lane用 `sublane quarantine` の `lane_active` guardは緩めない。本 rail は hibernated-bound signatureを
+        lifecycle revision+generation、released state、empty declared pins、clean exact branchとともに毎回再検証し、
+        `ReplacementTransactionStore` の別immutable actionで扱う。close直前にも同じ slot/composer/lifecycle/worktree
+        authorityを再読する。pending-preservation overrideはこのactionのapproved participantだけで、generic overrideではない。
+      - partial retryでold slot absentを受理できるのは、同じimmutable transaction participantがclose済みを証明する
+        場合だけ。fresh launchはaction-bound attestation必須。完了後もlaneはhibernatedのまま、declared pins / disposition /
+        worktree / branchを変更せず、resume / dispatch / callback sendを行わない。次に通常の
+        `sublane converge-bound-pair`を新しいaction-time markerで実行し、fresh pair proofからだけpinsを修復する。
     - **record-less scratch pair retire は本 component を書かない** (`herdr session-retire`、#13892、live evidence #13882
       j#80060 / j#80066)。`herdr session-start` の scratch pair は lane lifecycle row を **一度も持たない**ため、上記 4 契約
       (#13754 guarded close / #13841 migration / #13842 reconcile / #13845 bound retire) は **すべて row の存在を前提**に
