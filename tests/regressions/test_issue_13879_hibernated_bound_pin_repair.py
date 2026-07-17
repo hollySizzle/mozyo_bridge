@@ -49,9 +49,11 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -1263,6 +1265,90 @@ class PinRepairCommandTests(unittest.TestCase):
         self.assertIn("fail-closed", text)
         self.assertIn("nothing was written", text)
         self.assertNotIn("durable write", text)
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(("git", "-C", str(cwd), *args), check=True, capture_output=True, text=True)
+
+
+class PinRepairExecutionRootInvarianceTests(unittest.TestCase):
+    """repair-pins derives lane identity from the --worktree KIND, not the --repo (Redmine
+    #13933 R7 F2, design answer j#81046 Decision 4).
+
+    The identity probe runs against the ``--worktree`` root, so the ``--repo`` an operator
+    happens to run from cannot flip the token family.  This drives the REAL derivation (the
+    git probe is NOT stubbed) against a real linked git worktree: only the unrelated
+    herdr / provider anchors are stubbed.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name).resolve()
+        self.home = root / "home"
+        self.home.mkdir()
+        self._prev_home = os.environ.get("MOZYO_BRIDGE_HOME")
+        os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
+        self.addCleanup(self._restore_home)
+
+        self.main = root / "main_checkout"
+        self.main.mkdir()
+        _git(self.main, "init", "-q", "-b", "main")
+        _git(self.main, "config", "user.email", "t@example.invalid")
+        _git(self.main, "config", "user.name", "t")
+        (self.main / "f.txt").write_text("x\n")
+        _git(self.main, "add", "f.txt")
+        _git(self.main, "commit", "-qm", "init")
+        self.worktree = root / "lane_worktree"
+        _git(self.main, "worktree", "add", "-q", "-b", _LANE, str(self.worktree))
+        self.worktree = self.worktree.resolve()
+        self.elsewhere = root / "elsewhere"
+        self.elsewhere.mkdir()
+
+        # The row carries the worktree's REAL wt_ token, so a correct derivation matches it.
+        self.token = herdr_identity.derive_lane_workspace_token(str(self.worktree))
+        self.key = LaneLifecycleKey(_WORKSPACE_ID, _LANE)
+        _seed_hibernated_released_bound(path=None, key=self.key, worktree_identity=self.token)
+
+        # Stub the unit-resolution anchors that vary with repo_root -- but NOT the git probe,
+        # which is the behaviour under test.
+        for module, attr, value in (
+            (herdr_projection, "repo_backend_is_herdr", lambda repo: True),
+            (session_start, "herdr_workspace_segment", lambda path: _WORKSPACE_ID),
+            (provider_resolution, "resolve_gateway_provider", lambda repo: _GW_PROVIDER),
+            (provider_resolution, "resolve_worker_provider", lambda repo: _WK_PROVIDER),
+        ):
+            patch = mock.patch.object(module, attr, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _restore_home(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("MOZYO_BRIDGE_HOME", None)
+        else:
+            os.environ["MOZYO_BRIDGE_HOME"] = self._prev_home
+
+    def _run_from(self, repo_root: Path) -> PinRepairVerdict:
+        args = argparse.Namespace(
+            issue=_ISSUE, lane=_LANE, journal=_JOURNAL,
+            worktree=str(self.worktree), execute=False, repo=str(repo_root), json=False,
+        )
+        return run_hibernated_pin_repair(
+            args, repo_root, ops=_FakeOps(_live_pair(), attested=_attest_pair())
+        )
+
+    def test_outcome_is_the_same_from_the_lane_worktree_and_an_unrelated_root(self):
+        from_lane_root = self._run_from(self.worktree)
+        from_elsewhere = self._run_from(self.elsewhere)
+        self.assertEqual(from_lane_root.state, from_elsewhere.state)
+        self.assertEqual(from_lane_root.reason, from_elsewhere.reason)
+
+    def test_lane_worktree_root_matches_identity_and_is_repairable(self):
+        # Pre-fix, --repo == --worktree collapsed to a dl_ token that mismatched the wt_ row
+        # and blocked `not_repairable_state`.  The real probe keeps the git worktree a `wt_`.
+        result = self._run_from(self.worktree)
+        self.assertNotEqual(result.state, REPAIR_NOT_REPAIRABLE_STATE)
+        self.assertIn(result.state, (REPAIR_REPAIRABLE, REPAIR_REPAIRED))
 
 
 if __name__ == "__main__":

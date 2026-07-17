@@ -634,8 +634,10 @@ Table naming:
         `lane_runtime_identity(git_worktree=...)` で family を選ぶ。**persisted row に合わせて family を選ばない**: root の kind が
         決め、食い違う row は caller が報告すべき real mismatch。
         - この derive を採るのは **read/repair surface** = `prepare-bound-pair` / `converge-bound-pair` と metadata-only
-          `repair-pins`。3 rail は execution root に依らず同一 identity を derive する (regression:
-          `tests/regressions/test_issue_13933_lane_identity_execution_root.py`)。
+          `repair-pins`。prepare/converge は共有 `_worktree` で識別子を derive し (regression:
+          `test_issue_13933_lane_identity_execution_root.py` が `is_git_worktree_root` / `lane_runtime_identity` / convergence・prepare
+          両 ops の `_worktree` を real git worktree に対し駆動)、`repair-pins` は inline derive を real git worktree + real probe で
+          `--repo` 非依存に固定する (`test_issue_13879_...::PinRepairExecutionRootInvarianceTests`、旧 proxy で fail することを実測)。
         - **destructive retire 系** (`sublane retire` guarded close / hibernated-bound / hibernated-legacy / live-reconcile) は
           この derive を採らない。#13754 は「lane worktree を `--repo` と `--worktree` の両方に渡すと token が collapse し、
           worktree-binding attestation が **意図的に fail-closed** する」ことを安全弁として持つ (false block は安全、false close が
