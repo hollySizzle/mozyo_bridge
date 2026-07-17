@@ -105,6 +105,27 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
 3. worktree / local branch の除去は **統合後** (`git worktree remove` + `git branch -d|-D`)。remote branch は削除しない。
 
+## hibernated bound pair の pins/stale 循環解消
+
+`sublane repair-pins` が `slot_stale` / `identity_unattested` を返し、同時に `sublane recover-pair` が
+`hibernated_record_missing_pins` を返す場合は、一方の guard を緩めたり locator を手入力せず、専用の
+`sublane converge-bound-pair` (#13933) を使う。
+
+1. read-only preflight:
+   `mozyo-bridge sublane converge-bound-pair --issue <id> --journal <decision-journal> --lane <lane> --worktree <path> --branch <exact-branch> --repo <target-root> --json`
+   - `state=actionable` のときだけ、出力の `approval_marker` を owner approval journal に**そのまま**記録する。
+     action-time slot locator / revision / generation / worktree / branch のいずれかが変われば marker は stale になる。
+   - `inventory_unreadable` / pair duplicate・foreign・half / busy / pending composer / dirty worktree / branch mismatch は
+     zero-close。先に原因を解消して preflight を取り直す。
+2. execute:
+   同じ command に `--execute` を加える。command は `--journal` を credential-gated live Redmine で fresh readし、
+   structured marker が exact 一致する場合だけ、bad generation を guarded close → action-bound relaunch → fresh pair
+   attestation → bounded pins CAS の順で進める。raw Herdr/tmux、DB/store直接編集、pins推測は代替にしない。
+3. outcome:
+   成功しても lane は `hibernated` のままで、work dispatch / resume は起きない。`sublane repair-pins` または
+   lifecycle readで pins を再確認し、その lane の本来の next action（通常 recovery / hibernate release / retire）へ
+   進む。partial stop は同じ marker/actionで replayする。transaction proof のない absent slot は replay対象にならない。
+
 ## scratch pair retire (session-start の逆操作)
 
 `herdr session-start` が作る scratch pair は **lane lifecycle record を持たない**。ゆえに上記 `sublane retire` の全契約が構造的に拒否し (`--execute` は `attest_retire_target` が `record is None` で `lane_owner_unverified`、`--retire-hibernated-bound` / `--reconcile-hibernated-live` / `--migrate-hibernated-legacy` は既存 `hibernated` row 前提で `lane_not_declared`、`recover-pair` は declared pins 前提)、public rail が無いまま capacity を専有し続ける (実証: #13882 j#80060 / j#80066 の保全 `dogfood13882` pair)。この隙間を埋める public rail が `herdr session-retire` (#13892)。

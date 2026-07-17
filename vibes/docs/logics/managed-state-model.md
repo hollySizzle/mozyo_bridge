@@ -566,6 +566,29 @@ Table naming:
       `observed_at`（実証拠）、`runtime_revision` は空（herdr に runtime version 観測 surface が無い、
       #13809 / #13810 R4-F1 — fabricate しない）。startup self-attestation は generation ごとに 1 回・locator で
       pin されるので、同 generation の replay は同じ `observed_at` を読み byte-equality が安定する。
+    - **hibernated bound stale-pair convergence** (`sublane converge-bound-pair`, #13933)。
+      上記 `repair-pins` が意図的に拒否する **stale / unattested pair** と、`recover-pair` が意図的に要求する
+      **declared pins** が同時に欠落した場合、互いが相手の前提になり循環する。専用 rail はこの交差 shape
+      （`hibernated` / `released` / issue-bound / exact non-empty worktree binding / `declared_slots` empty）だけを扱い、
+      sibling surface の authority を緩めない。
+      - default は read-only preflight。exact issue / lane / lifecycle revision+generation / resolved worktree token+
+        branch / action-time slot set を digest した structured direct-owner marker を出す。`--execute` は
+        credential-gated `LiveRedmineJournalSource` で **その exact journal を fresh read**し、prose でなく marker の
+        byte-exact field 一致だけを authority とする。
+      - replacement は `ReplacementTransactionStore` の immutable manifest と
+        `ReplacementActuatorUseCase.drive_worker_recovery` を使う。対象は positive-fact classifier が
+        `recover_bad_generation` とした exact locator のみ。inventory unreadable / duplicate / foreign / busy /
+        pending composer / dirty-or-unreadable worktree / branch mismatch / revision race は transaction plan・close 前に
+        fail-closed。partial close の absent slot は **同じ transaction participant が close 済みと証明する場合だけ**
+        replay でき、名前や cache から absent proof を捏造しない。
+      - fresh launch は replacement `action_id` を startup self-attestationへ binding する。最終 pair は両 slot が
+        unique / live / idle / composer-settled / locator-bound attested で、replacement participant はさらに exact
+        action-bound でなければ pins を作らない。pins はこの最終 live pairだけから構築し、
+        `LanePinRepairStore.repair_hibernated_bound_pins` の revision+generation+worktree CASへ渡す。
+      - pin CAS 後は replacement transaction を `completed` にして lease を releaseするが、lane disposition は
+        **hibernated のまま**。resume / redispatch / callback send は行わない。次 action は既存 public hibernate /
+        retire/recovery rail が所有する。replay は exact transaction + byte-equal pins のみ idempotentで、他 lane / default
+        coordinator / worktree / branch を変更しない。
     - **record-less scratch pair retire は本 component を書かない** (`herdr session-retire`、#13892、live evidence #13882
       j#80060 / j#80066)。`herdr session-start` の scratch pair は lane lifecycle row を **一度も持たない**ため、上記 4 契約
       (#13754 guarded close / #13841 migration / #13842 reconcile / #13845 bound retire) は **すべて row の存在を前提**に
