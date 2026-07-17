@@ -307,12 +307,15 @@ class CliTests(unittest.TestCase):
         self.assertFalse(payload["durable_complete"])
 
     def test_from_glance_derives_lanes_and_release_dogfood(self):
+        # A canonical glance envelope: rows carry equal workflow_state/state_class, diagnostics
+        # carry a non-active disposition + in-vocabulary process_release, degraded=false.
         glance_env = {
             "rows": [
                 {
                     "issue_id": "200",
                     "lane": "lane-200",
                     "workflow_state": LANE_STATE_REVIEW_WAITING,
+                    "state_class": LANE_STATE_REVIEW_WAITING,
                     "next_owner": "auditor",
                 }
             ],
@@ -330,6 +333,7 @@ class CliTests(unittest.TestCase):
                     "process_release": "released",
                 },
             ],
+            "degraded": False,
         }
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "glance.json"
@@ -337,6 +341,7 @@ class CliTests(unittest.TestCase):
             payload = self._run(from_glance=str(path))
         # The active review row holds; the requested-release lane is a delegated dogfood
         # bucket entry; the already-released lane is not pending, so it is not counted.
+        self.assertTrue(payload["durable_complete"])
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertEqual(payload["release_dogfood_pending"], 1)
 
@@ -358,6 +363,45 @@ class CliTests(unittest.TestCase):
                 payload = self._run(from_glance=str(path))
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
+
+    def test_from_glance_row_authority_contract(self):
+        # Redmine #13967 R7: the canonical glance row contract — active rows carry equal
+        # workflow_state/state_class; diagnostic rows carry issue/lane/lane_disposition
+        # (non-active) + process_release (closed RELEASE_STATES). A violation is a
+        # contradictory/malformed canonical row -> hold, never trusted one-sided.
+        def env(rows=None, diag=None):
+            return {"rows": rows or [], "lifecycle_diagnostic": diag or [], "degraded": False}
+
+        hold_cases = [
+            # R7-F1: workflow_state/state_class conflict, or missing/null/non-string state_class.
+            env(rows=[{"issue_id": "1", "workflow_state": "idle", "state_class": "review_waiting", "lane": "l", "next_owner": "x"}]),
+            env(rows=[{"issue_id": "1", "workflow_state": "idle", "lane": "l", "next_owner": "x"}]),
+            env(rows=[{"issue_id": "1", "workflow_state": "idle", "state_class": None, "lane": "l", "next_owner": "x"}]),
+            # R7-F2: unknown / missing-identity / null-disposition / active-disposition diagnostics.
+            env(diag=[{"issue": "1", "lane": "l", "lane_disposition": "hibernated", "process_release": "bogus"}]),
+            env(diag=[{"lane_disposition": "retired", "process_release": "released"}]),
+            env(diag=[{"issue": "1", "lane": "l", "lane_disposition": None, "process_release": "released"}]),
+            env(diag=[{"issue": "1", "lane": "l", "lane_disposition": "active", "process_release": "requested"}]),
+        ]
+        for e in hold_cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(e), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, e)
+            self.assertFalse(payload["durable_complete"], e)
+        # A valid canonical row with equal states and an in-vocabulary non-active diagnostic
+        # (released, not pending) is complete and releasable.
+        ok = env(
+            rows=[{"issue_id": "1", "workflow_state": "idle", "state_class": "idle", "lane": "l", "next_owner": "x"}],
+            diag=[{"issue": "2", "lane": "l2", "lane_disposition": "retired", "process_release": "released"}],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ok.json"
+            path.write_text(json.dumps(ok), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
 
     def test_from_glance_envelope_completeness(self):
         # Redmine #13967 R6-F2: the canonical `workflow glance --json` producer always emits
@@ -458,37 +502,30 @@ class CliTests(unittest.TestCase):
         self.assertFalse(payload["durable_complete"])
         self.assertEqual(payload["release_dogfood_pending"], 0)
 
-    def test_from_glance_merges_release_flag_by_identity(self):
-        # Redmine #13967 F3: a lane that is both an active row AND a release-pending
-        # diagnostic row is counted ONCE, and its coordinator-blocking base bucket wins
-        # over release_dogfood (a delegated dogfood never hides live review drain).
-        glance_env = {
-            "rows": [
-                {
-                    "issue_id": "300",
-                    "lane": "lane-300",
-                    "workflow_state": LANE_STATE_REVIEW_WAITING,
-                    "next_owner": "auditor",
-                }
-            ],
-            "lifecycle_diagnostic": [
-                {
-                    "issue": "300",
-                    "lane": "lane-300",
-                    "lane_disposition": "active",
-                    "process_release": "requested",
-                }
-            ],
-        }
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "glance.json"
-            path.write_text(json.dumps(glance_env), encoding="utf-8")
-            payload = self._run(from_glance=str(path))
-        self.assertEqual(payload["lane_count"], 1)  # merged, not double-counted
-        self.assertEqual(payload["release_dogfood_pending"], 0)  # blocking base bucket wins
-        review = next(b for b in payload["buckets"] if b["bucket"] == BUCKET_REVIEW)
-        self.assertEqual(review["total"], 1)
-        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+    def test_merge_release_pending_by_identity(self):
+        # Redmine #13967 F3: the identity-merge helper is where the "one lane, one bucket"
+        # invariant lives. A canonical glance envelope cannot place the same lane in both the
+        # active roster and the (non-active-only) lifecycle diagnostic — R7-F2 now rejects an
+        # `active` diagnostic disposition — so the merge is exercised at the helper directly
+        # (composed/malformed defensive hardening): a release-pending identity that matches an
+        # active lane sets its flag on the SAME row (counted once), and its coordinator-
+        # blocking base bucket still wins over release_dogfood.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain import (
+            _merge_release_pending,
+        )
+
+        active = [DrainLane(issue="300", lane="lane-300", state_class=LANE_STATE_REVIEW_WAITING)]
+        merged = _merge_release_pending(active, [("300", "lane-300")])
+        self.assertEqual(len(merged), 1)  # merged, not double-counted
+        self.assertTrue(merged[0].release_pending)
+        projection = project_drain_queue(merged)
+        self.assertEqual(projection.release_dogfood_pending, 0)  # blocking base bucket wins
+        review = projection.bucket(BUCKET_REVIEW)
+        self.assertEqual(review.total, 1)
+        self.assertEqual(projection.process_retention, PROCESS_HOLD)
+        # A release identity with no matching active lane appends a fresh release_dogfood lane.
+        merged2 = _merge_release_pending(active, [("999", "lane-999")])
+        self.assertEqual(len(merged2), 2)
 
 
 if __name__ == "__main__":
