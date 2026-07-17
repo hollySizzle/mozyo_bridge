@@ -115,8 +115,18 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
     ``next_action_owner`` / ``reason`` (identity and classification fields are NEVER
     ``str(...)``-coerced — Redmine #13967 R4-F2); a ``release_pending`` or
     ``delivery_anomaly_active`` that is present but not an exact JSON bool (a string
-    ``"false"`` must not coerce to True — R2-F2 / R10-F1). The caller marks a snapshot with any
-    malformed row durable-incomplete rather than dropping it.
+    ``"false"`` must not coerce to True — R2-F2 / R10-F1); OR a ``release_pending: true`` row
+    (a NON-ACTIVE, lifecycle-diagnostic-derived release-dogfood row) with an empty ``lane`` —
+    such a row carries release authority and, like the ``--from-glance`` diagnostic contract,
+    requires a non-empty lane identity (R14-F1). The caller marks a snapshot with any malformed
+    row durable-incomplete rather than dropping it.
+
+    Row-kind contract (Redmine #13967 R14-F1 / R14-F3): ``release_pending: false`` (or absent)
+    marks an ACTIVE lane — its ``lane`` is optional (an active row may carry no lane, mirroring
+    the canonical glance active roster). ``release_pending: true`` marks a NON-ACTIVE release
+    row derived from a lifecycle diagnostic (the same rows the glance path folds into synthetic
+    ``release_dogfood`` lanes); it requires a non-empty lane and is exempt from active-issue
+    uniqueness (an active recovery lane and its same-issue historical release row co-exist).
     """
     if not isinstance(raw, dict):
         return None
@@ -130,6 +140,10 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
     rp = raw.get("release_pending", False)
     if not isinstance(rp, bool):
         return None  # exact-type: a non-bool release_pending is malformed, never coerced
+    if rp and not lane:
+        # A release row (non-active, diagnostic-derived) requires a non-empty lane identity,
+        # symmetric with the from-glance / default-live diagnostic contract (R14-F1).
+        return None
     # `delivery_anomaly_active` is an authority-bearing hold field (Redmine #13967 R10-F1):
     # `DrainLane.as_payload()` emits it, so the deterministic snapshot contract must read it
     # back on the SAME exact-bool terms — a present non-bool is malformed (never coerced), and
@@ -158,12 +172,17 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     """``(lanes, complete)``. ``complete`` is False when any row was malformed (an invalid
     row is NOT silently dropped — it makes the snapshot durable-incomplete so the retention
     verdict fails closed to hold, Redmine #13967 R2-F2), when the same ``(issue, lane)``
-    identity appears twice (R10-F4), OR when the same ISSUE appears in two rows even with
-    different lanes: a snapshot is an already-composed ACTIVE lane set, and the canonical drain
-    roster holds at most one active lane per issue (the lifecycle model), so two active rows for
-    one issue is contradictory / ambiguous ownership and must hold — the same active-issue
-    uniqueness the ``--from-glance`` (R9-F2) and default-live (R12-F1) paths enforce, keeping
-    identity enforcement symmetric across all three sources (R13-F1)."""
+    identity appears twice (R10-F4), OR when two ACTIVE rows (``release_pending: false``) name
+    the same ISSUE even with different lanes: the canonical drain roster holds at most one
+    active lane per issue (the lifecycle model's active-owner invariant), so two active rows for
+    one issue is ambiguous ownership and must hold — the active-issue uniqueness the
+    ``--from-glance`` (R9-F2) and default-live (R12-F1) paths enforce (R13-F1).
+
+    Active-issue uniqueness applies ONLY to active rows: a ``release_pending: true`` row is a
+    NON-ACTIVE release-dogfood row (the glance active-roster / lifecycle-diagnostic split), so a
+    valid active recovery lane and its same-issue historical release row co-exist and must NOT
+    be rejected (Redmine #13967 R14-F3). ``(issue, lane)`` uniqueness still spans ALL rows (an
+    active and a release row sharing one ``(issue, lane)`` is a contradiction -> hold)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -175,7 +194,7 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         return (), False
     lanes: list[DrainLane] = []
     seen: set[tuple[str, str]] = set()
-    seen_issues: set[str] = set()
+    seen_active_issues: set[str] = set()
     complete = True
     for raw in entries:
         lane = _lane_from_mapping(raw)
@@ -184,15 +203,17 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             continue
         key = (lane.issue, lane.lane)
         if key in seen:
-            # A duplicated (issue, lane) identity is contradictory composed input -> hold
-            # (Redmine #13967 R10-F4), never silently double-counted.
-            complete = False
-        if lane.issue in seen_issues:
-            # Two active rows for the same ISSUE (even with different lanes) is ambiguous active
-            # ownership -> hold (Redmine #13967 R13-F1), symmetric with from-glance / live.
+            # A duplicated (issue, lane) identity — active or release — is contradictory
+            # composed input -> hold (Redmine #13967 R10-F4), never silently double-counted.
             complete = False
         seen.add(key)
-        seen_issues.add(lane.issue)
+        if not lane.release_pending:
+            # ACTIVE row: at most one active lane per ISSUE (Redmine #13967 R13-F1). A release
+            # row (release_pending=true) is non-active and exempt, so an active recovery lane
+            # and its same-issue historical release row co-exist (R14-F3).
+            if lane.issue in seen_active_issues:
+                complete = False
+            seen_active_issues.add(lane.issue)
         lanes.append(lane)
     return tuple(lanes), complete
 
@@ -487,6 +508,12 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
       (``LaneLifecycleStore.declare_active(issue_id="")``) surfaces in the diagnostic with an
       empty issue, and must NOT become a healthy ``release_dogfood`` row here (Redmine
       #13967 R13-F2), so it is held rather than silently attributed;
+    - lifecycle-diagnostic ``lane_disposition`` in the closed :data:`_NON_ACTIVE_DISPOSITIONS`
+      and ``process_release`` in the closed :data:`RELEASE_STATES` vocabularies — the lifecycle
+      SQLite schema stores both as ``TEXT NOT NULL`` with NO ``CHECK`` and the readonly decoder
+      does not validate them, so a corrupted / legacy / foreign row with an out-of-vocabulary
+      disposition or release is readable; the ``--from-glance`` reader rejects those, so the
+      live path must too (Redmine #13967 R14-F2);
     - lifecycle-diagnostic ``(issue, lane)`` uniqueness;
     - active / diagnostic identity disjointness (a lane is active XOR non-active, never both).
     """
@@ -510,6 +537,8 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
     for entry in diagnostic:
         issue = str(entry[0] or "").strip()
         lane = str(entry[1] or "").strip()
+        disposition = str(entry[2] or "").strip() if len(entry) > 2 else ""
+        release = str(entry[3] or "").strip() if len(entry) > 3 else ""
         if not issue or not lane:
             # An empty diagnostic issue/lane is an unattributable release/lifecycle row — the
             # from-glance reader rejects it, so the live path holds too (Redmine #13967 R13-F2).
@@ -517,6 +546,16 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
                 f"lifecycle diagnostic: row with empty identity ({issue!r}/{lane!r})"
             )
             continue
+        # Closed-vocabulary validation, symmetric with the from-glance diagnostic contract
+        # (Redmine #13967 R14-F2): the store cannot enforce these, so the reader must.
+        if disposition not in _NON_ACTIVE_DISPOSITIONS:
+            notes.append(
+                f"lifecycle diagnostic: invalid disposition {disposition!r} for {issue}/{lane}"
+            )
+        if release not in RELEASE_STATES:
+            notes.append(
+                f"lifecycle diagnostic: invalid process_release {release!r} for {issue}/{lane}"
+            )
         key = (issue, lane)
         if key in diag_keys:
             notes.append(f"lifecycle diagnostic: duplicate identity {issue}/{lane}")
@@ -605,12 +644,14 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
         notes.extend(identity_notes)
     release_rows = [
         (issue, lane)
-        for issue, lane, _disposition, process_release in diagnostic
-        # An empty issue/lane never becomes a phantom release_dogfood lane (Redmine #13967
-        # R13-F2); it is already reported as a durable-incomplete identity error above.
+        for issue, lane, disposition, process_release in diagnostic
+        # An empty issue/lane (R13-F2) or an out-of-vocabulary disposition (R14-F2) never becomes
+        # a phantom release_dogfood lane; both are already reported as durable-incomplete
+        # identity/vocab errors above. Only a fully-valid non-active requested/partial row folds.
         if process_release in _RELEASE_PENDING
         and str(issue or "").strip()
         and str(lane or "").strip()
+        and str(disposition or "").strip() in _NON_ACTIVE_DISPOSITIONS
     ]
     return _merge_release_pending(active, release_rows), degraded, tuple(notes)
 
