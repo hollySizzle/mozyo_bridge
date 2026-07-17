@@ -980,6 +980,11 @@ class _CountingActuatorPort:
         self.verified.append(pin.identity)
         return self.attest.get(pin.identity, ATTEST_BOUND)
 
+    def _fresh_authority(self, *, require_attested_roles=()):
+        # ``_finish`` re-reads full pair authority at each completion edge; a live pair is
+        # non-None.  ``None`` would leave the transaction retryably draining.
+        return self
+
 
 class PartialReplayEndToEndTests(unittest.TestCase):
     """The launch-failure replay drives the REAL actuator + REAL transaction store.
@@ -994,7 +999,9 @@ class PartialReplayEndToEndTests(unittest.TestCase):
     """
 
     GEN = 1
-    FIXED = "2026-07-17T12:00:00+00:00"
+    # A FUTURE clock so the lease the actuator mints stays live when `_finish` re-reads it
+    # under the store's real clock (mirrors VerifyAndCompletionAuthorityTests).
+    FIXED = "2099-07-17T12:00:00+00:00"
 
     def _participants(self):
         # The #13933 discard shape: the exact uncorrelated pending composer roles of one pair.
@@ -1028,6 +1035,18 @@ class PartialReplayEndToEndTests(unittest.TestCase):
             participants=self.participants,
         )
         self.port = _CountingActuatorPort()
+        # The public `.drive()` runs the actuator over THIS store, then completes the
+        # transaction through `_finish` under the same holder/action -- so the completion leg
+        # is driven over the same real store, not a separate use case.
+        self.ops = LiveBoundPairPreparationOps(
+            repo_root=self.home, transaction_store=self.store
+        )
+        self.expectation = PreparationExpectation(
+            issue="13846", lane=REQ.lane, revision=4, generation=1,
+            action_generation=self.GEN, action_id="prepare-bound-pair-abc",
+            worktree_digest="wt", slot_digest="sd",
+            discard_roles=("gateway", "worker"),
+        )
 
     def _drive(self):
         return ReplacementActuatorUseCase(
@@ -1036,6 +1055,9 @@ class PartialReplayEndToEndTests(unittest.TestCase):
         ).drive_worker_recovery(
             self.key, holder="H", expected_action_generation=self.GEN
         )
+
+    def _finish(self) -> bool:
+        return self.ops._finish(self.key, self.expectation, "H", self.port)
 
     def _phase(self, pin: ParticipantPin) -> str:
         return self.store.get(self.key).find_participant(pin.identity).phase
@@ -1069,13 +1091,34 @@ class PartialReplayEndToEndTests(unittest.TestCase):
             self.assertEqual(self.port.closed.count(pin.identity), 1, pin.role)
             self.assertIn(pin.identity, self.port.launched)
             self.assertIn(pin.identity, self.port.verified)
+        # The actuator stops at replacing_nonself holding the lease; `.drive` then runs the
+        # completion leg (`_finish`) over the SAME store/holder/action.  Drive it here so this
+        # one replay fixture proves the top-level record reaches PHASE_COMPLETED (R8 j#81211
+        # / R9 j#81222 required correction), not merely that participants are replaced.
+        self.assertEqual(self.store.get(self.key).phase, PHASE_REPLACING_NONSELF)
+        self.assertTrue(self._finish())
+        self.assertEqual(self.store.get(self.key).phase, PHASE_COMPLETED)
+        # completion never re-closed anything.
+        self.assertEqual(self.port.closed.count(gateway.identity), 1)
 
-    def test_clean_run_recovers_without_any_relaunch(self):
+    def test_clean_run_recovers_and_completes_the_transaction(self):
         result = self._drive()
         self.assertEqual(result.status, ACTUATION_RECOVERED)
         for pin in self.participants:
             self.assertEqual(self._phase(pin), PARTICIPANT_REPLACED, pin.role)
             self.assertEqual(self.port.closed.count(pin.identity), 1, pin.role)
+        self.assertTrue(self._finish())
+        self.assertEqual(self.store.get(self.key).phase, PHASE_COMPLETED)
+
+    def test_finish_is_idempotent_on_a_completed_transaction(self):
+        self._drive()
+        self.assertTrue(self._finish())
+        self.assertEqual(self.store.get(self.key).phase, PHASE_COMPLETED)
+        closed_after = list(self.port.closed)
+        # A replay of the completion leg on an already-completed record writes nothing.
+        self.assertTrue(self._finish())
+        self.assertEqual(self.store.get(self.key).phase, PHASE_COMPLETED)
+        self.assertEqual(self.port.closed, closed_after)
 
 
 class VerifyAndCompletionAuthorityTests(unittest.TestCase):
