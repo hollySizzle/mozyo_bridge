@@ -488,7 +488,14 @@ class SnapshotSourceRefusalTest(unittest.TestCase):
 
     def test_the_live_source_declares_freshness(self):
         # The counterpart: the live adapter re-fetches per call, so it may actuate.
-        self.assertTrue(source_is_fresh(LiveRedmineJournalSource(base_url="https://x", api_key="k")))
+        self.assertTrue(
+            source_is_fresh(
+                LiveRedmineJournalSource(
+                    base_url="https://redmine.example.test",
+                    api_key="fake-api-key",
+                )
+            )
+        )
 
 
 class WorkspaceAttestationTest(unittest.TestCase):
