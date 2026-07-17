@@ -679,6 +679,36 @@ class SublaneEarlyHibernateTest(unittest.TestCase):
             self.assertTrue(outcome.is_blocked)
             self.assertIn(BLOCK_NOT_PARKED, outcome.preflight.blocked_reasons)
 
+    def test_early_hibernate_permits_pending_owner_approval(self) -> None:
+        # Redmine #13967 F1: early hibernate runs in the owner_waiting state — owner close
+        # approval is deferred to the coordinator's normal path (hibernate != close), so a
+        # pending owner approval must NOT block it. Dependency park still requires it.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(assertions=_early_gates(no_owner_approval_pending=False)),
+                execute=True,
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertNotIn(BLOCK_OWNER_PENDING, outcome.preflight.blocked_reasons)
+            self.assertEqual(outcome.preflight.park_basis, PARK_BASIS_EARLY_HIBERNATE)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
+
+    def test_dependency_park_still_blocks_on_pending_owner_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(assertions=_all_gates(no_owner_approval_pending=False)),
+                execute=True,
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_OWNER_PENDING, outcome.preflight.blocked_reasons)
+
     def test_dependency_park_basis_unaffected(self) -> None:
         # A dependency park (explicitly_parked=True) with no early flags still hibernates,
         # and does NOT require commits_pushed (it preserves unpublished commits).

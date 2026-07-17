@@ -52,13 +52,13 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 
 ## Release-dogfood の集約 (専用 release issue)
 
-TestPyPI / installed dogfood を各 feature lane の drain へ直列結合すると、実装 → 反復 review → installed dogfood → ticket close が 1 本の lane に連なり、coordinator の常駐 lane 回収が遅れる (Redmine #13967 owner decision)。標準は、**TestPyPI / installed dogfood を専用の release issue へ集約する** ことである。feature lane は same-lane Review Gate approved + staging integration + required CI green を満たしたら early hibernate し (skill `references/workflow.md` `## Sublane hibernate (プロセス解放) と early hibernate`)、dogfood と close を専用 release issue へ **durable に委譲** する。
+TestPyPI / installed dogfood を各 feature lane の drain へ直列結合すると、実装 → 反復 review → installed dogfood → ticket close が 1 本の lane に連なり、coordinator の常駐 lane 回収が遅れる (Redmine #13967 owner decision)。標準は、**TestPyPI / installed dogfood を専用の release issue へ集約する** ことである。feature lane は same-lane Review Gate approved + staging integration + required CI green を満たしたら early hibernate し (skill `references/workflow.md` `## Sublane hibernate (プロセス解放) と early hibernate`)、**dogfood の実行と evidence を専用 release issue へ durable に委譲** する。委譲するのは dogfood の execution / evidence であって close authority ではない: source issue の close authority と owner close approval は **coordinator の通常経路** (US-level audit → owner close approval → Close Gate) に残り、release issue へは移らない。
 
 - **専用 release issue は durable link を持つ。** 委譲元の source issue、dogfood 対象の exact SHA、acceptance criteria、resume / close 条件を release issue の durable record にリンクする。委譲は「あとで pane で覚えておく」ではなく durable record 上の park / delegation record である。
 - **hibernate を close / dogfood 成功 / owner approval へ読み替えない。** early hibernate は process を畳むだけで、source issue は依然 open である。dogfood が green になっても、それは release issue 側の gate であって source issue の close ではない。source issue の完了は通常経路 (US-level audit → owner close approval → Close Gate) を通る。
 - **release issue は publish → QA を運用単位とする。** 集約された dogfood は、非循環 exact-candidate gate (`## TestPyPI exact-candidate 手動配布`) で publish し、`#13528「TestPyPI publish」→ #13527「exact install QA」` 型の順序で QA する。複数の source issue の dogfood を 1 つの release candidate へまとめてよい (lane ごとに TestPyPI publish を分割しない)。
 - **drain queue 上の可視化。** 委譲済み dogfood は coordinator の drain queue projection の `release_dogfood` bucket に現れ (`references/workflow.md` `### Drain queue projection と process retention`)、feature-lane coordinator の process retention を `hold` にしない (release issue owner の cadence で処理される)。
-- portable な部分は、*dogfood を feature lane へ直列化せず専用 release issue へ集約し、source issue / exact SHA / acceptance / resume・close 条件を durable にリンクし、hibernate を close / dogfood 成功 / owner approval へ読み替えないこと* である。具体的な release issue の番号・運用 cadence は operator の runtime policy であり配布本文に焼かない。
+- portable な部分は、*dogfood の execution/evidence を feature lane へ直列化せず専用 release issue へ集約し、source issue / exact SHA / acceptance / resume・close 条件を durable にリンクし、source issue の close authority と owner close approval は coordinator の通常経路に残し、hibernate を close / dogfood 成功 / owner approval へ読み替えないこと* である。具体的な release issue の番号・運用 cadence は operator の runtime policy であり配布本文に焼かない。
 
 ## TestPyPI dev 自動配布 (main CI)
 

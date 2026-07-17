@@ -47,6 +47,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BUCKET_REVIEW,
     BUCKET_UNKNOWN,
     DRAIN_BUCKETS,
+    HOLD_REASON_DURABLE_INCOMPLETE,
+    HOLD_REASON_UNKNOWN_STATE,
     PROCESS_HOLD,
     PROCESS_RELEASABLE,
     DrainLane,
@@ -183,12 +185,27 @@ class ProjectionTests(unittest.TestCase):
         # implementing is surfaced as a non-drain bucket.
         self.assertIsNotNone(projection.bucket(BUCKET_IMPLEMENTING))
 
-    def test_unknown_state_bucket_does_not_hold_but_is_visible(self):
+    def test_unknown_state_holds_fail_closed_and_is_visible(self):
+        # Redmine #13967 F2: an unreadable durable state must fail closed to hold — a
+        # retention verdict that gates early hibernate never releases from state it could
+        # not read.
         projection = project_drain_queue(
             [DrainLane(issue="9", state_class="mystery")]
         )
-        self.assertEqual(projection.process_retention, PROCESS_RELEASABLE)
+        self.assertEqual(projection.process_retention, PROCESS_HOLD)
+        self.assertIn(HOLD_REASON_UNKNOWN_STATE, projection.hold_buckets)
         self.assertIsNotNone(projection.bucket(BUCKET_UNKNOWN))
+
+    def test_durable_incomplete_forces_hold(self):
+        # A source the caller could not fully read (degraded) forces hold even with no
+        # coordinator-blocking lane.
+        projection = project_drain_queue(
+            [DrainLane(issue="1", state_class=LANE_STATE_IMPLEMENTING)],
+            durable_complete=False,
+        )
+        self.assertEqual(projection.process_retention, PROCESS_HOLD)
+        self.assertIn(HOLD_REASON_DURABLE_INCOMPLETE, projection.hold_buckets)
+        self.assertFalse(projection.durable_complete)
 
     def test_ownership_split_counts(self):
         projection = project_drain_queue(
@@ -286,6 +303,38 @@ class CliTests(unittest.TestCase):
         # bucket entry; the already-released lane is not pending, so it is not counted.
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertEqual(payload["release_dogfood_pending"], 1)
+
+    def test_from_glance_merges_release_flag_by_identity(self):
+        # Redmine #13967 F3: a lane that is both an active row AND a release-pending
+        # diagnostic row is counted ONCE, and its coordinator-blocking base bucket wins
+        # over release_dogfood (a delegated dogfood never hides live review drain).
+        glance_env = {
+            "rows": [
+                {
+                    "issue_id": "300",
+                    "lane": "lane-300",
+                    "workflow_state": LANE_STATE_REVIEW_WAITING,
+                    "next_owner": "auditor",
+                }
+            ],
+            "lifecycle_diagnostic": [
+                {
+                    "issue": "300",
+                    "lane": "lane-300",
+                    "lane_disposition": "active",
+                    "process_release": "requested",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "glance.json"
+            path.write_text(json.dumps(glance_env), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertEqual(payload["lane_count"], 1)  # merged, not double-counted
+        self.assertEqual(payload["release_dogfood_pending"], 0)  # blocking base bucket wins
+        review = next(b for b in payload["buckets"] if b["bucket"] == BUCKET_REVIEW)
+        self.assertEqual(review["total"], 1)
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
 
 
 if __name__ == "__main__":

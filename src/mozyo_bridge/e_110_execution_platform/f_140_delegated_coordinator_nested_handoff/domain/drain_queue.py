@@ -254,6 +254,14 @@ class DrainBucketProjection:
         }
 
 
+# The synthetic hold reasons that are NOT drain buckets: an unreadable durable state, or a
+# source the projection could not fully read. Either forces `hold` (fail-closed) — a
+# process-retention verdict that feeds the early-hibernate decision must never say
+# `releasable` from state it could not read (Redmine #13967 F2).
+HOLD_REASON_UNKNOWN_STATE = "unknown_durable_state"
+HOLD_REASON_DURABLE_INCOMPLETE = "durable_source_incomplete"
+
+
 @dataclass(frozen=True)
 class DrainQueueProjection:
     """The bucketed drain queue + the single process-retention verdict (pure)."""
@@ -265,6 +273,7 @@ class DrainQueueProjection:
     retirement_pending: int
     release_dogfood_pending: int
     lane_count: int
+    durable_complete: bool = True
 
     @property
     def process_releasable(self) -> bool:
@@ -284,6 +293,7 @@ class DrainQueueProjection:
             "retirement_pending": self.retirement_pending,
             "release_dogfood_pending": self.release_dogfood_pending,
             "lane_count": self.lane_count,
+            "durable_complete": self.durable_complete,
             "buckets": [b.as_payload() for b in self.buckets],
         }
 
@@ -308,14 +318,22 @@ def _bucket_projection(name: str, lanes: list[DrainLane]) -> DrainBucketProjecti
     )
 
 
-def project_drain_queue(lanes: Iterable[DrainLane]) -> DrainQueueProjection:
+def project_drain_queue(
+    lanes: Iterable[DrainLane], *, durable_complete: bool = True
+) -> DrainQueueProjection:
     """Fold the active lane set into the bucketed drain queue + retention verdict (pure).
 
     Every one of the eight :data:`DRAIN_BUCKETS` is always emitted (even empty) so the
     projection is a stable contract; a non-drain bucket
     (``implementing`` / ``idle`` / ``unknown``) is emitted only when it holds a lane.
-    The verdict is :data:`PROCESS_HOLD` iff some :data:`PROCESS_HOLDING_BUCKETS` bucket
-    holds a ``coordinator_actionable`` lane, else :data:`PROCESS_RELEASABLE`.
+
+    The verdict is :data:`PROCESS_RELEASABLE` **only** when the durable state is fully
+    readable AND no coordinator-owned drain remains. It is :data:`PROCESS_HOLD` when any
+    :data:`PROCESS_HOLDING_BUCKETS` bucket holds a ``coordinator_actionable`` lane, **or**
+    a lane's durable state was unreadable (:data:`BUCKET_UNKNOWN`), **or**
+    ``durable_complete`` is False (a source the caller needed was unavailable). A retention
+    verdict that gates the early-hibernate / process-release decision must never say
+    ``releasable`` from state it could not read (Redmine #13967 F2 — fail-closed).
     """
     lanes = tuple(lanes)
     grouped: dict[str, list[DrainLane]] = {}
@@ -330,7 +348,14 @@ def project_drain_queue(lanes: Iterable[DrainLane]) -> DrainQueueProjection:
         if entries:
             buckets.append(_bucket_projection(name, entries))
 
-    hold_buckets = tuple(b.bucket for b in buckets if b.holds_process)
+    hold_buckets = list(b.bucket for b in buckets if b.holds_process)
+    # Fail-closed additions: an unreadable durable state, or an incomplete source, holds
+    # the process even with no coordinator-blocking drain bucket.
+    if any(l.bucket == BUCKET_UNKNOWN for l in lanes):
+        hold_buckets.append(HOLD_REASON_UNKNOWN_STATE)
+    if not durable_complete:
+        hold_buckets.append(HOLD_REASON_DURABLE_INCOMPLETE)
+
     coordinator_total = sum(
         b.coordinator_actionable for b in buckets if b.bucket in PROCESS_HOLDING_BUCKETS
     )
@@ -344,11 +369,12 @@ def project_drain_queue(lanes: Iterable[DrainLane]) -> DrainQueueProjection:
     return DrainQueueProjection(
         buckets=tuple(buckets),
         process_retention=retention,
-        hold_buckets=hold_buckets,
+        hold_buckets=tuple(hold_buckets),
         coordinator_actionable_total=coordinator_total,
         retirement_pending=retirement,
         release_dogfood_pending=release_dogfood,
         lane_count=len(lanes),
+        durable_complete=bool(durable_complete),
     )
 
 
@@ -431,6 +457,8 @@ __all__ = (
     "PROCESS_HOLDING_BUCKETS",
     "PROCESS_HOLD",
     "PROCESS_RELEASABLE",
+    "HOLD_REASON_UNKNOWN_STATE",
+    "HOLD_REASON_DURABLE_INCOMPLETE",
     "bucket_for_state",
     "DrainLane",
     "DrainBucketProjection",

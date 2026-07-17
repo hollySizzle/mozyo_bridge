@@ -30,28 +30,52 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-def _finding_from_mapping(raw: object) -> SubsystemFinding | None:
+def _exact_bool(value: object, default: bool = False) -> bool | None:
+    """Return the value only when it is an EXACT JSON bool (Redmine #13967 F4).
+
+    A missing key takes ``default``; a present-but-non-bool value (e.g. the string
+    ``"false"``, which ``bool(...)`` would coerce to True) returns None so the caller can
+    treat the entry as malformed rather than silently coercing it. No coercion.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _finding_from_mapping(raw: object) -> tuple[SubsystemFinding | None, str]:
+    """``(finding, subsystem)``. finding is None when the entry is malformed; the subsystem
+    (if extractable) is returned so the caller can fail it closed to escalation rather than
+    silently dropping it (Redmine #13967 F4)."""
     if not isinstance(raw, dict):
-        return None
+        return None, ""
     subsystem = str(raw.get("subsystem", "") or "").strip()
     if not subsystem:
-        return None
-    try:
-        round_index = int(raw.get("round_index", 0))
-    except (TypeError, ValueError):
-        return None
-    return SubsystemFinding(
-        subsystem=subsystem,
-        round_index=round_index,
-        authority_bearing=bool(raw.get("authority_bearing", False)),
-        late=bool(raw.get("late", False)),
-        finding_id=str(raw.get("finding_id", "") or "").strip(),
+        return None, ""
+    ri = raw.get("round_index", 0)
+    if isinstance(ri, bool) or not isinstance(ri, int):
+        return None, subsystem  # round_index must be an exact int (not bool/str/float)
+    authority = _exact_bool(raw.get("authority_bearing"))
+    late = _exact_bool(raw.get("late"))
+    if authority is None or late is None:
+        return None, subsystem  # non-bool flag -> malformed, fail closed
+    return (
+        SubsystemFinding(
+            subsystem=subsystem,
+            round_index=ri,
+            authority_bearing=authority,
+            late=late,
+            finding_id=str(raw.get("finding_id", "") or "").strip(),
+        ),
+        subsystem,
     )
 
 
 def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
     """Project the deterministic late-finding escalation verdict. Read-only; always exits 0."""
     raw = (getattr(args, "snapshot_json", None) or "").strip()
+    history_provided = bool(raw)
     data: object = {}
     if raw:
         try:
@@ -70,9 +94,16 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
         snapshot_unreadable = []
         snapshot_threshold = None
 
-    findings = [
-        f for raw_f in (entries or []) if (f := _finding_from_mapping(raw_f)) is not None
-    ]
+    findings: list = []
+    malformed_subsystems: list[str] = []
+    for raw_f in entries or []:
+        f, subsystem = _finding_from_mapping(raw_f)
+        if f is not None:
+            findings.append(f)
+        elif subsystem:
+            # A malformed entry with a nameable subsystem fails that subsystem CLOSED to
+            # escalation rather than being silently dropped (Redmine #13967 F4).
+            malformed_subsystems.append(subsystem)
 
     cli_threshold = getattr(args, "threshold", None)
     threshold = (
@@ -81,17 +112,31 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
         else (int(snapshot_threshold) if snapshot_threshold is not None else DEFAULT_ESCALATION_THRESHOLD)
     )
 
-    unreadable = list(snapshot_unreadable) + list(getattr(args, "unreadable_subsystem", None) or [])
+    unreadable = (
+        list(snapshot_unreadable)
+        + list(getattr(args, "unreadable_subsystem", None) or [])
+        + malformed_subsystems
+    )
     unreadable = [str(s).strip() for s in unreadable if str(s).strip()]
 
     projection = project_review_escalation(
         findings, threshold=threshold, unreadable_subsystems=unreadable
     )
+    payload = projection.as_payload()
+    payload["history_provided"] = history_provided
     if getattr(args, "as_json", False):
-        print(_json.dumps(projection.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(render_review_escalation_table(projection))
-        if projection.any_escalation:
+        if not history_provided:
+            # An authority-bearing projection must not read as a confident "no escalation"
+            # when no review history was supplied at all (Redmine #13967 F4).
+            print("")
+            print(
+                "no readable review history provided (--snapshot-json absent); this is not "
+                "a verdict of 'no escalation'. Supply a durable/verified history to evaluate."
+            )
+        elif projection.any_escalation:
             print("")
             print(
                 "escalate next round to full-surface adversarial sweep: "

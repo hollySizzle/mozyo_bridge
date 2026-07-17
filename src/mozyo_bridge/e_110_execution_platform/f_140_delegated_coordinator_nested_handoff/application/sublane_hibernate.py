@@ -165,6 +165,37 @@ class HibernateAssertions:
         )
 
     @property
+    def obligations_satisfied(self) -> bool:
+        """The obligation gate for the ASSERTED park basis (Redmine #13967 F1).
+
+        The common obligations (no callback / review / integration owed) apply to every
+        basis. Owner close approval is basis-dependent: the **dependency park** keeps the
+        original #13682 requirement (`no_owner_approval_pending`), but **early hibernate**
+        must NOT require it — hibernate is not close, the source issue stays open, and the
+        owner close approval is collected later on the coordinator's normal path. The
+        anchor's fail-closed list for early hibernate deliberately omits owner approval
+        (Implementation Request j#81283 item 1), so requiring it here made early hibernate
+        undischargeable in its target `owner_waiting` state. Fails closed: no affirmative
+        basis -> False.
+        """
+        base = self.callbacks_drained and self.no_review_pending and self.no_integration_pending
+        if self.explicitly_parked:
+            return base and self.no_owner_approval_pending
+        if self.early_hibernate_qualified:
+            return base
+        return False
+
+    @property
+    def owner_gate_applies(self) -> bool:
+        """True when a pending owner close approval should block this hibernate.
+
+        Only the dependency-park basis gates on owner approval. An early-hibernate
+        attempt (or a no-basis request) does not — its owner approval is deferred to the
+        coordinator's normal close path.
+        """
+        return not self.early_hibernate_attempted
+
+    @property
     def lane_idle(self) -> bool:
         return self.no_pending_prompt and self.not_working
 
@@ -230,7 +261,7 @@ class HibernateAssertions:
         """
         return (
             self.park_satisfied
-            and self.no_outstanding_obligation
+            and self.obligations_satisfied
             and self.lane_idle
             and self.boundary_ok
         )
@@ -247,7 +278,7 @@ class HibernatePreflight:
 
     original_identity_known: bool
     park_satisfied: bool
-    no_outstanding_obligation: bool
+    obligations_satisfied: bool
     lane_idle: bool
     boundary_ok: bool
     inventory_readable: bool = True
@@ -258,7 +289,7 @@ class HibernatePreflight:
         return (
             self.original_identity_known
             and self.park_satisfied
-            and self.no_outstanding_obligation
+            and self.obligations_satisfied
             and self.lane_idle
             and self.boundary_ok
             and self.inventory_readable
@@ -285,7 +316,10 @@ class HibernatePreflight:
             reasons.append(BLOCK_CALLBACK_DEBT)
         if not self.assertions.no_review_pending:
             reasons.append(BLOCK_REVIEW_PENDING)
-        if not self.assertions.no_owner_approval_pending:
+        # Owner close approval only gates the dependency-park basis (Redmine #13967 F1):
+        # an early hibernate is expected to run while owner approval is still outstanding
+        # (deferred to the coordinator's normal close path), so it is not a blocker there.
+        if self.assertions.owner_gate_applies and not self.assertions.no_owner_approval_pending:
             reasons.append(BLOCK_OWNER_PENDING)
         if not self.assertions.no_integration_pending:
             reasons.append(BLOCK_INTEGRATION_PENDING)
@@ -305,7 +339,7 @@ class HibernatePreflight:
             "original_identity_known": self.original_identity_known,
             "park_satisfied": self.park_satisfied,
             "park_basis": self.park_basis,
-            "no_outstanding_obligation": self.no_outstanding_obligation,
+            "obligations_satisfied": self.obligations_satisfied,
             "lane_idle": self.lane_idle,
             "boundary_ok": self.boundary_ok,
             "inventory_readable": self.inventory_readable,
@@ -460,7 +494,7 @@ class SublaneHibernateUseCase:
             preflight = HibernatePreflight(
                 original_identity_known=False,
                 park_satisfied=request.assertions.park_satisfied,
-                no_outstanding_obligation=request.assertions.no_outstanding_obligation,
+                obligations_satisfied=request.assertions.obligations_satisfied,
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
                 assertions=request.assertions,
@@ -481,7 +515,7 @@ class SublaneHibernateUseCase:
             preflight = HibernatePreflight(
                 original_identity_known=False,
                 park_satisfied=request.assertions.park_satisfied,
-                no_outstanding_obligation=request.assertions.no_outstanding_obligation,
+                obligations_satisfied=request.assertions.obligations_satisfied,
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
                 assertions=request.assertions,
@@ -521,7 +555,7 @@ class SublaneHibernateUseCase:
             preflight = HibernatePreflight(
                 original_identity_known=True,  # the hibernated lane is known
                 park_satisfied=request.assertions.park_satisfied,
-                no_outstanding_obligation=request.assertions.no_outstanding_obligation,
+                obligations_satisfied=request.assertions.obligations_satisfied,
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
                 inventory_readable=inventory_readable,
@@ -551,7 +585,7 @@ class SublaneHibernateUseCase:
         preflight = HibernatePreflight(
             original_identity_known=original_identity_known,
             park_satisfied=request.assertions.park_satisfied,
-            no_outstanding_obligation=request.assertions.no_outstanding_obligation,
+            obligations_satisfied=request.assertions.obligations_satisfied,
             lane_idle=request.assertions.lane_idle,
             boundary_ok=request.assertions.boundary_ok,
             inventory_readable=inventory_readable,
