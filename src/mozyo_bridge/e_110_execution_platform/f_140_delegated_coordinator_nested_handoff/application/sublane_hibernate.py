@@ -20,8 +20,8 @@ substrate, exactly mirroring ``sublane supersede`` minus the ownership handover:
    in flight. There are two park bases (Redmine #13967 item 1): the original **dependency
    park** (the issue is explicitly parked/blocked on a wait) and the standardized **early
    hibernate** (a same-lane review-approved + staging-integrated + required-CI-green
-   feature lane whose TestPyPI / installed dogfood + close are delegated to the dedicated
-   release issue — so the lane hibernates without waiting for ticket close or installed
+   feature lane whose TestPyPI / installed dogfood execution/evidence is delegated to the
+   dedicated release issue (close authority stays with the coordinator) — so the lane hibernates without waiting for ticket close or installed
    dogfood; unpushed commits fail closed here, since an early hibernate presupposes
    integrated work). A dirty worktree does **not** block (hibernate preserves the
    worktree) but its uncommitted diff / resume next-action must be captured in a boundary
@@ -99,9 +99,10 @@ BLOCK_UNPUSHED_COMMITS = "unpushed_commits"
 # justify winding a lane's processes down. `dependency` is the original #13682 park (issue
 # explicitly parked/blocked on a wait). `early_hibernate` is the standardized new basis: a
 # same-lane review-approved + staging-integrated + required-CI-green feature lane whose
-# TestPyPI / installed dogfood + close are delegated to the dedicated release issue via a
-# durable park/delegation record (so the lane hibernates without waiting for ticket close
-# or installed dogfood). `none` = no affirmative basis (fail-closed).
+# TestPyPI / installed dogfood execution/evidence is delegated to the dedicated release
+# issue via a durable park/delegation record (close authority + owner close approval stay
+# with the coordinator's normal path, NOT delegated), so the lane hibernates without
+# waiting for ticket close or installed dogfood. `none` = no affirmative basis (fail-closed).
 PARK_BASIS_DEPENDENCY = "dependency"
 PARK_BASIS_EARLY_HIBERNATE = "early_hibernate"
 PARK_BASIS_NONE = "none"
@@ -144,8 +145,9 @@ class HibernateAssertions:
     boundary_recorded: bool = False
     # Early-hibernate park basis (Redmine #13967 item 1). The alternative affirmative
     # precondition to `explicitly_parked`: a same-lane review-approved + staging-integrated
-    # + required-CI-green feature lane whose dogfood/close is delegated to the dedicated
-    # release issue. Every flag defaults False (fail-closed). The generic safety gates
+    # + required-CI-green feature lane whose dogfood execution/evidence is delegated to the
+    # dedicated release issue (close authority stays with the coordinator). Every flag
+    # defaults False (fail-closed). The generic safety gates
     # above (callbacks_drained / no_review_pending / no_integration_pending / lane_idle /
     # boundary) are NOT weakened by this basis — in the early-hibernate case they are all
     # satisfied (review approved => no review owed; integrated => no integration pending).
@@ -179,21 +181,28 @@ class HibernateAssertions:
         basis -> False.
         """
         base = self.callbacks_drained and self.no_review_pending and self.no_integration_pending
-        if self.explicitly_parked:
-            return base and self.no_owner_approval_pending
+        # Prefer the early-hibernate basis when it fully qualifies (Redmine #13967 R2-F4):
+        # if a lane genuinely meets every early-hibernate precondition, dropping the owner
+        # gate is correct even when `explicitly_parked` is ALSO set — otherwise an ambiguous
+        # input silently falls back to the stricter dependency basis and re-blocks the
+        # owner_waiting state early hibernate exists to serve. `park_basis` uses the same
+        # ordering so the reported basis and the gate agree.
         if self.early_hibernate_qualified:
             return base
+        if self.explicitly_parked:
+            return base and self.no_owner_approval_pending
         return False
 
     @property
     def owner_gate_applies(self) -> bool:
         """True when a pending owner close approval should block this hibernate.
 
-        Only the dependency-park basis gates on owner approval. An early-hibernate
-        attempt (or a no-basis request) does not — its owner approval is deferred to the
-        coordinator's normal close path.
+        Only the dependency-park basis gates on owner approval. A lane that fully qualifies
+        for early hibernate (even if `explicitly_parked` is also set) does not — its owner
+        approval is deferred to the coordinator's normal close path (Redmine #13967 R2-F4:
+        early qualification wins over dependency).
         """
-        return not self.early_hibernate_attempted
+        return not self.early_hibernate_qualified and not self.early_hibernate_attempted
 
     @property
     def lane_idle(self) -> bool:
@@ -210,8 +219,9 @@ class HibernateAssertions:
 
         Every early-hibernate precondition is affirmed: the same-lane Review Gate is
         approved, the coordinator staging integration is recorded, required CI is green,
-        the TestPyPI / installed dogfood + close are delegated to the dedicated release
-        issue (a durable park/delegation record), and the commits are pushed /
+        the TestPyPI / installed dogfood execution/evidence is delegated to the dedicated
+        release issue (a durable park/delegation record; close authority + owner close
+        approval stay with the coordinator, NOT delegated), and the commits are pushed /
         origin-reachable (unpushed fails closed — an early hibernate presupposes the work
         is integrated, unlike a dependency park which preserves unpublished commits).
         """
@@ -242,10 +252,12 @@ class HibernateAssertions:
 
     @property
     def park_basis(self) -> str:
-        if self.explicitly_parked:
-            return PARK_BASIS_DEPENDENCY
+        # Early qualification wins over dependency when both hold (Redmine #13967 R2-F4),
+        # matching `obligations_satisfied` so the reported basis and the owner gate agree.
         if self.early_hibernate_qualified:
             return PARK_BASIS_EARLY_HIBERNATE
+        if self.explicitly_parked:
+            return PARK_BASIS_DEPENDENCY
         return PARK_BASIS_NONE
 
     @property
@@ -798,8 +810,9 @@ def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
          "is recorded (required when the worktree is not clean)."),
         # Early-hibernate park basis (Redmine #13967 item 1): the alternative to
         # --explicitly-parked for a review-approved + staging-integrated feature lane
-        # whose dogfood/close is delegated to the dedicated release issue. All five must
-        # hold to qualify (each defaults unsatisfied -> fail closed).
+        # whose dogfood execution/evidence is delegated to the dedicated release issue
+        # (close authority stays with the coordinator). All five must hold to qualify
+        # (each defaults unsatisfied -> fail closed).
         ("--review-approved", "review_approved",
          "Early hibernate: the same-lane Review Gate is approved with no open findings."),
         ("--staging-integrated", "staging_integrated",
@@ -808,8 +821,9 @@ def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
         ("--required-ci-green", "required_ci_green",
          "Early hibernate: the required CI for the integrated commits is green."),
         ("--dogfood-delegated", "dogfood_delegated",
-         "Early hibernate: TestPyPI / installed dogfood + close are delegated to the "
-         "dedicated release issue via a durable park/delegation record."),
+         "Early hibernate: TestPyPI / installed dogfood execution/evidence is delegated to "
+         "the dedicated release issue via a durable park/delegation record (close authority "
+         "and owner close approval stay with the coordinator, not delegated)."),
         ("--commits-pushed", "commits_pushed",
          "Early hibernate: the lane's commits are pushed / origin-reachable (unpushed "
          "fails closed — an early hibernate presupposes integrated work)."),

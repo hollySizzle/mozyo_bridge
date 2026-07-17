@@ -105,6 +105,13 @@ class BucketMappingTests(unittest.TestCase):
             BUCKET_RELEASE_DOGFOOD,
         )
 
+    def test_release_pending_never_launders_unknown_state(self):
+        # Redmine #13967 R2-F2: a release flag must not route an unreadable state into
+        # release_dogfood (which would bypass the fail-closed unknown hold).
+        self.assertEqual(
+            bucket_for_state("mystery", release_pending=True), BUCKET_UNKNOWN
+        )
+
     def test_release_pending_never_masks_a_blocking_drain(self):
         # A lane that still owes a review is bucketed by the review, not hidden behind a
         # delegated dogfood flag.
@@ -196,6 +203,15 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn(HOLD_REASON_UNKNOWN_STATE, projection.hold_buckets)
         self.assertIsNotNone(projection.bucket(BUCKET_UNKNOWN))
 
+    def test_unknown_with_release_pending_still_holds(self):
+        # Redmine #13967 R2-F2: a release flag cannot launder an unknown state past the hold.
+        projection = project_drain_queue(
+            [DrainLane(issue="9", state_class="mystery", release_pending=True)]
+        )
+        self.assertEqual(projection.process_retention, PROCESS_HOLD)
+        self.assertIn(HOLD_REASON_UNKNOWN_STATE, projection.hold_buckets)
+        self.assertEqual(projection.release_dogfood_pending, 0)
+
     def test_durable_incomplete_forces_hold(self):
         # A source the caller could not fully read (degraded) forces hold even with no
         # coordinator-blocking lane.
@@ -269,6 +285,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertIn(BUCKET_REVIEW, payload["hold_buckets"])
         self.assertIn(BUCKET_INTEGRATION, payload["hold_buckets"])
+
+    def test_snapshot_malformed_row_forces_hold(self):
+        # Redmine #13967 R2-F2: a malformed row (here a non-bool release_pending) is not
+        # silently dropped — it makes the snapshot durable-incomplete -> hold.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "lanes.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "lanes": [
+                            {"issue": "1", "state_class": LANE_STATE_IMPLEMENTING},
+                            {"issue": "2", "state_class": LANE_STATE_IDLE, "release_pending": "false"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
 
     def test_from_glance_derives_lanes_and_release_dogfood(self):
         glance_env = {

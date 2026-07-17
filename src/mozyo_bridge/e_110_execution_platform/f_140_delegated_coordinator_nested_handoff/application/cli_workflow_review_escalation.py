@@ -30,36 +30,29 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-def _exact_bool(value: object, default: bool = False) -> bool | None:
-    """Return the value only when it is an EXACT JSON bool (Redmine #13967 F4).
-
-    A missing key takes ``default``; a present-but-non-bool value (e.g. the string
-    ``"false"``, which ``bool(...)`` would coerce to True) returns None so the caller can
-    treat the entry as malformed rather than silently coercing it. No coercion.
-    """
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return None
-
-
 def _finding_from_mapping(raw: object) -> tuple[SubsystemFinding | None, str]:
     """``(finding, subsystem)``. finding is None when the entry is malformed; the subsystem
     (if extractable) is returned so the caller can fail it closed to escalation rather than
-    silently dropping it (Redmine #13967 F4)."""
+    silently dropping it (Redmine #13967 F4 / R2-F3).
+
+    ``authority_bearing``, ``late`` and ``round_index`` are **required and exact-typed**: a
+    missing key, or a value that is not an exact JSON bool (``"false"`` must not coerce to
+    True) / exact int, makes the entry malformed. No coercion, no defaulting of a required
+    authority field to a valid ``false``."""
     if not isinstance(raw, dict):
         return None, ""
     subsystem = str(raw.get("subsystem", "") or "").strip()
     if not subsystem:
         return None, ""
-    ri = raw.get("round_index", 0)
+    ri = raw.get("round_index")
     if isinstance(ri, bool) or not isinstance(ri, int):
-        return None, subsystem  # round_index must be an exact int (not bool/str/float)
-    authority = _exact_bool(raw.get("authority_bearing"))
-    late = _exact_bool(raw.get("late"))
-    if authority is None or late is None:
-        return None, subsystem  # non-bool flag -> malformed, fail closed
+        return None, subsystem  # round_index required, exact int (not bool/str/float/missing)
+    authority = raw.get("authority_bearing")
+    late = raw.get("late")
+    if not isinstance(authority, bool) or not isinstance(late, bool):
+        # Required authority flags must be present exact bools — a missing key is NOT a
+        # valid `false`, and a string is NOT coerced (Redmine #13967 R2-F3).
+        return None, subsystem
     return (
         SubsystemFinding(
             subsystem=subsystem,
@@ -72,8 +65,24 @@ def _finding_from_mapping(raw: object) -> tuple[SubsystemFinding | None, str]:
     )
 
 
+# Tri-state escalation decision (Redmine #13967 R2-F3). `indeterminate` is distinct from
+# `no_escalation` so an absent / unprovenanced / partially-malformed history can NEVER read
+# as a confident "no escalation" verdict — only an evaluated history that genuinely produced
+# no escalation is `no_escalation`.
+DECISION_ESCALATE = "escalate"
+DECISION_NO_ESCALATION = "no_escalation"
+DECISION_INDETERMINATE = "indeterminate"
+
+
 def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
-    """Project the deterministic late-finding escalation verdict. Read-only; always exits 0."""
+    """Project the deterministic late-finding escalation decision. Read-only; always exits 0.
+
+    Authority-bearing gate (Redmine #13967 R2-F3): the decision is only ``escalate`` /
+    ``no_escalation`` when the history was **provided with a declared provenance** (a durable
+    anchor / verified source) and no fatal indeterminacy was hit. Absent history, missing
+    provenance, a non-list ``findings``, or a malformed entry with no nameable subsystem all
+    resolve to ``indeterminate`` — never a confident ``no_escalation``.
+    """
     raw = (getattr(args, "snapshot_json", None) or "").strip()
     history_provided = bool(raw)
     data: object = {}
@@ -85,25 +94,41 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
                 f"--snapshot-json {raw!r} could not be read as JSON: {exc}"
             ) from exc
 
+    provenance = ""
+    indeterminate_reasons: list[str] = []
     if isinstance(data, dict):
-        entries = data.get("findings", [])
+        raw_entries = data.get("findings", [])
         snapshot_unreadable = data.get("unreadable_subsystems", []) or []
         snapshot_threshold = data.get("threshold")
+        provenance = str(data.get("provenance", "") or "").strip()
     else:
-        entries = data
+        raw_entries = data
         snapshot_unreadable = []
         snapshot_threshold = None
 
+    if not history_provided:
+        indeterminate_reasons.append("no_history_provided")
+    if history_provided and not provenance:
+        # Authority-bearing projection requires a declared durable/verified provenance.
+        indeterminate_reasons.append("no_snapshot_provenance")
+    if history_provided and not isinstance(raw_entries, list):
+        indeterminate_reasons.append("findings_not_a_list")
+        raw_entries = []
+
     findings: list = []
     malformed_subsystems: list[str] = []
-    for raw_f in entries or []:
+    for raw_f in raw_entries or []:
         f, subsystem = _finding_from_mapping(raw_f)
         if f is not None:
             findings.append(f)
         elif subsystem:
-            # A malformed entry with a nameable subsystem fails that subsystem CLOSED to
-            # escalation rather than being silently dropped (Redmine #13967 F4).
+            # Malformed entry with a nameable subsystem -> that subsystem fails CLOSED to
+            # escalation (never silently dropped).
             malformed_subsystems.append(subsystem)
+        else:
+            # Malformed entry we cannot even attribute to a subsystem makes the whole
+            # projection indeterminate (we cannot claim we read the history).
+            indeterminate_reasons.append("unattributable_malformed_entry")
 
     cli_threshold = getattr(args, "threshold", None)
     threshold = (
@@ -122,26 +147,38 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
     projection = project_review_escalation(
         findings, threshold=threshold, unreadable_subsystems=unreadable
     )
+    evaluated = not indeterminate_reasons
+    if not evaluated:
+        decision = DECISION_INDETERMINATE
+    elif projection.any_escalation:
+        decision = DECISION_ESCALATE
+    else:
+        decision = DECISION_NO_ESCALATION
+
     payload = projection.as_payload()
     payload["history_provided"] = history_provided
+    payload["provenance"] = provenance
+    payload["evaluated"] = evaluated
+    payload["escalation_decision"] = decision
+    payload["indeterminate_reasons"] = sorted(set(indeterminate_reasons))
     if getattr(args, "as_json", False):
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(render_review_escalation_table(projection))
-        if not history_provided:
-            # An authority-bearing projection must not read as a confident "no escalation"
-            # when no review history was supplied at all (Redmine #13967 F4).
-            print("")
+        print("")
+        if decision == DECISION_INDETERMINATE:
             print(
-                "no readable review history provided (--snapshot-json absent); this is not "
-                "a verdict of 'no escalation'. Supply a durable/verified history to evaluate."
+                "escalation_decision: indeterminate — the review history was not evaluable "
+                "(" + ", ".join(sorted(set(indeterminate_reasons))) + "). This is NOT a "
+                "verdict of 'no escalation'; supply a provenanced, well-formed history."
             )
-        elif projection.any_escalation:
-            print("")
+        elif decision == DECISION_ESCALATE:
             print(
-                "escalate next round to full-surface adversarial sweep: "
-                + ", ".join(projection.escalating_subsystems)
+                "escalation_decision: escalate next round to full-surface adversarial "
+                "sweep: " + ", ".join(projection.escalating_subsystems)
             )
+        else:
+            print("escalation_decision: no_escalation (evaluated with provenance)")
     return 0
 
 
@@ -170,9 +207,13 @@ def register_review_escalation(workflow_sub) -> None:
         default=None,
         metavar="PATH",
         help=(
-            "Read the per-subsystem review history: {\"findings\": [ {subsystem, round_index, "
-            "authority_bearing, late, finding_id}, ... ], \"unreadable_subsystems\": [...], "
-            "\"threshold\": N} (a bare findings list is also accepted). Structured facts only."
+            "Read the per-subsystem review history: {\"provenance\": \"<durable anchor / "
+            "verified source>\", \"findings\": [ {subsystem, round_index, authority_bearing, "
+            "late, finding_id}, ... ], \"unreadable_subsystems\": [...], \"threshold\": N}. A "
+            "non-empty `provenance` is REQUIRED for an evaluable verdict (without it, or with "
+            "no snapshot, the decision is `indeterminate`, never `no_escalation`). "
+            "authority_bearing / late / round_index are required exact-typed per finding. "
+            "Structured facts only."
         ),
     )
     esc.add_argument(
