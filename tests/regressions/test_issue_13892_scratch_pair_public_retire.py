@@ -50,6 +50,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_WORK_OBLIGATION_PRESENT,
     run_session_retire,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+    herdr_workspace_segment,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
@@ -65,6 +68,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     STATE_ABSENT,
     STATE_BLOCKED,
     STATE_GREEN,
+)
+from tests.support.herdr_workspace_fixtures import (
+    FIXTURE_WORKSPACE_ID,
+    anchored_repo_root,
 )
 
 LANE = "dogfood13892"
@@ -175,16 +182,19 @@ class FakeOps:
 
 class ScratchPairRetireTest(unittest.TestCase):
     def setUp(self):
-        self.repo_root = Path(__file__).resolve().parents[2]
+        # The fixture owns its repo root and anchors the identity there (#13924): deriving
+        # it from the source checkout only resolved where the operator had registered that
+        # checkout, so a fresh CI checkout failed every test in this class at setUp.
+        self.repo_root = anchored_repo_root(self)
         # The workspace segment the surface derives from this repo root; the test builds
         # its fixture names with the SAME encoder the product uses, so a name-shape change
         # cannot make these tests silently stop matching.
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
-            herdr_workspace_segment,
-        )
-
         self.ws = herdr_workspace_segment(self.repo_root)
-        self.assertTrue(self.ws, "the fixture needs a resolvable workspace segment")
+        self.assertEqual(
+            self.ws,
+            FIXTURE_WORKSPACE_ID,
+            "the fixture root must resolve to the identity the fixture anchored",
+        )
         self.gw_name = encode_assigned_name(self.ws, GATEWAY, LANE)
         self.wk_name = encode_assigned_name(self.ws, WORKER, LANE)
 
@@ -214,6 +224,23 @@ class ScratchPairRetireTest(unittest.TestCase):
         if getattr(ops, "fence", None) is None:
             ops.fence = self._fence()
         return run_session_retire(self._args(**kw), self.repo_root, ops=ops)
+
+    # -- control: the fixture's identity is its own, not the operator's --------
+
+    def test_control_fixture_identity_is_anchored_never_ambient(self):
+        """The identity must come from the fixture's own anchor (#13924).
+
+        Three facts pin it, and the CI-red shape breaks each: an unanchored root resolves
+        to ``""`` through this same resolver (so nothing is patched into resolving, and the
+        product's fail-closed contract is intact); this root resolves only because the
+        fixture wrote an anchor there; and the root is NOT the source checkout, whose
+        segment exists only where an operator registered it.
+        """
+        bare = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bare, True)
+        self.assertEqual(herdr_workspace_segment(bare), "")
+        self.assertEqual(herdr_workspace_segment(self.repo_root), FIXTURE_WORKSPACE_ID)
+        self.assertNotEqual(self.repo_root, Path(__file__).resolve().parents[2])
 
     # -- control: the harness itself resolves the pair -------------------------
 
