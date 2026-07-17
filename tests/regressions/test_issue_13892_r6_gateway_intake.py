@@ -23,6 +23,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LEG_ATTEMPTED,
     LEG_NOT_APPLICABLE,
     REASON_DISPATCH_AMBIGUOUS,
+    REASON_DISPATCH_NOT_FOUND,
     REASON_NOT_GATEWAY_LANE,
     execute_gateway_disposition_leg,
     resolve_round_dispatch,
@@ -71,13 +72,13 @@ class RoundDispatchResolutionTest(unittest.TestCase):
         )
 
     def test_the_single_open_round_resolves(self):
-        auth = self._resolve([_entry("100", _auth_note()), _entry("200", REVIEW_GATE)])
-        self.assertIsNotNone(auth)
-        self.assertEqual(auth.action_id, ACTION)
+        r = self._resolve([_entry("100", _auth_note()), _entry("200", REVIEW_GATE)])
+        self.assertTrue(r.ok)
+        self.assertEqual(r.auth.action_id, ACTION)
 
     def test_a_prior_closed_round_is_not_reopened(self):
         """R1's AUTHORIZE belongs to R1's review_request, not R2's."""
-        auth = self._resolve(
+        r = self._resolve(
             [
                 _entry("100", _auth_note(action_id="r1")),
                 _entry("200", REVIEW_GATE),
@@ -86,30 +87,40 @@ class RoundDispatchResolutionTest(unittest.TestCase):
             ],
             terminal="400",
         )
-        self.assertIsNotNone(auth)
-        self.assertEqual(auth.action_id, "r2", "the round this gate closes is the open one")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.auth.action_id, "r2", "the round this gate closes is the open one")
 
     def test_two_authorizes_in_one_round_are_ambiguous(self):
-        self.assertIsNone(
-            self._resolve(
-                [
-                    _entry("100", _auth_note(action_id="a")),
-                    _entry("150", _auth_note(action_id="b")),
-                    _entry("200", REVIEW_GATE),
-                ]
-            ),
+        r = self._resolve(
+            [
+                _entry("100", _auth_note(action_id="a")),
+                _entry("150", _auth_note(action_id="b")),
+                _entry("200", REVIEW_GATE),
+            ]
+        )
+        self.assertFalse(r.ok)
+        self.assertEqual(
+            r.reason, REASON_DISPATCH_AMBIGUOUS,
             "two AUTHORIZE markers in one round: which action a discharge names is unknown",
         )
 
-    def test_no_authorize_resolves_nothing(self):
-        self.assertIsNone(self._resolve([_entry("200", REVIEW_GATE)]))
+    def test_no_authorize_is_NOT_FOUND_not_ambiguous(self):
+        """R7-F1: 0 and 2+ are different answers.
+
+        Collapsing "nothing opened this round" into "ambiguous" sends the operator hunting a
+        duplicate AUTHORIZE that does not exist.
+        """
+        r = self._resolve([_entry("200", REVIEW_GATE)])
+        self.assertFalse(r.ok)
+        self.assertEqual(r.reason, REASON_DISPATCH_NOT_FOUND)
+        self.assertNotEqual(r.reason, REASON_DISPATCH_AMBIGUOUS)
 
     def test_a_foreign_lane_authorize_is_not_this_lane_s_round(self):
-        self.assertIsNone(
-            self._resolve(
-                [_entry("100", _auth_note(lane_id="other_lane")), _entry("200", REVIEW_GATE)]
-            )
+        r = self._resolve(
+            [_entry("100", _auth_note(lane_id="other_lane")), _entry("200", REVIEW_GATE)]
         )
+        self.assertFalse(r.ok)
+        self.assertEqual(r.reason, REASON_DISPATCH_NOT_FOUND)
 
 
 class GatewayDispositionLegTest(unittest.TestCase):
@@ -167,6 +178,12 @@ class GatewayDispositionLegTest(unittest.TestCase):
         result = self._run()
         self.assertEqual(result.reason, REASON_DISPATCH_AMBIGUOUS)
         self.assertEqual(self.appended, [], "zero-write on ambiguity")
+
+    def test_a_missing_round_reports_not_found_not_ambiguous(self):
+        self.entries = [_entry("200", REVIEW_GATE)]
+        result = self._run()
+        self.assertEqual(result.reason, REASON_DISPATCH_NOT_FOUND)
+        self.assertEqual(self.appended, [], "zero-write when no round opened")
 
     def test_an_implementation_done_anchor_does_not_discharge(self):
         """A partial implementation_done is routine and truthful — it terminates nothing."""

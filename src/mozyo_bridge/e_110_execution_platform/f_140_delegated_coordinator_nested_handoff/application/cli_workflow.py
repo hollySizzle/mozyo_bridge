@@ -652,10 +652,10 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     if resume_outcome is not None:
         outcome = resume_outcome
 
-    # Redmine #13892 R6-F1: gateway-owned disposition intake (the writer's ONLY production caller).
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_disposition_intake import maybe_record_gateway_disposition  # noqa: E501
-    maybe_record_gateway_disposition(args, outcome, dry_run=dry_run)
-
+    # Redmine #13892: gateway-owned disposition intake (the writer's ONLY production caller);
+    # its result rides the envelope because an unseen refusal is an unrecoverable zero-write.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_disposition_intake import disposition_payload_fields, disposition_text_lines, maybe_record_gateway_disposition  # noqa: E501
+    disposition = maybe_record_gateway_disposition(args, outcome, dry_run=dry_run)
     # The increment-2 herdr worker-dispatch leg and the increment-3 herdr coordinator-forward leg
     # are executable but ride their own dedicated fences, not the generic `executable` set (Redmine
     # #13489 / #13583). The #13813 resume leg is the same shape. Treat each as an executable leg.
@@ -679,11 +679,11 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
             reported = dataclasses.replace(outcome, execution=EXECUTION_DRY_RUN)
         if as_json:
             payload = reported.as_payload()
-            payload.update(reconciled.reconcile_payload_fields())
+            payload.update({**reconciled.reconcile_payload_fields(), **disposition_payload_fields(disposition)})  # noqa: E501
             print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             _print_outcome_text(reported)
-            for line in reconciled.reconcile_text_lines():
+            for line in reconciled.reconcile_text_lines() + disposition_text_lines(disposition):
                 print(line)
         return 0 if reported.ok else 1
 
@@ -702,7 +702,7 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         payload = executed.as_payload()
         payload["primitive_rc"] = rc
         payload["primitive_output"] = primitive_out
-        payload.update(reconciled.reconcile_payload_fields())
+        payload.update({**reconciled.reconcile_payload_fields(), **disposition_payload_fields(disposition)})  # noqa: E501
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         _print_outcome_text(executed)
@@ -710,7 +710,7 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         if primitive_out.strip():
             print("--- primitive output ---")
             print(primitive_out, end="" if primitive_out.endswith("\n") else "\n")
-        for line in reconciled.reconcile_text_lines():
+        for line in reconciled.reconcile_text_lines() + disposition_text_lines(disposition):
             print(line)
     # Surface the primitive's own rc: the step resolved an executable leg, but the
     # delivery's success/fail-closed result is the primitive's (e.g. a gateway that

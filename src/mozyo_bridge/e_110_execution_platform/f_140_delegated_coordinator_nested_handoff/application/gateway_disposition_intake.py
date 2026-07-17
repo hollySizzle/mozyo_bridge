@@ -41,6 +41,13 @@ from typing import Optional, Sequence
 LEG_NOT_APPLICABLE = "not_applicable"
 #: The writer ran. `detail` carries its state / reason verbatim.
 LEG_ATTEMPTED = "attempted"
+#: An unexpected error escaped the leg. Zero-write, and SAID so (review j#80659 R7-F1): a bare
+#: `None` here made a swallowed exception indistinguishable from "nothing to do".
+LEG_ERROR = "error"
+
+REASON_LEG_RAISED = "leg_raised"
+#: A dry run: reported, never appended.
+REASON_DRY_RUN = "dry_run"
 
 REASON_NOT_GATEWAY_LANE = "not_gateway_lane"
 REASON_NO_VERIFIED_ANCHOR = "no_verified_anchor"
@@ -57,12 +64,63 @@ def _norm(value) -> str:
 
 @dataclass(frozen=True)
 class DispositionLegResult:
-    """What the leg did. Reported alongside the step outcome; never raised."""
+    """What the leg did. Reported alongside the step outcome; never raised.
+
+    This is surfaced on the ``workflow step`` envelope, not merely returned (review j#80659
+    R7-F1). A refusal the operator cannot see is a silent zero-write: the marker never lands,
+    the delivered row stays owed forever, and once the review result posts, the verified anchor
+    moves past this round so nothing will ever retry it. Fail-closed is only safe when someone
+    is told.
+    """
 
     state: str
     reason: str = ""
     detail: str = ""
     wrote: bool = False
+
+    @property
+    def applicable(self) -> bool:
+        """Did this step actually concern a disposition? (drives whether to report at all)"""
+        return self.state != LEG_NOT_APPLICABLE or self.reason not in (
+            REASON_NOT_GATEWAY_LANE,
+            REASON_NO_VERIFIED_ANCHOR,
+        )
+
+    def envelope_fields(self) -> dict:
+        """The step envelope's ``dispatch_disposition`` object."""
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "detail": self.detail,
+            "wrote": self.wrote,
+        }
+
+    def describe(self) -> str:
+        """One operator-facing line for the text envelope."""
+        if self.wrote:
+            return "dispatch disposition: recorded"
+        return (
+            f"dispatch disposition: NOT recorded ({self.reason or self.state})"
+            f"{' — ' + self.detail if self.detail else ''}"
+        )
+
+
+@dataclass(frozen=True)
+class RoundResolution:
+    """Which dispatch round a terminal gate closes — or WHY that could not be decided.
+
+    Carries the reason rather than collapsing every failure to ``None`` (review j#80659
+    R7-F1): "no dispatch opens this round" and "two do" are different operator situations,
+    and reporting the first as an ambiguity sends them hunting a duplicate that isn't there.
+    """
+
+    auth: object = None
+    reason: str = ""
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.auth is not None
 
 
 def _anchor_field(anchor_pointer: str, field: str) -> str:
@@ -83,7 +141,7 @@ def resolve_round_dispatch(
     workspace_id: str,
     lane_id: str,
     terminal_journal: str,
-):
+) -> RoundResolution:
     """The ONE dispatch AUTHORIZE the ``review_request`` at ``terminal_journal`` terminates.
 
     A lane runs many rounds, each shaped ``AUTHORIZE -> ... -> review_request``. So the round
@@ -92,9 +150,12 @@ def resolve_round_dispatch(
     its own review_request already closed.
 
     Cardinality is the answer, not an obstacle (review j#80644 R6-F2): exactly one candidate
-    resolves; zero or two-plus return ``None`` and the caller writes nothing. Never "pick the
-    latest" — two AUTHORIZE markers in one round is a real ambiguity about which action a
-    discharge would name.
+    resolves. Never "pick the latest" — two AUTHORIZE markers in one round is a real ambiguity
+    about which action a discharge would name.
+
+    Returns a :class:`RoundResolution` carrying either the auth or the reason it could not be
+    decided — :data:`REASON_DISPATCH_NOT_FOUND` for zero, :data:`REASON_DISPATCH_AMBIGUOUS` for
+    two-plus. Both are zero-write, and they are NOT the same answer (review j#80659 R7-F1).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
         parse_dispatch_authorizations,
@@ -106,7 +167,10 @@ def resolve_round_dispatch(
     order = {_norm(getattr(e, "journal_id", "")): i for i, e in enumerate(entries)}
     terminal_pos = order.get(_norm(terminal_journal))
     if terminal_pos is None:
-        return None
+        return RoundResolution(
+            reason=REASON_DISPATCH_NOT_FOUND,
+            detail=f"the terminal journal {terminal_journal} is not in the read history",
+        )
 
     prior_terminal_pos = -1
     for m in extract_markers(entries):
@@ -129,9 +193,27 @@ def resolve_round_dispatch(
         if pos is None or not (prior_terminal_pos < pos < terminal_pos):
             continue
         candidates.append(auth)
-    if len(candidates) != 1:
-        return None
-    return candidates[0]
+    # 0 and 2+ are DIFFERENT answers and must not collapse (review j#80659 R7-F1): "this round
+    # has no dispatch to discharge" and "this round has two and I cannot tell which" are
+    # distinct operator situations. Both are zero-write, but reporting the first as ambiguity
+    # sends the operator looking for a duplicate that does not exist.
+    if not candidates:
+        return RoundResolution(
+            reason=REASON_DISPATCH_NOT_FOUND,
+            detail=(
+                f"no valid dispatch AUTHORIZE for lane {lane_id} opens the round terminated "
+                f"by j#{terminal_journal}"
+            ),
+        )
+    if len(candidates) > 1:
+        return RoundResolution(
+            reason=REASON_DISPATCH_AMBIGUOUS,
+            detail=(
+                f"{len(candidates)} valid dispatch AUTHORIZE markers open the round "
+                f"terminated by j#{terminal_journal}; refusing to guess which one it closes"
+            ),
+        )
+    return RoundResolution(auth=candidates[0])
 
 
 def execute_gateway_disposition_leg(
@@ -183,23 +265,19 @@ def execute_gateway_disposition_leg(
     if sender is None:
         return DispositionLegResult(LEG_NOT_APPLICABLE, REASON_NO_VERIFIED_ANCHOR)
 
-    auth = resolve_round_dispatch(
+    round_ = resolve_round_dispatch(
         entries,
         workspace_id=sender.workspace_id,
         lane_id=sender.lane_id,
         terminal_journal=terminal_journal,
     )
-    if auth is None:
+    if not round_.ok:
         # Zero or many: either way this producer cannot name the exact action a discharge
-        # would close, so it records nothing and the reader keeps blocking.
+        # would close, so it records nothing — but it says WHICH, so the operator can act.
         return DispositionLegResult(
-            LEG_NOT_APPLICABLE,
-            REASON_DISPATCH_AMBIGUOUS,
-            detail=(
-                f"no single valid dispatch AUTHORIZE opens the round terminated by "
-                f"j#{terminal_journal} for lane {sender.lane_id}"
-            ),
+            LEG_NOT_APPLICABLE, round_.reason, detail=round_.detail
         )
+    auth = round_.auth
 
     if append_note is None:
         append_note = _live_append_note()
@@ -236,13 +314,44 @@ def maybe_record_gateway_disposition(
     Never raises. The leg already fails closed on every unreadable / ambiguous input; this
     boundary additionally refuses to let an unexpected error in a bookkeeping append take down
     the gateway's review action, which is the thing that actually matters.
+
+    An escaped exception becomes a :data:`LEG_ERROR` result, never a bare ``None`` (review
+    j#80659 R7-F1): swallowing it made a crashed writer look exactly like a step that had
+    nothing to record, and the operator was never told the marker had not landed.
     """
     if dry_run:
-        return None
+        return DispositionLegResult(
+            LEG_NOT_APPLICABLE,
+            REASON_DRY_RUN,
+            detail="a dry run reports without appending a durable marker",
+        )
     try:
         return execute_gateway_disposition_leg(args, outcome)
-    except Exception:  # noqa: BLE001 - a disposition append never blocks the review action
-        return None
+    except Exception as exc:  # noqa: BLE001 - never blocks the review action, but never silent
+        return DispositionLegResult(LEG_ERROR, REASON_LEG_RAISED, detail=str(exc))
+
+
+def disposition_payload_fields(result: Optional[DispositionLegResult]) -> dict:
+    """The step JSON envelope's additive ``dispatch_disposition`` field, or ``{}``.
+
+    Additive and always present once the leg applied, mirroring how the store reconcile
+    contributes to the same envelope. A step that never concerned a disposition (a worker
+    lane, an unverified anchor) contributes nothing, so ordinary output is unchanged.
+    """
+    if result is None or not result.applicable:
+        return {}
+    return {"dispatch_disposition": result.envelope_fields()}
+
+
+def disposition_text_lines(result: Optional[DispositionLegResult]) -> list:
+    """The step text envelope's disposition line(s), or ``()``.
+
+    A NOT-recorded outcome must be legible to the operator reading the terminal — the whole
+    point of R7-F1 is that a silent zero-write is unrecoverable once the anchor moves on.
+    """
+    if result is None or not result.applicable:
+        return []
+    return [result.describe()]
 
 
 def _live_source():
@@ -305,6 +414,10 @@ def _sender_identity(args: argparse.Namespace):
 __all__ = (
     "LEG_NOT_APPLICABLE",
     "LEG_ATTEMPTED",
+    "LEG_ERROR",
+    "REASON_LEG_RAISED",
+    "REASON_DRY_RUN",
+    "RoundResolution",
     "REASON_NOT_GATEWAY_LANE",
     "REASON_NO_VERIFIED_ANCHOR",
     "REASON_SOURCE_UNAVAILABLE",
@@ -316,4 +429,6 @@ __all__ = (
     "resolve_round_dispatch",
     "execute_gateway_disposition_leg",
     "maybe_record_gateway_disposition",
+    "disposition_payload_fields",
+    "disposition_text_lines",
 )
