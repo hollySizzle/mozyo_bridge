@@ -21,6 +21,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_CLOSE_FAILED,
     REASON_LANE_IS_DEFAULT,
     REASON_LANE_REQUIRED,
+    REASON_OBLIGATION_UNREADABLE,
+    REASON_POST_CLOSE_RESIDUE,
+    REASON_POST_CLOSE_UNREADABLE,
+    REASON_RETIRE_EVIDENCE_ABSENT,
+    REASON_WORK_OBLIGATION_PRESENT,
     run_session_retire,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -56,6 +61,16 @@ class FakeOps:
 
     Records every close so a test can assert **zero-close**, which is the property most of
     these gates actually protect.
+
+    ``fail_roles`` mirrors the production close executor's **per-target, non-fatal** contract
+    (``execute_herdr_retire_close``): each target closes or fails independently, so
+    "one closed + one failed" is a reachable production state and must be reachable here too
+    (review j#80506 F5 — the first double returned ``closed=()`` whenever anything failed,
+    which made a real partial commit inexpressible and the "reports what committed" assertion
+    vacuous).
+
+    A close also REMOVES the closed rows from the inventory, so the post-close re-measure and
+    a re-run observe the world the closes actually produced rather than a frozen fixture.
     """
 
     def __init__(
@@ -66,21 +81,33 @@ class FakeOps:
         runtime="awaiting_input",
         composer=(True, False),
         rows_raise=False,
-        close_failed=(),
+        fail_roles=(),
+        obligations=(),
+        rows_raise_after_close=False,
+        residue_after_close=False,
     ):
-        self._rows = rows
+        self._rows = list(rows)
         self._record_absent = record_absent
         self._runtime = runtime
         self._composer = composer
         self._rows_raise = rows_raise
-        self._close_failed = tuple(close_failed)
+        self._fail_roles = tuple(fail_roles)
+        self._obligations = obligations
+        self._rows_raise_after_close = rows_raise_after_close
+        self._residue_after_close = residue_after_close
+        self._closed_any = False
         self.close_calls = []
         self.recorded = []
 
     def agent_rows(self):
         if self._rows_raise:
             raise RuntimeError("herdr inventory unreadable")
-        return self._rows
+        if self._closed_any and self._rows_raise_after_close:
+            raise RuntimeError("herdr inventory unreadable after close")
+        return list(self._rows)
+
+    def open_obligations(self, workspace_id, assigned_names):
+        return self._obligations
 
     def runtime_state(self, locator):
         if isinstance(self._runtime, dict):
@@ -97,9 +124,20 @@ class FakeOps:
 
     def close(self, workspace_id, lane_id, targets):
         self.close_calls.append(tuple(targets))
-        if self._close_failed:
-            return _CloseResult(closed=(), failed=self._close_failed)
-        return _CloseResult(closed=tuple(targets))
+        closed, failed = [], []
+        for role, locator in targets:
+            if role in self._fail_roles:
+                failed.append((role, locator, "herdr refused"))
+            else:
+                closed.append((role, locator))
+        self._closed_any = bool(closed)
+        if not self._residue_after_close:
+            # A committed close removes that row: the next read sees the real post-close world.
+            closed_locators = {loc for _r, loc in closed}
+            self._rows = [
+                row for row in self._rows if row.get("pane") not in closed_locators
+            ]
+        return _CloseResult(closed=tuple(closed), failed=tuple(failed))
 
     def record_retirement(self, *, workspace_id, lane_id, intent):
         self.recorded.append(intent)
@@ -270,22 +308,46 @@ class ScratchPairRetireTest(unittest.TestCase):
         self.assertEqual(result.state, STATE_GREEN, result.detail)
         self.assertEqual(ops.close_calls, [((WORKER, "%2"),)])
 
-    def test_second_run_is_idempotent_and_closes_nothing(self):
-        ops = FakeOps([])  # both slots already gone
-        result = self._run(ops, execute=True)
-        self.assertEqual(result.state, STATE_ABSENT)
-        self.assertTrue(result.ok, "a proven absence is a successful idempotent replay")
-        self.assertEqual(ops.close_calls, [])
-
-    def test_failed_close_reports_what_committed_and_is_not_ok(self):
-        ops = FakeOps(
-            self._pair_rows(), close_failed=((GATEWAY, "%1", "herdr refused"),)
-        )
+    def test_zero_slot_without_evidence_is_not_a_retirement(self):
+        """j#80506 F1: absence proves the pair is not here, never that WE retired it."""
+        ops = FakeOps([])  # nothing live — a completed retire, or a lane that never existed
         result = self._run(ops, execute=True)
         self.assertEqual(result.state, STATE_BLOCKED)
-        self.assertEqual(result.reason, REASON_CLOSE_FAILED)
+        self.assertEqual(result.reason, REASON_RETIRE_EVIDENCE_ABSENT)
+        self.assertFalse(result.ok, "exit 0 must mean a proven retire")
+        self.assertEqual(ops.close_calls, [])
+        self.assertEqual(ops.recorded, [], "zero-close must also be zero-write")
+
+    def test_mistyped_lane_does_not_report_success(self):
+        """j#80506 F1: the operator-facing consequence — a typo must not read as retired."""
+        ops = FakeOps(self._pair_rows())  # the REAL pair is live under the intended label
+        result = self._run(ops, execute=True, lane="dogfood13892_typo")
         self.assertFalse(result.ok)
-        self.assertTrue(result.failed)
+        self.assertEqual(result.reason, REASON_RETIRE_EVIDENCE_ABSENT)
+        self.assertEqual(ops.close_calls, [], "the real pair must be untouched")
+
+    def test_partial_commit_then_rerun_closes_the_remainder(self):
+        """j#80506 F5: one closed + one failed in ONE execute, then a real re-run.
+
+        The production close executor is per-target non-fatal, so this state is reachable;
+        the first double could not express it.
+        """
+        ops = FakeOps(self._pair_rows(), fail_roles=(WORKER,))
+        first = self._run(ops, execute=True)
+        # Run 1: the gateway close committed, the worker close failed.
+        self.assertEqual(first.state, STATE_BLOCKED)
+        self.assertEqual(first.reason, REASON_CLOSE_FAILED)
+        self.assertFalse(first.ok)
+        self.assertEqual(first.closed, ((GATEWAY, "%1"),), "must report what committed")
+        self.assertEqual(len(first.failed), 1)
+        self.assertEqual(ops.recorded, [], "a partial close is not a retirement")
+
+        # Run 2: the gateway slot is now positively absent; the worker slot must still close.
+        ops._fail_roles = ()
+        second = self._run(ops, execute=True)
+        self.assertEqual(second.state, STATE_GREEN, second.detail)
+        self.assertEqual(ops.close_calls[-1], ((WORKER, "%2"),))
+        self.assertEqual(len(ops.recorded), 1, "the completed retire is recorded once")
 
     # -- acceptance 5: missing / unreadable inventory --------------------------
 
@@ -358,6 +420,78 @@ class ScratchPairRetireTest(unittest.TestCase):
         result = self._run(ops, execute=True)
         self.assertEqual(result.state, STATE_BLOCKED)
         self.assertEqual(result.reason, REASON_AGENT_NOT_IDLE)
+        self.assertEqual(ops.close_calls, [])
+
+    # -- j#80506 F3: the close command's return code is not proof of emptiness ---
+
+    def test_ack_success_but_still_live_is_not_a_retirement(self):
+        """F3: the close 'succeeded' yet the unit is still occupied -> no success, no record."""
+        ops = FakeOps(self._pair_rows(), residue_after_close=True)
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_POST_CLOSE_RESIDUE)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.closed, ((GATEWAY, "%1"), (WORKER, "%2")),
+                         "the committed closes are still reported")
+        self.assertEqual(ops.recorded, [], "no durable retirement over a non-empty unit")
+
+    def test_post_close_foreign_arrival_withholds_success(self):
+        """F3: a foreign occupant appearing at the unit withholds the retirement."""
+        ops = FakeOps(self._pair_rows())
+        foreign = encode_assigned_name(self.ws, "gemini", LANE)
+        original_close = ops.close
+
+        def close_then_foreign(ws, lane, targets):
+            out = original_close(ws, lane, targets)
+            ops._rows.append(self._row(foreign, locator="%9", agent="gemini"))
+            return out
+
+        ops.close = close_then_foreign
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_POST_CLOSE_RESIDUE)
+        self.assertEqual(ops.recorded, [])
+
+    def test_post_close_unreadable_inventory_withholds_success(self):
+        """F3: emptiness unproven -> not a retirement, but the closes are reported."""
+        ops = FakeOps(self._pair_rows(), rows_raise_after_close=True)
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_POST_CLOSE_UNREADABLE)
+        self.assertTrue(result.closed)
+        self.assertEqual(ops.recorded, [])
+
+    # -- j#80506 F4: durable obligations are not a runtime reading ------------
+
+    def test_durable_work_obligation_blocks_the_close(self):
+        """F4: a reserved dispatch is owed to a slot -> zero-close, even when idle."""
+        ops = FakeOps(
+            self._pair_rows(), obligations=((f"{self.wk_name}", "reserved"),)
+        )
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
+        self.assertEqual(ops.close_calls, [], "never close over owed work")
+
+    def test_uncertain_obligation_blocks_the_close(self):
+        ops = FakeOps(self._pair_rows(), obligations=((f"{self.gw_name}", "uncertain"),))
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
+        self.assertEqual(ops.close_calls, [])
+
+    def test_unreadable_obligation_store_blocks_the_close(self):
+        """F4: an obligation we cannot observe is not an obligation that is absent."""
+        ops = FakeOps(self._pair_rows(), obligations=None)
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_OBLIGATION_UNREADABLE)
+        self.assertEqual(ops.close_calls, [])
+
+    def test_obligation_gate_also_refuses_in_read_only_preflight(self):
+        ops = FakeOps(self._pair_rows(), obligations=((f"{self.wk_name}", "reserved"),))
+        result = self._run(ops, execute=False)
+        self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
         self.assertEqual(ops.close_calls, [])
 
     def test_stale_shell_residue_is_closed_not_stranded(self):

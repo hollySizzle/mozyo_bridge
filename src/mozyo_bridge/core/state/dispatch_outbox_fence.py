@@ -38,7 +38,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -493,6 +493,50 @@ class DispatchOutboxFence:
             conn.close()
 
     # -- reads -------------------------------------------------------------
+
+    def open_obligations_for_targets(
+        self, *, workspace_id: str, target_assigned_names: Sequence[str]
+    ) -> tuple[tuple[str, str], ...]:
+        """Non-terminal fence rows aimed at any of these assigned names. (read-only, #13892)
+
+        Returns ``(target_assigned_name, state)`` for every row in :data:`FENCE_RESERVED` or
+        :data:`FENCE_UNCERTAIN` whose target is one of ``target_assigned_names`` — the durable
+        obligations a *destructive* action against those slots must not run over. A
+        ``reserved`` row means a send took the write lock and its fate is not yet known; an
+        ``uncertain`` row means a send's outcome was never resolved. Both are work owed TO that
+        slot, which no runtime ``idle`` / ``turn_ended`` observation can rule out (the ACK /
+        receiver-state / completion separation: a receiver state is not an obligation).
+
+        :meth:`state_of` cannot answer this: it requires the full six-part
+        :class:`FenceKey` — an action-time caller that only knows *which panes it is about to
+        close* has no issue / journal / action_id to build one, so it could never enumerate
+        what is owed to a target. Hence this bounded by-target read.
+
+        Unlike :meth:`state_of` (a fail-soft per-key diagnostic) this is a **gate input**, so
+        it fails closed: an un-bootstrapped store has provably no rows and returns empty, but a
+        present-yet-unreadable / identity-mismatched store raises
+        :class:`DispatchOutboxFenceError` rather than reporting "no obligations". Not observing
+        an obligation is never the same as there being none.
+        """
+        names = tuple(dict.fromkeys(n for n in target_assigned_names if n))
+        if not names:
+            return ()
+        if not self.is_bootstrapped():
+            # Never bootstrapped: no reserve ever happened here, so nothing can be owed. This
+            # is a positive absence (the sidecar+DB pair does not exist), not a failed read.
+            return ()
+        conn = self._connect()
+        try:
+            placeholders = ", ".join("?" * len(names))
+            rows = conn.execute(
+                "SELECT target_assigned_name, state FROM dispatch_outbox "
+                f"WHERE workspace_id=? AND target_assigned_name IN ({placeholders}) "
+                "AND state IN (?, ?) ORDER BY target_assigned_name",
+                (workspace_id, *names, FENCE_RESERVED, FENCE_UNCERTAIN),
+            ).fetchall()
+        finally:
+            conn.close()
+        return tuple((str(row[0]), str(row[1])) for row in rows)
 
     def state_of(self, key: FenceKey) -> str:
         """The current fence state for the key, or :data:`FENCE_ABSENT` (fail-soft diagnostic).

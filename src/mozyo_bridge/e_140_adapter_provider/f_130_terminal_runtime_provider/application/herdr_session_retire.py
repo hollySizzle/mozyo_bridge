@@ -78,6 +78,26 @@ REASON_LANE_IS_DEFAULT = "lane_is_default"
 REASON_PROVIDER_UNRESOLVED = "provider_unresolved"
 REASON_IDENTITY_UNENCODABLE = "identity_unencodable"
 REASON_CLOSE_FAILED = "close_failed"
+#: A durable obligation is owed to one of this pair's slots (Redmine #13892 review j#80506 F4).
+#: A reserved / uncertain dispatch-outbox row means a send took the write lock against that
+#: assigned name and its fate is unresolved. A runtime ``idle`` / ``turn_ended`` reading cannot
+#: rule this out: receiver state and durable obligation are different axes, and the workflow
+#: contract forbids promoting a runtime signal into a gate verdict.
+REASON_WORK_OBLIGATION_PRESENT = "work_obligation_present"
+#: The durable obligation store could not be read. Not observing an obligation is not the same
+#: as there being none, so this fails closed rather than closing over unknown owed work.
+REASON_OBLIGATION_UNREADABLE = "obligation_unreadable"
+#: The post-close re-measure found the targeted unit still occupied (Redmine #13892 review
+#: j#80506 F3). A close command's return code is not proof the unit is empty; capacity is
+#: recovered only when the panes are actually gone.
+REASON_POST_CLOSE_RESIDUE = "post_close_residue"
+#: The post-close re-measure could not read a fresh inventory, so the unit's emptiness — the
+#: whole point of the retire — is unproven. The closes that committed are still reported.
+REASON_POST_CLOSE_UNREADABLE = "post_close_unreadable"
+#: Zero expected slots are live, but nothing proves THIS command retired them (Redmine #13892
+#: review j#80506 F1). A mistyped ``--lane`` and a never-launched pair are indistinguishable
+#: from a completed retire by absence alone, so absence is refused rather than celebrated.
+REASON_RETIRE_EVIDENCE_ABSENT = "retire_evidence_absent"
 
 #: The managed-event kinds this surface appends as its durable retirement outcome. It is
 #: an audit record, NOT lifecycle authority — capacity is recovered by the panes ceasing to
@@ -152,6 +172,11 @@ class SessionRetireOps(Protocol):
     def lifecycle_record_absent(self, workspace_id: str, lane_id: str) -> Optional[bool]:
         """``True`` = no record, ``False`` = a record exists, ``None`` = unreadable."""
 
+    def open_obligations(
+        self, workspace_id: str, assigned_names: Sequence[str]
+    ) -> Optional[tuple[tuple[str, str], ...]]:
+        """Durable obligations owed to these slots; ``None`` = unreadable (fail closed)."""
+
     def close(self, workspace_id: str, lane_id: str, targets):
         """Close exactly ``targets`` (``(role, locator)``); returns the close result."""
 
@@ -222,6 +247,21 @@ class LiveSessionRetireOps:
         except Exception:  # noqa: BLE001 - unreadable is NOT absent; fail closed
             return None
         return record is None
+
+    def open_obligations(self, workspace_id: str, assigned_names):
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            DispatchOutboxFence,
+            DispatchOutboxFenceError,
+        )
+
+        try:
+            return DispatchOutboxFence().open_obligations_for_targets(
+                workspace_id=workspace_id, target_assigned_names=tuple(assigned_names)
+            )
+        except (DispatchOutboxFenceError, OSError):
+            # Unreadable / identity-mismatched store: an obligation we cannot see is not an
+            # obligation that is absent. `None` routes the caller to a fail-closed refusal.
+            return None
 
     def close(self, workspace_id: str, lane_id: str, targets):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -479,11 +519,46 @@ def run_session_retire(
     if verdict.state == STATE_BLOCKED:
         return _blocked(verdict.reason, verdict.detail, **base)
     if verdict.state == STATE_ABSENT:
-        # A proven idempotent replay: readable inventory, zero expected slots live.
-        return SessionRetireVerdict(
-            state=STATE_ABSENT,
-            detail="no expected slot of this pair is live; nothing to close",
-            executed=bool(getattr(args, "execute", False)),
+        # Zero expected slots live over a readable inventory. This is NOT a retirement
+        # (review j#80506 F1): absence proves the pair is not here, never that THIS command
+        # retired it. A mistyped `--lane`, and a pair that never launched, land here
+        # identically — so reporting success would tell an operator their pair is retired
+        # while the real one stays live under the label they meant to type.
+        #
+        # Success on this branch requires positive evidence of a prior completed retire of
+        # this exact identity set. That evidence needs a durable store, and which store may
+        # legitimately hold it is an open design question raised to the gateway (see the
+        # design consultation on j#80506 F1/F2): `managed_events` is `append_only_lossy` and
+        # its charter forbids completion truth, a lane lifecycle row is forbidden by
+        # acceptance 4, and an isolated ledger was removed as an anti-pattern by #13842 R5.
+        # Until that is decided this branch fails closed, which is the safe half of F1.
+        return _blocked(
+            REASON_RETIRE_EVIDENCE_ABSENT,
+            "no slot of this pair is live, and there is no evidence this command retired it; "
+            "refusing to report a retirement it cannot prove (a mistyped --lane looks exactly "
+            "like this). Nothing was closed and nothing was written",
+            **base,
+        )
+
+    # Durable obligation gate (review j#80506 F4). The runtime facts the observation already
+    # cleared (idle / turn-ended / settled composer) prove only that no turn is IN FLIGHT —
+    # they are receiver state, and the workflow contract forbids reading a runtime signal as a
+    # workflow verdict. Work *owed* to a slot lives in a durable fence, so read it before any
+    # close. Placed before the read-only return too, so a preflight reports the same refusal.
+    obligations = live_ops.open_obligations(workspace_id, expected_names)
+    if obligations is None:
+        return _blocked(
+            REASON_OBLIGATION_UNREADABLE,
+            "the durable dispatch-obligation store could not be read; an obligation that "
+            "cannot be observed is not an obligation that is absent, so nothing is closed",
+            **base,
+        )
+    if obligations:
+        owed = ", ".join(f"{name} ({state})" for name, state in obligations)
+        return _blocked(
+            REASON_WORK_OBLIGATION_PRESENT,
+            f"durable work is owed to this pair ({owed}); a reserved / uncertain dispatch "
+            "means a send's fate is unresolved, which no idle runtime reading can rule out",
             **base,
         )
 
@@ -514,6 +589,53 @@ def run_session_retire(
             **base,
         )
 
+    # Whole-unit post-close re-measure (review j#80506 F3, the #13842 j#79320 R3 precedent).
+    # A close command's return code says the command was accepted, NOT that the unit is empty;
+    # capacity is recovered only when the panes are actually gone (`enumerate_active_lanes`
+    # folds live panes). Re-observe the WHOLE unit on a FRESH inventory and require a positive
+    # emptiness — expected slots absent AND no foreign / duplicate / unresolved occupant —
+    # before claiming a retirement. Anything else keeps the committed closes and fails closed.
+    after = observe_scratch_pair(
+        live_ops,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        expected_roles=expected_roles,
+    )
+    if not after.inventory_readable:
+        return SessionRetireVerdict(
+            state=STATE_BLOCKED,
+            reason=REASON_POST_CLOSE_UNREADABLE,
+            detail=(
+                "the close committed but a fresh inventory could not be read, so the unit's "
+                "emptiness is unproven; re-run to re-measure and complete"
+            ),
+            closed=closed,
+            executed=True,
+            **base,
+        )
+    residue = [slot.assigned_name for slot in after.slots if not slot.absent]
+    if residue or after.foreign_names or after.duplicate_slot_keys:
+        detail_bits = []
+        if residue:
+            detail_bits.append(f"expected slot(s) still live: {', '.join(residue)}")
+        if after.foreign_names:
+            detail_bits.append(f"foreign occupant(s): {', '.join(after.foreign_names)}")
+        if after.duplicate_slot_keys:
+            detail_bits.append("duplicate canonical slot(s) appeared")
+        return SessionRetireVerdict(
+            state=STATE_BLOCKED,
+            reason=REASON_POST_CLOSE_RESIDUE,
+            detail=(
+                "the close committed but the unit is not empty, so this is not a retirement ("
+                + "; ".join(detail_bits)
+                + ")"
+            ),
+            closed=closed,
+            foreign_names=tuple(after.foreign_names),
+            executed=True,
+            **{k: v for k, v in base.items() if k != "foreign_names"},
+        )
+
     durable = live_ops.record_retirement(
         workspace_id=workspace_id,
         lane_id=lane_id,
@@ -526,7 +648,9 @@ def run_session_retire(
     )
     return SessionRetireVerdict(
         state=STATE_GREEN,
-        detail=f"closed {len(closed)} slot(s) of the scratch pair",
+        detail=(
+            f"closed {len(closed)} slot(s); the unit re-measured empty on a fresh inventory"
+        ),
         closed=closed,
         durable_retirement=durable,
         executed=True,
@@ -567,6 +691,11 @@ __all__ = (
     "REASON_PROVIDER_UNRESOLVED",
     "REASON_IDENTITY_UNENCODABLE",
     "REASON_CLOSE_FAILED",
+    "REASON_WORK_OBLIGATION_PRESENT",
+    "REASON_OBLIGATION_UNREADABLE",
+    "REASON_POST_CLOSE_RESIDUE",
+    "REASON_POST_CLOSE_UNREADABLE",
+    "REASON_RETIRE_EVIDENCE_ABSENT",
     "SessionRetireVerdict",
     "SessionRetireOps",
     "LiveSessionRetireOps",

@@ -535,6 +535,23 @@ Table naming:
       ★deadness の positive 証明のみで進む: `classify_named_slot` が `SLOT_STALE` と積極判定した shell residue は agent 不在ゆえ
       turn / composer を持たず close 可 (runtime `unknown` だけで block すると residue が恒久残留する)。process mutation は
       **自 pair の pin-matched close のみ**で、worktree/branch 削除・launch/resume・store 直接 mutation は伴わない。
+      ★**durable obligation は runtime signal で代替できない**（review j#80506 F4）: idle / turn-ended / composer settled は
+      `ack-completion-receiver-state.md` の分類で言う **receiver state** であり「その slot に *owed* な work が無い」ことを
+      証明しない。close の前に対象 assigned name 宛の **非終端 dispatch-outbox row**（`reserved` / `uncertain`）を bounded read
+      （`DispatchOutboxFence.open_obligations_for_targets`）し、存在すれば `work_obligation_present`、store 不読は
+      `obligation_unreadable` で zero-close。`state_of` は完全な 6-tuple `FenceKey` を要するため「これから閉じる pane に owed な物」
+      を列挙できず、by-target read の新設が要った（既存 guard は不変の read-only 追加）。
+      ★**close の return code は空の証明ではない**（review j#80506 F3。#13842 j#79320 R3 の precedent を自 surface へ適用）:
+      close 後に **fresh inventory** で unit 全体を再測定し expected 全不在 + foreign/duplicate 不在を positive 確認できたときのみ
+      durable 記録 + success。residue は `post_close_residue`、不読は `post_close_unreadable` で、**commit 済み `closed` を保持した
+      まま** non-success。
+      ★**zero-slot は retirement ではない**（review j#80506 F1）: absence は「pair がここに無い」ことの証明であって「**この command が
+      retire した**」ことの証明ではなく、`--lane` typo と never-launched が absence として同一に見える。ゆえに
+      `retire_evidence_absent` で non-success / zero-write。**idempotent success（2 回目の run）と append 失敗からの repair は
+      load-bearing な durable proof store を要する**が、`managed_events` は `append_only_lossy` かつ「append 失敗は caller を壊さない」
+      「completion truth にしない」charter（`:153` / `:179` / `:826`）、lifecycle row は Acceptance 4 が禁止、isolated ledger は
+      #13842 j#79346 R5 が撤去済み — **3 契約が同時に閉じる**ため store 選定を設計判断として escalate 中（#13892 j#80511）。
+      本節はその裁定後に更新する。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
