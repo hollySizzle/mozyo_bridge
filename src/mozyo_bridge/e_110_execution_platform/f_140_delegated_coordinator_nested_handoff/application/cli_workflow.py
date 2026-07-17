@@ -58,6 +58,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_glance,
     register_glance,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain import (
+    register_drain_queue,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_review_escalation import (
+    register_review_escalation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_fences import (
+    register_fence_operator_parsers,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_dispatch_plan import (
     cmd_workflow_dispatch_plan,
     register_dispatch_plan,
@@ -845,72 +854,12 @@ def register(sub) -> None:
     register_resume(workflow_sub)
     register_watch(workflow_sub)
     register_glance(workflow_sub)
+    register_drain_queue(workflow_sub)
+    register_review_escalation(workflow_sub)
     register_callbacks(workflow_sub)
     register_supervisor(workflow_sub)
 
-    fence_p = workflow_sub.add_parser(
-        "dispatch-fence",
-        description=(
-            "Operator surface for the increment-2 worker-dispatch idempotency fence "
-            "(Redmine #13489). `--bootstrap` initializes it; `--recover` mints a fresh store "
-            "after a loss (only after reconciling the lost action + issuing a new action_id "
-            "upstream); no flag reports status. The reserve path never auto-creates the store."
-        ),
-        help="Bootstrap / recover / status the worker-dispatch idempotency fence.",
-    )
-    fence_p.add_argument(
-        "--bootstrap", dest="fence_bootstrap", action="store_true",
-        help="Initialize the fence store (safe first init; refuses on a detected loss).",
-    )
-    fence_p.add_argument(
-        "--recover", dest="fence_recover", action="store_true",
-        help="Deliberate loss recovery: mint a fresh store under a new nonce.",
-    )
-    fence_p.set_defaults(func=cmd_workflow_dispatch_fence)
-
-    lease_p = workflow_sub.add_parser(
-        "callback-lease",
-        description=(
-            "Operator surface for the callback-sweep attempt lease (Redmine #13889). "
-            "`--bootstrap` initializes it; `--recover` mints a fresh store after a loss, which "
-            "invalidates every outstanding grant (invoke ONLY after confirming no sweep is "
-            "mid-attempt); no flag reports status. `sublane callback-recovery --execute` never "
-            "auto-creates or auto-recovers the store: a silent re-create would hand a second live "
-            "owner the same anchor."
-        ),
-        help="Bootstrap / recover / status the callback-sweep attempt lease.",
-    )
-    lease_p.add_argument(
-        "--bootstrap", dest="lease_bootstrap", action="store_true",
-        help="Initialize the lease store (safe first init; refuses on a detected loss).",
-    )
-    lease_p.add_argument(
-        "--recover", dest="lease_recover", action="store_true",
-        help="Deliberate loss recovery: fresh store under a new nonce (invalidates all grants).",
-    )
-    lease_p.set_defaults(func=cmd_workflow_callback_lease)
-
-    register_callback_publication_parser(workflow_sub)
-
-    forward_fence_p = workflow_sub.add_parser(
-        "forward-fence",
-        description=(
-            "Operator surface for the herdr coordinator-forward generation store (Redmine #13583). "
-            "`--bootstrap` initializes it; `--recover` mints a fresh store after a loss (only after "
-            "reconciling the lost forward); no flag reports status. The `workflow step` execution "
-            "path never auto-creates the store (a loss must not resurrect a delivered forward)."
-        ),
-        help="Bootstrap / recover / status the herdr forward generation store.",
-    )
-    forward_fence_p.add_argument(
-        "--bootstrap", dest="fence_bootstrap", action="store_true",
-        help="Initialize the forward store (safe first init; refuses on a detected loss).",
-    )
-    forward_fence_p.add_argument(
-        "--recover", dest="fence_recover", action="store_true",
-        help="Deliberate loss recovery: mint a fresh forward store under a new nonce.",
-    )
-    forward_fence_p.set_defaults(func=cmd_workflow_forward_fence)
+    register_fence_operator_parsers(workflow_sub)
 
     step = workflow_sub.add_parser(
         "step",

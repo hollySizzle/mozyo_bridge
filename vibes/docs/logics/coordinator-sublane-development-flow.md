@@ -722,6 +722,16 @@ retire_blockers = active_lane, review_pending, owner_approval_pending, unresolve
 
 `retired` journal には removed / killed した worktree、pane、branch、`durable_anchor` (`retire_ready` journal) を残す。retirement は close を自己承認しない。
 
+## Early hibernate / dogfood 集約 / drain-queue / late-finding escalation (Redmine #13967)
+
+owner decision (Redmine #13967) は、feature lane の early hibernate、installed dogfood の集約、late-finding 面レビューを標準化し、coordinator の常駐 lane 回収を速める。配布正本 (portable rule) は各々次にあり、本 spine は再掲せず repo-local wiring だけを持つ。
+
+- **early hibernate** (feature lane の process 解放を ticket close / installed dogfood に直列結合しない): 配布正本は skill `references/workflow.md` `## Sublane hibernate (プロセス解放) と early hibernate` と central preset `## Completion` の hibernate 節。repo-local runtime は `sublane hibernate` の 2 park basis (`dependency` / `early_hibernate`)。early hibernate は same-lane Review Gate approved + staging integration (`main-next`) + required CI green を basis とし、dogfood / close を専用 release issue へ委譲する。pending review/callback/integration/work/prompt・dirty/unpushed・identity 不明は従来どおり fail-closed。retire (issue closed 前提) とは別 disposition であり、`## サブレーン退役` を置き換えない。
+- **dogfood 集約** (TestPyPI / installed dogfood を専用 release issue へ集約): 配布正本は skill `references/release.md` `## Release-dogfood の集約`。repo-local の非循環 exact-candidate gate は `vibes/docs/logics/release-flow.md` `### Internal beta の非循環 gate` と `#13528 → #13527` 順序を運用単位とする。委譲は release issue の durable link (source issue / exact SHA / acceptance / resume・close 条件) で表現する。
+- **drain-queue projection** (dependency drain queue の可視化と process retention): 配布正本は skill `references/workflow.md` `### Drain queue projection と process retention`。repo-local runtime は `mozyo-bridge workflow drain-queue` (read-only projection)。`### Drain Order` の bucket に委譲済み dogfood の `release_dogfood` bucket を加え、bucket ごとに `coordinator_actionable` / `delegated_in_flight` / `non_actionable_wait` を数え、`process_retention` (`hold` | `releasable`) を返す。`retirement` / `release_dogfood` は holding bucket から除外し (batch cleanup / release issue 委譲)、early hibernate の可否判断に使う。`### Lane State Classes` の enum は変えない。
+- **durable-event callback uptake** (#13968 fence 維持): 配布正本は skill `references/workflow.md` `### callback uptake は durable Redmine event を正本とする`。repo-local の fence 正本は #13968 callback supervisor workspace partition と `### callback 欠落時の sweep` / `#### sweep watermark contract`。sublane → coordinator uptake は durable Redmine event を正本とし、authoritative workspace 一意性・issue generation fence・historical replay suppression を維持する。pane ACK / process 終了を gate へ昇格しない。
+- **late-finding full-surface escalation** (同一 subsystem の反復 late authority finding → 次 round を full-surface adversarial sweep へ deterministic 昇格): 配布正本は central preset `### Late-Finding Full-Surface Adversarial Sweep Escalation`。repo-local runtime は `mozyo-bridge workflow review-escalation` (subsystem ごとの round history から escalate 要否と next_round_mode を deterministic 算出)。review / close authority は緩めない (scope を足すのみ)。
+
 ## 後続 Version / US 提案の順序
 
 後続計画は `$followup_contract()` の順序で扱う。実装前に必要な coordinator-owned 仕様決定は Redmine / cataloged doc に残し、新規セッション prompt 例は開始すべき issue ID と durable anchor 付きで提示する。

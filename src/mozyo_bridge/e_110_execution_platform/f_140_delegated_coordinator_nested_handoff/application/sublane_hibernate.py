@@ -14,14 +14,20 @@ hibernate signal — ``workflow.md`` stall discipline). Layered on the #13689 li
 substrate, exactly mirroring ``sublane supersede`` minus the ownership handover:
 
 1. **preflight (fail-closed)** — the lane's identity is known and *actively* owns the
-   issue, and every durable idle gate the operator asserts from the Redmine record holds:
-   the issue is explicitly parked/blocked, no coordinator callback is owed, no review /
+   issue, an **affirmative park basis** holds, and every durable idle gate the operator
+   asserts from the Redmine record holds: no coordinator callback is owed, no review /
    owner-approval / integration is pending, no composer input is pending, and no work is
-   in flight. A dirty worktree does **not** block (hibernate preserves the worktree) but
-   its uncommitted diff / resume next-action must be captured in a boundary journal first
-   — asserted via ``worktree_clean`` OR ``boundary_recorded`` (Design Answer Q2). Any unmet
-   gate blocks with a reason and mutates nothing; each flag defaults to the unsatisfied
-   (safe-failing) value.
+   in flight. There are two park bases (Redmine #13967 item 1): the original **dependency
+   park** (the issue is explicitly parked/blocked on a wait) and the standardized **early
+   hibernate** (a same-lane review-approved + staging-integrated + required-CI-green
+   feature lane whose TestPyPI / installed dogfood + close are delegated to the dedicated
+   release issue — so the lane hibernates without waiting for ticket close or installed
+   dogfood; unpushed commits fail closed here, since an early hibernate presupposes
+   integrated work). A dirty worktree does **not** block (hibernate preserves the
+   worktree) but its uncommitted diff / resume next-action must be captured in a boundary
+   journal first — asserted via ``worktree_clean`` OR ``boundary_recorded`` (Design Answer
+   Q2). Any unmet gate blocks with a reason and mutates nothing; each flag defaults to the
+   unsatisfied (safe-failing) value.
 2. **commit point** — :meth:`LaneLifecycleStore.transition_disposition` CAS-moves the lane
    ``active -> hibernated``. After this the lane draws zero active capacity (W4 roster
    join) and an explicit send to it is a zero-send (W3 gate, ``lane_hibernated``).
@@ -83,6 +89,22 @@ BLOCK_PENDING_PROMPT = "pending_composer_input"
 BLOCK_WORKING = "work_in_flight"
 BLOCK_UNRECORDED_BOUNDARY = "dirty_worktree_without_boundary_journal"
 BLOCK_INVENTORY_UNREADABLE = "inventory_unreadable"
+# Early-hibernate (Redmine #13967 item 1) unpushed fence: an early-hibernate basis
+# presupposes the commits are integrated to staging, so an early-hibernate attempt whose
+# commits are not pushed / origin-reachable fails closed (unlike a dependency park, which
+# deliberately preserves unpublished commits).
+BLOCK_UNPUSHED_COMMITS = "unpushed_commits"
+
+# Park-basis vocabulary (Redmine #13967 item 1): the two affirmative preconditions that
+# justify winding a lane's processes down. `dependency` is the original #13682 park (issue
+# explicitly parked/blocked on a wait). `early_hibernate` is the standardized new basis: a
+# same-lane review-approved + staging-integrated + required-CI-green feature lane whose
+# TestPyPI / installed dogfood + close are delegated to the dedicated release issue via a
+# durable park/delegation record (so the lane hibernates without waiting for ticket close
+# or installed dogfood). `none` = no affirmative basis (fail-closed).
+PARK_BASIS_DEPENDENCY = "dependency"
+PARK_BASIS_EARLY_HIBERNATE = "early_hibernate"
+PARK_BASIS_NONE = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +117,12 @@ class HibernateAssertions:
     """Durable-record facts no live probe can infer, asserted from the Redmine record.
 
     Every flag defaults to the unsatisfied (safe-failing) value, so a caller that omits
-    one fails closed. The lane must be explicitly parked/blocked with no outstanding
-    coordinator obligation before its processes are released:
+    one fails closed. The lane must have an affirmative park basis (dependency park OR
+    early hibernate — see :attr:`park_basis`) with no outstanding coordinator obligation
+    before its processes are released:
 
     - :attr:`explicitly_parked` — the issue is open AND explicitly parked/blocked (the
-      affirmative precondition; hibernate is never an idle-timeout kill, j#77485).
+      *dependency* park basis; hibernate is never an idle-timeout kill, j#77485).
     - :attr:`callbacks_drained` / :attr:`no_review_pending` /
       :attr:`no_owner_approval_pending` / :attr:`no_integration_pending` — no coordinator
       callback, review, owner approval, or integration is due on this lane.
@@ -119,6 +142,18 @@ class HibernateAssertions:
     not_working: bool = False
     worktree_clean: bool = False
     boundary_recorded: bool = False
+    # Early-hibernate park basis (Redmine #13967 item 1). The alternative affirmative
+    # precondition to `explicitly_parked`: a same-lane review-approved + staging-integrated
+    # + required-CI-green feature lane whose dogfood/close is delegated to the dedicated
+    # release issue. Every flag defaults False (fail-closed). The generic safety gates
+    # above (callbacks_drained / no_review_pending / no_integration_pending / lane_idle /
+    # boundary) are NOT weakened by this basis — in the early-hibernate case they are all
+    # satisfied (review approved => no review owed; integrated => no integration pending).
+    review_approved: bool = False
+    staging_integrated: bool = False
+    required_ci_green: bool = False
+    dogfood_delegated: bool = False
+    commits_pushed: bool = False
 
     @property
     def no_outstanding_obligation(self) -> bool:
@@ -139,17 +174,62 @@ class HibernateAssertions:
         return self.worktree_clean or self.boundary_recorded
 
     @property
+    def early_hibernate_qualified(self) -> bool:
+        """The early-hibernate basis holds (Redmine #13967 item 1).
+
+        Every early-hibernate precondition is affirmed: the same-lane Review Gate is
+        approved, the coordinator staging integration is recorded, required CI is green,
+        the TestPyPI / installed dogfood + close are delegated to the dedicated release
+        issue (a durable park/delegation record), and the commits are pushed /
+        origin-reachable (unpushed fails closed — an early hibernate presupposes the work
+        is integrated, unlike a dependency park which preserves unpublished commits).
+        """
+        return (
+            self.review_approved
+            and self.staging_integrated
+            and self.required_ci_green
+            and self.dogfood_delegated
+            and self.commits_pushed
+        )
+
+    @property
+    def early_hibernate_attempted(self) -> bool:
+        """True when an early-hibernate basis is being asserted (any early flag set) without
+        a dependency park. Used to surface the specific unpushed fence rather than a generic
+        ``not parked`` when the operator intends an early hibernate but has not pushed."""
+        return (not self.explicitly_parked) and (
+            self.review_approved
+            or self.staging_integrated
+            or self.required_ci_green
+            or self.dogfood_delegated
+        )
+
+    @property
+    def park_satisfied(self) -> bool:
+        """An affirmative park basis holds: a dependency park OR an early hibernate."""
+        return self.explicitly_parked or self.early_hibernate_qualified
+
+    @property
+    def park_basis(self) -> str:
+        if self.explicitly_parked:
+            return PARK_BASIS_DEPENDENCY
+        if self.early_hibernate_qualified:
+            return PARK_BASIS_EARLY_HIBERNATE
+        return PARK_BASIS_NONE
+
+    @property
     def preservation_satisfied(self) -> bool:
         """Every work-preservation gate holds (identity aside).
 
         The gate both the initial hibernate and the already-hibernated release re-drive
-        share (R1-F2): a lane whose processes are (re-)released must be explicitly parked,
-        owe no coordinator obligation, be idle (no work in flight / no pending composer),
-        and have its dirty diff captured. A partial-release retry re-checks this against the
-        lane's *current* state — a lane that has since started working is never closed.
+        share (R1-F2): a lane whose processes are (re-)released must have an affirmative
+        park basis (dependency park OR early hibernate), owe no coordinator obligation, be
+        idle (no work in flight / no pending composer), and have its dirty diff captured. A
+        partial-release retry re-checks this against the lane's *current* state — a lane
+        that has since started working is never closed.
         """
         return (
-            self.explicitly_parked
+            self.park_satisfied
             and self.no_outstanding_obligation
             and self.lane_idle
             and self.boundary_ok
@@ -166,7 +246,7 @@ class HibernatePreflight:
     """The fail-closed inputs + verdict of a hibernate preflight (pure)."""
 
     original_identity_known: bool
-    explicitly_parked: bool
+    park_satisfied: bool
     no_outstanding_obligation: bool
     lane_idle: bool
     boundary_ok: bool
@@ -177,7 +257,7 @@ class HibernatePreflight:
     def may_hibernate(self) -> bool:
         return (
             self.original_identity_known
-            and self.explicitly_parked
+            and self.park_satisfied
             and self.no_outstanding_obligation
             and self.lane_idle
             and self.boundary_ok
@@ -185,12 +265,21 @@ class HibernatePreflight:
         )
 
     @property
+    def park_basis(self) -> str:
+        return self.assertions.park_basis
+
+    @property
     def blocked_reasons(self) -> tuple[str, ...]:
         reasons: list[str] = []
         if not self.original_identity_known:
             reasons.append(BLOCK_ORIGINAL_IDENTITY)
-        if not self.explicitly_parked:
+        if not self.park_satisfied:
             reasons.append(BLOCK_NOT_PARKED)
+        # An intended early hibernate (Redmine #13967 item 1) whose commits are not pushed
+        # fails closed on the specific unpushed fence — surfaced even when the generic
+        # `not parked` already fired, so the operator sees the concrete unmet gate.
+        if self.assertions.early_hibernate_attempted and not self.assertions.commits_pushed:
+            reasons.append(BLOCK_UNPUSHED_COMMITS)
         # Each obligation names itself so the operator sees exactly which gate is unmet.
         if not self.assertions.callbacks_drained:
             reasons.append(BLOCK_CALLBACK_DEBT)
@@ -214,7 +303,8 @@ class HibernatePreflight:
         return {
             "may_hibernate": self.may_hibernate,
             "original_identity_known": self.original_identity_known,
-            "explicitly_parked": self.explicitly_parked,
+            "park_satisfied": self.park_satisfied,
+            "park_basis": self.park_basis,
             "no_outstanding_obligation": self.no_outstanding_obligation,
             "lane_idle": self.lane_idle,
             "boundary_ok": self.boundary_ok,
@@ -369,7 +459,7 @@ class SublaneHibernateUseCase:
         if not issue or not lane or not workspace_id or decision is None:
             preflight = HibernatePreflight(
                 original_identity_known=False,
-                explicitly_parked=request.assertions.explicitly_parked,
+                park_satisfied=request.assertions.park_satisfied,
                 no_outstanding_obligation=request.assertions.no_outstanding_obligation,
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
@@ -390,7 +480,7 @@ class SublaneHibernateUseCase:
         except (LaneLifecycleError, OSError):
             preflight = HibernatePreflight(
                 original_identity_known=False,
-                explicitly_parked=request.assertions.explicitly_parked,
+                park_satisfied=request.assertions.park_satisfied,
                 no_outstanding_obligation=request.assertions.no_outstanding_obligation,
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
@@ -430,7 +520,7 @@ class SublaneHibernateUseCase:
                 release = self._drive_release(key, lane, workspace_id, rows)
             preflight = HibernatePreflight(
                 original_identity_known=True,  # the hibernated lane is known
-                explicitly_parked=request.assertions.explicitly_parked,
+                park_satisfied=request.assertions.park_satisfied,
                 no_outstanding_obligation=request.assertions.no_outstanding_obligation,
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
@@ -460,7 +550,7 @@ class SublaneHibernateUseCase:
         )
         preflight = HibernatePreflight(
             original_identity_known=original_identity_known,
-            explicitly_parked=request.assertions.explicitly_parked,
+            park_satisfied=request.assertions.park_satisfied,
             no_outstanding_obligation=request.assertions.no_outstanding_obligation,
             lane_idle=request.assertions.lane_idle,
             boundary_ok=request.assertions.boundary_ok,
@@ -597,6 +687,11 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
             not_working=bool(getattr(args, "not_working", False)),
             worktree_clean=bool(getattr(args, "worktree_clean", False)),
             boundary_recorded=bool(getattr(args, "boundary_recorded", False)),
+            review_approved=bool(getattr(args, "review_approved", False)),
+            staging_integrated=bool(getattr(args, "staging_integrated", False)),
+            required_ci_green=bool(getattr(args, "required_ci_green", False)),
+            dogfood_delegated=bool(getattr(args, "dogfood_delegated", False)),
+            commits_pushed=bool(getattr(args, "commits_pushed", False)),
         ),
     )
     json_mode = bool(getattr(args, "json", False))
@@ -610,6 +705,100 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
     return 1 if outcome.is_blocked else 0
 
 
+def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
+    """Register ``sublane hibernate`` outside the at-ceiling core CLI module.
+
+    Mirrors the sibling ``register_sublane_resume_parser`` placement (the core CLI module
+    is at the module-health ceiling), keeping the hibernate parser next to its use case
+    (Redmine #13967). Includes the early-hibernate park-basis flags (item 1).
+    """
+    from mozyo_bridge.application.cli_common import add_repo_option
+
+    sublane_hibernate = sublane_sub.add_parser(
+        "hibernate",
+        help=(
+            "Redmine #13682: release an OPEN lane's managed gateway/worker processes "
+            "while preserving its worktree / branch / unpublished commits / lane metadata "
+            "/ durable callback route (tombstone-free — never closes the issue, removes a "
+            "worktree, or deletes a branch). Fail-closed preflight (lane actively owns the "
+            "issue; an affirmative park basis — dependency park or early hibernate; no "
+            "callback/review/owner/integration due; no pending composer; no work in "
+            "flight; a dirty worktree needs a boundary journal). Not an idle-timeout kill. "
+            "Default is preflight only; --execute performs the hibernate. Exits non-zero "
+            "when blocked. Resume with `sublane resume`."
+        ),
+    )
+    sublane_hibernate.add_argument(
+        "--issue", required=True, help="Redmine issue id the lane owns (stays open)"
+    )
+    sublane_hibernate.add_argument(
+        "--lane",
+        required=True,
+        help="Lane label to hibernate (e.g. issue_<id>_<slug>)",
+    )
+    sublane_hibernate.add_argument(
+        "--journal",
+        required=True,
+        help="Redmine journal id that authorizes the hibernate (durable anchor)",
+    )
+    # Durable-record invariants the operator asserts from the Redmine record (each
+    # defaults to unsatisfied so an omitted flag fails closed).
+    for _opt, _dest, _help in (
+        ("--explicitly-parked", "explicitly_parked",
+         "The issue is open and explicitly parked/blocked (dependency park basis)."),
+        ("--callbacks-drained", "callbacks_drained",
+         "The lane owes no outstanding coordinator callback."),
+        ("--no-review-pending", "no_review_pending",
+         "The lane has no review awaiting a result."),
+        ("--no-owner-approval-pending", "no_owner_approval_pending",
+         "The lane has no owner close approval pending."),
+        ("--no-integration-pending", "no_integration_pending",
+         "The lane has no integration disposition pending."),
+        ("--no-pending-prompt", "no_pending_prompt",
+         "The lane has no composer input pending."),
+        ("--not-working", "not_working", "The lane has no work in flight."),
+        ("--worktree-clean", "worktree_clean",
+         "The lane's worktree has no uncommitted diff (no boundary journal needed)."),
+        ("--boundary-recorded", "boundary_recorded",
+         "A boundary journal capturing the dirty worktree's diff / resume next-action "
+         "is recorded (required when the worktree is not clean)."),
+        # Early-hibernate park basis (Redmine #13967 item 1): the alternative to
+        # --explicitly-parked for a review-approved + staging-integrated feature lane
+        # whose dogfood/close is delegated to the dedicated release issue. All five must
+        # hold to qualify (each defaults unsatisfied -> fail closed).
+        ("--review-approved", "review_approved",
+         "Early hibernate: the same-lane Review Gate is approved with no open findings."),
+        ("--staging-integrated", "staging_integrated",
+         "Early hibernate: the coordinator staging integration is recorded (merged / "
+         "patch-equivalent to the staging branch)."),
+        ("--required-ci-green", "required_ci_green",
+         "Early hibernate: the required CI for the integrated commits is green."),
+        ("--dogfood-delegated", "dogfood_delegated",
+         "Early hibernate: TestPyPI / installed dogfood + close are delegated to the "
+         "dedicated release issue via a durable park/delegation record."),
+        ("--commits-pushed", "commits_pushed",
+         "Early hibernate: the lane's commits are pushed / origin-reachable (unpushed "
+         "fails closed — an early hibernate presupposes integrated work)."),
+    ):
+        sublane_hibernate.add_argument(
+            _opt, dest=_dest, action="store_true", help=_help
+        )
+    sublane_hibernate.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Perform the hibernate: CAS the disposition (active->hibernated) and release "
+            "the lane's managed processes. Without it this is preflight only (no mutation)."
+        ),
+    )
+    add_repo_option(sublane_hibernate)
+    sublane_hibernate.add_argument(
+        "--json", action="store_true", help="Emit structured JSON output"
+    )
+    sublane_hibernate.set_defaults(func=cmd_sublane_hibernate)
+
+
 __all__ = (
     "BLOCK_CALLBACK_DEBT",
     "BLOCK_INTEGRATION_PENDING",
@@ -619,7 +808,11 @@ __all__ = (
     "BLOCK_PENDING_PROMPT",
     "BLOCK_REVIEW_PENDING",
     "BLOCK_UNRECORDED_BOUNDARY",
+    "BLOCK_UNPUSHED_COMMITS",
     "BLOCK_WORKING",
+    "PARK_BASIS_DEPENDENCY",
+    "PARK_BASIS_EARLY_HIBERNATE",
+    "PARK_BASIS_NONE",
     "HibernateAssertions",
     "HibernateOutcome",
     "HibernatePreflight",
@@ -629,4 +822,5 @@ __all__ = (
     "SublaneHibernateUseCase",
     "cmd_sublane_hibernate",
     "format_hibernate_text",
+    "register_sublane_hibernate_parser",
 )
