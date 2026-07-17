@@ -182,8 +182,10 @@ def run_hibernated_pin_repair(
         LaneLifecycleStore,
         ProcessGenerationPin,
         ProcessPinError,
+        encode_declared_slots,
         norm,
         replacement_settled,
+        validate_declared_slots,
     )
     from mozyo_bridge.core.state.lane_lifecycle_readonly import (
         lifecycle_migration_payload,
@@ -461,7 +463,59 @@ def run_hibernated_pin_repair(
             lane_id=lane_label,
         )
     pin_payloads = tuple(p.as_payload() for p in pins)
+    # The EXACT bytes the CAS will compare the row's snapshot against, computed through the SAME
+    # validate -> encode path the CAS uses (Redmine #13879 review j#80547 F1). A preflight that
+    # compared any other way could report "byte-equal" where the authority reports "divergent",
+    # which is the very split this fixes.
+    try:
+        encoded_pins = encode_declared_slots(validate_declared_slots(tuple(pins)))
+    except ProcessPinError as exc:
+        return _blocked(
+            REPAIR_STORE_ERROR,
+            detail=f"the observed live pair could not be encoded ({exc}); fail closed",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            pins=pin_payloads,
+        )
     if not execute:
+        # A preflight must predict what --execute would do, on EVERY axis the CAS decides —
+        # including the ``declared_slots`` axis the base signature above deliberately leaves
+        # unchecked (a byte-equal replay legitimately finds a NON-empty snapshot, so emptiness
+        # is not a precondition). Reporting a bare "repairable" here regardless of the persisted
+        # snapshot made the public default disagree with --execute: a divergent row previewed as
+        # exit 0 while the CAS refused it (review j#80547 F1), and a byte-equal row previewed as
+        # "would repair" when the CAS writes nothing. The comparison stays a DIAGNOSTIC: it is
+        # confined to this preflight branch, so --execute always reaches the CAS, which re-reads
+        # the row under its lock and remains the sole authority (a stale preview must never
+        # refuse a row the authority would accept).
+        persisted = norm(record.declared_slots)
+        if persisted and persisted != encoded_pins:
+            return _blocked(
+                REPAIR_PINS_DIVERGENT,
+                detail=(
+                    "the row already carries a DIFFERENT pin snapshot than the observed live "
+                    "pair (a recycled / foreign generation); --execute would refuse it "
+                    "zero-write and never overwrite it"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+                pins=pin_payloads,
+            )
+        if persisted == encoded_pins:
+            # Non-empty and byte-equal (``pins`` always carries both slots, so an equal snapshot
+            # is never the empty one): the repair has already happened.
+            return PinRepairVerdict(
+                state=REPAIR_ALREADY,
+                detail=(
+                    "the row is already pinned to EXACTLY the observed live pair (byte-equal); "
+                    "the repair has already happened and --execute would write nothing"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+                executed=False,
+                repaired=False,
+                pins=pin_payloads,
+            )
         return PinRepairVerdict(
             state=REPAIR_REPAIRABLE,
             detail=(
@@ -593,8 +647,13 @@ def format_pin_repair_text(result: PinRepairVerdict) -> str:
             )
         else:
             lines.append("  -> fail-closed: pins NOT repaired; nothing was written")
-    elif not result.executed:
+    elif result.state == REPAIR_REPAIRABLE:
         lines.append("  (preflight only; re-run with --execute to repair the pins)")
+    elif result.state == REPAIR_ALREADY and not result.executed:
+        # Do NOT advertise --execute here: the row is already byte-equal, so --execute would
+        # write nothing. Telling the operator to re-run it would misdescribe the outcome
+        # (review j#80547 F1 — the preflight must predict what --execute actually does).
+        lines.append("  (preflight only; nothing to repair — the pins are already exact)")
     return "\n".join(lines)
 
 
