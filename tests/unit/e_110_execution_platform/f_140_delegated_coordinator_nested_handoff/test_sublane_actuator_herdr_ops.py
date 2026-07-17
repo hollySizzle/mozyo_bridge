@@ -11,6 +11,7 @@ explicit-lane dispatch argv, and the backend selector.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import stat
@@ -40,6 +41,24 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
+
+
+@contextlib.contextmanager
+def _no_probe_wait():
+    """Keep the #13948 startup probe's ROUNDS but not its sleeps (Redmine #13948).
+
+    `heal_lane_column` goes through `prepare_session`, which since #13948 waits a bounded
+    deadline for each requested role to come up. That bound is real production behaviour
+    and is deliberately NOT disabled here — the probe still performs every poll, so these
+    tests exercise the same retry path an operator hits. Only the wall-clock interval is
+    removed, so a scenario whose slot never comes up costs no seconds.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+        herdr_startup_health,
+    )
+
+    with patch.object(herdr_startup_health, "DEFAULT_PROBE_INTERVAL", 0.0):
+        yield
 
 
 class _StatefulHerdr:
@@ -188,31 +207,57 @@ class _SplitOnHealHerdr(_StatefulHerdr):
 
 
 class _ListControlHerdr(_StatefulHerdr):
-    """A herdr whose ``agent list`` can be made to fail / drop a role on a given call.
+    """A herdr whose ``agent list`` breaks in a named way once the relaunch has happened.
 
     ``fail_list_on`` is a set of 1-indexed ``agent list`` call numbers to answer with a
     non-zero exit (so ``_live_rows`` raises ``HerdrSessionStartError`` — an unreadable
-    inventory). ``drop_role_on`` is ``(call_number, name_substring)``: on that list call
-    the inventory omits the matching role (simulating a slot vanishing between the
-    relaunch and the postcondition read). Redmine #13705 R1-F3.
+    inventory). Ordinals are fine for a PREflight read, which is the first call by
+    construction.
+
+    ``fail_list_after_start`` / ``drop_role_after_start`` are the post-relaunch faults, and
+    they are deliberately NOT keyed on a call ordinal (Redmine #13948 correction, j#81034).
+    They were, and it made these tests depend on how many times `prepare_session` happens
+    to read the inventory internally — so adding the #13948 startup probe silently
+    re-aimed the fault at a probe read instead of the postcondition. Worse, the fault
+    itself changed the count (a dropped role makes the probe retry), so no fixed number
+    could be correct. Keyed on "the relaunch has happened" instead, each fault means what
+    the test says it means — the slot vanished / the inventory went unreadable after the
+    relaunch — for EVERY subsequent read, whoever makes it. Redmine #13705 R1-F3.
     """
 
-    def __init__(self, *, fail_list_on=(), drop_role_on=None, **kw):
+    def __init__(
+        self,
+        *,
+        fail_list_on=(),
+        fail_list_after_start=False,
+        drop_role_after_start=None,
+        **kw,
+    ):
         super().__init__(**kw)
         self._list_calls = 0
         self._fail_list_on = set(fail_list_on)
-        self._drop_role_on = drop_role_on
+        self._fail_list_after_start = fail_list_after_start
+        self._drop_role_after_start = drop_role_after_start
+
+    @property
+    def _relaunched(self) -> bool:
+        return bool(self.start_argvs)
 
     def run(self, argv, **kw):
         rest = list(argv[1:])
         if rest == ["agent", "list"]:
             self._list_calls += 1
-            if self._list_calls in self._fail_list_on:
+            unreadable = self._list_calls in self._fail_list_on or (
+                self._fail_list_after_start and self._relaunched
+            )
+            if unreadable:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr="herdr inventory unavailable"
                 )
-            if self._drop_role_on and self._list_calls == self._drop_role_on[0]:
-                keep = [a for a in self.agents if self._drop_role_on[1] not in a["name"]]
+            if self._drop_role_after_start and self._relaunched:
+                keep = [
+                    a for a in self.agents if self._drop_role_after_start not in a["name"]
+                ]
                 return subprocess.CompletedProcess(
                     argv, 0, stdout=json.dumps({"agents": keep}), stderr=""
                 )
@@ -220,6 +265,15 @@ class _ListControlHerdr(_StatefulHerdr):
 
 
 class HerdrSublaneOpsTest(unittest.TestCase):
+    def setUp(self):
+        # Every op here goes through `prepare_session`, which since #13948 waits a bounded
+        # deadline for each requested role to come up. Keep the ROUNDS (so these tests
+        # exercise the same retry path production does) and drop only the wall clock —
+        # otherwise a scenario whose slot never comes up costs 10s of real sleeping.
+        self._probe_wait = _no_probe_wait()
+        self._probe_wait.__enter__()
+        self.addCleanup(self._probe_wait.__exit__, None, None, None)
+
     def _ops(self, tmp, herdr, *, lane_label="issue_13331_x", issue="13331"):
         home = Path(tmp) / "home"
         home.mkdir(exist_ok=True)
@@ -735,15 +789,14 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         # Redmine #13705 R1-F3: an unreadable inventory AFTER the relaunch does not pass
         # as success — the same-tab placement is unverified, so it fails closed.
         # list calls: 1=preflight, 2=append(prepare_session), 3=postcondition.
-        herdr = _ListControlHerdr(fail_list_on={3})
+        herdr = _ListControlHerdr(fail_list_after_start=True)
         with tempfile.TemporaryDirectory() as tmp:
             ops, home = self._ops(tmp, herdr)
             worktree = Path(tmp) / "lane-wt"
             worktree.mkdir()
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 ops.append_lane_column(str(worktree))
-                # Reset the list counter so the heal's own 3 list calls are counted.
-                herdr._list_calls = 0
+                herdr.start_argvs.clear()  # arm the fault for the HEAL's relaunch only
                 herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
                 with self.assertRaises(RuntimeError) as ctx:
                     ops.heal_lane_column(str(worktree))
@@ -754,14 +807,14 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         # Redmine #13705 R1-F3: if the post-heal read-back cannot confirm BOTH slots
         # co-located (a slot vanished), the heal fails closed rather than reporting
         # success on an incomplete pair.
-        herdr = _ListControlHerdr(drop_role_on=(3, "_codex_"))
+        herdr = _ListControlHerdr(drop_role_after_start="_codex_")
         with tempfile.TemporaryDirectory() as tmp:
             ops, home = self._ops(tmp, herdr)
             worktree = Path(tmp) / "lane-wt"
             worktree.mkdir()
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 ops.append_lane_column(str(worktree))
-                herdr._list_calls = 0
+                herdr.start_argvs.clear()  # arm the fault for the HEAL's relaunch only
                 herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
                 with self.assertRaises(RuntimeError) as ctx:
                     ops.heal_lane_column(str(worktree))

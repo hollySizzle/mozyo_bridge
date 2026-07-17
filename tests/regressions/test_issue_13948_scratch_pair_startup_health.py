@@ -49,6 +49,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
     REASON_ACTION_UNKNOWN,
     REASON_ALREADY_ROLLED_BACK,
+    REASON_AUTHORITY_UNAVAILABLE,
     REASON_BLOCKED,
     REASON_INCOMPLETE,
     REASON_NOTHING_OWED,
@@ -864,6 +865,88 @@ class SessionRollbackRailTest(unittest.TestCase):
         replay = self._run(_RollbackOps([]), action, execute=True)
         self.assertTrue(replay.ok)
         self.assertEqual(replay.reason, REASON_ALREADY_ROLLED_BACK)
+
+    def test_a_completion_write_failure_withholds_success_rather_than_faking_it(self):
+        # The panes ARE gone; we simply cannot prove it durably. #13892 j#80526: withhold
+        # the success — there is no capacity leak either way, and a fabricated completion
+        # would let a later replay believe this action is settled when its record is not.
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        original = self.fence.set_phase
+
+        def _fail_completion(action_id, phase):
+            if phase == PHASE_COMPLETED_ROLLED_BACK:
+                raise StartupTransactionError("completion write refused")
+            return original(action_id, phase)
+
+        self.fence.set_phase = _fail_completion
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_INCOMPLETE)
+        self.assertTrue(verdict.executed)
+        # The record still says the debt stands, so a re-run resumes from proven facts.
+        self.fence.set_phase = original
+        self.assertEqual(self.fence.read(action.action_id).phase, PHASE_ROLLBACK_OWED)
+
+    def test_an_unreadable_post_close_inventory_withholds_success(self):
+        # A close's return code is not evidence of absence, and neither is a remeasure
+        # that could not be read (#13892 j#80506 F3).
+        action = self._owed_action()
+
+        class _BlindAfterClose(_RollbackOps):
+            def close(self, workspace_id, lane_id, targets):
+                result = super().close(workspace_id, lane_id, targets)
+                self.inventory_readable = False  # the world goes dark right after
+                return result
+
+        ops = _BlindAfterClose(self._rows("claude", "codex"))
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_INCOMPLETE)
+        self.assertEqual(self.fence.read(action.action_id).phase, PHASE_ROLLBACK_OWED)
+
+    def test_a_damaged_authority_refuses_and_closes_nothing(self):
+        action = self._owed_action()
+        self.fence.seal_path.unlink()  # a partial artifact set: something WAS here
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
+    def test_an_absent_authority_never_bootstraps_to_close_something(self):
+        # The reserve/rollback asymmetry, driven end to end: a rollback against a store
+        # that does not exist has no proof of anything and must not conjure one.
+        unknown = StartupTransactionFence(home=Path(self._tmp.name) / "elsewhere")
+        ops = _RollbackOps([])
+        verdict = run_session_rollback(
+            action_id=startup_action_id(self.unit, "n1"),
+            ops=ops,
+            fence=unknown,
+            execute=True,
+        )
+        self.assertEqual(verdict.reason, REASON_ACTION_UNKNOWN)
+        self.assertTrue(unknown.store_shape().absent)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_launching_action_that_died_mid_pair_is_still_recoverable(self):
+        # A run that died between two starts never reached its health check, so its phase
+        # is `launching` — and its first agent is exactly the orphan this rail exists for.
+        action = self.fence.reserve(self.unit, "n1")
+        self.fence.record_participant(
+            action.action_id,
+            Participant(
+                role="codex", assigned_name="mzb1_ws1_codex_lane-1", locator="w2G:p4"
+            ),
+        )
+        ops = _RollbackOps(self._rows("codex"))
+        verdict = run_session_rollback(
+            action_id=action.action_id, ops=ops, fence=self.fence, execute=True
+        )
+        self.assertTrue(verdict.ok)
+        self.assertEqual(
+            self.fence.read(action.action_id).phase, PHASE_COMPLETED_ROLLED_BACK
+        )
 
     def test_a_partial_rollback_resumes_rather_than_sticking(self):
         # The first attempt closes claude and fails on codex; the second finds claude

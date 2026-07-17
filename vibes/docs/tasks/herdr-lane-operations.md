@@ -105,6 +105,33 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
 3. worktree / local branch の除去は **統合後** (`git worktree remove` + `git branch -d|-D`)。remote branch は削除しない。
 
+## session-start が片role分だけ起動して失敗した場合 (#13948)
+
+`herdr session-start` は #13948 以降、requested role すべてが **launch した locator に live / startup screen clear /
+locator-matched self-attestation** を観測できるまで success を返さない。片方だけ落ちた run は **exit 非 0** で、role ごとに
+原因を名指しする (`provider_exited` / `shell_residue` / `startup_interaction_required` / `receiver_unreadable` /
+`attestation_timeout` / `attestation_mismatch` / `locator_drift` / `inventory_unreadable` / `unprofiled_provider` /
+`attestation_unavailable`)。**この run 自身は何も close しない**。
+
+1. 出力 (text の `action=` / `--json` の `action_id`) から **startup action id** を取る。rollback はこの id の下でしか動かない。
+2. read-only preflight: `mozyo-bridge herdr session-rollback --action-id <id> --json`
+   - 何が閉じられ、何が閉じられないかを role ごとに返す。ここでは **一切 close しない**。
+3. 全 participant が `eligible` のときだけ `--execute` を足す。**この action が起動した participant だけ**が対象で、
+   adopted slot・別 action の slot・durable name だけ一致する pane は決して閉じない。
+4. refusal はそのまま原因である。緩めない:
+   - `pending_input_present` — 誰かの未送信入力がある。**owner approval があっても本 rail では preserve** する。破棄が必要なら
+     `herdr session-retire` の `--pending-composer-discard-approval` (exact `direct_owner` marker) という**別 authority**へ回す。
+   - `work_obligation_present` / `obligation_unreadable` — durable ledger が work を owe している / 読めない。
+   - `identity_drift` / `ambiguous` — その pane はもう我々の物ではない / 重複名。
+   - `agent_busy` — turn 実行中。中断しない。
+   - `composer_unreadable` / `inventory_unreadable` — 読めないものを空とみなさない。
+5. `startup_interaction_required` (trust / login / theme) は **operator が provider の UI で承諾する**。mozyo は決して回答しない。
+   承諾後に `session-start` を再実行する (新しい action になる)。
+6. `attestation_unavailable` は launch env の PATH に `mozyo-bridge` が無く #13637 wrapper が乗らなかったことを意味する。
+   agent の boot identity が検証できないため success にはならない。PATH を直して再実行する。
+7. rollback が `rollback_incomplete` を返したら **debt は残る**。同じ `--action-id` で再実行してよい (resume する)。
+   `already_rolled_back` は record から答えた replay で、再 close はしない。
+
 ## hibernated bound pair の pins/stale 循環解消
 
 `sublane repair-pins` が `slot_stale` / `identity_unattested` を返し、同時に `sublane recover-pair` が

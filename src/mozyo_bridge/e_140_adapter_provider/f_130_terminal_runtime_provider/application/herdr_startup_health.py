@@ -44,7 +44,7 @@ not proof of liveness).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -215,6 +215,14 @@ def _attestation_of(
     return ATTESTATION_ABSENT if join.state == ATTEST_ABSENT else ATTESTATION_INVALID
 
 
+def _read_rows(list_rows: Lister):
+    """One inventory read. ``None`` on any failure — never an empty list (fail-closed)."""
+    try:
+        return list_rows()
+    except Exception:  # noqa: BLE001 - an unreadable inventory is never an empty one
+        return None
+
+
 def _observe_once(
     *,
     provider: str,
@@ -222,17 +230,20 @@ def _observe_once(
     launched_locator: str,
     workspace_id: str,
     lane: str,
-    list_rows: Lister,
+    rows,
     read_attestation: AttestationReader,
     read_visible: VisibleReader,
     attested_launch: bool = True,
     registry=None,
 ) -> tuple[str, str]:
-    """One full observation of a live slot -> ``(health, blocker_id)``."""
-    try:
-        rows = list_rows()
-    except Exception:  # noqa: BLE001 - an unreadable inventory is never an empty one
-        rows = None
+    """Classify one live slot against an ALREADY-READ inventory -> ``(health, blocker)``.
+
+    Takes ``rows`` rather than a lister on purpose (Redmine #13948 correction, j#81034):
+    the inventory read belongs to the poll ROUND, not to the slot. One read per round
+    means the call count is a function of how long the pair takes to come up, never of
+    how many roles were requested — and every role in a round is judged against the same
+    snapshot, so a pair can never be classified from two different views of the world.
+    """
     if rows is None:
         return HEALTH_INVENTORY_UNREADABLE, ""
     matches = [
@@ -291,6 +302,25 @@ def _observe_once(
     return health, (blocker_id if health == HEALTH_STARTUP_INTERACTION else "")
 
 
+def _slot_health(
+    *, slot_provider, assigned_name, locator, disposition, health, blocker_id
+) -> SlotHealth:
+    healthy = health == HEALTH_HEALTHY
+    owed = (not healthy) and disposition == DISPOSITION_FRESH_LAUNCHED
+    return SlotHealth(
+        provider=slot_provider,
+        assigned_name=assigned_name,
+        disposition=disposition,
+        health=health,
+        locator=locator,
+        blocker_id=blocker_id,
+        # This run started it and it did not come up: the effect is owed a compensation,
+        # which ONLY the explicit public rollback rail may perform (Answer j#80991).
+        compensation=COMPENSATION_ROLLBACK_OWED if owed else COMPENSATION_NOT_NEEDED,
+        detail=HEALTH_DETAIL.get(health, ""),
+    )
+
+
 def probe_startup_health(
     *,
     provider: str,
@@ -308,12 +338,15 @@ def probe_startup_health(
     interval: float = DEFAULT_PROBE_INTERVAL,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> SlotHealth:
-    """Observe one live slot until healthy, terminal, or the deadline expires.
+    """Observe ONE live slot until healthy, terminal, or the deadline expires.
 
-    Returns the LAST verdict, not an optimistic one: a slot that never becomes healthy
-    reports the reason it was in when the deadline ran out. ``polls`` / ``interval`` /
-    ``sleeper`` are injected so tests drive the deadline deterministically without wall
-    clock. Never raises — every port failure is already a named non-success.
+    The single-slot entry point (a caller with one role, and the unit under test for the
+    per-slot decision). :func:`probe_session_health` is what a run uses: it shares one
+    inventory read across every role of a poll round.
+
+    Returns the LAST verdict, not an optimistic one. ``polls`` / ``interval`` / ``sleeper``
+    are injected so tests drive the deadline deterministically without wall clock. Never
+    raises — every port failure is already a named non-success.
 
     ``disposition`` distinguishes a slot this run started from one it adopted. Both are
     probed (an adopted pair sitting on a trust screen is not a usable pair either —
@@ -330,7 +363,7 @@ def probe_startup_health(
             launched_locator=launched_locator,
             workspace_id=workspace_id,
             lane=lane,
-            list_rows=list_rows,
+            rows=_read_rows(list_rows),
             read_attestation=read_attestation,
             read_visible=read_visible,
             attested_launch=attested_launch,
@@ -340,19 +373,13 @@ def probe_startup_health(
             break
         if attempt < attempts - 1:
             sleeper(interval)
-    healthy = health == HEALTH_HEALTHY
-    owed = (not healthy) and disposition == DISPOSITION_FRESH_LAUNCHED
-    return SlotHealth(
-        provider=provider,
+    return _slot_health(
+        slot_provider=provider,
         assigned_name=assigned_name,
+        locator=launched_locator,
         disposition=disposition,
         health=health,
-        locator=launched_locator,
         blocker_id=blocker_id,
-        # This run started it and it did not come up: the effect is owed a compensation,
-        # which ONLY the explicit public rollback rail may perform (Answer j#80991).
-        compensation=COMPENSATION_ROLLBACK_OWED if owed else COMPENSATION_NOT_NEEDED,
-        detail=HEALTH_DETAIL.get(health, ""),
     )
 
 
@@ -376,9 +403,12 @@ class StartupProbe:
     """
 
     visible_reader: Optional[VisibleReader] = None
-    polls: int = DEFAULT_PROBE_POLLS
-    interval: float = DEFAULT_PROBE_INTERVAL
-    sleeper: Callable[[float], None] = time.sleep
+    # Resolved at CONSTRUCTION, not at class definition: a dataclass default is baked in
+    # at import, so a caller (or a test) that rebinds the module-level bound would have no
+    # effect at all — silently, which is the worst way for a knob to not work.
+    polls: int = field(default_factory=lambda: DEFAULT_PROBE_POLLS)
+    interval: float = field(default_factory=lambda: DEFAULT_PROBE_INTERVAL)
+    sleeper: Callable[[float], None] = field(default_factory=lambda: time.sleep)
     registry: object = None
 
 
@@ -433,51 +463,94 @@ def probe_session_health(
     a two-role pair does not pay one deadline per role. Slots that this run only planned
     or surfaced read-only are returned untouched with ``health = not_probed`` — which is
     not success, and is exactly how a ``stale_named_slot`` pair stops exiting 0.
+
+    **One inventory read per poll round, shared by every role** (Redmine #13948 correction,
+    j#81034). Two reasons, and both are contract:
+
+    - *Cost*: `session-start` (and `heal_lane_column`, which calls it) previously issued
+      exactly one ``agent list``. A per-slot-per-poll read made that count a function of
+      how many roles were requested, which broke callers that reason about the herdr call
+      sequence — a real regression this correction removes rather than renumbers.
+    - *Consistency*: every role in a round is judged against the SAME snapshot. Reading
+      per slot lets a pair be classified from two different views of the world, so "claude
+      gone, codex live" could be an artifact of read ordering rather than a fact.
+
+    The deadline is bounded and explicit: at most ``probe.polls`` rounds spaced by
+    ``probe.interval`` (default 40 x 0.25s = 10s), spent only while at least one slot is
+    still in a legitimately transient state. A pair that comes up healthy costs ONE round;
+    a terminal verdict (trust screen, drift, unprofiled, attestation mismatch, unwrapped
+    launch) short-circuits without waiting. That bound is what `heal_lane_column` inherits.
     """
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
         SlotResult,
     )
 
     cfg = probe or StartupProbe()
-    probed: list = []
-    for slot in slots:
+    targets = []
+    for index, slot in enumerate(slots):
         disposition = _PROBED_DISPOSITION.get(slot.outcome, "")
-        if not disposition or not slot.locator:
-            probed.append(slot)
-            continue
-        health = probe_startup_health(
-            provider=slot.provider,
-            assigned_name=slot.assigned_name,
-            launched_locator=slot.locator,
-            workspace_id=workspace_id,
-            lane=lane,
-            list_rows=list_rows,
-            read_attestation=read_attestation,
-            read_visible=read_visible,
-            disposition=disposition,
-            # The wrap fact is a property of THIS run's launches. An adopted slot was
-            # started by an earlier run, whose own wrapper (or lack of one) already
-            # decided whether it has a record — and pass 1 only adopts when it does.
-            attested_launch=(
-                attested_launch or disposition != DISPOSITION_FRESH_LAUNCHED
-            ),
-            registry=cfg.registry,
-            polls=cfg.polls,
-            interval=cfg.interval,
-            sleeper=cfg.sleeper,
-        )
-        probed.append(
-            SlotResult(
+        if disposition and slot.locator:
+            targets.append((index, slot, disposition))
+    if not targets:
+        return list(slots)
+
+    verdicts: dict = {}
+    attempts = max(1, int(cfg.polls))
+    for attempt in range(attempts):
+        rows = _read_rows(list_rows)  # the round's single view of the live world
+        pending = False
+        for index, slot, disposition in targets:
+            settled = verdicts.get(index)
+            if settled is not None and (
+                settled[0] == HEALTH_HEALTHY or settled[0] not in _RETRYABLE
+            ):
+                continue  # already decided; do not re-read a settled slot
+            health, blocker_id = _observe_once(
                 provider=slot.provider,
                 assigned_name=slot.assigned_name,
-                outcome=slot.outcome,
-                locator=slot.locator,
-                detail=slot.detail,
-                health=health.health,
-                blocker_id=health.blocker_id,
-                compensation=health.compensation,
-                health_detail=health.detail,
+                launched_locator=slot.locator,
+                workspace_id=workspace_id,
+                lane=lane,
+                rows=rows,
+                read_attestation=read_attestation,
+                read_visible=read_visible,
+                # The wrap fact is a property of THIS run's launches. An adopted slot was
+                # started by an earlier run, whose own wrapper (or lack of one) already
+                # decided whether it has a record — and pass 1 only adopts when it does.
+                attested_launch=(
+                    attested_launch or disposition != DISPOSITION_FRESH_LAUNCHED
+                ),
+                registry=cfg.registry,
             )
+            verdicts[index] = (health, blocker_id)
+            if health != HEALTH_HEALTHY and health in _RETRYABLE:
+                pending = True
+        if not pending:
+            break
+        if attempt < attempts - 1:
+            cfg.sleeper(cfg.interval)
+
+    probed: list = list(slots)
+    for index, slot, disposition in targets:
+        health, blocker_id = verdicts[index]
+        settled = _slot_health(
+            slot_provider=slot.provider,
+            assigned_name=slot.assigned_name,
+            locator=slot.locator,
+            disposition=disposition,
+            health=health,
+            blocker_id=blocker_id,
+        )
+        probed[index] = SlotResult(
+            provider=slot.provider,
+            assigned_name=slot.assigned_name,
+            outcome=slot.outcome,
+            locator=slot.locator,
+            detail=slot.detail,
+            health=settled.health,
+            blocker_id=settled.blocker_id,
+            compensation=settled.compensation,
+            health_detail=settled.detail,
         )
     return probed
 

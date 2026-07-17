@@ -632,9 +632,14 @@ Table naming:
       (各 surface が自らの signature を literal に述べる規律の適用。共有 predicate へ一般化しない)。lifecycle store が **不読**の
       場合は「record 無し」と読まず fail-closed。★**attestation を要求しない** (#13892 j#80483、#13842 の意図的反転):
       #13842 が attestation を要るのは generation-bound pin を row へ **write** するためだが、scratch pair は row も generation も
-      持たず attestation は構造的に取得不能 (session-start は self-attest 前に pane を返す)。要求すれば本 rail が対象とする唯一の
-      shape (live-but-unattested = #13882 の保全 pair そのもの) を恒久 retire 不能にし、**over-block による恒久 stuck**
-      (#13845 が名指しした defect 再生産) を作る。identity は assigned-name の injective encoding + uniqueness
+      持たない。**根拠は recovery compatibility であって「session-start が attest を待たない」ことではない** (#13948 j#80989
+      Documentation disposition による書き換え): #13948 以降 `session-start` は fresh launch を **fully successful と報告する前に**
+      bounded startup health + locator-matched self-attestation を待つ (`herdr_startup_health.probe_session_health`)。それでも
+      **wrapper 自体は non-blocking のまま**であり (`herdr_agent_attest`)、unwrapped fallback (`attest_launcher == ""`)・旧 runtime・
+      launch 途中の crash・health が非 green のまま残った pair では **unattested な live pair が現に残りうる**。本 rail が回収するのは
+      まさにその集合なので、attestation を close prerequisite にすれば対象そのもの (live-but-unattested = #13882 の保全 pair) を
+      恒久 retire 不能にし、**over-block による恒久 stuck** (#13845 が名指しした defect 再生産) を作る。**success 条件の強化を
+      retirement の over-block へ伝播させない**のが両者の分界である。identity は assigned-name の injective encoding + uniqueness
       (`session-start` が重複名で fail-closed) + foreign 不在 + duplicate 不在 + locator 一意で証明する。★**partial close は
       block せず resume** (#13847 R1-F1 と同型): 前 run で閉じた slot は positive absence として観測し残りを閉じる。#13842 の
       `pair_incomplete` block を踏襲すると中断した retire が恒久 stuck になる。acceptance 2 の「expected slot ちょうど 2」は
@@ -686,6 +691,32 @@ Table naming:
       **live exact pair が positively present ∧ 全 artifact absent** の時のみ（同一 lock 下で serialize）で、**zero-slot は決して
       bootstrap しない**（失われた authority の無言再作成を防ぐ）。★**relaunch 誤認防止**: `completed` の後に新しい live slots が
       現れたら **新しい attempt（revision+1）** を開き、古い completion を稼働中 pair の proof に流用しない。
+    - **session-start startup transaction** (`startup_transaction_fence.sqlite`、#13948、設計 j#80989 Q3)。
+      **第 5 の state kind ではなく、第 4 の kind (operational action-idempotency / side-effect transaction authority) の
+      2 つ目の住人**である。`scratch_retirement_fence` とは **store も unit も completion も共有しない**: あちらの unit/table/
+      completion は *retirement* を意味し、launch rollback を同 unit の attempt として開くと **古い retirement completion が
+      live な launch の proof として誤読される** (あちら自身の「relaunch 誤認防止」が禁じている形)。借りるのは pattern だけ
+      — external close を跨ぐ nonblocking advisory lock / reserve-before-effect / revision+replay / artifact tri-state /
+      fresh whole-unit remeasure / completion-write fail-closed。
+      - **unit** = workspace + lane + requested provider set + action nonce。nonce が無いと「同じ操作者が同じ lane で
+        再実行した run」が前の run の record を継承し、rollback が **自分が起動していない pane** を閉じうる。
+      - **participants** = provider / assigned-name / launch locator / launch receipt。各 fresh launch の**直後**に記録する
+        (最後にまとめて記録すると、2 つの start の間で死んだ run — まさに partial pair — の第 1 agent が誰の物か分からなくなる)。
+      - **phases** = `planned` → `launching` → `health_check` → `rollback_owed` | `success_owed` → `completed_rolled_back` |
+        `completed_success`。terminal は write-once で、replay は record から答える (再 close しない)。
+      - **reserve は bootstrap 可 / rollback は不可** (意図的な非対称): reserve は *新しい* identity を作るので何も忘れない。
+        absent store に対する rollback は proof を持たないため fail-closed。ここで bootstrap すると失われた authority を
+        無言で再作成し、その上で pane を閉じることになる。
+      - `session-start` は **debt を記録するだけで close しない** (j#80991)。destructive compensation は explicit public rail
+        `herdr session-rollback --action-id <id> [--execute]` のみが行い、対象は **同 action の participant** に限る。
+        adopted / foreign / newer / identity drift / duplicate / obligation-present / busy / unreadable は zero-close。
+        composer は 3 値を保つ: 捨てられるのは **transaction 自身が生んだ startup UI** (認識済み provider startup blocker で、
+        誰も打鍵していないもの) だけで、LLM / operator が投入した composer body は **owner approval の有無に関わらず preserve**
+        する。generic pending-composer discard authority (#13918 / #13933 の `direct_owner`) は**拡張しない**。
+        trust screen には**回答しない** (承諾は provider 自身の UI 上の operator action)。
+      - close の return code は不在の証明ではない: close 後に fresh whole-unit remeasure で participant の positive absence を
+        確認し、durable completion write が成功したときだけ rollback success。close 失敗 / residue / 不読 / completion write
+        失敗は role 別 non-success として残し、debt を保持する (中断した rollback は再実行で resume する)。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
