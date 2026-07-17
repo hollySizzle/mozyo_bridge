@@ -92,13 +92,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     list_herdr_agent_rows,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    WorkflowProviderUnresolved,
     resolve_gateway_provider,
     resolve_worker_provider,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     _agent_locator,
+    _norm_lane as norm_lane,
+    decode_assigned_name,
 )
+
+
+def _action_closed_providers(slots: Sequence[BoundSlot]) -> tuple[str, ...]:
+    """Provider roles whose live absence is proven by this action's own immutable close.
+
+    ``close_proven`` is set only where the slot has no live row AND the transaction pinned by
+    the approved action id carries that participant past ``close_owed``.
+    """
+    return tuple(slot.provider for slot in slots if slot.close_proven)
 
 
 def _convergence_request(request: PrepareBoundPairRequest) -> ConvergeBoundPairRequest:
@@ -116,9 +128,64 @@ class _SnapshotQuarantineOps(LiveSublaneQuarantineOps):
     """Run the pending-composer classifier against one already-read inventory."""
 
     snapshot_rows: Sequence[Mapping[str, object]] = ()
+    #: Provider roles whose live row is absent *because this immutable action closed it*
+    #: (Redmine #13933 j#80934).  Only a caller holding that transaction proof may set this.
+    action_closed_roles: tuple[str, ...] = ()
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         return self.snapshot_rows
+
+    def _pair_ok(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        workspace_id: str,
+        lane: str,
+    ) -> bool:
+        """Admit the sibling absence this action itself caused, and nothing else.
+
+        The inherited pair fence requires BOTH provider rows live and co-placed.  A
+        ``prepare-bound-pair`` run that closed one role and then failed to relaunch destroys
+        that premise with its own effect, so the still-owed role reads as
+        ``generation_mismatch`` and the transaction can never be replayed (j#80934).  The
+        absence is re-admitted only for a role whose close THIS transaction proves, and only
+        while that role stays absent — a reappeared or foreign sibling falls back to the
+        inherited fence, which is the authority for every live row.
+        """
+        if super()._pair_ok(rows, workspace_id=workspace_id, lane=lane):
+            return True
+        if not self.action_closed_roles:
+            return False
+        try:
+            providers = set(self._providers())
+        except WorkflowProviderUnresolved:
+            return False
+        closed = {norm(role) for role in self.action_closed_roles}
+        # A proper subset: a wholly action-closed pair has no live composer left to classify.
+        if not closed < providers:
+            return False
+        live: list[str] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
+            if not decoded.ok or decoded.identity is None:
+                continue
+            identity = decoded.identity
+            if (
+                identity.workspace_id == workspace_id
+                and norm_lane(identity.lane_id) == norm_lane(lane)
+                and identity.role in providers
+            ):
+                live.append(identity.role)
+        # Every role this action closed must still be gone (a reappeared sibling is a live row
+        # the inherited fence owns), and every other role of the pair must still be live and
+        # unique.  Identity / revision / cwd of the classified row remain the caller's fences.
+        return (
+            len(live) == len(set(live))
+            and not (closed & set(live))
+            and (providers - closed) <= set(live)
+        )
 
 
 @dataclass
@@ -258,6 +325,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         assigned_name: str,
         locator: str,
         rows: Sequence[Mapping[str, object]] | None = None,
+        action_closed_roles: Sequence[str] = (),
     ) -> bool:
         """Positive raw facts for one uncorrelated, non-productive pending composer."""
         if rows is None:
@@ -283,6 +351,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 repo_root=Path(request.worktree).expanduser(),
                 env=self.env,
                 snapshot_rows=rows,
+                action_closed_roles=tuple(action_closed_roles),
             ).inspect(
                 QuarantineRequest(
                     issue=request.issue,
@@ -510,7 +579,6 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         live.snapshot_rows = tuple(rows)
         live.target_workspace_id = workspace
         slots: list[BoundSlot] = []
-        discard: list[str] = []
         for role, provider in providers:
             slot_observation, locator, assigned = live.observe_slot(
                 role=role,
@@ -529,27 +597,33 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                     locator = participant.old_locator
                     disposition = SLOT_RECOVER
                     close_proven = True
-            slot = BoundSlot(
-                role=role,
-                provider=provider,
-                assigned_name=assigned,
-                locator=locator,
-                disposition=disposition,
-                close_proven=close_proven,
-            )
-            slots.append(slot)
-            if (
-                disposition == SLOT_PRESERVE_PENDING
-                and self._composer_discardable(
-                    request,
+            slots.append(
+                BoundSlot(
                     role=role,
                     provider=provider,
                     assigned_name=assigned,
                     locator=locator,
-                    rows=rows,
+                    disposition=disposition,
+                    close_proven=close_proven,
                 )
-            ):
-                discard.append(role)
+            )
+        # Discardability is decided only after the whole pair is known: a sibling this action
+        # already closed must not read as a broken pair for the role still owed (j#80934).
+        action_closed = _action_closed_providers(slots)
+        discard = [
+            slot.role
+            for slot in slots
+            if slot.disposition == SLOT_PRESERVE_PENDING
+            and self._composer_discardable(
+                request,
+                role=slot.role,
+                provider=slot.provider,
+                assigned_name=slot.assigned_name,
+                locator=slot.locator,
+                rows=rows,
+                action_closed_roles=action_closed,
+            )
+        ]
         return PreparationObservation(
             workspace_id=workspace,
             worktree_path=str(worktree),
@@ -573,6 +647,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         self, request: PrepareBoundPairRequest, *, action_id: str = ""
     ) -> PreparationObservation:
         base = super().observe(_convergence_request(request), action_id=action_id)
+        # With an action id the base projects the slots this action already closed; that proof
+        # is what lets the role still owed keep its discard authority on a replay (j#80934).
+        action_closed = _action_closed_providers(base.slots)
         discard: list[str] = []
         rejected_pending: list[str] = []
         for slot in base.slots:
@@ -584,6 +661,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 provider=slot.provider,
                 assigned_name=slot.assigned_name,
                 locator=slot.locator,
+                action_closed_roles=action_closed,
             ):
                 discard.append(slot.role)
             else:
@@ -835,6 +913,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         # On retry, a still-owed close must remain the exact approved uncorrelated pending
         # composer.  Later phases rely on the immutable close proof and may legitimately have
         # an absent or freshly launched slot.
+        current_action_closed = _action_closed_providers(current.slots)
         for participant in current_record.participants:
             if participant.phase != PARTICIPANT_CLOSE_OWED:
                 continue
@@ -851,6 +930,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                     provider=participant.provider,
                     assigned_name=participant.assigned_name,
                     locator=participant.old_locator,
+                    action_closed_roles=current_action_closed,
                 )
             ):
                 return PreparationDrive(False, "transaction_conflict", "owed close lost discard authority")

@@ -89,6 +89,7 @@ class PreparationOutcome:
     discard_roles: tuple[str, ...] = ()
     executed: bool = False
     replacement_status: str = ""
+    resuming: bool = False
 
     @property
     def is_blocked(self) -> bool:
@@ -110,6 +111,7 @@ class PreparationOutcome:
             "discard_roles": list(self.discard_roles),
             "executed": self.executed,
             "replacement_status": self.replacement_status or None,
+            "resuming": self.resuming,
             "is_blocked": self.is_blocked,
             "pins_repaired": False,
             "resumed": False,
@@ -243,6 +245,48 @@ def _approved(fields: Sequence[Mapping[str, str]]) -> PreparationExpectation | N
     return None
 
 
+def _resume_preflight(
+    request: PrepareBoundPairRequest,
+    ops: BoundPairPreparationOps,
+    initial: PreparationObservation,
+) -> PreparationOutcome | None:
+    """Report the replay this pair's own in-flight action still owns, else ``None``.
+
+    A pair half-replaced by a previous run no longer digests to the approved action id, so the
+    transaction-blind classification above blocks work THIS action owns and the operator reads
+    a dead end (j#80934).  The approval the caller already names is the anchor: re-observing
+    under its exact action id projects only the slots this immutable transaction proves it
+    closed.  A projection identical to the raw observation means no action owns this pair, so
+    the original block stands.  Read-only, and ``--execute`` re-validates everything.
+    """
+    try:
+        fields = tuple(ops.approval_fields(request.issue, request.journal))
+    except Exception:  # noqa: BLE001 - a credential/network failure resumes nothing
+        return None
+    approved = _approved(fields)
+    if approved is None or approved.issue != request.issue or approved.lane != request.lane:
+        return None
+    projected = ops.observe(request, action_id=approved.action_id)
+    if projected == initial:
+        return None
+    terminal, _expected = _classify(request, projected)
+    if terminal is not None:
+        return None
+    return PreparationOutcome(
+        request=request,
+        state=STATE_ACTIONABLE,
+        detail=(
+            "this pair's own in-flight action has partial progress; --execute replays the "
+            "same immutable transaction under the approval already recorded"
+        ),
+        action_id=approved.action_id,
+        approval_marker=approved.marker(),
+        slots=projected.slots,
+        discard_roles=approved.discard_roles,
+        resuming=True,
+    )
+
+
 def run_bound_pair_preparation(
     request: PrepareBoundPairRequest,
     *,
@@ -253,7 +297,7 @@ def run_bound_pair_preparation(
     terminal, expected = _classify(request, initial)
     if not execute:
         if terminal is not None:
-            return terminal
+            return _resume_preflight(request, ops, initial) or terminal
         assert expected is not None
         return PreparationOutcome(
             request=request,
@@ -309,6 +353,8 @@ def format_preparation_text(outcome: PreparationOutcome) -> str:
         f"sublane prepare-bound-pair: {outcome.request.lane} (issue {outcome.request.issue})",
         f"  state: {outcome.state} executed: {outcome.executed}",
     ]
+    if outcome.resuming:
+        lines.append("  resuming: this pair's own in-flight replacement action")
     if outcome.reason:
         lines.append(f"  reason: {outcome.reason}")
     if outcome.detail:

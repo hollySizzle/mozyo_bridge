@@ -26,6 +26,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     PHASE_DRAINING_CONTINUATION,
     PHASE_REPLACING_NONSELF,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    sublane_quarantine as quarantine_module,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (
     ReplacementActuatorUseCase,
 )
@@ -70,6 +73,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     marker_fields_in_note,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    encode_assigned_name,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
     ACTUATION_IN_PROGRESS,
@@ -586,6 +592,200 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
                 progress_proven_roles=("gateway",),
             )
         )
+
+
+class PartialEffectPairCoherenceTests(unittest.TestCase):
+    """#13846 j#80933 live shape: this action closed the gateway, then the launch failed.
+
+    The pair fence inherited from the quarantine classifier requires BOTH provider rows live,
+    so the action's own close made the role still owed read as ``generation_mismatch`` — the
+    transaction could never be replayed (j#80934).  These drive the real classifier: the
+    previous rails only ever asserted against hand-authored ``discard_roles``.
+    """
+
+    WS = "mzb1workspace"
+    GATEWAY_PROVIDER = "codex"
+    WORKER_PROVIDER = "claude"
+
+    def setUp(self) -> None:
+        self.worktree = tempfile.mkdtemp()
+        self.request = PrepareBoundPairRequest(
+            issue="13933", journal="80925", lane=REQ.lane,
+            worktree=self.worktree, branch=REQ.branch,
+        )
+        self.gateway_name = encode_assigned_name(self.WS, self.GATEWAY_PROVIDER, REQ.lane)
+        self.worker_name = encode_assigned_name(self.WS, self.WORKER_PROVIDER, REQ.lane)
+
+    def _row(self, name, locator, *, tab="w28:t1"):
+        return {
+            "name": name, "pane_id": locator, "workspace_id": self.WS,
+            "tab_id": tab, "revision": 7, "foreground_cwd": self.worktree,
+        }
+
+    def _discardable(self, rows, *, action_closed=()):
+        ops = LiveBoundPairPreparationOps(repo_root=Path(self.worktree), env={})
+        with mock.patch.object(
+            quarantine_module, "repo_scope_workspace_id", return_value=self.WS
+        ), mock.patch.object(
+            quarantine_module, "resolve_gateway_provider", return_value=self.GATEWAY_PROVIDER
+        ), mock.patch.object(
+            quarantine_module, "resolve_worker_provider", return_value=self.WORKER_PROVIDER
+        ), mock.patch.object(
+            quarantine_module, "_resolve_binary_or_die", return_value="herdr"
+        ), mock.patch.object(
+            quarantine_module, "HerdrCliAgentStateReader"
+        ) as state, mock.patch.object(
+            quarantine_module, "HerdrCliTransport"
+        ) as transport, mock.patch.object(
+            quarantine_module, "observe_composer_text",
+            return_value=quarantine_module.ComposerObservation(True, True),
+        ):
+            state.return_value.read_agent_state.return_value = SimpleNamespace(
+                ok=True, state="idle"
+            )
+            transport.return_value.read_pane.return_value = SimpleNamespace(
+                ok=True, content="unsent composer text"
+            )
+            return ops._composer_discardable(
+                self.request, role="worker", provider=self.WORKER_PROVIDER,
+                assigned_name=self.worker_name, locator="w28:p5J", rows=rows,
+                action_closed_roles=action_closed,
+            )
+
+    def _both(self):
+        return [
+            self._row(self.gateway_name, "w28:p5H"),
+            self._row(self.worker_name, "w28:p5J"),
+        ]
+
+    def _worker_only(self):
+        return [self._row(self.worker_name, "w28:p5J")]
+
+    def test_intact_pair_keeps_its_pending_worker_discardable(self):
+        self.assertTrue(self._discardable(self._both()))
+
+    def test_sibling_this_action_closed_keeps_the_owed_role_discardable(self):
+        # The exact j#80934 deadlock: without the proof the action's own effect disqualifies
+        # the work it still owes, so the immutable transaction can never be replayed.
+        self.assertFalse(self._discardable(self._worker_only()))
+        self.assertTrue(
+            self._discardable(
+                self._worker_only(), action_closed=(self.GATEWAY_PROVIDER,)
+            )
+        )
+
+    def test_reappeared_sibling_falls_back_to_the_inherited_live_pair_fence(self):
+        # Claiming the gateway is action-closed must not launder a live row: a sibling that
+        # came back is judged by the inherited fence, which rejects a split placement.
+        split = [
+            self._row(self.gateway_name, "w28:p5H", tab="w28:t9"),
+            self._row(self.worker_name, "w28:p5J"),
+        ]
+        self.assertFalse(
+            self._discardable(split, action_closed=(self.GATEWAY_PROVIDER,))
+        )
+
+    def test_foreign_absence_is_never_admitted_as_this_actions_progress(self):
+        # The gateway is gone, but nothing proves THIS action closed it.
+        self.assertFalse(self._discardable(self._worker_only(), action_closed=()))
+
+    def test_wholly_action_closed_pair_has_no_composer_left_to_discard(self):
+        self.assertFalse(
+            self._discardable(
+                self._worker_only(),
+                action_closed=(self.GATEWAY_PROVIDER, self.WORKER_PROVIDER),
+            )
+        )
+
+
+class PartialProgressPreflightTests(unittest.TestCase):
+    """A half-replaced pair must report the replay it owns, not an unactionable block."""
+
+    def _ops_at_partial_progress(self):
+        approved = _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("gateway", "worker"),
+        )
+        expectation = _expectation(approved)
+        gateway = _participant("gateway", phase=PARTICIPANT_LAUNCH_OWED)
+        # Raw: the gateway this action closed has no live row, so no role is discardable.
+        raw = _observation(
+            slots=(
+                BoundSlot("gateway", gateway.provider, gateway.assigned_name, "", SLOT_RECOVER),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=(),
+        )
+        # Projected under the approved action id: the close this transaction proves.
+        projected = _observation(
+            slots=(
+                BoundSlot(
+                    "gateway", gateway.provider, gateway.assigned_name,
+                    gateway.old_locator, SLOT_RECOVER, close_proven=True,
+                ),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("worker",),
+        )
+
+        class _Ops(FakeOps):
+            def observe(self, request, *, action_id=""):
+                self.calls.append(("observe", action_id))
+                return projected if action_id == expectation.action_id else raw
+
+        ops = _Ops(raw)
+        ops.markers = (expectation.marker_fields(),)
+        return ops, expectation
+
+    def test_partial_progress_preflight_reports_the_owned_replay(self):
+        ops, expectation = self._ops_at_partial_progress()
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+
+        self.assertEqual(outcome.state, STATE_ACTIONABLE)
+        self.assertTrue(outcome.resuming)
+        self.assertEqual(outcome.action_id, expectation.action_id)
+        # The replay stays bound to the approval already recorded; no new marker is minted.
+        self.assertEqual(outcome.approval_marker, expectation.marker())
+        self.assertFalse(outcome.executed)
+        self.assertNotIn("drive", [call[0] for call in ops.calls])
+
+    def test_preflight_without_an_owning_action_keeps_the_original_block(self):
+        ops, _expectation = self._ops_at_partial_progress()
+        # No approval recorded: nothing anchors a replay, so the block must stand.
+        ops.markers = ()
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+
+        self.assertEqual(outcome.reason, BLOCK_NO_DISCARDABLE_COMPOSER)
+        self.assertFalse(outcome.resuming)
+
+    def test_approval_that_projects_nothing_is_not_a_replay(self):
+        # The approval resolves, but the action owns no progress on this pair: the observation
+        # is unchanged under its id, so this is a genuine block, not a resume.
+        blocked = _observation(
+            slots=(_slot("gateway", SLOT_HEALTHY), _slot("worker", SLOT_RECOVER)),
+            discard_roles=(),
+        )
+        ops = FakeOps(blocked)
+        ops.markers = (_expectation(_observation()).marker_fields(),)
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+
+        self.assertEqual(outcome.reason, BLOCK_NO_DISCARDABLE_COMPOSER)
+        self.assertFalse(outcome.resuming)
+
+    def test_unreadable_approval_source_resumes_nothing(self):
+        ops, _expectation = self._ops_at_partial_progress()
+
+        def _raise(issue, journal):
+            raise RuntimeError("redmine credential missing")
+
+        ops.approval_fields = _raise
+        outcome = run_bound_pair_preparation(REQ, execute=False, ops=ops)
+
+        self.assertEqual(outcome.reason, BLOCK_NO_DISCARDABLE_COMPOSER)
+        self.assertFalse(outcome.resuming)
 
 
 class VerifyAndCompletionAuthorityTests(unittest.TestCase):

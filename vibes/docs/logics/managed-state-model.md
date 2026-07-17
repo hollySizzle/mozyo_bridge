@@ -608,7 +608,19 @@ Table naming:
         `ReplacementTransactionStore` の別immutable actionで扱う。close直前にも同じ slot/composer/lifecycle/worktree
         authorityを再読する。pending-preservation overrideはこのactionのapproved participantだけで、generic overrideではない。
       - partial retryでold slot absentを受理できるのは、同じimmutable transaction participantがclose済みを証明する
-        場合だけ。fresh launchはaction-bound attestation必須。完了後もlaneはhibernatedのまま、declared pins / disposition /
+        場合だけ。fresh launchはaction-bound attestation必須。
+      - ★**action自身のcloseがpair fenceを壊す点をfenceする** (#13933 R6、live evidence #13846 j#80933 / j#80934)。
+        pending composer classifierが継承する pair fence は **両 provider の live rowが揃うこと**を要求するため、
+        片roleをcloseした直後にlaunchが失敗すると、**このaction自身の効果**によって残りrole が `generation_mismatch`
+        となり、preflightは `no_exact_uncorrelated_pending_composer`、`--execute` は `transaction_conflict` で
+        恒久停止する (gateway missing + old worker remains)。sibling の不在を再admitできるのは、**同じimmutable
+        transactionがそのcloseを証明する場合だけ** (`close_proven` = live row無し **かつ** participantが `close_owed`
+        を通過済み)。復帰したsibling / 証明の無い不在 / pair全体がaction-closed は継承fenceに戻し zero-close。
+        live rowのidentity/uniqueness/revision/cwd判定は継承側が所有し、本railは緩めない。
+      - preflightは **transaction-blindな分類がblockした場合に限り**、callerが渡したapproval journalを anchorに
+        exact action idで再observeする。projectionが raw observationと同一なら「このpairを所有するactionは無い」
+        として元のblockを維持する。approval不在 / credential失敗 / projection不成立は resume しない。resumeを
+        報告しても新しいmarkerはmintせず、既存approvalに束縛したまま `--execute` が全fenceを再検証する。完了後もlaneはhibernatedのまま、declared pins / disposition /
         worktree / branchを変更せず、resume / dispatch / callback sendを行わない。次に通常の
         `sublane converge-bound-pair`を新しいaction-time markerで実行し、fresh pair proofからだけpinsを修復する。
     - **record-less scratch pair retire は本 component を書かない** (`herdr session-retire`、#13892、live evidence #13882
