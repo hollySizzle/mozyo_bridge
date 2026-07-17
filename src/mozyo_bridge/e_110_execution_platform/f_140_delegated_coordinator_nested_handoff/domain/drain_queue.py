@@ -146,17 +146,30 @@ _STATE_BUCKET: dict[str, str] = {
 }
 
 
+# The KNOWN non-blocking base buckets a release-pending lane may be re-routed into
+# release_dogfood from. An unreadable (`unknown`) state is deliberately excluded so a
+# release flag can never launder an unreadable durable state past the fail-closed hold
+# (Redmine #13967 R2-F2). A coordinator-blocking base is also excluded so a delegated
+# dogfood never masks live drain.
+_RELEASE_ROUTABLE_BASES = frozenset(
+    {BUCKET_IMPLEMENTING, BUCKET_IDLE, BUCKET_RETIREMENT}
+)
+
+
 def bucket_for_state(state_class: str, *, release_pending: bool = False) -> str:
     """Map a lane state class (+ release-pending flag) to a drain bucket (pure).
 
-    ``release_pending`` routes a lane into :data:`BUCKET_RELEASE_DOGFOOD` **only** when it
-    carries no coordinator-blocking drain (its base bucket is not a
-    :data:`PROCESS_HOLDING_BUCKETS` one) — a delegated dogfood never masks a live review /
-    callback / owner / integration / close / blocker. An unrecognized state class is
-    surfaced as :data:`BUCKET_UNKNOWN`, never dropped.
+    ``release_pending`` routes a lane into :data:`BUCKET_RELEASE_DOGFOOD` **only** when its
+    base bucket is a KNOWN non-blocking one (:data:`_RELEASE_ROUTABLE_BASES`). A
+    coordinator-blocking base keeps its bucket (a delegated dogfood never masks live
+    review / callback / owner / integration / close / blocker), and — critically — an
+    unrecognized state stays :data:`BUCKET_UNKNOWN` even when release-pending, so a release
+    flag can never launder an unreadable durable state past the fail-closed hold
+    (Redmine #13967 R2-F2). An unrecognized state class is always surfaced as
+    :data:`BUCKET_UNKNOWN`, never dropped.
     """
     base = _STATE_BUCKET.get(state_class, BUCKET_UNKNOWN)
-    if release_pending and base not in PROCESS_HOLDING_BUCKETS:
+    if release_pending and base in _RELEASE_ROUTABLE_BASES:
         return BUCKET_RELEASE_DOGFOOD
     return base
 

@@ -68,13 +68,22 @@ _RELEASE_PENDING = frozenset({RELEASE_REQUESTED, RELEASE_PARTIAL})
 
 
 def _lane_from_mapping(raw: object) -> DrainLane | None:
-    """Build a :class:`DrainLane` from a structured mapping (fail-closed)."""
+    """Build a :class:`DrainLane` from a structured mapping (fail-closed, exact-type).
+
+    Returns None when the row is malformed: a non-dict, a missing issue / state_class, or a
+    ``release_pending`` that is present but not an exact JSON bool (a string ``"false"``
+    must not coerce to True — Redmine #13967 R2-F2). The caller marks a snapshot with any
+    malformed row durable-incomplete rather than silently dropping it.
+    """
     if not isinstance(raw, dict):
         return None
     issue = str(raw.get("issue", "") or "").strip()
     state_class = str(raw.get("state_class", "") or "").strip()
     if not issue or not state_class:
         return None
+    rp = raw.get("release_pending", False)
+    if not isinstance(rp, bool):
+        return None  # exact-type: a non-bool release_pending is malformed, never coerced
     return DrainLane(
         issue=issue,
         state_class=state_class,
@@ -84,12 +93,15 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
         or ACTIONABILITY_COORDINATOR_ACTIONABLE,
         next_action_owner=str(raw.get("next_action_owner", "") or "").strip(),
         lane=str(raw.get("lane", "") or "").strip(),
-        release_pending=bool(raw.get("release_pending", False)),
+        release_pending=rp,
         reason=str(raw.get("reason", "") or "").strip(),
     )
 
 
-def _lanes_from_snapshot(path: str) -> tuple[DrainLane, ...]:
+def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
+    """``(lanes, complete)``. ``complete`` is False when any row was malformed (an invalid
+    row is NOT silently dropped — it makes the snapshot durable-incomplete so the retention
+    verdict fails closed to hold, Redmine #13967 R2-F2)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -97,8 +109,15 @@ def _lanes_from_snapshot(path: str) -> tuple[DrainLane, ...]:
     entries = data.get("lanes", data) if isinstance(data, dict) else data
     if not isinstance(entries, list):
         raise SystemExit("--snapshot-json must carry a list of lanes (or a {'lanes': [...]})")
-    lanes = [lane for raw in entries if (lane := _lane_from_mapping(raw)) is not None]
-    return tuple(lanes)
+    lanes: list[DrainLane] = []
+    complete = True
+    for raw in entries:
+        lane = _lane_from_mapping(raw)
+        if lane is None:
+            complete = False  # malformed row -> durable-incomplete, not dropped
+        else:
+            lanes.append(lane)
+    return tuple(lanes), complete
 
 
 def _release_dogfood_lane(issue: str, lane: str) -> DrainLane:
@@ -140,8 +159,11 @@ def _merge_release_pending(
     return tuple(merged)
 
 
-def _lanes_from_glance(path: str) -> tuple[DrainLane, ...]:
-    """Derive drain lanes from a ``workflow glance --json`` envelope."""
+def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
+    """Derive drain lanes from a ``workflow glance --json`` envelope. ``(lanes, complete)``:
+    ``complete`` is False when a row could not be read (a non-dict, a missing issue_id, or a
+    row with no workflow_state) — an unreadable row makes the projection durable-incomplete
+    rather than being silently dropped (Redmine #13967 R2-F2)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -149,24 +171,29 @@ def _lanes_from_glance(path: str) -> tuple[DrainLane, ...]:
     if not isinstance(data, dict):
         raise SystemExit("--from-glance must carry a workflow glance --json envelope")
 
+    complete = True
     active: list[DrainLane] = []
     for row in data.get("rows", []) or []:
         if not isinstance(row, dict):
+            complete = False
             continue
         issue = str(row.get("issue_id", "") or "").strip()
-        if not issue:
+        state = str(row.get("workflow_state", "") or "").strip()
+        if not issue or not state:
+            complete = False
             continue
         active.append(
             DrainLane(
                 issue=issue,
                 lane=str(row.get("lane", "") or "").strip(),
-                state_class=str(row.get("workflow_state", "") or "").strip(),
+                state_class=state,
                 next_action_owner=str(row.get("next_owner", "") or "").strip(),
             )
         )
     release_rows: list[tuple[str, str]] = []
     for diag in data.get("lifecycle_diagnostic", []) or []:
         if not isinstance(diag, dict):
+            complete = False
             continue
         if str(diag.get("process_release", "") or "").strip() not in _RELEASE_PENDING:
             continue
@@ -176,7 +203,7 @@ def _lanes_from_glance(path: str) -> tuple[DrainLane, ...]:
                 str(diag.get("lane", "") or "").strip(),
             )
         )
-    return _merge_release_pending(active, release_rows)
+    return _merge_release_pending(active, release_rows), complete
 
 
 def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str, ...]]:
@@ -254,15 +281,19 @@ def cmd_workflow_drain_queue(args: argparse.Namespace) -> int:
     notes: tuple[str, ...] = ()
 
     if snapshot:
-        lanes = _lanes_from_snapshot(snapshot)
+        lanes, complete = _lanes_from_snapshot(snapshot)
+        degraded = not complete
     elif from_glance:
-        lanes = _lanes_from_glance(from_glance)
-        # A glance envelope that reports its own source degradation makes the drain
-        # projection durable-incomplete too (Redmine #13967 F2 — do not release from a
-        # partially-read durable record).
+        lanes, complete = _lanes_from_glance(from_glance)
+        # A glance envelope that reports its own source degradation, OR that carried an
+        # unreadable row, makes the drain projection durable-incomplete too (Redmine #13967
+        # F2 / R2-F2 — do not release from a partially-read durable record).
+        degraded = not complete
         try:
             glance_env = _json.loads(Path(from_glance).read_text(encoding="utf-8"))
-            degraded = bool(isinstance(glance_env, dict) and glance_env.get("degraded"))
+            degraded = degraded or bool(
+                isinstance(glance_env, dict) and glance_env.get("degraded")
+            )
         except (OSError, ValueError):
             degraded = True
     else:

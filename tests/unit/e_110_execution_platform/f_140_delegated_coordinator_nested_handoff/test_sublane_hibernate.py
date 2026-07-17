@@ -709,6 +709,25 @@ class SublaneEarlyHibernateTest(unittest.TestCase):
             self.assertTrue(outcome.is_blocked)
             self.assertIn(BLOCK_OWNER_PENDING, outcome.preflight.blocked_reasons)
 
+    def test_both_bases_prefers_early_hibernate(self) -> None:
+        # Redmine #13967 R2-F4: when a lane satisfies BOTH explicitly_parked and every early
+        # condition, the early basis wins (its owner gate correctly drops) — an ambiguous
+        # input must not silently fall back to the stricter dependency basis and re-block.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(
+                    assertions=_early_gates(
+                        explicitly_parked=True, no_owner_approval_pending=False
+                    )
+                ),
+                execute=True,
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertEqual(outcome.preflight.park_basis, PARK_BASIS_EARLY_HIBERNATE)
+            self.assertNotIn(BLOCK_OWNER_PENDING, outcome.preflight.blocked_reasons)
+
     def test_dependency_park_basis_unaffected(self) -> None:
         # A dependency park (explicitly_parked=True) with no early flags still hibernates,
         # and does NOT require commits_pushed (it preserves unpublished commits).

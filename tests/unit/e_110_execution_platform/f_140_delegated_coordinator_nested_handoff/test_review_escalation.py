@@ -128,7 +128,9 @@ class ProjectionTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def _run(self, payload_obj, **kwargs):
+    def _run(self, payload_obj, *, add_provenance=True, **kwargs):
+        if add_provenance and isinstance(payload_obj, dict) and "provenance" not in payload_obj:
+            payload_obj = {**payload_obj, "provenance": "redmine:13967:j#test"}
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "hist.json"
             path.write_text(json.dumps(payload_obj), encoding="utf-8")
@@ -153,7 +155,8 @@ class CliTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertTrue(payload["any_escalation"])
+        self.assertEqual(payload["escalation_decision"], "escalate")
+        self.assertTrue(payload["evaluated"])
         self.assertIn("supervisor", payload["escalating_subsystems"])
 
     def test_cli_threshold_override(self):
@@ -166,10 +169,10 @@ class CliTests(unittest.TestCase):
             },
             threshold=3,
         )
-        self.assertFalse(payload["any_escalation"])
+        self.assertEqual(payload["escalation_decision"], "no_escalation")
 
     def test_cli_malformed_bool_fails_closed_to_escalation(self):
-        # Redmine #13967 F4: a JSON string "false" (which bool(...) would coerce to True)
+        # Redmine #13967 R2-F3: a JSON string "false" (which bool(...) would coerce to True)
         # is not an exact bool -> the entry is malformed -> its subsystem fails closed to
         # escalation, never silently dropped.
         payload = self._run(
@@ -179,10 +182,38 @@ class CliTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertTrue(payload["any_escalation"])
+        self.assertEqual(payload["escalation_decision"], "escalate")
         self.assertIn("sup", payload["escalating_subsystems"])
 
-    def test_cli_no_history_is_not_a_no_escalation_verdict(self):
+    def test_cli_missing_bool_is_malformed_not_default_false(self):
+        # Redmine #13967 R2-F3: a finding missing `late` is not a valid `false` — it is
+        # malformed and its subsystem fails closed to escalation.
+        payload = self._run(
+            {
+                "findings": [
+                    {"subsystem": "sup", "round_index": 2, "authority_bearing": True},
+                ]
+            }
+        )
+        self.assertEqual(payload["escalation_decision"], "escalate")
+        self.assertIn("sup", payload["escalating_subsystems"])
+
+    def test_cli_no_provenance_is_indeterminate(self):
+        # Redmine #13967 R2-F3: without a declared provenance the authority verdict is
+        # indeterminate, never a confident no_escalation.
+        payload = self._run(
+            {
+                "findings": [
+                    {"subsystem": "s", "round_index": 2, "authority_bearing": True, "late": False},
+                ]
+            },
+            add_provenance=False,
+        )
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
+        self.assertFalse(payload["evaluated"])
+        self.assertIn("no_snapshot_provenance", payload["indeterminate_reasons"])
+
+    def test_cli_no_history_is_indeterminate_not_no_escalation(self):
         args = argparse.Namespace(
             snapshot_json=None, threshold=None, unreadable_subsystem=None, as_json=True
         )
@@ -192,7 +223,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         payload = json.loads(buf.getvalue())
         self.assertFalse(payload["history_provided"])
-        self.assertFalse(payload["any_escalation"])
+        self.assertFalse(payload["evaluated"])
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
 
 
 if __name__ == "__main__":
