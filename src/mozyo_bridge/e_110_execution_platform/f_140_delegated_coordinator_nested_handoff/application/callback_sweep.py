@@ -588,6 +588,22 @@ def _mutating_path(
         result["needs_reconcile"] = bool(reserve.needs_reconcile)
         return result
 
+    # (5b) The target must not be inside a retirement (Redmine #13892 R4-F3): this edge
+    #      reserves on the same fence with a `target_assigned_name` and then sends, so it needs
+    #      the same guard `execute_dispatch` has. Wiring only that one edge and reporting "all
+    #      outbox edges are checked" was the defect.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
+        target_is_retiring,
+    )
+
+    _retiring, _retire_detail = target_is_retiring(key.target_assigned_name)
+    if _retiring:
+        fence.mark_cancelled(key, detail=_retire_detail, now=now)
+        _release()
+        result["send_reason"] = ZERO_SEND_FENCE_HELD
+        result["send_detail"] = f"zero-send: {_retire_detail}"
+        return result
+
     if not still_owns():
         fence.mark_cancelled(key, detail="attempt lease lost before send", now=now)
         _release()

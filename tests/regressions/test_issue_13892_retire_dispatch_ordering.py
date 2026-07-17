@@ -193,3 +193,88 @@ class RetireDispatchOrderingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelaunchAfterCompletedTest(RetireDispatchOrderingTest):
+    """j#80594 R4-F2 — a completed attempt must not block a RELAUNCHED pair forever.
+
+    My R3-F1 dispatch guard treated any pending/completed attempt naming the slot as
+    "retiring". Because herdr assigned names are deterministic, a relaunched pair takes the
+    same name, so an old completion cancelled every future dispatch to the new pair — the very
+    "never reuse an old completion for a relaunched pair" rule the retire side enforces,
+    violated on the dispatch side. The guard is now locator-correlated.
+    """
+
+    def _complete_at(self, pins):
+        with self.fence.transaction(self.unit, live_pair_present=True) as txn:
+            a = txn.reserve(pinned=pins)
+            txn.mark_completed(attempt_id=a.attempt_id, closed=pins)
+
+    def test_relaunched_pair_at_a_new_locator_is_dispatchable(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
+
+        self._complete_at((("codex", "%old1"), ("claude", "%old2")))
+        original = de._live_locator_for
+        de._live_locator_for = lambda n: "%new9"
+        self.addCleanup(setattr, de, "_live_locator_for", original)
+        result = execute_dispatch(
+            authorization=self._auth(self.wk), fence=self.outbox, send=self._send
+        )
+        self.assertTrue(result.sent, "an old completion must not strand a relaunched pair")
+        self.assertEqual(len(self.sends), 1)
+
+    def test_stale_dispatch_to_the_closed_pane_is_refused(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
+
+        self._complete_at((("codex", "%old1"), ("claude", "%old2")))
+        original = de._live_locator_for
+        de._live_locator_for = lambda n: "%old2"  # the very pane the attempt closed
+        self.addCleanup(setattr, de, "_live_locator_for", original)
+        result = execute_dispatch(
+            authorization=self._auth(self.wk), fence=self.outbox, send=self._send
+        )
+        self.assertFalse(result.sent)
+        self.assertEqual(self.sends, [])
+
+    def test_unobservable_locator_with_a_completed_attempt_fails_closed(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
+
+        self._complete_at((("codex", "%old1"), ("claude", "%old2")))
+        original = de._live_locator_for
+        de._live_locator_for = lambda n: ""
+        self.addCleanup(setattr, de, "_live_locator_for", original)
+        result = execute_dispatch(
+            authorization=self._auth(self.wk), fence=self.outbox, send=self._send
+        )
+        self.assertFalse(result.sent, "ambiguous -> fail closed")
+
+    def test_pending_blocks_regardless_of_locator(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution as de
+
+        with self.fence.transaction(self.unit, live_pair_present=True) as txn:
+            txn.reserve(pinned=(("claude", "%2"),))
+        original = de._live_locator_for
+        de._live_locator_for = lambda n: "%totally_other"
+        self.addCleanup(setattr, de, "_live_locator_for", original)
+        result = execute_dispatch(
+            authorization=self._auth(self.wk), fence=self.outbox, send=self._send
+        )
+        self.assertFalse(result.sent, "a close in flight blocks whatever the locator is")
+
+    def test_the_guard_is_shared_by_every_reserve_then_send_edge(self):
+        """j#80594 R4-F3(c): `execute_dispatch` was the ONLY edge wired, while I reported
+        that all outbox reserve->send edges checked. The guard is now one exported seam and
+        each edge calls it; this pins that the other edges actually import it."""
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            callback_sweep,
+            operator_startup_resume,
+        )
+
+        for mod in (callback_sweep, operator_startup_resume):
+            self.assertIn(
+                "target_is_retiring",
+                inspect.getsource(mod),
+                f"{mod.__name__} reserves on the outbox and sends; it must ask the same guard",
+            )

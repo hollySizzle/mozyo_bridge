@@ -1012,3 +1012,24 @@ class ScratchRetirementBootstrapTest(unittest.TestCase):
     def test_orphan_temp_alone_is_not_an_absent_store(self):
         self.fence.temp_path.write_text("x")
         self.assertEqual(ScratchRetirementFence(home=self.home).store_shape().state, "damaged")
+
+    def test_temp_residue_beside_a_healthy_store_is_damaged(self):
+        """j#80594 R4-F4: R3-F5 added `temp` to the inventory but not to the VERDICT.
+
+        A bootstrap builds in temp, renames, then seals — a healthy store never carries a
+        temp beside it, so its presence is interrupted / foreign residue. It showed up in
+        `present_artifacts` while `store_shape` still returned `present` and admitted the
+        transaction: inventoried but not load-bearing.
+        """
+        with self.fence.transaction(self.unit, live_pair_present=True):
+            pass
+        self.assertEqual(self.fence.store_shape().state, "present")
+        self.fence.temp_path.write_text("residue")
+        shape = ScratchRetirementFence(home=self.home).store_shape()
+        self.assertEqual(shape.state, "damaged")
+        self.assertIn("temp", shape.present_artifacts)
+        with self.assertRaises(ScratchRetirementFenceError):
+            with ScratchRetirementFence(home=self.home).transaction(
+                self.unit, live_pair_present=True
+            ):
+                pass

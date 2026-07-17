@@ -117,6 +117,10 @@ class ScratchRetirementBusy(ScratchRetirementFenceError):
     """Another caller holds this unit's transaction. Zero-close; never wait, never steal."""
 
 
+def _norm_locator(value: str) -> str:
+    return (value or "").strip()
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -273,6 +277,21 @@ class ScratchRetirementFence:
         if not present:
             return StoreShape(state=STORE_ABSENT)
         row_bearing = {"db", "wal", "shm", "journal"} & set(present)
+        if "temp" in present:
+            # A bootstrap builds in `temp`, renames, then seals — so a healthy store NEVER has
+            # a temp beside it. Its presence is interrupted-bootstrap or foreign residue: an
+            # ambiguous shape, which is damaged (review j#80594 R4-F4). Inventorying the temp
+            # without letting it change the verdict was the bug: it showed up in
+            # `present_artifacts` while `present` was still returned.
+            return StoreShape(
+                state=STORE_DAMAGED,
+                present_artifacts=present,
+                detail=(
+                    "a bootstrap staging artifact is present beside the authority "
+                    f"(present: {', '.join(present)}); a healthy store never carries one, so "
+                    "this is an interrupted bootstrap or foreign residue"
+                ),
+            )
         if "db" in present and "seal" in present:
             return StoreShape(state=STORE_PRESENT, present_artifacts=present)
         # Anything else is an orphaned / partial set: a DB with no seal (identity unpinnable),
@@ -395,14 +414,34 @@ class ScratchRetirementFence:
             conn.close()
         return _row_to_attempt(unit, row) if row is not None else None
 
-    def attempt_for_target(
-        self, *, workspace_id: str, lane_id: str, target_assigned_name: str
+    def blocking_attempt_for_target(
+        self,
+        *,
+        workspace_id: str,
+        lane_id: str,
+        target_assigned_name: str,
+        live_locator: str = "",
     ) -> Optional[RetirementAttempt]:
-        """Any attempt whose PINNED slots name this assigned name. (read-only, #13892 R3-F1)
+        """The attempt (if any) that forbids sending to this slot RIGHT NOW. (read-only)
 
         The dispatch side knows one target, not the pair's whole assigned-name set, so it
-        cannot rebuild a :class:`RetirementUnit` digest. This asks the question it can ask:
+        cannot rebuild a :class:`RetirementUnit` digest. This answers the question it can ask:
         "is the slot I am about to send into inside a retirement?"
+
+        **Locator-correlated** (review j#80594 R4-F2). Returning any attempt that merely *names*
+        the slot was an over-block: herdr assigned names are deterministic, so a **relaunched**
+        pair occupies the same name, and an old `completed` attempt then blocked the new pair's
+        dispatches forever — the exact "an old completion must never be reused for a relaunched
+        pair" rule this component enforces on the retire side, violated on the dispatch side.
+        So:
+
+        - **pending** — a close is in flight for this unit. Block regardless of locator: even a
+          send to a slot whose locator we cannot compare could land in a pane about to close.
+        - **completed** — the close is done. Block ONLY when the target's live locator is one
+          this attempt pinned, i.e. a stale pre-close dispatch aimed at the pane that was
+          closed. A **different** locator is a relaunched pair the old completion has no say
+          over, and it must be allowed through.
+        - an unknown live locator with a completed attempt is ambiguous, so it blocks.
 
         Read-only and creates nothing: a send must never bring the retirement authority into
         existence. A genuinely absent store returns ``None`` (no retirement was ever recorded
@@ -433,16 +472,26 @@ class ScratchRetirementFence:
             attempt = _row_to_attempt(unit, row)
             # `pinned` holds (role, locator); the assigned name is rebuilt from the unit's
             # identity, so match on the encoded name for each pinned role.
-            for role, _locator in attempt.pinned:
+            for role, locator in attempt.pinned:
                 try:
                     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
                         encode_assigned_name,
                     )
 
-                    if encode_assigned_name(workspace_id, role, lane_id) == want:
-                        return attempt
+                    if encode_assigned_name(workspace_id, role, lane_id) != want:
+                        continue
                 except Exception:  # noqa: BLE001 - an unencodable role cannot match
                     continue
+                if attempt.pending:
+                    return attempt  # a close is in flight: never send into it
+                # completed: only the pane this attempt actually closed is off limits.
+                if not live_locator:
+                    return attempt  # cannot compare -> ambiguous -> fail closed
+                if _norm_locator(live_locator) == _norm_locator(locator):
+                    return attempt  # a stale dispatch to the pane we closed
+                # A different locator at the same name: a relaunched pair. The old completion
+                # has no authority over it, and blocking would strand every future dispatch.
+                return None
         return None
 
     def transaction(self, unit: RetirementUnit, *, live_pair_present: bool):
