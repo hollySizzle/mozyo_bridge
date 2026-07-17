@@ -164,77 +164,91 @@ class LiveSessionRetireOps:
             return None
 
     def _durable_disposition(self, issue: str, journal: str):
-        """Did the work a delivered send handed over reach a terminal disposition? (R4-F1)
+        """Was the work a delivered send handed over positively discharged? (design j#80629)
 
-        The callback outbox is where handed-over work reports back: a terminal callback for
-        the same ``(issue, journal)`` means the receiver's turn closed the loop. `None` =
-        unknown (the caller blocks); never guess "finished".
+        Reads the **source of truth** — the Redmine issue's journals — and requires the full
+        three-way correspondence: the row's own AUTHORIZE, a later canonical `review_request`,
+        and a later `dispatch-disposition` naming that exact action and terminal journal.
+
+        The earlier cut asked the CallbackOutbox instead, which was rejected (j#80620): a
+        callback `delivered` is a *callback's* delivery ACK and `dead_letter` is "unclassified /
+        retries exhausted" — neither owns the completion of the work the dispatch handed over.
+        That the Redmine gate is hard to read here is not a licence to believe a different
+        store: unreadable means `None`, and the caller blocks.
+
+        `True` = discharged, `False` = still owed, `None` = unknown (the caller blocks).
         """
-        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_disposition import (  # noqa: E501
+            CORRELATION_DISCHARGED,
+            CORRELATION_OWED,
+            DispatchRowIdentity,
+            correlate_dispatch_disposition,
+        )
+
+        source = self._redmine_source()
+        if source is None:
+            return None  # no credentialed source -> unknown -> block
+        try:
+            entries = list(source.read_entries(issue))
+        except Exception:  # noqa: BLE001 - unreadable / credential failure -> unknown -> block
+            return None
+        auths, reviews = self._authorize_and_review_index(entries)
+        auth = auths.get(_norm(journal))
+        if auth is None:
+            return None  # the row's own AUTHORIZE is not readable -> unknown -> block
+        row = DispatchRowIdentity(
+            issue=_norm(issue),
+            journal=_norm(journal),
+            workspace_id=_norm(auth.workspace_id),
+            lane_id=_norm(auth.lane_id),
+            target_assigned_name=_norm(auth.target_assigned_name),
+            action_id=_norm(auth.action_id),
+        )
+        verdict = correlate_dispatch_disposition(
+            row, entries, authorize_journals=auths, review_request_journals=reviews
+        )
+        if verdict.state == CORRELATION_DISCHARGED:
+            return True
+        if verdict.state == CORRELATION_OWED:
+            return False
+        return None  # ambiguous -> block
+
+    def _redmine_source(self):
+        """The credential-gated live journal source, or ``None`` when unavailable."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
 
         try:
-            rows = CallbackOutbox().read()
-        except Exception:  # noqa: BLE001 - unreadable -> unknown -> the caller blocks
+            return LiveRedmineJournalSource.from_environment()
+        except Exception:  # noqa: BLE001 - no credentials / transport -> unknown -> block
             return None
-        terminal = {"delivered", "dead_letter"}
-        seen = False
-        for row in rows:
-            if str(getattr(row, "issue", "") or "").strip() != issue:
-                continue
-            if journal and str(getattr(row, "journal", "") or "").strip() != journal:
-                continue
-            seen = True
-            if str(getattr(row, "state", "") or "").strip() not in terminal:
-                return False  # a callback for this work is still owed
-        return True if seen else None
 
-    def retirement_transaction(self, unit, *, live_pair_present: bool):
-        from mozyo_bridge.core.state.scratch_retirement_fence import (
-            ScratchRetirementFence,
+    @staticmethod
+    def _authorize_and_review_index(entries):
+        """`{journal: DispatchAuthorization}` and the canonical review_request journals.
+
+        Both come from the repo's existing parsers — this adds no second interpretation of
+        marker text.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
+            parse_dispatch_authorizations,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            extract_markers,
         )
 
-        return ScratchRetirementFence().transaction(
-            unit, live_pair_present=live_pair_present
-        )
-
-    def peek_retirement(self, unit):
-        from mozyo_bridge.core.state.scratch_retirement_fence import (
-            ScratchRetirementFence,
-        )
-
-        return ScratchRetirementFence().peek(unit)
-
-    def close(self, workspace_id: str, lane_id: str, targets):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-            HerdrRetireClosePlan,
-            execute_herdr_retire_close,
-        )
-
-        # A pin-matched plan built from the VERDICT's targets: the reviewed executor can
-        # then only ever touch the set the decision proved (#13842 pin_matched_close_plan).
-        plan = HerdrRetireClosePlan(
-            workspace_id=workspace_id,
-            lane_id=lane_id,
-            close_targets=tuple(targets),
-            foreign_names=(),
-        )
-        return execute_herdr_retire_close(plan, env=self._environ())
-
-    def record_retirement(self, *, workspace_id: str, lane_id: str, intent: dict) -> str:
-        from mozyo_bridge.core.state.managed_events import record_managed_event
-
-        event = record_managed_event(
-            command=EVENT_COMMAND,
-            event_kind=EVENT_KIND_RETIRED,
-            workspace_id=workspace_id,
-            repo_root=str(self._repo_root),
-            intent=intent,
-        )
-        # Best-effort by contract (a telemetry-shaped append must never undo a committed
-        # close), so the token is surfaced rather than raised — an operator must be able to
-        # see that the close happened but the audit row did not.
-        return "recorded" if event is not None else "not_recorded:append_failed"
-
+        auths = {
+            _norm(a.journal): a
+            for a in parse_dispatch_authorizations(entries)
+            if a.valid
+        }
+        reviews = [
+            _norm(m.journal)
+            for m in extract_markers(entries)
+            if _norm(m.gate) == "review_request"
+        ]
+        return auths, reviews
 
 def observe_scratch_pair(
     ops: SessionRetireOps,

@@ -175,7 +175,7 @@ def callback_outbox_obligations(
     )
 
     try:
-        rows = CallbackOutbox().read()
+        rows = CallbackOutbox().read_strict_readonly()
     except Exception as exc:  # noqa: BLE001
         raise ObligationStoreUnreadable(
             f"the callback outbox could not be read ({exc})"
