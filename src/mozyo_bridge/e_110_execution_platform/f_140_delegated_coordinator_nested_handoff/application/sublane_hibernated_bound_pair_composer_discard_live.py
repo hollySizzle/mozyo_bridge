@@ -81,6 +81,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
     ACTUATION_RECOVERED,
+    ATTEST_BOUND,
+    ATTEST_PENDING,
     CLOSE_ERROR,
     LAUNCH_ERROR,
     OLD_SLOT_ABSENT,
@@ -124,7 +126,9 @@ class _ComposerDiscardActuatorPort(_BoundPairActuatorPort):
     prepare_request: PrepareBoundPairRequest
     approved_roles: tuple[str, ...]
 
-    def _fresh_authority(self) -> PreparationObservation | None:
+    def _fresh_authority(
+        self, *, require_attested_roles: Sequence[str] = ()
+    ) -> PreparationObservation | None:
         """Revalidate the approval-bound full pair at one destructive-effect edge."""
         try:
             rows = tuple(list_herdr_agent_rows(self.owner.env))
@@ -156,6 +160,7 @@ class _ComposerDiscardActuatorPort(_BoundPairActuatorPort):
                 observation,
                 self.expectation,
                 transaction.participants,
+                require_attested_roles=require_attested_roles,
             )
         except Exception:  # noqa: BLE001 - every unreadable edge is zero effect
             return None
@@ -221,6 +226,20 @@ class _ComposerDiscardActuatorPort(_BoundPairActuatorPort):
         if self._fresh_authority() is None:
             return LAUNCH_ERROR
         return super().launch_action_bound(action_id, pin)
+
+    def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
+        """Accept a bound attestation only under a final fresh full-pair fence."""
+        verdict = super().verify_attestation(action_id, pin)
+        if verdict != ATTEST_BOUND:
+            return verdict
+        # The inherited verifier proves the launched participant only.  Re-read the full
+        # approval-bound pair as the last step before the generic actuator records
+        # ``verify_owed -> replaced``.  An authority race remains retryable, never writable.
+        return (
+            ATTEST_BOUND
+            if self._fresh_authority(require_attested_roles=(pin.role,)) is not None
+            else ATTEST_PENDING
+        )
 
 
 @dataclass
@@ -373,6 +392,8 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         observation: PreparationObservation,
         expectation: PreparationExpectation,
         participant: ParticipantPin,
+        *,
+        require_attestation: bool = False,
     ) -> bool:
         slot = next(
             (item for item in observation.slots if item.role == participant.role), None
@@ -397,6 +418,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         if (
             participant.phase == PARTICIPANT_VERIFY_OWED
             and slot.disposition in (SLOT_RECOVER, SLOT_HEALTHY)
+            and not require_attestation
         ):
             # The immutable phase proves launch completion.  The generic actuator owns the
             # action-bound attestation wait and cannot advance another participant until this
@@ -424,12 +446,21 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         observation: PreparationObservation,
         expectation: PreparationExpectation,
         participants: Sequence[ParticipantPin],
+        *,
+        require_attested_roles: Sequence[str] = (),
     ) -> tuple[str, ...]:
+        exact_attestation = set(require_attested_roles)
         return tuple(
             pin.role
             for pin in participants
             if pin.phase != PARTICIPANT_CLOSE_OWED
-            and self._action_bound_slot(request, observation, expectation, pin)
+            and self._action_bound_slot(
+                request,
+                observation,
+                expectation,
+                pin,
+                require_attestation=pin.role in exact_attestation,
+            )
         )
 
     def _observation_from_snapshot(
@@ -618,13 +649,23 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             and request.lane == expectation.lane
         )
 
-    def _finish(self, key: ReplacementTransactionKey, expectation: PreparationExpectation, holder: str) -> bool:
+    def _finish(
+        self,
+        key: ReplacementTransactionKey,
+        expectation: PreparationExpectation,
+        holder: str,
+        authority: _ComposerDiscardActuatorPort,
+    ) -> bool:
         record = self.transaction_store.get(key)
         if record is None:
             return False
         if record.phase == PHASE_COMPLETED:
+            # No write remains.  The immutable completed row is the idempotent replay proof;
+            # fresh external authority is required only at the still-owed transition edges.
             return True
         if record.phase == PHASE_REPLACING_NONSELF:
+            if authority._fresh_authority() is None:
+                return False
             moved = self.transaction_store.transition_phase(
                 key,
                 expected_revision=record.revision,
@@ -636,6 +677,11 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 return False
             record = self.transaction_store.get(key)
         if record is None or record.phase != PHASE_DRAINING_CONTINUATION:
+            return False
+        # The first transition and this final completion CAS are distinct durable writes.
+        # Re-read full pair/lifecycle/worktree authority at each edge so a race between them
+        # leaves the transaction retryably draining rather than falsely completed.
+        if authority._fresh_authority() is None:
             return False
         done = self.transaction_store.transition_phase(
             key,
@@ -846,7 +892,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 result.status,
                 result.detail or ",".join(result.preservation_reasons),
             )
-        if not self._finish(key, expectation, holder):
+        if not self._finish(key, expectation, holder, port):
             return PreparationDrive(False, "completion_stopped", "transaction completion CAS stopped")
         return PreparationDrive(True, ACTUATION_RECOVERED)
 

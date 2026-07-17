@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from mozyo_bridge.core.state.replacement_preservation import assess_preservation
-from mozyo_bridge.core.state.replacement_transaction import ParticipantPin
+from mozyo_bridge.core.state.replacement_transaction import (
+    ContinuationPointer,
+    DecisionPointer,
+    ParticipantPin,
+    ReplacementTransactionKey,
+    ReplacementTransactionStore,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import (
     PARTICIPANT_CLOSE_OWED,
     PARTICIPANT_LAUNCH_OWED,
     PARTICIPANT_REPLACED,
     PARTICIPANT_VERIFY_OWED,
+    PHASE_CLAIMED,
+    PHASE_COMPLETED,
+    PHASE_DRAINING_CONTINUATION,
+    PHASE_REPLACING_NONSELF,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (
+    ReplacementActuatorUseCase,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import (
     PreparationDrive,
@@ -58,6 +72,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
+    ACTUATION_IN_PROGRESS,
+    ACTUATION_RECOVERED,
+    ATTEST_BOUND,
+    ATTEST_PENDING,
     CLOSE_ERROR,
     LAUNCH_ERROR,
     OLD_SLOT_AMBIGUOUS,
@@ -445,12 +463,16 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
             f"{module}._git", side_effect=git_result
         ), mock.patch(f"{base}.close_exact_generation") as close, mock.patch(
             f"{base}.launch_action_bound"
-        ) as launch:
+        ) as launch, mock.patch(
+            f"{base}.verify_attestation", return_value=ATTEST_BOUND
+        ) as verify:
             pin = CloseBoundaryTests._pin()
             self.assertEqual(port.close_exact_generation(pin), CLOSE_ERROR)
             self.assertEqual(port.launch_action_bound("action", pin), LAUNCH_ERROR)
+            self.assertEqual(port.verify_attestation("action", pin), ATTEST_PENDING)
         close.assert_not_called()
         launch.assert_not_called()
+        verify.assert_called_once()
 
     def test_proven_launch_owed_partial_retry_preserves_approved_projection(self):
         approved = _observation()
@@ -500,6 +522,39 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
                 progress_proven_roles=proven,
             )
         )
+        store_path = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_composer_discard_live."
+            "HerdrIdentityAttestationStore.read"
+        )
+        evaluate_path = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_composer_discard_live."
+            "evaluate_attestation"
+        )
+        attestation = SimpleNamespace(replacement_action_id=expectation.action_id)
+        with mock.patch(store_path, return_value=attestation), mock.patch(
+            evaluate_path,
+            side_effect=(SimpleNamespace(ok=False), SimpleNamespace(ok=True)),
+        ):
+            self.assertFalse(
+                ops._action_bound_slot(
+                    REQ,
+                    launched,
+                    expectation,
+                    verifying,
+                    require_attestation=True,
+                )
+            )
+            self.assertTrue(
+                ops._action_bound_slot(
+                    REQ,
+                    launched,
+                    expectation,
+                    verifying,
+                    require_attestation=True,
+                )
+            )
 
     def test_two_role_sequence_uses_immutable_first_progress_and_exact_second_close(self):
         approved = _observation(
@@ -531,6 +586,201 @@ class FullPairRetryAuthorityTests(unittest.TestCase):
                 progress_proven_roles=("gateway",),
             )
         )
+
+
+class VerifyAndCompletionAuthorityTests(unittest.TestCase):
+    # Keep the synthetic lease live even when `_finish` uses the store's real clock.
+    now = "2099-07-17T10:45:00+00:00"
+    expiry = "2100-07-17T10:45:00+00:00"
+
+    def _store_at_verify(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = ReplacementTransactionStore(home=Path(temporary.name))
+        expectation = _expectation(_observation())
+        key = ReplacementTransactionKey("mzb1_workspace", expectation.action_id)
+        holder = f"prepare:{expectation.action_id}:g{expectation.action_generation}"
+        planned = store.plan_transaction(
+            key,
+            action_generation=expectation.action_generation,
+            decision=DecisionPointer(
+                source="redmine", issue_id=REQ.issue, journal_id=REQ.journal
+            ),
+            continuation=ContinuationPointer(
+                source="redmine",
+                issue_id=REQ.issue,
+                journal_id=REQ.journal,
+                expected_gate=APPROVAL_GATE,
+                next_semantic_action="converge_bound_pair",
+            ),
+            participants=(_participant("gateway"),),
+        )
+        self.assertTrue(planned.applied)
+        record = store.get(key)
+        claimed = store.claim(
+            key,
+            expected_revision=record.revision,
+            expected_action_generation=expectation.action_generation,
+            holder=holder,
+            lease_expires_at=self.expiry,
+            now=self.now,
+        )
+        self.assertTrue(claimed.applied)
+        for phase in (PHASE_CLAIMED, PHASE_REPLACING_NONSELF):
+            record = store.get(key)
+            moved = store.transition_phase(
+                key,
+                expected_revision=record.revision,
+                expected_action_generation=expectation.action_generation,
+                target=phase,
+                holder=holder,
+                now=self.now,
+            )
+            self.assertTrue(moved.applied)
+        for phase in (PARTICIPANT_LAUNCH_OWED, PARTICIPANT_VERIFY_OWED):
+            record = store.get(key)
+            moved = store.transition_participant(
+                key,
+                expected_revision=record.revision,
+                expected_action_generation=expectation.action_generation,
+                identity=record.participants[0].identity,
+                target=phase,
+                holder=holder,
+                now=self.now,
+            )
+            self.assertTrue(moved.applied)
+        return store, key, expectation, holder
+
+    @staticmethod
+    def _phase(store, key):
+        return store.get(key).participants[0].phase
+
+    def test_verify_rechecks_full_pair_after_bound_attestation(self):
+        port = CloseBoundaryTests()._port()
+        port._fresh_authority.return_value = None
+        base = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_convergence_live."
+            "_BoundPairActuatorPort.verify_attestation"
+        )
+        with mock.patch(base, return_value=ATTEST_BOUND) as inherited:
+            self.assertEqual(
+                port.verify_attestation("action", CloseBoundaryTests._pin()),
+                ATTEST_PENDING,
+            )
+        inherited.assert_called_once()
+        port._fresh_authority.assert_called_once_with(
+            require_attested_roles=("gateway",)
+        )
+
+    def test_verify_authority_race_writes_zero_participant_phase(self):
+        store, key, expectation, holder = self._store_at_verify()
+        port = CloseBoundaryTests()._port()
+        port.owner.transaction_store = store
+        port._fresh_authority.return_value = None
+        base = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_convergence_live."
+            "_BoundPairActuatorPort.verify_attestation"
+        )
+        with mock.patch(base, return_value=ATTEST_BOUND), mock.patch.object(
+            store, "transition_participant", wraps=store.transition_participant
+        ) as transition:
+            result = ReplacementActuatorUseCase(
+                store, port, clock=lambda: self.now
+            ).drive_worker_recovery(
+                key,
+                holder=holder,
+                expected_action_generation=expectation.action_generation,
+            )
+        self.assertEqual(result.status, ACTUATION_IN_PROGRESS)
+        self.assertEqual(self._phase(store, key), PARTICIPANT_VERIFY_OWED)
+        transition.assert_not_called()
+
+    def test_finish_authority_race_before_first_leg_writes_zero_phase(self):
+        expectation = _expectation(_observation())
+        holder = "holder"
+        record = SimpleNamespace(
+            phase=PHASE_REPLACING_NONSELF, revision=7, lease_holder=holder
+        )
+        store = SimpleNamespace(
+            get=mock.Mock(return_value=record),
+            transition_phase=mock.Mock(),
+            release=mock.Mock(),
+        )
+        ops = LiveBoundPairPreparationOps(
+            repo_root=Path("/coordinator"), env={}, transaction_store=store
+        )
+        authority = SimpleNamespace(_fresh_authority=mock.Mock(return_value=None))
+        self.assertFalse(
+            ops._finish(
+                ReplacementTransactionKey("mzb1_workspace", expectation.action_id),
+                expectation,
+                holder,
+                authority,
+            )
+        )
+        store.transition_phase.assert_not_called()
+
+    def test_finish_authority_race_before_final_leg_writes_zero_completion(self):
+        expectation = _expectation(_observation())
+        holder = "holder"
+        replacing = SimpleNamespace(
+            phase=PHASE_REPLACING_NONSELF, revision=7, lease_holder=holder
+        )
+        draining = SimpleNamespace(
+            phase=PHASE_DRAINING_CONTINUATION, revision=8, lease_holder=holder
+        )
+        store = SimpleNamespace(
+            get=mock.Mock(side_effect=(replacing, draining)),
+            transition_phase=mock.Mock(return_value=SimpleNamespace(applied=True)),
+            release=mock.Mock(),
+        )
+        ops = LiveBoundPairPreparationOps(
+            repo_root=Path("/coordinator"), env={}, transaction_store=store
+        )
+        authority = SimpleNamespace(
+            _fresh_authority=mock.Mock(side_effect=(_observation(), None))
+        )
+        self.assertFalse(
+            ops._finish(
+                ReplacementTransactionKey("mzb1_workspace", expectation.action_id),
+                expectation,
+                holder,
+                authority,
+            )
+        )
+        self.assertEqual(store.transition_phase.call_count, 1)
+        self.assertEqual(
+            store.transition_phase.call_args.kwargs["target"],
+            PHASE_DRAINING_CONTINUATION,
+        )
+
+    def test_valid_verify_and_replaced_retry_complete_under_fresh_authority(self):
+        store, key, expectation, holder = self._store_at_verify()
+        port = CloseBoundaryTests()._port()
+        port.owner.transaction_store = store
+        port._fresh_authority.return_value = _observation()
+        base = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_convergence_live."
+            "_BoundPairActuatorPort.verify_attestation"
+        )
+        with mock.patch(base, return_value=ATTEST_BOUND):
+            result = ReplacementActuatorUseCase(
+                store, port, clock=lambda: self.now
+            ).drive_worker_recovery(
+                key,
+                holder=holder,
+                expected_action_generation=expectation.action_generation,
+            )
+        self.assertEqual(result.status, ACTUATION_RECOVERED)
+        self.assertEqual(self._phase(store, key), PARTICIPANT_REPLACED)
+        ops = LiveBoundPairPreparationOps(
+            repo_root=Path("/coordinator"), env={}, transaction_store=store
+        )
+        self.assertTrue(ops._finish(key, expectation, holder, port))
+        self.assertEqual(store.get(key).phase, PHASE_COMPLETED)
 
 
 if __name__ == "__main__":
