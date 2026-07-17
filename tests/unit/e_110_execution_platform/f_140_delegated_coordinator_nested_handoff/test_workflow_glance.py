@@ -638,6 +638,36 @@ class JournalGrammarTest(unittest.TestCase):
         facts = fold_issue_gate_facts([_j("100", "## Gate: Review Result — changes_requested\n- 結論: 承認")])
         self.assertEqual(facts.review_conclusion, REVIEW_APPROVED)
 
+    def test_conclusion_is_exact_not_substring_so_prose_and_negations_stay_pending(self):
+        # #13952 j#81089 F1: a substring match promoted prose and reversed negations. The
+        # conclusion is now an anchored exact-match, so none of these classify — the audit is
+        # still owed (fail-closed), never a fabricated approved / changes_requested.
+        for notes in (
+            "## Gate: Review — needs owner clarification",
+            "## Gate: Review — approved wording pending",
+            "## Gate: Review\n- 結論: not approved",
+            "## Gate: Review\n- 結論: changes not requested",
+        ):
+            with self.subTest(notes=notes):
+                facts = fold_issue_gate_facts([_j("100", notes)])
+                self.assertEqual(facts.latest_gate, _GATE_REVIEW)
+                self.assertEqual(facts.review_conclusion, REVIEW_PENDING)
+                self.assertFalse(facts.blocker_recorded)
+                self.assertEqual(
+                    classify_lane_state(lane_signal_from_gate_facts("7", facts)), "review_waiting"
+                )
+
+    def test_conclusion_tolerates_only_a_trailing_parenthetical_qualifier(self):
+        # The one structural qualifier allowed: a governed reviewer's `要修正 (再review 要)` /
+        # `blocker (…)` still reads because the trailing `(...)` is stripped before the
+        # exact-match — while `要修正 、詳細は…` (prose, no parenthetical) stays pending.
+        approved = fold_issue_gate_facts([_j("100", "## Gate: Review\n- 結論: 要修正 (再review 要)")])
+        self.assertEqual(approved.review_conclusion, REVIEW_CHANGES_REQUESTED)
+        blocker = fold_issue_gate_facts([_j("100", "## Gate: Review\n- 結論: blocker (remote_verification 不能)")])
+        self.assertTrue(blocker.blocker_recorded)
+        prose = fold_issue_gate_facts([_j("100", "## Gate: Review\n- 結論: 要修正 、詳細は本文")])
+        self.assertEqual(prose.review_conclusion, REVIEW_PENDING)
+
     def test_round_qualifier_before_a_dash_does_not_lose_the_gate(self):
         # #13910 j#81068 (evidence j#81073 / correction j#81076): the round parenthetical sits
         # BEFORE the dash, so the title-level trailing-paren normalization never reached it and

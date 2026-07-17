@@ -216,17 +216,20 @@ CANONICAL_REVIEW_CONCLUSION_LABEL = "結論"
 #: "a recorded blocker" — so the closed review vocabulary gains no fourth value.
 REVIEW_OUTCOME_BLOCKER = "blocker"
 
-#: The closed conclusion vocabulary: canonical token -> outcome. Matched as a substring of the
-#: ``結論:`` value (or of the review heading's bounded qualifier) so a governed reviewer's
-#: ``要修正 (再review 要)`` still reads, while body sentiment never does. "re-review required"
+#: The closed conclusion vocabulary: canonical token -> outcome. A value is classified only
+#: when — after a trailing ``(...)`` qualifier is stripped and whitespace/case are normalized —
+#: it EQUALS one of these keys. It is NOT a substring test: an anchored exact-match is what
+#: keeps prose and negations out of the workflow state (Redmine #13952 j#81089 F1: a substring
+#: ``approve``/``changes``/``needs`` promoted ``needs owner clarification`` and even reversed
+#: ``not approved`` -> approved). The trailing-``(...)`` strip is the one structural qualifier
+#: allowed, so a governed reviewer's ``要修正 (再review 要)`` still reads. "re-review required"
 #: is NOT a separate outcome: it is ``要修正`` (the work goes back to the implementer) plus the
 #: template's own ``再review要否`` field, which this read-model does not project.
 CANONICAL_REVIEW_CONCLUSION_TOKENS: dict[str, str] = {
     "承認": REVIEW_APPROVED,
-    "approve": REVIEW_APPROVED,
+    "approved": REVIEW_APPROVED,
     "要修正": REVIEW_CHANGES_REQUESTED,
-    "changes": REVIEW_CHANGES_REQUESTED,
-    "needs": REVIEW_CHANGES_REQUESTED,
+    "changes_requested": REVIEW_CHANGES_REQUESTED,
     "blocker": REVIEW_OUTCOME_BLOCKER,
     "blocked": REVIEW_OUTCOME_BLOCKER,
 }
@@ -305,16 +308,20 @@ def _gate_heading_parts(notes: str) -> Tuple[Tuple[str, str], ...]:
 def _classify_conclusion(value: str) -> Tuple[str, bool]:
     """Classify one conclusion value against the closed vocabulary -> ``(conclusion, blocker)``.
 
-    :data:`CANONICAL_REVIEW_CONCLUSION_TOKENS` iteration order is the precedence for a value
-    that (ambiguously) carries more than one token. A value carrying none is ``pending``.
+    The value must EQUAL a :data:`CANONICAL_REVIEW_CONCLUSION_TOKENS` key after a single
+    trailing ``(...)`` qualifier is stripped and whitespace/case are normalized — the same
+    normalization the gate headings use. Anything else (prose, a negation like ``not
+    approved``, a topic qualifier) is ``pending``: the audit is still owed, the fail-closed
+    read (Redmine #13952 j#81089 F1).
     """
-    haystack = value.lower()
-    for token, outcome in CANONICAL_REVIEW_CONCLUSION_TOKENS.items():
-        if token in haystack:
-            if outcome == REVIEW_OUTCOME_BLOCKER:
-                return REVIEW_PENDING, True
-            return outcome, False
-    return REVIEW_PENDING, False
+    normalized = _TRAILING_PAREN_RE.sub("", value)
+    normalized = _WS_RE.sub(" ", normalized).strip().lower()
+    outcome = CANONICAL_REVIEW_CONCLUSION_TOKENS.get(normalized)
+    if outcome is None:
+        return REVIEW_PENDING, False
+    if outcome == REVIEW_OUTCOME_BLOCKER:
+        return REVIEW_PENDING, True
+    return outcome, False
 
 
 def _review_outcome(notes: str, heading_qualifier: str) -> Tuple[str, bool]:
