@@ -489,6 +489,85 @@ class StartupTransactionFenceTest(unittest.TestCase):
                 self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
                 self.assertFalse(ops.close_calls)
 
+    def test_malformed_row_types_and_unknown_phase_are_structured_refusals(self):
+        # Review j#81122 R4-F1: decoding a row is not validating it. A providers cell that
+        # is not text (`.split()` -> AttributeError), a participant that is not an object
+        # (`.get()` -> AttributeError), or an unknown phase (silently read as a no-op
+        # action, `nothing_owed`) all slipped the R3 guard, which caught only
+        # (DatabaseError, TypeError, ValueError). The row is now validated as a versioned
+        # authority shape, and every violation is a structured refusal.
+        import sqlite3
+
+        def _store(participants, phase, providers, revision="1"):
+            home = Path(self._tmp.name) / f"row_{len(list(Path(self._tmp.name).iterdir()))}"
+            home.mkdir()
+            fence = StartupTransactionFence(home=home)
+            nonce = "nn"
+            conn = sqlite3.connect(fence.path, isolation_level=None)
+            conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO store_meta VALUES ('store_nonce', ?)", (nonce,))
+            # A shape-complete table WITHOUT the NOT NULL constraints, so a NULL/typed cell
+            # can be planted — the exact corrupt-authority shape R4-F1 describes.
+            conn.execute(
+                "CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, workspace_id "
+                "TEXT, lane_id TEXT, providers TEXT, phase TEXT, revision, participants "
+                "TEXT, reserved_at TEXT, updated_at TEXT)"
+            )
+            aid = startup_action_id(self.unit, "n1")
+            conn.execute(
+                "INSERT INTO startup_actions VALUES (?,?,?,?,?,?,?,?,?)",
+                (aid, "ws1", "lane-1", providers, phase, revision, participants, "t", "t"),
+            )
+            conn.execute(f"PRAGMA user_version={STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+            conn.close()
+            fence.seal_path.write_text(nonce, encoding="utf-8")
+            return fence, aid
+
+        cases = {
+            "providers_null": dict(participants="[]", phase=PHASE_ROLLBACK_OWED, providers=None),
+            "participant_not_object": dict(
+                participants='["bad"]', phase=PHASE_ROLLBACK_OWED, providers="claude"
+            ),
+            "participants_not_list": dict(
+                participants='{"x":1}', phase=PHASE_ROLLBACK_OWED, providers="claude"
+            ),
+            "unknown_phase": dict(participants="[]", phase="corrupt_phase", providers="claude"),
+            "non_int_revision": dict(
+                participants="[]", phase=PHASE_ROLLBACK_OWED, providers="claude", revision="x"
+            ),
+        }
+        for label, kw in cases.items():
+            with self.subTest(shape=label):
+                fence, aid = _store(**kw)
+                with self.assertRaises(StartupTransactionError):
+                    fence.read(aid)
+                ops = _RollbackOps([])
+                verdict = run_session_rollback(
+                    action_id=aid, ops=ops, fence=fence, execute=True
+                )
+                self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+                self.assertFalse(ops.close_calls)
+
+    def test_a_reserve_write_failure_is_structured_before_any_side_effect(self):
+        # Review j#81122 R4-F2: reserve's SELECT/INSERT were outside the normalization that
+        # _write already had, so a write that aborts leaked a raw IntegrityError — and
+        # reserve is the reserve-before-effect anchor, so the caller could not tell
+        # "reserved" from "refused".
+        import sqlite3
+
+        home = Path(self._tmp.name) / "reserve_write_fail"
+        home.mkdir()
+        fence = StartupTransactionFence(home=home)
+        fence.reserve(self.unit, "seed")  # bootstrap the store
+        conn = sqlite3.connect(fence.path, isolation_level=None)
+        conn.execute(
+            "CREATE TRIGGER block_insert BEFORE INSERT ON startup_actions "
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+        )
+        conn.close()
+        with self.assertRaises(StartupTransactionError):
+            fence.reserve(self.unit, "n2")
+
     def test_a_read_never_creates_the_authority_it_checks(self):
         # Review j#81108 R3-F1: `sqlite3.connect(path)` defaults to `rwc`, so a read of an
         # absent-but-present-shaped path could fabricate an empty store. The read path is
