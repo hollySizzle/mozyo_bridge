@@ -116,8 +116,9 @@ locator-matched self-attestation** を観測できるまで success を返さな
 1. 出力 (text の `action=` / `--json` の `action_id`) から **startup action id** を取る。rollback はこの id の下でしか動かない。
 2. read-only preflight: `mozyo-bridge herdr session-rollback --action-id <id> --json`
    - 何が閉じられ、何が閉じられないかを role ごとに返す。ここでは **一切 close しない**。
-3. preflight が `state=actionable` なら `--execute` を足す。`state=actionable` は「**close-target でない participant が
-   残っていない**」の意味であって「全 participant が `eligible`」ではない。**close されるのは `eligible` の participant だけ**で、
+3. preflight が `state=actionable` なら `--execute` を足す。`state=actionable` は「**settled でない (=解消すべき) refusal participant が
+   残っていない**」の意味であって「全 participant が `eligible`」ではない。settled = `eligible`(close-target) ∪ `absent`・`already_closed`
+   (no-target)。**close されるのは `eligible` の participant だけ**で、
    `absent`(既に居ない) と `already_closed`(前回の実行が閉じ済み) は **no-target だが実行を block しない** — 途中まで閉じた
    rollback を再実行すると残りが `eligible`・前回閉じた role が `absent|already_closed` になるのが正規の resume 形であり、
    ここで operator が止めてはならない (それが `--execute` を再度足す意味)。`eligible` が対象になるのは **この action が起動した

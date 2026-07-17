@@ -67,6 +67,7 @@ from mozyo_bridge.core.state.startup_transaction_fence import (  # noqa: E501
     PHASE_LAUNCHING,
     PHASE_PLANNED,
     PHASE_ROLLBACK_OWED,
+    STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION,
     STORE_ABSENT,
     STORE_DAMAGED,
     Participant,
@@ -426,6 +427,76 @@ class StartupTransactionFenceTest(unittest.TestCase):
         )
         self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
         self.assertFalse(ops.close_calls)
+
+    def test_partial_schema_and_malformed_rows_are_structured_refusals(self):
+        # Review j#81108 R3-F1: normalizing only the connect + version/seal read left the
+        # row query and its decode raw, so a valid-SQLite store with a partial schema
+        # (`no such table`) or a malformed cell (JSONDecodeError / non-int revision)
+        # escaped the public rail as a raw error. The shape is part of the schema, and
+        # every read/decode of the authority must fail closed, not just the first PRAGMA.
+        import sqlite3
+
+        def _seal(fence, nonce="n"):
+            fence.seal_path.write_text(nonce, encoding="utf-8")
+
+        def _missing_table(fence):
+            conn = sqlite3.connect(fence.path, isolation_level=None)
+            conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO store_meta VALUES ('store_nonce','n')")
+            conn.execute(f"PRAGMA user_version = {STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+            conn.close(); _seal(fence)
+            return startup_action_id(self.unit, "n1")
+
+        def _missing_column(fence):
+            conn = sqlite3.connect(fence.path, isolation_level=None)
+            conn.execute("CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, phase TEXT)")
+            conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO store_meta VALUES ('store_nonce','n')")
+            conn.execute(f"PRAGMA user_version = {STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+            conn.close(); _seal(fence)
+            return startup_action_id(self.unit, "n1")
+
+        def _corrupt_cell(column, value):
+            def _mut(fence):
+                action = fence.reserve(self.unit, "n1")
+                conn = sqlite3.connect(fence.path, isolation_level=None)
+                conn.execute(
+                    f"UPDATE startup_actions SET {column}=? WHERE action_id=?",
+                    (value, action.action_id),
+                )
+                conn.close()
+                return action.action_id
+            return _mut
+
+        cases = {
+            "missing_table": _missing_table,
+            "missing_column": _missing_column,
+            "malformed_participants": _corrupt_cell("participants", "not-json"),
+            "non_int_revision": _corrupt_cell("revision", "not-an-int"),
+        }
+        for label, setup in cases.items():
+            with self.subTest(shape=label):
+                home = Path(self._tmp.name) / label
+                home.mkdir()
+                fence = StartupTransactionFence(home=home)
+                action_id = setup(fence)
+                with self.assertRaises(StartupTransactionError):
+                    fence.read(action_id)
+                ops = _RollbackOps([])
+                verdict = run_session_rollback(
+                    action_id=action_id, ops=ops, fence=fence, execute=True
+                )
+                self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+                self.assertFalse(ops.close_calls)
+
+    def test_a_read_never_creates_the_authority_it_checks(self):
+        # Review j#81108 R3-F1: `sqlite3.connect(path)` defaults to `rwc`, so a read of an
+        # absent-but-present-shaped path could fabricate an empty store. The read path is
+        # existing-only (`mode=ro`); a read against a truly absent store returns None from
+        # the shape gate and leaves no file behind.
+        fence = StartupTransactionFence(home=Path(self._tmp.name) / "never_created")
+        self.assertIsNone(fence.read(startup_action_id(self.unit, "n1")))
+        self.assertFalse(fence.path.exists(), "a read fabricated the authority file")
 
     def test_a_non_utf8_seal_is_unreadable_not_a_match(self):
         # The seal reader catches UnicodeDecodeError (a ValueError) alongside OSError; a
