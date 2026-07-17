@@ -27,7 +27,12 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
+from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_UNCERTAIN
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleReader, LaneLifecycleStore
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
+    CallbackCandidate,
+    CallbackOutboxProcessor,
+)
 from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer, LaneLifecycleKey
 from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore
 from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
@@ -215,6 +220,99 @@ class SupervisorWorkspacePartitionTest(unittest.TestCase):
         self.assertEqual(ws_a.issues[0].historical_fenced, 1)
         self.assertEqual(ws_a.issues[0].delivered, 0)
         self.assertEqual(self.sender.calls, [])
+
+
+class SendEdgeFenceBacklogTest(unittest.TestCase):
+    """Review R2-F1: pre-existing pending + recovered stale-inflight historical rows are fenced."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.store = WorkflowRuntimeStore(path=self.store_path)
+        self.outbox = CallbackOutbox(path=self.store_path)
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "supervisor-lease.sqlite")
+        self.sender = _RecordingSender()
+        self.ws_a = SupervisedWorkspace(workspace_id=WS_A, canonical_path=str(self.dir / "repoA"))
+
+    def _seed_pending(self, journal):
+        # Enqueue a historical pending row into WS_A's partition (as a previous generation would
+        # have), classified against a source that carries that journal's review_request gate.
+        src = MappingRedmineJournalSource(payload=_review_payload([journal]))
+        CallbackOutboxProcessor(self.outbox, src, workspace_id=WS_A).ingest(
+            [CallbackCandidate(ISSUE, str(journal), "coordinator", workspace_id=WS_A)]
+        )
+
+    def _supervisor(self):
+        return WorkspaceCallbackSupervisor(
+            holder="superX",
+            lease_store=self.lease_store,
+            store=self.store,
+            outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws_a],
+            roster_fn=default_roster,
+            redmine_source_fn=lambda ws: MappingRedmineJournalSource(
+                payload=_review_payload(["300"])  # current generation gate
+            ),
+            sender_fn=lambda ws: self.sender,
+            clock=lambda: "2026-07-18T00:00:00+00:00",
+            authoritative_fn=lambda: {ISSUE: WS_A},
+            candidate_fence_fn=lambda wsid, issue, source: "206",  # current dispatch anchor
+        )
+
+    def _run(self):
+        views = [_View(ISSUE, "issue_13811_a", "issue_13811_a", WS_A)]
+        with patch.multiple(
+            proj,
+            repo_backend_is_herdr=lambda repo_root: True,
+            herdr_sublane_views=lambda repo_root, **_kw: views,
+        ), patch.object(gss, "_lifecycle_disposition_by_unit", return_value={}):
+            return self._supervisor().run_once()
+
+    def _state_by_journal(self):
+        return {r.journal: r.state for r in self.outbox.read()}
+
+    def test_pre_existing_historical_pending_row_is_fenced_not_delivered(self) -> None:
+        self._seed_pending("100")  # historical pending (j100 < anchor j206), pre-existing
+        report = self._run()
+        ws_a = {w.workspace_id: w for w in report.workspaces}[WS_A]
+        issue_outcome = ws_a.issues[0]
+        # Only the current-generation j300 delivered; j100 fenced at the send edge.
+        self.assertEqual([r.journal for r in self.sender.calls], ["300"])
+        self.assertEqual(issue_outcome.delivered, 1)
+        self.assertGreaterEqual(issue_outcome.historical_fenced, 1)
+        # j100 durable disposition is terminal (uncertain) — never re-claimed / re-sent, and NOT
+        # dead-lettered (no amplification).
+        states = self._state_by_journal()
+        self.assertEqual(states["100"], CALLBACK_UNCERTAIN)
+
+    def test_fenced_row_does_not_replay_on_a_second_sweep(self) -> None:
+        # The fence disposition is terminal: a second sweep neither re-sends j100 nor grows the
+        # dead-letter / pending backlog (no self-amplification).
+        self._seed_pending("100")
+        self._run()
+        self.sender.calls.clear()
+        report2 = self._run()
+        ws_a = {w.workspace_id: w for w in report2.workspaces}[WS_A]
+        # j300 is already delivered (idempotent), j100 stays terminally uncertain -> zero sends.
+        self.assertEqual(self.sender.calls, [])
+        self.assertEqual(ws_a.issues[0].dead_letter, 0)
+        self.assertEqual(self._state_by_journal()["100"], CALLBACK_UNCERTAIN)
+
+    def test_recovered_stale_inflight_historical_row_is_fenced(self) -> None:
+        # Seed j101 pending, then claim it into inflight with a STALE claimed_at (a crashed
+        # processor's abandoned pre-send claim). The deliver pass recovers it to pending and
+        # re-claims it in the same pass, so it too passes the send-edge fence.
+        self._seed_pending("101")
+        # Claim into stale inflight (old claimed_at, no mark_sending -> send_attempted=0).
+        claimed = self.outbox.claim_pending(
+            now="2020-01-01T00:00:00+00:00", workspace_id=WS_A
+        )
+        self.assertTrue(claimed)  # j101 is now stale inflight
+        report = self._run()
+        ws_a = {w.workspace_id: w for w in report.workspaces}[WS_A]
+        self.assertEqual([r.journal for r in self.sender.calls], ["300"])  # j101 never sent
+        self.assertGreaterEqual(ws_a.issues[0].historical_fenced, 1)
+        self.assertEqual(self._state_by_journal()["101"], CALLBACK_UNCERTAIN)
 
 
 class DefaultAuthoritativeMapTest(unittest.TestCase):

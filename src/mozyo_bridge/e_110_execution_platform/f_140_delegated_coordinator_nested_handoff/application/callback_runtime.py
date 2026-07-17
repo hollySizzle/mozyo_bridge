@@ -139,20 +139,24 @@ def run_once(
     cursor: Optional[str] = None,
     stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
     now: Optional[str] = None,
+    send_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
 ) -> dict:
     """Run one production callback pass (ingest -> deliver-once -> sweep); return a report.
 
     ``candidates`` are the freshly-observed handoff-worthy gate transitions to classify + enqueue
     (empty when this pass only drains the existing outbox). Delivery fires **one** send per
     claimed pending row through ``sender`` (the injected real / fake port), fenced by the outbox
-    so a repeat / crash / concurrent processor never duplicates. The final sweep surfaces the
-    pending + dead-letter backlog once. The report is redaction-safe (no pane id / credential).
+    so a repeat / crash / concurrent processor never duplicates. ``send_fence_fn`` (Redmine #13968
+    R2-F1) is an optional per-row send-edge fence forwarded to :meth:`...deliver` — a fenced row is
+    zero-send + terminally uncertain, which stops a pre-existing / recovered historical backlog row
+    that the caller's ingest-side candidate fence never saw. The final sweep surfaces the pending +
+    dead-letter backlog once. The report is redaction-safe (no pane id / credential).
     """
     report: dict = {}
     if candidates:
         report["ingest"] = processor.ingest(candidates, cursor=cursor, now=now).as_payload()
     report["deliver"] = processor.deliver(
-        sender, stale_seconds=stale_seconds, now=now
+        sender, stale_seconds=stale_seconds, now=now, send_fence_fn=send_fence_fn
     ).as_payload()
     report["sweep"] = processor.sweep(stale_seconds=stale_seconds, now=now).as_payload()
     return report

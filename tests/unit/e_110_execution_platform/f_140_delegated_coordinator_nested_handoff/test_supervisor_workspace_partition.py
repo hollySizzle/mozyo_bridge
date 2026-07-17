@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
     authoritative_workspace_by_issue,
     fence_candidates_to_anchor,
+    make_send_edge_fence,
     partition_authoritative,
 )
 
@@ -59,6 +60,14 @@ class _Cand:
     """The minimal candidate shape the anchor fence reads (its journal id)."""
 
     journal: str
+
+
+@dataclass
+class _Row:
+    """The minimal outbox-row shape the send-edge fence reads (journal + route)."""
+
+    journal: str
+    callback_route: str = "coordinator"
 
 
 class EnumerateActiveLanesPartitionTest(unittest.TestCase):
@@ -161,6 +170,34 @@ class CandidateFenceTest(unittest.TestCase):
         kept, dropped = fence_candidates_to_anchor([_Cand("abc"), _Cand("300")], "206")
         self.assertEqual([c.journal for c in kept], ["300"])
         self.assertEqual([c.journal for c in dropped], ["abc"])
+
+
+class SendEdgeFenceTest(unittest.TestCase):
+    """Review R2-F1 (pure): the per-row send-edge fence for pre-existing / recovered backlog rows."""
+
+    def test_historical_coordinator_row_fenced(self) -> None:
+        fence = make_send_edge_fence("206", "coordinator")
+        blocked, reason = fence(_Row("100", "coordinator"))
+        self.assertTrue(blocked)
+        self.assertIn("superseded", reason)
+
+    def test_current_coordinator_row_allowed(self) -> None:
+        fence = make_send_edge_fence("206", "coordinator")
+        blocked, _ = fence(_Row("300", "coordinator"))
+        self.assertFalse(blocked)
+
+    def test_unresolvable_anchor_fences_coordinator_row(self) -> None:
+        fence = make_send_edge_fence(None, "coordinator")
+        blocked, reason = fence(_Row("300", "coordinator"))
+        self.assertTrue(blocked)
+        self.assertIn("unresolvable", reason)
+
+    def test_review_return_row_is_exempt(self) -> None:
+        # review_return rows carry their OWN generation fence (#13684); the general anchor never
+        # fences them, even a historical journal.
+        fence = make_send_edge_fence("206", "coordinator")
+        blocked, _ = fence(_Row("100", "review_return:issue_13811_lane"))
+        self.assertFalse(blocked)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkspaceSupervisionOutcome,
     authoritative_workspace_by_issue,
     fence_candidates_to_anchor,
+    make_send_edge_fence,
     partition_authoritative,
     select_supervised_issues,
 )
@@ -200,21 +201,16 @@ class WorkspaceCallbackSupervisor:
         # drain, on the same lease/wake path. Optional so the callback-only supervisor
         # (pre-#13758) is unchanged; the production leg is wired in build_supervisor.
         self._reconcile_leg_fn = reconcile_leg_fn
-        # Redmine #13968 review F1: the authoritative-workspace resolver. Returns a home-global
+        # Redmine #13968 F1: the authoritative-workspace resolver — a home-global
         # ``{issue -> sole actively-owning workspace}`` map from the durable lifecycle authority.
-        # When wired, each workspace supervises ONLY the issues it uniquely owns (an issue owned by
-        # another workspace, unowned, or ambiguously owned is dropped — zero-ingest/zero-deliver).
-        # Optional so a supervisor without a lifecycle authority (unit fakes) is unchanged; the
-        # production resolver is wired in build_supervisor.
+        # When wired, each workspace supervises ONLY the issues it uniquely owns (owned-elsewhere /
+        # unowned / ambiguous -> dropped, zero-ingest/zero-deliver). Optional (unit fakes unchanged).
         self._authoritative_fn = authoritative_fn
-        # Redmine #13968 review F2: the latest-generation dispatch-anchor resolver. Given
-        # ``(workspace_id, issue, source)`` it returns the current dispatch entry journal id (the
-        # owning journal of the current implementation_request for the issue's owning lane +
-        # generation), or ``None`` when it cannot be pinned. General callback candidates on a
-        # journal OLDER than that anchor are historical (previous-generation) replay and are fenced
-        # (0-send); ``None`` fails closed (all general candidates dropped). Optional so a supervisor
-        # without the fence (unit fakes) is unchanged; the production resolver is wired in
-        # build_supervisor.
+        # Redmine #13968 F2: the latest-generation dispatch-anchor resolver. Given
+        # ``(workspace_id, issue, source)`` it returns the current dispatch entry journal id, or
+        # ``None`` when it cannot be pinned. General callbacks on a journal OLDER than that anchor
+        # are historical replay and are fenced (0-send) at both the ingest and send edges; ``None``
+        # fails closed. Optional (unit fakes unchanged); the production resolver is in build_supervisor.
         self._candidate_fence_fn = candidate_fence_fn
 
     # -- public entrypoint -------------------------------------------------
@@ -402,6 +398,7 @@ class WorkspaceCallbackSupervisor:
         error = ""
         candidates = ()
         historical_fenced = 0
+        send_fence_fn = None
         review_return_refusals: tuple[str, ...] = ()
         try:
             if source is not None:
@@ -417,18 +414,21 @@ class WorkspaceCallbackSupervisor:
                     )
                 )
                 # Redmine #13968 F2: fence the GENERAL coordinator candidates to the issue's current
-                # generation. ``discover_candidates`` yields a candidate for EVERY handoff-worthy
-                # gate marker in the issue journal — including historical gates from previous lane
-                # incarnations. Bind them to the owning lane's current dispatch anchor (the owning
-                # journal of the current implementation_request for the owning lane + generation):
-                # a candidate on a journal OLDER than that anchor is previous-generation replay and
-                # is dropped (0-send); an unresolvable anchor fails closed (all general candidates
-                # dropped). The correlated review_return candidates below carry their OWN
-                # generation fence (#13684) and are appended AFTER this fence, so they are unaffected.
+                # generation. ``discover_candidates`` yields a candidate for EVERY gate marker in the
+                # journal, incl. historical gates from previous lane incarnations. A candidate on a
+                # journal OLDER than the owning lane's current dispatch anchor is previous-generation
+                # replay -> dropped (0-send); an unresolvable anchor fails closed (all dropped). The
+                # review_return candidates below carry their OWN generation fence (#13684), appended
+                # AFTER this fence, so they are unaffected.
                 if self._candidate_fence_fn is not None:
                     anchor = self._candidate_fence_fn(workspace_id, issue, source)
                     candidates, fenced = fence_candidates_to_anchor(candidates, anchor)
                     historical_fenced = len(fenced)
+                    # R2-F1: the SAME anchor also fences PRE-EXISTING pending / recovered backlog
+                    # rows at the send edge — the ingest fence above only stops newly discovered
+                    # candidates, but the outbox deliver pass claims + sends every pending row in
+                    # the partition (including historical rows enqueued by a previous generation).
+                    send_fence_fn = make_send_edge_fence(anchor, self._route)
                 # #13684: reserve the correlated review_result return to the issue's owning-lane
                 # Codex gateway. The pure policy (:func:`...review_return_route.plan_review_returns`)
                 # consults the durable owning-lane binding + the latest-review fence; only a returnable
@@ -455,6 +455,18 @@ class WorkspaceCallbackSupervisor:
         except Exception:  # noqa: BLE001 - a source read failure degrades this issue, never the sweep
             error = ISSUE_SOURCE_UNREADABLE
             candidates = ()
+            send_fence_fn = None
+
+        # R2-F1 transient-source guard: fence active but source read failed -> the current dispatch
+        # anchor could not be resolved. Skip delivery entirely rather than deliver un-fenced
+        # (historical replay) or terminally fence on a transient blip (drops current rows); rows stay
+        # pending for the next sweep. Only the fenced (production) supervisor is guarded.
+        if self._candidate_fence_fn is not None and error:
+            return IssueSupervisionOutcome(
+                issue=issue, events_supplied=events_supplied, error=error,
+                historical_fenced=historical_fenced,
+                review_return_refusals=review_return_refusals,
+            )
 
         # Send-boundary ownership fence (R2-F1): the source reads above can be slow enough to cross
         # the lease TTL; a takeover DURING them means we no longer own the workspace. Re-verify (and
@@ -475,7 +487,9 @@ class WorkspaceCallbackSupervisor:
             processor = CallbackOutboxProcessor(
                 self._outbox, source or _NULL_SOURCE, workspace_id=workspace_id
             )
-            report = run_once(processor, sender, candidates=candidates)
+            report = run_once(
+                processor, sender, candidates=candidates, send_fence_fn=send_fence_fn
+            )
         except Exception:  # noqa: BLE001 - a store / send failure is recorded, not fatal to the sweep
             return IssueSupervisionOutcome(
                 issue=issue, events_supplied=events_supplied, error=error or ISSUE_PASS_ERROR,
@@ -496,6 +510,9 @@ class WorkspaceCallbackSupervisor:
 
         deliver = report.get("deliver") or {}
         sweep = report.get("sweep") or {}
+        # historical_fenced is the TOTAL fenced this pass: ingest-side dropped candidates (newly
+        # discovered historical markers) + send-edge fenced rows (pre-existing / recovered backlog).
+        historical_fenced += len(deliver.get("fenced") or [])
         return IssueSupervisionOutcome(
             issue=issue,
             events_supplied=events_supplied,
@@ -601,15 +618,12 @@ def default_roster(ws: SupervisedWorkspace) -> tuple[tuple[str, ...], str]:
 def default_authoritative_map(lifecycle_store: object) -> dict[str, str]:
     """The home-global ``{issue -> sole actively-owning workspace}`` map (Redmine #13968 F1).
 
-    Reads every lifecycle row via the NON-migrating reader (``lifecycle_store.records()``) and
-    keeps the ACTIVE-disposition rows carrying a bound issue as ``(workspace_id, issue)``
-    active-owner pairs, then resolves each issue's unique authoritative workspace
-    (:func:`...domain.workspace_supervisor.authoritative_workspace_by_issue`): an issue actively
-    owned by exactly one workspace maps to it; zero / two-or-more owners is omitted (supervised
-    nowhere — fail-closed). An unreadable lifecycle store yields an empty map (no authoritative
-    owner anywhere), never a crash. This is the durable owning-lane authority — the registry
-    identity source of truth — that selects the one authoritative workspace per issue, so a foreign
-    / stale registry workspace (or a duplicate live lane) never double-delivers a shared issue.
+    The durable owning-lane authority (registry-identity source of truth) that selects the one
+    authoritative workspace per issue, so a foreign / stale registry workspace (or a duplicate live
+    lane) never double-delivers a shared issue. Reads every lifecycle row via the NON-migrating
+    reader, keeps the ACTIVE-disposition + bound-issue rows as ``(workspace_id, issue)`` pairs, and
+    resolves each issue's unique owner (:func:`...authoritative_workspace_by_issue`): zero /
+    two-or-more owners is omitted (fail-closed). An unreadable store yields ``{}`` (never a crash).
     """
     from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_ACTIVE
 
@@ -920,12 +934,9 @@ def build_supervisor(
     ) -> Optional[str]:
         """The issue's current dispatch anchor journal for the general-callback fence (#13968 F2).
 
-        Resolves the issue's owning lane + generation (``_lane_facts``) then its current dispatch
-        entry journal (``_dispatch_anchor_fn`` — the owning journal of the current
-        ``implementation_request``). Returns that journal id, or ``None`` when the owning lane or
-        the anchor cannot be pinned (no owner / legacy prose-only IR): the fence then drops every
-        general candidate (fail-closed), so no historical marker is delivered under an
-        unresolvable current generation.
+        Resolves the owning lane + generation (``_lane_facts``) then its current dispatch entry
+        journal (``_dispatch_anchor_fn``). ``None`` when the owning lane / anchor cannot be pinned
+        (no owner / legacy prose-only IR): the fence then drops every general candidate (fail-closed).
         """
         lane_id, generation, _disposition = _lane_facts(workspace_id, issue)
         if not lane_id:
