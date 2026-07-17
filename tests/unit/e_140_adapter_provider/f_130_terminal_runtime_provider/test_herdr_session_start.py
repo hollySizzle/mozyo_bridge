@@ -462,10 +462,13 @@ class _SessionStartHarness:
         claude_permission_mode_default=None,
         agent_launch=None,
     ):
+        # `exist_ok`: a scenario may drive TWO runs through one tmp (Redmine #13948 pins
+        # that a re-run of the same command in the same lane is a NEW action), and the
+        # second must reuse the first's repo/home — that shared identity is the point.
         repo = Path(tmp) / "repo"
-        repo.mkdir()
+        repo.mkdir(exist_ok=True)
         home = Path(tmp) / "home"
-        home.mkdir()
+        home.mkdir(exist_ok=True)
         binpath = Path(tmp) / "fake-herdr"
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -3761,6 +3764,82 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(slot.compensation, "not_needed")
         self.assertFalse(result.ok)
         self.assertFalse(herdr.start_argvs)  # a surfacing never relaunches over residue
+
+    def test_partial_pair_is_recorded_as_an_action_with_its_participants(self) -> None:
+        # Answer j#80989 Q3: the run that started the panes is the only thing that knows
+        # they are ITS panes. Without this record a later command cannot tell this action's
+        # Codex from one somebody else launched a minute ago — which is exactly why #13882
+        # j#80951 needed a hand-written owner approval to converge a pair the tool had just
+        # created. The action is reserved BEFORE the first side effect and each launch is
+        # recorded as it happens, so a run that dies mid-pair still leaves an owner.
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_ROLLBACK_OWED,
+            StartupTransactionFence,
+        )
+
+        herdr = _Herdr()
+        herdr.exit_after_start = {"claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+            fence = StartupTransactionFence(home=Path(tmp) / "home")
+            action = fence.read(result.action_id)
+        self.assertTrue(result.action_id)
+        self.assertIsNotNone(action)
+        # The debt is recorded by the run that incurred it...
+        self.assertEqual(action.phase, PHASE_ROLLBACK_OWED)
+        # ...over BOTH fresh launches, including the healthy sibling: converging the pair
+        # is what the rollback rail is for, and it can only act on what is recorded.
+        self.assertEqual({p.role for p in action.participants}, {"claude", "codex"})
+        codex = action.participant_for("codex")
+        self.assertEqual(codex.locator, self._by_provider(result)["codex"].locator)
+        self.assertIn("workspace=", codex.receipt)
+        self.assertFalse(codex.closed)
+
+    def test_a_healthy_run_completes_its_action_owing_nothing(self) -> None:
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_COMPLETED_SUCCESS,
+            StartupTransactionFence,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+            action = StartupTransactionFence(home=Path(tmp) / "home").read(result.action_id)
+        self.assertTrue(result.ok)
+        self.assertEqual(action.phase, PHASE_COMPLETED_SUCCESS)
+
+    def test_a_rerun_is_a_new_action_and_never_inherits_the_old_record(self) -> None:
+        # The nonce is what stops an old completion being read as proof about a new pair.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            first, _, _ = self._wrapped(tmp, herdr)
+            second, _, _ = self._wrapped(tmp, herdr)
+        self.assertTrue(first.action_id and second.action_id)
+        self.assertNotEqual(first.action_id, second.action_id)
+
+    def test_dry_run_reserves_no_action(self) -> None:
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+            result = self._run_dry_run(repo, home, binpath, herdr)
+            # A dry run has no side effect to own, so it mints no identity AND leaves the
+            # authority untouched — reserving one would itself be the side effect it
+            # promises not to have.
+            self.assertTrue(StartupTransactionFence(home=home).store_shape().absent)
+        self.assertEqual(result.action_id, "")
 
     def test_health_axes_reach_the_json_payload(self) -> None:
         # The operator-facing surface must carry the cause, not just a boolean: `--json`

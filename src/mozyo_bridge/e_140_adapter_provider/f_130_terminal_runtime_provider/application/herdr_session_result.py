@@ -58,6 +58,21 @@ _DISPOSITION_BY_OUTCOME: dict[str, str] = {
 
 
 @dataclass(frozen=True)
+class _SlotPlan:
+    """A per-provider decision (adopt / launch / dry-run plan) made before any launch.
+
+    Classifying every slot up front lets the run pick a single launch-target
+    workspace (and decide whether to create+reclaim a base pane) before it starts
+    launching, so ``agent start`` can pass an explicit ``--workspace``.
+    """
+
+    provider: str
+    assigned_name: str
+    kind: str  # "adopt" | "launch" | "planned" | "stale" | "unattested"
+    locator: str = ""  # adopted live locator (kind == "adopt") / stale residue pane (kind == "stale"); else ""
+    detail: str = ""  # fail-closed reason for kind == "unattested" (Redmine #13637); else ""
+
+@dataclass(frozen=True)
 class SlotResult:
     """The outcome of preparing one provider slot's durable herdr identity.
 
@@ -218,4 +233,5 @@ __all__ = (
     "SLOT_UNATTESTED",
     "SessionStartResult",
     "SlotResult",
+    "_SlotPlan",
 )
