@@ -514,6 +514,22 @@ class ForwardOutboxFence:
         """True when the route currently holds a reserved / delivered / uncertain generation."""
         return self.active(route).state in _ACTIVE_STATES
 
+    def _genuinely_uninitialized(self) -> bool:
+        """True only when BOTH artifacts are truly absent. (tri-state, #13892 R5-F3)
+
+        `_read_sidecar_nonce() is None` is a fail-soft predicate: it covers an EMPTY or
+        UNREADABLE sidecar as well as a missing one, so `nonce is None and not path.exists()`
+        read a DB-absent + empty-sidecar-residue store as "nothing was ever reserved here" —
+        turning damage into a silent "no obligations owed". This is the identical defect the
+        sibling dispatch fence was corrected for (review j#80523 R2-F1); it was re-introduced
+        here by writing the same fail-soft check again.
+
+        Uses `lexists`, so a broken symlink still counts as evidence something was placed here.
+        """
+        import os
+
+        return not os.path.lexists(self.sidecar_path) and not os.path.lexists(self.path)
+
     def rows_for_sender(
         self, *, workspace_id: str, from_lane_id: str
     ) -> tuple[tuple[str, str, str], ...]:
@@ -529,8 +545,10 @@ class ForwardOutboxFence:
         Fails closed on a damaged / identity-mismatched store; a never-bootstrapped store has
         provably no rows and returns empty (the ordinary case, which must not be over-blocked).
         """
-        if self._read_sidecar_nonce() is None and not self.path.exists():
+        if self._genuinely_uninitialized():
             return ()  # both artifacts absent: nothing was ever reserved here
+        # Any other shape must prove itself through `_connect`, which fails closed on a
+        # missing / empty / foreign / nonce-mismatched store.
         conn = self._connect()
         try:
             rows = conn.execute(

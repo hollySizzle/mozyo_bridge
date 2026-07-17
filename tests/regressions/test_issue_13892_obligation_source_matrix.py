@@ -178,12 +178,47 @@ class ForwardFenceCoveredForOwedFromTest(_Home):
             forward_generation_obligations(workspace_id=WS, lane_id=LANE, roles=(ROLE,)), ()
         )
 
-    def test_an_unreadable_store_raises(self):
-        f = ForwardOutboxFence(home=self.home)
-        f.bootstrap()
-        f.sidecar_path.write_text("deadbeef")
-        with self.assertRaises(ObligationStoreUnreadable):
-            forward_generation_obligations(workspace_id=WS, lane_id=LANE, roles=(ROLE,))
+    def test_every_damage_shape_fails_closed(self):
+        """j#80620 R5-F3 — the same fail-open the dispatch fence was corrected for at R2-F1,
+        re-introduced here by writing `nonce is None and not path.exists()` again.
+
+        `_read_sidecar_nonce() is None` also covers an EMPTY / unreadable sidecar, so a
+        DB-absent + empty-sidecar-residue store read as "nothing was ever reserved here".
+        """
+        import sqlite3
+
+        def bump(f):
+            conn = sqlite3.connect(f.path)
+            conn.execute("PRAGMA user_version = 9999")
+            conn.commit()
+            conn.close()
+
+        shapes = {
+            "db gone, EMPTY sidecar": lambda f: (
+                f.path.unlink(), f.sidecar_path.write_text("")
+            ),
+            "db gone, sidecar remains": lambda f: f.path.unlink(),
+            "sidecar gone, db remains": lambda f: f.sidecar_path.unlink(),
+            "corrupt db": lambda f: f.path.write_bytes(b"not sqlite"),
+            "nonce mismatch": lambda f: f.sidecar_path.write_text("deadbeef"),
+            "unknown schema": bump,
+        }
+        for label, mutate in shapes.items():
+            with self.subTest(shape=label):
+                d = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, d, True)
+                home = Path(d)
+                with mock.patch(
+                    "mozyo_bridge.core.state.forward_outbox_fence.mozyo_bridge_home",
+                    return_value=home,
+                ):
+                    f = ForwardOutboxFence(home=home)
+                    f.bootstrap()
+                    mutate(f)
+                    with self.assertRaises(ObligationStoreUnreadable):
+                        forward_generation_obligations(
+                            workspace_id=WS, lane_id=LANE, roles=(ROLE,)
+                        )
 
 
 # ------------------------------------------- structurally inapplicable ---
