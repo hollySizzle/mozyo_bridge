@@ -40,6 +40,13 @@ _PROVENANCE_ANCHOR = re.compile(
 )
 
 
+# Sentinel distinguishing a KEY-ABSENT envelope field from a KEY-PRESENT null (Redmine
+# #13967 R6-F1) — the same absent-vs-present-null discipline the finding rows / collection
+# members already use, applied at the top-level envelope. A present null / "" / wrong-type
+# authority field is malformed (-> indeterminate), never folded into the absent default.
+_MISSING = object()
+
+
 def _valid_provenance(value: object) -> bool:
     """True when ``value`` is a non-empty string shaped like a durable anchor (R3/R4-F3)."""
     if not isinstance(value, str):
@@ -122,13 +129,15 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
 
     provenance_raw: object = ""
     indeterminate_reasons: list[str] = []
-    snapshot_threshold: object = None
+    snapshot_threshold: object = _MISSING
     raw_entries: object = []
-    snapshot_unreadable: object = []
+    snapshot_unreadable: object = _MISSING
     if isinstance(data, dict):
-        raw_entries = data.get("findings", [])
-        snapshot_unreadable = data.get("unreadable_subsystems", [])
-        snapshot_threshold = data.get("threshold")
+        # `raw.get(k, _MISSING)`: an absent key takes the safe default, a PRESENT null / ""
+        # / wrong-type authority field is malformed (never folded into absent — R6-F1).
+        raw_entries = data.get("findings", _MISSING)
+        snapshot_unreadable = data.get("unreadable_subsystems", _MISSING)
+        snapshot_threshold = data.get("threshold", _MISSING)
         provenance_raw = data.get("provenance", "")
     else:
         raw_entries = data
@@ -140,14 +149,18 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
         # Authority-bearing projection requires a declared durable-anchor-shaped provenance
         # — a free-form or non-string value is not a verified source (Redmine #13967 R3-F3).
         indeterminate_reasons.append("no_or_invalid_provenance")
-    if history_provided and not isinstance(raw_entries, list):
+    # `findings`: absent -> the empty default (evaluable); a PRESENT null / non-list is a
+    # malformed envelope -> indeterminate (Redmine #13967 R6-F1).
+    if raw_entries is _MISSING:
+        raw_entries = []
+    elif history_provided and not isinstance(raw_entries, list):
         indeterminate_reasons.append("findings_not_a_list")
         raw_entries = []
-    # `unreadable_subsystems` must be a list; a non-list is a malformed envelope, reported
-    # as indeterminate rather than crashing on `list(...)` (Redmine #13967 R3-F3d).
-    if snapshot_unreadable in (None, ""):
+    # `unreadable_subsystems`: absent -> the empty default; a PRESENT null / "" / non-list is
+    # a malformed envelope -> indeterminate (never normalized to absent — Redmine #13967 R6-F1).
+    if snapshot_unreadable is _MISSING:
         snapshot_unreadable = []
-    if not isinstance(snapshot_unreadable, list):
+    elif not isinstance(snapshot_unreadable, list):
         indeterminate_reasons.append("unreadable_subsystems_not_a_list")
         snapshot_unreadable = []
 
@@ -166,12 +179,14 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
             # projection indeterminate (we cannot claim we read the history).
             indeterminate_reasons.append("unattributable_malformed_entry")
 
-    # Threshold must be an exact int (a snapshot `"100"` string is NOT coerced — R3-F3c).
+    # Threshold must be an exact int (a snapshot `"100"` string is NOT coerced — R3-F3c). An
+    # absent snapshot threshold takes the default; a PRESENT null / non-int is malformed ->
+    # indeterminate (never treated as absent — Redmine #13967 R6-F1).
     cli_threshold = getattr(args, "threshold", None)  # argparse already enforces int
     threshold = DEFAULT_ESCALATION_THRESHOLD
     if cli_threshold is not None:
         threshold = int(cli_threshold)
-    elif snapshot_threshold is not None:
+    elif snapshot_threshold is not _MISSING:
         if isinstance(snapshot_threshold, bool) or not isinstance(snapshot_threshold, int):
             indeterminate_reasons.append("threshold_not_an_int")
         else:

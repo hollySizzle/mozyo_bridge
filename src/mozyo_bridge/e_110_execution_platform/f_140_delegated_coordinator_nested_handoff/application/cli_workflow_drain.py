@@ -195,10 +195,17 @@ def _merge_release_pending(
 
 
 def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
-    """Derive drain lanes from a ``workflow glance --json`` envelope. ``(lanes, complete)``:
-    ``complete`` is False when a row could not be read (a non-dict, a missing issue_id, or a
-    row with no workflow_state) — an unreadable row makes the projection durable-incomplete
-    rather than being silently dropped (Redmine #13967 R2-F2)."""
+    """Derive drain lanes from a ``workflow glance --json`` envelope. ``(lanes, complete)``.
+
+    The canonical ``workflow glance --json`` producer ALWAYS emits ``rows`` and an exact-bool
+    ``degraded`` (``domain/workflow_glance.py::glance_payload``) and always appends
+    ``lifecycle_diagnostic`` (``cli_workflow_glance.py``). So this reader treats those three
+    keys as REQUIRED with exact types (Redmine #13967 R6-F2): a missing / present-null /
+    wrong-type ``rows`` / ``lifecycle_diagnostic`` (must be a list) or ``degraded`` (must be an
+    exact bool), or a ``degraded=True`` envelope, makes the projection durable-incomplete
+    (-> hold). Only the canonical empty envelope (both lists present + ``degraded: false``)
+    with no unreadable row is ``complete``. An unreadable row (non-dict / non-string identity
+    or state) also makes it incomplete rather than being silently dropped (R2-F2)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -207,16 +214,22 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         raise SystemExit("--from-glance must carry a workflow glance --json envelope")
 
     complete = True
-    # A non-list `rows` / `lifecycle_diagnostic` is a malformed envelope: it makes the
-    # projection durable-incomplete (-> hold) instead of crashing on iteration (R4-F2).
-    rows = data.get("rows", [])
+    # `rows` / `lifecycle_diagnostic` are REQUIRED lists (a missing key, present null, or
+    # non-list is a partially-read glance envelope -> durable-incomplete, R6-F2).
+    rows = data.get("rows", _MISSING)
     if not isinstance(rows, list):
         complete = False
         rows = []
-    diagnostics = data.get("lifecycle_diagnostic", [])
+    diagnostics = data.get("lifecycle_diagnostic", _MISSING)
     if not isinstance(diagnostics, list):
         complete = False
         diagnostics = []
+    # `degraded` is a REQUIRED exact bool. A missing / present-null / falsey-non-bool value
+    # (e.g. `0`), or an explicit `degraded: true`, means the glance source was not confirmed
+    # healthy -> durable-incomplete (R6-F2). Only an exact `degraded: false` clears it.
+    degraded = data.get("degraded", _MISSING)
+    if not isinstance(degraded, bool) or degraded is True:
+        complete = False
 
     active: list[DrainLane] = []
     for row in rows:
@@ -338,18 +351,12 @@ def cmd_workflow_drain_queue(args: argparse.Namespace) -> int:
         lanes, complete = _lanes_from_snapshot(snapshot)
         degraded = not complete
     elif from_glance:
+        # `_lanes_from_glance` fully validates the envelope (required rows / lifecycle_
+        # diagnostic lists + an exact-bool `degraded: false`, and every row's exact-type
+        # identity), so `complete` already reflects source degradation and any unreadable
+        # row — do not release from a partially-read glance envelope (Redmine #13967 R6-F2).
         lanes, complete = _lanes_from_glance(from_glance)
-        # A glance envelope that reports its own source degradation, OR that carried an
-        # unreadable row, makes the drain projection durable-incomplete too (Redmine #13967
-        # F2 / R2-F2 — do not release from a partially-read durable record).
         degraded = not complete
-        try:
-            glance_env = _json.loads(Path(from_glance).read_text(encoding="utf-8"))
-            degraded = degraded or bool(
-                isinstance(glance_env, dict) and glance_env.get("degraded")
-            )
-        except (OSError, ValueError):
-            degraded = True
     else:
         repo = getattr(args, "repo", None)
         repo_root = Path(repo).expanduser() if repo else Path.cwd()
