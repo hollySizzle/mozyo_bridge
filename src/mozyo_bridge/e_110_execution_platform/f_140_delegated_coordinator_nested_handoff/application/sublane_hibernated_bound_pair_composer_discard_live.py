@@ -11,11 +11,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    evaluate_attestation,
+)
 from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer, norm
 from mozyo_bridge.core.state.replacement_preservation import (
     PreservationObservation,
     assess_preservation,
-    identity_observation_for,
 )
 from mozyo_bridge.core.state.replacement_transaction import (
     CAS_ALREADY_DECLARED,
@@ -25,6 +28,9 @@ from mozyo_bridge.core.state.replacement_transaction import (
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (
     PARTICIPANT_CLOSE_OWED,
+    PARTICIPANT_LAUNCH_OWED,
+    PARTICIPANT_REPLACED,
+    PARTICIPANT_VERIFY_OWED,
     PHASE_COMPLETED,
     PHASE_DRAINING_CONTINUATION,
     PHASE_REPLACING_NONSELF,
@@ -58,7 +64,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PreparationExpectation,
     expectation_for,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_convergence import worktree_digest
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_convergence import (
+    BoundSlot,
+    slot_digest,
+    worktree_digest,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (
     SLOT_HEALTHY,
     SLOT_PRESERVE_PENDING,
@@ -71,11 +81,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
     ACTUATION_RECOVERED,
+    CLOSE_ERROR,
+    LAUNCH_ERROR,
     OLD_SLOT_ABSENT,
     OLD_SLOT_AMBIGUOUS,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
     list_herdr_agent_rows,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    resolve_gateway_provider,
+    resolve_worker_provider,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
@@ -94,9 +110,64 @@ def _convergence_request(request: PrepareBoundPairRequest) -> ConvergeBoundPairR
 
 
 @dataclass
+class _SnapshotQuarantineOps(LiveSublaneQuarantineOps):
+    """Run the pending-composer classifier against one already-read inventory."""
+
+    snapshot_rows: Sequence[Mapping[str, object]] = ()
+
+    def _rows(self) -> Sequence[Mapping[str, object]]:
+        return self.snapshot_rows
+
+
+@dataclass
 class _ComposerDiscardActuatorPort(_BoundPairActuatorPort):
     prepare_request: PrepareBoundPairRequest
     approved_roles: tuple[str, ...]
+
+    def _fresh_authority(self) -> PreparationObservation | None:
+        """Revalidate the approval-bound full pair at one destructive-effect edge."""
+        try:
+            rows = tuple(list_herdr_agent_rows(self.owner.env))
+            record = self.owner._lifecycle(self.request)
+            worktree, workspace, identity = self.owner._worktree(self.request)
+            if record is None or worktree is None or not workspace or not identity:
+                return None
+            ok_branch, branch = _git(worktree, "branch", "--show-current")
+            ok_status, status = _git(worktree, "status", "--porcelain=v1")
+            key = ReplacementTransactionKey(workspace, self.expectation.action_id)
+            transaction = self.owner.transaction_store.get(key)
+            if transaction is None:
+                return None
+            observation = self.owner._observation_from_snapshot(
+                self.prepare_request,
+                rows=rows,
+                record=record,
+                worktree=worktree,
+                workspace=workspace,
+                identity=identity,
+                ok_branch=ok_branch,
+                branch=branch,
+                ok_status=ok_status,
+                status=status,
+                transaction=transaction,
+            )
+            progress = self.owner._progress_proven_roles(
+                self.prepare_request,
+                observation,
+                self.expectation,
+                transaction.participants,
+            )
+        except Exception:  # noqa: BLE001 - every unreadable edge is zero effect
+            return None
+        if not self.owner._progress_snapshot_matches(
+            self.prepare_request,
+            observation,
+            self.expectation,
+            transaction.participants,
+            progress_proven_roles=progress,
+        ):
+            return None
+        return observation
 
     def observe_old_slot(self, pin: ParticipantPin) -> str:
         observed = super().observe_old_slot(pin)
@@ -114,71 +185,42 @@ class _ComposerDiscardActuatorPort(_BoundPairActuatorPort):
         sibling port re-runs every identity/lifecycle/worktree/composer fact and clears only
         that one reason for a participant named by the distinct discard approval.
         """
-        try:
-            rows = tuple(list_herdr_agent_rows(self.owner.env))
-        except Exception:  # noqa: BLE001
-            return PreservationObservation(detail="inventory_unreadable")
-        self.live.snapshot_rows = rows
-        record = self.owner._lifecycle(self.request)
-        if record is None:
-            return PreservationObservation(detail="lifecycle_unreadable")
-        worktree, workspace, identity = self.owner._worktree(self.request)
-        if worktree is None or not workspace or not identity:
-            return PreservationObservation(detail="worktree_identity_unreadable")
-        ok_branch, branch = _git(worktree, "branch", "--show-current")
-        ok_status, status = _git(worktree, "status", "--porcelain=v1")
-        observation, locator, assigned = self.live.observe_slot(
-            role=pin.role,
-            provider=pin.provider,
-            workspace_id=self.live.workspace_id(),
-            lane=self.request.lane,
-            record=record,
-        )
-        disposition = decide_slot_recovery(observation)
+        fresh = self._fresh_authority()
+        slot = next(
+            (item for item in fresh.slots if item.role == pin.role), None
+        ) if fresh is not None else None
         authority_ok = bool(
-            pin.role in self.approved_roles
-            and disposition == SLOT_PRESERVE_PENDING
-            and norm(workspace) == norm(self.live.workspace_id())
-            and self.owner._lifecycle_exact(self.request, record, identity)
-            and identity_observation_for(
-                pin,
-                observed_lane_id=self.request.lane,
-                observed_role=pin.role,
-                observed_provider=pin.provider,
-                observed_assigned_name=assigned,
-                observed_locator=locator,
-                observed_lane_revision=str(record.revision),
-                observed_lane_generation=str(record.lane_generation),
-            )
+            fresh is not None
+            and pin.role in self.approved_roles
+            and slot is not None
+            and self.owner._close_owed_slot_matches(slot, pin, fresh.discard_roles)
         )
-        composer_ok = bool(
-            authority_ok
-            and self.owner._composer_discardable(
-                self.prepare_request,
-                role=pin.role,
-                provider=pin.provider,
-                assigned_name=pin.assigned_name,
-                locator=pin.old_locator,
-            )
-        )
-        branch_ok = bool(ok_branch and norm(branch) == norm(self.request.branch))
-        clean = bool(ok_status and not status and branch_ok)
         return PreservationObservation(
-            dirty_diff=not clean,
-            running_process=not observation.not_productive,
+            dirty_diff=not authority_ok,
+            running_process=not authority_ok,
             # This is the only override: the distinct structured approval authorizes
             # discarding this exact uncorrelated pending composer generation.
-            pending_approval=not composer_ok,
+            pending_approval=not authority_ok,
             identity_matches=authority_ok,
             # The old slot may be unattested; exact owner approval + positive pair identity
             # is its close authority.  The replacement must be action-attested below.
-            attestation_fresh=composer_ok,
+            attestation_fresh=authority_ok,
             detail=(
                 "approved_exact_uncorrelated_pending_composer"
-                if composer_ok and clean
-                else f"{disposition}; discard_or_lifecycle_authority_changed"
+                if authority_ok
+                else "approval_bound_full_pair_or_composer_changed"
             ),
         )
+
+    def close_exact_generation(self, pin: ParticipantPin) -> str:
+        if self._fresh_authority() is None:
+            return CLOSE_ERROR
+        return super().close_exact_generation(pin)
+
+    def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
+        if self._fresh_authority() is None:
+            return LAUNCH_ERROR
+        return super().launch_action_bound(action_id, pin)
 
 
 @dataclass
@@ -196,12 +238,16 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         provider: str,
         assigned_name: str,
         locator: str,
+        rows: Sequence[Mapping[str, object]] | None = None,
     ) -> bool:
         """Positive raw facts for one uncorrelated, non-productive pending composer."""
-        try:
-            rows = tuple(list_herdr_agent_rows(self.env))
-        except Exception:  # noqa: BLE001
-            return False
+        if rows is None:
+            try:
+                rows = tuple(list_herdr_agent_rows(self.env))
+            except Exception:  # noqa: BLE001
+                return False
+        else:
+            rows = tuple(rows)
         exact = [
             row for row in rows
             if norm(row.get(AGENT_KEY_NAME)) == norm(assigned_name)
@@ -214,8 +260,10 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         if not isinstance(revision, int) or isinstance(revision, bool):
             return False
         try:
-            inspection = LiveSublaneQuarantineOps(
-                repo_root=Path(request.worktree).expanduser(), env=self.env
+            inspection = _SnapshotQuarantineOps(
+                repo_root=Path(request.worktree).expanduser(),
+                env=self.env,
+                snapshot_rows=rows,
             ).inspect(
                 QuarantineRequest(
                     issue=request.issue,
@@ -240,6 +288,254 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             and signal.agent_state.strip().lower() not in ("busy", "working")
             and not signal.correlation_ambiguous
             and not signal.correlated_marker_ids
+        )
+
+    @staticmethod
+    def _close_owed_slot_matches(
+        slot: BoundSlot,
+        participant: ParticipantPin,
+        discard_roles: Sequence[str],
+    ) -> bool:
+        return bool(
+            participant.phase == PARTICIPANT_CLOSE_OWED
+            and slot.role == participant.role
+            and slot.provider == participant.provider
+            and slot.assigned_name == participant.assigned_name
+            and slot.locator == participant.old_locator
+            and slot.disposition == SLOT_PRESERVE_PENDING
+            and not slot.close_proven
+            and participant.role in discard_roles
+        )
+
+    @classmethod
+    def _progress_snapshot_matches(
+        cls,
+        request: PrepareBoundPairRequest,
+        observation: PreparationObservation,
+        expectation: PreparationExpectation,
+        participants: Sequence[ParticipantPin],
+        *,
+        progress_proven_roles: Sequence[str] = (),
+    ) -> bool:
+        """Compare a retry to the approved pair while admitting proven participant progress."""
+        if not cls._observation_matches(request, observation, expectation):
+            return False
+        pins = tuple(participants)
+        by_role = {pin.role: pin for pin in pins}
+        expected_roles = set(expectation.discard_roles)
+        if (
+            len(by_role) != len(pins)
+            or set(by_role) != expected_roles
+            or any(role not in expected_roles for role in observation.discard_roles)
+            or any(
+                pin.is_self
+                or norm(pin.lane_id) != norm(request.lane)
+                or pin.lane_revision != str(expectation.revision)
+                or pin.lane_generation != str(expectation.generation)
+                or pin.phase not in {
+                    PARTICIPANT_CLOSE_OWED,
+                    PARTICIPANT_LAUNCH_OWED,
+                    PARTICIPANT_VERIFY_OWED,
+                    PARTICIPANT_REPLACED,
+                }
+                for pin in pins
+            )
+        ):
+            return False
+        proven = set(progress_proven_roles)
+        projected: list[BoundSlot] = []
+        for slot in observation.slots:
+            pin = by_role.get(slot.role)
+            if pin is None:
+                projected.append(slot)
+                continue
+            if pin.phase == PARTICIPANT_CLOSE_OWED:
+                if not cls._close_owed_slot_matches(
+                    slot, pin, observation.discard_roles
+                ):
+                    return False
+            elif pin.role not in proven:
+                return False
+            projected.append(
+                BoundSlot(
+                    role=pin.role,
+                    provider=pin.provider,
+                    assigned_name=pin.assigned_name,
+                    locator=pin.old_locator,
+                    disposition=SLOT_PRESERVE_PENDING,
+                )
+            )
+        return slot_digest(projected) == expectation.slot_digest
+
+    @staticmethod
+    def _action_bound_slot(
+        request: PrepareBoundPairRequest,
+        observation: PreparationObservation,
+        expectation: PreparationExpectation,
+        participant: ParticipantPin,
+    ) -> bool:
+        slot = next(
+            (item for item in observation.slots if item.role == participant.role), None
+        )
+        if slot is None:
+            return False
+        if (
+            participant.phase == PARTICIPANT_LAUNCH_OWED
+            and slot.close_proven
+            and slot.provider == participant.provider
+            and slot.assigned_name == participant.assigned_name
+            and slot.locator == participant.old_locator
+        ):
+            return True
+        if (
+            slot.provider != participant.provider
+            or slot.assigned_name != participant.assigned_name
+            or not slot.locator
+            or slot.locator == participant.old_locator
+        ):
+            return False
+        if (
+            participant.phase == PARTICIPANT_VERIFY_OWED
+            and slot.disposition in (SLOT_RECOVER, SLOT_HEALTHY)
+        ):
+            # The immutable phase proves launch completion.  The generic actuator owns the
+            # action-bound attestation wait and cannot advance another participant until this
+            # one reaches ``replaced``.
+            return True
+        try:
+            record = HerdrIdentityAttestationStore().read(slot.assigned_name)
+        except Exception:  # noqa: BLE001
+            return False
+        join = evaluate_attestation(
+            record,
+            live_locator=slot.locator,
+            expected_workspace_id=observation.workspace_id,
+            expected_role=slot.provider,
+            expected_lane=request.lane,
+        )
+        return bool(
+            join.ok
+            and norm(record.replacement_action_id) == norm(expectation.action_id)
+        )
+
+    def _progress_proven_roles(
+        self,
+        request: PrepareBoundPairRequest,
+        observation: PreparationObservation,
+        expectation: PreparationExpectation,
+        participants: Sequence[ParticipantPin],
+    ) -> tuple[str, ...]:
+        return tuple(
+            pin.role
+            for pin in participants
+            if pin.phase != PARTICIPANT_CLOSE_OWED
+            and self._action_bound_slot(request, observation, expectation, pin)
+        )
+
+    def _observation_from_snapshot(
+        self,
+        request: PrepareBoundPairRequest,
+        *,
+        rows: Sequence[Mapping[str, object]],
+        record,
+        worktree: Path,
+        workspace: str,
+        identity: str,
+        ok_branch: bool,
+        branch: str,
+        ok_status: bool,
+        status: str,
+        transaction,
+    ) -> PreparationObservation:
+        try:
+            providers = (
+                ("gateway", resolve_gateway_provider(str(self.repo_root))),
+                ("worker", resolve_worker_provider(str(self.repo_root))),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return PreparationObservation(
+                workspace_id=workspace,
+                worktree_path=str(worktree),
+                worktree_identity=identity,
+                branch=branch,
+                revision=record.revision,
+                generation=record.lane_generation,
+                lifecycle_exact=self._lifecycle_exact(
+                    _convergence_request(request), record, identity
+                ),
+                pins_empty=not bool(record.declared_slots),
+                worktree_readable=ok_status,
+                worktree_clean=ok_status and not status,
+                branch_matches=ok_branch and branch == request.branch,
+                detail=f"provider identity unreadable ({type(exc).__name__})",
+            )
+        live = _SnapshotRecoveryOps(
+            repo_root=self.repo_root,
+            request_issue=request.issue,
+            request_lane=request.lane,
+            request_journal=request.journal,
+            env=self.env,
+        )
+        live.snapshot_rows = tuple(rows)
+        live.target_workspace_id = workspace
+        slots: list[BoundSlot] = []
+        discard: list[str] = []
+        for role, provider in providers:
+            slot_observation, locator, assigned = live.observe_slot(
+                role=role,
+                provider=provider,
+                workspace_id=workspace,
+                lane=request.lane,
+                record=record,
+            )
+            disposition = decide_slot_recovery(slot_observation)
+            close_proven = False
+            if not locator and transaction is not None:
+                participant = transaction.find_participant(
+                    (request.lane, role, provider, assigned)
+                )
+                if participant is not None and participant.phase != PARTICIPANT_CLOSE_OWED:
+                    locator = participant.old_locator
+                    disposition = SLOT_RECOVER
+                    close_proven = True
+            slot = BoundSlot(
+                role=role,
+                provider=provider,
+                assigned_name=assigned,
+                locator=locator,
+                disposition=disposition,
+                close_proven=close_proven,
+            )
+            slots.append(slot)
+            if (
+                disposition == SLOT_PRESERVE_PENDING
+                and self._composer_discardable(
+                    request,
+                    role=role,
+                    provider=provider,
+                    assigned_name=assigned,
+                    locator=locator,
+                    rows=rows,
+                )
+            ):
+                discard.append(role)
+        return PreparationObservation(
+            workspace_id=workspace,
+            worktree_path=str(worktree),
+            worktree_identity=identity,
+            branch=branch,
+            revision=record.revision,
+            generation=record.lane_generation,
+            lifecycle_exact=self._lifecycle_exact(
+                _convergence_request(request), record, identity
+            ),
+            pins_empty=not bool(record.declared_slots),
+            inventory_readable=True,
+            worktree_readable=ok_status,
+            worktree_clean=ok_status and not status,
+            branch_matches=ok_branch and branch == request.branch,
+            slots=tuple(slots),
+            discard_roles=tuple(sorted(discard)),
         )
 
     def observe(
@@ -375,6 +671,22 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         current = self.observe(request, action_id=expectation.action_id if existing else "")
         if not self._observation_matches(request, current, expectation):
             return PreparationDrive(False, "transaction_conflict", "approval-bound observation changed")
+        if existing is not None:
+            progress = self._progress_proven_roles(
+                request, current, expectation, existing.participants
+            )
+            if not self._progress_snapshot_matches(
+                request,
+                current,
+                expectation,
+                existing.participants,
+                progress_proven_roles=progress,
+            ):
+                return PreparationDrive(
+                    False,
+                    "transaction_conflict",
+                    "approval-bound full pair or immutable progress changed",
+                )
         decision = DecisionPointer(
             source="redmine", issue_id=request.issue, journal_id=request.journal
         )

@@ -9,6 +9,12 @@ from unittest import mock
 
 from mozyo_bridge.core.state.replacement_preservation import assess_preservation
 from mozyo_bridge.core.state.replacement_transaction import ParticipantPin
+from mozyo_bridge.core.state.replacement_transaction_model import (
+    PARTICIPANT_CLOSE_OWED,
+    PARTICIPANT_LAUNCH_OWED,
+    PARTICIPANT_REPLACED,
+    PARTICIPANT_VERIFY_OWED,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import (
     PreparationDrive,
     PreparationObservation,
@@ -52,6 +58,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
+    CLOSE_ERROR,
+    LAUNCH_ERROR,
     OLD_SLOT_AMBIGUOUS,
 )
 
@@ -93,6 +101,34 @@ def _observation(**changes) -> PreparationObservation:
     )
     values.update(changes)
     return PreparationObservation(**values)
+
+
+def _expectation(observation: PreparationObservation) -> PreparationExpectation:
+    return expectation_for(
+        issue=REQ.issue,
+        lane=REQ.lane,
+        revision=observation.revision,
+        generation=observation.generation,
+        resolved_worktree=observation.worktree_path,
+        worktree_identity=observation.worktree_identity,
+        branch=observation.branch,
+        slots=observation.slots,
+        discard_roles=observation.discard_roles,
+    )
+
+
+def _participant(role: str, *, phase: str = PARTICIPANT_CLOSE_OWED) -> ParticipantPin:
+    slot = next(item for item in _observation().slots if item.role == role)
+    return ParticipantPin(
+        lane_id=REQ.lane,
+        role=role,
+        provider=slot.provider,
+        assigned_name=slot.assigned_name,
+        old_locator=slot.locator,
+        lane_revision="4",
+        lane_generation="1",
+        phase=phase,
+    )
 
 
 class FakeOps:
@@ -235,7 +271,6 @@ class PreparationAuthorityTests(unittest.TestCase):
 class CloseBoundaryTests(unittest.TestCase):
     def _port(self, *, composer_ok=True, disposition=SLOT_PRESERVE_PENDING):
         owner = LiveBoundPairPreparationOps(repo_root=Path("/coordinator"), env={})
-        owner._composer_discardable = mock.Mock(return_value=composer_ok)
         owner._lifecycle = mock.Mock(
             return_value=SimpleNamespace(
                 lane_disposition="hibernated",
@@ -269,10 +304,25 @@ class CloseBoundaryTests(unittest.TestCase):
             ),
         )
         request = ConvergeBoundPairRequest(**REQ.__dict__)
-        expectation = SimpleNamespace(action_id="action")
-        return _ComposerDiscardActuatorPort(
+        expectation = _expectation(_observation())
+        port = _ComposerDiscardActuatorPort(
             owner, request, expectation, live, REQ, ("gateway",)
         )
+        fresh = _observation(
+            slots=(
+                _slot("gateway", disposition),
+                _slot("worker", SLOT_RECOVER),
+            ),
+            discard_roles=("gateway",) if composer_ok and disposition == SLOT_PRESERVE_PENDING else (),
+        )
+        port._fresh_authority = mock.Mock(
+            return_value=(
+                fresh
+                if composer_ok and disposition == SLOT_PRESERVE_PENDING
+                else None
+            )
+        )
+        return port
 
     @staticmethod
     def _pin():
@@ -287,19 +337,10 @@ class CloseBoundaryTests(unittest.TestCase):
             lane_generation="1",
         )
 
-    def _observe(self, port, *, branch=REQ.branch, status=""):
-        module = (
-            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
-            "application.sublane_hibernated_bound_pair_composer_discard_live"
-        )
-
-        def git_result(_worktree, *args):
-            return (True, branch) if args == ("branch", "--show-current") else (True, status)
-
-        with mock.patch(f"{module}.list_herdr_agent_rows", return_value=()), mock.patch(
-            f"{module}._git", side_effect=git_result
-        ):
-            return assess_preservation(port.observe_preservation(self._pin()))
+    def _observe(self, port, *, authority=True):
+        if not authority:
+            port._fresh_authority.return_value = None
+        return assess_preservation(port.observe_preservation(self._pin()))
 
     def test_exact_approved_uncorrelated_pending_slot_is_the_only_close_carveout(self):
         self.assertTrue(self._observe(self._port()).may_close)
@@ -307,8 +348,7 @@ class CloseBoundaryTests(unittest.TestCase):
         self.assertTrue(
             self._observe(self._port(disposition=SLOT_PRESERVE_PRODUCTIVE)).blocked
         )
-        self.assertTrue(self._observe(self._port(), branch="other").blocked)
-        self.assertTrue(self._observe(self._port(), status=" M guarded.txt").blocked)
+        self.assertTrue(self._observe(self._port(), authority=False).blocked)
 
     def test_absent_close_owed_slot_without_transaction_close_proof_is_ambiguous(self):
         port = self._port()
@@ -318,6 +358,179 @@ class CloseBoundaryTests(unittest.TestCase):
         )
         with mock.patch(module, return_value=()):
             self.assertEqual(port.observe_old_slot(self._pin()), OLD_SLOT_AMBIGUOUS)
+
+
+class FullPairRetryAuthorityTests(unittest.TestCase):
+    def test_nonparticipant_identity_locator_and_disposition_drift_are_rejected(self):
+        approved = _observation()
+        expectation = _expectation(approved)
+        participant = _participant("gateway")
+        worker = _slot("worker", SLOT_RECOVER)
+        mutations = (
+            BoundSlot("worker", "foreign", worker.assigned_name, worker.locator, SLOT_RECOVER),
+            BoundSlot("worker", worker.provider, "foreign-worker", worker.locator, SLOT_RECOVER),
+            BoundSlot("worker", worker.provider, worker.assigned_name, "w9:p9", SLOT_RECOVER),
+            BoundSlot(
+                "worker", worker.provider, worker.assigned_name, worker.locator,
+                SLOT_PRESERVE_PRODUCTIVE,
+            ),
+        )
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                current = _observation(
+                    slots=(_slot("gateway", SLOT_PRESERVE_PENDING), changed)
+                )
+                self.assertFalse(
+                    LiveBoundPairPreparationOps._progress_snapshot_matches(
+                        REQ, current, expectation, (participant,)
+                    )
+                )
+
+    def test_existing_close_owed_retry_blocks_before_actuator_on_other_role_drift(self):
+        approved = _observation()
+        expectation = _expectation(approved)
+        current = _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                BoundSlot("worker", "claude", "managed-worker", "w9:p9", SLOT_RECOVER),
+            )
+        )
+        existing = SimpleNamespace(participants=(_participant("gateway"),))
+        store = SimpleNamespace(get=mock.Mock(return_value=existing))
+        ops = LiveBoundPairPreparationOps(
+            repo_root=Path("/coordinator"), env={}, transaction_store=store
+        )
+        ops.observe = mock.Mock(return_value=current)
+        module = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_composer_discard_live."
+            "ReplacementActuatorUseCase"
+        )
+        with mock.patch(module) as actuator:
+            result = ops.drive(REQ, expectation, approved)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "transaction_conflict")
+        actuator.assert_not_called()
+
+    def test_close_and_launch_edges_reject_a_late_full_pair_race_without_effect(self):
+        port = CloseBoundaryTests()._port()
+        port._fresh_authority = _ComposerDiscardActuatorPort._fresh_authority.__get__(
+            port, _ComposerDiscardActuatorPort
+        )
+        changed = _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                BoundSlot("worker", "claude", "managed-worker", "w9:p9", SLOT_RECOVER),
+            )
+        )
+        transaction = SimpleNamespace(participants=(_participant("gateway"),))
+        port.owner.transaction_store = SimpleNamespace(
+            get=mock.Mock(return_value=transaction)
+        )
+        port.owner._observation_from_snapshot = mock.Mock(return_value=changed)
+        port.owner._progress_proven_roles = mock.Mock(return_value=())
+        base = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_convergence_live._BoundPairActuatorPort"
+        )
+        module = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_composer_discard_live"
+        )
+
+        def git_result(_worktree, *args):
+            return (True, REQ.branch) if args == ("branch", "--show-current") else (True, "")
+
+        with mock.patch(f"{module}.list_herdr_agent_rows", return_value=()), mock.patch(
+            f"{module}._git", side_effect=git_result
+        ), mock.patch(f"{base}.close_exact_generation") as close, mock.patch(
+            f"{base}.launch_action_bound"
+        ) as launch:
+            pin = CloseBoundaryTests._pin()
+            self.assertEqual(port.close_exact_generation(pin), CLOSE_ERROR)
+            self.assertEqual(port.launch_action_bound("action", pin), LAUNCH_ERROR)
+        close.assert_not_called()
+        launch.assert_not_called()
+
+    def test_proven_launch_owed_partial_retry_preserves_approved_projection(self):
+        approved = _observation()
+        expectation = _expectation(approved)
+        participant = _participant("gateway", phase=PARTICIPANT_LAUNCH_OWED)
+        current = _observation(
+            slots=(
+                BoundSlot(
+                    "gateway", participant.provider, participant.assigned_name,
+                    participant.old_locator, SLOT_RECOVER, close_proven=True,
+                ),
+                _slot("worker", SLOT_RECOVER),
+            ),
+            discard_roles=(),
+        )
+        self.assertTrue(
+            LiveBoundPairPreparationOps._progress_snapshot_matches(
+                REQ,
+                current,
+                expectation,
+                (participant,),
+                progress_proven_roles=("gateway",),
+            )
+        )
+        verifying = _participant("gateway", phase=PARTICIPANT_VERIFY_OWED)
+        launched = _observation(
+            slots=(
+                BoundSlot(
+                    "gateway", verifying.provider, verifying.assigned_name,
+                    "w1:p9", SLOT_RECOVER,
+                ),
+                _slot("worker", SLOT_RECOVER),
+            ),
+            discard_roles=(),
+        )
+        ops = LiveBoundPairPreparationOps(repo_root=Path("/coordinator"), env={})
+        proven = ops._progress_proven_roles(
+            REQ, launched, expectation, (verifying,)
+        )
+        self.assertEqual(proven, ("gateway",))
+        self.assertTrue(
+            ops._progress_snapshot_matches(
+                REQ,
+                launched,
+                expectation,
+                (verifying,),
+                progress_proven_roles=proven,
+            )
+        )
+
+    def test_two_role_sequence_uses_immutable_first_progress_and_exact_second_close(self):
+        approved = _observation(
+            slots=(
+                _slot("gateway", SLOT_PRESERVE_PENDING),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("gateway", "worker"),
+        )
+        expectation = _expectation(approved)
+        gateway = _participant("gateway", phase=PARTICIPANT_REPLACED)
+        worker = _participant("worker")
+        current = _observation(
+            slots=(
+                BoundSlot(
+                    "gateway", gateway.provider, gateway.assigned_name,
+                    "w1:p9", SLOT_HEALTHY,
+                ),
+                _slot("worker", SLOT_PRESERVE_PENDING),
+            ),
+            discard_roles=("worker",),
+        )
+        self.assertTrue(
+            LiveBoundPairPreparationOps._progress_snapshot_matches(
+                REQ,
+                current,
+                expectation,
+                (gateway, worker),
+                progress_proven_roles=("gateway",),
+            )
+        )
 
 
 if __name__ == "__main__":
