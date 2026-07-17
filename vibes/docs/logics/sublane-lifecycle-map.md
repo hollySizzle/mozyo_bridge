@@ -69,9 +69,11 @@ retire_三義:
             drain-queue process retention / dogfood 委譲),
             skill references/workflow.md `## Sublane hibernate (プロセス解放) と early hibernate`
       park basis: dependency (依存 wait で park) | early_hibernate (Redmine #13967: review
-            approved + staging integration + CI green + dogfood/close を専用 release issue へ委譲)。
-      注: hibernate は close / dogfood 成功 / owner approval へ読み替えない。safety gate
+            approved + staging integration + CI green + dogfood の execution/evidence を専用
+            release issue へ委譲。close authority + owner approval は coordinator に残す)。
+      注: hibernate は close / dogfood 成功 / owner approval へ読み替えない。common safety gate
           (pending review/callback/integration/work/prompt・dirty/unpushed・identity 不明) は fail-closed。
+          owner approval pending は basis 依存 (early hibernate では blocker にしない)。
 
 [5] retire               lane を退役する (pane/worktree/branch)。owner 確認なしに退役してよい条件は所有 doc。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),

@@ -286,6 +286,37 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["escalation_decision"], "indeterminate")
         self.assertIn("unreadable_subsystems_not_a_list", payload["indeterminate_reasons"])
 
+    def test_cli_bare_colon_digit_provenance_is_indeterminate(self):
+        # Redmine #13967 R4-F3: a free-form "x:1" is not a recognized durable anchor.
+        payload = self._run(
+            {
+                "provenance": "x:1",
+                "findings": [
+                    {"subsystem": "s", "round_index": 2, "authority_bearing": True, "late": False},
+                ],
+            },
+            add_provenance=False,
+        )
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
+
+    def test_cli_structured_subsystem_is_unattributable_indeterminate(self):
+        # Redmine #13967 R4-F3: a non-string subsystem is not str-coerced into an invented
+        # name; it is unattributable -> indeterminate (cannot split rounds to evade threshold).
+        payload = self._run(
+            {
+                "provenance": "redmine:13967:j#81330",
+                "findings": [
+                    {"subsystem": {"x": 1}, "round_index": 2, "authority_bearing": True, "late": True},
+                ],
+            },
+            add_provenance=False,
+        )
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
+
+    def test_cli_non_list_findings_is_indeterminate(self):
+        payload = self._run({"provenance": "redmine:1:j#1", "findings": 1}, add_provenance=False)
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
+
     def test_cli_valid_provenance_evaluates(self):
         payload = self._run(
             {

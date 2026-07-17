@@ -67,34 +67,57 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 _RELEASE_PENDING = frozenset({RELEASE_REQUESTED, RELEASE_PARTIAL})
 
 
+def _exact_str(value: object, *, required: bool = False) -> str | None:
+    """Return the stripped string ONLY when ``value`` is an exact ``str`` (Redmine #13967 R4-F2).
+
+    A non-string (dict / list / number / None) is NEVER coerced via ``str(...)`` — it
+    returns None so the caller can treat the field as malformed. When ``required`` a
+    present-but-empty string also returns None. An absent/optional field returns "".
+    """
+    if value is None:
+        return None if required else ""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if required and not text:
+        return None
+    return text
+
+
 def _lane_from_mapping(raw: object) -> DrainLane | None:
     """Build a :class:`DrainLane` from a structured mapping (fail-closed, exact-type).
 
-    Returns None when the row is malformed: a non-dict, a missing issue / state_class, or a
-    ``release_pending`` that is present but not an exact JSON bool (a string ``"false"``
-    must not coerce to True — Redmine #13967 R2-F2). The caller marks a snapshot with any
-    malformed row durable-incomplete rather than silently dropping it.
+    Returns None when the row is malformed: a non-dict; a missing / non-string / empty
+    ``issue`` or ``state_class``; a non-string ``lane`` / ``actionability`` /
+    ``next_action_owner`` / ``reason`` (identity and classification fields are NEVER
+    ``str(...)``-coerced — Redmine #13967 R4-F2); or a ``release_pending`` that is present
+    but not an exact JSON bool (a string ``"false"`` must not coerce to True — R2-F2). The
+    caller marks a snapshot with any malformed row durable-incomplete rather than dropping it.
     """
     if not isinstance(raw, dict):
         return None
-    issue = str(raw.get("issue", "") or "").strip()
-    state_class = str(raw.get("state_class", "") or "").strip()
-    if not issue or not state_class:
+    issue = _exact_str(raw.get("issue"), required=True)
+    state_class = _exact_str(raw.get("state_class"), required=True)
+    lane = _exact_str(raw.get("lane"))
+    next_owner = _exact_str(raw.get("next_action_owner"))
+    reason = _exact_str(raw.get("reason"))
+    if issue is None or state_class is None or lane is None or next_owner is None or reason is None:
         return None
     rp = raw.get("release_pending", False)
     if not isinstance(rp, bool):
         return None  # exact-type: a non-bool release_pending is malformed, never coerced
+    actionability = raw.get("actionability", ACTIONABILITY_COORDINATOR_ACTIONABLE)
+    if not isinstance(actionability, str):
+        return None
+    actionability = actionability.strip() or ACTIONABILITY_COORDINATOR_ACTIONABLE
     return DrainLane(
         issue=issue,
         state_class=state_class,
-        actionability=str(
-            raw.get("actionability", ACTIONABILITY_COORDINATOR_ACTIONABLE) or ""
-        ).strip()
-        or ACTIONABILITY_COORDINATOR_ACTIONABLE,
-        next_action_owner=str(raw.get("next_action_owner", "") or "").strip(),
-        lane=str(raw.get("lane", "") or "").strip(),
+        actionability=actionability,
+        next_action_owner=next_owner,
+        lane=lane,
         release_pending=rp,
-        reason=str(raw.get("reason", "") or "").strip(),
+        reason=reason,
     )
 
 
@@ -108,7 +131,9 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         raise SystemExit(f"--snapshot-json {path!r} could not be read as JSON: {exc}") from exc
     entries = data.get("lanes", data) if isinstance(data, dict) else data
     if not isinstance(entries, list):
-        raise SystemExit("--snapshot-json must carry a list of lanes (or a {'lanes': [...]})")
+        # A non-list lanes is a malformed envelope -> durable-incomplete (hold), not a crash
+        # and not a silent empty (Redmine #13967 R4-F2).
+        return (), False
     lanes: list[DrainLane] = []
     complete = True
     for raw in entries:
@@ -172,37 +197,53 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         raise SystemExit("--from-glance must carry a workflow glance --json envelope")
 
     complete = True
+    # A non-list `rows` / `lifecycle_diagnostic` is a malformed envelope: it makes the
+    # projection durable-incomplete (-> hold) instead of crashing on iteration (R4-F2).
+    rows = data.get("rows", [])
+    if not isinstance(rows, list):
+        complete = False
+        rows = []
+    diagnostics = data.get("lifecycle_diagnostic", [])
+    if not isinstance(diagnostics, list):
+        complete = False
+        diagnostics = []
+
     active: list[DrainLane] = []
-    for row in data.get("rows", []) or []:
+    for row in rows:
         if not isinstance(row, dict):
             complete = False
             continue
-        issue = str(row.get("issue_id", "") or "").strip()
-        state = str(row.get("workflow_state", "") or "").strip()
-        if not issue or not state:
+        issue = _exact_str(row.get("issue_id"), required=True)
+        state = _exact_str(row.get("workflow_state"), required=True)
+        lane = _exact_str(row.get("lane"))
+        next_owner = _exact_str(row.get("next_owner"))
+        if issue is None or state is None or lane is None or next_owner is None:
+            # Non-string / missing identity or state is malformed (never str-coerced) -> hold.
             complete = False
             continue
         active.append(
             DrainLane(
-                issue=issue,
-                lane=str(row.get("lane", "") or "").strip(),
-                state_class=state,
-                next_action_owner=str(row.get("next_owner", "") or "").strip(),
+                issue=issue, lane=lane, state_class=state, next_action_owner=next_owner
             )
         )
     release_rows: list[tuple[str, str]] = []
-    for diag in data.get("lifecycle_diagnostic", []) or []:
+    for diag in diagnostics:
         if not isinstance(diag, dict):
             complete = False
             continue
-        if str(diag.get("process_release", "") or "").strip() not in _RELEASE_PENDING:
+        pr = _exact_str(diag.get("process_release"))
+        if pr is None or pr not in _RELEASE_PENDING:
+            # A non-string process_release, or one not in the pending set, is not a release
+            # row (a non-string is malformed -> hold; a known non-pending value is skipped).
+            if pr is None:
+                complete = False
             continue
-        d_issue = str(diag.get("issue", "") or "").strip()
-        d_lane = str(diag.get("lane", "") or "").strip()
-        if not d_issue or not d_lane:
-            # A release-pending diagnostic row with no durable identity must NOT become a
-            # phantom release_dogfood lane that reads `releasable` — it makes the projection
-            # durable-incomplete (-> hold) instead (Redmine #13967 R3-F2).
+        d_issue = _exact_str(diag.get("issue"), required=True)
+        d_lane = _exact_str(diag.get("lane"), required=True)
+        if d_issue is None or d_lane is None:
+            # A release-pending diagnostic row with no exact-string durable identity must NOT
+            # become a phantom release_dogfood lane that reads `releasable` — it makes the
+            # projection durable-incomplete (-> hold) instead (Redmine #13967 R3-F2 / R4-F2).
             complete = False
             continue
         release_rows.append((d_issue, d_lane))

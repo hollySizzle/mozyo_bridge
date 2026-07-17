@@ -30,17 +30,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_review_escalation_table,
 )
 
-# A declared provenance must LOOK like a durable anchor that references an id, not any
-# free-form non-empty string (Redmine #13967 R3-F3). It must be a string that names a
-# ticket / journal reference: a `#<id>`, `j#<id>`, a `<scheme>:<...>:<digits>` anchor, or a
-# recognized source word plus a digit. This is a shape gate, not proof the anchor resolves.
+# A declared provenance must LOOK like a durable review anchor that names a ticket /
+# journal reference — a recognized source scheme (`redmine`/`asana`) followed by a digit,
+# or a `#<id>` / `j#<id>` reference (Redmine #13967 R3-F3 / R4-F3). A bare `:<digit>`
+# alternative is deliberately NOT accepted: a free-form `"x:1"` is not a verified durable
+# anchor. This is a shape gate, not proof the anchor resolves.
 _PROVENANCE_ANCHOR = re.compile(
-    r"(#\s*\d+|j#\s*\d+|\b(redmine|asana)\b[^\n]*\d+|:\s*\d+)", re.IGNORECASE
+    r"(j#\s*\d+|#\s*\d+|\b(redmine|asana)\b[^\n]*\d+)", re.IGNORECASE
 )
 
 
 def _valid_provenance(value: object) -> bool:
-    """True when ``value`` is a non-empty string shaped like a durable anchor (R3-F3)."""
+    """True when ``value`` is a non-empty string shaped like a durable anchor (R3/R4-F3)."""
     if not isinstance(value, str):
         return False
     text = value.strip()
@@ -59,7 +60,14 @@ def _finding_from_mapping(raw: object) -> tuple[SubsystemFinding | None, str]:
     ``false``."""
     if not isinstance(raw, dict):
         return None, ""
-    subsystem = str(raw.get("subsystem", "") or "").strip()
+    subsystem_raw = raw.get("subsystem")
+    # subsystem must be an EXACT non-empty string — a structured value (dict/list/number) is
+    # not str-coerced into an invented subsystem name that could split a real subsystem's
+    # rounds and evade the threshold (Redmine #13967 R4-F3). A non-string subsystem is
+    # unattributable -> the projection is indeterminate.
+    if not isinstance(subsystem_raw, str):
+        return None, ""
+    subsystem = subsystem_raw.strip()
     if not subsystem:
         return None, ""
     ri = raw.get("round_index")

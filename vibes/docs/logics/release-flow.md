@@ -265,7 +265,7 @@ PyPI production publisher:
 
 ## Internal Beta Gate
 
-- TestPyPI / installed dogfood は各 feature lane へ直列結合せず、**専用の release issue へ集約する** (Redmine #13967)。feature lane は early hibernate し dogfood / close を release issue へ durable に委譲する。配布正本は skill `references/release.md` `## Release-dogfood の集約`、repo-local wiring は `vibes/docs/logics/coordinator-sublane-development-flow.md` `## Early hibernate / dogfood 集約 / drain-queue / late-finding escalation`。
+- TestPyPI / installed dogfood は各 feature lane へ直列結合せず、**専用の release issue へ集約する** (Redmine #13967)。feature lane は early hibernate し **dogfood の execution/evidence を release issue へ durable に委譲する (source issue の close authority と owner close approval は委譲せず coordinator の通常経路に残る)**。配布正本は skill `references/release.md` `## Release-dogfood の集約`、repo-local wiring は `vibes/docs/logics/coordinator-sublane-development-flow.md` `## Early hibernate / dogfood 集約 / drain-queue / late-finding escalation`。
 - 社内ベータ配布は TestPyPI を使う。production PyPI や GitHub Release は使わない。
 - TestPyPI package が pipx で install でき、`mozyo-bridge` と `mozyo` を expose すること。
 - beta tester には TestPyPI install command と version を明示する。
