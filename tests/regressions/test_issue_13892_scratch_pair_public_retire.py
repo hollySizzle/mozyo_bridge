@@ -19,7 +19,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mozyo_bridge.core.state.dispatch_outbox_fence import TargetObligation
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.scratch_pair_obligations import (  # noqa: E501
+    OWED,
+    UNCORRELATED,
+    PairObligation,
+)
 from mozyo_bridge.core.state.scratch_retirement_fence import (  # noqa: E501
     RETIRE_COMPLETED,
     RETIRE_PENDING,
@@ -531,7 +535,7 @@ class ScratchPairRetireTest(unittest.TestCase):
         ops = FakeOps(
             self._pair_rows(),
             obligations=(
-                TargetObligation(self.wk_name, "reserved", issue="13999", journal="1"),
+                PairObligation(source="dispatch_outbox", verdict=OWED, target=self.wk_name, state="reserved", issue="13999", journal="1"),
             ),
         )
         result = self._run(ops, execute=True)
@@ -542,7 +546,7 @@ class ScratchPairRetireTest(unittest.TestCase):
     def test_uncertain_obligation_blocks_the_close(self):
         ops = FakeOps(
             self._pair_rows(),
-            obligations=(TargetObligation(self.gw_name, "uncertain", issue="13999"),),
+            obligations=(PairObligation(source="dispatch_outbox", verdict=OWED, target=self.gw_name, state="uncertain", issue="13999"),),
         )
         result = self._run(ops, execute=True)
         self.assertEqual(result.state, STATE_BLOCKED)
@@ -560,7 +564,7 @@ class ScratchPairRetireTest(unittest.TestCase):
     def test_obligation_gate_also_refuses_in_read_only_preflight(self):
         ops = FakeOps(
             self._pair_rows(),
-            obligations=(TargetObligation(self.wk_name, "reserved", issue="13999"),),
+            obligations=(PairObligation(source="dispatch_outbox", verdict=OWED, target=self.wk_name, state="reserved", issue="13999"),),
         )
         result = self._run(ops, execute=False)
         self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
@@ -932,7 +936,7 @@ class ScratchPairRetireReplayTest(ScratchPairRetireTest):
 
         ops.close = close_then_reserve
         ops.open_obligations = lambda ws, names: (
-            (TargetObligation(self.wk_name, "reserved", issue="13999"),)
+            (PairObligation(source="dispatch_outbox", verdict=OWED, target=self.wk_name, state="reserved", issue="13999"),)
             if state["closed"]
             else ()
         )
@@ -945,8 +949,9 @@ class ScratchPairRetireReplayTest(ScratchPairRetireTest):
         """j#80526: a delivery ACK is not task completion; uncorrelatable -> fail closed."""
         ops = FakeOps(
             self._pair_rows(),
-            obligations=(TargetObligation(self.wk_name, "delivered", issue="13999",
-                                          journal="42"),),
+            obligations=(PairObligation(source="dispatch_outbox", verdict=UNCORRELATED,
+                                        target=self.wk_name, state="delivered",
+                                        issue="13999", journal="42"),),
         )
         result = self._run(ops, execute=True)
         self.assertEqual(result.state, STATE_BLOCKED)

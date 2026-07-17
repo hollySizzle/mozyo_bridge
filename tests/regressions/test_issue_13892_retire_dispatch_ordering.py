@@ -115,13 +115,32 @@ class RetireDispatchOrderingTest(unittest.TestCase):
                 return True
 
             def open_obligations(self, ws, names):
-                from mozyo_bridge.core.state.dispatch_outbox_fence import (
-                    DispatchOutboxFence as F,
+                """Drive the REAL covered-source reader over the temp stores."""
+                from unittest import mock
+
+                from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+                    scratch_pair_obligations as spo,
                 )
 
-                return F(home=test.home).obligations_for_targets(
-                    workspace_id=ws, target_assigned_names=tuple(names)
-                )
+                with mock.patch(
+                    "mozyo_bridge.core.state.dispatch_outbox_fence.mozyo_bridge_home",
+                    return_value=test.home,
+                ), mock.patch(
+                    "mozyo_bridge.core.state.callback_outbox.mozyo_bridge_home",
+                    return_value=test.home,
+                    create=True,
+                ), mock.patch(
+                    "mozyo_bridge.core.state.forward_outbox_fence.mozyo_bridge_home",
+                    return_value=test.home,
+                ):
+                    try:
+                        return spo.all_pair_obligations(
+                            workspace_id=ws, lane_id=LANE,
+                            assigned_names=tuple(names),
+                            roles=(GW, WK),
+                        )
+                    except spo.ObligationStoreUnreadable:
+                        return None
 
             def retirement_transaction(self, unit, *, live_pair_present):
                 return test.fence.transaction(unit, live_pair_present=live_pair_present)

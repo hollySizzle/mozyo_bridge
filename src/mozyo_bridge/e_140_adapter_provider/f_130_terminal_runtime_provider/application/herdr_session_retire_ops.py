@@ -54,7 +54,11 @@ class SessionRetireOps(Protocol):
         """``True`` = no record, ``False`` = a record exists, ``None`` = unreadable."""
 
     def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
-        """Obligations owed to these slots (with causal identity); ``None`` = unreadable."""
+        """EVERY covered source's blocking obligations; ``None`` = unreadable (fail closed).
+
+        Covered = dispatch outbox (owed TO) + callback outbox (owed TO) + forward fence
+        (owed BY). The set is fixed by the obligation source matrix test.
+        """
 
     def retirement_transaction(self, unit, *, live_pair_present: bool):
         """The held, exclusive retirement transaction for the unit (context manager)."""
@@ -134,19 +138,55 @@ class LiveSessionRetireOps:
         return record is None
 
     def open_obligations(self, workspace_id: str, assigned_names):
-        from mozyo_bridge.core.state.dispatch_outbox_fence import (
-            DispatchOutboxFence,
-            DispatchOutboxFenceError,
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.scratch_pair_obligations import (  # noqa: E501
+            ObligationStoreUnreadable,
+            all_pair_obligations,
         )
 
+        lane = ""
+        roles: list[str] = []
+        for name in assigned_names:
+            decode = decode_assigned_name(name)
+            if decode.ok and decode.identity is not None:
+                lane = lane or _norm_lane(decode.identity.lane_id)
+                roles.append(decode.identity.role)
         try:
-            return DispatchOutboxFence().obligations_for_targets(
-                workspace_id=workspace_id, target_assigned_names=tuple(assigned_names)
+            return all_pair_obligations(
+                workspace_id=workspace_id,
+                lane_id=lane,
+                assigned_names=tuple(assigned_names),
+                roles=tuple(roles),
+                correlate=self._durable_disposition,
             )
-        except (DispatchOutboxFenceError, OSError):
-            # Unreadable / identity-mismatched store: an obligation we cannot see is not an
-            # obligation that is absent. `None` routes the caller to a fail-closed refusal.
+        except ObligationStoreUnreadable:
+            # An obligation we cannot see is not an obligation that is absent. `None` routes
+            # the caller to a fail-closed refusal.
             return None
+
+    def _durable_disposition(self, issue: str, journal: str):
+        """Did the work a delivered send handed over reach a terminal disposition? (R4-F1)
+
+        The callback outbox is where handed-over work reports back: a terminal callback for
+        the same ``(issue, journal)`` means the receiver's turn closed the loop. `None` =
+        unknown (the caller blocks); never guess "finished".
+        """
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
+
+        try:
+            rows = CallbackOutbox().read()
+        except Exception:  # noqa: BLE001 - unreadable -> unknown -> the caller blocks
+            return None
+        terminal = {"delivered", "dead_letter"}
+        seen = False
+        for row in rows:
+            if str(getattr(row, "issue", "") or "").strip() != issue:
+                continue
+            if journal and str(getattr(row, "journal", "") or "").strip() != journal:
+                continue
+            seen = True
+            if str(getattr(row, "state", "") or "").strip() not in terminal:
+                return False  # a callback for this work is still owed
+        return True if seen else None
 
     def retirement_transaction(self, unit, *, live_pair_present: bool):
         from mozyo_bridge.core.state.scratch_retirement_fence import (

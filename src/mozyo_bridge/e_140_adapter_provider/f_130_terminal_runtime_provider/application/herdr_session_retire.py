@@ -538,42 +538,26 @@ def _preflight_verdict(
 
 
 def _obligation_refusal(live_ops, workspace_id, expected_names, base):
-    """The durable-obligation gate, or ``None`` when nothing is owed. (review j#80506 F4)"""
+    """The durable-obligation gate across EVERY covered source, or ``None``.
+
+    Covered (review j#80594 R4-F3): the dispatch outbox and the callback outbox for work owed
+    TO these slots, and the forward fence for work owed BY them. `delivered` sends are
+    correlated against the durable disposition of the work they handed over rather than being
+    blocked forever (R4-F1) or waved through (a delivery ACK is not completion).
+    """
     obligations = live_ops.open_obligations(workspace_id, expected_names)
     if obligations is None:
         return _blocked(
             REASON_OBLIGATION_UNREADABLE,
-            "the durable dispatch-obligation store could not be read; an obligation that "
-            "cannot be observed is not an obligation that is absent, so nothing is closed",
+            "a durable obligation store could not be read; an obligation that cannot be "
+            "observed is not an obligation that is absent, so nothing is closed",
             **base,
         )
-    owed = [o for o in obligations if o.non_terminal]
-    if owed:
-        shown = ", ".join(
-            f"{o.target_assigned_name} ({o.state}, issue {o.issue or '<none>'})" for o in owed
-        )
+    if obligations:
+        shown = "; ".join(o.describe() for o in obligations)
         return _blocked(
             REASON_WORK_OBLIGATION_PRESENT,
-            f"durable work is owed to this pair ({shown}); a reserved / uncertain dispatch "
-            "means a send's fate is unresolved, which no idle runtime reading can rule out",
-            **base,
-        )
-    # `delivered` is a delivery ACK, not task completion (the ACK / completion separation), so
-    # it cannot be waved through on its own: whether the handed-off work is discharged lives in
-    # the Redmine gate its issue/journal names. This surface has no read of that gate, so an
-    # uncorrelatable delivered obligation fails closed rather than being assumed finished.
-    delivered = [o for o in obligations if o.needs_gate_correlation]
-    if delivered:
-        shown = ", ".join(
-            f"{o.target_assigned_name} (delivered, issue {o.issue or '<none>'} "
-            f"j#{o.journal or '<none>'})"
-            for o in delivered
-        )
-        return _blocked(
-            REASON_WORK_OBLIGATION_PRESENT,
-            f"work was delivered to this pair and its completion cannot be correlated "
-            f"({shown}); a delivery ACK is not task completion, so this surface will not "
-            "assume the work is discharged",
+            f"durable work is still owed for this pair ({shown})",
             **base,
         )
     return None

@@ -514,6 +514,34 @@ class ForwardOutboxFence:
         """True when the route currently holds a reserved / delivered / uncertain generation."""
         return self.active(route).state in _ACTIVE_STATES
 
+    def rows_for_sender(
+        self, *, workspace_id: str, from_lane_id: str
+    ) -> tuple[tuple[str, str, str], ...]:
+        """``(from_role, to_role, state)`` for every generation this lane SENT. (read-only)
+
+        Redmine #13892 R4-F3: a destructive action against a lane must know what that lane
+        still owes, not only what is owed to it. A forward generation stays active from the
+        send until its correlated callback returns, so closing the sender mid-generation
+        strands it. :meth:`is_active` cannot answer this — it needs the full route key
+        (including ``to_role`` / ``project_scope``), which a caller that only knows *which
+        panes it is about to close* cannot build.
+
+        Fails closed on a damaged / identity-mismatched store; a never-bootstrapped store has
+        provably no rows and returns empty (the ordinary case, which must not be over-blocked).
+        """
+        if self._read_sidecar_nonce() is None and not self.path.exists():
+            return ()  # both artifacts absent: nothing was ever reserved here
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT from_role, to_role, state FROM forward_generation "
+                "WHERE workspace_id=? AND from_lane_id=? ORDER BY from_role, to_role",
+                (workspace_id, from_lane_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        return tuple((str(r[0]), str(r[1]), str(r[2])) for r in rows)
+
 
 __all__ = (
     "FORWARD_OUTBOX_FENCE_FILENAME",
