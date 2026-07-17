@@ -487,8 +487,11 @@ class WorkspaceCallbackSupervisor:
             processor = CallbackOutboxProcessor(
                 self._outbox, source or _NULL_SOURCE, workspace_id=workspace_id
             )
+            # R3-F1: scope the deliver's recover + claim to THIS issue, so the issue-specific
+            # dispatch-anchor fence is never applied to another issue's rows (each issue's
+            # generation baseline is independent) and ``historical_fenced`` is attributed correctly.
             report = run_once(
-                processor, sender, candidates=candidates, send_fence_fn=send_fence_fn
+                processor, sender, candidates=candidates, send_fence_fn=send_fence_fn, issue=issue
             )
         except Exception:  # noqa: BLE001 - a store / send failure is recorded, not fatal to the sweep
             return IssueSupervisionOutcome(
@@ -510,8 +513,7 @@ class WorkspaceCallbackSupervisor:
 
         deliver = report.get("deliver") or {}
         sweep = report.get("sweep") or {}
-        # historical_fenced is the TOTAL fenced this pass: ingest-side dropped candidates (newly
-        # discovered historical markers) + send-edge fenced rows (pre-existing / recovered backlog).
+        # Total fenced this pass: ingest-dropped candidates + send-edge fenced backlog rows.
         historical_fenced += len(deliver.get("fenced") or [])
         return IssueSupervisionOutcome(
             issue=issue,

@@ -422,7 +422,12 @@ class CallbackOutbox:
     # -- claim / recover ---------------------------------------------------
 
     def claim_pending(
-        self, *, limit: int = 32, now: Optional[str] = None, workspace_id: Optional[str] = None
+        self,
+        *,
+        limit: int = 32,
+        now: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        issue: Optional[str] = None,
     ) -> tuple[CallbackOutboxRow, ...]:
         """Atomically claim up to ``limit`` pending rows, moving them to ``inflight``.
 
@@ -437,21 +442,28 @@ class CallbackOutbox:
         that workspace are claimed, so a watcher owning workspace A can never claim workspace B's
         rows on a shared home DB. ``None`` (the default) is the un-partitioned legacy behavior
         (single-workspace / test); the production watcher always pins its attested workspace.
+
+        ``issue`` (Redmine #13968 R3-F1) **further partitions the claim to a single issue**: a caller
+        that applies an issue-specific generation authority (the supervisor's dispatch-anchor fence)
+        must not drain another issue's rows under this issue's anchor, because each issue's
+        generation baseline is independent. ``None`` (the default) keeps the workspace-wide claim.
         """
         stamp = now or _utc_now()
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if workspace_id is None:
-                rows = conn.execute(
-                    _SELECT + " WHERE state=? ORDER BY seq LIMIT ?",
-                    (CALLBACK_PENDING, int(limit)),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    _SELECT + " WHERE state=? AND workspace_id=? ORDER BY seq LIMIT ?",
-                    (CALLBACK_PENDING, str(workspace_id), int(limit)),
-                ).fetchall()
+            where = "WHERE state=?"
+            params: list = [CALLBACK_PENDING]
+            if workspace_id is not None:
+                where += " AND workspace_id=?"
+                params.append(str(workspace_id))
+            if issue is not None:
+                where += " AND issue=?"
+                params.append(str(issue))
+            rows = conn.execute(
+                _SELECT + f" {where} ORDER BY seq LIMIT ?",
+                (*params, int(limit)),
+            ).fetchall()
             claimed = []
             for r in rows:
                 row = _row(r)
@@ -483,6 +495,7 @@ class CallbackOutbox:
         stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
         now: Optional[str] = None,
         workspace_id: Optional[str] = None,
+        issue: Optional[str] = None,
     ) -> tuple[CallbackOutboxRow, ...]:
         """Reconcile ``inflight`` rows whose claim **lease has expired** (crash recovery).
 
@@ -500,24 +513,28 @@ class CallbackOutbox:
         reconciled, so a workspace-A processor never mutates workspace B's rows on a shared home
         DB. ``None`` (the default) is the un-partitioned legacy behaviour (single-workspace / test /
         explicit migration); the production processor always pins its attested workspace.
+
+        ``issue`` (Redmine #13968 R3-F1) further partitions the reclaim to a single issue, exactly
+        like :meth:`claim_pending`: an issue-anchored caller must not recover + re-claim another
+        issue's rows under this issue's generation authority. ``None`` keeps the workspace-wide reclaim.
         """
         stamp = now or _utc_now()
         cutoff = _utc_cutoff(stale_seconds)
         conn = self._connect_immediate()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if workspace_id is None:
-                rows = conn.execute(
-                    _SELECT + " WHERE state=? AND (claimed_at='' OR claimed_at <= ?) ORDER BY seq",
-                    (CALLBACK_INFLIGHT, cutoff),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    _SELECT
-                    + " WHERE state=? AND workspace_id=? AND (claimed_at='' OR claimed_at <= ?) "
-                    "ORDER BY seq",
-                    (CALLBACK_INFLIGHT, str(workspace_id), cutoff),
-                ).fetchall()
+            where = "WHERE state=?"
+            params: list = [CALLBACK_INFLIGHT]
+            if workspace_id is not None:
+                where += " AND workspace_id=?"
+                params.append(str(workspace_id))
+            if issue is not None:
+                where += " AND issue=?"
+                params.append(str(issue))
+            rows = conn.execute(
+                _SELECT + f" {where} AND (claimed_at='' OR claimed_at <= ?) ORDER BY seq",
+                (*params, cutoff),
+            ).fetchall()
             recovered: list[CallbackOutboxRow] = []
             for r in rows:
                 row = _row(r)

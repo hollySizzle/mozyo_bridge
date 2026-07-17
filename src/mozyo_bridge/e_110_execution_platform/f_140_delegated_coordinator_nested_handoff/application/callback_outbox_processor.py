@@ -390,6 +390,7 @@ class CallbackOutboxProcessor:
         stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
         now: Optional[str] = None,
         send_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
+        issue: Optional[str] = None,
     ) -> DeliveryReport:
         """Recover crashed inflight rows, then fire **one** send per claimed pending row.
 
@@ -414,17 +415,24 @@ class CallbackOutboxProcessor:
         discovered candidates). Because ``recover_inflight`` resets a stale pre-send row back to
         ``pending``, that row is re-claimed in this same pass and therefore also passes this gate.
         ``None`` (the default) leaves delivery byte-for-byte unchanged (unfenced callers).
+
+        ``issue`` (Redmine #13968 R3-F1) scopes the recover + claim to a single issue. A caller that
+        applies an issue-specific ``send_fence_fn`` (the supervisor's dispatch-anchor fence) MUST pass
+        it, so this pass never drains ANOTHER issue's rows under this issue's generation anchor —
+        each issue's generation baseline is independent. ``None`` keeps the workspace-wide drain.
         """
         report = DeliveryReport()
+        issue_scope = str(issue).strip() if issue is not None and str(issue).strip() else None
         # Recover only lease-expired (stale) inflight rows — never a concurrent processor's
         # fresh active claim (#13520 review F2). A default lease is used unless overridden.
         report.recovered.extend(
             self._outbox.recover_inflight(
-                stale_seconds=stale_seconds, now=now, workspace_id=self._workspace_id or None
+                stale_seconds=stale_seconds, now=now,
+                workspace_id=self._workspace_id or None, issue=issue_scope,
             )
         )
         for row in self._outbox.claim_pending(
-            limit=limit, now=now, workspace_id=self._workspace_id or None
+            limit=limit, now=now, workspace_id=self._workspace_id or None, issue=issue_scope
         ):
             token = row.claim_token
             # The send gate: mark_sending is token-conditional. If we no longer own the row
