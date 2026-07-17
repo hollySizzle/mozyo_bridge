@@ -78,6 +78,7 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
     SEND_RESERVED,
     SWEEP_RECOVERY_ACTION_ID,
+    SWEEP_RECOVERY_RECEIVER,
     SWEEP_STATE_STALL_UNPROVABLE,
     _journal_int,
     render_sweep_record_note,
@@ -805,7 +806,10 @@ def build_recovery_sender(
             raise RecoverySendError("no recovery record journal to point at; refusing to send")
         argv = [
             str(mozyo_bridge_bin), "handoff", "send",
-            "--to", "codex",
+            # ONE constant, shared with the durable record's admission key (#13910): a literal here
+            # could drift from the recorded `receiver_identity`, and every delivery would then be
+            # refused as a receiver conflict.
+            "--to", SWEEP_RECOVERY_RECEIVER,
             "--target", str(target),
             "--source", "redmine",
             "--issue", str(issue),

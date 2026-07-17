@@ -103,7 +103,15 @@ SWEEP_STATE_STALL_UNPROVABLE = "stall_unprovable"
 
 #: The fence ``action_id`` every sweep recovery delivery reserves under. Combined with the fence
 #: key's ``journal`` (the dispatch anchor) this makes recovery **at most once per gate anchor**.
+#: It doubles as the ``action_kind`` of the receiver-side admission key (#13910), so the sender's
+#: and the receiver's authorities name the same action rather than two coincidentally-similar ones.
 SWEEP_RECOVERY_ACTION_ID = "callback_sweep_recovery"
+
+#: The semantic receiver role a sweep recovery is addressed to. ONE constant, read by both the
+#: sender (:func:`...application.callback_sweep.build_recovery_sender`'s ``--to``) and the durable
+#: record's admission key (#13910): were they allowed to drift, every delivery would reach a
+#: receiver whose identity contradicts the record, and admission would conflict forever.
+SWEEP_RECOVERY_RECEIVER = "codex"
 
 # --- Zero-send reasons (the closed vocabulary the mutation edge reports) ----------------------
 SEND_RESERVED = "reserved"  # the single caller cleared to perform the one recovery delivery
@@ -637,6 +645,7 @@ __all__ = (
     "SWEEP_STATE_ANCHOR_MISSING",
     "SWEEP_STATE_STALL_UNPROVABLE",
     "SWEEP_RECOVERY_ACTION_ID",
+    "SWEEP_RECOVERY_RECEIVER",
     "SEND_RESERVED",
     "ZERO_SEND_NOT_A_STALL",
     "ZERO_SEND_ANCHOR_MISSING",

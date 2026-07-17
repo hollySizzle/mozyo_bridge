@@ -191,7 +191,7 @@ def _derive_from_journals(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def _attested_workspace_id(args: argparse.Namespace) -> str:
+def attested_workspace_id(args: argparse.Namespace) -> str:
     """MEASURE the partition workspace id from the canonical registry authority (review R3-F2).
 
     The fence key is partitioned by workspace, so a wrong / invented id reserves a DIFFERENT row and
@@ -256,6 +256,9 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
         build_recovery_sender,
         sweep_once,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+        SWEEP_RECOVERY_RECEIVER,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
         LiveRedmineJournalSource,
     )
@@ -314,7 +317,7 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
             "needs the store restored, not re-created."
         )
     result = sweep_once(
-        workspace_id=_attested_workspace_id(args),
+        workspace_id=attested_workspace_id(args),
         lane_id=lane,
         issue=issue,
         lane_generation=generation,
@@ -330,7 +333,13 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
             source=source, issue=issue, lane=lane, lane_generation=generation,
             post_note=transport.post_issue_note, grant_is_live=grant_is_live,
             publication_fence=publication_fence,
-            workspace_id=_attested_workspace_id(args),
+            workspace_id=attested_workspace_id(args),
+            # #13910: the record carries the receiver-side admission key, so it must name the
+            # exact route this delivery is addressed to and the role allowed to admit it. Both
+            # come from the same values the send uses -- `target` is the fence's
+            # `target_assigned_name`, and the receiver constant is the sender's own `--to`.
+            route_identity=target,
+            receiver_identity=SWEEP_RECOVERY_RECEIVER,
         ),
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),

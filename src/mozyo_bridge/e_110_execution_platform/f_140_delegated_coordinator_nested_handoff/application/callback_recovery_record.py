@@ -36,8 +36,11 @@ from mozyo_bridge.core.state.callback_publication_fence import (
 
 from ..domain.redmine_journal_source import dispatch_generations
 
+from ..domain.callback_recovery_key import render_recovery_action_marker
+
 from ..domain.callback_sweep_watermark import (
     STATE_NO_PROGRESS_AFTER_HANDOFF,
+    SWEEP_RECOVERY_ACTION_ID,
     SweepWatermark,
     render_sweep_record_note,
     resolve_watermark,
@@ -85,6 +88,8 @@ def build_recovery_recorder(
     grant_is_live: Callable[[], bool],
     publication_fence: "CallbackPublicationFence",
     workspace_id: str,
+    route_identity: str,
+    receiver_identity: str,
 ) -> Callable[[dict, SweepWatermark], str]:
     """Build the production ``record_fn``: write the sweep record, then RESOLVE its journal id.
 
@@ -108,6 +113,13 @@ def build_recovery_recorder(
     The check therefore sits where it can be honest: immediately before the write, after every read
     this function performs. A lapsed grant raises :class:`RecordOwnershipLostError` and writes
     nothing.
+
+    ``route_identity`` (the assigned name the delivery is addressed to) and ``receiver_identity``
+    (the semantic receiver role) are **required**, not defaulted (#13910). They are two of the
+    fields of the receiver-side admission key this record carries, and a record written without
+    them would be admissible by nobody — every receiver's identity would contradict it, forever and
+    silently. A public invariant cannot be a caller convention (the same reasoning as R8-F2): the
+    API refuses to represent the unsafe shape rather than detect it later.
     """
 
     def _record(result: dict, watermark: SweepWatermark) -> str:
@@ -118,6 +130,25 @@ def build_recovery_recorder(
         keys = dict(
             lane=lane, lane_generation=lane_generation, dispatch_anchor=anchor, outcome=outcome
         )
+        # #13910: only a STALL record names a recovery action a receiver may admit. A zero-send
+        # resolution records a verdict, not an action — carrying an admission key on one would let
+        # a receiver admit and actuate a recovery that was deliberately never sent.
+        #
+        # Rendered HERE, before the pre-read and (critically) before the publication reserve: an
+        # unrepresentable identity must fail before any durable side effect. Rendering it after the
+        # reserve would strand that reservation `reserved` forever — and this fence is never
+        # reclaimed, so it would poison the anchor permanently rather than fail cleanly.
+        action_marker = ""
+        if outcome == STATE_NO_PROGRESS_AFTER_HANDOFF:
+            action_marker = render_recovery_action_marker(
+                original_dispatch_anchor=anchor,
+                workspace_id=workspace_id,
+                lane_id=lane,
+                lane_generation=lane_generation,
+                route_identity=route_identity,
+                receiver_identity=receiver_identity,
+                action_kind=SWEEP_RECOVERY_ACTION_ID,
+            )
         pre = list(source.read_entries(str(issue)))
         existing = sweep_record_journals(pre, **keys)
         if len(existing) == 1:
@@ -166,8 +197,13 @@ def build_recovery_recorder(
                 f"this record is already {reservation.prior_state}; publishing nothing "
                 f"({reservation.detail})"
             )
+        note = render_sweep_record_note(
+            _record_body(result, issue=str(issue), action_marker=action_marker), **keys
+        )
+        if action_marker:
+            note = f"{note}\n{action_marker}"
         try:
-            post_note(str(issue), render_sweep_record_note(_record_body(result), **keys))
+            post_note(str(issue), note)
         except Exception as exc:  # noqa: BLE001 - a PUT of unknown fate is NEVER auto-retried
             publication_fence.mark_uncertain(
                 pub_key, reservation.token, detail=f"PUT raised {type(exc).__name__}"
@@ -200,8 +236,14 @@ def build_recovery_recorder(
     return _record
 
 
-def _record_body(result: dict) -> str:
-    """The human-readable sweep record: the classification, what was missing, the retry target."""
+def _record_body(result: dict, *, issue: str = "", action_marker: str = "") -> str:
+    """The human-readable sweep record: the classification, what was missing, the retry target.
+
+    When ``action_marker`` is set this record names a recovery action, so the body carries the
+    **receiver contract** (#13910 j#80984 Disposition 3): the admission command and how each
+    outcome must be handled. The rail is only as binding as the record that states it — a receiver
+    reads this journal, not the pane prose, so this is where the obligation belongs.
+    """
     lines = [
         "## Gate: progress_log — callback sweep record",
         "",
@@ -228,9 +270,50 @@ def _record_body(result: dict) -> str:
     steps = result.get("recovery") or []
     if steps:
         lines += ["", "### recovery"] + [f"{i}. {s}" for i, s in enumerate(steps, 1)]
+    if action_marker:
+        lines += _admission_contract_lines(issue)
     lines += [
         "",
         "本 record は coordinator の sweep 記録であり、worker progress ではない "
         "(marker kind は `callback_sweep_record`)。",
     ]
     return "\n".join(lines)
+
+
+def _admission_contract_lines(issue: str) -> list:
+    """The receiver contract this record imposes (#13910 j#80984 Disposition 3).
+
+    ``--journal`` is deliberately described as "the journal id you were pointed at" rather than
+    printed: Redmine's note write returns ``204`` with no id, so this record cannot know where it
+    landed. The receiver does know — the handoff marker names it — and the admission resolves the
+    key from that entry's own id, which is the durable authority (never a self-reported field).
+    """
+    issue_s = str(issue or "").strip() or "<issue>"
+    return [
+        "",
+        "### 受領契約 (admission) — effect の前に必須",
+        "",
+        "本 record は recovery action を命じる。**最初の state-changing effect を行う前に** "
+        "admission rail を呼ぶこと。admission は completion ではない (transport ACK / pane 状態 / "
+        "claim のいずれも task completion ではない)。",
+        "",
+        "```",
+        f"mozyo-bridge workflow callback-admit --issue {issue_s} \\",
+        "  --journal <handoff が指した本 record の journal id> \\",
+        "  --route <自分の assigned name> --receiver <自分の role>",
+        "```",
+        "",
+        "outcome 別の必須挙動:",
+        "",
+        "- `admitted` — この receiver だけが recovery round を実行する。round の結果は durable な "
+        "Redmine gate として記録する。",
+        "- `duplicate` — 同一 recovery は既に admit 済み。**durable no-op**。再実行しない。",
+        "- `superseded` — lane は既に前進済み (または round が superseded)。**actuate しない**。"
+        "record が指す durable state を読むだけに留める。",
+        "- `conflict` / `unreadable` — fail-closed。**actuate しない**。durable record に blocker を "
+        "記録し、coordinator へ返す。",
+        "",
+        "retry は自動では起きない。claim 後に crash した同一 key は再 admit されない (claim は "
+        "reclaim しない)。retry が要るなら coordinator が新しい recovery action anchor を "
+        "`retry_of=<prior key>` 付きで明示発行する。",
+    ]

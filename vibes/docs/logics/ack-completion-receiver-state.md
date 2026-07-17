@@ -324,6 +324,31 @@ doctrine としての position:
 7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
 
+## Receiver-side recovery admission と、その保証境界 (Redmine #13910)
+
+本 doc は「receiver 側に独自 detector を生やさない」「completion を推定しない」を doctrine として固定している。#13910 で導入した **recovery admission rail** はその doctrine の *例外ではない*。何であって何でないかを取り違えると、次の agent が「receiver 側の completion 検出ができた」と誤読するため、境界をここに固定する。
+
+設計正本: Redmine #13910 j#80984 (design consultation answer、j#80986 で正本化)。相談の事実基盤は j#80980、実装者 verdict は j#80987。
+
+### admission rail は何か
+
+- `mozyo-bridge workflow callback-admit` は、callback sweep の recovery delivery を受けた receiver が **最初の state-changing effect の前に** 通す admission である。
+- 判定材料は **durable record のみ**: fresh に読んだ recovery record journal の structured marker から versioned idempotency key を導出する。pane text / rendered output は pointer であって key の source ではない (本 doc `## 運用への帰結` 6 と同じ規律)。
+- 権威は `core/state/callback_recovery_receipt.py`。**operational action-idempotency authority** であり、layer 3 workflow truth ではない。
+
+### admission rail は何ではないか
+
+- **detector ではない。** pane / stdout / silence を一切観測しない。本 doc `## 運用への帰結` 5 の「独自 detector を生やさない」に抵触しない。
+- **completion authority ではない。** receipt DB は `claimed` しか持たず、`completed` 状態を **意図的に持たない**。round が終わったかどうかは Redmine gate (layer 3) が所有する。admission を completion と読むことは、本 doc が禁止する「ACK → completion」短絡と同種の誤りである。
+- **receiver-state observability ではない。** 「今 receiver がどうなっているか」は依然として弱く、その本命は `mozyo_bridge_pty` inspector contract のままである (`## Receiver-State Observability を別 axis として priority に置く`)。
+
+### 保証境界 (これを広げて読まない)
+
+- 保証するのは **同一 idempotency key に対する at-most-once actuation + actuation 直前の fresh 検証** であって、文字どおりの exactly-once ではない。Redmine と LLM effect を跨ぐ atomic transaction が存在しないため、claim / effect / completion は原理的に atomic にできない (j#80984 Fact verdict 3)。
+- rail は **advisory** である。sidecar が存在しない以上、「rail を呼ばずに effect へ進む」経路を code で塞ぐ手段はない (`## Sidecar の位置づけ`)。義務の所在は recovery record 自身が載せる受領契約であり、機械的 bypass 防止は **別 residual** として `mozyo_bridge_pty` inspector / sidecar workstream が所有する。本 repo の実装が sidecar を仮装してはならない。
+- **claim は reclaim しない** (safety-first)。claim 後に crash した round は失われ、同一 key は再 admit されない。TTL / presumed-dead による自動再開は導入しない。retry が要る場合は coordinator が **新しい recovery action anchor** を durable journal として明示発行し (`retry_of=<prior key>` を記録)、新しい journal id が新しい key を生む。
+- 「次の sweep が自動的に新 anchor を作って救う」は **成立しない**。sender 側 `dispatch_outbox_fence` は一度 `delivered` になった anchor を二度と再送しないため、自動 reissue は存在しない (j#80987 で code 実測)。liveness は明示的な coordinator 判断が担う。
+
 ## Cross-References
 
 - Repo-local 関連 doctrine:
