@@ -34,10 +34,16 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
+from mozyo_bridge.core.state.scratch_retirement_fence import (  # noqa: E501
+    RetirementUnit,
+    ScratchRetirementBusy,
+    ScratchRetirementFenceError,
+    slot_digest,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
     RUNTIME_TURN_ENDED,
@@ -98,6 +104,21 @@ REASON_POST_CLOSE_UNREADABLE = "post_close_unreadable"
 #: review j#80506 F1). A mistyped ``--lane`` and a never-launched pair are indistinguishable
 #: from a completed retire by absence alone, so absence is refused rather than celebrated.
 REASON_RETIRE_EVIDENCE_ABSENT = "retire_evidence_absent"
+#: Another retirement transaction holds this unit. Zero-close; never wait, never steal.
+REASON_RETIREMENT_BUSY = "retirement_busy"
+#: The retirement authority is unavailable / unprovable (damaged artifacts, unknown schema,
+#: seal mismatch, or a zero-slot run over an absent store). Fail closed (j#80526).
+REASON_RETIREMENT_AUTHORITY_UNAVAILABLE = "retirement_authority_unavailable"
+#: The close committed but the fence completion write failed. NOT a success — but the closes
+#: that committed are reported truthfully, and the next run repairs from the pending attempt.
+REASON_COMPLETION_UNPROVEN = "completion_unproven"
+#: The surface's own signature (the unit has no lifecycle record) was lost mid-flight
+#: (Redmine #13892 review j#80523 R2-F3). Re-verified before the completion, never assumed.
+REASON_SIGNATURE_LOST = "signature_lost"
+
+#: The idempotent replay: this exact unit was proven retired by a prior run and no expected
+#: slot is live now. Exit 0 (design j#80526 rejects an effect-only exit 1).
+STATE_ALREADY_RETIRED = "already_retired"
 
 #: The managed-event kinds this surface appends as its durable retirement outcome. It is
 #: an audit record, NOT lifecycle authority — capacity is recovered by the panes ceasing to
@@ -128,11 +149,14 @@ class SessionRetireVerdict:
     closed: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     failed: tuple[tuple[str, str, str], ...] = field(default_factory=tuple)
     durable_retirement: str = ""
+    audit_record: str = ""
     executed: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.state in (STATE_GREEN, STATE_ABSENT)
+        # `already_retired` is a proven idempotent replay: exact prior completion + a
+        # live-zero measured now. Design j#80526 rejects an effect-only exit 1 for it.
+        return self.state in (STATE_GREEN, STATE_ALREADY_RETIRED)
 
     def as_payload(self) -> dict:
         return {
@@ -148,6 +172,7 @@ class SessionRetireVerdict:
                 {"role": r, "locator": loc, "detail": d} for r, loc, d in self.failed
             ],
             "durable_retirement": self.durable_retirement,
+            "audit_record": self.audit_record,
             "executed": self.executed,
             "retire_ok": self.ok,
         }
@@ -172,10 +197,11 @@ class SessionRetireOps(Protocol):
     def lifecycle_record_absent(self, workspace_id: str, lane_id: str) -> Optional[bool]:
         """``True`` = no record, ``False`` = a record exists, ``None`` = unreadable."""
 
-    def open_obligations(
-        self, workspace_id: str, assigned_names: Sequence[str]
-    ) -> Optional[tuple[tuple[str, str], ...]]:
-        """Durable obligations owed to these slots; ``None`` = unreadable (fail closed)."""
+    def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
+        """Obligations owed to these slots (with causal identity); ``None`` = unreadable."""
+
+    def retirement_transaction(self, unit, *, live_pair_present: bool):
+        """The held, exclusive retirement transaction for the unit (context manager)."""
 
     def close(self, workspace_id: str, lane_id: str, targets):
         """Close exactly ``targets`` (``(role, locator)``); returns the close result."""
@@ -255,13 +281,22 @@ class LiveSessionRetireOps:
         )
 
         try:
-            return DispatchOutboxFence().open_obligations_for_targets(
+            return DispatchOutboxFence().obligations_for_targets(
                 workspace_id=workspace_id, target_assigned_names=tuple(assigned_names)
             )
         except (DispatchOutboxFenceError, OSError):
             # Unreadable / identity-mismatched store: an obligation we cannot see is not an
             # obligation that is absent. `None` routes the caller to a fail-closed refusal.
             return None
+
+    def retirement_transaction(self, unit, *, live_pair_present: bool):
+        from mozyo_bridge.core.state.scratch_retirement_fence import (
+            ScratchRetirementFence,
+        )
+
+        return ScratchRetirementFence().transaction(
+            unit, live_pair_present=live_pair_present
+        )
 
     def close(self, workspace_id: str, lane_id: str, targets):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -516,35 +551,157 @@ def run_session_retire(
         expected_names=expected_names,
         foreign_names=tuple(observation.foreign_names),
     )
+    base = dict(
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        expected_names=expected_names,
+        foreign_names=tuple(observation.foreign_names),
+    )
     if verdict.state == STATE_BLOCKED:
         return _blocked(verdict.reason, verdict.detail, **base)
-    if verdict.state == STATE_ABSENT:
-        # Zero expected slots live over a readable inventory. This is NOT a retirement
-        # (review j#80506 F1): absence proves the pair is not here, never that THIS command
-        # retired it. A mistyped `--lane`, and a pair that never launched, land here
-        # identically — so reporting success would tell an operator their pair is retired
-        # while the real one stays live under the label they meant to type.
-        #
-        # Success on this branch requires positive evidence of a prior completed retire of
-        # this exact identity set. That evidence needs a durable store, and which store may
-        # legitimately hold it is an open design question raised to the gateway (see the
-        # design consultation on j#80506 F1/F2): `managed_events` is `append_only_lossy` and
-        # its charter forbids completion truth, a lane lifecycle row is forbidden by
-        # acceptance 4, and an isolated ledger was removed as an anti-pattern by #13842 R5.
-        # Until that is decided this branch fails closed, which is the safe half of F1.
-        return _blocked(
-            REASON_RETIRE_EVIDENCE_ABSENT,
-            "no slot of this pair is live, and there is no evidence this command retired it; "
-            "refusing to report a retirement it cannot prove (a mistyped --lane looks exactly "
-            "like this). Nothing was closed and nothing was written",
-            **base,
-        )
 
-    # Durable obligation gate (review j#80506 F4). The runtime facts the observation already
-    # cleared (idle / turn-ended / settled composer) prove only that no turn is IN FLIGHT —
-    # they are receiver state, and the workflow contract forbids reading a runtime signal as a
-    # workflow verdict. Work *owed* to a slot lives in a durable fence, so read it before any
-    # close. Placed before the read-only return too, so a preflight reports the same refusal.
+    live_targets = tuple(verdict.close_targets)
+    pair_is_live = bool(live_targets)
+
+    # The retirement transaction (design j#80526). Everything from the authority read through
+    # the close, the fresh re-measure and the completion happens under ONE exclusive,
+    # non-blocking advisory lock: `BEGIN IMMEDIATE` cannot span the close, which is an external
+    # process operation, so it alone would let a second caller enter the unit mid-flight.
+    try:
+        unit = RetirementUnit(
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            slot_digest=slot_digest(expected_names),
+        )
+    except ValueError as exc:
+        return _blocked(REASON_IDENTITY_UNENCODABLE, str(exc), **base)
+
+    try:
+        with live_ops.retirement_transaction(unit, live_pair_present=pair_is_live) as txn:
+            prior = txn.current()
+
+            if not pair_is_live:
+                # Zero expected slots live. Only a proven prior completion of THIS exact unit
+                # makes it a success; absence alone never does (review j#80506 F1).
+                if prior is not None and prior.completed:
+                    return SessionRetireVerdict(
+                        state=STATE_ALREADY_RETIRED,
+                        detail=(
+                            "this exact pair was proven retired by a prior run and no slot is "
+                            "live now"
+                        ),
+                        closed=prior.closed,
+                        durable_retirement="already_completed",
+                        executed=bool(getattr(args, "execute", False)),
+                        **base,
+                    )
+                if prior is not None and prior.pending:
+                    # A crash after the close but before the completion. Repair it: re-measure
+                    # the whole unit and, if provably empty, finish the attempt (F2 repair).
+                    if not getattr(args, "execute", False):
+                        return SessionRetireVerdict(
+                            state=STATE_GREEN,
+                            detail=(
+                                "a pending retirement attempt is repairable; re-run with "
+                                "--execute to re-measure and complete it"
+                            ),
+                            executed=False,
+                            **base,
+                        )
+                    return _finish_retirement(
+                        live_ops,
+                        txn,
+                        args=args,
+                        attempt=prior,
+                        closed=prior.closed,
+                        workspace_id=workspace_id,
+                        lane_id=lane_id,
+                        expected_roles=expected_roles,
+                        expected_names=expected_names,
+                        base=base,
+                        repaired=True,
+                    )
+                return _blocked(
+                    REASON_RETIRE_EVIDENCE_ABSENT,
+                    "no slot of this pair is live, and no durable attempt proves this command "
+                    "retired it; refusing to report a retirement it cannot prove (a mistyped "
+                    "--lane looks exactly like this). Nothing was closed or written",
+                    **base,
+                )
+
+            # A live pair. Read the durable obligations owed to these exact slots AFTER taking
+            # the transaction (j#80526 ordering): holding the authority first is what closes
+            # the window in which a dispatch could reserve against a slot we are about to
+            # close. Runtime idle / turn-ended is receiver state and proves nothing here.
+            blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
+            if blocked is not None:
+                return blocked
+
+            if not getattr(args, "execute", False):
+                return SessionRetireVerdict(
+                    state=STATE_GREEN,
+                    detail=(
+                        "the pair is retirable; re-run with --execute to close "
+                        f"{len(live_targets)} slot(s)"
+                    ),
+                    executed=False,
+                    **base,
+                )
+
+            # Resume an in-flight attempt, or open a new one. A `completed` attempt followed by
+            # newly live slots is a RELAUNCH at the same deterministic names, so it opens a new
+            # attempt rather than being mistaken for the old completion (j#80526).
+            already_closed: tuple[tuple[str, str], ...] = ()
+            if prior is not None and prior.pending:
+                attempt = prior
+                already_closed = prior.closed
+                remaining = tuple(
+                    t for t in live_targets if t not in set(already_closed)
+                )
+            else:
+                attempt = txn.reserve(pinned=live_targets)
+                remaining = live_targets
+
+            result = live_ops.close(workspace_id, lane_id, remaining)
+            closed = tuple(already_closed) + tuple(getattr(result, "closed", ()) or ())
+            failed = tuple(getattr(result, "failed", ()) or ())
+            if closed:
+                # Persist progress so a crash here resumes from what actually committed.
+                txn.record_progress(attempt_id=attempt.attempt_id, closed=closed)
+            if failed:
+                return SessionRetireVerdict(
+                    state=STATE_BLOCKED,
+                    reason=REASON_CLOSE_FAILED,
+                    detail=(
+                        "one or more slots did not close; the attempt stays pending and a "
+                        "re-run resumes the remainder"
+                    ),
+                    closed=closed,
+                    failed=failed,
+                    executed=True,
+                    **base,
+                )
+            return _finish_retirement(
+                live_ops,
+                txn,
+                args=args,
+                attempt=attempt,
+                closed=closed,
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                expected_roles=expected_roles,
+                expected_names=expected_names,
+                base=base,
+                repaired=False,
+            )
+    except ScratchRetirementBusy as exc:
+        return _blocked(REASON_RETIREMENT_BUSY, str(exc), **base)
+    except ScratchRetirementFenceError as exc:
+        return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+
+
+def _obligation_refusal(live_ops, workspace_id, expected_names, base):
+    """The durable-obligation gate, or ``None`` when nothing is owed. (review j#80506 F4)"""
     obligations = live_ops.open_obligations(workspace_id, expected_names)
     if obligations is None:
         return _blocked(
@@ -553,48 +710,58 @@ def run_session_retire(
             "cannot be observed is not an obligation that is absent, so nothing is closed",
             **base,
         )
-    if obligations:
-        owed = ", ".join(f"{name} ({state})" for name, state in obligations)
+    owed = [o for o in obligations if o.non_terminal]
+    if owed:
+        shown = ", ".join(
+            f"{o.target_assigned_name} ({o.state}, issue {o.issue or '<none>'})" for o in owed
+        )
         return _blocked(
             REASON_WORK_OBLIGATION_PRESENT,
-            f"durable work is owed to this pair ({owed}); a reserved / uncertain dispatch "
+            f"durable work is owed to this pair ({shown}); a reserved / uncertain dispatch "
             "means a send's fate is unresolved, which no idle runtime reading can rule out",
             **base,
         )
-
-    if not getattr(args, "execute", False):
-        return SessionRetireVerdict(
-            state=STATE_GREEN,
-            detail=(
-                "the pair is retirable; re-run with --execute to close "
-                f"{len(verdict.close_targets)} slot(s)"
-            ),
-            executed=False,
+    # `delivered` is a delivery ACK, not task completion (the ACK / completion separation), so
+    # it cannot be waved through on its own: whether the handed-off work is discharged lives in
+    # the Redmine gate its issue/journal names. This surface has no read of that gate, so an
+    # uncorrelatable delivered obligation fails closed rather than being assumed finished.
+    delivered = [o for o in obligations if o.needs_gate_correlation]
+    if delivered:
+        shown = ", ".join(
+            f"{o.target_assigned_name} (delivered, issue {o.issue or '<none>'} "
+            f"j#{o.journal or '<none>'})"
+            for o in delivered
+        )
+        return _blocked(
+            REASON_WORK_OBLIGATION_PRESENT,
+            f"work was delivered to this pair and its completion cannot be correlated "
+            f"({shown}); a delivery ACK is not task completion, so this surface will not "
+            "assume the work is discharged",
             **base,
         )
+    return None
 
-    result = live_ops.close(workspace_id, lane_id, verdict.close_targets)
-    closed = tuple(getattr(result, "closed", ()) or ())
-    failed = tuple(getattr(result, "failed", ()) or ())
-    if failed:
-        # A partially failed close is NOT a retire — but the closes that did commit are
-        # reported, and a re-run resumes from the positive absence of the closed slots.
-        return SessionRetireVerdict(
-            state=STATE_BLOCKED,
-            reason=REASON_CLOSE_FAILED,
-            detail="one or more slots did not close; re-run to resume the remainder",
-            closed=closed,
-            failed=failed,
-            executed=True,
-            **base,
-        )
 
-    # Whole-unit post-close re-measure (review j#80506 F3, the #13842 j#79320 R3 precedent).
-    # A close command's return code says the command was accepted, NOT that the unit is empty;
-    # capacity is recovered only when the panes are actually gone (`enumerate_active_lanes`
-    # folds live panes). Re-observe the WHOLE unit on a FRESH inventory and require a positive
-    # emptiness — expected slots absent AND no foreign / duplicate / unresolved occupant —
-    # before claiming a retirement. Anything else keeps the committed closes and fails closed.
+def _finish_retirement(
+    live_ops,
+    txn,
+    *,
+    args,
+    attempt,
+    closed,
+    workspace_id,
+    lane_id,
+    expected_roles,
+    expected_names,
+    base,
+    repaired,
+):
+    """Fresh whole-unit re-measure -> fence completion -> best-effort audit -> green.
+
+    The re-measure re-checks the SURFACE SIGNATURE too, not only the inventory (review j#80523
+    R2-F3): this rail exists only for a record-less unit, so if a lifecycle record appeared
+    mid-flight the unit stopped being this surface's to retire and no completion may be claimed.
+    """
     after = observe_scratch_pair(
         live_ops,
         workspace_id=workspace_id,
@@ -607,7 +774,20 @@ def run_session_retire(
             reason=REASON_POST_CLOSE_UNREADABLE,
             detail=(
                 "the close committed but a fresh inventory could not be read, so the unit's "
-                "emptiness is unproven; re-run to re-measure and complete"
+                "emptiness is unproven; the attempt stays pending and a re-run repairs it"
+            ),
+            closed=closed,
+            executed=True,
+            **base,
+        )
+    if not after.lifecycle_record_absent:
+        return SessionRetireVerdict(
+            state=STATE_BLOCKED,
+            reason=REASON_SIGNATURE_LOST,
+            detail=(
+                "the unit gained a durable lifecycle record during the retire, so it is no "
+                "longer this surface's to retire (this rail is only for record-less pairs); "
+                "no completion is claimed"
             ),
             closed=closed,
             executed=True,
@@ -615,19 +795,19 @@ def run_session_retire(
         )
     residue = [slot.assigned_name for slot in after.slots if not slot.absent]
     if residue or after.foreign_names or after.duplicate_slot_keys:
-        detail_bits = []
+        bits = []
         if residue:
-            detail_bits.append(f"expected slot(s) still live: {', '.join(residue)}")
+            bits.append(f"expected slot(s) still live: {', '.join(residue)}")
         if after.foreign_names:
-            detail_bits.append(f"foreign occupant(s): {', '.join(after.foreign_names)}")
+            bits.append(f"foreign occupant(s): {', '.join(after.foreign_names)}")
         if after.duplicate_slot_keys:
-            detail_bits.append("duplicate canonical slot(s) appeared")
+            bits.append("duplicate canonical slot(s) appeared")
         return SessionRetireVerdict(
             state=STATE_BLOCKED,
             reason=REASON_POST_CLOSE_RESIDUE,
             detail=(
                 "the close committed but the unit is not empty, so this is not a retirement ("
-                + "; ".join(detail_bits)
+                + "; ".join(bits)
                 + ")"
             ),
             closed=closed,
@@ -635,8 +815,37 @@ def run_session_retire(
             executed=True,
             **{k: v for k, v in base.items() if k != "foreign_names"},
         )
+    # An obligation reserved DURING the close would be invisible to the pre-close read alone
+    # (review j#80523 R2-F2), so re-read it here, still under the held transaction.
+    blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
+    if blocked is not None:
+        return replace(blocked, closed=closed, executed=True)
 
-    durable = live_ops.record_retirement(
+    try:
+        txn.mark_completed(
+            attempt_id=attempt.attempt_id,
+            closed=closed,
+            detail=f"{len(closed)} slot(s) closed; unit re-measured empty",
+        )
+    except ScratchRetirementFenceError as exc:
+        # The load-bearing durable outcome failed. NOT a success — but the closes that
+        # committed are reported truthfully, and the pending attempt lets the next run repair.
+        return SessionRetireVerdict(
+            state=STATE_BLOCKED,
+            reason=REASON_COMPLETION_UNPROVEN,
+            detail=(
+                f"the panes closed and the unit re-measured empty, but the retirement could "
+                f"not be recorded ({exc}); re-run to repair the pending attempt"
+            ),
+            closed=closed,
+            executed=True,
+            **base,
+        )
+
+    # The fence row IS the durable outcome (acceptance 4). `managed_events` is appended only
+    # AFTER it, purely as lossy narrative audit: its failure is reported but never invalidates
+    # a proven retirement, because the load-bearing authority is the fence, not the audit log.
+    audit = live_ops.record_retirement(
         workspace_id=workspace_id,
         lane_id=lane_id,
         intent={
@@ -646,16 +855,22 @@ def run_session_retire(
             "surface": EVENT_COMMAND,
         },
     )
+    detail = f"closed {len(closed)} slot(s); the unit re-measured empty on a fresh inventory"
+    if repaired:
+        detail = (
+            f"repaired a pending attempt: {len(closed)} slot(s) were already closed and the "
+            "unit re-measured empty"
+        )
     return SessionRetireVerdict(
         state=STATE_GREEN,
-        detail=(
-            f"closed {len(closed)} slot(s); the unit re-measured empty on a fresh inventory"
-        ),
+        detail=detail,
         closed=closed,
-        durable_retirement=durable,
+        durable_retirement="fence_completed",
+        audit_record=audit,
         executed=True,
         **base,
     )
+
 
 
 def format_session_retire_text(result: SessionRetireVerdict) -> str:
@@ -676,6 +891,11 @@ def format_session_retire_text(result: SessionRetireVerdict) -> str:
         lines.append(f"    close FAILED: {role} @ {locator}: {detail}")
     if result.durable_retirement:
         lines.append(f"  durable retirement: {result.durable_retirement}")
+    if result.audit_record and result.audit_record != "recorded":
+        # The fence proves the retirement; the audit log is narrative only, so a failed
+        # append is reported without invalidating a proven close (design j#80526).
+        lines.append(f"  audit record: {result.audit_record} (narrative only; the "
+                     f"retirement itself is proven by the fence)")
     if not result.executed and result.state == STATE_GREEN:
         lines.append("  (read-only preflight; nothing was closed)")
     return "\n".join(lines)
@@ -696,6 +916,11 @@ __all__ = (
     "REASON_POST_CLOSE_RESIDUE",
     "REASON_POST_CLOSE_UNREADABLE",
     "REASON_RETIRE_EVIDENCE_ABSENT",
+    "REASON_RETIREMENT_BUSY",
+    "REASON_RETIREMENT_AUTHORITY_UNAVAILABLE",
+    "REASON_COMPLETION_UNPROVEN",
+    "REASON_SIGNATURE_LOST",
+    "STATE_ALREADY_RETIRED",
     "SessionRetireVerdict",
     "SessionRetireOps",
     "LiveSessionRetireOps",

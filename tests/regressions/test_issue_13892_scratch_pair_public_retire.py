@@ -14,11 +14,28 @@ Acceptance 5 asks for deterministic coverage of success / identity ambiguity / f
 from __future__ import annotations
 
 import argparse
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
+from mozyo_bridge.core.state.dispatch_outbox_fence import TargetObligation
+from mozyo_bridge.core.state.scratch_retirement_fence import (  # noqa: E501
+    RETIRE_COMPLETED,
+    RETIRE_PENDING,
+    RetirementUnit,
+    ScratchRetirementBusy,
+    ScratchRetirementFence,
+    ScratchRetirementFenceError,
+    slot_digest,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire import (  # noqa: E501
     REASON_CLOSE_FAILED,
+    REASON_COMPLETION_UNPROVEN,
+    REASON_RETIREMENT_AUTHORITY_UNAVAILABLE,
+    REASON_RETIREMENT_BUSY,
+    REASON_SIGNATURE_LOST,
+    STATE_ALREADY_RETIRED,
     REASON_LANE_IS_DEFAULT,
     REASON_LANE_REQUIRED,
     REASON_OBLIGATION_UNREADABLE,
@@ -98,6 +115,7 @@ class FakeOps:
         self._closed_any = False
         self.close_calls = []
         self.recorded = []
+        self.fence = None  # set by the test fixture to a real fence over a temp home
 
     def agent_rows(self):
         if self._rows_raise:
@@ -108,6 +126,9 @@ class FakeOps:
 
     def open_obligations(self, workspace_id, assigned_names):
         return self._obligations
+
+    def retirement_transaction(self, unit, *, live_pair_present):
+        return self.fence.transaction(unit, live_pair_present=live_pair_present)
 
     def runtime_state(self, locator):
         if isinstance(self._runtime, dict):
@@ -174,7 +195,16 @@ class ScratchPairRetireTest(unittest.TestCase):
             self._row(self.wk_name, locator=wk_locator, agent=WORKER),
         ]
 
+    def _fence(self):
+        """A REAL fence over a throwaway home: the lock / replay / identity semantics under
+        test must be production's, not a mock's (the test-double fidelity rule)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return ScratchRetirementFence(home=Path(d))
+
     def _run(self, ops, **kw):
+        if getattr(ops, "fence", None) is None:
+            ops.fence = self._fence()
         return run_session_retire(self._args(**kw), self.repo_root, ops=ops)
 
     # -- control: the harness itself resolves the pair -------------------------
@@ -199,8 +229,9 @@ class ScratchPairRetireTest(unittest.TestCase):
         self.assertEqual(
             sorted(ops.close_calls[0]), sorted([(GATEWAY, "%1"), (WORKER, "%2")])
         )
-        self.assertEqual(result.durable_retirement, "recorded")
-        self.assertEqual(len(ops.recorded), 1)
+        self.assertEqual(result.durable_retirement, "fence_completed",
+                         "the fence row is the load-bearing durable outcome")
+        self.assertEqual(len(ops.recorded), 1, "managed_events is appended AFTER the fence")
 
     def test_read_only_by_default_closes_nothing(self):
         ops = FakeOps(self._pair_rows())
@@ -466,7 +497,10 @@ class ScratchPairRetireTest(unittest.TestCase):
     def test_durable_work_obligation_blocks_the_close(self):
         """F4: a reserved dispatch is owed to a slot -> zero-close, even when idle."""
         ops = FakeOps(
-            self._pair_rows(), obligations=((f"{self.wk_name}", "reserved"),)
+            self._pair_rows(),
+            obligations=(
+                TargetObligation(self.wk_name, "reserved", issue="13999", journal="1"),
+            ),
         )
         result = self._run(ops, execute=True)
         self.assertEqual(result.state, STATE_BLOCKED)
@@ -474,7 +508,10 @@ class ScratchPairRetireTest(unittest.TestCase):
         self.assertEqual(ops.close_calls, [], "never close over owed work")
 
     def test_uncertain_obligation_blocks_the_close(self):
-        ops = FakeOps(self._pair_rows(), obligations=((f"{self.gw_name}", "uncertain"),))
+        ops = FakeOps(
+            self._pair_rows(),
+            obligations=(TargetObligation(self.gw_name, "uncertain", issue="13999"),),
+        )
         result = self._run(ops, execute=True)
         self.assertEqual(result.state, STATE_BLOCKED)
         self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
@@ -489,7 +526,10 @@ class ScratchPairRetireTest(unittest.TestCase):
         self.assertEqual(ops.close_calls, [])
 
     def test_obligation_gate_also_refuses_in_read_only_preflight(self):
-        ops = FakeOps(self._pair_rows(), obligations=((f"{self.wk_name}", "reserved"),))
+        ops = FakeOps(
+            self._pair_rows(),
+            obligations=(TargetObligation(self.wk_name, "reserved", issue="13999"),),
+        )
         result = self._run(ops, execute=False)
         self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
         self.assertEqual(ops.close_calls, [])
@@ -515,3 +555,368 @@ class ScratchPairRetireTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScratchRetirementFenceTest(unittest.TestCase):
+    """The retirement authority itself (Redmine #13892, design j#80526).
+
+    Drives the REAL store: the lock, the artifact inventory and the identity checks are the
+    properties under test, so a mock would test nothing.
+    """
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.home = Path(d)
+        self.fence = ScratchRetirementFence(home=self.home)
+        self.unit = RetirementUnit("ws1", "lane1", slot_digest(["mzb1_a", "mzb1_b"]))
+        self.pins = (("codex", "%1"), ("claude", "%2"))
+
+    def _open(self, *, live=True):
+        return self.fence.transaction(self.unit, live_pair_present=live)
+
+    # -- identity ----------------------------------------------------------
+
+    def test_slot_digest_is_order_independent_and_deduped(self):
+        self.assertEqual(slot_digest(["b", "a"]), slot_digest(["a", "b"]))
+        self.assertEqual(slot_digest(["a", "b", "a"]), slot_digest(["a", "b"]))
+        self.assertNotEqual(slot_digest(["a", "b"]), slot_digest(["a", "c"]))
+        with self.assertRaises(ValueError):
+            slot_digest([])
+
+    def test_a_different_slot_set_is_a_different_unit(self):
+        with self._open() as txn:
+            txn.reserve(pinned=self.pins)
+            txn.mark_completed(attempt_id=txn.current().attempt_id, closed=self.pins)
+        other = RetirementUnit("ws1", "lane1", slot_digest(["mzb1_a", "mzb1_c"]))
+        with self.fence.transaction(other, live_pair_present=False) as txn:
+            self.assertIsNone(txn.current(), "a different pair must not inherit the proof")
+
+    # -- bootstrap ---------------------------------------------------------
+
+    def test_zero_slot_never_bootstraps_and_reports_no_attempt(self):
+        with self._open(live=False) as txn:
+            self.assertIsNone(txn.current())
+            self.assertFalse(txn.bootstrapped)
+        self.assertFalse(self.fence.path.exists(), "a zero-slot run must not create the store")
+
+    def test_first_bootstrap_requires_a_live_pair(self):
+        with self._open(live=True) as txn:
+            self.assertTrue(txn.bootstrapped)
+        self.assertTrue(self.fence.path.exists())
+        self.assertTrue(self.fence.seal_path.exists())
+
+    # -- store damage: every shape fails closed ----------------------------
+
+    def _bootstrap(self):
+        with self._open(live=True):
+            pass
+
+    def test_seal_without_db_fails_closed(self):
+        self._bootstrap()
+        self.fence.path.unlink()
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True):
+                pass
+
+    def test_db_without_seal_fails_closed(self):
+        self._bootstrap()
+        self.fence.seal_path.unlink()
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True):
+                pass
+
+    def test_orphan_wal_is_not_read_as_absent(self):
+        """A stray SQLite sidecar is evidence something was here — never a fresh world."""
+        (self.home / (ScratchRetirementFence(home=self.home).path.name + "-wal")).write_text("x")
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True):
+                pass
+
+    def test_broken_symlink_artifact_counts_as_present(self):
+        """`lexists` semantics: a dangling link is still evidence (j#80526)."""
+        self.fence.seal_path.symlink_to(self.home / "nowhere")
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True):
+                pass
+
+    def test_seal_mismatch_fails_closed(self):
+        self._bootstrap()
+        self.fence.seal_path.write_text("deadbeef")
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True) as txn:
+                txn.current()
+
+    def test_unknown_schema_fails_closed(self):
+        self._bootstrap()
+        import sqlite3
+
+        conn = sqlite3.connect(self.fence.path)
+        conn.execute("PRAGMA user_version = 9999")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True) as txn:
+                txn.current()
+
+    def test_corrupt_db_fails_closed(self):
+        self._bootstrap()
+        self.fence.path.write_bytes(b"not sqlite")
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True) as txn:
+                txn.current()
+
+    # -- concurrency -------------------------------------------------------
+
+    def test_second_caller_is_busy_and_never_waits(self):
+        with self._open(live=True):
+            with self.assertRaises(ScratchRetirementBusy):
+                with self.fence.transaction(self.unit, live_pair_present=True):
+                    pass
+
+
+    def test_lock_is_exclusive_across_processes(self):
+        """The real risk is two CLI invocations, not two threads.
+
+        An in-process assertion could pass on a re-entrant lock while two separate
+        `herdr session-retire` processes both entered the same unit and closed it twice.
+        """
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        child = textwrap.dedent(
+            f"""
+            from pathlib import Path
+            from mozyo_bridge.core.state.scratch_retirement_fence import (
+                ScratchRetirementFence, RetirementUnit, ScratchRetirementBusy, slot_digest)
+            f = ScratchRetirementFence(home=Path({str(self.home)!r}))
+            u = RetirementUnit("ws1", "lane1", slot_digest(["mzb1_a", "mzb1_b"]))
+            try:
+                with f.transaction(u, live_pair_present=True):
+                    print("ACQUIRED")
+            except ScratchRetirementBusy:
+                print("BUSY")
+            """
+        )
+        env = {**os.environ, "PYTHONPATH": "src"}
+        repo = Path(__file__).resolve().parents[2]
+        with self._open(live=True):
+            out = subprocess.run(
+                [sys.executable, "-c", child], env=env, cwd=repo,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(out.stdout.strip(), "BUSY", out.stderr[-300:])
+        out = subprocess.run(
+            [sys.executable, "-c", child], env=env, cwd=repo,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(
+            out.stdout.strip(), "ACQUIRED",
+            "the lock must be released when the transaction exits",
+        )
+
+    def test_lock_is_released_after_the_transaction(self):
+        with self._open(live=True):
+            pass
+        with self._open(live=True) as txn:  # must not raise
+            self.assertIsNone(txn.current())
+
+    # -- replay ------------------------------------------------------------
+
+    def test_reserve_then_complete(self):
+        with self._open(live=True) as txn:
+            a = txn.reserve(pinned=self.pins)
+            self.assertTrue(a.pending)
+            txn.mark_completed(attempt_id=a.attempt_id, closed=self.pins)
+            self.assertTrue(txn.current().completed)
+
+    def test_crash_at_reserve_leaves_a_resumable_pending(self):
+        with self._open(live=True) as txn:
+            txn.reserve(pinned=self.pins)  # "crash" — no completion
+        with self._open(live=True) as txn:
+            cur = txn.current()
+            self.assertIsNotNone(cur)
+            self.assertTrue(cur.pending, "a crashed attempt must be resumable, not stuck")
+
+    def test_partial_close_progress_survives_a_crash(self):
+        with self._open(live=True) as txn:
+            a = txn.reserve(pinned=self.pins)
+            txn.record_progress(attempt_id=a.attempt_id, closed=(("codex", "%1"),))
+        with self._open(live=True) as txn:
+            self.assertEqual(txn.current().closed, (("codex", "%1"),))
+
+    def test_completion_cas_rejects_a_stale_attempt(self):
+        with self._open(live=True) as txn:
+            stale = txn.reserve(pinned=self.pins).attempt_id
+            txn.reserve(pinned=self.pins)  # a newer attempt supersedes it
+            with self.assertRaises(ScratchRetirementFenceError):
+                txn.mark_completed(attempt_id=stale, closed=self.pins)
+
+    def test_relaunch_after_completed_opens_a_new_attempt(self):
+        """The same deterministic names relaunched must NOT inherit the old completion."""
+        with self._open(live=True) as txn:
+            a = txn.reserve(pinned=self.pins)
+            txn.mark_completed(attempt_id=a.attempt_id, closed=self.pins)
+            first_rev = txn.current().revision
+        with self._open(live=True) as txn:
+            b = txn.reserve(pinned=self.pins)  # a live pair reappeared at the same names
+            self.assertTrue(b.pending)
+            self.assertGreater(b.revision, first_rev)
+
+    # -- status ------------------------------------------------------------
+
+    def test_status_reports_absent_readable_and_damaged(self):
+        self.assertEqual(self.fence.status()["store_state"], "absent")
+        self._bootstrap()
+        self.assertEqual(self.fence.status()["store_state"], "present")
+        self.assertTrue(self.fence.status()["readable"])
+        self.fence.seal_path.unlink()
+        st = self.fence.status()
+        self.assertEqual(st["store_state"], "damaged")
+        self.assertIn("db", st["present_artifacts"])
+
+
+class ScratchPairRetireReplayTest(ScratchPairRetireTest):
+    """End-to-end replay of the retirement transaction through the real entry point."""
+
+    def test_second_run_after_success_is_idempotent_exit_zero(self):
+        """j#80526: an exact prior completion + a live-zero now is a SUCCESS, not exit 1."""
+        fence = self._fence()
+        ops = FakeOps(self._pair_rows())
+        ops.fence = fence
+        first = self._run(ops, execute=True)
+        self.assertEqual(first.state, STATE_GREEN)
+
+        second_ops = FakeOps([])  # the panes are gone now
+        second_ops.fence = fence  # ...but the SAME authority proves we retired them
+        second = self._run(second_ops, execute=True)
+        self.assertEqual(second.state, STATE_ALREADY_RETIRED)
+        self.assertTrue(second.ok, "a proven replay must exit 0")
+        self.assertEqual(second_ops.close_calls, [], "and close nothing")
+
+    def test_completion_failure_is_not_success_then_repairs(self):
+        """j#80506 F2: the load-bearing write fails -> non-success; the next run repairs."""
+        fence = self._fence()
+        ops = FakeOps(self._pair_rows())
+        ops.fence = fence
+        real_txn = fence.transaction
+
+        class _BreakComplete:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                self._t = self._inner.__enter__()
+                return self
+
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+            def __getattr__(self, name):
+                return getattr(self._t, name)
+
+            def mark_completed(self, **kw):
+                raise ScratchRetirementFenceError("simulated completion write failure")
+
+        fence.transaction = lambda u, **kw: _BreakComplete(real_txn(u, **kw))
+        first = self._run(ops, execute=True)
+        self.assertEqual(first.state, STATE_BLOCKED)
+        self.assertEqual(first.reason, REASON_COMPLETION_UNPROVEN)
+        self.assertFalse(first.ok)
+        self.assertEqual(len(first.closed), 2, "the closes that committed are reported")
+        self.assertEqual(ops.recorded, [], "no audit over an unproven completion")
+
+        # The pending attempt survives: a re-run re-measures and repairs to completed.
+        fence.transaction = real_txn
+        repair_ops = FakeOps([])  # panes already gone
+        repair_ops.fence = fence
+        second = self._run(repair_ops, execute=True)
+        self.assertEqual(second.state, STATE_GREEN, second.detail)
+        self.assertEqual(second.durable_retirement, "fence_completed")
+        self.assertEqual(repair_ops.close_calls, [], "repair closes nothing further")
+
+    def test_audit_append_failure_does_not_invalidate_a_proven_retirement(self):
+        """j#80526: managed_events is lossy narrative; the fence is the authority."""
+        fence = self._fence()
+        ops = FakeOps(self._pair_rows())
+        ops.fence = fence
+        ops.record_retirement = lambda **kw: "not_recorded:append_failed"
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_GREEN, result.detail)
+        self.assertTrue(result.ok, "a lossy audit failure must not invalidate the fence proof")
+        self.assertEqual(result.durable_retirement, "fence_completed")
+        self.assertEqual(result.audit_record, "not_recorded:append_failed")
+
+    def test_busy_unit_closes_nothing(self):
+        fence = self._fence()
+        ops = FakeOps(self._pair_rows())
+        ops.fence = fence
+        unit = RetirementUnit(
+            workspace_id=self.ws,
+            lane_id=LANE,
+            slot_digest=slot_digest([self.gw_name, self.wk_name]),
+        )
+        with fence.transaction(unit, live_pair_present=True):
+            result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_RETIREMENT_BUSY)
+        self.assertEqual(ops.close_calls, [], "a busy unit must never be closed into")
+
+    def test_signature_lost_mid_flight_withholds_completion(self):
+        """j#80523 R2-F3: the unit gained a lifecycle record during the retire."""
+        fence = self._fence()
+        ops = FakeOps(self._pair_rows())
+        ops.fence = fence
+        state = {"closed": False}
+        real_close = ops.close
+
+        def close_then_declare(ws, lane, targets):
+            out = real_close(ws, lane, targets)
+            state["closed"] = True
+            return out
+
+        ops.close = close_then_declare
+        ops.lifecycle_record_absent = lambda ws, lane: not state["closed"]
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_SIGNATURE_LOST)
+        self.assertTrue(result.closed, "the committed closes are still reported")
+        self.assertEqual(ops.recorded, [])
+
+    def test_late_obligation_after_close_withholds_completion(self):
+        """j#80523 R2-F2: an obligation reserved DURING the close is re-read before completing."""
+        fence = self._fence()
+        ops = FakeOps(self._pair_rows())
+        ops.fence = fence
+        state = {"closed": False}
+        real_close = ops.close
+
+        def close_then_reserve(ws, lane, targets):
+            out = real_close(ws, lane, targets)
+            state["closed"] = True
+            return out
+
+        ops.close = close_then_reserve
+        ops.open_obligations = lambda ws, names: (
+            (TargetObligation(self.wk_name, "reserved", issue="13999"),)
+            if state["closed"]
+            else ()
+        )
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
+        self.assertEqual(ops.recorded, [], "no completion over newly owed work")
+
+    def test_delivered_obligation_without_correlation_blocks(self):
+        """j#80526: a delivery ACK is not task completion; uncorrelatable -> fail closed."""
+        ops = FakeOps(
+            self._pair_rows(),
+            obligations=(TargetObligation(self.wk_name, "delivered", issue="13999",
+                                          journal="42"),),
+        )
+        result = self._run(ops, execute=True)
+        self.assertEqual(result.state, STATE_BLOCKED)
+        self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
+        self.assertEqual(ops.close_calls, [])

@@ -518,8 +518,13 @@ Table naming:
       (Redmine からの explicit re-declare) を偽の row で汚す。★**row が不要な理由は capacity 経路が live pane 由来だから**:
       `enumerate_active_lanes` は herdr live pane を畳んで roster を作り、lifecycle disposition は **非 active を除外する
       filter** としてのみ効く (`glance_snapshot_source.py`)。row を持たない unit は disposition `None` ゆえ roster に残り、
-      **pane が消えること自体**が唯一かつ十分な capacity 回収手段である。∴ 本 rail の durable outcome は lifecycle authority では
-      なく `managed_events` の audit record (retirement を *説明* するものであって *引き起こす* ものではない)。★signature は
+      **pane が消えること自体**が唯一かつ十分な capacity 回収手段である。★**durable outcome は `scratch_retirement_fence` の row**
+      (設計 j#80526 Option A-prime)。`managed_events` は **不可** — `append_only_lossy` かつ「append 失敗は caller を壊さない」
+      「completion truth にしない」charter (`:153` / `:179` / `:826`) で、F2 が要求する load-bearing な completion と正面から矛盾する。
+      lifecycle row も Acceptance 4 が禁止する。ゆえに **第 4 の state kind** を立てる:
+      **operational action-idempotency / side-effect transaction authority** (workflow truth でも desired-state history でも
+      lifecycle authority でもない)。`managed_events` は fence completed の **後**に best-effort narrative audit として append し、
+      その失敗は proven retirement を無効化しない。★signature は
       **「lifecycle record が無いこと」** で、record を持つ lane は `lane_record_present` zero-write で既存 surface へ route する
       (各 surface が自らの signature を literal に述べる規律の適用。共有 predicate へ一般化しない)。lifecycle store が **不読**の
       場合は「record 無し」と読まず fail-closed。★**attestation を要求しない** (#13892 j#80483、#13842 の意図的反転):
@@ -546,12 +551,26 @@ Table naming:
       durable 記録 + success。residue は `post_close_residue`、不読は `post_close_unreadable` で、**commit 済み `closed` を保持した
       まま** non-success。
       ★**zero-slot は retirement ではない**（review j#80506 F1）: absence は「pair がここに無い」ことの証明であって「**この command が
-      retire した**」ことの証明ではなく、`--lane` typo と never-launched が absence として同一に見える。ゆえに
-      `retire_evidence_absent` で non-success / zero-write。**idempotent success（2 回目の run）と append 失敗からの repair は
-      load-bearing な durable proof store を要する**が、`managed_events` は `append_only_lossy` かつ「append 失敗は caller を壊さない」
-      「completion truth にしない」charter（`:153` / `:179` / `:826`）、lifecycle row は Acceptance 4 が禁止、isolated ledger は
-      #13842 j#79346 R5 が撤去済み — **3 契約が同時に閉じる**ため store 選定を設計判断として escalate 中（#13892 j#80511）。
-      本節はその裁定後に更新する。
+      retire した**」ことの証明ではなく、`--lane` typo と never-launched が absence として同一に見える。**exact な prior completion +
+      action-time live-zero を証明できる時だけ** `already_retired`（**exit 0**）、それ以外は `retire_evidence_absent` で
+      non-success / zero-write。★**その proof を持つのが専用 authority `scratch_retirement_fence`**（設計 j#80526 Option A-prime）。
+      置き場の 3 択が同時に閉じていた（`managed_events` は `append_only_lossy` かつ「append 失敗は caller を壊さない」「completion
+      truth にしない」charter（`:153` / `:179` / `:826`）で F2 と矛盾 / lifecycle row は Acceptance 4 が禁止 / isolated ledger は
+      #13842 j#79346 R5 が撤去済み）ため、**第 4 の state kind** を立てた:
+      **operational action-idempotency / side-effect transaction authority**。
+      ★**#13842 の isolated-ledger anti-pattern とは別物**である: あちらは ledger loss が **live pane を抱えたままの恒久 stuck** を
+      作った。本 fence の `pending` は **held / crash-released OS advisory lock 下で resume** され、`completed` の loss は success を
+      捏造せず **withhold する**だけで、その時点で pane は既に消えているので **capacity leak も stuck も生じない**。残余は sibling
+      authority と同じ **local total-loss indistinguishability** のみで、それ以上は主張しない。
+      ★**transaction は OS advisory lock（exclusive / nonblocking）で保持**する: `BEGIN IMMEDIATE` は statement/txn の間しか持続せず
+      **外部 process 操作である close を跨げない**。contention は `retirement_busy` で zero-close（待たない・奪わない）。
+      ordering は reserve pending → close → fresh whole-unit remeasure → fence completed → green。`managed_events` は completed の
+      **後**に best-effort narrative audit として append し、その失敗は proven retirement を無効化しない。
+      ★**store identity**: artifact inventory は `lexists` semantics で DB / `-wal` / `-shm` / `-journal` / seal を見て
+      **absent / present / damaged を三分**する。damaged は `retirement_authority_unavailable` で fail-closed。true first bootstrap は
+      **live exact pair が positively present ∧ 全 artifact absent** の時のみ（同一 lock 下で serialize）で、**zero-slot は決して
+      bootstrap しない**（失われた authority の無言再作成を防ぐ）。★**relaunch 誤認防止**: `completed` の後に新しい live slots が
+      現れたら **新しい attempt（revision+1）** を開き、古い completion を稼働中 pair の proof に流用しない。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。
