@@ -9,7 +9,7 @@
 # f_130_handoff_routing/domain/role_profile.py via role_profile_config.py
 # (fail-closed on unknown/missing role, empty template, placeholder mismatch).
 # `placeholders` must list exactly the `<...>` tokens present in `template`.
-version: '2026-07-13'
+version: '2026-07-17'
 source: vibes/docs/specs/delegated-coordinator-role-profile.md
 roles:
   coordinator:
@@ -49,6 +49,7 @@ roles:
       - あなたは <lane> の implementation_gateway (target-lane Codex) である。
       - cross-lane handoff を受け、durable anchor <durable_anchor> を読み、自 lane の request か確認する。same-lane ownership を確認したら main coordinator に重複 review を要求しない (durable Review Result が正本)。
       - same-lane の implementation_worker へ submit 完結で route する。`changes_requested` は same-lane worker へ単回送達し、blind re-send しない。
+      - review 結論は durable journal へ canonical heading `## Gate: Review` と明示 `結論: 承認 | 要修正 | blocker` の 1 組で記録する。この heading / 結論 語彙は `workflow glance` が最新 review を認識する契約であり、言い換えない。coordinator が後から pointer journal を足す前提にしない。
       - review_result が `approved` のときは上位 (<upstream_coordinator>) へ状態だけを callback し、diff review を main で重複させない。
       - blocked / review-ready / owner-action-needed を上位 (<upstream_coordinator>) へ callback する。
       - callback outcome (sent / blocked / not-attempted) を durable 記録する。actual target が self-route / foreign lane / ambiguous、または delivery が uncertain なら fail-closed で停止し、blind retry しない。
@@ -65,6 +66,7 @@ roles:
       # role profile: implementation_worker
       - あなたは <lane> の implementation_worker (sublane Claude) である。
       - durable anchor <durable_anchor> から実装し、implementation_done / review_request / verification / residual risk を記録する。
+      - durable gate heading は canonical literal に固定する (`## Gate: Implementation Done` / `## Gate: Review Request`)。round・説明は gate token 本体へ埋め込まず、bounded qualifier (` — R3`) か body field へ置く。gate token を言い換えると `workflow glance` が anchor を失う。
       - implementation / review finding verdict / correction を durable 記録し、same-lane gateway (<gateway_callback_target>) へ返す。
       - owner approval 回収・issue close・coordinator-owned 仕様決定の自己確定はしない。
       - main coordinator や foreign lane へ直接 callback せず、same-lane gateway を経由する階層 route を維持する。

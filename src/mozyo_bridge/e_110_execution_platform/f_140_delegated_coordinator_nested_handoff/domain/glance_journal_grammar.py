@@ -12,13 +12,17 @@ The boundary (j#74307):
   exactly as-is; ``workflow watch`` still ingests markers only. This module is a separate
   read-model adapter that interprets the *governed journal template* for display, and it
   produces no watcher events and mutates nothing.
-- **Only line-anchored ``## Gate: <kind>`` headings are read**, normalized (case /
-  surrounding whitespace / a trailing ``(...)`` qualifier / a bounded dash qualifier whose
-  left-hand lifecycle token is an exact allowlist match) and **exact-matched** against a fixed
-  allowlist. Natural-language body text, ambiguous substrings, and pane scrollback are never
-  consulted. A ``##`` heading without the ``Gate:`` label (a
-  ``Progress Log`` / ``Handoff Delivery Record`` / ``Correction`` note) is structurally
-  ignored — it is not a gate.
+- **Only line-anchored gate headings are read**, in the two governed shapes: the prefixed
+  ``## Gate: <kind>`` and the suffixed ``## <kind> Gate`` (Redmine #13952: same-lane reviewers
+  durably write ``## Review Gate — 要修正``). Both are normalized (case / surrounding
+  whitespace / a trailing ``(...)`` qualifier / a bounded dash qualifier whose left-hand
+  lifecycle token is an exact allowlist match) and **exact-matched** against a fixed allowlist.
+  Natural-language body text, ambiguous substrings, and pane scrollback are never consulted. A
+  ``##`` heading in neither shape (a ``Progress Log`` / ``Handoff Delivery Record`` /
+  ``Correction`` note) is structurally ignored — it is not a gate. The suffixed shape stays
+  fail-closed the same way the prefixed one does: the whole left side must be an exact
+  allowlist entry, so ``## Review Gate approval を待つ`` (trailing prose) and
+  ``## Sublane 完了 guardrail`` contribute nothing.
 - **Combined headings carry several explicit gate facts.** ``## Gate: Implementation Done +
   Review Request`` splits on ``+`` into two recognized gates in one journal.
 - **Collisions are excluded, not guessed.** ``Review Finding Verdict(s)`` is the
@@ -26,9 +30,21 @@ The boundary (j#74307):
   review result. Because the match is exact against the allowlist, these headings simply
   contribute no gate (an unrecognized template → the caller marks the lane ``unknown``,
   never a misclassified state). Misclassification is worse than non-classification.
-- **A review conclusion is read only from an audit ``review`` journal that carries an
-  explicit ``結論:`` field** (``承認`` -> approved, ``要修正`` -> changes requested). It is
-  never inferred from body sentiment.
+- **A review conclusion is read from a closed vocabulary, never from body sentiment.** The
+  canonical producer form is an explicit ``結論:`` field (``承認`` -> approved, ``要修正`` ->
+  changes requested, ``blocker`` -> a recorded blocker) and it always wins. When it is absent,
+  the review heading's own bounded qualifier is read against the *same* vocabulary
+  (``## Gate: Review Result — changes_requested``), because that qualifier is as explicit and
+  as bounded as the field. A qualifier carrying no vocabulary token (``## Gate: Review — R6``)
+  leaves the conclusion ``pending`` — the audit is still owed, which is the fail-closed read.
+- **Producer and consumer are pinned to one contract.** The governed producer template (the
+  ``implementation_gateway`` role profile in ``role_profile_templates.yaml``) mandates the
+  literals exported here as :data:`CANONICAL_REVIEW_HEADING` /
+  :data:`CANONICAL_REVIEW_CONCLUSION_LABEL` / :data:`CANONICAL_REVIEW_CONCLUSION_TOKENS`, and a
+  drift test drives the template's own mandated journal through this grammar. That is what
+  stops the two sides from re-forking into separate literal allowlists (Redmine #13952: the
+  producer said ``Review Result``, the consumer only knew ``review``, so durable reviews were
+  invisible until a coordinator hand-added a pointer journal).
 
 The output is a :class:`GateFacts` (or ``None`` when no canonical gate was recognized), which
 :func:`lane_signal_from_gate_facts` turns into the same
@@ -81,6 +97,10 @@ _HEADING_GATE: dict[str, str] = {
     "review request": GATE_REVIEW_REQUEST,
     "review_request": GATE_REVIEW_REQUEST,
     "review": GATE_REVIEW,
+    # The same-lane reviewer's durable wording for the audit review itself (#13952 j#81029
+    # `## Gate: Review Result — changes_requested`). It is the review gate, not a request.
+    "review result": GATE_REVIEW,
+    "review_result": GATE_REVIEW,
     "owner close approval": GATE_OWNER_CLOSE_APPROVAL,
     "owner_close_approval": GATE_OWNER_CLOSE_APPROVAL,
     "blocked": GATE_BLOCKED,
@@ -152,6 +172,17 @@ _COMMIT_BEARING_GATES: frozenset[str] = frozenset(
 # non-gate ``##`` section is structurally ignored). The ``:`` may be an ASCII or fullwidth
 # colon (governed journals are authored in a mixed JA/EN workspace).
 _GATE_HEADING_RE = re.compile(r"^\s{0,3}#{2,}\s*Gate\s*[:：]\s*(?P<title>.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+
+# The suffixed governed shape: ``## <kind> Gate`` with an optional bounded dash qualifier
+# (#13952 j#81021 ``## Review Gate — 要修正``). The line must END at ``Gate`` or at that
+# qualifier, so trailing prose (``## Review Gate approval を待つ``) does not match at all —
+# the shape itself is the first fail-closed filter, before the allowlist exact-match. The
+# match is reassembled into the prefixed form's title (``review — 要修正``) so both shapes
+# share one normalization / allowlist / qualifier path and cannot drift apart.
+_SUFFIX_GATE_HEADING_RE = re.compile(
+    r"^\s{0,3}#{2,}\s*(?P<title>[^\n]+?)\s+Gate(?P<qualifier>\s+[—–]\s+[^\n]+?)?\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 _TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
 _WS_RE = re.compile(r"\s+")
 _SPLIT_PLUS_RE = re.compile(r"\s*\+\s*")
@@ -160,6 +191,45 @@ _BOUNDED_QUALIFIER_RE = re.compile(r"\s+[—–]\s+")
 # An explicit ``結論:`` (conclusion) field line inside an audit review journal. ASCII or
 # fullwidth colon; a leading list marker (``-`` / ``*``) is tolerated.
 _CONCLUSION_RE = re.compile(r"^\s*[-*]?\s*結論\s*[:：]\s*(?P<value>.+?)\s*$", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
+# The canonical producer contract (Redmine #13952).
+#
+# These are the literals the governed ``implementation_gateway`` role profile template tells a
+# same-lane reviewer to write. They are exported so the producer template and this consumer
+# grammar are verified from ONE contract instead of two hand-maintained literal lists: the
+# drift test asserts the packaged template mandates exactly these, then folds a journal
+# written to them and asserts the projection. Changing a literal here without changing the
+# template (or vice versa) fails that test.
+# ---------------------------------------------------------------------------
+
+#: The canonical review-gate heading a reviewer writes (the prefixed shape).
+CANONICAL_REVIEW_HEADING = "## Gate: Review"
+
+#: The canonical explicit-conclusion field label on that journal.
+CANONICAL_REVIEW_CONCLUSION_LABEL = "結論"
+
+#: A review outcome that is not a :data:`REVIEW_CONCLUSIONS` member: the audit concluded, but
+#: it concluded that the lane cannot proceed (e.g. the central preset's `### Gate Schema`
+#: review ``remote_verification`` failure, which is "blocker とし close へ進めない", not a
+#: finding). It folds to :attr:`GateFacts.blocker_recorded` — the field already documented as
+#: "a recorded blocker" — so the closed review vocabulary gains no fourth value.
+REVIEW_OUTCOME_BLOCKER = "blocker"
+
+#: The closed conclusion vocabulary: canonical token -> outcome. Matched as a substring of the
+#: ``結論:`` value (or of the review heading's bounded qualifier) so a governed reviewer's
+#: ``要修正 (再review 要)`` still reads, while body sentiment never does. "re-review required"
+#: is NOT a separate outcome: it is ``要修正`` (the work goes back to the implementer) plus the
+#: template's own ``再review要否`` field, which this read-model does not project.
+CANONICAL_REVIEW_CONCLUSION_TOKENS: dict[str, str] = {
+    "承認": REVIEW_APPROVED,
+    "approve": REVIEW_APPROVED,
+    "要修正": REVIEW_CHANGES_REQUESTED,
+    "changes": REVIEW_CHANGES_REQUESTED,
+    "needs": REVIEW_CHANGES_REQUESTED,
+    "blocker": REVIEW_OUTCOME_BLOCKER,
+    "blocked": REVIEW_OUTCOME_BLOCKER,
+}
 
 # A line-anchored ``## Integration disposition: <value>`` heading (the canonical governed
 # form; a ``## Gate: Integration disposition:`` variant is also accepted). ``<value>`` is the
@@ -182,46 +252,84 @@ def _normalize_heading(title: str) -> str:
     return _WS_RE.sub(" ", title).strip().lower()
 
 
-def _strip_bounded_qualifier(part: str) -> str:
-    """Drop a spaced em/en-dash suffix only after an exact governed lifecycle token.
+def _split_bounded_qualifier(part: str) -> Tuple[str, str]:
+    """Split a spaced em/en-dash suffix off an exact governed lifecycle token.
 
-    The left side must already be a complete allowlist entry (or an explicit collision
-    exclusion).  This intentionally does not perform prefix matching: near-matches remain
-    unknown instead of being promoted to workflow truth.
+    Returns ``(token, qualifier)``. The left side must be a complete allowlist entry (or an
+    explicit collision exclusion) *after* the contract's existing trailing-parenthetical
+    normalization is re-applied to it; otherwise the part is returned whole and unqualified.
+
+    That re-application is why ``## Gate: Review Request (R3) — correction completed`` reads
+    (Redmine #13952 j#81076, live evidence #13910 j#81068). :func:`_normalize_heading` only
+    strips a parenthetical at the END of the title, so a round qualifier sitting *before* the
+    dash was never reached and the whole heading fell out of the allowlist. This is the same
+    normalization, applied at the same boundary, to the same closed vocabulary — NOT a
+    ``review request (r3)`` alias and NOT prefix matching. ``Review Request candidate (R3)``
+    and ``Review Request R3`` still normalize to non-entries and stay unknown.
     """
 
     match = _BOUNDED_QUALIFIER_RE.search(part)
     if not match:
-        return part
-    left = part[: match.start()].strip()
+        return part, ""
+    left = _TRAILING_PAREN_RE.sub("", part[: match.start()]).strip()
     if left in _HEADING_GATE or left in _EXCLUDED_HEADINGS:
-        return left
-    return part
+        return left, part[match.end() :].strip()
+    return part, ""
 
 
-def _gate_heading_parts(notes: str) -> Tuple[str, ...]:
-    """Every normalized ``## Gate:`` heading part in one journal note (``+``-split; pure)."""
-    parts: list[str] = []
-    for match in _GATE_HEADING_RE.finditer(notes or ""):
-        normalized = _normalize_heading(match.group("title"))
-        for part in _SPLIT_PLUS_RE.split(normalized):
-            part = _strip_bounded_qualifier(part.strip())
+def _heading_titles(notes: str) -> Tuple[str, ...]:
+    """Every governed gate-heading title in one note, both shapes, as prefixed-form titles.
+
+    The suffixed ``## <kind> Gate — <qualifier>`` is reassembled into the prefixed form's
+    title (``<kind> — <qualifier>``) so exactly one normalization / allowlist / qualifier path
+    exists downstream.
+    """
+    titles = [match.group("title") for match in _GATE_HEADING_RE.finditer(notes or "")]
+    for match in _SUFFIX_GATE_HEADING_RE.finditer(notes or ""):
+        titles.append(match.group("title") + (match.group("qualifier") or ""))
+    return tuple(titles)
+
+
+def _gate_heading_parts(notes: str) -> Tuple[Tuple[str, str], ...]:
+    """Every normalized ``(gate token, qualifier)`` heading part in one note (``+``-split; pure)."""
+    parts: list[Tuple[str, str]] = []
+    for title in _heading_titles(notes):
+        normalized = _normalize_heading(title)
+        for raw_part in _SPLIT_PLUS_RE.split(normalized):
+            part, qualifier = _split_bounded_qualifier(raw_part.strip())
             if part:
-                parts.append(part)
+                parts.append((part, qualifier))
     return tuple(parts)
 
 
-def _review_conclusion(notes: str) -> str:
-    """Read the explicit ``結論:`` field of an audit review journal (never body sentiment)."""
+def _classify_conclusion(value: str) -> Tuple[str, bool]:
+    """Classify one conclusion value against the closed vocabulary -> ``(conclusion, blocker)``.
+
+    :data:`CANONICAL_REVIEW_CONCLUSION_TOKENS` iteration order is the precedence for a value
+    that (ambiguously) carries more than one token. A value carrying none is ``pending``.
+    """
+    haystack = value.lower()
+    for token, outcome in CANONICAL_REVIEW_CONCLUSION_TOKENS.items():
+        if token in haystack:
+            if outcome == REVIEW_OUTCOME_BLOCKER:
+                return REVIEW_PENDING, True
+            return outcome, False
+    return REVIEW_PENDING, False
+
+
+def _review_outcome(notes: str, heading_qualifier: str) -> Tuple[str, bool]:
+    """Read an audit review journal's outcome -> ``(conclusion, blocker)`` (never sentiment).
+
+    The canonical explicit ``結論:`` field wins. Only when it is absent does the review
+    heading's own bounded qualifier stand in for it (#13952 j#81029
+    ``## Gate: Review Result — changes_requested``), read against the same closed vocabulary.
+    """
     match = _CONCLUSION_RE.search(notes or "")
-    if not match:
-        return REVIEW_PENDING
-    value = match.group("value")
-    if "承認" in value or "approve" in value.lower():
-        return REVIEW_APPROVED
-    if "要修正" in value or "changes" in value.lower() or "needs" in value.lower():
-        return REVIEW_CHANGES_REQUESTED
-    return REVIEW_PENDING
+    if match:
+        return _classify_conclusion(match.group("value"))
+    if heading_qualifier:
+        return _classify_conclusion(heading_qualifier)
+    return REVIEW_PENDING, False
 
 
 def _int_journal(journal_id) -> Optional[int]:
@@ -258,7 +366,9 @@ class GateFacts:
     journal id. ``review_conclusion`` is meaningful only when ``latest_gate`` is
     :data:`GATE_REVIEW`. ``commit_bearing`` / ``integration_recorded`` are sticky facts
     accumulated across the recognized gate journals; ``blocker_recorded`` is true when the
-    latest gate is :data:`GATE_BLOCKED`.
+    latest gate is :data:`GATE_BLOCKED`, or when the latest gate is an audit review that
+    concluded :data:`REVIEW_OUTCOME_BLOCKER` (a concluded audit that says the lane cannot
+    proceed is a recorded blocker, not an audit still owed).
     """
 
     latest_gate: str
@@ -275,6 +385,7 @@ class _RecognizedJournal:
     gate: str  # max-precedence gate of this journal (GATE_NONE if integration-only)
     review_conclusion: str
     commit_bearing: bool
+    blocker: bool = False  # an audit review that concluded ``blocker``
 
 
 def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
@@ -302,16 +413,23 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         if _integration_disposition(notes) is True:
             integration_recorded = True
         gates: set[str] = set()
-        for part in _gate_heading_parts(notes):
+        review_qualifier = ""
+        for part, qualifier in _gate_heading_parts(notes):
             if part in _EXCLUDED_HEADINGS:
                 continue
             gate = _HEADING_GATE.get(part)
-            if gate is not None:
-                gates.add(gate)
+            if gate is None:
+                continue
+            gates.add(gate)
+            if gate == GATE_REVIEW and qualifier and not review_qualifier:
+                review_qualifier = qualifier
         if not gates:
             continue
         top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
-        conclusion = _review_conclusion(notes) if GATE_REVIEW in gates else REVIEW_PENDING
+        if GATE_REVIEW in gates:
+            conclusion, blocker = _review_outcome(notes, review_qualifier)
+        else:
+            conclusion, blocker = REVIEW_PENDING, False
         commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))
         recognized.append(
             _RecognizedJournal(
@@ -319,6 +437,7 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
                 gate=top_gate,
                 review_conclusion=conclusion,
                 commit_bearing=commit_bearing,
+                blocker=blocker,
             )
         )
 
@@ -332,7 +451,7 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         review_conclusion=latest.review_conclusion if latest.gate == GATE_REVIEW else REVIEW_PENDING,
         commit_bearing=any(r.commit_bearing for r in recognized),
         integration_recorded=integration_recorded,
-        blocker_recorded=(latest.gate == GATE_BLOCKED),
+        blocker_recorded=(latest.gate == GATE_BLOCKED or latest.blocker),
     )
 
 
@@ -363,7 +482,11 @@ def lane_signal_from_gate_facts(
 
 
 __all__ = (
+    "CANONICAL_REVIEW_CONCLUSION_LABEL",
+    "CANONICAL_REVIEW_CONCLUSION_TOKENS",
+    "CANONICAL_REVIEW_HEADING",
     "GateFacts",
+    "REVIEW_OUTCOME_BLOCKER",
     "fold_issue_gate_facts",
     "lane_signal_from_gate_facts",
 )

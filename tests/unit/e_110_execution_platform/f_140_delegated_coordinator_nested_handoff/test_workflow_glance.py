@@ -77,6 +77,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GATE_REVIEW as _GATE_REVIEW,
     GATE_START,
     REVIEW_CHANGES_REQUESTED,
+    REVIEW_PENDING,
     classify_lane_state,
 )
 
@@ -567,6 +568,109 @@ class JournalGrammarTest(unittest.TestCase):
             ]
         )
         self.assertIsNone(facts)
+
+    # -- Redmine #13952: the reviewer's durable vocabulary ------------------------------
+
+    def test_suffixed_review_gate_heading_is_the_review_gate(self):
+        # #13910 j#81021 verbatim: the same-lane reviewer's durable changes-requested review.
+        # It carries no 結論: field — the bounded qualifier IS the conclusion.
+        facts = fold_issue_gate_facts([_j("81021", "## Review Gate — 要修正\n\n- finding_1: ...")])
+        self.assertEqual(facts.latest_gate, _GATE_REVIEW)
+        self.assertEqual(facts.review_conclusion, REVIEW_CHANGES_REQUESTED)
+        self.assertEqual(facts.latest_gate_journal, "81021")
+
+    def test_qualified_review_result_heading_is_the_review_gate(self):
+        # #13910 j#81029 verbatim: the prefixed shape with the reviewer's `Review Result`
+        # wording and an English conclusion token in the qualifier.
+        facts = fold_issue_gate_facts(
+            [_j("81029", "## Gate: Review Result — changes_requested\n\n- target_commit: `7f67ae6b`")]
+        )
+        self.assertEqual(facts.latest_gate, _GATE_REVIEW)
+        self.assertEqual(facts.review_conclusion, REVIEW_CHANGES_REQUESTED)
+
+    def test_review_outcomes_project_to_their_lane_state_and_next_owner(self):
+        # The four outcomes the coordinator reads off a durable review, pinned end-to-end
+        # (grammar -> signal -> lane state -> next owner). `re-review required` is not a
+        # separate outcome: it is 要修正 plus the template's own 再review要否 field.
+        cases = (
+            ("approved", "## Gate: Review\n- 結論: 承認", "owner_waiting", OWNER_COORDINATOR),
+            ("changes_requested", "## Gate: Review\n- 結論: 要修正", "implementing", OWNER_WORKER),
+            ("blocker", "## Gate: Review\n- 結論: blocker (remote_verification 不能)", "blocked", OWNER_COORDINATOR),
+            (
+                "re-review required",
+                "## Gate: Review\n- 再review要否: 要\n- 結論: 要修正",
+                "implementing",
+                OWNER_WORKER,
+            ),
+        )
+        for label, notes, expected_state, expected_owner in cases:
+            with self.subTest(outcome=label):
+                facts = fold_issue_gate_facts([_j("81021", notes)])
+                self.assertEqual(facts.latest_gate, _GATE_REVIEW)
+                row = fold_glance_row(
+                    IssueGlanceSnapshot(
+                        issue_id="13910",
+                        signal=lane_signal_from_gate_facts("13910", facts),
+                        latest_gate_journal=facts.latest_gate_journal,
+                        delivery=DeliveryObservation(),
+                    )
+                )
+                self.assertEqual(row.workflow_state, expected_state)
+                self.assertEqual(row.next_owner, expected_owner)
+
+    def test_concluded_blocker_review_is_a_blocker_not_an_audit_still_owed(self):
+        # A review that concluded `blocker` has *happened*; folding it to pending would read
+        # as "audit owed" and dispatch past a lane that cannot proceed.
+        facts = fold_issue_gate_facts([_j("100", "## Gate: Review\n- 結論: blocker")])
+        self.assertTrue(facts.blocker_recorded)
+        self.assertEqual(classify_lane_state(lane_signal_from_gate_facts("7", facts)), "blocked")
+
+    def test_review_qualifier_without_a_vocabulary_token_stays_pending(self):
+        # A topic-only qualifier asserts no conclusion: the audit is still owed (fail-closed),
+        # never guessed from the surrounding words.
+        facts = fold_issue_gate_facts([_j("100", "## Gate: Review — R6 partial recovery")])
+        self.assertEqual(facts.latest_gate, _GATE_REVIEW)
+        self.assertEqual(facts.review_conclusion, REVIEW_PENDING)
+        self.assertEqual(classify_lane_state(lane_signal_from_gate_facts("7", facts)), "review_waiting")
+
+    def test_explicit_conclusion_field_outranks_the_heading_qualifier(self):
+        # The canonical field is the contract; the qualifier only stands in when it is absent.
+        facts = fold_issue_gate_facts([_j("100", "## Gate: Review Result — changes_requested\n- 結論: 承認")])
+        self.assertEqual(facts.review_conclusion, REVIEW_APPROVED)
+
+    def test_round_qualifier_before_a_dash_does_not_lose_the_gate(self):
+        # #13910 j#81068 (evidence j#81073 / correction j#81076): the round parenthetical sits
+        # BEFORE the dash, so the title-level trailing-paren normalization never reached it and
+        # the review_request anchor was lost. The same normalization now applies to the
+        # dash-split left token.
+        facts = fold_issue_gate_facts([_j("81068", "## Gate: Review Request (R3) — correction completed")])
+        self.assertEqual(facts.latest_gate, GATE_REVIEW_REQUEST)
+        self.assertEqual(facts.latest_gate_journal, "81068")
+
+    def test_round_qualifier_normalization_is_not_a_broad_alias(self):
+        # The correction re-applies an existing normalization; it must not become prefix
+        # matching or a `review request (r3)` alias. Both of these normalize to non-entries.
+        for notes in (
+            "## Gate: Review Request candidate (R3) — ...",
+            "## Gate: Review Request R3 — ...",
+        ):
+            with self.subTest(notes=notes):
+                self.assertIsNone(fold_issue_gate_facts([_j("100", notes)]))
+
+    def test_suffixed_shape_stays_fail_closed_against_prose_and_collisions(self):
+        # The suffixed shape is the widest surface added here, so it carries the widest
+        # negative set: trailing prose breaks the shape; a non-entry token breaks the
+        # allowlist; an excluded collision stays excluded in this shape too.
+        for notes in (
+            "## Review Gate approval を待つ",  # trailing prose -> not the governed shape
+            "## Sublane 完了 guardrail",
+            "## Review Finding Verdict Gate",  # collision exclusion holds in the suffixed shape
+            "## Gate Schema",
+            "## そのうち Gate を通す",
+            "## Progress Log — worker alive",
+        ):
+            with self.subTest(notes=notes):
+                self.assertIsNone(fold_issue_gate_facts([_j("100", notes)]))
 
 
 class _FakeRedmineSource:
