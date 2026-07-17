@@ -101,8 +101,8 @@ class SubsystemFinding:
         rather than trusting the caller's ``late`` flag alone. ``round_index`` must be a real
         int ``>= 2`` (a non-int / bool / < 2 does not count)."""
         return (
-            self.authority_bearing
-            and self.late
+            self.authority_bearing is True
+            and self.late is True
             and isinstance(self.round_index, int)
             and not isinstance(self.round_index, bool)
             and self.round_index >= 2

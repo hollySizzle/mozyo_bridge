@@ -340,6 +340,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertEqual(payload["release_dogfood_pending"], 1)
 
+    def test_from_glance_identity_missing_release_row_holds(self):
+        # R3-F2: a release-pending lifecycle_diagnostic row with no durable identity must not
+        # become a phantom release_dogfood lane that reads releasable — it fails closed to
+        # durable-incomplete (hold).
+        glance_env = {
+            "rows": [],
+            "lifecycle_diagnostic": [{"process_release": "requested"}],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "glance.json"
+            path.write_text(json.dumps(glance_env), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        self.assertEqual(payload["release_dogfood_pending"], 0)
+
     def test_from_glance_merges_release_flag_by_identity(self):
         # Redmine #13967 F3: a lane that is both an active row AND a release-pending
         # diagnostic row is counted ONCE, and its coordinator-blocking base bucket wins

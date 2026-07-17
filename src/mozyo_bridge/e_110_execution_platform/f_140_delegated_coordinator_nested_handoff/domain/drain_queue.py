@@ -36,8 +36,9 @@ Design invariants (they mirror the spine and the fill policy, never a second aut
   ``retirement`` and ``release_dogfood`` are deliberately **excluded** from the holding
   set: retirement is a batchable cleanup cadence and release-dogfood is delegated to the
   release issue, so neither alone forces the feature-lane coordinator process to stay
-  resident (this is what lets a review-approved + integrated lane hibernate early while
-  its dogfood/close ride the release issue).
+  resident (this is what lets a review-approved + integrated lane hibernate early while its
+  dogfood execution/evidence rides the release issue — the source issue's close authority
+  and owner close approval stay with the coordinator, not delegated).
 - **fail-closed.** An unrecognized actionability token resolves to
   ``coordinator_actionable`` (the blocking sink); an unrecognized state class routes to
   :data:`BUCKET_UNKNOWN` (surfaced, never dropped). A lane is never silently omitted.

@@ -94,6 +94,16 @@ class EvaluateTests(unittest.TestCase):
         self.assertFalse(v.escalate)
         self.assertEqual(v.reason, REASON_NO_LATE_AUTHORITY_FINDING)
 
+    def test_domain_enforces_exact_bool(self):
+        # R3-F3: a domain-direct caller passing truthy non-bool strings must not count —
+        # counts_toward_escalation requires `is True`, not truthiness.
+        v = evaluate_subsystem_escalation(
+            "s",
+            [SubsystemFinding(subsystem="s", round_index=2, authority_bearing="true", late="true")],
+        )
+        self.assertEqual(v.late_authority_round_count, 0)
+        self.assertFalse(v.escalate)
+
     def test_unreadable_history_escalates(self):
         v = evaluate_subsystem_escalation("x", [], history_readable=False)
         self.assertTrue(v.escalate)
@@ -211,7 +221,9 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(payload["escalation_decision"], "indeterminate")
         self.assertFalse(payload["evaluated"])
-        self.assertIn("no_snapshot_provenance", payload["indeterminate_reasons"])
+        self.assertIn("no_or_invalid_provenance", payload["indeterminate_reasons"])
+        # R3-F3a: any_escalation must fail closed to True when indeterminate.
+        self.assertTrue(payload["any_escalation"])
 
     def test_cli_no_history_is_indeterminate_not_no_escalation(self):
         args = argparse.Namespace(
@@ -225,6 +237,68 @@ class CliTests(unittest.TestCase):
         self.assertFalse(payload["history_provided"])
         self.assertFalse(payload["evaluated"])
         self.assertEqual(payload["escalation_decision"], "indeterminate")
+        # R3-F3a: a legacy consumer keying on any_escalation must NOT read a confident False.
+        self.assertTrue(payload["any_escalation"])
+
+    def test_cli_freeform_and_nonstring_provenance_are_indeterminate(self):
+        # R3-F3b: a free-form ("x") or non-string (["x"]) provenance is not a verified
+        # durable anchor -> indeterminate (never no_escalation).
+        for prov in ("x", ["x"], 5):
+            payload = self._run(
+                {
+                    "provenance": prov,
+                    "findings": [
+                        {"subsystem": "s", "round_index": 2, "authority_bearing": True, "late": False},
+                    ],
+                },
+                add_provenance=False,
+            )
+            self.assertEqual(payload["escalation_decision"], "indeterminate", prov)
+
+    def test_cli_round_index_zero_is_malformed(self):
+        # R3-F3c: round_index must be >= 1 (1-based); 0 is malformed -> subsystem escalates.
+        payload = self._run(
+            {
+                "findings": [
+                    {"subsystem": "s", "round_index": 0, "authority_bearing": True, "late": True},
+                ]
+            }
+        )
+        self.assertEqual(payload["escalation_decision"], "escalate")
+        self.assertIn("s", payload["escalating_subsystems"])
+
+    def test_cli_string_threshold_is_indeterminate(self):
+        # R3-F3c: a snapshot threshold that is not an exact int is not coerced.
+        payload = self._run(
+            {
+                "threshold": "100",
+                "findings": [
+                    {"subsystem": "s", "round_index": 2, "authority_bearing": True, "late": True},
+                ],
+            }
+        )
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
+
+    def test_cli_non_list_unreadable_subsystems_does_not_crash(self):
+        # R3-F3d: a non-list unreadable_subsystems returns a safe indeterminate envelope,
+        # not a TypeError crash.
+        payload = self._run({"unreadable_subsystems": 1, "findings": []})
+        self.assertEqual(payload["escalation_decision"], "indeterminate")
+        self.assertIn("unreadable_subsystems_not_a_list", payload["indeterminate_reasons"])
+
+    def test_cli_valid_provenance_evaluates(self):
+        payload = self._run(
+            {
+                "provenance": "redmine:13967:j#81322",
+                "findings": [
+                    {"subsystem": "s", "round_index": 2, "authority_bearing": True, "late": False},
+                ],
+            },
+            add_provenance=False,
+        )
+        self.assertEqual(payload["escalation_decision"], "no_escalation")
+        self.assertTrue(payload["evaluated"])
+        self.assertFalse(payload["any_escalation"])
 
 
 if __name__ == "__main__":

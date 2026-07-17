@@ -197,12 +197,15 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             continue
         if str(diag.get("process_release", "") or "").strip() not in _RELEASE_PENDING:
             continue
-        release_rows.append(
-            (
-                str(diag.get("issue", "") or "").strip(),
-                str(diag.get("lane", "") or "").strip(),
-            )
-        )
+        d_issue = str(diag.get("issue", "") or "").strip()
+        d_lane = str(diag.get("lane", "") or "").strip()
+        if not d_issue or not d_lane:
+            # A release-pending diagnostic row with no durable identity must NOT become a
+            # phantom release_dogfood lane that reads `releasable` — it makes the projection
+            # durable-incomplete (-> hold) instead (Redmine #13967 R3-F2).
+            complete = False
+            continue
+        release_rows.append((d_issue, d_lane))
     return _merge_release_pending(active, release_rows), complete
 
 
