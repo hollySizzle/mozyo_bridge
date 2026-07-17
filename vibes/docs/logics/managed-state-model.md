@@ -543,7 +543,7 @@ Table naming:
       ★**durable obligation は runtime signal で代替できない**（review j#80506 F4）: idle / turn-ended / composer settled は
       `ack-completion-receiver-state.md` の分類で言う **receiver state** であり「その slot に *owed* な work が無い」ことを
       証明しない。close の前に対象 assigned name 宛の **非終端 dispatch-outbox row**（`reserved` / `uncertain`）を bounded read
-      （`DispatchOutboxFence.open_obligations_for_targets`）し、存在すれば `work_obligation_present`、store 不読は
+      （`DispatchOutboxFence.obligations_for_targets`。**全 state を causal identity 付きで返す** — `delivered` は delivery ACK であって completion ではないため store 側で捨てない）し、存在すれば `work_obligation_present`、store 不読は
       `obligation_unreadable` で zero-close。`state_of` は完全な 6-tuple `FenceKey` を要するため「これから閉じる pane に owed な物」
       を列挙できず、by-target read の新設が要った（既存 guard は不変の read-only 追加）。
       ★**close の return code は空の証明ではない**（review j#80506 F3。#13842 j#79320 R3 の precedent を自 surface へ適用）:

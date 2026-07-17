@@ -34,6 +34,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_COMPLETION_UNPROVEN,
     REASON_RETIREMENT_AUTHORITY_UNAVAILABLE,
     REASON_RETIREMENT_BUSY,
+    REASON_PIN_DRIFT,
     REASON_SIGNATURE_LOST,
     STATE_ALREADY_RETIRED,
     REASON_LANE_IS_DEFAULT,
@@ -129,6 +130,9 @@ class FakeOps:
 
     def retirement_transaction(self, unit, *, live_pair_present):
         return self.fence.transaction(unit, live_pair_present=live_pair_present)
+
+    def peek_retirement(self, unit):
+        return self.fence.peek(unit)
 
     def runtime_state(self, locator):
         if isinstance(self._runtime, dict):
@@ -239,6 +243,34 @@ class ScratchPairRetireTest(unittest.TestCase):
         self.assertEqual(result.state, STATE_GREEN)
         self.assertEqual(ops.close_calls, [], "a preflight must never close")
         self.assertEqual(ops.recorded, [], "a preflight must never write")
+
+    def test_read_only_preflight_creates_no_authority_artifact(self):
+        """j#80523 R3-F4: the old test watched close/audit only, so a preflight that
+        BOOTSTRAPPED the authority (db + seal) sailed through it."""
+        ops = FakeOps(self._pair_rows())
+        ops.fence = self._fence()
+        f = ops.fence
+        before = {
+            "db": f.path.exists(),
+            "seal": f.seal_path.exists(),
+            "lock": f.lock_path.exists(),
+            "temp": f.temp_path.exists(),
+        }
+        result = self._run(ops, execute=False)
+        after = {
+            "db": f.path.exists(),
+            "seal": f.seal_path.exists(),
+            "lock": f.lock_path.exists(),
+            "temp": f.temp_path.exists(),
+        }
+        self.assertEqual(result.state, STATE_GREEN)
+        self.assertFalse(result.executed)
+        self.assertEqual(
+            before, after,
+            "a --execute-less preflight must leave every authority artifact untouched "
+            "(including the lock file: open(O_CREAT) is a write)",
+        )
+        self.assertEqual(after, {"db": False, "seal": False, "lock": False, "temp": False})
 
     def test_unattested_pair_is_retirable(self):
         """Over-block probe: the #13882 preserved pair is live-and-UNATTESTED.
@@ -920,3 +952,63 @@ class ScratchPairRetireReplayTest(ScratchPairRetireTest):
         self.assertEqual(result.state, STATE_BLOCKED)
         self.assertEqual(result.reason, REASON_WORK_OBLIGATION_PRESENT)
         self.assertEqual(ops.close_calls, [])
+
+
+class ScratchRetirementBootstrapTest(unittest.TestCase):
+    """j#80523 R3-F5 — a REAL interrupted bootstrap, not an after-the-fact artifact delete.
+
+    The prior "interrupted bootstrap" test deleted the seal after a SUCCESSFUL bootstrap. That
+    is a different shape and pins nothing about the write path: it never drives a crash inside
+    the bootstrap itself, so a bootstrap that left a half-built authority at the real path
+    would still pass.
+    """
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.home = Path(d)
+        self.fence = ScratchRetirementFence(home=self.home)
+        self.unit = RetirementUnit("ws1", "lane1", slot_digest(["mzb1_a", "mzb1_b"]))
+
+    def _crash_at(self, stage):
+        def hook(s, got):
+            if got == stage:
+                raise RuntimeError(f"simulated crash at {stage}")
+
+        self.fence._bootstrap_hook = hook.__get__(self.fence)
+
+    def test_crash_before_rename_leaves_a_temp_and_the_next_run_fails_closed(self):
+        self._crash_at("built_temp")
+        with self.assertRaises(RuntimeError):
+            with self.fence.transaction(self.unit, live_pair_present=True):
+                pass
+        self.assertTrue(self.fence.temp_path.exists(), "the temp is the crash evidence")
+        self.assertFalse(self.fence.path.exists(), "no half-built authority at the real path")
+        shape = ScratchRetirementFence(home=self.home).store_shape()
+        self.assertEqual(shape.state, "damaged")
+        self.assertIn("temp", shape.present_artifacts)
+        # A later run must NOT bootstrap over the wreckage.
+        with self.assertRaises(ScratchRetirementFenceError):
+            with ScratchRetirementFence(home=self.home).transaction(
+                self.unit, live_pair_present=True
+            ):
+                pass
+
+    def test_crash_after_rename_before_seal_fails_closed(self):
+        self._crash_at("renamed")
+        with self.assertRaises(RuntimeError):
+            with self.fence.transaction(self.unit, live_pair_present=True):
+                pass
+        self.assertTrue(self.fence.path.exists())
+        self.assertFalse(self.fence.seal_path.exists(), "the seal is written last")
+        shape = ScratchRetirementFence(home=self.home).store_shape()
+        self.assertEqual(shape.state, "damaged", "a db with no identity seal is damaged")
+        with self.assertRaises(ScratchRetirementFenceError):
+            with ScratchRetirementFence(home=self.home).transaction(
+                self.unit, live_pair_present=True
+            ):
+                pass
+
+    def test_orphan_temp_alone_is_not_an_absent_store(self):
+        self.fence.temp_path.write_text("x")
+        self.assertEqual(ScratchRetirementFence(home=self.home).store_shape().state, "damaged")

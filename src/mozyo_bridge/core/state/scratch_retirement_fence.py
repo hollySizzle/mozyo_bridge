@@ -62,6 +62,9 @@ SCRATCH_RETIREMENT_FENCE_SEAL_SUFFIX = ".seal"
 #: The advisory-lock file. Separate from the DB so the lock survives a DB replacement and so
 #: taking it never creates or touches the authority itself.
 SCRATCH_RETIREMENT_FENCE_LOCK_SUFFIX = ".lock"
+#: The bootstrap staging artifact. A bootstrap builds here and renames into place, so a crash
+#: mid-write leaves THIS behind rather than a half-built authority at the real path.
+SCRATCH_RETIREMENT_FENCE_TEMP_SUFFIX = ".tmp"
 SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION = 1
 
 #: A retirement is authorized and in flight: its close may be partially done and its fate is
@@ -229,6 +232,11 @@ class ScratchRetirementFence:
     def lock_path(self) -> Path:
         return self.path.with_name(self.path.name + SCRATCH_RETIREMENT_FENCE_LOCK_SUFFIX)
 
+    @property
+    def temp_path(self) -> Path:
+        """The bootstrap staging file. Present only while a bootstrap is in flight (or died)."""
+        return self.path.with_name(self.path.name + SCRATCH_RETIREMENT_FENCE_TEMP_SUFFIX)
+
     # -- artifact inventory ------------------------------------------------
 
     def _artifact_paths(self) -> tuple[tuple[str, Path], ...]:
@@ -237,8 +245,12 @@ class ScratchRetirementFence:
         SQLite's sidecars (``-wal`` / ``-shm`` / ``-journal``) are included because a crash or
         a partial delete can leave one behind with the main DB gone: treating that as "nothing
         was ever here" would let a normal execute silently re-create a *lost* authority and
-        forget prior retirements. The lock file is excluded — taking a lock is not evidence of
-        a retirement, and including it would make the fence un-bootstrappable.
+        forget prior retirements. The **temp** entry is included for the same reason (j#80526 /
+        review j#80523 R3-F5): a bootstrap that dies mid-write leaves its temp behind, and an
+        inventory blind to it would call that world "absent" and bootstrap over the wreckage.
+
+        The lock file is excluded — taking a lock is not evidence of a retirement, and
+        including it would make the fence structurally un-bootstrappable.
         """
         return (
             ("db", self.path),
@@ -246,6 +258,7 @@ class ScratchRetirementFence:
             ("shm", self.path.with_name(self.path.name + "-shm")),
             ("journal", self.path.with_name(self.path.name + "-journal")),
             ("seal", self.seal_path),
+            ("temp", self.temp_path),
         )
 
     def store_shape(self) -> StoreShape:
@@ -349,6 +362,89 @@ class ScratchRetirementFence:
 
     # -- the held transaction ---------------------------------------------
 
+    def peek(self, unit: RetirementUnit) -> Optional[RetirementAttempt]:
+        """Observe the unit's attempt WITHOUT writing anything at all. (review j#80523 R3-F4)
+
+        The read-only preflight must leave the authority byte-identical: it takes no lock (even
+        ``open(O_CREAT)`` on the lock file is an artifact write), creates no DB and no seal.
+        A ``--execute``-less run that bootstrapped the store would both contradict its own
+        "closes nothing and writes nothing" contract and, worse, silently re-create an
+        authority that was *lost* — erasing the evidence of prior retirements.
+
+        ``None`` = no attempt (including a genuinely absent store: truthfully "nothing was
+        recorded here"). A damaged / unreadable store raises — an unobservable authority is
+        never an empty one.
+        """
+        shape = self.store_shape()
+        if shape.state == STORE_DAMAGED:
+            raise ScratchRetirementFenceError(
+                shape.detail
+                or "the retirement authority's artifacts are incomplete; fail closed"
+            )
+        if shape.absent:
+            return None
+        conn = self._connect_ro()
+        try:
+            row = conn.execute(
+                "SELECT state, attempt_id, revision, pinned_json, closed_json, detail, "
+                "reserved_at, updated_at FROM scratch_retirement "
+                "WHERE workspace_id=? AND lane_id=? AND slot_digest=?",
+                unit.as_row(),
+            ).fetchone()
+        finally:
+            conn.close()
+        return _row_to_attempt(unit, row) if row is not None else None
+
+    def attempt_for_target(
+        self, *, workspace_id: str, lane_id: str, target_assigned_name: str
+    ) -> Optional[RetirementAttempt]:
+        """Any attempt whose PINNED slots name this assigned name. (read-only, #13892 R3-F1)
+
+        The dispatch side knows one target, not the pair's whole assigned-name set, so it
+        cannot rebuild a :class:`RetirementUnit` digest. This asks the question it can ask:
+        "is the slot I am about to send into inside a retirement?"
+
+        Read-only and creates nothing: a send must never bring the retirement authority into
+        existence. A genuinely absent store returns ``None`` (no retirement was ever recorded
+        — the ordinary case for every non-scratch lane, which must not be over-blocked); a
+        damaged store raises, and the caller treats that as "do not send".
+        """
+        shape = self.store_shape()
+        if shape.absent:
+            return None
+        if shape.state == STORE_DAMAGED:
+            raise ScratchRetirementFenceError(
+                shape.detail
+                or "the retirement authority's artifacts are incomplete; fail closed"
+            )
+        conn = self._connect_ro()
+        try:
+            rows = conn.execute(
+                "SELECT state, attempt_id, revision, pinned_json, closed_json, detail, "
+                "reserved_at, updated_at, slot_digest FROM scratch_retirement "
+                "WHERE workspace_id=? AND lane_id=?",
+                (workspace_id, lane_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        want = (target_assigned_name or "").strip()
+        for row in rows:
+            unit = RetirementUnit(workspace_id, lane_id, str(row[8]))
+            attempt = _row_to_attempt(unit, row)
+            # `pinned` holds (role, locator); the assigned name is rebuilt from the unit's
+            # identity, so match on the encoded name for each pinned role.
+            for role, _locator in attempt.pinned:
+                try:
+                    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+                        encode_assigned_name,
+                    )
+
+                    if encode_assigned_name(workspace_id, role, lane_id) == want:
+                        return attempt
+                except Exception:  # noqa: BLE001 - an unencodable role cannot match
+                    continue
+        return None
+
     def transaction(self, unit: RetirementUnit, *, live_pair_present: bool):
         """Open the exclusive retirement transaction for a unit.
 
@@ -365,8 +461,17 @@ class ScratchRetirementFence:
         return _RetirementTransaction(self, unit, live_pair_present=live_pair_present)
 
     def _create_fresh(self, nonce: str) -> None:
+        """Build the store in a temp and rename it into place, then seal it.
+
+        Staging through ``temp`` means a crash mid-build leaves the temp — which the artifact
+        inventory sees, so the next caller reports DAMAGED instead of finding a plausible but
+        half-built authority at the real path (review j#80523 R3-F5).
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, isolation_level=None)
+        temp = self.temp_path
+        if temp.exists():
+            temp.unlink()
+        conn = sqlite3.connect(temp, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 2000")
             conn.execute(_TABLE_SQL)
@@ -378,9 +483,20 @@ class ScratchRetirementFence:
             conn.execute(f"PRAGMA user_version = {SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION}")
         finally:
             conn.close()
+        self._bootstrap_hook("built_temp")
+        os.replace(temp, self.path)
+        self._bootstrap_hook("renamed")
         # The seal is written LAST: an interrupted bootstrap then leaves a db-without-seal,
         # which `store_shape` reports as DAMAGED (fail-closed) rather than as a healthy store.
         self.seal_path.write_text(nonce, encoding="utf-8")
+
+    def _bootstrap_hook(self, stage: str) -> None:
+        """Crash-injection seam: tests raise here to drive REAL interrupted-bootstrap boundaries.
+
+        Without it an "interrupted bootstrap" test can only delete artifacts after a SUCCESSFUL
+        bootstrap, which is a different shape and pins nothing about the write path itself
+        (review j#80523 R3-F5).
+        """
 
     def status(self) -> dict:
         """Operator-visible status (doctor surface). Never raises; never mutates."""
@@ -415,6 +531,20 @@ class ScratchRetirementFence:
         finally:
             conn.close()
         return out
+
+
+def _row_to_attempt(unit: "RetirementUnit", row) -> "RetirementAttempt":
+    return RetirementAttempt(
+        unit=unit,
+        state=str(row[0]),
+        attempt_id=str(row[1]),
+        revision=int(row[2]),
+        pinned=_decode_pairs(row[3]),
+        closed=_decode_pairs(row[4]),
+        detail=str(row[5] or ""),
+        reserved_at=str(row[6] or ""),
+        updated_at=str(row[7] or ""),
+    )
 
 
 def _decode_pairs(blob: str) -> tuple[tuple[str, str], ...]:
@@ -532,19 +662,7 @@ class _RetirementTransaction:
             ).fetchone()
         finally:
             conn.close()
-        if row is None:
-            return None
-        return RetirementAttempt(
-            unit=self._unit,
-            state=str(row[0]),
-            attempt_id=str(row[1]),
-            revision=int(row[2]),
-            pinned=_decode_pairs(row[3]),
-            closed=_decode_pairs(row[4]),
-            detail=str(row[5] or ""),
-            reserved_at=str(row[6] or ""),
-            updated_at=str(row[7] or ""),
-        )
+        return _row_to_attempt(self._unit, row) if row is not None else None
 
     def reserve(
         self, *, pinned: Sequence[tuple[str, str]], now: Optional[str] = None
@@ -733,4 +851,5 @@ __all__ = (
     "RetirementUnit",
     "RetirementAttempt",
     "ScratchRetirementFence",
+    "SCRATCH_RETIREMENT_FENCE_TEMP_SUFFIX",
 )

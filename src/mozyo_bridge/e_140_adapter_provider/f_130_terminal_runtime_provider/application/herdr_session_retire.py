@@ -38,6 +38,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire_ops import (  # noqa: E501
+    LiveSessionRetireOps,
+    SessionRetireOps,
+    observe_scratch_pair,
+)
 from mozyo_bridge.core.state.scratch_retirement_fence import (  # noqa: E501
     RetirementUnit,
     ScratchRetirementBusy,
@@ -115,6 +120,10 @@ REASON_COMPLETION_UNPROVEN = "completion_unproven"
 #: The surface's own signature (the unit has no lifecycle record) was lost mid-flight
 #: (Redmine #13892 review j#80523 R2-F3). Re-verified before the completion, never assumed.
 REASON_SIGNATURE_LOST = "signature_lost"
+#: A pending attempt's pinned slot is live at a DIFFERENT locator: the assigned name matches
+#: but the process does not, so it is a relaunched pair the old attempt cannot close
+#: (Redmine #13892 review j#80523 R3-F2).
+REASON_PIN_DRIFT = "pin_drift"
 
 #: The idempotent replay: this exact unit was proven retired by a prior run and no expected
 #: slot is live now. Exit 0 (design j#80526 rejects an effect-only exit 1).
@@ -180,279 +189,6 @@ class SessionRetireVerdict:
 
 def _blocked(reason: str, detail: str = "", **kw) -> SessionRetireVerdict:
     return SessionRetireVerdict(state=STATE_BLOCKED, reason=reason, detail=detail, **kw)
-
-
-class SessionRetireOps(Protocol):
-    """The impure seam: live inventory, runtime, lifecycle read, close, audit append."""
-
-    def agent_rows(self) -> Sequence[Mapping[str, object]]:
-        """The live herdr inventory. Raises on an unreadable inventory (fail-closed)."""
-
-    def runtime_state(self, locator: str) -> str:
-        """The herdr runtime receiver-state, fail-soft to ``unknown``."""
-
-    def observe_composer(self, locator: str) -> tuple[bool, Optional[bool]]:
-        """Content-free ``(readable, has_pending)``; ``None`` pending = unreadable."""
-
-    def lifecycle_record_absent(self, workspace_id: str, lane_id: str) -> Optional[bool]:
-        """``True`` = no record, ``False`` = a record exists, ``None`` = unreadable."""
-
-    def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
-        """Obligations owed to these slots (with causal identity); ``None`` = unreadable."""
-
-    def retirement_transaction(self, unit, *, live_pair_present: bool):
-        """The held, exclusive retirement transaction for the unit (context manager)."""
-
-    def close(self, workspace_id: str, lane_id: str, targets):
-        """Close exactly ``targets`` (``(role, locator)``); returns the close result."""
-
-    def record_retirement(self, *, workspace_id: str, lane_id: str, intent: dict) -> str:
-        """Append the durable audit record; returns an outcome token."""
-
-
-class LiveSessionRetireOps:
-    """The live composition root (herdr CLI + state stores)."""
-
-    def __init__(self, *, repo_root: Path, env: Optional[Mapping[str, str]] = None):
-        self._repo_root = repo_root
-        self._env = env
-
-    def _environ(self) -> Mapping[str, str]:
-        return self._env if self._env is not None else os.environ
-
-    def agent_rows(self) -> Sequence[Mapping[str, object]]:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-            list_herdr_agent_rows,
-        )
-
-        return list_herdr_agent_rows(self._environ())
-
-    def _binary(self):
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
-            _resolve_binary_or_die,
-        )
-
-        return _resolve_binary_or_die(self._environ())
-
-    def runtime_state(self, locator: str) -> str:
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (  # noqa: E501
-            HerdrCliAgentStateReader,
-        )
-
-        try:
-            state = HerdrCliAgentStateReader(self._binary()).read_agent_state(locator)
-            return state.state if state.ok else "unknown"
-        except Exception:  # noqa: BLE001 - a failed runtime read is fail-soft to unknown
-            return "unknown"
-
-    def observe_composer(self, locator: str) -> tuple[bool, Optional[bool]]:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
-            observe_composer_text,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
-            HerdrCliTransport,
-        )
-
-        try:
-            read = HerdrCliTransport(self._binary()).read_pane(locator, lines=80)
-            if not read.ok:
-                return (False, None)
-            observation = observe_composer_text(read.content)
-            return (observation.readable, observation.has_pending)
-        except Exception:  # noqa: BLE001 - a failed composer read is fail-soft to unreadable
-            return (False, None)
-
-    def lifecycle_record_absent(self, workspace_id: str, lane_id: str) -> Optional[bool]:
-        from mozyo_bridge.core.state.lane_lifecycle import (
-            LaneLifecycleKey,
-            LaneLifecycleStore,
-        )
-
-        try:
-            record = LaneLifecycleStore().get(LaneLifecycleKey(workspace_id, lane_id))
-        except Exception:  # noqa: BLE001 - unreadable is NOT absent; fail closed
-            return None
-        return record is None
-
-    def open_obligations(self, workspace_id: str, assigned_names):
-        from mozyo_bridge.core.state.dispatch_outbox_fence import (
-            DispatchOutboxFence,
-            DispatchOutboxFenceError,
-        )
-
-        try:
-            return DispatchOutboxFence().obligations_for_targets(
-                workspace_id=workspace_id, target_assigned_names=tuple(assigned_names)
-            )
-        except (DispatchOutboxFenceError, OSError):
-            # Unreadable / identity-mismatched store: an obligation we cannot see is not an
-            # obligation that is absent. `None` routes the caller to a fail-closed refusal.
-            return None
-
-    def retirement_transaction(self, unit, *, live_pair_present: bool):
-        from mozyo_bridge.core.state.scratch_retirement_fence import (
-            ScratchRetirementFence,
-        )
-
-        return ScratchRetirementFence().transaction(
-            unit, live_pair_present=live_pair_present
-        )
-
-    def close(self, workspace_id: str, lane_id: str, targets):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-            HerdrRetireClosePlan,
-            execute_herdr_retire_close,
-        )
-
-        # A pin-matched plan built from the VERDICT's targets: the reviewed executor can
-        # then only ever touch the set the decision proved (#13842 pin_matched_close_plan).
-        plan = HerdrRetireClosePlan(
-            workspace_id=workspace_id,
-            lane_id=lane_id,
-            close_targets=tuple(targets),
-            foreign_names=(),
-        )
-        return execute_herdr_retire_close(plan, env=self._environ())
-
-    def record_retirement(self, *, workspace_id: str, lane_id: str, intent: dict) -> str:
-        from mozyo_bridge.core.state.managed_events import record_managed_event
-
-        event = record_managed_event(
-            command=EVENT_COMMAND,
-            event_kind=EVENT_KIND_RETIRED,
-            workspace_id=workspace_id,
-            repo_root=str(self._repo_root),
-            intent=intent,
-        )
-        # Best-effort by contract (a telemetry-shaped append must never undo a committed
-        # close), so the token is surfaced rather than raised — an operator must be able to
-        # see that the close happened but the audit row did not.
-        return "recorded" if event is not None else "not_recorded:append_failed"
-
-
-def observe_scratch_pair(
-    ops: SessionRetireOps,
-    *,
-    workspace_id: str,
-    lane_id: str,
-    expected_roles: Sequence[str],
-) -> ScratchPairObservation:
-    """Observe the targeted unit at action time (impure; every fact positive).
-
-    A slot is resolved by **exact assigned-name match**, the pair's only durable identity.
-    Liveness policy follows the #13845 discipline: progress requires a *positive proof of
-    deadness*, never the absence of a liveness proof. A row ``classify_named_slot``
-    positively calls ``SLOT_STALE`` is shell residue — it has no agent, hence no in-flight
-    turn and no composer to lose, so its settle-facts are true by construction. Every other
-    present row must positively prove idle + settled composer through the runtime.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-        expected_slot_rows,
-        plan_herdr_retire_close,
-    )
-
-    try:
-        rows = list(ops.agent_rows())
-    except Exception:  # noqa: BLE001 - an unreadable inventory is never an empty one
-        return ScratchPairObservation(inventory_readable=False)
-
-    record_absent = ops.lifecycle_record_absent(workspace_id, lane_id)
-
-    # The plan is used ONLY as a unit scoper: it fixes the targeted unit to this lane and
-    # structurally excludes the coordinator's default-lane pair and every other lane. Its
-    # own close_targets are deliberately ignored — this surface decides its own.
-    plan = plan_herdr_retire_close(
-        rows,
-        workspace_id=workspace_id,
-        lane_id=lane_id,
-        legacy_workspace_id="",
-        managed_roles=tuple(expected_roles),
-    )
-    candidates = expected_slot_rows(rows, plan, managed_roles=tuple(expected_roles))
-
-    # Duplicate multiplicity, keyed on the CANONICAL slot `(workspace_id, lane_id, role)` —
-    # never on `role` alone, which would misread the legitimate shared/legacy-twin shape as
-    # a uniqueness violation (#13845 review j#80187 R3-F1).
-    seen: dict[tuple[str, str, str], int] = {}
-    for found in candidates:
-        seen[found.slot_key] = seen.get(found.slot_key, 0) + 1
-    duplicates = tuple(sorted(key for key, count in seen.items() if count > 1))
-
-    # Present-but-unlocatable rows that the liveness contract does NOT positively call
-    # stale residue: they can neither be closed nor read as gone.
-    unresolved = tuple(
-        sorted(
-            {
-                found.role
-                for found in candidates
-                if not found.locator and classify_named_slot(found.row) != SLOT_STALE
-            }
-        )
-    )
-
-    slots: list[ScratchSlotObservation] = []
-    for role in expected_roles:
-        assigned_name = encode_assigned_name(workspace_id, role, lane_id)
-        matches = [
-            row
-            for row in rows
-            if isinstance(row, Mapping)
-            and _norm(row.get(AGENT_KEY_NAME)) == _norm(assigned_name)
-        ]
-        if len(matches) != 1:
-            # 0 = positively absent (a prior run closed it, or it never launched) — that is
-            # what makes a partial close replayable, not a block. >1 = ambiguous.
-            slots.append(
-                ScratchSlotObservation(
-                    role=role,
-                    assigned_name=assigned_name,
-                    candidate_count=len(matches),
-                )
-            )
-            continue
-        row = matches[0]
-        locator = _norm(_agent_locator(row))
-        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        belongs = bool(
-            decode.ok
-            and decode.identity is not None
-            and decode.identity.workspace_id == _norm(workspace_id)
-            and _norm_lane(decode.identity.lane_id) == _norm_lane(lane_id)
-            and decode.identity.role == _norm(role)
-        )
-        if classify_named_slot(row) == SLOT_STALE:
-            # Positively dead shell residue: no agent, so no turn and no composer to lose.
-            agent_idle = True
-            composer_settled = True
-        elif locator:
-            agent_idle = ops.runtime_state(locator) in _SETTLED_RUNTIME_STATES
-            readable, has_pending = ops.observe_composer(locator)
-            composer_settled = bool(readable) and has_pending is False
-        else:
-            agent_idle = False
-            composer_settled = False
-        slots.append(
-            ScratchSlotObservation(
-                role=role,
-                assigned_name=assigned_name,
-                candidate_count=1,
-                locator=locator,
-                belongs_to_pair=belongs,
-                agent_idle=agent_idle,
-                composer_settled=composer_settled,
-            )
-        )
-
-    return ScratchPairObservation(
-        inventory_readable=True,
-        # `None` (unreadable) must never be read as "absent" — a lifecycle store that
-        # cannot be read cannot prove this unit is record-less.
-        lifecycle_record_absent=record_absent is True,
-        slots=tuple(slots),
-        duplicate_slot_keys=duplicates,
-        foreign_names=tuple(plan.foreign_names),
-        unresolved_roles=unresolved,
-    )
 
 
 def run_session_retire(
@@ -562,11 +298,8 @@ def run_session_retire(
 
     live_targets = tuple(verdict.close_targets)
     pair_is_live = bool(live_targets)
+    live_by_role = {role: locator for role, locator in live_targets}
 
-    # The retirement transaction (design j#80526). Everything from the authority read through
-    # the close, the fresh re-measure and the completion happens under ONE exclusive,
-    # non-blocking advisory lock: `BEGIN IMMEDIATE` cannot span the close, which is an external
-    # process operation, so it alone would let a second caller enter the unit mid-flight.
     try:
         unit = RetirementUnit(
             workspace_id=workspace_id,
@@ -576,13 +309,36 @@ def run_session_retire(
     except ValueError as exc:
         return _blocked(REASON_IDENTITY_UNENCODABLE, str(exc), **base)
 
+    execute = bool(getattr(args, "execute", False))
+
+    # A read-only preflight observes the authority and writes NOTHING — no lock file, no DB,
+    # no seal (review j#80523 R3-F4). It must never bootstrap: an authority created by a
+    # `--execute`-less run would both break the command's own contract and silently re-create
+    # a *lost* store, erasing the evidence of prior retirements.
+    if not execute:
+        try:
+            prior = live_ops.peek_retirement(unit)
+        except ScratchRetirementFenceError as exc:
+            return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+        return _preflight_verdict(
+            live_ops,
+            prior=prior,
+            pair_is_live=pair_is_live,
+            live_targets=live_targets,
+            workspace_id=workspace_id,
+            expected_names=expected_names,
+            base=base,
+        )
+
+    # The retirement transaction (design j#80526). Everything from the authority read through
+    # the close, the fresh re-measure and the completion happens under ONE exclusive,
+    # non-blocking advisory lock: `BEGIN IMMEDIATE` cannot span the close, which is an external
+    # process operation, so it alone would let a second caller enter the unit mid-flight.
     try:
         with live_ops.retirement_transaction(unit, live_pair_present=pair_is_live) as txn:
             prior = txn.current()
 
             if not pair_is_live:
-                # Zero expected slots live. Only a proven prior completion of THIS exact unit
-                # makes it a success; absence alone never does (review j#80506 F1).
                 if prior is not None and prior.completed:
                     return SessionRetireVerdict(
                         state=STATE_ALREADY_RETIRED,
@@ -592,22 +348,12 @@ def run_session_retire(
                         ),
                         closed=prior.closed,
                         durable_retirement="already_completed",
-                        executed=bool(getattr(args, "execute", False)),
+                        executed=True,
                         **base,
                     )
                 if prior is not None and prior.pending:
                     # A crash after the close but before the completion. Repair it: re-measure
                     # the whole unit and, if provably empty, finish the attempt (F2 repair).
-                    if not getattr(args, "execute", False):
-                        return SessionRetireVerdict(
-                            state=STATE_GREEN,
-                            detail=(
-                                "a pending retirement attempt is repairable; re-run with "
-                                "--execute to re-measure and complete it"
-                            ),
-                            executed=False,
-                            **base,
-                        )
                     return _finish_retirement(
                         live_ops,
                         txn,
@@ -629,44 +375,48 @@ def run_session_retire(
                     **base,
                 )
 
-            # A live pair. Read the durable obligations owed to these exact slots AFTER taking
-            # the transaction (j#80526 ordering): holding the authority first is what closes
-            # the window in which a dispatch could reserve against a slot we are about to
-            # close. Runtime idle / turn-ended is receiver state and proves nothing here.
-            blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
-            if blocked is not None:
-                return blocked
-
-            if not getattr(args, "execute", False):
-                return SessionRetireVerdict(
-                    state=STATE_GREEN,
-                    detail=(
-                        "the pair is retirable; re-run with --execute to close "
-                        f"{len(live_targets)} slot(s)"
-                    ),
-                    executed=False,
-                    **base,
-                )
-
-            # Resume an in-flight attempt, or open a new one. A `completed` attempt followed by
-            # newly live slots is a RELAUNCH at the same deterministic names, so it opens a new
-            # attempt rather than being mistaken for the old completion (j#80526).
-            already_closed: tuple[tuple[str, str], ...] = ()
+            # Resume an in-flight attempt, or open a new one. The reserve comes FIRST — before
+            # the obligation read and before any close (review j#80523 R3-F1, design j#80526):
+            # publishing the pending intent is what a concurrent dispatch reads to abort its
+            # own send. Reading obligations first only ever produced a stale answer, because a
+            # dispatch could reserve in the gap and nothing told it to stop.
             if prior is not None and prior.pending:
                 attempt = prior
-                already_closed = prior.closed
-                remaining = tuple(
-                    t for t in live_targets if t not in set(already_closed)
-                )
+                plan = _resume_plan(prior, live_by_role, base)
+                if isinstance(plan, SessionRetireVerdict):
+                    return plan
+                remaining = plan
             else:
                 attempt = txn.reserve(pinned=live_targets)
                 remaining = live_targets
 
+            # Now that the pending intent is durable and visible, read what is owed. A dispatch
+            # that reserves after this point sees our pending and zero-sends, so a late
+            # obligation cannot appear behind our back.
+            blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
+            if blocked is not None:
+                return blocked
+
+            if not remaining:
+                # Every pinned slot is already positively gone: nothing left to close.
+                return _finish_retirement(
+                    live_ops,
+                    txn,
+                    args=args,
+                    attempt=attempt,
+                    closed=attempt.closed,
+                    workspace_id=workspace_id,
+                    lane_id=lane_id,
+                    expected_roles=expected_roles,
+                    expected_names=expected_names,
+                    base=base,
+                    repaired=True,
+                )
+
             result = live_ops.close(workspace_id, lane_id, remaining)
-            closed = tuple(already_closed) + tuple(getattr(result, "closed", ()) or ())
+            closed = tuple(attempt.closed) + tuple(getattr(result, "closed", ()) or ())
             failed = tuple(getattr(result, "failed", ()) or ())
             if closed:
-                # Persist progress so a crash here resumes from what actually committed.
                 txn.record_progress(attempt_id=attempt.attempt_id, closed=closed)
             if failed:
                 return SessionRetireVerdict(
@@ -698,6 +448,93 @@ def run_session_retire(
         return _blocked(REASON_RETIREMENT_BUSY, str(exc), **base)
     except ScratchRetirementFenceError as exc:
         return _blocked(REASON_RETIREMENT_AUTHORITY_UNAVAILABLE, str(exc), **base)
+
+
+def _resume_plan(attempt, live_by_role, base):
+    """The exact slots a RESUMED attempt may close, or a blocked verdict. (R3-F2)
+
+    A resumed attempt's authority is its own ``pinned`` locators — never the pair that happens
+    to be live now. herdr assigned names are deterministic in ``(workspace, role, lane)``, so a
+    relaunched pair occupies the SAME names at NEW locators; closing "whatever is live at those
+    names" would destroy a running pair on the strength of an old attempt (review j#80523 R3-F2,
+    reproduced: pins %1/%2, live %11/%22 -> the old attempt closed the new pair).
+
+    Each still-open pin is therefore one of exactly three things:
+
+    - **live at its pinned locator** — this attempt's own slot: closable;
+    - **positively absent** (its name resolves to no live slot) — a prior run already closed
+      it, or it died: nothing to do, and NOT a block (that is what makes a partial close
+      replayable);
+    - **live at a DIFFERENT locator** — a relaunch at the same name. The attempt has no
+      authority over it, and silently re-pinning would be exactly the destruction above.
+    """
+    already = set(attempt.closed)
+    remaining: list[tuple[str, str]] = []
+    drifted: list[str] = []
+    for role, locator in attempt.pinned:
+        if (role, locator) in already:
+            continue
+        live_locator = live_by_role.get(role)
+        if live_locator is None:
+            continue  # positively absent: already gone
+        if live_locator == locator:
+            remaining.append((role, locator))
+            continue
+        drifted.append(f"{role}: pinned {locator}, live {live_locator}")
+    if drifted:
+        return _blocked(
+            REASON_PIN_DRIFT,
+            "a pending retirement attempt's pinned slot(s) are no longer at the pinned "
+            f"locator ({'; '.join(drifted)}); the assigned name matches but the process does "
+            "not, so this is a relaunched pair the old attempt has no authority to close",
+            closed=attempt.closed,
+            **base,
+        )
+    return tuple(remaining)
+
+
+def _preflight_verdict(
+    live_ops, *, prior, pair_is_live, live_targets, workspace_id, expected_names, base
+):
+    """The read-only verdict: report what an execute WOULD do, writing nothing."""
+    if not pair_is_live:
+        if prior is not None and prior.completed:
+            return SessionRetireVerdict(
+                state=STATE_ALREADY_RETIRED,
+                detail="this exact pair is proven retired and no slot is live",
+                closed=prior.closed,
+                durable_retirement="already_completed",
+                executed=False,
+                **base,
+            )
+        if prior is not None and prior.pending:
+            return SessionRetireVerdict(
+                state=STATE_GREEN,
+                detail=(
+                    "a pending retirement attempt is repairable; re-run with --execute to "
+                    "re-measure and complete it"
+                ),
+                executed=False,
+                **base,
+            )
+        return _blocked(
+            REASON_RETIRE_EVIDENCE_ABSENT,
+            "no slot of this pair is live, and no durable attempt proves this command retired "
+            "it; nothing was closed or written",
+            **base,
+        )
+    blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
+    if blocked is not None:
+        return blocked
+    return SessionRetireVerdict(
+        state=STATE_GREEN,
+        detail=(
+            f"the pair is retirable; re-run with --execute to close {len(live_targets)} slot(s)"
+        ),
+        executed=False,
+        **base,
+    )
+
 
 
 def _obligation_refusal(live_ops, workspace_id, expected_names, base):
@@ -920,6 +757,7 @@ __all__ = (
     "REASON_RETIREMENT_AUTHORITY_UNAVAILABLE",
     "REASON_COMPLETION_UNPROVEN",
     "REASON_SIGNATURE_LOST",
+    "REASON_PIN_DRIFT",
     "STATE_ALREADY_RETIRED",
     "SessionRetireVerdict",
     "SessionRetireOps",

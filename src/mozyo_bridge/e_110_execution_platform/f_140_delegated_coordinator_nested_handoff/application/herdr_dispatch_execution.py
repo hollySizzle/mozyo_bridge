@@ -24,8 +24,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    _norm,
+    decode_assigned_name,
+)
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     FENCE_ABSENT,
+    FENCE_CANCELLED,
     DispatchOutboxFence,
     DispatchOutboxFenceError,
     FenceKey,
@@ -98,6 +103,55 @@ def fence_key_for(authorization: DispatchAuthorization) -> FenceKey:
     )
 
 
+def _target_is_retiring(authorization) -> tuple[bool, str]:
+    """Is this exact target inside a retirement transaction? (Redmine #13892 R3-F1)
+
+    Reads the retirement authority for the unit this target belongs to. Returns
+    ``(True, reason)`` when a ``pending`` or ``completed`` attempt names the target's slot —
+    the send must not land in panes that are being (or have been) retired.
+
+    Fail-closed on an unreadable authority: a send we cannot prove is safe is not sent. A
+    genuinely absent authority means no retirement was ever recorded, so the send proceeds
+    (this is the ordinary case for every non-scratch lane, and it must not be over-blocked).
+    """
+    from mozyo_bridge.core.state.scratch_retirement_fence import (
+        ScratchRetirementFence,
+        ScratchRetirementFenceError,
+    )
+
+    target = _norm(getattr(authorization, "target_assigned_name", ""))
+    if not target:
+        return (False, "")
+    decode = decode_assigned_name(target)
+    if not decode.ok or decode.identity is None:
+        # Not a managed mzb1 slot: the retirement authority is keyed on decoded units, so it
+        # structurally cannot hold an attempt for this target.
+        return (False, "")
+    identity = decode.identity
+    try:
+        fence = ScratchRetirementFence()
+        # A scratch unit's digest is over the pair's full assigned-name set, so a single
+        # target cannot rebuild it. Ask the authority for any attempt naming this slot.
+        attempt = fence.attempt_for_target(
+            workspace_id=identity.workspace_id,
+            lane_id=identity.lane_id,
+            target_assigned_name=target,
+        )
+    except ScratchRetirementFenceError as exc:
+        return (
+            True,
+            f"the retirement authority is unreadable ({exc}); refusing to send into a target "
+            "whose retirement state cannot be established",
+        )
+    if attempt is None:
+        return (False, "")
+    return (
+        True,
+        f"the target {target} is inside a {attempt.state} retirement attempt "
+        f"(revision {attempt.revision}); sending would race a close",
+    )
+
+
 def execute_dispatch(
     *,
     authorization: DispatchAuthorization,
@@ -136,7 +190,27 @@ def execute_dispatch(
             sent=False,
         )
 
-    # We won the reserve: perform exactly one send attempt.
+    # We won the reserve. Before the send, check whether this exact target is being retired
+    # (Redmine #13892 review j#80523 R3-F1, design j#80526). The retire side publishes its
+    # `pending` intent BEFORE it reads obligations, and this read happens AFTER our reserve, so
+    # one of the two always sees the other:
+    #
+    #   - our reserve lands first  -> the retire's obligation read sees it and closes nothing;
+    #   - the retire's pending lands first -> we see it here and send nothing.
+    #
+    # Without this half, holding the retire lock published nothing to us: a dispatch could
+    # reserve and send into panes that were about to be closed.
+    retiring, detail = _target_is_retiring(authorization)
+    if retiring:
+        fence.mark_cancelled(key, detail=detail, now=now)
+        return DispatchExecutionResult(
+            result=DISPATCH_SKIPPED,
+            fence_state=FENCE_CANCELLED,
+            detail=f"zero-send: {detail}",
+            sent=False,
+        )
+
+    # We won the reserve and the target is not being retired: perform exactly one send attempt.
     try:
         outcome = send()
     except Exception as exc:  # noqa: BLE001 - the send may have landed; mark uncertain, never retry
