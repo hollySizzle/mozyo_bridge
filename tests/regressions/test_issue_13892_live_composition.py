@@ -18,12 +18,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire_ops import (  # noqa: E402,E501
     LiveSessionRetireOps,
 )
+from tests.support.herdr_workspace_fixtures import anchored_repo_root  # noqa: E402
 
 
 class LiveSessionRetireCompositionTest(unittest.TestCase):
     def test_read_only_preflight_calls_real_live_ops_peek_method(self) -> None:
         """The live class, not a protocol fake, must compose the retirement fence."""
-        repo = ROOT
+        repo = anchored_repo_root(self)
         ops = LiveSessionRetireOps(repo_root=repo, env={})
         args = argparse.Namespace(lane="issue_13892_live_composition", execute=False)
 
