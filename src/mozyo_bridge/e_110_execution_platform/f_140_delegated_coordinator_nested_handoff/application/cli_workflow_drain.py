@@ -488,32 +488,36 @@ def _delivery_ledger():
         return None
 
 
-def _live_identity_notes(roster, diagnostic) -> list[str]:
-    """Source-health notes for raw collection-identity contradictions in the live path.
+def _live_diagnostic_report(
+    roster, diagnostic
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Normalize + validate the raw live roster + diagnostic ONCE. ``(notes, release_rows)``.
 
     The default-live path feeds the raw active roster into ``active_lane_snapshots`` (which
     dedups by issue via its ``seen`` set) and merges the lifecycle diagnostic through
     ``_merge_release_pending`` (which merges by ``(issue, lane)``) — both SILENTLY normalize
     contradictions. So the same collection-identity invariants the ``--from-glance`` reader
     enforces on the canonical envelope (Redmine #13967 R8-F1 / R9-F2) are checked here on the
-    RAW roster + diagnostic BEFORE that normalization, and any breach is reported so the caller
-    marks the projection degraded -> hold rather than laundering it into a release bucket
-    (R12-F1):
+    RAW roster + diagnostic BEFORE that normalization, and any breach is a ``note`` so the
+    caller marks the projection degraded -> hold rather than laundering it into a release
+    bucket (R12-F1).
 
-    - active roster issue REQUIRED non-empty (an empty active issue is unattributable);
-    - active roster issue uniqueness (the canonical active roster is one row per issue);
-    - active roster ``(issue, lane)`` uniqueness;
-    - lifecycle-diagnostic issue AND lane REQUIRED non-empty — the ``--from-glance`` reader
-      rejects an empty diagnostic issue/lane (``required=True``); a real unbound lane
-      (``LaneLifecycleStore.declare_active(issue_id="")``) surfaces in the diagnostic with an
-      empty issue, and must NOT become a healthy ``release_dogfood`` row here (Redmine
-      #13967 R13-F2), so it is held rather than silently attributed;
-    - lifecycle-diagnostic ``lane_disposition`` in the closed :data:`_NON_ACTIVE_DISPOSITIONS`
-      and ``process_release`` in the closed :data:`RELEASE_STATES` vocabularies — the lifecycle
-      SQLite schema stores both as ``TEXT NOT NULL`` with NO ``CHECK`` and the readonly decoder
-      does not validate them, so a corrupted / legacy / foreign row with an out-of-vocabulary
-      disposition or release is readable; the ``--from-glance`` reader rejects those, so the
-      live path must too (Redmine #13967 R14-F2);
+    Crucially, the NORMALIZED release rows (``release_rows``) are produced in this SAME pass and
+    returned to the caller — the validator and the release projection must never re-parse the
+    raw tuple independently, or they drift on whitespace / raw values (a ``' requested '`` that
+    the validator strips to valid but a raw ``in _RELEASE_PENDING`` check drops, silently losing
+    the release debt — Redmine #13967 R15-F1). Every ``(issue, lane)`` in ``release_rows`` is
+    already stripped/validated and is a genuine non-active requested/partial delegated dogfood.
+
+    Validation surface (each breach -> a note -> degraded -> hold):
+
+    - active roster issue REQUIRED non-empty; issue uniqueness; ``(issue, lane)`` uniqueness;
+    - lifecycle-diagnostic issue AND lane REQUIRED non-empty (an empty identity — e.g. a real
+      unbound lane, ``declare_active(issue_id="")`` — is never a healthy release row, R13-F2);
+    - lifecycle-diagnostic ``lane_disposition`` in :data:`_NON_ACTIVE_DISPOSITIONS` and
+      ``process_release`` in :data:`RELEASE_STATES` — the lifecycle SQLite schema stores both as
+      ``TEXT NOT NULL`` with NO ``CHECK`` and the decoder does not validate them, so a corrupted
+      / legacy / foreign row is readable; the ``--from-glance`` reader rejects those (R14-F2);
     - lifecycle-diagnostic ``(issue, lane)`` uniqueness;
     - active / diagnostic identity disjointness (a lane is active XOR non-active, never both).
     """
@@ -534,6 +538,7 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
             notes.append(f"active roster: duplicate active identity {issue}/{lane}")
         active_keys.add(key)
     diag_keys: set[tuple[str, str]] = set()
+    release_rows: list[tuple[str, str]] = []
     for entry in diagnostic:
         issue = str(entry[0] or "").strip()
         lane = str(entry[1] or "").strip()
@@ -548,11 +553,13 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
             continue
         # Closed-vocabulary validation, symmetric with the from-glance diagnostic contract
         # (Redmine #13967 R14-F2): the store cannot enforce these, so the reader must.
-        if disposition not in _NON_ACTIVE_DISPOSITIONS:
+        disposition_ok = disposition in _NON_ACTIVE_DISPOSITIONS
+        release_ok = release in RELEASE_STATES
+        if not disposition_ok:
             notes.append(
                 f"lifecycle diagnostic: invalid disposition {disposition!r} for {issue}/{lane}"
             )
-        if release not in RELEASE_STATES:
+        if not release_ok:
             notes.append(
                 f"lifecycle diagnostic: invalid process_release {release!r} for {issue}/{lane}"
             )
@@ -560,9 +567,14 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
         if key in diag_keys:
             notes.append(f"lifecycle diagnostic: duplicate identity {issue}/{lane}")
         diag_keys.add(key)
+        # The release projection uses the SAME normalized tokens validated just above — never a
+        # second raw parse (Redmine #13967 R15-F1). Only a fully-valid non-active
+        # requested/partial row folds into a delegated release_dogfood lane.
+        if disposition_ok and release in _RELEASE_PENDING:
+            release_rows.append(key)
     for issue, lane in sorted(active_keys & diag_keys):
         notes.append(f"active/diagnostic identity collision {issue}/{lane}")
-    return notes
+    return notes, release_rows
 
 
 def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str, ...]]:
@@ -578,12 +590,13 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     richer path for durable-state classification. A ledger that is absent / unreadable simply
     yields no anomaly observation (fail-open), never a crash.
 
-    Before the fold, the RAW roster + diagnostic identities are validated
-    (:func:`_live_identity_notes`) so a contradiction the downstream helpers would otherwise
-    silently normalize (a duplicate active issue dropped by ``active_lane_snapshots``, or an
-    active lane merged with a colliding lifecycle-diagnostic row) is reported degraded -> hold,
-    keeping the live path's collection invariants symmetric with the ``--from-glance`` reader
-    (Redmine #13967 R12-F1).
+    Before the fold, the RAW roster + diagnostic are normalized + validated ONCE
+    (:func:`_live_diagnostic_report`), which both reports a contradiction the downstream helpers
+    would otherwise silently normalize (a duplicate active issue dropped by
+    ``active_lane_snapshots``, or an active lane merged with a colliding lifecycle-diagnostic
+    row) — degraded -> hold — AND returns the normalized release rows the projection folds, so
+    validator and projection never drift on raw/whitespace values (Redmine #13967 R12-F1 /
+    R15-F1), keeping the live path symmetric with the ``--from-glance`` reader.
     """
     from mozyo_bridge.core.state.workflow_runtime_store import (
         WorkflowRuntimeStore,
@@ -636,23 +649,15 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     if diag_error:
         degraded = True
         notes.append(diag_error)
-    # Validate raw collection identities BEFORE active_lane_snapshots / _merge_release_pending
-    # silently normalize any contradiction (Redmine #13967 R12-F1) — a breach holds the process.
-    identity_notes = _live_identity_notes(roster, diagnostic)
+    # Normalize + validate the raw roster + diagnostic ONCE (Redmine #13967 R12-F1 / R15-F1):
+    # `_live_diagnostic_report` both reports contradictions the downstream helpers would
+    # silently normalize AND returns the normalized release rows, so the release projection
+    # never re-parses the raw tuple and drifts from the validator (a whitespace `' requested '`
+    # can no longer validate-clean yet vanish from the release fold).
+    identity_notes, release_rows = _live_diagnostic_report(roster, diagnostic)
     if identity_notes:
         degraded = True
         notes.extend(identity_notes)
-    release_rows = [
-        (issue, lane)
-        for issue, lane, disposition, process_release in diagnostic
-        # An empty issue/lane (R13-F2) or an out-of-vocabulary disposition (R14-F2) never becomes
-        # a phantom release_dogfood lane; both are already reported as durable-incomplete
-        # identity/vocab errors above. Only a fully-valid non-active requested/partial row folds.
-        if process_release in _RELEASE_PENDING
-        and str(issue or "").strip()
-        and str(lane or "").strip()
-        and str(disposition or "").strip() in _NON_ACTIVE_DISPOSITIONS
-    ]
     return _merge_release_pending(active, release_rows), degraded, tuple(notes)
 
 
