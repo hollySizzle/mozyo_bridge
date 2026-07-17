@@ -812,6 +812,12 @@ class PinRepairCommandTests(unittest.TestCase):
         self._patch(herdr_projection, "repo_backend_is_herdr", lambda root: True)
         self._patch(session_start, "herdr_workspace_segment", lambda p: _WORKSPACE_ID)
         self._patch(herdr_identity, "derive_lane_workspace_token", lambda p: _BOUND_WT)
+        # This fixture models a git-worktree BOUND lane (identity family `wt_`).  The identity
+        # token family is now chosen by the target root's git-worktree kind (#13933 j#81046),
+        # so stub that git anchor True -- like the herdr anchors above, it is unit resolution,
+        # not a repair guard.  The real derivation is driven against real git worktrees in
+        # tests/regressions/test_issue_13933_lane_identity_execution_root.py.
+        self._patch(herdr_projection, "is_git_worktree_root", lambda p: True)
         self._patch(provider_resolution, "resolve_gateway_provider", lambda r: _GW_PROVIDER)
         self._patch(provider_resolution, "resolve_worker_provider", lambda r: _WK_PROVIDER)
 

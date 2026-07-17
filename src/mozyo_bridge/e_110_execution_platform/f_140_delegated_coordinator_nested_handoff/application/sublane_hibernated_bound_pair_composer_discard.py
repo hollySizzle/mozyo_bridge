@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -24,6 +24,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_REPLACEMENT_STOPPED,
     BLOCK_TRANSACTION_CONFLICT,
     BLOCK_WORKTREE_UNSAFE,
+    RESUME_ADOPTED,
+    RESUME_APPROVAL_UNREADABLE,
+    RESUME_NO_OWNED_PROGRESS,
+    RESUME_NO_OWNING_APPROVAL,
+    RESUME_PROJECTED_BLOCKED,
     STATE_ACTIONABLE,
     STATE_BLOCKED,
     STATE_PREPARED,
@@ -33,7 +38,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     roles_token,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_convergence import (
+    FAULT_PINS_NOT_EMPTY,
     BoundSlot,
+    bound_signature_detail,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (
     SLOT_HEALTHY,
@@ -67,6 +74,8 @@ class PreparationObservation:
     branch_matches: bool = False
     slots: tuple[BoundSlot, ...] = ()
     discard_roles: tuple[str, ...] = ()
+    #: Typed axes of the bound signature this row fails (#13933 j#81046 Decision 2).
+    bound_faults: tuple[str, ...] = ()
     detail: str = ""
 
 
@@ -90,6 +99,8 @@ class PreparationOutcome:
     executed: bool = False
     replacement_status: str = ""
     resuming: bool = False
+    #: Why the preflight did or did not adopt this pair's in-flight action (#13933 j#81046).
+    resume_diagnostic: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -112,6 +123,7 @@ class PreparationOutcome:
             "executed": self.executed,
             "replacement_status": self.replacement_status or None,
             "resuming": self.resuming,
+            "resume_diagnostic": self.resume_diagnostic or None,
             "is_blocked": self.is_blocked,
             "pins_repaired": False,
             "resumed": False,
@@ -143,6 +155,7 @@ def _blocked(
     discard_roles: Sequence[str] = (),
     executed: bool = False,
     replacement_status: str = "",
+    resume_diagnostic: str = "",
 ) -> PreparationOutcome:
     return PreparationOutcome(
         request=request,
@@ -154,6 +167,7 @@ def _blocked(
         discard_roles=tuple(discard_roles),
         executed=executed,
         replacement_status=replacement_status,
+        resume_diagnostic=resume_diagnostic,
     )
 
 
@@ -166,8 +180,16 @@ def _classify(
     ):
         return _blocked(request, BLOCK_IDENTITY_INCOMPLETE), None
     if not observation.lifecycle_exact or not observation.pins_empty:
+        # This rail requires pins to be absent outright, so it owns its own pin axis.  Naming
+        # the failed axes is what turns "the row is wrong somehow" into a diagnosis: the live
+        # a7 block read as a partial-effect defect for a whole round while the actual fault
+        # was a worktree identity mismatch (#13846 j#81024 -> #13933 j#81043).
+        faults = observation.bound_faults + (
+            () if observation.pins_empty else (FAULT_PINS_NOT_EMPTY,)
+        )
         return _blocked(
-            request, BLOCK_NOT_BOUND_SIGNATURE, detail=observation.detail,
+            request, BLOCK_NOT_BOUND_SIGNATURE,
+            detail=bound_signature_detail(faults) or observation.detail,
             slots=observation.slots,
         ), None
     if not observation.inventory_readable:
@@ -249,8 +271,8 @@ def _resume_preflight(
     request: PrepareBoundPairRequest,
     ops: BoundPairPreparationOps,
     initial: PreparationObservation,
-) -> PreparationOutcome | None:
-    """Report the replay this pair's own in-flight action still owns, else ``None``.
+) -> tuple[PreparationOutcome | None, str]:
+    """Report the replay this pair's own in-flight action owns, plus WHY when there is none.
 
     A pair half-replaced by a previous run no longer digests to the approved action id, so the
     transaction-blind classification above blocks work THIS action owns and the operator reads
@@ -258,20 +280,28 @@ def _resume_preflight(
     under its exact action id projects only the slots this immutable transaction proves it
     closed.  A projection identical to the raw observation means no action owns this pair, so
     the original block stands.  Read-only, and ``--execute`` re-validates everything.
+
+    Every declining path returns a typed diagnostic beside the ``None``.  Silence here is what
+    made the live a7 block unreadable: an unreadable credential and a pair with no in-flight
+    action produced byte-identical output, so a correct rail was reported as a defect for a
+    whole round (#13846 j#81024 -> #13933 j#81043).
     """
     try:
         fields = tuple(ops.approval_fields(request.issue, request.journal))
-    except Exception:  # noqa: BLE001 - a credential/network failure resumes nothing
-        return None
+    except Exception as exc:  # noqa: BLE001 - a credential/network failure resumes nothing
+        # The exception TYPE only: its message may quote credential/journal content.
+        return None, f"{RESUME_APPROVAL_UNREADABLE}:{type(exc).__name__}"
     approved = _approved(fields)
     if approved is None or approved.issue != request.issue or approved.lane != request.lane:
-        return None
+        return None, RESUME_NO_OWNING_APPROVAL
     projected = ops.observe(request, action_id=approved.action_id)
     if projected == initial:
-        return None
+        return None, RESUME_NO_OWNED_PROGRESS
     terminal, _expected = _classify(request, projected)
     if terminal is not None:
-        return None
+        # The action owns progress but the pair is blocked on an axis no transaction proof may
+        # clear -- a lifecycle-signature fault is the row's own truth, not this action's doing.
+        return None, f"{RESUME_PROJECTED_BLOCKED}:{terminal.reason}"
     return PreparationOutcome(
         request=request,
         state=STATE_ACTIONABLE,
@@ -284,7 +314,8 @@ def _resume_preflight(
         slots=projected.slots,
         discard_roles=approved.discard_roles,
         resuming=True,
-    )
+        resume_diagnostic=RESUME_ADOPTED,
+    ), RESUME_ADOPTED
 
 
 def run_bound_pair_preparation(
@@ -297,7 +328,9 @@ def run_bound_pair_preparation(
     terminal, expected = _classify(request, initial)
     if not execute:
         if terminal is not None:
-            return _resume_preflight(request, ops, initial) or terminal
+            resumed, diagnostic = _resume_preflight(request, ops, initial)
+            # A declined resume still tells the operator WHY, on the block it stands behind.
+            return resumed or replace(terminal, resume_diagnostic=diagnostic)
         assert expected is not None
         return PreparationOutcome(
             request=request,

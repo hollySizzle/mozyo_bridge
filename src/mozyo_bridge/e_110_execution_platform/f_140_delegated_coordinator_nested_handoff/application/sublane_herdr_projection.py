@@ -187,6 +187,41 @@ def probe_worktree_resolved(path: str) -> Optional[bool]:
     return result.returncode == 0
 
 
+def is_git_worktree_root(resolved: Path | str) -> bool:
+    """True when ``resolved`` is itself the root of a git worktree (Redmine #13933).
+
+    The discriminant for the lane-identity token family (``wt_`` linked git worktree vs
+    ``dl_`` non-git directory-scaffold lane), probed on the TARGET root rather than inferred
+    from the caller's cwd (design answer j#81046 Decision 1).  Both a linked worktree and the
+    main checkout are worktree roots, so ``--show-toplevel`` must equal the path itself: a
+    plain directory that merely sits INSIDE some enclosing repository is not a worktree of its
+    own, yet ``--is-inside-work-tree`` would call it one.  Both sides are resolved so a symlink
+    cannot read as a mismatch.  Never raises; git unavailable / non-git reads ``False``.
+    """
+    import subprocess
+
+    try:
+        root = Path(resolved).resolve()
+        if not root.is_dir():
+            return False
+    except OSError:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            text=True, capture_output=True,
+        )
+    except OSError:
+        return False
+    top = (getattr(result, "stdout", "") or "").strip()
+    if result.returncode != 0 or not top:
+        return False
+    try:
+        return Path(top).resolve() == root
+    except OSError:
+        return False
+
+
 @dataclass(frozen=True)
 class _LaneEntry:
     """One pre-hint lane row of the fold (internal assembly record)."""
@@ -705,6 +740,7 @@ __all__ = (
     "WORKER_SLOT_MISSING_HINT",
     "herdr_lane_view_for_worktree",
     "herdr_sublane_views",
+    "is_git_worktree_root",
     "list_herdr_agent_rows",
     "probe_worktree_resolved",
     "project_herdr_sublanes",
