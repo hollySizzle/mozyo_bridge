@@ -35,6 +35,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     SessionStartResult,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
+    COMPENSATION_NOT_NEEDED,
+)
 
 
 def _render_text(result: SessionStartResult) -> str:
@@ -44,10 +47,22 @@ def _render_text(result: SessionStartResult) -> str:
     if result.herdr_tab_id:
         lines[0] += f" tab={result.herdr_tab_id}"
     for slot in result.slots:
-        lines.append(
+        line = (
             f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
             + (f" locator={slot.locator}" if slot.locator else "")
         )
+        # Redmine #13948: the outcome is what the launcher did; the health is what is
+        # actually there. Say both — the defect was a run that printed `launched` twice
+        # and exited 0 while one of the two panes had already died.
+        if not result.dry_run:
+            line += f" health={slot.health}"
+            if slot.blocker_id:
+                line += f" blocker={slot.blocker_id}"
+            if slot.compensation != COMPENSATION_NOT_NEEDED:
+                line += f" compensation={slot.compensation}"
+        lines.append(line)
+        if not slot.healthy and slot.health_detail:
+            lines.append(f"      {slot.health_detail}")
     if result.base_pane_id:
         state = (
             "reclaimed"
@@ -62,6 +77,18 @@ def _render_text(result: SessionStartResult) -> str:
             else f"reclaim-failed ({result.tab_pane_detail})"
         )
         lines.append(f"tab root pane {result.tab_pane_id}: {state}")
+    if not result.ok:
+        # Name the next action. A partial pair used to be silent (exit 0), which is how
+        # #13882 j#80951 spent a dogfood cycle discovering it from a follow-up dry-run.
+        lines.append(
+            "session-start did NOT fully succeed: at least one requested role is not "
+            "live-and-attested (see health above). This run closed nothing."
+        )
+        if any(s.compensation != COMPENSATION_NOT_NEEDED for s in result.slots):
+            lines.append(
+                "  a fresh launch of this run is owed a rollback: converge it with the "
+                "explicit public rollback rail, not by hand."
+            )
     return "\n".join(lines)
 
 
@@ -106,7 +133,10 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
         print(json.dumps(result.as_payload(), ensure_ascii=False, sort_keys=True))
     else:
         print(_render_text(result))
-    return 0
+    # Redmine #13948 Acceptance 1: a partial pair is not a success. The exit code used to
+    # be a hardcoded 0 — there was no axis on which a started-but-dead role could be
+    # reported, so `session-start` told the truth it had and it was the wrong one.
+    return 0 if result.ok else 1
 
 
 __all__ = ("cmd_herdr_session_start",)

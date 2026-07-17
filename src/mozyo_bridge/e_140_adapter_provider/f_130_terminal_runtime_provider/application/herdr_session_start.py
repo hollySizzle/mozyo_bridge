@@ -153,6 +153,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SLOT_STALE as LIVENESS_STALE,
     classify_named_slot,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (
+    StartupProbe,
+    attach_startup_health,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (
     SLOT_ADOPTED,
     SLOT_LAUNCHED,
@@ -279,6 +283,7 @@ def prepare_session(
     lane_placement: "Optional[LanePlacementConfig]" = None,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
     replacement_action_id: str = "",
+    probe: "Optional[StartupProbe]" = None,
 ) -> SessionStartResult:
     """Managed-launch admission under the store's shared lock (Redmine #13882 j#80190).
 
@@ -318,6 +323,7 @@ def prepare_session(
         lane_placement=lane_placement,
         attestation_reader=attestation_reader,
         replacement_action_id=replacement_action_id,
+        probe=probe,
     )
     if dry_run:
         return _prepare_session_locked(**call)
@@ -350,6 +356,7 @@ def _prepare_session_locked(
     lane_placement: "Optional[LanePlacementConfig]" = None,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
     replacement_action_id: str = "",
+    probe: "Optional[StartupProbe]" = None,
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
 
@@ -491,7 +498,9 @@ def _prepare_session_locked(
                 "workspace has no resolvable workspace_id after registration"
             )
 
-    result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
+    result = SessionStartResult(
+        workspace_id=workspace_id, lane_id=lane or "default", dry_run=dry_run
+    )
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
     # lane class's `(split, order)` ONCE, then reorder the requested providers so the
@@ -770,6 +779,17 @@ def _prepare_session_locked(
         )
         result.tab_pane_reclaimed = reclaimed
         result.tab_pane_detail = detail
+    # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
+    # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says
+    # nothing about the process. This bounded read-only probe turns "accepted" into
+    # "live there, screen-clear, self-attested", per role, after every launch so the
+    # providers boot concurrently. A dry run started nothing, so it observes nothing.
+    if not dry_run:
+        attach_startup_health(
+            result, workspace_id=workspace_id, binary=binary, runner=runner,
+            timeout=timeout, attestation_read=attestation_read, probe=probe,
+            attested_launch=bool(attest_launcher),
+        )
     return result
 
 

@@ -56,6 +56,17 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     VERDICT_PRESENT,
+    record_identity_attestation,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E501
+    StartupProbe,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
+    HEALTH_ATTESTATION_UNAVAILABLE,
+    HEALTH_HEALTHY,
+    HEALTH_PROVIDER_EXITED,
+    HEALTH_SHELL_RESIDUE,
+    HEALTH_STARTUP_INTERACTION,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     LanePlacementConfig,
@@ -112,6 +123,12 @@ def _env_flags(start_argv):
             key, value = start_argv[i + 1].split("=", 1)
             flags[key] = value
     return flags
+
+
+#: Redmine #13948: the post-launch probe's bounded deadline, driven with a no-op sleeper.
+#: The polls still happen (so a retry path is really exercised); only the waiting is
+#: removed, so no test in this file pays wall-clock for a deadline.
+_FAST_PROBE = StartupProbe(polls=3, interval=0.0, sleeper=lambda _seconds: None)
 
 
 def _present_attestation_reader(ws, role, lane, locator):
@@ -202,6 +219,28 @@ class _Herdr:
         self.start_tab = start_tab
         self.start_fails = start_fails
         self.close_fails = close_fails
+        # Redmine #13948: the fake is stateful about its OWN launches. Real herdr surfaces
+        # a started agent in the next `agent list`, and the #13637 wrapper attests it — so
+        # a fake whose `agent list` stayed frozen at `existing_rows` would model a world in
+        # which every launch is instantly dead. That is not a neutral simplification: the
+        # post-launch health probe reads exactly these two facts, so a frozen fake would
+        # make every launch look like the #13882 defect and prove nothing about the code.
+        self.started_rows: list = []
+        # Providers whose pane the health probe must find gone / residual, to drive the
+        # live #13882 shapes deterministically. Keyed by role token (`claude` / `codex`).
+        self.exit_after_start: set = set()
+        self.residue_after_start: set = set()
+        # Visible pane text per locator, and the default for anything unlisted. The
+        # default is deliberately a plain, blocker-free prompt: a *clear* screen.
+        self.pane_text: dict = {}
+        self.default_pane_text = "$ agent ready\n> "
+        self.pane_reads: list = []
+        self.pane_read_fails: set = set()
+        # Where the wrapper writes its self-attestation. `_prepare` points this at the
+        # same MOZYO_BRIDGE_HOME the launcher reads, so a WRAPPED launch attests exactly
+        # as the real one does — and an unwrapped launch still writes nothing.
+        self.attest_home = None
+        self.attest_writes: list = []
         self.calls: list = []
         self.launch_envs: list = []
         self.start_argvs: list = []
@@ -241,7 +280,10 @@ class _Herdr:
             )
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps({"agents": self.existing_rows}), stderr=""
+                argv,
+                0,
+                stdout=json.dumps({"agents": self.existing_rows + self.started_rows}),
+                stderr="",
             )
         if rest[:2] == ["workspace", "create"]:
             self.workspace_creates.append(rest)
@@ -284,6 +326,20 @@ class _Herdr:
                 ),
                 stderr="",
             )
+        if rest[:2] == ["agent", "read"]:
+            locator = rest[2]
+            self.pane_reads.append(locator)
+            if locator in self.pane_read_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane read refused"
+                )
+            text = self.pane_text.get(locator, self.default_pane_text)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps({"result": {"read": {"text": text, "truncated": False}}}),
+                stderr="",
+            )
         if rest[:2] == ["pane", "close"]:
             self.pane_closes.append(rest)
             if self.close_fails:
@@ -311,6 +367,7 @@ class _Herdr:
             # Landed tab (Redmine #13411): echo the requested `--tab` unless forced.
             requested_tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
             landed_tab = self.start_tab if self.start_tab is not None else requested_tab
+            self._settle_launch(rest, pane_id)
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -334,8 +391,65 @@ class _Herdr:
             )
         raise AssertionError(f"unexpected herdr call: {argv!r}")
 
+    # -- what a real launch leaves behind (Redmine #13948) -------------------------
 
-class SessionStartTest(unittest.TestCase):
+    @staticmethod
+    def _start_env(rest):
+        """The identity vars the launch actually passes via repeated ``--env K=V``."""
+        out = {}
+        for index, token in enumerate(rest):
+            if token == "--env" and index + 1 < len(rest):
+                key, _, value = rest[index + 1].partition("=")
+                out[key] = value
+        return out
+
+    def _settle_launch(self, rest, pane_id):
+        """Model the two after-effects of a real ``agent start``.
+
+        1. herdr surfaces the started agent in the next ``agent list``. ``exit_after_start``
+           / ``residue_after_start`` suppress or deaden that row to reproduce the live
+           #13882 shapes (the pane is gone / the name outlives its agent).
+        2. the #13637 wrapper — when it is actually ON the argv — reads its own env and
+           writes a locator-bound self-attestation. An UNWRAPPED launch writes nothing,
+           exactly as in production, so the unwrapped fallback stays honest here.
+        """
+        name = rest[2]
+        env = self._start_env(rest)
+        role = env.get("MOZYO_AGENT_ROLE", "")
+        if role in self.exit_after_start:
+            return  # started, then left: no row at all
+        row = {"name": name, "pane_id": pane_id, "agent_status": "idle"}
+        if role in self.residue_after_start:
+            # Positive shell residue: the name is there, the agent field is present and
+            # blank — the exact signal `classify_named_slot` calls SLOT_STALE (#13518).
+            row["agent"] = ""
+            row["agent_status"] = "unknown"
+        else:
+            row["agent"] = role
+        self.started_rows.append(row)
+        wrapped = "agent-attest" in rest
+        if not wrapped or self.attest_home is None:
+            return
+        record = IdentityAttestationRecord(
+            assigned_name=name,
+            workspace_id=env.get("MOZYO_WORKSPACE_ID", ""),
+            role=role,
+            lane_id=env.get("MOZYO_LANE_ID", ""),
+            locator=pane_id,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-07-17T00:00:00+00:00",
+        )
+        record_identity_attestation(record, home=Path(self.attest_home))
+        self.attest_writes.append(name)
+
+
+class _SessionStartHarness:
+    """Shared machinery for driving `prepare_session` against the fake herdr.
+
+    Extracted from ``SessionStartTest`` (Redmine #13948) so a second test class can
+    reuse the harness WITHOUT inheriting — and silently re-running — its suite.
+    """
+
     def _prepare(
         self,
         tmp,
@@ -364,6 +478,9 @@ class SessionStartTest(unittest.TestCase):
         env = _launch_env(binpath)
         if extra_env:
             env.update(extra_env)
+        # Redmine #13948: point the fake wrapper's attestation write at the SAME home the
+        # launcher resolves, so a wrapped launch in a test attests where the real one does.
+        herdr.attest_home = home
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
             result = prepare_session(
                 repo_root=repo,
@@ -374,6 +491,7 @@ class SessionStartTest(unittest.TestCase):
                 dry_run=dry_run,
                 claude_permission_mode_default=claude_permission_mode_default,
                 agent_launch=agent_launch,
+                probe=_FAST_PROBE,
             )
             anchor = read_anchor(repo)
         return result, anchor, repo
@@ -395,6 +513,20 @@ class SessionStartTest(unittest.TestCase):
         path = os.pathsep.join([str(bindir), str(PROVIDER_BINS.bin_dir)])
         return {"PATH": path}, str(launcher)
 
+    def _run_dry_run(self, repo, home, binpath, herdr, *, providers=("claude",), lane="lane-1"):
+        """Run a --dry-run under the given HOME; return the result."""
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            return prepare_session(
+                repo_root=repo,
+                providers=list(providers),
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                dry_run=True,
+            )
+
+
+class SessionStartTest(_SessionStartHarness, unittest.TestCase):
     def test_launch_wraps_provider_in_self_attest_when_launcher_resolves(self) -> None:
         # Redmine #13637: a launch execs the provider THROUGH `mozyo-bridge herdr
         # agent-attest`, passing the expected identity, so the agent self-attests before
@@ -1183,18 +1315,6 @@ class SessionStartTest(unittest.TestCase):
                         runner=herdr.run,
                     )
 
-    def _run_dry_run(self, repo, home, binpath, herdr, *, providers=("claude",), lane="lane-1"):
-        """Run a --dry-run under the given HOME; return the result."""
-        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
-            return prepare_session(
-                repo_root=repo,
-                providers=list(providers),
-                lane_id=lane,
-                env=_launch_env(binpath),
-                runner=herdr.run,
-                dry_run=True,
-            )
-
     def test_dry_run_plans_without_side_effects(self) -> None:
         # Redmine #13595: a --dry-run on a REGISTERED repo returns the planned slot
         # read-only and mutates NOTHING — registry + anchor bytes AND mtimes are
@@ -1649,7 +1769,7 @@ class SessionStartTest(unittest.TestCase):
         self.assertEqual(herdr.calls, [])
 
 
-class SessionStartCliTest(unittest.TestCase):
+class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
     def test_repeated_agent_flag_dies_fail_closed(self) -> None:
         from mozyo_bridge.application.cli import build_parser
 
@@ -1717,9 +1837,16 @@ class SessionStartCliTest(unittest.TestCase):
         real_prepare = hss.prepare_session
 
         def _prepare_with_fake_runner(**kwargs):
-            return real_prepare(runner=herdr.run, **kwargs)
+            return real_prepare(runner=herdr.run, probe=_FAST_PROBE, **kwargs)
 
         env = _launch_env(binpath, MOZYO_BRIDGE_HOME=str(home))
+        # Redmine #13948: model the PRODUCTION launch env, in which `mozyo-bridge` is on
+        # PATH and the #13637 wrapper therefore attests every launch. Without it these
+        # CLI tests would assert an exit code for an unwrapped fallback that a real
+        # operator never hits — and the exit code is now a health verdict, not a constant.
+        launcher_env, _ = self._fake_launcher_env(tmp)
+        env["PATH"] = os.pathsep.join([launcher_env["PATH"], env.get("PATH", "")])
+        herdr.attest_home = home
         if extra_env:
             env.update(extra_env)
         with patch.dict(os.environ, env, clear=False), patch.object(
@@ -1733,6 +1860,8 @@ class SessionStartCliTest(unittest.TestCase):
             if not (extra_env and "MOZYO_CLAUDE_PERMISSION_MODE" in extra_env):
                 os.environ.pop("MOZYO_CLAUDE_PERMISSION_MODE", None)
             rc = args.func(args)
+        # A wrapped pair that comes up healthy exits 0 — and after #13948 that 0 is
+        # earned by observation, not printed unconditionally.
         self.assertEqual(rc, 0)
         by_provider = {}
         for argv in herdr.start_argvs:
@@ -3444,6 +3573,209 @@ class LanePlacementLaunchTest(unittest.TestCase):
         self.assertEqual(herdr.tab_creates, [])
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual({s.outcome for s in result.slots} - {SLOT_ADOPTED}, {SLOT_UNATTESTED})
+
+
+class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
+    """Redmine #13948 — a launch is not a success until it is observed (Answer j#80989).
+
+    Driven through the SAME producer as every other test in this file: the real
+    ``prepare_session`` against the stateful fake herdr. The failure shapes are the ones
+    #13882 j#80951 / j#80968 actually reproduced, twice, on a clean repo — a Claude that
+    exec'd and left while Codex stayed live.
+    """
+
+    def _wrapped(self, tmp, herdr, providers=("claude", "codex")):
+        """A launch with the #13637 wrapper on the argv (so a healthy slot can attest)."""
+        launcher_env, _ = self._fake_launcher_env(tmp)
+        return self._prepare(
+            tmp, providers=list(providers), herdr=herdr, extra_env=launcher_env
+        )
+
+    @staticmethod
+    def _by_provider(result):
+        return {slot.provider: slot for slot in result.slots}
+
+    def test_wrapped_pair_that_comes_up_is_healthy_and_ok(self) -> None:
+        # The green baseline: without it, every assertion below could pass for the wrong
+        # reason (a probe that can never say "healthy" would "detect" every defect).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        slots = self._by_provider(result)
+        self.assertEqual(
+            {p: s.health for p, s in slots.items()},
+            {"claude": HEALTH_HEALTHY, "codex": HEALTH_HEALTHY},
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual({s.compensation for s in result.slots}, {"not_needed"})
+
+    def test_claude_exits_after_start_is_a_visible_per_role_failure(self) -> None:
+        # THE #13882 j#80951 shape: `agent start` returned a locator for both roles, and
+        # Claude was gone by the time anyone looked. Before #13948 this run reported both
+        # `launched` and exited 0.
+        herdr = _Herdr()
+        herdr.exit_after_start = {"claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        slots = self._by_provider(result)
+        # The launcher's own claim is unchanged — and is exactly what used to be trusted.
+        self.assertEqual(slots["claude"].outcome, SLOT_LAUNCHED)
+        # ...but the observation disagrees, per role, and the sibling is untouched.
+        self.assertEqual(slots["claude"].health, HEALTH_PROVIDER_EXITED)
+        self.assertEqual(slots["codex"].health, HEALTH_HEALTHY)
+        self.assertFalse(result.ok)
+
+    def test_codex_only_failure_is_reported_on_codex(self) -> None:
+        # The mirror image: the gate is not hard-coded to the provider that happened to
+        # fail live. A guard that only ever fires for `claude` would pass every test above.
+        herdr = _Herdr()
+        herdr.exit_after_start = {"codex"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        slots = self._by_provider(result)
+        self.assertEqual(slots["codex"].health, HEALTH_PROVIDER_EXITED)
+        self.assertEqual(slots["claude"].health, HEALTH_HEALTHY)
+        self.assertFalse(result.ok)
+
+    def test_shell_residue_is_distinguished_from_provider_exit(self) -> None:
+        # #13948 Acceptance 3: the post-read in j#80968 saw `stale_named_slot` — a name
+        # outliving its agent. Collapsing it into `provider_exited` would send the
+        # operator to the wrong fix (there is a pane here, and it needs reclaiming).
+        herdr = _Herdr()
+        herdr.residue_after_start = {"claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        slots = self._by_provider(result)
+        self.assertEqual(slots["claude"].health, HEALTH_SHELL_RESIDUE)
+        self.assertFalse(result.ok)
+
+    def test_trust_screen_is_named_and_never_answered(self) -> None:
+        # #13760's exact screen, now caught at LAUNCH time. mozyo must report it and
+        # touch nothing: accepting a trust prompt is an action in the provider's own UI.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr.default_pane_text = (
+                "Is this a project you created or one you trust\n"
+                "Claude will be able to read, edit, and execute files here\n"
+            )
+            result, _, _ = self._wrapped(tmp, herdr, providers=("claude",))
+        slot = self._by_provider(result)["claude"]
+        self.assertEqual(slot.health, HEALTH_STARTUP_INTERACTION)
+        self.assertEqual(slot.blocker_id, "workspace_trust_confirmation")
+        self.assertFalse(result.ok)
+        # Zero-send, zero-write: reading is the only thing the probe is allowed to do.
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "send"]])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "type"]])
+
+    def test_a_failed_launch_owes_a_rollback_that_session_start_never_performs(self) -> None:
+        # Answer j#80991: compensation is the explicit public rail's, not session-start's.
+        # session-start reports the debt and closes nothing — the only panes it may ever
+        # close are the empty root panes it created itself (#13330 / #13411).
+        herdr = _Herdr()
+        herdr.exit_after_start = {"claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        slots = self._by_provider(result)
+        self.assertEqual(slots["claude"].compensation, "rollback_owed")
+        agent_locators = {s.locator for s in result.slots}
+        closed = {c[2] for c in herdr.pane_closes}
+        self.assertFalse(
+            closed & agent_locators,
+            f"session-start closed an agent pane it launched: {closed & agent_locators}",
+        )
+
+    def test_unwrapped_launch_is_named_unavailable_not_a_timeout(self) -> None:
+        # The #13637 fallback (no `mozyo-bridge` on the launch PATH) writes no record, so
+        # no record is ever coming. Reporting `attestation_timeout` would tell the
+        # operator to wait for something that cannot arrive; it is still not a success.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(tmp, providers=["claude"], herdr=herdr)
+        slot = self._by_provider(result)["claude"]
+        self.assertNotIn("agent-attest", herdr.start_argvs[0])
+        self.assertEqual(slot.health, HEALTH_ATTESTATION_UNAVAILABLE)
+        self.assertFalse(result.ok)
+
+    def test_dry_run_is_ok_and_probes_nothing(self) -> None:
+        # A dry run started nothing, so it has nothing to observe: it must not read panes
+        # and must not be failed for lacking a health it could never have. (A dry run
+        # requires an already-registered workspace — it refuses to mint one, #13595.)
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+            result = self._run_dry_run(repo, home, binpath, herdr)
+        self.assertEqual({s.outcome for s in result.slots}, {SLOT_PLANNED})
+        self.assertTrue(result.dry_run)
+        self.assertTrue(result.ok)
+        self.assertFalse(herdr.pane_reads)
+
+    def test_preexisting_stale_slot_is_surfaced_and_not_a_success(self) -> None:
+        # A read-only surfacing is not this run's to close (it started nothing here, so it
+        # owes nothing) — but it is also not a usable pair, and the whole point of #13948
+        # is that `session-start` stops reporting one as a success.
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                # Host-restart residue: the durable name survives, the agent does not.
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "claude", "lane-1"),
+                            "pane_id": "w1:pOLD",
+                            "agent": "",
+                            "agent_status": "unknown",
+                        }
+                    ]
+                )
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude"],
+                    lane_id="lane-1",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    probe=_FAST_PROBE,
+                )
+        slot = result.slots[0]
+        self.assertEqual(slot.outcome, SLOT_STALE)
+        self.assertEqual(slot.disposition, "surfaced")
+        self.assertEqual(slot.compensation, "not_needed")
+        self.assertFalse(result.ok)
+        self.assertFalse(herdr.start_argvs)  # a surfacing never relaunches over residue
+
+    def test_health_axes_reach_the_json_payload(self) -> None:
+        # The operator-facing surface must carry the cause, not just a boolean: `--json`
+        # is what the #13882 dogfood reads back.
+        herdr = _Herdr()
+        herdr.exit_after_start = {"claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        payload = result.as_payload()
+        self.assertFalse(payload["ok"])
+        claude = [s for s in payload["slots"] if s["provider"] == "claude"][0]
+        self.assertEqual(claude["disposition"], "fresh_launched")
+        self.assertEqual(claude["health"], HEALTH_PROVIDER_EXITED)
+        self.assertEqual(claude["compensation"], "rollback_owed")
+        self.assertTrue(claude["health_detail"].strip())
 
 
 if __name__ == "__main__":  # pragma: no cover
