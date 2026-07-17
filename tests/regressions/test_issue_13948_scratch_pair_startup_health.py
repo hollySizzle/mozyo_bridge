@@ -22,6 +22,7 @@ the report name the *actionable* cause rather than the first one noticed.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -547,6 +548,122 @@ class StartupTransactionFenceTest(unittest.TestCase):
                 )
                 self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
                 self.assertFalse(ops.close_calls)
+
+    def test_participant_exact_keys_and_verbatim_identity(self):
+        # Review j#81202 R6-F1: the participant contract must be an EXACT key set with no
+        # defaulting and no identity coercion. A missing receipt/closed, an extra key, or a
+        # whitespace-wrapped identity is a corrupt authority — not a value to complete or
+        # strip into a live-pane match.
+        import sqlite3
+
+        def _store(participants, providers="claude"):
+            home = Path(self._tmp.name) / f"pk_{len(list(Path(self._tmp.name).iterdir()))}"
+            home.mkdir()
+            fence = StartupTransactionFence(home=home)
+            conn = sqlite3.connect(fence.path, isolation_level=None)
+            conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value)")
+            conn.execute("INSERT INTO store_meta VALUES ('store_nonce', 'nn')")
+            conn.execute(
+                "CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, workspace_id "
+                "TEXT, lane_id TEXT, providers TEXT, phase TEXT, revision, participants "
+                "TEXT, reserved_at TEXT, updated_at TEXT)"
+            )
+            aid = startup_action_id(self.unit, "n1")
+            conn.execute(
+                "INSERT INTO startup_actions VALUES (?,?,?,?,?,?,?,?,?)",
+                (aid, "ws1", "lane-1", providers, PHASE_ROLLBACK_OWED, 1, participants,
+                 "t", "t"),
+            )
+            conn.execute(f"PRAGMA user_version={STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+            conn.close()
+            fence.seal_path.write_text("nn", encoding="utf-8")
+            return fence, aid
+
+        base = '{"role":"claude","assigned_name":"mzb1_ws1_claude_lane-1","locator":"w2G:p3"'
+        cases = {
+            "missing_receipt_closed": f"[{base}}}]",
+            "extra_key": f'[{base},"receipt":"","closed":false,"x":1}}]',
+            "whitespace_role": '[{"role":" claude ","assigned_name":"n","locator":"w2G:p3","receipt":"","closed":false}]',
+            "whitespace_locator": f'[{base.replace("w2G:p3"," w2G:p3 ")},"receipt":"","closed":false}}]',
+            "providers_trailing_comma": (f'[{base},"receipt":"","closed":false}}]', "claude,"),
+            "providers_duplicate": (f'[{base},"receipt":"","closed":false}}]', "claude,claude"),
+        }
+        for label, spec in cases.items():
+            with self.subTest(shape=label):
+                if isinstance(spec, tuple):
+                    fence, aid = _store(spec[0], providers=spec[1])
+                else:
+                    fence, aid = _store(spec)
+                with self.assertRaises(StartupTransactionError):
+                    fence.read(aid)
+                ops = _RollbackOps([])
+                verdict = run_session_rollback(
+                    action_id=aid, ops=ops, fence=fence, execute=True
+                )
+                self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+                self.assertFalse(ops.close_calls)
+
+    def test_a_blob_nonce_never_coerces_into_an_identity_match(self):
+        # Review j#81202 R6-F3.2: str(b"abc") == "b'abc'", so a BLOB DB nonce compared to a
+        # seal literally holding b'abc' used to MATCH. The nonce is text or the authority
+        # identity is corrupt — never coerced.
+        import sqlite3
+
+        home = Path(self._tmp.name) / "blob_nonce"
+        home.mkdir()
+        fence = StartupTransactionFence(home=home)
+        conn = sqlite3.connect(fence.path, isolation_level=None)
+        conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value)")
+        conn.execute("INSERT INTO store_meta VALUES ('store_nonce', ?)", (b"abc",))
+        conn.execute(
+            "CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, workspace_id TEXT, "
+            "lane_id TEXT, providers TEXT, phase TEXT, revision, participants TEXT, "
+            "reserved_at TEXT, updated_at TEXT)"
+        )
+        aid = startup_action_id(self.unit, "n1")
+        conn.execute(
+            "INSERT INTO startup_actions VALUES (?,?,?,?,?,?,?,?,?)",
+            (aid, "ws1", "lane-1", "claude", PHASE_ROLLBACK_OWED, 1, "[]", "t", "t"),
+        )
+        conn.execute(f"PRAGMA user_version={STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+        conn.close()
+        fence.seal_path.write_text("b'abc'", encoding="utf-8")
+        with self.assertRaises(StartupTransactionError):
+            fence.read(aid)
+        ops = _RollbackOps([])
+        verdict = run_session_rollback(action_id=aid, ops=ops, fence=fence, execute=True)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_connection_close_failure_is_structured_not_raw(self):
+        # Review j#81202 R6-F3.3: a DB connection close() that raises escaped the public
+        # rail as a raw OperationalError. Every read/reserve/write now closes through the
+        # _connection context manager, which normalizes the close.
+        import sqlite3
+        from unittest.mock import patch as _patch
+
+        action = self.fence.reserve(self.unit, "n1")
+        self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+        real_connect = sqlite3.connect
+
+        def _closing_conn_fails(*a, **k):
+            conn = real_connect(*a, **k)
+
+            class _W:
+                def execute(self, *x, **y):
+                    return conn.execute(*x, **y)
+
+                def close(self):
+                    raise sqlite3.OperationalError("close boom")
+
+            return _W()
+
+        with _patch(
+            "mozyo_bridge.core.state.startup_transaction_fence.sqlite3.connect",
+            _closing_conn_fails,
+        ):
+            with self.assertRaises(StartupTransactionError):
+                self.fence.read(action.action_id)
 
     def test_falsy_and_coerced_rows_are_corruption_not_empty_or_closed(self):
         # Review j#81166 R5-F1 (authority loss, not display): a corrupt row that decoded
@@ -1317,18 +1434,84 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertFalse(ops.close_calls)
 
     def test_an_unprobeable_artifact_set_is_a_structured_refusal(self):
-        # Review j#81171 authority-surface inventory: store_shape's os.path.lexists runs
-        # before the connect/lock guards on every read and reserve, so a raw OSError there
-        # escaped the public rail's "never raises". An unprobeable artifact set is a
-        # damaged authority, not an absent one.
+        # Review j#81202 R6-F3.1: os.path.lexists SWALLOWS the lstat OSError internally and
+        # returns False, so the earlier test (which mocked lexists itself) was a false
+        # green — the real permission-denied artifact read as absent. The probe now uses a
+        # raw os.lstat, and THIS test injects the failure at os.lstat, the real stdlib call.
         from unittest.mock import patch as _patch
 
         action = self._owed_action()
         ops = _RollbackOps(self._rows("claude", "codex"))
-        with _patch("os.path.lexists", side_effect=OSError("boom")):
+        with _patch("os.lstat", side_effect=PermissionError("denied")):
             verdict = self._run(ops, action, execute=True)
         self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
         self.assertFalse(ops.close_calls)
+
+    def test_lock_acquire_cleanup_close_failure_does_not_mask_the_acquire_error(self):
+        # Review j#81202 R6-F2: when flock fails during acquire, the cleanup os.close(fd)
+        # was unguarded — a secondary close failure masked the acquire error with a raw
+        # OSError. The cleanup close is swallowed now; the structured acquire refusal wins.
+        from unittest.mock import patch as _patch
+        import fcntl as _fcntl
+
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+
+        def _flock_fails(fd, op):
+            raise OSError(5, "flock EIO")
+
+        with _patch("fcntl.flock", side_effect=_flock_fails), _patch(
+            "os.close", side_effect=OSError("cleanup close boom")
+        ):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_lock_release_close_failure_is_not_silently_swallowed(self):
+        # Review j#81202 R6-F2: a normal-release os.close(fd) failure used to be swallowed,
+        # so the rail returned completed/ok over an authority it could not fully release.
+        from unittest.mock import patch as _patch
+        import fcntl as _fcntl
+
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        real_close = os.close
+        state = {"unlocked": False}
+        real_flock = _fcntl.flock
+
+        def _flock(fd, op):
+            if op == _fcntl.LOCK_UN:
+                state["unlocked"] = True
+            return real_flock(fd, op)
+
+        def _close(fd):
+            if state["unlocked"]:
+                raise OSError("release close boom")
+            return real_close(fd)
+
+        with _patch("os.close", _close), _patch("fcntl.flock", _flock):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+
+    def test_a_body_exception_is_not_overwritten_by_a_release_failure(self):
+        # Review j#81202 R6-F2: __exit__ ignored the body exception and raised the unlock
+        # failure, so the real fault (the body's own error) was lost. The body exception
+        # must survive a secondary release failure.
+        from unittest.mock import patch as _patch
+        import fcntl as _fcntl
+
+        fence = StartupTransactionFence(home=Path(self._tmp.name) / "body_priority")
+        real_flock = _fcntl.flock
+
+        def _unlock_fails(fd, op):
+            if op == _fcntl.LOCK_UN:
+                raise OSError("unlock boom")
+            return real_flock(fd, op)
+
+        with _patch("fcntl.flock", _unlock_fails):
+            with self.assertRaises(ValueError):
+                with fence._hold():
+                    raise ValueError("the real fault")
 
     def test_a_lock_release_failure_is_structured_not_raw(self):
         # The release half of R5-F2 (authority-surface inventory): a flock(LOCK_UN) that
