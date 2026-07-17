@@ -59,10 +59,37 @@ RECOVERY_ACTION_MARKER_KIND = "callback_recovery_action"
 #: key space cannot collide with one from another authority's, whatever the field values.
 _KEY_DOMAIN = "mozyo.callback_recovery_admission"
 
+#: The ACTION tag. A second, disjoint digest space over the fields that say *which recovery this
+#: is* — deliberately NOT including the journal it was published at (review j#81021 F2). See
+#: :meth:`RecoveryAdmissionKey.action_digest`.
+_ACTION_DOMAIN = "mozyo.callback_recovery_action"
+
+#: ``retry_of`` when this action is not a retry. An explicit sentinel rather than a blank: every key
+#: field is non-empty by construction, and "I am not a retry" is a positive statement the producer
+#: must make, not an absence a reader has to interpret.
+RETRY_OF_NONE = "none"
+
 #: The canonical field order. The digest is defined over exactly these, in exactly this order.
 _KEY_FIELDS = (
     "schema_version",
     "recovery_action_journal",
+    "original_dispatch_anchor",
+    "workspace_id",
+    "lane_id",
+    "lane_generation",
+    "route_identity",
+    "receiver_identity",
+    "action_kind",
+    "retry_of",
+)
+
+#: The fields that identify the ACTION rather than its publication (review j#81021 F2).
+#:
+#: ``recovery_action_journal`` is excluded because it is precisely what an accidental duplicate
+#: publication — or a hand-copied note — changes, and ``retry_of`` because a retry is by definition
+#: the same action again. Everything else is what makes two recoveries the same recovery.
+_ACTION_FIELDS = (
+    "schema_version",
     "original_dispatch_anchor",
     "workspace_id",
     "lane_id",
@@ -83,6 +110,7 @@ _MARKER_FIELD_NAMES = {
     "route_identity": "route",
     "receiver_identity": "receiver",
     "action_kind": "action_kind",
+    "retry_of": "retry_of",
 }
 
 #: Characters that cannot survive the marker grammar (``[mozyo:<channel>:k=v:k=v]``). A value
@@ -99,8 +127,18 @@ LOOKUP_MARKER_AMBIGUOUS = "marker_ambiguous"
 LOOKUP_MARKER_MALFORMED = "marker_malformed"
 
 
+#: sha256 hex length. A retry linkage must look exactly like a key digest or be the sentinel.
+_DIGEST_LENGTH = 64
+
+
 class RecoveryKeyError(ValueError):
     """A key / marker could not be built from the given facts (fail-closed; never a partial key)."""
+
+
+def _is_digest(value: str) -> bool:
+    """True when ``value`` is shaped exactly like a key digest (pure)."""
+    text = str(value or "")
+    return len(text) == _DIGEST_LENGTH and all(c in "0123456789abcdef" for c in text)
 
 
 def _validate_value(name: str, value: object) -> str:
@@ -139,7 +177,15 @@ class RecoveryAdmissionKey:
     - ``workspace_id`` / ``lane_id`` / ``lane_generation`` — the partition and the exact round;
     - ``route_identity`` — the assigned name the delivery was addressed to;
     - ``receiver_identity`` — the semantic receiver role that is allowed to admit it;
-    - ``action_kind`` — which recovery action this is, so two kinds at one anchor stay distinct.
+    - ``action_kind`` — which recovery action this is, so two kinds at one anchor stay distinct;
+    - ``retry_of`` — :data:`RETRY_OF_NONE`, or the digest of the key this one explicitly retries.
+
+    **Why ``retry_of`` exists** (review j#81021 F2). ``recovery_action_journal`` is in the key, so
+    the same recovery re-published at a different journal id digests differently — and both copies
+    admitted. A hand-copied note or an accidental duplicate publication therefore walked straight
+    around a claim that is never reclaimed. Journal id alone cannot separate "the coordinator
+    deliberately issued a retry" from "this action showed up twice", so the producer has to *say*
+    which it is, and :meth:`action_digest` is what lets the authority hold it to that.
     """
 
     recovery_action_journal: str
@@ -150,6 +196,7 @@ class RecoveryAdmissionKey:
     route_identity: str
     receiver_identity: str
     action_kind: str
+    retry_of: str = RETRY_OF_NONE
     schema_version: int = RECOVERY_KEY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -157,6 +204,16 @@ class RecoveryAdmissionKey:
             if name == "schema_version":
                 continue
             object.__setattr__(self, name, _validate_value(name, getattr(self, name)))
+        # A retry linkage is either the explicit "not a retry" sentinel or a real key digest.
+        # Anything else is refused here rather than compared later: a malformed linkage that
+        # reached the authority would simply never match, and would surface as a mystery conflict
+        # instead of the producer bug it is.
+        if self.retry_of != RETRY_OF_NONE and not _is_digest(self.retry_of):
+            raise RecoveryKeyError(
+                f"recovery admission key retry_of={self.retry_of!r} is neither {RETRY_OF_NONE!r} "
+                f"nor a {_DIGEST_LENGTH}-hex-character key digest: a retry must name the exact key "
+                f"it retries, or positively declare that it is not a retry"
+            )
         try:
             version = int(self.schema_version)
         except (TypeError, ValueError) as exc:
@@ -189,6 +246,34 @@ class RecoveryAdmissionKey:
         """The stable content digest of this key (pure, sha256 of :meth:`canonical_encoding`)."""
         return hashlib.sha256(self.canonical_encoding().encode("utf-8")).hexdigest()
 
+    def action_canonical_encoding(self) -> str:
+        """The injective canonical encoding of the ACTION this key names (pure).
+
+        Same length-prefixed scheme, different domain tag and a narrower field set — so an action
+        digest can never be mistaken for a key digest, and vice versa.
+        """
+        parts = [f"{_ACTION_DOMAIN}.v{self.schema_version}"]
+        parts.extend(
+            f"{name}={len(str(getattr(self, name)))}:{getattr(self, name)}"
+            for name in _ACTION_FIELDS
+        )
+        return "\x1f".join(parts)
+
+    def action_digest(self) -> str:
+        """The digest of *which recovery this is*, ignoring where it was published (pure).
+
+        Review j#81021 F2. Two keys share an action digest exactly when they are the same recovery
+        — same round, same route, same receiver, same kind — however many journals it was published
+        at. That is what lets the authority ask the question journal id cannot answer: "has this
+        recovery already been admitted here, under any name?"
+        """
+        return hashlib.sha256(self.action_canonical_encoding().encode("utf-8")).hexdigest()
+
+    @property
+    def is_retry(self) -> bool:
+        """True when this key positively declares itself a retry of a specific prior key."""
+        return self.retry_of != RETRY_OF_NONE
+
 
 def render_recovery_action_marker(
     *,
@@ -199,6 +284,7 @@ def render_recovery_action_marker(
     route_identity: str,
     receiver_identity: str,
     action_kind: str,
+    retry_of: str = RETRY_OF_NONE,
 ) -> str:
     """The durable marker that carries a recovery action's admission key (pure; fail-closed).
 
@@ -206,6 +292,18 @@ def render_recovery_action_marker(
     :func:`resolve_recovery_action_key`. Every field is validated here rather than at read time:
     an unrepresentable value is a defect in the caller, and rendering it would mint a marker that
     silently reads back as a different key.
+
+    This is the **canonical producer** of a retry linkage (review j#81021 F2). A coordinator that
+    deliberately re-issues a recovery — because the prior round's receiver claimed and then died,
+    and claims are never reclaimed — records a new durable journal bearing this marker with
+    ``retry_of`` set to the prior key's digest. That declaration is the only thing that separates an
+    authorized retry from a duplicate publication, so it is written here, in the marker, rather than
+    asserted in prose.
+
+    ``retry_of`` defaults to :data:`RETRY_OF_NONE` because "not a retry" is the overwhelmingly
+    common case AND the fail-closed one: an action that omits the linkage is refused when a prior
+    admission exists, never admitted. (Contrast ``route_identity`` / ``receiver_identity``, which
+    have no safe default and are therefore required.)
     """
     fields = {
         "original_dispatch_anchor": original_dispatch_anchor,
@@ -215,8 +313,15 @@ def render_recovery_action_marker(
         "route_identity": route_identity,
         "receiver_identity": receiver_identity,
         "action_kind": action_kind,
+        "retry_of": retry_of,
     }
     rendered = {name: _validate_value(name, value) for name, value in fields.items()}
+    if rendered["retry_of"] != RETRY_OF_NONE and not _is_digest(rendered["retry_of"]):
+        raise RecoveryKeyError(
+            f"recovery action marker retry_of={rendered['retry_of']!r} is neither "
+            f"{RETRY_OF_NONE!r} nor a key digest: refusing to mint a linkage no authority can "
+            f"resolve"
+        )
     tokens = [
         f"kind={RECOVERY_ACTION_MARKER_KIND}",
         f"{_MARKER_FIELD_NAMES['schema_version']}={RECOVERY_KEY_SCHEMA_VERSION}",
@@ -280,6 +385,7 @@ def _marker_key_from_fields(fields: dict, *, recovery_action_journal: str) -> Re
         route_identity=fields.get(_MARKER_FIELD_NAMES["route_identity"], ""),
         receiver_identity=fields.get(_MARKER_FIELD_NAMES["receiver_identity"], ""),
         action_kind=fields.get(_MARKER_FIELD_NAMES["action_kind"], ""),
+        retry_of=fields.get(_MARKER_FIELD_NAMES["retry_of"], ""),
     )
 
 
@@ -352,6 +458,7 @@ def resolve_recovery_action_key(
 
 __all__ = (
     "RECOVERY_KEY_SCHEMA_VERSION",
+    "RETRY_OF_NONE",
     "RECOVERY_ACTION_MARKER_KIND",
     "LOOKUP_ENTRY_ABSENT",
     "LOOKUP_ENTRY_AMBIGUOUS",
