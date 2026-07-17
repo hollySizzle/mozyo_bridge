@@ -886,12 +886,12 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     )
 
     register_herdr_attestation_store_parser(herdr_sub, add_repo_option=add_repo_option)
-    # Redmine #13892: register record-less scratch-pair retirement and read-only status.
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_retirement_store import (  # noqa: E501
-        register_herdr_retirement_surfaces,
+    # Redmine #13892 / #13948: every herdr session recovery surface, in one call.
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_recovery import (  # noqa: E501
+        register_herdr_recovery_surfaces,
     )
 
-    register_herdr_retirement_surfaces(herdr_sub, add_repo_option=add_repo_option)
+    register_herdr_recovery_surfaces(herdr_sub, add_repo_option=add_repo_option)
     herdr_session_start = herdr_sub.add_parser(
         "session-start",
         help=(

@@ -26,6 +26,36 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
+    COMPOSER_EMPTY,
+    COMPOSER_PENDING,
+    COMPOSER_STARTUP_BLOCKER,
+    COMPOSER_UNREADABLE,
+    ROLLBACK_AGENT_BUSY,
+    ROLLBACK_ALREADY_CLOSED,
+    ROLLBACK_AMBIGUOUS,
+    ROLLBACK_COMPOSER_UNREADABLE,
+    ROLLBACK_DETAIL,
+    ROLLBACK_ELIGIBLE,
+    ROLLBACK_IDENTITY_DRIFT,
+    ROLLBACK_INVENTORY_UNREADABLE,
+    ROLLBACK_OBLIGATION_UNREADABLE,
+    ROLLBACK_PENDING_INPUT,
+    ROLLBACK_VERDICTS,
+    ROLLBACK_WORK_OBLIGATION,
+    ParticipantFacts,
+    classify_rollback,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
+    REASON_ACTION_UNKNOWN,
+    REASON_ALREADY_ROLLED_BACK,
+    REASON_BLOCKED,
+    REASON_INCOMPLETE,
+    REASON_NOTHING_OWED,
+    REASON_OK,
+    REASON_PREFLIGHT,
+    run_session_rollback,
+)
 from mozyo_bridge.core.state.startup_transaction_fence import (  # noqa: E501
     PHASE_COMPLETED_ROLLED_BACK,
     PHASE_COMPLETED_SUCCESS,
@@ -444,6 +474,408 @@ class StartupTransactionFenceTest(unittest.TestCase):
         stored = self.fence.mark_closed(action.action_id, "codex")
         self.assertTrue(stored.participant_for("codex").closed)
         self.assertFalse(stored.participant_for("claude").closed)
+
+
+class ClassifyRollbackTest(unittest.TestCase):
+    """The module that says NO (Answer j#80989 Q1, narrowed by j#80991).
+
+    Each test starts from the one fact set that MAY be closed and breaks exactly one
+    thing. A guard nobody drives is a guard nobody has: the eligible baseline is what
+    stops these from passing against a classifier that simply refuses everything.
+    """
+
+    def _facts(self, **over):
+        base = dict(
+            recorded_closed=False,
+            inventory_readable=True,
+            name_matches=1,
+            live_locator="w2G:p4",
+            recorded_locator="w2G:p4",
+            shell_residue=False,
+            agent_idle=True,
+            composer=COMPOSER_EMPTY,
+            obligation_present=False,
+            obligation_unreadable=False,
+        )
+        base.update(over)
+        return ParticipantFacts(**base)
+
+    def test_our_own_idle_empty_pane_is_the_only_plain_eligible_case(self):
+        self.assertEqual(classify_rollback(self._facts()), ROLLBACK_ELIGIBLE)
+
+    def test_a_replay_is_answered_from_the_record_not_by_closing_again(self):
+        self.assertEqual(
+            classify_rollback(self._facts(recorded_closed=True)), ROLLBACK_ALREADY_CLOSED
+        )
+
+    def test_unreadable_inventory_closes_nothing(self):
+        self.assertEqual(
+            classify_rollback(self._facts(inventory_readable=False)),
+            ROLLBACK_INVENTORY_UNREADABLE,
+        )
+
+    def test_a_duplicate_name_is_never_resolved_by_guessing(self):
+        self.assertEqual(
+            classify_rollback(self._facts(name_matches=2)), ROLLBACK_AMBIGUOUS
+        )
+
+    def test_an_absent_participant_is_settled_so_a_partial_rollback_resumes(self):
+        # #13847 R1-F1 / #13892: blocking on a slot a previous attempt already closed is
+        # how an interrupted rollback becomes permanently stuck. Absence is positive.
+        self.assertEqual(
+            classify_rollback(self._facts(name_matches=0)), ROLLBACK_ELIGIBLE
+        )
+
+    def test_a_drifted_locator_is_never_closed(self):
+        # The name matches but the pane does not: this is someone else's process now, or a
+        # newer generation of ours. Either way it is not what this action started.
+        self.assertEqual(
+            classify_rollback(self._facts(live_locator="w2G:p9")), ROLLBACK_IDENTITY_DRIFT
+        )
+        self.assertEqual(
+            classify_rollback(self._facts(recorded_locator="")), ROLLBACK_IDENTITY_DRIFT
+        )
+
+    def test_a_durable_obligation_outranks_an_idle_empty_slot(self):
+        # #13892 j#80506 F4: idle / settled composer are RECEIVER states. Neither proves
+        # that no work is owed to the slot.
+        self.assertEqual(
+            classify_rollback(self._facts(obligation_present=True)),
+            ROLLBACK_WORK_OBLIGATION,
+        )
+
+    def test_an_unreadable_ledger_is_never_an_empty_one(self):
+        self.assertEqual(
+            classify_rollback(self._facts(obligation_unreadable=True)),
+            ROLLBACK_OBLIGATION_UNREADABLE,
+        )
+
+    def test_pending_input_is_preserved_and_no_approval_changes_that(self):
+        # j#80991: action ownership is NOT a generic pending-composer discard permission.
+        # A rollback throws away the startup state it created, never a body someone typed.
+        self.assertEqual(
+            classify_rollback(self._facts(composer=COMPOSER_PENDING)),
+            ROLLBACK_PENDING_INPUT,
+        )
+
+    def test_an_unreadable_composer_is_never_an_empty_one(self):
+        for composer in (COMPOSER_UNREADABLE, "something-new"):
+            with self.subTest(composer=composer):
+                self.assertEqual(
+                    classify_rollback(self._facts(composer=composer)),
+                    ROLLBACK_COMPOSER_UNREADABLE,
+                )
+
+    def test_a_busy_agent_is_never_interrupted(self):
+        self.assertEqual(
+            classify_rollback(self._facts(agent_idle=False)), ROLLBACK_AGENT_BUSY
+        )
+
+    def test_an_action_owned_startup_screen_is_closeable(self):
+        # This action's launch put that screen there and nobody typed into it. Preserving
+        # it would leave the operator a dead-end pane the tool itself created — while
+        # still never ANSWERING the prompt (that stays an action in the provider's UI).
+        self.assertEqual(
+            classify_rollback(self._facts(composer=COMPOSER_STARTUP_BLOCKER)),
+            ROLLBACK_ELIGIBLE,
+        )
+
+    def test_shell_residue_short_circuits_liveness_questions(self):
+        # A pane with no agent has no turn and no composer. Demanding idle+empty proof
+        # from it would preserve dead residue forever — the #13845 over-block defect.
+        self.assertEqual(
+            classify_rollback(
+                self._facts(
+                    shell_residue=True, agent_idle=False, composer=COMPOSER_UNREADABLE
+                )
+            ),
+            ROLLBACK_ELIGIBLE,
+        )
+
+    def test_identity_outranks_every_liveness_fact(self):
+        # Asking about a stranger's composer is already a trespass: identity is settled
+        # first, and a drifted pane is refused whatever its runtime looks like.
+        self.assertEqual(
+            classify_rollback(
+                self._facts(
+                    live_locator="w2G:p9", agent_idle=True, composer=COMPOSER_EMPTY
+                )
+            ),
+            ROLLBACK_IDENTITY_DRIFT,
+        )
+
+    def test_obligation_outranks_shell_residue(self):
+        # Residue with work still owed to its name is not a free close: the work is owed
+        # to the SLOT, and the ledger outlives the pane.
+        self.assertEqual(
+            classify_rollback(self._facts(shell_residue=True, obligation_present=True)),
+            ROLLBACK_WORK_OBLIGATION,
+        )
+
+    def test_every_verdict_has_an_operator_detail(self):
+        for verdict in ROLLBACK_VERDICTS:
+            with self.subTest(verdict=verdict):
+                self.assertTrue(ROLLBACK_DETAIL.get(verdict, "").strip(), verdict)
+
+
+class _CloseResult:
+    def __init__(self, closed=(), failed=()):
+        self.closed = tuple(closed)
+        self.failed = tuple(failed)
+
+
+class _RollbackOps:
+    """A stateful fake of the five reads + one close the rollback rail is allowed.
+
+    Stateful on purpose: `close` actually removes the row, so the post-close re-measure
+    reads a world the close produced rather than one the test hand-wrote. A fake whose
+    close is a no-op would let "a close's return code is not evidence of absence" (#13892
+    j#80506 F3) pass by construction — which is the guard being pinned.
+    """
+
+    def __init__(self, rows, *, obligations=(), obligations_unreadable=False):
+        self.rows = list(rows)
+        self._obligations = tuple(obligations)
+        self._obligations_unreadable = obligations_unreadable
+        self.inventory_readable = True
+        self.runtime = {}
+        self.composers = {}
+        self.blockers = {}
+        self.close_calls = []
+        self.close_fails = set()
+        self.close_is_a_lie = False
+
+    def agent_rows(self):
+        if not self.inventory_readable:
+            raise RuntimeError("herdr agent list failed")
+        return list(self.rows)
+
+    def runtime_state(self, locator):
+        return self.runtime.get(locator, "turn_ended")
+
+    def observe_composer(self, locator):
+        return self.composers.get(locator, (True, False))
+
+    def startup_blocker(self, provider, locator):
+        return self.blockers.get(locator, "")
+
+    def open_obligations(self, workspace_id, assigned_names):
+        if self._obligations_unreadable:
+            return None
+        return self._obligations
+
+    def close(self, workspace_id, lane_id, targets):
+        self.close_calls.append(list(targets))
+        closed, failed = [], []
+        for role, locator in targets:
+            if role in self.close_fails:
+                failed.append((role, locator, "pane close refused"))
+                continue
+            closed.append((role, locator))
+            if not self.close_is_a_lie:
+                self.rows = [r for r in self.rows if r.get("pane_id") != locator]
+        return _CloseResult(closed=closed, failed=failed)
+
+
+class _Obligation:
+    def __init__(self, target):
+        self.target = target
+        self.blocks = True
+
+
+class SessionRollbackRailTest(unittest.TestCase):
+    """The explicit public rail: the only thing that may close what a run started."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        self.fence = StartupTransactionFence(home=self.home)
+        self.unit = StartupUnit(
+            workspace_id="ws1", lane_id="lane-1", providers=("claude", "codex")
+        )
+
+    def _owed_action(self, *, roles=("claude", "codex")):
+        """A run that started `roles` and did not come up: the #13882 partial pair."""
+        action = self.fence.reserve(self.unit, "n1")
+        for index, role in enumerate(roles):
+            self.fence.record_participant(
+                action.action_id,
+                Participant(
+                    role=role,
+                    assigned_name=f"mzb1_ws1_{role}_lane-1",
+                    locator=f"w2G:p{3 + index}",
+                    receipt="workspace=w2G",
+                ),
+            )
+        self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+        return self.fence.read(action.action_id)
+
+    def _rows(self, *roles):
+        return [
+            {
+                "name": f"mzb1_ws1_{role}_lane-1",
+                "pane_id": f"w2G:p{3 + ('claude', 'codex').index(role)}",
+                "agent": role,
+                "agent_status": "idle",
+            }
+            for role in roles
+        ]
+
+    def _run(self, ops, action, **kw):
+        return run_session_rollback(
+            action_id=action.action_id, ops=ops, fence=self.fence, **kw
+        )
+
+    def test_preflight_is_read_only_and_closes_nothing(self):
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        verdict = self._run(ops, action)
+        self.assertEqual(verdict.state, "actionable")
+        self.assertEqual(verdict.reason, REASON_PREFLIGHT)
+        self.assertFalse(verdict.executed)
+        self.assertFalse(ops.close_calls)
+        self.assertEqual(
+            {p.verdict for p in verdict.participants}, {ROLLBACK_ELIGIBLE}
+        )
+
+    def test_execute_converges_the_pair_and_proves_it(self):
+        # The live #13882 shape resolved: the healthy Codex sibling is closed because it is
+        # a participant of the SAME action, not because its name matched.
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        verdict = self._run(ops, action, execute=True)
+        self.assertTrue(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_OK)
+        self.assertEqual({r for r, _ in ops.close_calls[0]}, {"claude", "codex"})
+        self.assertEqual(
+            self.fence.read(action.action_id).phase, PHASE_COMPLETED_ROLLED_BACK
+        )
+
+    def test_a_close_that_lies_is_caught_by_the_remeasure(self):
+        # #13892 j#80506 F3: a close's return code is not evidence of absence. The rail
+        # must re-measure and withhold success when the pane is still there.
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.close_is_a_lie = True
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_INCOMPLETE)
+        # The debt survives, so the operator can re-run rather than start over.
+        self.assertEqual(self.fence.read(action.action_id).phase, PHASE_ROLLBACK_OWED)
+
+    def test_a_close_failure_is_reported_per_role_and_withholds_success(self):
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.close_fails = {"codex"}
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_INCOMPLETE)
+        codex = [p for p in verdict.participants if p.role == "codex"][0]
+        self.assertFalse(codex.closed)
+        self.assertTrue(codex.close_detail)
+
+    def test_pending_input_blocks_the_whole_rollback_and_closes_nothing(self):
+        # j#80991: external input is preserved regardless of any approval, and a partial
+        # close behind the operator's back is not an improvement over refusing.
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.composers["w2G:p4"] = (True, True)
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        self.assertFalse(ops.close_calls)
+        codex = [p for p in verdict.participants if p.role == "codex"][0]
+        self.assertEqual(codex.verdict, ROLLBACK_PENDING_INPUT)
+
+    def test_an_obligation_blocks_and_closes_nothing(self):
+        action = self._owed_action()
+        ops = _RollbackOps(
+            self._rows("claude", "codex"),
+            obligations=(_Obligation("mzb1_ws1_codex_lane-1"),),
+        )
+        verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        self.assertFalse(ops.close_calls)
+
+    def test_an_unreadable_ledger_blocks_and_closes_nothing(self):
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"), obligations_unreadable=True)
+        verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_drifted_locator_is_never_closed(self):
+        action = self._owed_action()
+        rows = self._rows("claude", "codex")
+        rows[1]["pane_id"] = "w2G:p99"  # the name is ours; this process is not
+        ops = _RollbackOps(rows)
+        verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        self.assertFalse(ops.close_calls)
+
+    def test_an_action_owned_startup_screen_is_closeable_and_never_answered(self):
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.blockers["w2G:p3"] = "workspace_trust_confirmation"
+        verdict = self._run(ops, action, execute=True)
+        self.assertTrue(verdict.ok)
+        # The rail has no send/type port at all: answering the prompt is not expressible.
+        self.assertFalse(hasattr(ops, "sent"))
+
+    def test_an_unreadable_inventory_closes_nothing(self):
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.inventory_readable = False
+        verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        self.assertFalse(ops.close_calls)
+
+    def test_an_unknown_action_is_refused(self):
+        self.fence.reserve(self.unit, "n1")
+        ops = _RollbackOps([])
+        verdict = run_session_rollback(
+            action_id=startup_action_id(self.unit, "someone-elses"),
+            ops=ops,
+            fence=self.fence,
+            execute=True,
+        )
+        self.assertEqual(verdict.reason, REASON_ACTION_UNKNOWN)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_successful_action_owes_nothing_and_is_refused(self):
+        action = self.fence.reserve(self.unit, "n1")
+        self.fence.record_participant(
+            action.action_id,
+            Participant(role="codex", assigned_name="mzb1_ws1_codex_lane-1", locator="w2G:p4"),
+        )
+        self.fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
+        ops = _RollbackOps(self._rows("codex"))
+        verdict = run_session_rollback(
+            action_id=action.action_id, ops=ops, fence=self.fence, execute=True
+        )
+        self.assertEqual(verdict.reason, REASON_NOTHING_OWED)
+        self.assertFalse(ops.close_calls)
+
+    def test_terminal_replay_is_answered_from_the_record(self):
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        self.assertTrue(self._run(ops, action, execute=True).ok)
+        replay = self._run(_RollbackOps([]), action, execute=True)
+        self.assertTrue(replay.ok)
+        self.assertEqual(replay.reason, REASON_ALREADY_ROLLED_BACK)
+
+    def test_a_partial_rollback_resumes_rather_than_sticking(self):
+        # The first attempt closes claude and fails on codex; the second finds claude
+        # positively absent and finishes the job. Blocking on the already-closed slot is
+        # how an interrupted rollback becomes permanently stuck (#13847 R1-F1).
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.close_fails = {"codex"}
+        self.assertFalse(self._run(ops, action, execute=True).ok)
+        ops.close_fails = set()
+        verdict = self._run(ops, self.fence.read(action.action_id), execute=True)
+        self.assertTrue(verdict.ok)
 
 
 if __name__ == "__main__":  # pragma: no cover

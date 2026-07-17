@@ -272,6 +272,14 @@ class StartupTransactionFence:
 
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
         self.path = path or startup_transaction_fence_path(home)
+        # Re-entrancy is per INSTANCE and is not a weakening of the exclusion. A rollback
+        # holds the lock across its external close and then records what it proved; those
+        # inner writes are the same holder, and flock — which keys on the open file
+        # description, not the process — would otherwise refuse this fence its own lock and
+        # report `busy` to itself. A *different* holder (another instance, another process)
+        # still gets a hard refusal, which is the property that matters.
+        self._lock_fd: Optional[int] = None
+        self._lock_depth = 0
 
     @property
     def seal_path(self) -> Path:
@@ -522,17 +530,22 @@ class _FenceLock:
 
     def __init__(self, fence: StartupTransactionFence) -> None:
         self._fence = fence
-        self._fd: Optional[int] = None
+        self._nested = False
 
     def __enter__(self) -> "_FenceLock":
-        lock = self._fence.lock_path
+        fence = self._fence
+        if fence._lock_depth > 0:
+            # Already held by this exact holder: nest without re-acquiring.
+            fence._lock_depth += 1
+            self._nested = True
+            return self
+        lock = fence.lock_path
         lock.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
-            os.close(self._fd)
-            self._fd = None
+            os.close(fd)
             if exc.errno in (errno.EACCES, errno.EAGAIN):
                 raise StartupTransactionBusy(
                     "another startup transaction holds this authority; refusing to wait "
@@ -541,16 +554,24 @@ class _FenceLock:
             raise StartupTransactionError(
                 f"could not take the startup transaction lock ({exc}); fail closed"
             ) from exc
+        fence._lock_fd = fd
+        fence._lock_depth = 1
         return self
 
     def __exit__(self, *_exc) -> None:
-        if self._fd is None:
+        fence = self._fence
+        if self._nested:
+            fence._lock_depth -= 1
             return
+        if fence._lock_fd is None:
+            return
+        fd = fence._lock_fd
+        fence._lock_fd = None
+        fence._lock_depth = 0
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            os.close(self._fd)
-            self._fd = None
+            os.close(fd)
 
 
 def _row_to_action(row) -> StartupAction:
