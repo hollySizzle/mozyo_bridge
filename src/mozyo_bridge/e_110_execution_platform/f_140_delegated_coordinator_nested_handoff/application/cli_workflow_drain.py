@@ -241,6 +241,7 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         complete = False
 
     active: list[DrainLane] = []
+    active_keys: set[tuple[str, str]] = set()
     for row in rows:
         if not isinstance(row, dict):
             complete = False
@@ -266,12 +267,18 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             # is malformed (never str-coerced) -> hold.
             complete = False
             continue
+        key = (issue, lane)
+        if key in active_keys:
+            # A duplicated active identity is a contradictory roster -> hold (R8-F1).
+            complete = False
+        active_keys.add(key)
         active.append(
             DrainLane(
                 issue=issue, lane=lane, state_class=state, next_action_owner=next_owner
             )
         )
     release_rows: list[tuple[str, str]] = []
+    diag_keys: set[tuple[str, str]] = set()
     for diag in diagnostics:
         if not isinstance(diag, dict):
             complete = False
@@ -298,8 +305,20 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         ):
             complete = False
             continue
+        key = (d_issue, d_lane)
+        if key in diag_keys:
+            # The same lane appearing twice in the diagnostic (with possibly conflicting
+            # disposition / release) is contradictory durable state -> hold (R8-F1).
+            complete = False
+        diag_keys.add(key)
         if pr in _RELEASE_PENDING:
-            release_rows.append((d_issue, d_lane))
+            release_rows.append(key)
+    # Collection-level identity invariant (Redmine #13967 R8-F1): the active roster and the
+    # non-active lifecycle-diagnostic roster are disjoint by contract — a lane is active XOR
+    # non-active, never both. A `(issue, lane)` in BOTH sets is a contradictory / unreadable
+    # durable state, so the projection is durable-incomplete (-> hold), never releasable.
+    if active_keys & diag_keys:
+        complete = False
     return _merge_release_pending(active, release_rows), complete
 
 
