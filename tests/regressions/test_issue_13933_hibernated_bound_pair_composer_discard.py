@@ -8,7 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from mozyo_bridge.core.state.replacement_preservation import assess_preservation
+from mozyo_bridge.core.state.replacement_preservation import (
+    PreservationObservation,
+    assess_preservation,
+)
 from mozyo_bridge.core.state.replacement_transaction import (
     ContinuationPointer,
     DecisionPointer,
@@ -85,13 +88,17 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
+    ACTUATION_EFFECT_FAILED,
     ACTUATION_IN_PROGRESS,
     ACTUATION_RECOVERED,
     ATTEST_BOUND,
     ATTEST_PENDING,
+    CLOSE_DONE,
     CLOSE_ERROR,
+    LAUNCH_DONE,
     LAUNCH_ERROR,
     OLD_SLOT_AMBIGUOUS,
+    OLD_SLOT_PRESENT,
 )
 
 
@@ -936,6 +943,139 @@ class ResumeDiagnosticAndPublicStatusTests(unittest.TestCase):
         drive_calls = [c for c in ops.calls if c[0] == "drive"]
         self.assertEqual(drive_calls, [("drive", expectation.action_id)])
         self.assertEqual(outcome.action_id, expectation.action_id)
+
+
+class _CountingActuatorPort:
+    """A synthetic ExactGenerationActuatorPort that counts close/launch/verify per identity.
+
+    No live process, no DB.  ``launch_result`` injects a launch failure for a scripted first
+    run; ``closed`` / ``launched`` / ``verified`` are the tripwires that prove a replay never
+    re-closes an already-closed identity (Redmine #13933 R7 F2-remain / j#81046 Decision 3).
+    """
+
+    def __init__(self) -> None:
+        self.old: dict[tuple, str] = {}
+        self.attest: dict[tuple, str] = {}
+        self.launch_result: dict[tuple, str] = {}
+        self.closed: list[tuple] = []
+        self.launched: list[tuple] = []
+        self.verified: list[tuple] = []
+        self._pres = PreservationObservation(identity_matches=True, attestation_fresh=True)
+
+    def observe_old_slot(self, pin: ParticipantPin) -> str:
+        return self.old.get(pin.identity, OLD_SLOT_PRESENT)
+
+    def observe_preservation(self, pin: ParticipantPin) -> PreservationObservation:
+        return self._pres
+
+    def close_exact_generation(self, pin: ParticipantPin) -> str:
+        self.closed.append(pin.identity)
+        return CLOSE_DONE
+
+    def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
+        self.launched.append(pin.identity)
+        return self.launch_result.get(pin.identity, LAUNCH_DONE)
+
+    def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
+        self.verified.append(pin.identity)
+        return self.attest.get(pin.identity, ATTEST_BOUND)
+
+
+class PartialReplayEndToEndTests(unittest.TestCase):
+    """The launch-failure replay drives the REAL actuator + REAL transaction store.
+
+    Redmine #13933 R7 F2-remain (review j#81211): the FakeOps drive test asserted only that
+    ``drive()`` was called once with the same action id.  This drives the actuator seam
+    ``prepare-bound-pair --execute`` delegates to -- ``ReplacementActuatorUseCase
+    .drive_worker_recovery`` over a real ``ReplacementTransactionStore`` -- so an execute whose
+    launch fails, then replays under the SAME immutable action, is shown to (1) surface the
+    typed ``effect_failed`` status the public ``replacement_status`` carries verbatim, (2) never
+    re-close an already-closed identity, and (3) converge every participant to ``replaced``.
+    """
+
+    GEN = 1
+    FIXED = "2026-07-17T12:00:00+00:00"
+
+    def _participants(self):
+        # The #13933 discard shape: the exact uncorrelated pending composer roles of one pair.
+        return [
+            ParticipantPin(
+                lane_id=REQ.lane, role="gateway", provider="codex",
+                assigned_name="mzb1-gw", old_locator="w28:p3G",
+                lane_revision="4", lane_generation="1",
+            ),
+            ParticipantPin(
+                lane_id=REQ.lane, role="worker", provider="claude",
+                assigned_name="mzb1-wk", old_locator="w28:p3H",
+                lane_revision="4", lane_generation="1",
+            ),
+        ]
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp())
+        self.store = ReplacementTransactionStore(home=self.home)
+        self.key = ReplacementTransactionKey("ws", "prepare-bound-pair-abc")
+        self.participants = self._participants()
+        self.store.plan_transaction(
+            self.key,
+            action_generation=self.GEN,
+            decision=DecisionPointer(source="redmine", issue_id="13846", journal_id="80925"),
+            continuation=ContinuationPointer(
+                source="redmine", issue_id="13846", journal_id="80925",
+                expected_gate="bound_pair_composer_discard_approval",
+                next_semantic_action="converge_bound_pair",
+            ),
+            participants=self.participants,
+        )
+        self.port = _CountingActuatorPort()
+
+    def _drive(self):
+        return ReplacementActuatorUseCase(
+            self.store, self.port, preservation_policy=assess_preservation,
+            clock=lambda: self.FIXED,
+        ).drive_worker_recovery(
+            self.key, holder="H", expected_action_generation=self.GEN
+        )
+
+    def _phase(self, pin: ParticipantPin) -> str:
+        return self.store.get(self.key).find_participant(pin.identity).phase
+
+    def test_launch_failure_then_same_action_replay_never_re_closes_and_converges(self):
+        gateway, worker = self.participants
+        # Run 1: the gateway's launch fails after its close commits -- the exact j#80933 shape.
+        self.port.launch_result[gateway.identity] = LAUNCH_ERROR
+        first = self._drive()
+
+        # (1) the typed status the public `replacement_status` surfaces verbatim (see
+        # LiveBoundPairPreparationOps.drive: `PreparationDrive(False, result.status)`).
+        self.assertEqual(first.status, ACTUATION_EFFECT_FAILED)
+        self.assertEqual(ACTUATION_EFFECT_FAILED, "effect_failed")
+        self.assertNotEqual(first.status, ACTUATION_RECOVERED)
+        # the close committed; the gateway is now owed a launch, not another close.
+        self.assertEqual(self.port.closed.count(gateway.identity), 1)
+        self.assertEqual(self._phase(gateway), PARTICIPANT_LAUNCH_OWED)
+
+        # Run 2: the SAME immutable action + generation; the launch now succeeds.
+        self.port.launch_result.pop(gateway.identity)
+        second = self._drive()
+
+        self.assertEqual(second.status, ACTUATION_RECOVERED)
+        # (2) the already-closed gateway is NEVER re-closed on the replay.
+        self.assertEqual(self.port.closed.count(gateway.identity), 1)
+        # (3) every participant converges to replaced; the still-owed worker is processed and
+        #     each identity is closed exactly once and verified after an action-bound launch.
+        for pin in self.participants:
+            self.assertEqual(self._phase(pin), PARTICIPANT_REPLACED, pin.role)
+            self.assertEqual(self.port.closed.count(pin.identity), 1, pin.role)
+            self.assertIn(pin.identity, self.port.launched)
+            self.assertIn(pin.identity, self.port.verified)
+
+    def test_clean_run_recovers_without_any_relaunch(self):
+        result = self._drive()
+        self.assertEqual(result.status, ACTUATION_RECOVERED)
+        for pin in self.participants:
+            self.assertEqual(self._phase(pin), PARTICIPANT_REPLACED, pin.role)
+            self.assertEqual(self.port.closed.count(pin.identity), 1, pin.role)
 
 
 class VerifyAndCompletionAuthorityTests(unittest.TestCase):
