@@ -3,8 +3,11 @@
 Split from :mod:`startup_transaction_fence` (review j#81202 correction) as the module's
 module-health reduction: the byte-exact row contract grew large enough — validating every
 cell as a typed authority shape rather than a lenient decode — to earn its own home
-alongside the fence I/O it serves. The fence imports these lazily (inside ``read``) so this
-value layer and the I/O layer stay a one-way dependency with no import cycle.
+alongside the fence I/O it serves. The dependency is bidirectional by design (review
+j#81224): this module imports the value types from the fence at load time, and the fence
+imports :func:`_row_to_action` LAZILY (inside ``read``) so no import cycle forms at module
+load — the lazy edge is what defers the back-reference until both modules exist, not a
+claim that the graph is acyclic.
 
 Every function here fails closed by raising :class:`StartupTransactionError`: a row read
 back from the store is byte-exact authority (Answer j#80989 Q1/Q3) or it is unreadable —
@@ -77,11 +80,18 @@ def _row_to_action(row) -> StartupAction:
         )
     # revision must be an EXACT integer — a stored float (1.5) truncating to 1 is silent
     # authority drift, so bool / float / non-numeric string are all rejected (bool is an
-    # int subclass, hence the explicit guard).
+    # int subclass, hence the explicit guard). It must also be >= 1: the writer starts at 1
+    # and only increments, so revision 0 / negative is a corrupt authority (review j#81224
+    # R7-F2).
     if isinstance(revision_cell, bool) or not isinstance(revision_cell, int):
         raise StartupTransactionError(
             f"startup action {action_id!r} has a non-integer revision {revision_cell!r}; "
             "the authority row is malformed"
+        )
+    if revision_cell < 1:
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has a non-positive revision {revision_cell!r}; "
+            "the writer starts at 1 — the authority row is malformed"
         )
     revision = revision_cell
 
@@ -121,6 +131,24 @@ def _row_to_action(row) -> StartupAction:
         raise StartupTransactionError(
             f"startup action {action_id!r} providers cell {providers_cell!r} is not the "
             "canonical sorted-unique serialization; the authority row is malformed"
+        )
+    # Relational invariant across participants and the unit (review j#81224 R7-F2): a
+    # participant role must be one this action actually requested, and each role at most
+    # once. Per-field validity is not enough — a codex participant in a claude-only unit is
+    # each field valid yet still a role this action never started, and closing its pane
+    # would breach "same-action participants only". The read side enforces it so a row
+    # corrupted directly in the DB (bypassing record_participant) is refused too.
+    participant_roles = [p.role for p in participants]
+    if len(participant_roles) != len(set(participant_roles)):
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has duplicate participant roles "
+            f"{participant_roles}; the authority row is malformed"
+        )
+    foreign = set(participant_roles) - set(providers)
+    if foreign:
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has participant roles {sorted(foreign)} outside "
+            f"the requested provider set {providers}; the authority row is malformed"
         )
     return StartupAction(
         action_id=action_id,

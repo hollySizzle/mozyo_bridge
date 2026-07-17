@@ -435,7 +435,12 @@ class StartupTransactionFence:
         try:
             os.lstat(path)
             return True
-        except (FileNotFoundError, NotADirectoryError):
+        except FileNotFoundError:
+            # ONLY a genuine not-found is absence (review j#81224 R7-F3). NotADirectoryError
+            # (a path component is a file), PermissionError, and every other OSError mean
+            # the namespace is unreadable — NOT that the artifact is absent — so they
+            # propagate to store_shape's guard as a damaged/unreadable authority rather than
+            # collapsing to "absent" (which would bootstrap over it, or answer unknown).
             return False
 
     def store_shape(self) -> StoreShape:
@@ -490,14 +495,18 @@ class StartupTransactionFence:
         self.seal_path.write_text(nonce, encoding="utf-8")
 
     def _read_seal_nonce(self) -> Optional[str]:
-        """The seal's nonce, or ``None`` when it cannot be read as one.
+        """The seal's nonce as the writer wrote it, or ``None`` when unreadable.
 
-        ``ValueError`` is caught alongside ``OSError`` deliberately: a seal holding
-        non-UTF-8 bytes raises ``UnicodeDecodeError``, which is a ``ValueError`` and would
-        otherwise escape an ``OSError``-only guard.
+        The bytes are NOT stripped (review j#81224 R7-F3): the seal is one half of the
+        identity comparison, and normalizing it is the same coercion the DB-nonce side
+        already forbids — a nonce wrapped in whitespace/newline would otherwise MATCH a
+        clean stored nonce and let a corrupt authority pass its own identity check. The
+        writer emits the exact nonce (`_create_fresh`), so an exact compare is what a
+        genuine seal survives. ``ValueError`` is caught with ``OSError`` because a non-UTF-8
+        seal raises ``UnicodeDecodeError`` (a ``ValueError``).
         """
         try:
-            value = self.seal_path.read_text(encoding="utf-8").strip()
+            value = self.seal_path.read_text(encoding="utf-8")
         except (OSError, ValueError):
             return None
         return value or None
@@ -772,6 +781,16 @@ class StartupTransactionFence:
                     f"startup action {action_id!r} already has a {participant.role!r} "
                     "participant; one action starts a role at most once"
                 )
+            # A participant must be a role this action actually requested (review j#81224
+            # R7-F2): the requested provider set is part of the action's identity, and a
+            # participant outside it would let the rail close a pane this action never
+            # started. Enforced on the WRITE side so a corrupt participant never lands.
+            if participant.role not in action.unit.providers:
+                raise StartupTransactionError(
+                    f"startup action {action_id!r} participant role {participant.role!r} is "
+                    f"not in the requested provider set {action.unit.providers}; refusing "
+                    "to record a role this action did not request"
+                )
             merged = action.participants + (participant,)
             self._write(action_id, phase=PHASE_LAUNCHING, participants=merged)
             return self._require(action_id)
@@ -794,6 +813,14 @@ class StartupTransactionFence:
         """Record that a participant's pane was proven closed by a rollback."""
         with self._hold():
             action = self._require(action_id)
+            if action.terminal:
+                # A terminal action is answered from the record, never mutated (review
+                # j#81224 R7-F1): a stale close arriving after a concurrent rollback
+                # completed must not re-write a settled authority.
+                raise StartupTransactionError(
+                    f"startup action {action_id!r} is {action.phase!r}; refusing to record "
+                    "a close against a completed action"
+                )
             updated = tuple(
                 Participant(
                     role=p.role,

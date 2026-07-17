@@ -224,8 +224,16 @@ def _facts_for(
         _SETTLED_RUNTIME_STATES,
     )
 
-    base["agent_idle"] = ops.runtime_state(live_locator) in _SETTLED_RUNTIME_STATES
-    composer, blocker = _composer_fact(ops, participant.role, live_locator)
+    # A live-state port (runtime state / composer) is a herdr CLI call that can raise on an
+    # I/O failure (review j#81224 R7-F4). An exception here is not "idle with an empty
+    # composer" — it is an UNREADABLE live state, which fails closed to a zero-close verdict
+    # rather than escaping the public rail as a raw OSError.
+    try:
+        base["agent_idle"] = ops.runtime_state(live_locator) in _SETTLED_RUNTIME_STATES
+        composer, blocker = _composer_fact(ops, participant.role, live_locator)
+    except Exception:  # noqa: BLE001 - an unreadable live state is never a settled one
+        base["live_state_unreadable"] = True
+        return ParticipantFacts(**base), ""
     base["composer"] = composer
     return ParticipantFacts(**base), blocker
 
@@ -291,6 +299,17 @@ def run_session_rollback(
             reason=REASON_AUTHORITY_UNAVAILABLE,
             detail=str(exc),
         )
+    except Exception as exc:  # noqa: BLE001 - the public rail's "never raises" is a hard
+        # contract (review j#81224 R7-F4). The port-specific handlers above turn a live
+        # port failure into a structured verdict; this backstop guarantees that even an
+        # unforeseen exception surfaces as a fail-closed refusal, never a stack trace out
+        # of a destructive command. Nothing was proven closed, so the debt is intact.
+        return SessionRollbackVerdict(
+            action_id=action_id,
+            state="blocked",
+            reason=REASON_BLOCKED,
+            detail=f"the rollback could not complete ({type(exc).__name__}: {exc})",
+        )
 
 
 def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
@@ -340,6 +359,37 @@ def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
 
 
 def _rollback_locked(action_id, action, ops, fence, *, execute: bool):
+    # Re-read the action FRESH under the lock and act only on this snapshot (review j#81224
+    # R7-F1). The pre-lock read outside is a fast-path preflight; a concurrent holder can
+    # terminalize the action, change its participants, or delete it between that read and
+    # the lock, and closing panes on the stale object would re-close a settled authority
+    # (the TOCTOU the nonblocking lock exists to prevent). Everything below decides from
+    # `action`, the under-lock snapshot — never the caller's stale one.
+    action = fence.read(action_id)
+    if action is None:
+        return SessionRollbackVerdict(
+            action_id=action_id,
+            state="blocked",
+            reason=REASON_ACTION_UNKNOWN,
+            detail="the action vanished before the lock was held; nothing was closed",
+        )
+    if action.phase == PHASE_COMPLETED_ROLLED_BACK:
+        return SessionRollbackVerdict(
+            action_id=action_id,
+            state="completed",
+            reason=REASON_ALREADY_ROLLED_BACK,
+            detail="a concurrent rollback completed this action; nothing was closed",
+        )
+    if action.phase not in ACTIONABLE_PHASES:
+        return SessionRollbackVerdict(
+            action_id=action_id,
+            state="blocked",
+            reason=REASON_NOTHING_OWED,
+            detail=(
+                f"under the lock this action is {action.phase!r}: it owes no rollback. "
+                "Refusing to close panes an action did not record as owed"
+            ),
+        )
     verdicts, inventory_readable = _observe(action, ops)
     if not inventory_readable:
         return SessionRollbackVerdict(
@@ -390,8 +440,16 @@ def _execute_rollback(action_id, action, ops, fence, verdicts):
     settled = list(verdicts)
     failed: dict = {}
     if targets:
-        result = ops.close(action.unit.workspace_id, action.unit.lane_id, targets)
-        failed = {role: detail for role, _, detail in getattr(result, "failed", ())}
+        # The close port can raise AFTER a partial effect (review j#81224 R7-F4): some
+        # panes may already be gone. Do NOT let that escape the public rail raw — the
+        # remeasure below is what establishes the real end state, so a close exception is
+        # recorded as a whole-batch failure detail and the remeasure decides per role.
+        try:
+            result = ops.close(action.unit.workspace_id, action.unit.lane_id, targets)
+            failed = {role: detail for role, _, detail in getattr(result, "failed", ())}
+        except Exception as exc:  # noqa: BLE001 - a close that raised is a close that may
+            # have partially acted; the remeasure, not this exception, decides the outcome.
+            failed = {role: f"close raised: {exc}" for role, _ in targets}
     # A close's return code is not evidence of absence (#13892 j#80506 F3), so the durable
     # `closed` flag is written from the REMEASURE, never from the close's own report
     # (review j#81070 R1-F4). Believing the report first recorded `closed=True` for a pane
