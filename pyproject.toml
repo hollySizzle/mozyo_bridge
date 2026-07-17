@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mozyo-bridge"
-version = "0.12.0a7"
+version = "0.12.0a8"
 description = "Redmine-gated tmux pane notification bridge for Claude Code and Codex terminals"
 readme = "README.md"
 license = "MIT"
