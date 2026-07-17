@@ -186,6 +186,13 @@ class DeliveryReport:
     #: Rows whose target slot is inside a retirement (Redmine #13892 R5-F2). Zero-send, and
     #: surfaced rather than silently dropped so an operator can see why a callback did not fire.
     skipped_retiring: list[tuple] = field(default_factory=list)
+    #: Rows a send-edge fence blocked (Redmine #13968 R2-F1): a claimed row whose journal is older
+    #: than the caller's current dispatch anchor (a previous-generation historical replay), or one
+    #: the caller could not anchor. Zero-send, marked terminally (no auto-retry, not dead-lettered
+    #: — so a stale backlog neither replays nor amplifies), and surfaced here so the fenced count
+    #: is operator-visible. This is where a PRE-EXISTING pending / recovered-then-reclaimed
+    #: historical row is stopped — the ingest-side fence only stops NEWLY discovered candidates.
+    fenced: list[tuple] = field(default_factory=list)
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -194,6 +201,10 @@ class DeliveryReport:
             "skipped_retiring": [
                 {"key": k.as_row() if hasattr(k, "as_row") else str(k), "detail": d}
                 for k, d in self.skipped_retiring
+            ],
+            "fenced": [
+                {"key": k.as_row() if hasattr(k, "as_row") else str(k), "detail": d}
+                for k, d in self.fenced
             ],
         }
 
@@ -378,6 +389,7 @@ class CallbackOutboxProcessor:
         limit: int = 32,
         stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS,
         now: Optional[str] = None,
+        send_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
     ) -> DeliveryReport:
         """Recover crashed inflight rows, then fire **one** send per claimed pending row.
 
@@ -391,6 +403,17 @@ class CallbackOutboxProcessor:
         - :data:`SEND_NOT_SENT` (deterministic, pre-injection) -> bounded ``retry`` then
           ``dead_letter``;
         - :data:`SEND_UNCERTAIN` (or an unknown token, fail-safe) -> ``uncertain`` (no auto-retry).
+
+        ``send_fence_fn`` (Redmine #13968 R2-F1) is an optional per-row send-edge fence evaluated
+        AFTER a row is claimed and its send edge checkpointed, but BEFORE ``sender`` is invoked —
+        the same reserve->send boundary the retirement gate guards. It returns ``(fence, reason)``;
+        a fenced row is **zero-send**, marked terminally uncertain (no auto-retry, never
+        dead-lettered — a stale backlog neither replays nor amplifies), and surfaced in
+        ``report.fenced``. This is what stops a PRE-EXISTING pending or recovered-then-reclaimed
+        historical row from reaching the transport (the caller's ingest-side fence only stops newly
+        discovered candidates). Because ``recover_inflight`` resets a stale pre-send row back to
+        ``pending``, that row is re-claimed in this same pass and therefore also passes this gate.
+        ``None`` (the default) leaves delivery byte-for-byte unchanged (unfenced callers).
         """
         report = DeliveryReport()
         # Recover only lease-expired (stale) inflight rows — never a concurrent processor's
@@ -409,6 +432,20 @@ class CallbackOutboxProcessor:
             # send — a de-owned processor never fires a duplicate callback.
             if not self._outbox.mark_sending(row.key, claim_token=token, now=now):
                 continue
+            # The generation fence (Redmine #13968 R2-F1). A claimed row older than the caller's
+            # current dispatch anchor — or one the caller cannot anchor — is a previous-generation
+            # historical replay: zero-send, marked terminally uncertain (no auto-retry, not
+            # dead-lettered), and surfaced. This runs BEFORE the retirement / send edges so a stale
+            # backlog row never reaches the transport, whether it was pre-existing pending or a
+            # recovered stale-inflight row reset to pending this same pass.
+            if send_fence_fn is not None:
+                fenced, fence_reason = send_fence_fn(row)
+                if fenced:
+                    self._outbox.mark_uncertain(
+                        row.key, claim_token=token, now=now, detail=fence_reason
+                    )
+                    report.fenced.append((row.key, fence_reason))
+                    continue
             # The retirement gate (Redmine #13892 R5-F2). This is a real reserve -> send edge
             # against a slot the row names, so it needs the same guard `execute_dispatch` has:
             # the retire side publishes its `pending` intent BEFORE it reads obligations, and

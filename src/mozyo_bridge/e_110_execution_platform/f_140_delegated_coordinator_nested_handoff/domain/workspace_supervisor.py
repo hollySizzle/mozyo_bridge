@@ -157,6 +157,35 @@ def fence_candidates_to_anchor(candidates, anchor_journal):
     return tuple(kept), tuple(dropped)
 
 
+def make_send_edge_fence(anchor: object, coordinator_route: str):
+    """Build a per-row send-edge fence for general coordinator rows (Redmine #13968 R2-F1).
+
+    Returns ``send_fence_fn(row) -> (fence, reason)``. A row is fenced when it is a GENERAL
+    coordinator callback (its ``callback_route`` equals ``coordinator_route``) AND
+    :func:`fence_candidates_to_anchor` drops it against ``anchor`` — i.e. the row's journal is older
+    than the current dispatch anchor, or the anchor is unresolvable (``None`` / blank). Correlated
+    ``review_return:<lane>`` rows carry their OWN generation fence (#13684) and are exempt (route
+    mismatch → never fenced here). The reason token is secret-safe (no pane id / path / credential)
+    so a fenced zero-send is auditable. Pure and duck-typed on ``row.callback_route`` / ``.journal``.
+    """
+    anchor_blank = not str(anchor or "").strip()
+
+    def _fence(row) -> tuple[bool, str]:
+        if str(getattr(row, "callback_route", "") or "").strip() != coordinator_route:
+            return (False, "")  # review_return / non-coordinator: own fence, exempt
+        kept, _dropped = fence_candidates_to_anchor([row], anchor)
+        if kept:
+            return (False, "")
+        reason = (
+            "fenced: dispatch anchor unresolvable"
+            if anchor_blank
+            else "superseded: journal older than current dispatch anchor"
+        )
+        return (True, reason)
+
+    return _fence
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -387,6 +416,7 @@ __all__ = (
     "authoritative_workspace_by_issue",
     "partition_authoritative",
     "fence_candidates_to_anchor",
+    "make_send_edge_fence",
     "IssueSelection",
     "select_supervised_issues",
     "IssueSupervisionOutcome",
