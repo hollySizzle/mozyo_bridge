@@ -45,8 +45,11 @@ import json as _json
 from pathlib import Path
 
 from mozyo_bridge.core.state.lane_lifecycle_model import (
+    DISPOSITION_ACTIVE,
+    DISPOSITIONS,
     RELEASE_PARTIAL,
     RELEASE_REQUESTED,
+    RELEASE_STATES,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.drain_queue import (
     DrainLane,
@@ -65,6 +68,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # The release-axis values that mean a centralized TestPyPI / installed dogfood is still
 # owed on the dedicated release issue (Redmine #13967 item 2).
 _RELEASE_PENDING = frozenset({RELEASE_REQUESTED, RELEASE_PARTIAL})
+
+# The lifecycle-diagnostic roster is, by contract, non-active lanes only (an active lane is
+# in the active roster, not the diagnostic). So a diagnostic row whose lane_disposition is
+# `active` — or an unknown token — is a malformed/contradictory canonical row (Redmine
+# #13967 R7-F2).
+_NON_ACTIVE_DISPOSITIONS = frozenset(DISPOSITIONS - {DISPOSITION_ACTIVE})
 
 
 # Sentinel distinguishing a KEY-ABSENT field from a KEY-PRESENT null / non-string value
@@ -238,10 +247,23 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             continue
         issue = _exact_str(row.get("issue_id", _MISSING), required=True)
         state = _exact_str(row.get("workflow_state", _MISSING), required=True)
+        # The canonical WorkflowGlanceRow emits both `workflow_state` AND `state_class`, and
+        # its contract is that they are EQUAL. Validate the paired field too: a missing /
+        # null / non-string / MISMATCHED state_class is a contradictory canonical row, so the
+        # projection is durable-incomplete rather than trusting one side (Redmine #13967 R7-F1).
+        state_class = _exact_str(row.get("state_class", _MISSING), required=True)
         lane = _exact_str(row.get("lane", _MISSING))
         next_owner = _exact_str(row.get("next_owner", _MISSING))
-        if issue is None or state is None or lane is None or next_owner is None:
-            # Non-string / missing identity or state is malformed (never str-coerced) -> hold.
+        if (
+            issue is None
+            or state is None
+            or state_class is None
+            or state_class != state
+            or lane is None
+            or next_owner is None
+        ):
+            # Non-string / missing identity or state, or a workflow_state/state_class conflict,
+            # is malformed (never str-coerced) -> hold.
             complete = False
             continue
         active.append(
@@ -254,22 +276,30 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         if not isinstance(diag, dict):
             complete = False
             continue
-        pr = _exact_str(diag.get("process_release", _MISSING))
-        if pr is None or pr not in _RELEASE_PENDING:
-            # A non-string process_release, or one not in the pending set, is not a release
-            # row (a non-string is malformed -> hold; a known non-pending value is skipped).
-            if pr is None:
-                complete = False
-            continue
+        # The canonical producer emits issue / lane / lane_disposition / process_release on
+        # EVERY diagnostic row (non-active lanes only). Validate all four BEFORE deciding
+        # whether the row is a pending release: an unknown / missing / null / non-string
+        # process_release, an out-of-vocabulary lane_disposition (or an `active` one — the
+        # diagnostic roster is non-active by contract), or missing identity is a malformed /
+        # contradictory canonical row -> durable-incomplete (hold), never read as "no release
+        # debt" (Redmine #13967 R7-F2). Only a fully-valid requested/partial row folds as a
+        # pending release lane.
         d_issue = _exact_str(diag.get("issue", _MISSING), required=True)
         d_lane = _exact_str(diag.get("lane", _MISSING), required=True)
-        if d_issue is None or d_lane is None:
-            # A release-pending diagnostic row with no exact-string durable identity must NOT
-            # become a phantom release_dogfood lane that reads `releasable` — it makes the
-            # projection durable-incomplete (-> hold) instead (Redmine #13967 R3-F2 / R4-F2).
+        d_disposition = _exact_str(diag.get("lane_disposition", _MISSING), required=True)
+        pr = _exact_str(diag.get("process_release", _MISSING), required=True)
+        if (
+            d_issue is None
+            or d_lane is None
+            or d_disposition is None
+            or d_disposition not in _NON_ACTIVE_DISPOSITIONS
+            or pr is None
+            or pr not in RELEASE_STATES
+        ):
             complete = False
             continue
-        release_rows.append((d_issue, d_lane))
+        if pr in _RELEASE_PENDING:
+            release_rows.append((d_issue, d_lane))
     return _merge_release_pending(active, release_rows), complete
 
 
