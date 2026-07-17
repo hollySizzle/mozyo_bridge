@@ -116,9 +116,16 @@ locator-matched self-attestation** を観測できるまで success を返さな
 1. 出力 (text の `action=` / `--json` の `action_id`) から **startup action id** を取る。rollback はこの id の下でしか動かない。
 2. read-only preflight: `mozyo-bridge herdr session-rollback --action-id <id> --json`
    - 何が閉じられ、何が閉じられないかを role ごとに返す。ここでは **一切 close しない**。
-3. 全 participant が `eligible` のときだけ `--execute` を足す。**この action が起動した participant だけ**が対象で、
-   adopted slot・別 action の slot・durable name だけ一致する pane は決して閉じない。
+3. preflight が `state=actionable` なら `--execute` を足す。`state=actionable` は「**close-target でない participant が
+   残っていない**」の意味であって「全 participant が `eligible`」ではない。**close されるのは `eligible` の participant だけ**で、
+   `absent`(既に居ない) と `already_closed`(前回の実行が閉じ済み) は **no-target だが実行を block しない** — 途中まで閉じた
+   rollback を再実行すると残りが `eligible`・前回閉じた role が `absent|already_closed` になるのが正規の resume 形であり、
+   ここで operator が止めてはならない (それが `--execute` を再度足す意味)。`eligible` が対象になるのは **この action が起動した
+   participant** だけで、adopted slot・別 action の slot・durable name だけ一致する pane は決して閉じない。preflight が
+   1 つでも close-target でない live refusal (下記) を残す間は `state=blocked` で、`--execute` も何も閉じない。
 4. refusal はそのまま原因である。緩めない:
+   - `rollback_authority_unavailable` — startup transaction store が読めない/壊れている/別 store に置換された。
+     raw error にはならず structured に refuse し、**close は 0**。store を直さない限り再実行しても閉じない。
    - `pending_input_present` — 誰かの未送信入力がある。**owner approval があっても本 rail では preserve** する。破棄が必要なら
      `herdr session-retire` の `--pending-composer-discard-approval` (exact `direct_owner` marker) という**別 authority**へ回す。
    - `work_obligation_present` / `obligation_unreadable` — durable ledger が work を owe している / 読めない。
