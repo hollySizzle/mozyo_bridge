@@ -40,6 +40,7 @@ structured lane supplies an earned non-blocking claim — a live projection neve
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json as _json
 from pathlib import Path
 
@@ -100,6 +101,45 @@ def _lanes_from_snapshot(path: str) -> tuple[DrainLane, ...]:
     return tuple(lanes)
 
 
+def _release_dogfood_lane(issue: str, lane: str) -> DrainLane:
+    return DrainLane(
+        issue=issue,
+        lane=lane,
+        state_class=LANE_STATE_IDLE,
+        actionability=ACTIONABILITY_NON_ACTIONABLE_WAIT,
+        next_action_owner="external_condition",
+        release_pending=True,
+        reason="release_dogfood_delegated_to_release_issue",
+    )
+
+
+def _merge_release_pending(
+    active: list[DrainLane], release_rows: list[tuple[str, str]]
+) -> tuple[DrainLane, ...]:
+    """Merge release-pending flags into the active lanes by (issue, lane) identity.
+
+    A lane already present in ``active`` gets its ``release_pending`` flag set on the SAME
+    row (so it is counted once and, per :func:`...drain_queue.bucket_for_state`, a
+    coordinator-blocking base bucket still wins over release_dogfood — a delegated dogfood
+    never hides live drain). A release-pending identity with no active row is appended as a
+    fresh release_dogfood lane. This keeps ``lane_count`` correct and enforces the "one
+    lane, one bucket" invariant against composed/malformed inputs (Redmine #13967 F3).
+    """
+    by_key: dict[tuple[str, str], int] = {
+        (l.issue, l.lane): i for i, l in enumerate(active)
+    }
+    merged = list(active)
+    for issue, lane in release_rows:
+        key = (issue, lane)
+        if key in by_key:
+            idx = by_key[key]
+            merged[idx] = dataclasses.replace(merged[idx], release_pending=True)
+        else:
+            by_key[key] = len(merged)
+            merged.append(_release_dogfood_lane(issue, lane))
+    return tuple(merged)
+
+
 def _lanes_from_glance(path: str) -> tuple[DrainLane, ...]:
     """Derive drain lanes from a ``workflow glance --json`` envelope."""
     try:
@@ -109,14 +149,14 @@ def _lanes_from_glance(path: str) -> tuple[DrainLane, ...]:
     if not isinstance(data, dict):
         raise SystemExit("--from-glance must carry a workflow glance --json envelope")
 
-    lanes: list[DrainLane] = []
+    active: list[DrainLane] = []
     for row in data.get("rows", []) or []:
         if not isinstance(row, dict):
             continue
         issue = str(row.get("issue_id", "") or "").strip()
         if not issue:
             continue
-        lanes.append(
+        active.append(
             DrainLane(
                 issue=issue,
                 lane=str(row.get("lane", "") or "").strip(),
@@ -124,24 +164,19 @@ def _lanes_from_glance(path: str) -> tuple[DrainLane, ...]:
                 next_action_owner=str(row.get("next_owner", "") or "").strip(),
             )
         )
+    release_rows: list[tuple[str, str]] = []
     for diag in data.get("lifecycle_diagnostic", []) or []:
         if not isinstance(diag, dict):
             continue
         if str(diag.get("process_release", "") or "").strip() not in _RELEASE_PENDING:
             continue
-        issue = str(diag.get("issue", "") or "").strip()
-        lanes.append(
-            DrainLane(
-                issue=issue,
-                lane=str(diag.get("lane", "") or "").strip(),
-                state_class=LANE_STATE_IDLE,
-                actionability=ACTIONABILITY_NON_ACTIONABLE_WAIT,
-                next_action_owner="external_condition",
-                release_pending=True,
-                reason="release_dogfood_delegated_to_release_issue",
+        release_rows.append(
+            (
+                str(diag.get("issue", "") or "").strip(),
+                str(diag.get("lane", "") or "").strip(),
             )
         )
-    return tuple(lanes)
+    return _merge_release_pending(active, release_rows)
 
 
 def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str, ...]]:
@@ -184,7 +219,7 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     degraded = degraded or collection.degraded
     rows = fold_glance_rows(collection.snapshots)
 
-    lanes: list[DrainLane] = [
+    active: list[DrainLane] = [
         DrainLane(
             issue=r.issue_id,
             lane=r.lane,
@@ -198,21 +233,12 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     if diag_error:
         degraded = True
         notes.append(diag_error)
-    for issue, lane, _disposition, process_release in diagnostic:
-        if process_release not in _RELEASE_PENDING:
-            continue
-        lanes.append(
-            DrainLane(
-                issue=issue,
-                lane=lane,
-                state_class=LANE_STATE_IDLE,
-                actionability=ACTIONABILITY_NON_ACTIONABLE_WAIT,
-                next_action_owner="external_condition",
-                release_pending=True,
-                reason="release_dogfood_delegated_to_release_issue",
-            )
-        )
-    return tuple(lanes), degraded, tuple(notes)
+    release_rows = [
+        (issue, lane)
+        for issue, lane, _disposition, process_release in diagnostic
+        if process_release in _RELEASE_PENDING
+    ]
+    return _merge_release_pending(active, release_rows), degraded, tuple(notes)
 
 
 def cmd_workflow_drain_queue(args: argparse.Namespace) -> int:
@@ -231,12 +257,23 @@ def cmd_workflow_drain_queue(args: argparse.Namespace) -> int:
         lanes = _lanes_from_snapshot(snapshot)
     elif from_glance:
         lanes = _lanes_from_glance(from_glance)
+        # A glance envelope that reports its own source degradation makes the drain
+        # projection durable-incomplete too (Redmine #13967 F2 — do not release from a
+        # partially-read durable record).
+        try:
+            glance_env = _json.loads(Path(from_glance).read_text(encoding="utf-8"))
+            degraded = bool(isinstance(glance_env, dict) and glance_env.get("degraded"))
+        except (OSError, ValueError):
+            degraded = True
     else:
         repo = getattr(args, "repo", None)
         repo_root = Path(repo).expanduser() if repo else Path.cwd()
         lanes, degraded, notes = _lanes_live(repo_root)
 
-    projection = project_drain_queue(lanes)
+    # Fail-closed: a live/glance source that could not be fully read holds the process
+    # (durable_complete=False), so the retention verdict never says `releasable` from state
+    # it could not read. A caller-supplied --snapshot-json is treated as complete.
+    projection = project_drain_queue(lanes, durable_complete=not degraded)
     if getattr(args, "as_json", False):
         payload = drain_queue_payload(projection)
         payload["degraded"] = bool(degraded)

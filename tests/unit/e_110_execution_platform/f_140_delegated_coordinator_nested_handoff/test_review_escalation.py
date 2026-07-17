@@ -51,25 +51,34 @@ def _f(subsystem, round_index, *, authority=True, late=True):
 
 class EvaluateTests(unittest.TestCase):
     def test_repeated_late_authority_escalates(self):
+        # Late authority findings in rounds 2 and 3 (round 1 can never be late).
         v = evaluate_subsystem_escalation(
-            "callback_supervisor", [_f("callback_supervisor", 1), _f("callback_supervisor", 2)]
+            "callback_supervisor", [_f("callback_supervisor", 2), _f("callback_supervisor", 3)]
         )
         self.assertTrue(v.escalate)
         self.assertEqual(v.next_round_mode, MODE_FULL_SURFACE_ADVERSARIAL)
         self.assertEqual(v.reason, REASON_REPEATED_LATE_AUTHORITY)
-        self.assertEqual(v.late_authority_rounds, (1, 2))
+        self.assertEqual(v.late_authority_rounds, (2, 3))
 
-    def test_single_round_is_below_threshold(self):
+    def test_round_1_is_never_late(self):
+        # Redmine #13967 F4: a finding in the first round can never be "late" even if the
+        # caller flags it late — nothing preceded it.
         v = evaluate_subsystem_escalation("x", [_f("x", 1)])
+        self.assertEqual(v.late_authority_round_count, 0)
+        self.assertFalse(v.escalate)
+        self.assertEqual(v.reason, REASON_NO_LATE_AUTHORITY_FINDING)
+
+    def test_single_late_round_is_below_threshold(self):
+        v = evaluate_subsystem_escalation("x", [_f("x", 2)])
         self.assertFalse(v.escalate)
         self.assertEqual(v.next_round_mode, MODE_PER_FINDING_REREVIEW)
         self.assertEqual(v.reason, REASON_BELOW_THRESHOLD)
 
     def test_multiple_findings_same_round_count_once(self):
         v = evaluate_subsystem_escalation(
-            "x", [_f("x", 1, ), _f("x", 1), _f("x", 1)]
+            "x", [_f("x", 2), _f("x", 2), _f("x", 2)]
         )
-        # three findings but all in round 1 -> a single late-authority round -> below threshold
+        # three findings but all in round 2 -> a single late-authority round -> below threshold
         self.assertEqual(v.late_authority_round_count, 1)
         self.assertFalse(v.escalate)
 
@@ -77,8 +86,8 @@ class EvaluateTests(unittest.TestCase):
         v = evaluate_subsystem_escalation(
             "x",
             [
-                _f("x", 1, authority=False),  # not authority-bearing
-                _f("x", 2, late=False),  # caught in-round, not late
+                _f("x", 2, authority=False),  # not authority-bearing
+                _f("x", 3, late=False),  # caught in-round, not late
             ],
         )
         self.assertEqual(v.late_authority_round_count, 0)
@@ -93,11 +102,11 @@ class EvaluateTests(unittest.TestCase):
 
     def test_threshold_is_configurable(self):
         v = evaluate_subsystem_escalation(
-            "x", [_f("x", 1), _f("x", 2)], threshold=3
+            "x", [_f("x", 2), _f("x", 3)], threshold=3
         )
         self.assertFalse(v.escalate)
         v3 = evaluate_subsystem_escalation(
-            "x", [_f("x", 1), _f("x", 2), _f("x", 3)], threshold=3
+            "x", [_f("x", 2), _f("x", 3), _f("x", 4)], threshold=3
         )
         self.assertTrue(v3.escalate)
 
@@ -106,9 +115,9 @@ class ProjectionTests(unittest.TestCase):
     def test_projection_groups_by_subsystem_and_orders(self):
         proj = project_review_escalation(
             [
-                _f("b_sub", 1),
                 _f("b_sub", 2),
-                _f("a_sub", 1),
+                _f("b_sub", 3),
+                _f("a_sub", 2),
             ],
             unreadable_subsystems=["c_sub"],
         )
@@ -139,8 +148,8 @@ class CliTests(unittest.TestCase):
         payload = self._run(
             {
                 "findings": [
-                    {"subsystem": "supervisor", "round_index": 1, "authority_bearing": True, "late": True},
                     {"subsystem": "supervisor", "round_index": 2, "authority_bearing": True, "late": True},
+                    {"subsystem": "supervisor", "round_index": 3, "authority_bearing": True, "late": True},
                 ]
             }
         )
@@ -151,12 +160,38 @@ class CliTests(unittest.TestCase):
         payload = self._run(
             {
                 "findings": [
-                    {"subsystem": "s", "round_index": 1, "authority_bearing": True, "late": True},
                     {"subsystem": "s", "round_index": 2, "authority_bearing": True, "late": True},
+                    {"subsystem": "s", "round_index": 3, "authority_bearing": True, "late": True},
                 ]
             },
             threshold=3,
         )
+        self.assertFalse(payload["any_escalation"])
+
+    def test_cli_malformed_bool_fails_closed_to_escalation(self):
+        # Redmine #13967 F4: a JSON string "false" (which bool(...) would coerce to True)
+        # is not an exact bool -> the entry is malformed -> its subsystem fails closed to
+        # escalation, never silently dropped.
+        payload = self._run(
+            {
+                "findings": [
+                    {"subsystem": "sup", "round_index": 2, "authority_bearing": "false", "late": True},
+                ]
+            }
+        )
+        self.assertTrue(payload["any_escalation"])
+        self.assertIn("sup", payload["escalating_subsystems"])
+
+    def test_cli_no_history_is_not_a_no_escalation_verdict(self):
+        args = argparse.Namespace(
+            snapshot_json=None, threshold=None, unreadable_subsystem=None, as_json=True
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cmd_workflow_review_escalation(args)
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertFalse(payload["history_provided"])
         self.assertFalse(payload["any_escalation"])
 
 

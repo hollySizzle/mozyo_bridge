@@ -93,7 +93,20 @@ class SubsystemFinding:
 
     @property
     def counts_toward_escalation(self) -> bool:
-        return self.authority_bearing and self.late
+        """True only for a structurally-valid late authority finding (Redmine #13967 F4).
+
+        Requires ``authority_bearing`` AND ``late`` AND ``round_index >= 2``: a finding in
+        the FIRST round can never be "late" (nothing preceded it), so the canonical rule
+        "初回 round で捕捉された finding は late ではない" is enforced structurally here
+        rather than trusting the caller's ``late`` flag alone. ``round_index`` must be a real
+        int ``>= 2`` (a non-int / bool / < 2 does not count)."""
+        return (
+            self.authority_bearing
+            and self.late
+            and isinstance(self.round_index, int)
+            and not isinstance(self.round_index, bool)
+            and self.round_index >= 2
+        )
 
 
 @dataclass(frozen=True)
