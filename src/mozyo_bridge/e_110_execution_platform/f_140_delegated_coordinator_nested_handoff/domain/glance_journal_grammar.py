@@ -13,9 +13,10 @@ The boundary (j#74307):
   read-model adapter that interprets the *governed journal template* for display, and it
   produces no watcher events and mutates nothing.
 - **Only line-anchored ``## Gate: <kind>`` headings are read**, normalized (case /
-  surrounding whitespace / a trailing ``(...)`` qualifier / separators) and **exact-matched**
-  against a fixed allowlist. Natural-language body text, ambiguous substrings, and pane
-  scrollback are never consulted. A ``##`` heading without the ``Gate:`` label (a
+  surrounding whitespace / a trailing ``(...)`` qualifier / a bounded dash qualifier whose
+  left-hand lifecycle token is an exact allowlist match) and **exact-matched** against a fixed
+  allowlist. Natural-language body text, ambiguous substrings, and pane scrollback are never
+  consulted. A ``##`` heading without the ``Gate:`` label (a
   ``Progress Log`` / ``Handoff Delivery Record`` / ``Correction`` note) is structurally
   ignored — it is not a gate.
 - **Combined headings carry several explicit gate facts.** ``## Gate: Implementation Done +
@@ -71,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 _HEADING_GATE: dict[str, str] = {
     "start": GATE_START,
+    "implementation request": GATE_START,
     "implementation request dispatch": GATE_START,
     "wave rebalance dispatch decision": GATE_START,
     "dispatch": GATE_START,
@@ -153,6 +155,7 @@ _GATE_HEADING_RE = re.compile(r"^\s{0,3}#{2,}\s*Gate\s*[:：]\s*(?P<title>.+?)\s
 _TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
 _WS_RE = re.compile(r"\s+")
 _SPLIT_PLUS_RE = re.compile(r"\s*\+\s*")
+_BOUNDED_QUALIFIER_RE = re.compile(r"\s+[—–]\s+")
 
 # An explicit ``結論:`` (conclusion) field line inside an audit review journal. ASCII or
 # fullwidth colon; a leading list marker (``-`` / ``*``) is tolerated.
@@ -179,13 +182,30 @@ def _normalize_heading(title: str) -> str:
     return _WS_RE.sub(" ", title).strip().lower()
 
 
+def _strip_bounded_qualifier(part: str) -> str:
+    """Drop a spaced em/en-dash suffix only after an exact governed lifecycle token.
+
+    The left side must already be a complete allowlist entry (or an explicit collision
+    exclusion).  This intentionally does not perform prefix matching: near-matches remain
+    unknown instead of being promoted to workflow truth.
+    """
+
+    match = _BOUNDED_QUALIFIER_RE.search(part)
+    if not match:
+        return part
+    left = part[: match.start()].strip()
+    if left in _HEADING_GATE or left in _EXCLUDED_HEADINGS:
+        return left
+    return part
+
+
 def _gate_heading_parts(notes: str) -> Tuple[str, ...]:
     """Every normalized ``## Gate:`` heading part in one journal note (``+``-split; pure)."""
     parts: list[str] = []
     for match in _GATE_HEADING_RE.finditer(notes or ""):
         normalized = _normalize_heading(match.group("title"))
         for part in _SPLIT_PLUS_RE.split(normalized):
-            part = part.strip()
+            part = _strip_bounded_qualifier(part.strip())
             if part:
                 parts.append(part)
     return tuple(parts)

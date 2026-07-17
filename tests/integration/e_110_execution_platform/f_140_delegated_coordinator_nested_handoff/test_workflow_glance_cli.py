@@ -153,6 +153,15 @@ class ActiveLanesRedmineFoldTest(unittest.TestCase):
                         "issue": {"subject": "noise lane", "status": {"is_closed": False}},
                         "journals": [{"id": "1", "notes": "## Progress Log: hi"}],
                     },
+                    "13933": {
+                        "issue": {"subject": "partial recovery", "status": {"is_closed": False}},
+                        "journals": [
+                            {
+                                "id": "80938",
+                                "notes": "## Gate: Implementation Request — R6 partial recovery",
+                            }
+                        ],
+                    },
                 }
             ),
             encoding="utf-8",
@@ -192,6 +201,22 @@ class ActiveLanesRedmineFoldTest(unittest.TestCase):
         self.assertEqual(rows["13480"]["next_owner"], "coordinator")
         self.assertTrue(payload["degraded"])
         self.assertTrue(payload["notes"])
+
+    def test_qualified_implementation_request_is_concrete_start_gate(self):
+        rc, out = _run(
+            [
+                "workflow", "glance", "--active-lanes", "--json", "--no-ledger",
+                "--issue", "13933",
+                "--redmine-json", str(self.redmine),
+                "--store-path", str(self.store_path),
+            ]
+        )
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        row = payload["rows"][0]
+        self.assertEqual(row["workflow_state"], "implementing")
+        self.assertEqual(row["latest_journal"], "80938")
+        self.assertFalse(payload["degraded"])
 
     def test_source_unavailable_is_degraded_not_silent_empty(self):
         # An issue absent from the fixture -> the Redmine read raises -> a degraded unknown
