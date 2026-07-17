@@ -3699,6 +3699,53 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(slot.health, HEALTH_ATTESTATION_UNAVAILABLE)
         self.assertFalse(result.ok)
 
+    def test_unwrapped_launch_keeps_its_byte_invariant_capability_boundary(self) -> None:
+        # `herdr-native-identity.md` §4: the unwrapped fallback runs no wrapper, so the
+        # #13748 launcher-capability probe is skipped and that path stays byte-invariant.
+        # #13948 reports the unwrapped launch as `attestation_unavailable` (it cannot
+        # confirm a boot identity that will never be written) — but that is a REPORT about
+        # the launched pair, not a new preflight. Pin the boundary: no capability probe,
+        # no extra herdr write, and the pair is still live and still retirable.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(tmp, providers=["claude", "codex"], herdr=herdr)
+        self.assertFalse(herdr.attest_probes, "unwrapped launch ran a capability probe")
+        self.assertNotIn("agent-attest", herdr.start_argvs[0])
+        self.assertEqual(len(herdr.start_argvs), 2)  # both roles still launched
+        # Not a success — and not a hard failure either: the agents are live, the run
+        # simply cannot vouch for their boot identity. Nothing was closed.
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            {s.health for s in result.slots}, {HEALTH_ATTESTATION_UNAVAILABLE}
+        )
+        agent_locators = {s.locator for s in result.slots}
+        self.assertFalse({c[2] for c in herdr.pane_closes} & agent_locators)
+
+    def test_unwrapped_launch_does_not_burn_the_deadline(self) -> None:
+        # No record is coming, so waiting for one would be a lie about what is awaited.
+        # `attestation_unavailable` is terminal: it must short-circuit, not poll.
+        herdr = _Herdr()
+        naps = []
+        probe = StartupProbe(polls=9, interval=0.0, sleeper=lambda s: naps.append(s))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                prepare_session(
+                    repo_root=repo,
+                    providers=["claude"],
+                    lane_id="lane-1",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    probe=probe,
+                )
+        self.assertEqual(naps, [], "an unwrapped launch waited for a record that cannot come")
+
     def test_dry_run_is_ok_and_probes_nothing(self) -> None:
         # A dry run started nothing, so it has nothing to observe: it must not read panes
         # and must not be failed for lacking a health it could never have. (A dry run
@@ -3840,6 +3887,134 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
             # promises not to have.
             self.assertTrue(StartupTransactionFence(home=home).store_shape().absent)
         self.assertEqual(result.action_id, "")
+
+    def test_one_inventory_read_per_poll_round_regardless_of_role_count(self) -> None:
+        # Redmine #13948 correction (j#81034). `session-start` used to issue exactly ONE
+        # `agent list`, and callers reason about that call sequence — a per-slot-per-poll
+        # read made the count scale with the requested roles and broke them for real
+        # (test_sublane_actuator_herdr_ops heal postconditions). The count must be a
+        # function of how long the pair takes to come up, never of how many roles ran.
+        one = _Herdr()
+        two = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._wrapped(tmp, one, providers=("claude",))
+        with tempfile.TemporaryDirectory() as tmp:
+            self._wrapped(tmp, two, providers=("claude", "codex"))
+        lists_one = len([c for c in one.calls if c == ["agent", "list"]])
+        lists_two = len([c for c in two.calls if c == ["agent", "list"]])
+        self.assertEqual(
+            lists_one,
+            lists_two,
+            f"inventory reads scaled with role count: 1 role={lists_one}, 2 roles={lists_two}",
+        )
+        # pass 1 classify + exactly one healthy probe round.
+        self.assertEqual(lists_two, 2)
+
+    def test_a_healthy_pair_costs_exactly_one_probe_round(self) -> None:
+        # The deadline is spent only on genuinely transient states. A pair that is up must
+        # not pay for the bound that exists for one that is not.
+        herdr = _Herdr()
+        naps = []
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                extra_env=launcher_env,
+            )
+        self.assertFalse(naps)
+        self.assertEqual(len([c for c in herdr.calls if c == ["agent", "list"]]), 2)
+
+    def test_every_role_of_a_round_is_judged_against_one_snapshot(self) -> None:
+        # Reading per slot lets a pair be classified from two different views of the
+        # world, so "claude gone, codex live" could be an artifact of read ordering
+        # rather than a fact. One read per round makes that impossible by construction.
+        herdr = _Herdr()
+        snapshots = []
+        original = herdr.run
+
+        def _recording(argv, **kw):
+            result = original(argv, **kw)
+            if list(argv[1:]) == ["agent", "list"]:
+                snapshots.append(json.loads(result.stdout)["agents"])
+            return result
+
+        herdr.run = _recording
+        with tempfile.TemporaryDirectory() as tmp:
+            self._wrapped(tmp, herdr)
+        # pass 1 (empty) + one probe round that saw BOTH launched roles at once.
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(len(snapshots[-1]), 2)
+
+    def test_the_live_shape_reproduces_across_every_repo_and_home_the_issue_names(
+        self,
+    ) -> None:
+        # #13948 Acceptance 4. The live evidence was gathered twice — once on an unborn /
+        # dirty scratch repo (#13882 j#80951) and once after making it a clean root commit
+        # (j#80967-j#80969) — precisely because "the repo was dirty" was the hypothesis,
+        # and it was WRONG: the same provider-asymmetric failure reproduced either way.
+        # Pin that: repo shape and home shape are not inputs to this verdict.
+        import subprocess as _sp
+
+        def _git(repo, *args):
+            _sp.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"},
+            )
+
+        def _shape(repo_kind, home_kind):
+            herdr = _Herdr()
+            herdr.exit_after_start = {"claude"}  # the live Claude shape
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp) / "repo"
+                repo.mkdir()
+                if repo_kind == "clean_root_commit":
+                    _git(repo, "init", "-q")
+                    (repo / "anchor.txt").write_text("x", encoding="utf-8")
+                    _git(repo, "add", "-A")
+                    _git(repo, "commit", "-qm", "root")
+                elif repo_kind == "unborn_dirty":
+                    _git(repo, "init", "-q")
+                    (repo / "untracked.txt").write_text("x", encoding="utf-8")
+                home = Path(tmp) / "home"
+                home.mkdir()
+                if home_kind == "isolated_fresh":
+                    pass  # a brand-new store, like the isolated dogfood home
+                elif home_kind == "already_used":
+                    # A home that has already served a run (the "current home" axis).
+                    (home / "marker").write_text("x", encoding="utf-8")
+                binpath = Path(tmp) / "fake-herdr"
+                binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+                launcher_env, _ = self._fake_launcher_env(tmp)
+                env = _launch_env(binpath)
+                env.update(launcher_env)
+                herdr.attest_home = home
+                with patch.dict(
+                    os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+                ):
+                    return prepare_session(
+                        repo_root=repo,
+                        providers=["claude", "codex"],
+                        lane_id="lane-1",
+                        env=env,
+                        runner=herdr.run,
+                        probe=_FAST_PROBE,
+                    )
+
+        for repo_kind in ("clean_root_commit", "unborn_dirty", "no_git"):
+            for home_kind in ("isolated_fresh", "already_used"):
+                with self.subTest(repo=repo_kind, home=home_kind):
+                    result = _shape(repo_kind, home_kind)
+                    slots = self._by_provider(result)
+                    self.assertEqual(slots["claude"].health, HEALTH_PROVIDER_EXITED)
+                    self.assertEqual(slots["codex"].health, HEALTH_HEALTHY)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(slots["claude"].compensation, "rollback_owed")
 
     def test_health_axes_reach_the_json_payload(self) -> None:
         # The operator-facing surface must carry the cause, not just a boolean: `--json`
