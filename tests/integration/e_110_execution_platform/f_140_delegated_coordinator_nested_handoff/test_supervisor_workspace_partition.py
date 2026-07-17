@@ -51,6 +51,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MappingRedmineJournalSource,
+    RedmineJournalEntry,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
     SKIP_NO_ACTIVE_ISSUES,
@@ -313,6 +314,104 @@ class SendEdgeFenceBacklogTest(unittest.TestCase):
         self.assertEqual([r.journal for r in self.sender.calls], ["300"])  # j101 never sent
         self.assertGreaterEqual(ws_a.issues[0].historical_fenced, 1)
         self.assertEqual(self._state_by_journal()["101"], CALLBACK_UNCERTAIN)
+
+
+_A = "13811"
+_B = "13933"
+_MARK = "[mozyo:workflow-event:gate=review_request:conclusion=pending]"
+
+
+class _MultiIssueSource:
+    """A journal source keyed by issue (each issue's ``read_entries`` returns its own journals)."""
+
+    def __init__(self, by_issue) -> None:
+        self._by_issue = by_issue  # {issue: [journal_id, ...]}
+
+    def read_entries(self, issue_id):
+        return [
+            RedmineJournalEntry(issue_id=str(issue_id), journal_id=str(j), notes=_MARK)
+            for j in self._by_issue.get(str(issue_id), [])
+        ]
+
+
+class MultiIssueAnchorScopeTest(unittest.TestCase):
+    """Review R3-F1: each claimed row is judged by ITS issue's anchor, never a sibling's."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store_path = self.dir / "workflow-runtime.sqlite"
+        self.store = WorkflowRuntimeStore(path=self.store_path)
+        self.outbox = CallbackOutbox(path=self.store_path)
+        self.lease_store = SupervisorLeaseStore(path=self.dir / "supervisor-lease.sqlite")
+        self.sender = _RecordingSender()
+        self.ws = SupervisedWorkspace(workspace_id=WS_A, canonical_path=str(self.dir / "repoA"))
+
+    def _seed_pending(self, issue, journal):
+        src = MappingRedmineJournalSource(
+            payload={"issue": {"id": issue}, "journals": [{"id": str(journal), "notes": _MARK}]}
+        )
+        CallbackOutboxProcessor(self.outbox, src, workspace_id=WS_A).ingest(
+            [CallbackCandidate(issue, str(journal), "coordinator", workspace_id=WS_A)]
+        )
+
+    def _run(self, *, source_by_issue, anchors):
+        # Roster: both A and B are active lanes of WS_A; each owned by WS_A.
+        views = [
+            _View(_A, f"issue_{_A}", f"issue_{_A}", WS_A),
+            _View(_B, f"issue_{_B}", f"issue_{_B}", WS_A),
+        ]
+        sup = WorkspaceCallbackSupervisor(
+            holder="superX",
+            lease_store=self.lease_store,
+            store=self.store,
+            outbox=self.outbox,
+            workspaces_fn=lambda: [self.ws],
+            roster_fn=default_roster,
+            redmine_source_fn=lambda ws: _MultiIssueSource(source_by_issue),
+            sender_fn=lambda ws: self.sender,
+            clock=lambda: "2026-07-18T00:00:00+00:00",
+            authoritative_fn=lambda: {_A: WS_A, _B: WS_A},
+            candidate_fence_fn=lambda wsid, issue, source: anchors[issue],
+        )
+        with patch.multiple(
+            proj,
+            repo_backend_is_herdr=lambda repo_root: True,
+            herdr_sublane_views=lambda repo_root, **_kw: views,
+        ), patch.object(gss, "_lifecycle_disposition_by_unit", return_value={}):
+            report = sup.run_once()
+        return {w.workspace_id: w for w in report.workspaces}[WS_A]
+
+    def _state(self, issue, journal):
+        return {
+            (r.issue, r.journal): r.state for r in self.outbox.read()
+        }.get((issue, str(journal)))
+
+    def test_b_current_row_not_misfenced_by_a_newer_anchor(self) -> None:
+        # (a) A anchor j500 (newer) would fence B's current j200 (200<500) if mis-applied; with
+        # per-issue scoping B is judged by ITS anchor j100, so B j200 is current and delivered.
+        self._seed_pending(_B, "200")
+        ws = self._run(
+            source_by_issue={_A: ["600"], _B: ["200"]},
+            anchors={_A: "500", _B: "100"},
+        )
+        sent = {(r.issue, r.journal) for r in self.sender.calls}
+        self.assertIn((_B, "200"), sent)  # B current delivered, NOT fenced by A's anchor
+        self.assertEqual(self._state(_B, "200"), "delivered")
+
+    def test_b_historical_row_not_passed_by_a_older_anchor(self) -> None:
+        # (b) A anchor j100 (older) would pass B's historical j200 (200>=100) if mis-applied; with
+        # per-issue scoping B is judged by ITS anchor j500, so B j200 is historical and fenced.
+        self._seed_pending(_B, "200")
+        by = {w.issue: w for w in self._run(
+            source_by_issue={_A: ["150"], _B: ["600"]},
+            anchors={_A: "100", _B: "500"},
+        ).issues}
+        sent = {(r.issue, r.journal) for r in self.sender.calls}
+        self.assertNotIn((_B, "200"), sent)  # B historical NOT sent under A's older anchor
+        self.assertEqual(self._state(_B, "200"), CALLBACK_UNCERTAIN)  # fenced by B's own anchor
+        # (c) the fence is attributed to B's outcome, not A's.
+        self.assertGreaterEqual(by[_B].historical_fenced, 1)
+        self.assertEqual(by[_A].historical_fenced, 0)
 
 
 class DefaultAuthoritativeMapTest(unittest.TestCase):

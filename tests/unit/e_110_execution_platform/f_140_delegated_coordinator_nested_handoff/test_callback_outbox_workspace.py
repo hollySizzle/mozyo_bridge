@@ -41,6 +41,44 @@ def _key(ws: str) -> CallbackOutboxKey:
     )
 
 
+def _key_issue(ws: str, issue: str, journal: str = "75094") -> CallbackOutboxKey:
+    return CallbackOutboxKey(
+        source="redmine", issue=issue, journal=journal,
+        normalized_gate="implementation_done", callback_route="coordinator", workspace_id=ws,
+    )
+
+
+class OutboxIssuePartitionTest(unittest.TestCase):
+    """Redmine #13968 R3-F1: claim / recover can be scoped to a single issue within a workspace."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.outbox = CallbackOutbox(path=Path(self._tmp.name) / "wf.sqlite")
+
+    def test_claim_scoped_to_issue_leaves_siblings_pending(self):
+        self.outbox.enqueue(_key_issue("A", "111"))
+        self.outbox.enqueue(_key_issue("A", "222"))
+        claimed = self.outbox.claim_pending(workspace_id="A", issue="111")
+        self.assertEqual([r.issue for r in claimed], ["111"])  # only issue 111's row
+        pending = self.outbox.read(states=[CALLBACK_PENDING])
+        self.assertEqual([r.issue for r in pending], ["222"])  # sibling issue untouched
+
+    def test_claim_without_issue_is_workspace_wide_backcompat(self):
+        self.outbox.enqueue(_key_issue("A", "111"))
+        self.outbox.enqueue(_key_issue("A", "222"))
+        # issue=None (the default) keeps the workspace-wide claim (unchanged legacy behaviour).
+        self.assertEqual(len(self.outbox.claim_pending(workspace_id="A")), 2)
+
+    def test_recover_inflight_scoped_to_issue(self):
+        self.outbox.enqueue(_key_issue("A", "111"))
+        self.outbox.enqueue(_key_issue("A", "222"))
+        # Claim both into stale inflight (old claimed_at, no mark_sending).
+        self.outbox.claim_pending(workspace_id="A", now="2020-01-01T00:00:00+00:00")
+        recovered = self.outbox.recover_inflight(workspace_id="A", issue="111")
+        self.assertEqual([r.issue for r in recovered], ["111"])  # only issue 111 recovered
+
+
 class OutboxPartitionTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
