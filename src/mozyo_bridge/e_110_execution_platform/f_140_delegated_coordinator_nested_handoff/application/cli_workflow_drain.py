@@ -230,15 +230,18 @@ def _merge_release_pending(
 def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     """Derive drain lanes from a ``workflow glance --json`` envelope. ``(lanes, complete)``.
 
-    The canonical ``workflow glance --json`` producer ALWAYS emits ``rows`` and an exact-bool
-    ``degraded`` (``domain/workflow_glance.py::glance_payload``) and always appends
-    ``lifecycle_diagnostic`` (``cli_workflow_glance.py``). So this reader treats those three
-    keys as REQUIRED with exact types (Redmine #13967 R6-F2): a missing / present-null /
-    wrong-type ``rows`` / ``lifecycle_diagnostic`` (must be a list) or ``degraded`` (must be an
-    exact bool), or a ``degraded=True`` envelope, makes the projection durable-incomplete
-    (-> hold). Only the canonical empty envelope (both lists present + ``degraded: false``)
-    with no unreadable row is ``complete``. An unreadable row (non-dict / non-string identity
-    or state) also makes it incomplete rather than being silently dropped (R2-F2).
+    The canonical ``workflow glance --json`` producer ALWAYS emits ``rows``, an exact-bool
+    ``degraded`` and a ``notes`` ``list[str]`` (``domain/workflow_glance.py::glance_payload``)
+    and always appends ``lifecycle_diagnostic`` (``cli_workflow_glance.py``). So this reader
+    treats those four keys as REQUIRED with exact types (Redmine #13967 R6-F2 / R11-F1): a
+    missing / present-null / wrong-type ``rows`` / ``lifecycle_diagnostic`` / ``notes`` (must be
+    a list) or ``degraded`` (must be an exact bool), a ``degraded=True`` envelope, or a
+    ``degraded``/``notes`` pair that breaks the producer invariant ``degraded == bool(notes)``
+    (a source failure the envelope reported in ``notes`` but did not flag ``degraded``), makes
+    the projection durable-incomplete (-> hold). Only the canonical healthy empty envelope
+    (both lists present + ``degraded: false`` + ``notes: []``) with no unreadable row is
+    ``complete``. An unreadable row (non-dict / non-string identity or state) also makes it
+    incomplete rather than being silently dropped (R2-F2).
 
     Beyond identity / state, the reader validates the canonical row's **delivery-anomaly**
     dimension and the envelope's **cardinality / active-issue ownership** (Redmine #13967
@@ -273,6 +276,23 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     # healthy -> durable-incomplete (R6-F2). Only an exact `degraded: false` clears it.
     degraded = data.get("degraded", _MISSING)
     if not isinstance(degraded, bool) or degraded is True:
+        complete = False
+    # `notes` is a REQUIRED source-health field the canonical producer ALWAYS emits
+    # (`glance_payload` -> `notes: list(notes)`), and it is bound to `degraded` by a structural
+    # invariant: `GlanceCollection.degraded` is `bool(self.notes)` and every `_collect` /
+    # lifecycle-diagnostic source error appends a note AND sets `degraded=True` together, so the
+    # CLI output always satisfies `degraded == bool(notes)` with `notes` a list[str]. A missing
+    # / present-null / non-list / non-string-member `notes`, OR a `degraded`/`notes` pair that
+    # breaks the invariant (e.g. `degraded: false` with a NON-empty notes = a source failure the
+    # envelope reported but did not flag degraded), is a contradictory / lost-field canonical
+    # envelope -> durable-incomplete (hold). Only `degraded: false` + `notes: []` is healthy
+    # (Redmine #13967 R11-F1). A non-empty notes never releases early-hibernate retention.
+    notes_field = data.get("notes", _MISSING)
+    if not isinstance(notes_field, list) or not all(
+        isinstance(n, str) for n in notes_field
+    ):
+        complete = False
+    elif isinstance(degraded, bool) and degraded != bool(notes_field):
         complete = False
 
     active: list[DrainLane] = []
