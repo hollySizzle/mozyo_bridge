@@ -73,6 +73,90 @@ class IssueSelection:
     ignored_wake: tuple[str, ...]
 
 
+#: A supervised issue dropped because this workspace is not its authoritative owner (#13968 F1).
+DROP_NOT_AUTHORITATIVE = "not_authoritative_workspace"
+
+
+def authoritative_workspace_by_issue(
+    active_owners: Iterable[tuple[str, str]],
+) -> dict[str, str]:
+    """Map each issue to its SOLE actively-owning workspace, else omit it (Redmine #13968 F1).
+
+    ``active_owners`` is an iterable of ``(workspace_id, issue_id)`` pairs — one per durable active
+    owning lane (the lifecycle authority's active-disposition rows carrying a bound issue). An
+    issue owned by **exactly one** workspace maps to that workspace; an issue owned by **zero** or
+    by **two-or-more** workspaces is OMITTED — fail-closed: with no unique authoritative owner, no
+    workspace supervises it (zero-ingest/zero-deliver everywhere).
+
+    This is the cross-workspace, issue-level uniqueness the workspace-local roster filter cannot
+    provide: the callback outbox partitions its UNIQUE key by ``workspace_id`` (a legal separate
+    row per workspace), so the same issue appearing in two workspaces' live rosters would
+    otherwise ingest + deliver twice. The durable owning-lane authority — the registry-identity
+    source of truth, not the project name or a shared issue list — is what selects the one
+    authoritative workspace (Redmine #13968 acceptance 1/2/5).
+    """
+    owners: dict[str, set[str]] = {}
+    for ws, issue in active_owners:
+        w = str(ws or "").strip()
+        i = str(issue or "").strip()
+        if not w or not i:
+            continue
+        owners.setdefault(i, set()).add(w)
+    return {issue: next(iter(wss)) for issue, wss in owners.items() if len(wss) == 1}
+
+
+def partition_authoritative(
+    supervised: Iterable[str],
+    authoritative_by_issue: dict[str, str],
+    workspace_id: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split supervised issues into ``(kept, dropped)`` by authoritative ownership (#13968 F1).
+
+    ``kept`` are the issues this workspace uniquely owns
+    (``authoritative_by_issue[issue] == workspace_id``); ``dropped`` are the rest — owned by
+    another workspace, unowned, or ambiguous (absent from the map) — which this workspace does not
+    supervise. Order-preserving.
+    """
+    ws = str(workspace_id or "").strip()
+    kept = tuple(i for i in supervised if authoritative_by_issue.get(i) == ws)
+    dropped = tuple(i for i in supervised if authoritative_by_issue.get(i) != ws)
+    return kept, dropped
+
+
+def _as_journal_int(value: object) -> int | None:
+    """Parse a Redmine journal id to ``int`` for chronological compare (``None`` if non-numeric)."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def fence_candidates_to_anchor(candidates, anchor_journal):
+    """Keep only candidates on a journal >= the current dispatch anchor (Redmine #13968 F2).
+
+    ``anchor_journal`` is the current dispatch entry journal id — the owning journal of the current
+    ``implementation_request`` for the issue's owning lane + generation (Redmine journal ids are
+    monotonic, so a numerically OLDER candidate journal is a previous-generation gate). A candidate
+    at or after the anchor is current and kept; one older than the anchor is historical and dropped
+    (0-send). A ``None`` / blank / non-numeric anchor fails closed — every candidate is dropped —
+    so a resolver that cannot pin the current generation never lets historical (or any) markers
+    through. A candidate whose own journal is non-numeric is likewise dropped (fail-closed). Pure
+    and duck-typed on ``candidate.journal``. Returns ``(kept, dropped)``, order-preserving.
+    """
+    anchor = _as_journal_int(anchor_journal)
+    if anchor is None:
+        return (), tuple(candidates)
+    kept: list = []
+    dropped: list = []
+    for candidate in candidates:
+        journal = _as_journal_int(getattr(candidate, "journal", ""))
+        if journal is not None and journal >= anchor:
+            kept.append(candidate)
+        else:
+            dropped.append(candidate)
+    return tuple(kept), tuple(dropped)
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -119,6 +203,10 @@ class IssueSupervisionOutcome:
     recovered: int = 0
     pending: int = 0
     dead_letter: int = 0
+    #: General callback candidates dropped by the latest-generation dispatch-anchor fence (#13968
+    #: F2): historical (previous-generation) gate journals that would otherwise re-enqueue and
+    #: re-deliver. Surfaced so a fenced zero-send is operator-visible, not a silent drop.
+    historical_fenced: int = 0
     error: str = ""
     #: The fixed-vocabulary review_result-return refusal reasons for this issue (#13684 review R1-F3):
     #: why a correlated return was NOT reserved (missing / ambiguous owner, self-route, stale, blank
@@ -134,6 +222,7 @@ class IssueSupervisionOutcome:
             "recovered": self.recovered,
             "pending": self.pending,
             "dead_letter": self.dead_letter,
+            "historical_fenced": self.historical_fenced,
             "error": self.error,
             "review_return_refusals": list(self.review_return_refusals),
         }
@@ -148,6 +237,10 @@ class WorkspaceSupervisionOutcome:
     lease_reason: str
     supervised_issues: tuple[str, ...] = ()
     ignored_wake_issues: tuple[str, ...] = ()
+    #: Roster issues dropped because this workspace is not their authoritative owner (#13968 F1):
+    #: another workspace owns the issue, or ownership is absent / ambiguous. Surfaced (not silently
+    #: dropped) so a fail-closed zero-supervise is operator-visible in the report.
+    non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
 
@@ -166,6 +259,7 @@ class WorkspaceSupervisionOutcome:
             "lease_reason": self.lease_reason,
             "supervised_issues": list(self.supervised_issues),
             "ignored_wake_issues": list(self.ignored_wake_issues),
+            "non_authoritative_issues": list(self.non_authoritative_issues),
             "skipped_reason": self.skipped_reason,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
@@ -289,6 +383,10 @@ __all__ = (
     "SKIP_ROSTER_UNREADABLE",
     "SKIP_NO_ACTIVE_ISSUES",
     "SKIP_LEASE_LOST",
+    "DROP_NOT_AUTHORITATIVE",
+    "authoritative_workspace_by_issue",
+    "partition_authoritative",
+    "fence_candidates_to_anchor",
     "IssueSelection",
     "select_supervised_issues",
     "IssueSupervisionOutcome",

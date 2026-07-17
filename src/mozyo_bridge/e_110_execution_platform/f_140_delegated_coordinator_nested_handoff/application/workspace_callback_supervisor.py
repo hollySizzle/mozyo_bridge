@@ -76,6 +76,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IssueSupervisionOutcome,
     SupervisorReport,
     WorkspaceSupervisionOutcome,
+    authoritative_workspace_by_issue,
+    fence_candidates_to_anchor,
+    partition_authoritative,
     select_supervised_issues,
 )
 
@@ -167,6 +170,10 @@ class WorkspaceCallbackSupervisor:
         release_after: bool = True,
         callback_route: str = DEFAULT_CALLBACK_ROUTE,
         reconcile_leg_fn: Optional[Callable[[str, str, object], object]] = None,
+        authoritative_fn: Optional[Callable[[], dict[str, str]]] = None,
+        candidate_fence_fn: Optional[
+            Callable[[str, str, Optional[RedmineJournalSource]], Optional[str]]
+        ] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -193,6 +200,22 @@ class WorkspaceCallbackSupervisor:
         # drain, on the same lease/wake path. Optional so the callback-only supervisor
         # (pre-#13758) is unchanged; the production leg is wired in build_supervisor.
         self._reconcile_leg_fn = reconcile_leg_fn
+        # Redmine #13968 review F1: the authoritative-workspace resolver. Returns a home-global
+        # ``{issue -> sole actively-owning workspace}`` map from the durable lifecycle authority.
+        # When wired, each workspace supervises ONLY the issues it uniquely owns (an issue owned by
+        # another workspace, unowned, or ambiguously owned is dropped — zero-ingest/zero-deliver).
+        # Optional so a supervisor without a lifecycle authority (unit fakes) is unchanged; the
+        # production resolver is wired in build_supervisor.
+        self._authoritative_fn = authoritative_fn
+        # Redmine #13968 review F2: the latest-generation dispatch-anchor resolver. Given
+        # ``(workspace_id, issue, source)`` it returns the current dispatch entry journal id (the
+        # owning journal of the current implementation_request for the issue's owning lane +
+        # generation), or ``None`` when it cannot be pinned. General callback candidates on a
+        # journal OLDER than that anchor are historical (previous-generation) replay and are fenced
+        # (0-send); ``None`` fails closed (all general candidates dropped). Optional so a supervisor
+        # without the fence (unit fakes) is unchanged; the production resolver is wired in
+        # build_supervisor.
+        self._candidate_fence_fn = candidate_fence_fn
 
     # -- public entrypoint -------------------------------------------------
 
@@ -218,11 +241,25 @@ class WorkspaceCallbackSupervisor:
         mode) is the loss recovery: a dropped wake is still caught because the roster is re-read.
         """
         wake_by_ws = _group_wake_hints(wake_hints)
+        # Redmine #13968 F1: resolve the authoritative-workspace map ONCE per sweep (a single
+        # home-global lifecycle read), so every workspace's authoritative filter reads the same
+        # durable owner snapshot. ``None`` (no resolver wired) disables the filter — the pre-#13968
+        # / unit-fake behaviour. A resolver failure fails closed to an empty map (every issue then
+        # has no authoritative owner -> supervised nowhere), never a crash of the sweep.
+        authoritative: Optional[dict[str, str]] = None
+        if self._authoritative_fn is not None:
+            try:
+                authoritative = dict(self._authoritative_fn() or {})
+            except Exception:  # noqa: BLE001 - an owner-map read never breaks the sweep
+                authoritative = {}
         outcomes: list[WorkspaceSupervisionOutcome] = []
         for ws in self._workspaces_fn():
             outcomes.append(
                 self._supervise_workspace(
-                    ws, mode=mode, wake_issues=wake_by_ws.get(ws.workspace_id, ())
+                    ws,
+                    mode=mode,
+                    wake_issues=wake_by_ws.get(ws.workspace_id, ()),
+                    authoritative=authoritative,
                 )
             )
         return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
@@ -244,7 +281,12 @@ class WorkspaceCallbackSupervisor:
     # -- per-workspace -----------------------------------------------------
 
     def _supervise_workspace(
-        self, ws: SupervisedWorkspace, *, mode: str, wake_issues: Sequence[str]
+        self,
+        ws: SupervisedWorkspace,
+        *,
+        mode: str,
+        wake_issues: Sequence[str],
+        authoritative: Optional[dict[str, str]] = None,
     ) -> WorkspaceSupervisionOutcome:
         wsid = str(ws.workspace_id or "").strip()
         # A FRESH clock per workspace (R1-F1): a single sweep-start clock would make a later
@@ -278,12 +320,24 @@ class WorkspaceCallbackSupervisor:
                     skipped_reason=SKIP_ROSTER_UNREADABLE,
                 )
             selection = select_supervised_issues(roster, mode=mode, wake_issues=wake_issues)
-            if not selection.supervised:
+            # Redmine #13968 F1: keep only the issues THIS workspace uniquely owns per the durable
+            # lifecycle authority. An issue owned by another workspace, unowned, or ambiguously
+            # owned is dropped and surfaced (``non_authoritative_issues``) — so the same issue is
+            # never supervised (ingested / delivered) from two workspaces. When no authoritative
+            # resolver is wired the roster is unchanged (pre-#13968 / unit-fake behaviour).
+            if authoritative is not None:
+                supervised, non_authoritative = partition_authoritative(
+                    selection.supervised, authoritative, wsid
+                )
+            else:
+                supervised, non_authoritative = selection.supervised, ()
+            if not supervised:
                 return WorkspaceSupervisionOutcome(
                     workspace_id=wsid,
                     lease_acquired=True,
                     lease_reason=lease.reason,
                     ignored_wake_issues=selection.ignored_wake,
+                    non_authoritative_issues=non_authoritative,
                     skipped_reason=SKIP_NO_ACTIVE_ISSUES,
                 )
             source = self._redmine_source_fn(ws)
@@ -291,7 +345,7 @@ class WorkspaceCallbackSupervisor:
             binding = self._binding_fn(ws) if self._binding_fn is not None else None
             issue_outcomes: list[IssueSupervisionOutcome] = []
             lease_lost = False
-            for index, issue in enumerate(selection.supervised):
+            for index, issue in enumerate(supervised):
                 # Issue-boundary renew fence (R1-F1): before each issue's side-effects (after the
                 # first, which the acquire above already fenced) re-establish lease ownership with a
                 # FRESH clock. renew() is holder-conditional: it returns False iff another supervisor
@@ -314,8 +368,9 @@ class WorkspaceCallbackSupervisor:
                 workspace_id=wsid,
                 lease_acquired=True,
                 lease_reason=lease.reason,
-                supervised_issues=selection.supervised,
+                supervised_issues=supervised,
                 ignored_wake_issues=selection.ignored_wake,
+                non_authoritative_issues=non_authoritative,
                 issues=tuple(issue_outcomes),
                 skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
             )
@@ -346,6 +401,7 @@ class WorkspaceCallbackSupervisor:
         events_supplied = 0
         error = ""
         candidates = ()
+        historical_fenced = 0
         review_return_refusals: tuple[str, ...] = ()
         try:
             if source is not None:
@@ -360,6 +416,19 @@ class WorkspaceCallbackSupervisor:
                         target_lane=target_lane, target_receiver=target_receiver,
                     )
                 )
+                # Redmine #13968 F2: fence the GENERAL coordinator candidates to the issue's current
+                # generation. ``discover_candidates`` yields a candidate for EVERY handoff-worthy
+                # gate marker in the issue journal — including historical gates from previous lane
+                # incarnations. Bind them to the owning lane's current dispatch anchor (the owning
+                # journal of the current implementation_request for the owning lane + generation):
+                # a candidate on a journal OLDER than that anchor is previous-generation replay and
+                # is dropped (0-send); an unresolvable anchor fails closed (all general candidates
+                # dropped). The correlated review_return candidates below carry their OWN
+                # generation fence (#13684) and are appended AFTER this fence, so they are unaffected.
+                if self._candidate_fence_fn is not None:
+                    anchor = self._candidate_fence_fn(workspace_id, issue, source)
+                    candidates, fenced = fence_candidates_to_anchor(candidates, anchor)
+                    historical_fenced = len(fenced)
                 # #13684: reserve the correlated review_result return to the issue's owning-lane
                 # Codex gateway. The pure policy (:func:`...review_return_route.plan_review_returns`)
                 # consults the durable owning-lane binding + the latest-review fence; only a returnable
@@ -398,6 +467,7 @@ class WorkspaceCallbackSupervisor:
         ):
             return IssueSupervisionOutcome(
                 issue=issue, events_supplied=events_supplied, error=ISSUE_LEASE_LOST,
+                historical_fenced=historical_fenced,
                 review_return_refusals=review_return_refusals,
             )
 
@@ -409,6 +479,7 @@ class WorkspaceCallbackSupervisor:
         except Exception:  # noqa: BLE001 - a store / send failure is recorded, not fatal to the sweep
             return IssueSupervisionOutcome(
                 issue=issue, events_supplied=events_supplied, error=error or ISSUE_PASS_ERROR,
+                historical_fenced=historical_fenced,
                 review_return_refusals=review_return_refusals,
             )
 
@@ -432,6 +503,7 @@ class WorkspaceCallbackSupervisor:
             recovered=len(deliver.get("recovered") or []),
             pending=len(sweep.get("pending") or []),
             dead_letter=len(sweep.get("dead_letter") or []),
+            historical_fenced=historical_fenced,
             error=error,
             review_return_refusals=review_return_refusals,
         )
@@ -524,6 +596,34 @@ def default_roster(ws: SupervisedWorkspace) -> tuple[tuple[str, ...], str]:
         dict.fromkeys(str(issue).strip() for issue, _lane in roster if str(issue).strip())
     )
     return issues, (error or "")
+
+
+def default_authoritative_map(lifecycle_store: object) -> dict[str, str]:
+    """The home-global ``{issue -> sole actively-owning workspace}`` map (Redmine #13968 F1).
+
+    Reads every lifecycle row via the NON-migrating reader (``lifecycle_store.records()``) and
+    keeps the ACTIVE-disposition rows carrying a bound issue as ``(workspace_id, issue)``
+    active-owner pairs, then resolves each issue's unique authoritative workspace
+    (:func:`...domain.workspace_supervisor.authoritative_workspace_by_issue`): an issue actively
+    owned by exactly one workspace maps to it; zero / two-or-more owners is omitted (supervised
+    nowhere — fail-closed). An unreadable lifecycle store yields an empty map (no authoritative
+    owner anywhere), never a crash. This is the durable owning-lane authority — the registry
+    identity source of truth — that selects the one authoritative workspace per issue, so a foreign
+    / stale registry workspace (or a duplicate live lane) never double-delivers a shared issue.
+    """
+    from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_ACTIVE
+
+    try:
+        records = lifecycle_store.records()
+    except Exception:  # noqa: BLE001 - an owner read never breaks the sweep
+        return {}
+    active_owners = [
+        (rec.repo_workspace_id, rec.issue_id)
+        for rec in records
+        if str(getattr(rec, "lane_disposition", "") or "").strip() == DISPOSITION_ACTIVE
+        and str(getattr(rec, "issue_id", "") or "").strip()
+    ]
+    return authoritative_workspace_by_issue(active_owners)
 
 
 def default_redmine_source(
@@ -815,6 +915,24 @@ def build_supervisor(
         except Exception:  # noqa: BLE001 - an unreadable dispatch anchor baselines fail-safe
             return ""
 
+    def _candidate_fence_fn(
+        workspace_id: str, issue: str, source: object
+    ) -> Optional[str]:
+        """The issue's current dispatch anchor journal for the general-callback fence (#13968 F2).
+
+        Resolves the issue's owning lane + generation (``_lane_facts``) then its current dispatch
+        entry journal (``_dispatch_anchor_fn`` — the owning journal of the current
+        ``implementation_request``). Returns that journal id, or ``None`` when the owning lane or
+        the anchor cannot be pinned (no owner / legacy prose-only IR): the fence then drops every
+        general candidate (fail-closed), so no historical marker is delivered under an
+        unresolvable current generation.
+        """
+        lane_id, generation, _disposition = _lane_facts(workspace_id, issue)
+        if not lane_id:
+            return None
+        anchor = _dispatch_anchor_fn(source, issue, lane_id, generation)
+        return anchor or None
+
     reconcile_leg_fn = build_reconcile_leg_fn(
         reconcile_store=reconcile_store,
         outbox=outbox,
@@ -839,6 +957,8 @@ def build_supervisor(
         release_after=release_after,
         lease_ttl_seconds=lease_ttl_seconds,
         reconcile_leg_fn=reconcile_leg_fn,
+        authoritative_fn=lambda: default_authoritative_map(lifecycle_store),
+        candidate_fence_fn=_candidate_fence_fn,
     )
 
 
@@ -852,6 +972,7 @@ __all__ = (
     "review_round_send_fence",
     "default_workspaces",
     "default_roster",
+    "default_authoritative_map",
     "default_redmine_source",
     "default_target_resolver",
     "default_background_transport",
