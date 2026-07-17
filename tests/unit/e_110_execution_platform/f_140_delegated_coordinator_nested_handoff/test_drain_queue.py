@@ -888,56 +888,59 @@ class CliTests(unittest.TestCase):
         ):
             self.assertIsNone(_delivery_ledger())
 
-    def test_live_identity_notes_pure(self):
-        # Redmine #13967 R12-F1: the raw-identity validator mirrors the --from-glance reader's
-        # collection invariants on the live roster + diagnostic. Healthy distinct identities
-        # raise no note; a duplicate active issue / active identity / diagnostic identity, or an
-        # active/diagnostic collision, each raises at least one note (-> degraded -> hold).
+    def test_live_diagnostic_report_pure(self):
+        # Redmine #13967 R12-F1 / R14-F2 / R15-F1: the raw normalize+validate pass mirrors the
+        # --from-glance reader's collection invariants on the live roster + diagnostic AND emits
+        # the normalized release rows the projection folds — one parse, no drift. Returns
+        # (notes, release_rows). Healthy distinct identities raise no note; each contradiction
+        # (dup active issue / identity, dup diagnostic identity, active/diagnostic collision,
+        # empty identity, out-of-vocab disposition/release) raises a note (-> degraded -> hold).
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain import (
-            _live_identity_notes,
+            _live_diagnostic_report,
         )
 
-        self.assertEqual(
-            _live_identity_notes((("9", "la"),), (("8", "lb", "retired", "released"),)), []
-        )
-        self.assertTrue(_live_identity_notes((("9", "la"), ("9", "lb")), ()))  # dup active issue
-        self.assertTrue(_live_identity_notes((("9", "la"), ("9", "la")), ()))  # dup active identity
+        def notes(roster, diag):
+            return _live_diagnostic_report(roster, diag)[0]
+
+        def releases(roster, diag):
+            return _live_diagnostic_report(roster, diag)[1]
+
+        self.assertEqual(notes((("9", "la"),), (("8", "lb", "retired", "released"),)), [])
+        self.assertTrue(notes((("9", "la"), ("9", "lb")), ()))  # dup active issue
+        self.assertTrue(notes((("9", "la"), ("9", "la")), ()))  # dup active identity
         self.assertTrue(  # dup diagnostic identity
-            _live_identity_notes(
+            notes(
                 (("9", "la"),),
                 (("8", "lb", "retired", "requested"), ("8", "lb", "hibernated", "released")),
             )
         )
         self.assertTrue(  # active/diagnostic collision
-            _live_identity_notes((("9", "la"),), (("9", "la", "hibernated", "requested"),))
+            notes((("9", "la"),), (("9", "la", "hibernated", "requested"),))
         )
         # Redmine #13967 R13-F2: an empty active issue, or an empty diagnostic issue/lane (a
-        # real unbound lane), is an unattributable identity -> flagged (-> degraded -> hold),
-        # symmetric with the from-glance reader's required non-empty identity.
-        self.assertTrue(_live_identity_notes((("", "la"),), ()))  # empty active issue
-        self.assertTrue(  # empty diagnostic issue (unbound lane)
-            _live_identity_notes((("9", "la"),), (("", "unbound-lane", "hibernated", "requested"),))
-        )
-        self.assertTrue(  # empty diagnostic lane
-            _live_identity_notes((("9", "la"),), (("8", "", "retired", "requested"),))
-        )
+        # real unbound lane), is an unattributable identity -> flagged.
+        self.assertTrue(notes((("", "la"),), ()))  # empty active issue
+        self.assertTrue(notes((("9", "la"),), (("", "unbound-lane", "hibernated", "requested"),)))
+        self.assertTrue(notes((("9", "la"),), (("8", "", "retired", "requested"),)))
         # Redmine #13967 R14-F2: an out-of-vocabulary lane_disposition or process_release is
-        # flagged (the lifecycle store cannot enforce the closed vocab, so the reader must),
-        # symmetric with the from-glance _NON_ACTIVE_DISPOSITIONS / RELEASE_STATES checks.
-        self.assertTrue(  # invalid disposition
-            _live_identity_notes((("9", "la"),), (("8", "lb", "bogus", "requested"),))
+        # flagged, symmetric with the from-glance _NON_ACTIVE_DISPOSITIONS / RELEASE_STATES.
+        self.assertTrue(notes((("9", "la"),), (("8", "lb", "bogus", "requested"),)))
+        self.assertTrue(notes((("9", "la"),), (("8", "lb", "hibernated", "bogus_release"),)))
+        self.assertTrue(notes((("9", "la"),), (("8", "lb", "active", "requested"),)))
+        self.assertEqual(notes((("9", "la"),), (("8", "lb", "retired", "released"),)), [])
+
+        # Redmine #13967 R15-F1: the release rows are produced from the SAME normalized pass, so
+        # a whitespace-padded requested row validates clean AND surfaces as a normalized release
+        # row (no drift). A released/not_requested row is valid but yields NO release row; an
+        # invalid-vocab row yields a note and no release row.
+        n, rel = _live_diagnostic_report(
+            (("9", "la"),), ((" 7 ", " lane ", " hibernated ", " requested "),)
         )
-        self.assertTrue(  # invalid process_release
-            _live_identity_notes((("9", "la"),), (("8", "lb", "hibernated", "bogus_release"),))
-        )
-        # an active disposition on the diagnostic roster is also out-of-vocab (non-active only)
-        self.assertTrue(
-            _live_identity_notes((("9", "la"),), (("8", "lb", "active", "requested"),))
-        )
-        # a fully-valid non-active released row raises no note
-        self.assertEqual(
-            _live_identity_notes((("9", "la"),), (("8", "lb", "retired", "released"),)), []
-        )
+        self.assertEqual(n, [])
+        self.assertEqual(rel, [("7", "lane")])  # normalized tokens, not raw
+        self.assertEqual(releases((("9", "la"),), (("8", "lb", "hibernated", "partial"),)), [("8", "lb")])
+        self.assertEqual(releases((("9", "la"),), (("8", "lb", "retired", "released"),)), [])
+        self.assertEqual(releases((("9", "la"),), (("8", "lb", "bogus", "requested"),)), [])
 
     def test_live_path_identity_contradiction_holds_with_durable_facts(self):
         # Redmine #13967 R12-F1: with durable facts present (so the fold is NOT degraded on its
@@ -986,6 +989,12 @@ class CliTests(unittest.TestCase):
         payload = run((("9", "la"),), (("8", "lb", "hibernated", "requested"),))
         self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
         self.assertEqual(payload["release_dogfood_pending"], 1)
+        # Redmine #13967 R15-F1: a whitespace-padded requested row validates clean AND still
+        # surfaces as a release_dogfood lane (the validator and the release projection share one
+        # normalized pass) -- it must NOT silently vanish.
+        payload = run((("9", "la"),), ((" 8 ", " lb ", " hibernated ", " requested "),))
+        self.assertEqual(payload["release_dogfood_pending"], 1)
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
 
     def test_live_path_holds_on_real_empty_issue_diagnostic(self):
         # Redmine #13967 R13-F2: a REAL unbound lane (LaneLifecycleStore.declare_active with
