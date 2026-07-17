@@ -508,6 +508,33 @@ Table naming:
       zero-write で拒否する。`--retire-hibernated-bound` は `--execute` / `--migrate-hibernated-legacy` /
       `--reconcile-hibernated-live` と競合する destructive intent ゆえ **2 つ以上の同時指定は command-time zero-write
       error**。
+    - **record-less scratch pair retire は本 component を書かない** (`herdr session-retire`、#13892、live evidence #13882
+      j#80060 / j#80066)。`herdr session-start` の scratch pair は lane lifecycle row を **一度も持たない**ため、上記 4 契約
+      (#13754 guarded close / #13841 migration / #13842 reconcile / #13845 bound retire) は **すべて row の存在を前提**に
+      しており構造的に拒否する: `--execute` は `attest_retire_target` が `record is None` で `lane_owner_unverified`、
+      他 3 者は `lane_not_declared` / `CAS_UNEXPECTED_STATE`。4 契約の間に収束経路が無く恒久停止する点は #13841 / #13842 /
+      #13845 と同型だが、**解法は反対側**にある: row を作らない。★**row 捏造は却下** (#13882 j#80066): retire を通すためだけに
+      lifecycle row を mint するのは durable authority の fabrication であり、`operator_current_state` の復旧契約
+      (Redmine からの explicit re-declare) を偽の row で汚す。★**row が不要な理由は capacity 経路が live pane 由来だから**:
+      `enumerate_active_lanes` は herdr live pane を畳んで roster を作り、lifecycle disposition は **非 active を除外する
+      filter** としてのみ効く (`glance_snapshot_source.py`)。row を持たない unit は disposition `None` ゆえ roster に残り、
+      **pane が消えること自体**が唯一かつ十分な capacity 回収手段である。∴ 本 rail の durable outcome は lifecycle authority では
+      なく `managed_events` の audit record (retirement を *説明* するものであって *引き起こす* ものではない)。★signature は
+      **「lifecycle record が無いこと」** で、record を持つ lane は `lane_record_present` zero-write で既存 surface へ route する
+      (各 surface が自らの signature を literal に述べる規律の適用。共有 predicate へ一般化しない)。lifecycle store が **不読**の
+      場合は「record 無し」と読まず fail-closed。★**attestation を要求しない** (#13892 j#80483、#13842 の意図的反転):
+      #13842 が attestation を要るのは generation-bound pin を row へ **write** するためだが、scratch pair は row も generation も
+      持たず attestation は構造的に取得不能 (session-start は self-attest 前に pane を返す)。要求すれば本 rail が対象とする唯一の
+      shape (live-but-unattested = #13882 の保全 pair そのもの) を恒久 retire 不能にし、**over-block による恒久 stuck**
+      (#13845 が名指しした defect 再生産) を作る。identity は assigned-name の injective encoding + uniqueness
+      (`session-start` が重複名で fail-closed) + foreign 不在 + duplicate 不在 + locator 一意で証明する。★**partial close は
+      block せず resume** (#13847 R1-F1 と同型): 前 run で閉じた slot は positive absence として観測し残りを閉じる。#13842 の
+      `pair_incomplete` block を踏襲すると中断した retire が恒久 stuck になる。acceptance 2 の「expected slot ちょうど 2」は
+      **expected set (binding の gateway + worker)** の濃度であって観測 live 数ではない (観測は 2/1/0 を取りうる)。★raw scan
+      (`expected_slot_rows`) を併読し duplicate は **canonical slot key** で数える (#13845 j#80148 / j#80187 R3-F1 と同じ規律)。
+      ★deadness の positive 証明のみで進む: `classify_named_slot` が `SLOT_STALE` と積極判定した shell residue は agent 不在ゆえ
+      turn / composer を持たず close 可 (runtime `unknown` だけで block すると residue が恒久残留する)。process mutation は
+      **自 pair の pin-matched close のみ**で、worktree/branch 削除・launch/resume・store 直接 mutation は伴わない。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。

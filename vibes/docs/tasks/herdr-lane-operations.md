@@ -105,6 +105,20 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
 3. worktree / local branch の除去は **統合後** (`git worktree remove` + `git branch -d|-D`)。remote branch は削除しない。
 
+## scratch pair retire (session-start の逆操作)
+
+`herdr session-start` が作る scratch pair は **lane lifecycle record を持たない**。ゆえに上記 `sublane retire` の全契約が構造的に拒否し (`--execute` は `attest_retire_target` が `record is None` で `lane_owner_unverified`、`--retire-hibernated-bound` / `--reconcile-hibernated-live` / `--migrate-hibernated-legacy` は既存 `hibernated` row 前提で `lane_not_declared`、`recover-pair` は declared pins 前提)、public rail が無いまま capacity を専有し続ける (実証: #13882 j#80060 / j#80066 の保全 `dogfood13882` pair)。この隙間を埋める public rail が `herdr session-retire` (#13892)。
+
+- `mozyo-bridge herdr session-retire --lane <label> --repo <root> [--json]` → **read-only preflight** (verdict のみ。close も write もしない)。
+- `... --execute` → 明示の destructive intent。**対象 scratch pair の slot のみ** close する。
+- identity は `session-start` と同じ durable な **assigned name** (`encode_assigned_name(workspace, role, lane)`) の exact 一致。pane / locator を引数で渡す口は無く、label-only / focus 依存の選択もできない。
+- **本 rail の signature は「lifecycle record が無いこと」**。record を持つ lane は `lane_record_present` で zero-write 拒否し、既存 `sublane retire` 系へ route する (逆に、record を持たない pair は既存系が拒否する)。**retire を通すための lifecycle row 捏造は行わない** (#13882 j#80066 が却下した案)。capacity は `enumerate_active_lanes` が live pane を畳んで数えるため、**pane が消えること自体**が capacity 回収であり row は不要。durable outcome は `managed_events` の audit record。
+- fail-closed 軸: inventory unreadable / duplicate assigned name / foreign occupant / locator 欠落 / busy agent / pending composer / 同一 locator への衝突 → すべて **zero-close**。
+- **default lane は拒否** (coordinator pair は対象外)。他 lane は plan の unit scoping で構造的に対象外。
+- **partial close は replay 可能**: 前回 run で閉じた slot は positive absence として観測され、残りを閉じる。2 回目の run は `absent` (idempotent, zero-close)。
+- attestation は要求 **しない** (#13892 j#80483): scratch pair は generation / lifecycle row を持たず attestation は構造的に取得不能で、要求すると本 rail が対象とする唯一の shape (live-but-unattested) を恒久 retire 不能にする。identity は assigned-name 一致 + foreign 不在 + duplicate 不在 + locator 一意で証明する。
+- worktree / branch 除去、process launch / resume、raw herdr / tmux、store 直接 mutation は伴わない。
+
 ## 統合 (integration disposition)
 
 - 単一 lane が origin/main 直上 (ff 可) → operator の `git push origin <hash>:main` 一発。

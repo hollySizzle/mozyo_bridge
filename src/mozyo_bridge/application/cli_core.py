@@ -882,6 +882,16 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     )
 
     register_herdr_attestation_store_parser(herdr_sub, add_repo_option=add_repo_option)
+    # `session-retire` (Redmine #13892) is the inverse of `session-start`: the public
+    # guarded retirement of the exact scratch pair it mints. A session-start pair carries
+    # no lane lifecycle record, so every `sublane retire` contract refuses it structurally
+    # and it leaks capacity forever (#13882 j#80060 / j#80066). Same feature-local parser
+    # precedent, so this near-ceiling module gains no flags.
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire_cli import (  # noqa: E501
+        register_herdr_session_retire_parser,
+    )
+
+    register_herdr_session_retire_parser(herdr_sub, add_repo_option=add_repo_option)
     herdr_session_start = herdr_sub.add_parser(
         "session-start",
         help=(
