@@ -99,12 +99,12 @@ class DispatchOutboxCoveredTest(_Home):
         self.assertEqual([o.verdict for o in found], [UNCORRELATED])
         # positively discharged -> does not block
         found = dispatch_outbox_obligations(
-            workspace_id=WS, assigned_names=(NAME,), correlate=lambda i, j: True
+            workspace_id=WS, assigned_names=(NAME,), correlate=lambda row: True
         )
         self.assertEqual(found, ())
         # positively not finished -> owed
         found = dispatch_outbox_obligations(
-            workspace_id=WS, assigned_names=(NAME,), correlate=lambda i, j: False
+            workspace_id=WS, assigned_names=(NAME,), correlate=lambda row: False
         )
         self.assertEqual([o.verdict for o in found], [OWED])
 

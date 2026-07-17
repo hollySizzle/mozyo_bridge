@@ -59,6 +59,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_ALREADY,
     REDISPATCH_DELIVERED,
     REDISPATCH_FAILED,
+    REDISPATCH_TARGET_RETIRING,
     REDISPATCH_UNCERTAIN,
     HibernatedPairRecoveryOps,
     SublaneRecoverPairUseCase,
@@ -363,7 +364,23 @@ class LiveHibernatedPairRecoveryOps:
             if reserve.needs_reconcile or reserve.current_state == "uncertain":
                 return REDISPATCH_UNCERTAIN
             return REDISPATCH_ALREADY
-        # We won the reserve: send the ORIGINAL implementation_request to the gateway once.
+        # We won the reserve. Before resolving a locator or sending, the shared retirement
+        # guard (Redmine #13892 R6-F3): this is a reserve -> send edge like every other, and
+        # `target_is_retiring`'s own docstring already named this call site. A send into panes
+        # a retirement transaction is closing either lands in a doomed pane or races the
+        # close, so the reserve is cancelled — never left reserved, which would read as an
+        # unresolved send fate and block the retirement it just deferred to.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
+            target_is_retiring,
+        )
+
+        retiring, why = target_is_retiring(_norm(gateway_assigned_name))
+        if retiring:
+            try:
+                fence.mark_cancelled(key, detail=f"target retiring: {why}")
+            except DispatchOutboxFenceError:
+                return REDISPATCH_UNCERTAIN
+            return REDISPATCH_TARGET_RETIRING
         gateway_locator = self._gateway_live_locator(gateway_assigned_name)
         if not gateway_locator:
             # No live gateway to deliver to: record uncertain (never mark delivered on no send).

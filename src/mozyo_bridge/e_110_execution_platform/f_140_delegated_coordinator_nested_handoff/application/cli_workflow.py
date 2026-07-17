@@ -652,6 +652,10 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     if resume_outcome is not None:
         outcome = resume_outcome
 
+    # Redmine #13892 R6-F1: gateway-owned disposition intake (the writer's ONLY production caller).
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_disposition_intake import maybe_record_gateway_disposition  # noqa: E501
+    maybe_record_gateway_disposition(args, outcome, dry_run=dry_run)
+
     # The increment-2 herdr worker-dispatch leg and the increment-3 herdr coordinator-forward leg
     # are executable but ride their own dedicated fences, not the generic `executable` set (Redmine
     # #13489 / #13583). The #13813 resume leg is the same shape. Treat each as an executable leg.

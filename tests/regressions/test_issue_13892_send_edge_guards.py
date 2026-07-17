@@ -110,24 +110,14 @@ class CallbackDeliverEdgeTest(unittest.TestCase):
         self.assertEqual(self.sends, [], "an unreadable authority must not permit a send")
 
 
-class ForwardSendEdgeTest(unittest.TestCase):
-    """`execute_herdr_forward` reserves then sends against a resolved slot."""
+class SharedGuardSeamTest(unittest.TestCase):
+    """The shared seam itself. The forward EDGE is driven in `test_issue_13892_r6_forward_edge`.
 
-    def test_the_forward_edge_consults_the_shared_guard(self):
-        import inspect
-
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            herdr_forward_send,
-        )
-
-        src = inspect.getsource(herdr_forward_send.execute_herdr_forward)
-        # Structural, but paired with the behavioural driver below.
-        self.assertIn("target_is_retiring", src)
-        self.assertLess(
-            src.index("target_is_retiring"),
-            src.index("send_port.send"),
-            "the guard must precede the send, not merely exist",
-        )
+    The `inspect.getsource` order assert that used to live here was removed (review j#80644
+    R6-F4): it passed on source text, so a deleted / bypassed / post-send guard would not have
+    failed it. A seam test plus a source-string assert is not a driven edge, however the two
+    are captioned.
+    """
 
     def test_the_guard_returns_zero_send_for_a_retiring_target(self):
         d = tempfile.mkdtemp()

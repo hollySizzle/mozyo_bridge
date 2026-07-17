@@ -253,15 +253,24 @@ def correlate_dispatch_disposition(
     row: DispatchRowIdentity,
     entries: Sequence,
     *,
-    authorize_journals: Mapping[str, "object"],
+    authorize_journals: Mapping[str, Sequence],
     review_request_journals: Sequence[str],
 ) -> CorrelationVerdict:
     """Is this exact dispatch action positively discharged? (pure, fail-closed)
 
+    ``authorize_journals`` maps a journal id to **every** valid AUTHORIZE at it — a sequence,
+    not one marker. The caller must not collapse it: two AUTHORIZE markers at one journal is
+    an ambiguity to surface, not a duplicate to resolve (review j#80644 R6-F2).
+
+    ``row`` must be the ACTUAL dispatch outbox row's identity. Rebuilding it from the
+    AUTHORIZE this function is about to compare it against makes check (1) compare the
+    AUTHORIZE with itself — a tautology that can never fail, and the exact false-discharge
+    R6-F2 recorded.
+
     Requires ALL THREE, in order (j#80629):
 
-    1. the row's ``dispatch_journal`` owns a valid AUTHORIZE whose issue / workspace / lane /
-       target / action_id match the row exactly;
+    1. the row's ``dispatch_journal`` owns **exactly one** valid AUTHORIZE whose issue /
+       workspace / lane / target / action_id match the row exactly;
     2. a later journal on the same issue carries a canonical ``review_request`` gate;
     3. a still-later disposition names that exact action AND that exact terminal journal, with
        the fixed fields literal.
@@ -276,14 +285,27 @@ def correlate_dispatch_disposition(
             "the dispatch row carries a blank causal identity; no exact round can be named",
         )
 
-    # (1) the AUTHORIZE this row came from must exist and match the row exactly.
-    auth = authorize_journals.get(_norm(row.journal))
-    if auth is None:
+    # (1) the AUTHORIZE this row came from must exist, be UNIQUE, and match the row exactly.
+    #
+    # The index maps journal -> EVERY valid AUTHORIZE at it, never a collapsed one (review
+    # j#80644 R6-F2): a `{journal: auth}` dict comprehension silently resolved two valid
+    # AUTHORIZE markers at one journal by last-write-wins, so a row whose action matched the
+    # surviving marker discharged while the round was genuinely ambiguous. Cardinality is the
+    # gate input here — 0, 1 and 2+ are three different answers and only 1 can correlate.
+    at_journal = tuple(authorize_journals.get(_norm(row.journal)) or ())
+    if not at_journal:
         return CorrelationVerdict(
             CORRELATION_AMBIGUOUS,
             f"journal {row.journal} carries no valid AUTHORIZE for this row; the dispatch's "
             "own origin cannot be confirmed",
         )
+    if len(at_journal) > 1:
+        return CorrelationVerdict(
+            CORRELATION_AMBIGUOUS,
+            f"journal {row.journal} carries {len(at_journal)} valid AUTHORIZE markers; "
+            "refusing to guess which round this row came from",
+        )
+    auth = at_journal[0]
     if (
         _norm(getattr(auth, "issue", "")) != _norm(row.issue)
         or _norm(getattr(auth, "workspace_id", "")) != _norm(row.workspace_id)

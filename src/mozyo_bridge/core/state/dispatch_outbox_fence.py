@@ -143,6 +143,8 @@ class TargetObligation:
     issue: str = ""
     journal: str = ""
     action_id: str = ""
+    workspace_id: str = ""
+    lane_id: str = ""
 
     @property
     def non_terminal(self) -> bool:
@@ -601,7 +603,8 @@ class DispatchOutboxFence:
         try:
             placeholders = ", ".join("?" * len(names))
             rows = conn.execute(
-                "SELECT target_assigned_name, state, issue, journal, action_id "
+                "SELECT target_assigned_name, state, issue, journal, action_id, "
+                "workspace_id, lane_id "
                 "FROM dispatch_outbox "
                 f"WHERE workspace_id=? AND target_assigned_name IN ({placeholders}) "
                 "ORDER BY target_assigned_name, action_id",
@@ -616,6 +619,8 @@ class DispatchOutboxFence:
                 issue=str(r[2]),
                 journal=str(r[3]),
                 action_id=str(r[4]),
+                workspace_id=str(r[5]),
+                lane_id=str(r[6]),
             )
             for r in rows
         )

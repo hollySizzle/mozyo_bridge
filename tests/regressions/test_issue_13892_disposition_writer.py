@@ -204,7 +204,10 @@ class WriterReaderRoundTripTest(unittest.TestCase):
         entries.append(
             RedmineJournalEntry(issue_id=ISSUE, journal_id="300", notes=appended[0][1])
         )
-        auths = {a.journal: a for a in parse_dispatch_authorizations(entries) if a.valid}
+        auths = {}
+        for a in parse_dispatch_authorizations(entries):
+            if a.valid:
+                auths.setdefault(a.journal, []).append(a)
         verdict = correlate_dispatch_disposition(
             DispatchRowIdentity(
                 issue=ISSUE, journal="100", workspace_id=WS, lane_id=LANE,

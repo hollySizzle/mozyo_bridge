@@ -46,6 +46,14 @@ class PairObligation:
     issue: str = ""
     journal: str = ""
     detail: str = ""
+    #: The rest of the row's causal identity. Carried, not filtered away (review j#80644
+    #: R6-F2): without `action_id` / `workspace_id` / `lane_id` a caller cannot tell WHICH
+    #: dispatch round an obligation belongs to, and a correlator handed only
+    #: `(issue, journal)` has to reconstruct them from somewhere — which is how the identity
+    #: check came to compare an AUTHORIZE with itself.
+    action_id: str = ""
+    workspace_id: str = ""
+    lane_id: str = ""
 
     @property
     def blocks(self) -> bool:
@@ -70,8 +78,11 @@ def dispatch_outbox_obligations(
     """Obligations from the dispatch outbox — the one store keyed on a target slot name.
 
     ``reserved`` / ``uncertain`` are owed on the fence's own terms. ``delivered`` is a delivery
-    ACK, so its disposition lives elsewhere: ``correlate(issue, journal)`` decides, and anything
-    it cannot establish stays :data:`UNCORRELATED` (blocking). Never assume discharged.
+    ACK, so its disposition lives elsewhere: ``correlate(row)`` decides — and it is handed the
+    **actual row**, full identity intact (review j#80644 R6-F2), not a ``(issue, journal)``
+    subset it would have to rebuild the rest of from the very marker it is meant to check the
+    row against. Anything it cannot establish stays :data:`UNCORRELATED` (blocking). Never
+    assume discharged.
     """
     from mozyo_bridge.core.state.dispatch_outbox_fence import (
         DispatchOutboxFence,
@@ -87,37 +98,32 @@ def dispatch_outbox_obligations(
             f"the dispatch outbox fence could not be read ({exc})"
         ) from exc
 
+    def _of(row, verdict: str, detail: str) -> PairObligation:
+        """Carry the row's identity through verbatim — every field the store recorded."""
+        return PairObligation(
+            source="dispatch_outbox",
+            verdict=verdict,
+            target=row.target_assigned_name,
+            state=row.state,
+            issue=row.issue,
+            journal=row.journal,
+            detail=detail,
+            action_id=row.action_id,
+            workspace_id=row.workspace_id,
+            lane_id=row.lane_id,
+        )
+
     out: list[PairObligation] = []
     for row in rows:
         if row.non_terminal:
-            out.append(
-                PairObligation(
-                    source="dispatch_outbox",
-                    verdict=OWED,
-                    target=row.target_assigned_name,
-                    state=row.state,
-                    issue=row.issue,
-                    journal=row.journal,
-                    detail="a send's fate is unresolved",
-                )
-            )
+            out.append(_of(row, OWED, "a send's fate is unresolved"))
             continue
         if not row.needs_gate_correlation:
             continue  # cancelled: positively not owed
         verdict, detail = _correlate_delivered(row, correlate)
         if verdict is DISCHARGED:
             continue
-        out.append(
-            PairObligation(
-                source="dispatch_outbox",
-                verdict=verdict,
-                target=row.target_assigned_name,
-                state=row.state,
-                issue=row.issue,
-                journal=row.journal,
-                detail=detail,
-            )
-        )
+        out.append(_of(row, verdict, detail))
     return tuple(out)
 
 
@@ -126,7 +132,12 @@ def _correlate_delivered(row, correlate) -> tuple[str, str]:
 
     A delivery ACK proves the message landed, never that the work finished — the ACK /
     delivery / completion separation. So the disposition is read from the durable record the
-    handed-over work reports into, keyed by the send's own ``(issue, journal)``.
+    handed-over work reports into, named by **this row's own full causal identity**.
+
+    The row is passed through whole (review j#80644 R6-F2). Handing the correlator only
+    ``(issue, journal)`` forced it to rebuild workspace / lane / target / action_id from the
+    AUTHORIZE it was supposed to check the row *against*, so the check compared that AUTHORIZE
+    with itself and discharged a row whose real ``action_id`` named a different action.
 
     Fail-closed: no identity to correlate with, no correlator wired, or an unreadable
     disposition all yield :data:`UNCORRELATED`, which blocks. Only a positive "this work is
@@ -137,13 +148,15 @@ def _correlate_delivered(row, correlate) -> tuple[str, str]:
             UNCORRELATED,
             "no durable-disposition correlator is available for this delivered send",
         )
-    if not _norm(row.issue):
-        return (
-            UNCORRELATED,
-            "the delivered send names no issue, so its completion cannot be correlated",
-        )
+    for field in ("issue", "journal", "action_id"):
+        if not _norm(getattr(row, field, "")):
+            return (
+                UNCORRELATED,
+                f"the delivered send names no {field}, so no exact dispatch round can be "
+                "correlated",
+            )
     try:
-        discharged = correlate(_norm(row.issue), _norm(row.journal))
+        discharged = correlate(row)
     except Exception as exc:  # noqa: BLE001 - unreadable disposition -> never assume finished
         return (UNCORRELATED, f"the durable disposition could not be read ({exc})")
     if discharged is True:

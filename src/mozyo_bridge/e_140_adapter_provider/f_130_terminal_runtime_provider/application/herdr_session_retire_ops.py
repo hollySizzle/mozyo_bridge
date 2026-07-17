@@ -163,8 +163,15 @@ class LiveSessionRetireOps:
             # the caller to a fail-closed refusal.
             return None
 
-    def _durable_disposition(self, issue: str, journal: str):
+    def _durable_disposition(self, row):
         """Was the work a delivered send handed over positively discharged? (design j#80629)
+
+        ``row`` is the ACTUAL :class:`TargetObligation` from the dispatch outbox, carrying the
+        full causal identity the store recorded. It is passed through **unchanged** (review
+        j#80644 R6-F2): the earlier cut received only ``(issue, journal)`` and rebuilt the
+        workspace / lane / target / action_id **from the AUTHORIZE**, so the correlator's
+        identity check compared that AUTHORIZE with itself — a tautology that discharged every
+        delivered row, including ones whose real ``action_id`` named a foreign action.
 
         Reads the **source of truth** — the Redmine issue's journals — and requires the full
         three-way correspondence: the row's own AUTHORIZE, a later canonical `review_request`,
@@ -189,23 +196,20 @@ class LiveSessionRetireOps:
         if source is None:
             return None  # no credentialed source -> unknown -> block
         try:
-            entries = list(source.read_entries(issue))
+            entries = list(source.read_entries(_norm(row.issue)))
         except Exception:  # noqa: BLE001 - unreadable / credential failure -> unknown -> block
             return None
         auths, reviews = self._authorize_and_review_index(entries)
-        auth = auths.get(_norm(journal))
-        if auth is None:
-            return None  # the row's own AUTHORIZE is not readable -> unknown -> block
-        row = DispatchRowIdentity(
-            issue=_norm(issue),
-            journal=_norm(journal),
-            workspace_id=_norm(auth.workspace_id),
-            lane_id=_norm(auth.lane_id),
-            target_assigned_name=_norm(auth.target_assigned_name),
-            action_id=_norm(auth.action_id),
+        identity = DispatchRowIdentity(
+            issue=_norm(row.issue),
+            journal=_norm(row.journal),
+            workspace_id=_norm(row.workspace_id),
+            lane_id=_norm(row.lane_id),
+            target_assigned_name=_norm(row.target_assigned_name),
+            action_id=_norm(row.action_id),
         )
         verdict = correlate_dispatch_disposition(
-            row, entries, authorize_journals=auths, review_request_journals=reviews
+            identity, entries, authorize_journals=auths, review_request_journals=reviews
         )
         if verdict.state == CORRELATION_DISCHARGED:
             return True
@@ -226,7 +230,13 @@ class LiveSessionRetireOps:
 
     @staticmethod
     def _authorize_and_review_index(entries):
-        """`{journal: DispatchAuthorization}` and the canonical review_request journals.
+        """`{journal: (DispatchAuthorization, ...)}` and the canonical review_request journals.
+
+        The AUTHORIZE index keeps **every** valid marker at a journal, preserving cardinality
+        (review j#80644 R6-F2). The earlier `{journal: auth}` dict comprehension collapsed two
+        valid AUTHORIZE markers at one journal by last-write-wins, silently converting a
+        genuine ambiguity into a confident discharge. 0 / 1 / 2+ are three different answers
+        and the correlator must be able to tell them apart.
 
         Both come from the repo's existing parsers — this adds no second interpretation of
         marker text.
@@ -238,11 +248,10 @@ class LiveSessionRetireOps:
             extract_markers,
         )
 
-        auths = {
-            _norm(a.journal): a
-            for a in parse_dispatch_authorizations(entries)
-            if a.valid
-        }
+        auths: dict[str, list] = {}
+        for a in parse_dispatch_authorizations(entries):
+            if a.valid:
+                auths.setdefault(_norm(a.journal), []).append(a)
         reviews = [
             _norm(m.journal)
             for m in extract_markers(entries)

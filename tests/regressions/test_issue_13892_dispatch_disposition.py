@@ -119,7 +119,7 @@ class CorrelationTest(unittest.TestCase):
         return correlate_dispatch_disposition(
             row or _row(),
             entries if entries is not None else _history(disposition_notes=_marker()),
-            authorize_journals=auths if auths is not None else {"100": _auth()},
+            authorize_journals=auths if auths is not None else {"100": (_auth(),)},
             review_request_journals=reviews,
         )
 
@@ -176,7 +176,7 @@ class CorrelationTest(unittest.TestCase):
         v = self._correlate(
             row=_row(journal="500", action_id="act-2"),
             entries=entries,
-            auths={"100": _auth(), "500": _auth(action_id="act-2")},
+            auths={"100": (_auth(),), "500": (_auth(action_id="act-2"),)},
         )
         self.assertEqual(v.state, CORRELATION_OWED, "round 1's proof is not round 2's")
 
@@ -184,7 +184,7 @@ class CorrelationTest(unittest.TestCase):
         """The dispatch's own origin cannot be confirmed -> never discharged."""
         v = self._correlate(
             row=_row(journal="999", action_id="act-9"),
-            auths={"999": _auth(action_id="act-9")},
+            auths={"999": (_auth(action_id="act-9"),)},
         )
         self.assertEqual(v.state, CORRELATION_AMBIGUOUS)
 
@@ -197,7 +197,7 @@ class CorrelationTest(unittest.TestCase):
         self.assertEqual(self._correlate(entries=entries).state, CORRELATION_OWED)
 
     def test_an_authorize_naming_a_different_identity_blocks(self):
-        v = self._correlate(auths={"100": _auth(action_id="someone-else")})
+        v = self._correlate(auths={"100": (_auth(action_id="someone-else"),)})
         self.assertEqual(v.state, CORRELATION_AMBIGUOUS)
 
     def test_a_missing_authorize_blocks(self):
@@ -293,9 +293,24 @@ class OpsCorrelationTest(unittest.TestCase):
             e.append(self.Entry(issue_id=ISSUE, journal_id="300", notes=self.disp))
         return e
 
-    def _run(self, entries):
+    def _row(self, **over):
+        """The ACTUAL outbox row identity the production seam passes (review j#80644 R6-F2).
+
+        Built from the store's own row type, never rebuilt from the AUTHORIZE it is about to
+        be checked against — that reconstruction was the tautology R6-F2 recorded.
+        """
+        from mozyo_bridge.core.state.dispatch_outbox_fence import TargetObligation
+
+        base = dict(
+            target_assigned_name=NAME, state="delivered", issue=ISSUE, journal="100",
+            action_id=ACTION, workspace_id=WS, lane_id=LANE,
+        )
+        base.update(over)
+        return TargetObligation(**base)
+
+    def _run(self, entries, row=None):
         self.ops._redmine_source = lambda: self._source(entries)
-        return self.ops._durable_disposition(ISSUE, "100")
+        return self.ops._durable_disposition(row or self._row())
 
     def test_the_full_correspondence_discharges(self):
         self.assertIs(self._run(self._history()), True)
@@ -305,7 +320,7 @@ class OpsCorrelationTest(unittest.TestCase):
 
     def test_no_credentials_blocks(self):
         self.ops._redmine_source = lambda: None
-        self.assertIsNone(self.ops._durable_disposition(ISSUE, "100"))
+        self.assertIsNone(self.ops._durable_disposition(self._row()))
 
     def test_an_unreadable_source_blocks(self):
         class Boom:
@@ -313,7 +328,7 @@ class OpsCorrelationTest(unittest.TestCase):
                 raise RuntimeError("credential failure")
 
         self.ops._redmine_source = lambda: Boom()
-        self.assertIsNone(self.ops._durable_disposition(ISSUE, "100"))
+        self.assertIsNone(self.ops._durable_disposition(self._row()))
 
     def test_a_missing_authorize_blocks(self):
         entries = [self.Entry(issue_id=ISSUE, journal_id="300", notes=self.disp)]
