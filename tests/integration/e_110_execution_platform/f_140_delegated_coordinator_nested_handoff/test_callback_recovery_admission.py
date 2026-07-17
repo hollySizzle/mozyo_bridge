@@ -313,7 +313,7 @@ class DuplicatePublicationTests(_AdmissionBase):
         self.assertTrue(retried.may_actuate)
 
     def test_a_forged_retry_linkage_is_refused(self):
-        """`retry_of` must name a key this authority actually admitted."""
+        """`retry_of` must name the key this authority actually admitted (prior EXISTS here)."""
         jid = self.produce()
         self.assertEqual(self.admit(jid).outcome, ADMIT_ADMITTED)
         forged = render_recovery_action_marker(
@@ -325,6 +325,22 @@ class DuplicatePublicationTests(_AdmissionBase):
         out = self.admit("81000")
         self.assertEqual(out.outcome, ADMIT_CONFLICT, out.detail)
         self.assertFalse(out.may_actuate)
+
+    def test_a_retry_with_no_prior_claim_is_refused_end_to_end(self):
+        """R2-F2 through the real marker: a retry cannot start a chain.
+
+        The distinct branch the test above never reaches — here NOTHING has been admitted for this
+        action, so there is no prior for the tip comparison to catch the forgery on.
+        """
+        retry_first = render_recovery_action_marker(
+            original_dispatch_anchor=ANCHOR, workspace_id=WS, lane_id=LANE, lane_generation=GEN,
+            route_identity=TARGET, receiver_identity=RECEIVER,
+            action_kind=SWEEP_RECOVERY_ACTION_ID, retry_of="b" * 64,
+        )
+        self.src.entries.append(entry("81000", f"## an unearned retry\n\n{retry_first}"))
+        out = self.admit("81000")
+        self.assertEqual(out.outcome, ADMIT_CONFLICT, out.detail)
+        self.assertFalse(out.may_actuate, "a retry naming a claim that never existed was admitted")
 
     def test_the_sweep_never_mints_a_retry(self):
         """The canonical stall record declares itself NOT a retry — the fail-closed default."""

@@ -6,6 +6,8 @@ of the two questions that actually matter — *what happens when the store is go
 when the same recovery shows up under a different journal id?* — was ever asked.
 """
 
+import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -127,6 +129,49 @@ class SealLifecycleTests(_ReceiptBase):
         with self.assertRaises(CallbackRecoveryReceiptError):
             r.bootstrap()
 
+    def test_a_dangling_seal_is_not_absence(self):
+        """THE R2-F1 regression: a broken symlink read as `absent` and re-admitted everything.
+
+        `read_text` raises FileNotFoundError for a dangling link even though its entry is right
+        there, so folding that exception to `absent` made a lost pair look like a fresh install.
+        """
+        k = key()
+        self.assertTrue(self.receipt.claim(k).won)
+        self.receipt.path.unlink()
+        self.receipt.sidecar_path.unlink()
+        self.receipt.seal_path.unlink()
+        self.receipt.seal_path.symlink_to(self.home / "target-that-does-not-exist")
+
+        self.assertTrue(os.path.lexists(self.receipt.seal_path), "the entry IS here")
+        self.assertEqual(
+            self.receipt.seal_state(), SEAL_INVALID,
+            "a directory entry that resolves to nothing is evidence, not absence",
+        )
+        with self.assertRaises(CallbackRecoveryReceiptError):
+            CallbackRecoveryReceipt(home=self.home).bootstrap()
+        with self.assertRaises(CallbackRecoveryReceiptError):
+            CallbackRecoveryReceipt(home=self.home).claim(k)
+
+    def test_an_undecodable_seal_is_a_domain_refusal_not_a_raw_leak(self):
+        """R2-F1: UnicodeDecodeError is a ValueError, so `except OSError` never caught it.
+
+        A raw exception out of a fail-closed authority is fail-OPEN in shape: the caller gets
+        something it cannot interpret as "do not actuate".
+        """
+        self.receipt.seal_path.write_bytes(b"\xff\xfe\x00 not utf-8 at all")
+        self.assertEqual(self.receipt.seal_state(), SEAL_INVALID)
+        with self.assertRaises(CallbackRecoveryReceiptError):
+            self.receipt.claim(key())
+
+    def test_a_genuinely_absent_seal_still_reads_absent(self):
+        """The other side of R2-F1: the fix must not make a first install undiagnosable."""
+        home = Path(tempfile.mkdtemp())
+        r = CallbackRecoveryReceipt(home=home)
+        self.assertFalse(os.path.lexists(r.seal_path))
+        self.assertEqual(r.seal_state(), SEAL_ABSENT)
+        r.bootstrap()
+        self.assertTrue(r.is_bootstrapped())
+
     def test_a_torn_store_is_not_empty(self):
         """Unusable is not empty: the DB still holds whatever was claimed through it."""
         self.assertTrue(self.receipt.claim(key()).won)
@@ -218,13 +263,74 @@ class RetryChainTests(_ReceiptBase):
         chained = key("81200", retry_of=retry.digest())  # continues from the tip
         self.assertTrue(self.receipt.claim(chained).won)
 
-    def test_a_retry_of_an_unknown_key_is_refused(self):
-        """A fabricated linkage names nothing this authority admitted."""
+    def test_a_forged_linkage_against_an_existing_prior_is_refused(self):
+        """A fabricated linkage does not match the prior key, so the tip comparison catches it.
+
+        Renamed from `test_a_retry_of_an_unknown_key_is_refused`, which is what it claimed to test
+        and never did (review j#81050 R2-F2): it claims the action FIRST, so `prior` exists and this
+        never reaches the no-prior branch. The honest name says which branch it drives; the root
+        case is `test_a_retry_with_no_prior_claim_is_refused` below.
+        """
         self.receipt.claim(key("80500"))
         forged = key("80900", retry_of="f" * 64)
         result = self.receipt.claim(forged)
         self.assertFalse(result.won)
         self.assertTrue(result.conflict)
+
+    def test_a_retry_with_no_prior_claim_is_refused(self):
+        """THE R2-F2 regression: a retry cannot start a chain, only continue one.
+
+        Nothing has ever been admitted for this action, so a linkage naming a key this authority
+        never issued is an assertion about a history that does not exist here.
+        """
+        virgin = key("80500", retry_of="f" * 64)
+        result = self.receipt.claim(virgin)
+        self.assertFalse(result.won, "a retry with no prior claim was admitted")
+        self.assertTrue(result.conflict)
+        self.assertIn("no prior claim to retry", result.detail.lower())
+        # ...and it did not consume the key: the real first publication still admits.
+        self.assertTrue(self.receipt.claim(key("80500")).won)
+
+
+class TamperedRowTests(_ReceiptBase):
+    """Review j#81050 R2-F3: a derived column is an opinion, not the record."""
+
+    def test_a_corrupt_action_digest_is_fail_closed_not_never_admitted(self):
+        """THE R2-F3 regression: corrupting ONE derived column re-admitted a duplicate.
+
+        The prior lookup keyed on `action_digest` alone, so a corrupted value simply failed to
+        match and read as "this action was never admitted" — fail-OPEN, and against this module's
+        own tampered-row contract.
+        """
+        first = key("80500")
+        self.assertTrue(self.receipt.claim(first).won)
+
+        con = sqlite3.connect(self.receipt.path)
+        con.execute("UPDATE recovery_receipt SET action_digest = 'corrupted'")
+        con.commit()
+        con.close()
+
+        with self.assertRaises(CallbackRecoveryReceiptError) as ctx:
+            self.receipt.claim(key("80900"))     # same action, new journal
+        self.assertIn("tampered", str(ctx.exception).lower())
+
+    def test_the_prior_lookup_survives_a_corrupt_index_of_another_row(self):
+        """The refusal must be about THIS action, not any corruption anywhere in the table."""
+        self.assertTrue(self.receipt.claim(key("80500")).won)
+        unrelated = key("80600", original_dispatch_anchor="88888")
+        self.assertTrue(self.receipt.claim(unrelated).won)
+
+        con = sqlite3.connect(self.receipt.path)
+        con.execute(
+            "UPDATE recovery_receipt SET action_digest = 'corrupted' "
+            "WHERE recovery_action_journal = '80600'"
+        )
+        con.commit()
+        con.close()
+        # The corrupt row belongs to a DIFFERENT action, so this action's chain is unaffected.
+        result = self.receipt.claim(key("80900"))
+        self.assertFalse(result.won)
+        self.assertTrue(result.conflict, "a duplicate of the healthy action is still a conflict")
 
     def test_a_retry_is_still_replay_protected(self):
         """A retry key is a key: presenting it twice is a duplicate, not a second round."""
