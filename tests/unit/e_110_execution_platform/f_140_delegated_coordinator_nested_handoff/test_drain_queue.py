@@ -27,6 +27,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -650,6 +651,124 @@ class CliTests(unittest.TestCase):
                 payload = self._run(from_glance=str(path))
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
+
+    def test_snapshot_delivery_anomaly_active_roundtrips(self):
+        # Redmine #13967 R10-F1: `DrainLane.as_payload()` emits delivery_anomaly_active, so the
+        # deterministic --snapshot-json reader must read it back on exact-bool terms — a
+        # self-emitted anomaly hold must survive the roundtrip, a present non-bool is malformed
+        # (hold), and an absent field defaults to false (evaluable).
+        lane = DrainLane(issue="1", lane="l", state_class=LANE_STATE_IDLE, delivery_anomaly_active=True)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(json.dumps({"lanes": [lane.as_payload()]}), encoding="utf-8")
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertIn(HOLD_REASON_DELIVERY_ANOMALY, payload["hold_buckets"])
+        self.assertEqual(payload["delivery_anomaly_pending"], 1)
+        # present non-bool -> malformed -> hold (never coerced)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [{"issue": "1", "lane": "l", "state_class": "idle",
+                                       "delivery_anomaly_active": "true"}]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        # absent -> default false -> evaluable / releasable
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [{"issue": "1", "lane": "l", "state_class": LANE_STATE_IDLE}]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+
+    def test_snapshot_duplicate_identity_holds(self):
+        # Redmine #13967 R10-F4: a snapshot is an already-composed active lane set, so the same
+        # (issue, lane) twice is contradictory input -> hold (durable-incomplete), matching the
+        # glance path's one-lane-one-bucket invariant. Distinct lanes are fine.
+        row = {"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(json.dumps({"lanes": [row, dict(row)]}), encoding="utf-8")
+            payload = self._run(snapshot_json=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        # distinct (issue, lane) identities are complete/releasable
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [
+                    {"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE},
+                    {"issue": "7", "lane": "l2", "state_class": LANE_STATE_IDLE},
+                ]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+
+    def test_live_path_joins_delivery_ledger_for_anomaly_hold(self):
+        # Redmine #13967 R10-F2: the default live path must join the SAME home-scoped delivery
+        # ledger `workflow glance` joins, so a live anomaly on the existing ledger holds the
+        # process (it is NOT hardwired to ledger=None). Seam test: capture the ledger passed to
+        # active_lane_snapshots and fold a row with a live anomaly.
+        mod = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+        gss = mod + ".application.glance_snapshot_source"
+        wg = mod + ".domain.workflow_glance"
+        wrs = "mozyo_bridge.core.state.workflow_runtime_store"
+        sentinel_ledger = object()
+        captured = {}
+
+        def fake_snapshots(roster, *, redmine_source, store, ledger, reconcile_store, authority_index):
+            captured["ledger"] = ledger
+
+            class _Coll:
+                snapshots = ("SNAP",)
+                notes = []
+                degraded = False
+
+            return _Coll()
+
+        class _Row:
+            issue_id = "9"
+            lane = "lane9"
+            workflow_state = LANE_STATE_IDLE
+            next_owner = "x"
+            has_active_anomaly = True
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain._delivery_ledger", return_value=sentinel_ledger), \
+                mock.patch(gss + ".enumerate_active_lanes", return_value=((("9", "lane9"),), None)), \
+                mock.patch(gss + ".enumerate_lifecycle_diagnostic", return_value=((), None)), \
+                mock.patch(gss + ".active_lane_snapshots", fake_snapshots), \
+                mock.patch(wg + ".fold_glance_rows", return_value=[_Row()]), \
+                mock.patch(wrs + ".WorkflowRuntimeStore", lambda *a, **k: object()), \
+                mock.patch(wrs + ".workflow_runtime_store_path", return_value=Path(td) / "rt.json"):
+            payload = self._run(repo=td)
+        # the joined ledger was the sentinel, NOT None (F2 wiring proven)
+        self.assertIs(captured["ledger"], sentinel_ledger)
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertIn(HOLD_REASON_DELIVERY_ANOMALY, payload["hold_buckets"])
+        self.assertEqual(payload["delivery_anomaly_pending"], 1)
+
+    def test_delivery_ledger_helper_is_fail_open(self):
+        # Redmine #13967 R10-F2: an unreadable ledger degrades to None (fail-open), never a
+        # crash — exactly as glance's _ledger_from_args does.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain import (
+            _delivery_ledger,
+        )
+
+        with mock.patch(
+            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger",
+            side_effect=RuntimeError("unreadable"),
+        ):
+            self.assertIsNone(_delivery_ledger())
 
     def test_present_null_is_malformed_not_absent(self):
         # Redmine #13967 R5-F1: an explicit JSON null is a present non-string value (malformed

@@ -113,9 +113,10 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
     Returns None when the row is malformed: a non-dict; a missing / non-string / empty
     ``issue`` or ``state_class``; a non-string ``lane`` / ``actionability`` /
     ``next_action_owner`` / ``reason`` (identity and classification fields are NEVER
-    ``str(...)``-coerced — Redmine #13967 R4-F2); or a ``release_pending`` that is present
-    but not an exact JSON bool (a string ``"false"`` must not coerce to True — R2-F2). The
-    caller marks a snapshot with any malformed row durable-incomplete rather than dropping it.
+    ``str(...)``-coerced — Redmine #13967 R4-F2); a ``release_pending`` or
+    ``delivery_anomaly_active`` that is present but not an exact JSON bool (a string
+    ``"false"`` must not coerce to True — R2-F2 / R10-F1). The caller marks a snapshot with any
+    malformed row durable-incomplete rather than dropping it.
     """
     if not isinstance(raw, dict):
         return None
@@ -129,6 +130,14 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
     rp = raw.get("release_pending", False)
     if not isinstance(rp, bool):
         return None  # exact-type: a non-bool release_pending is malformed, never coerced
+    # `delivery_anomaly_active` is an authority-bearing hold field (Redmine #13967 R10-F1):
+    # `DrainLane.as_payload()` emits it, so the deterministic snapshot contract must read it
+    # back on the SAME exact-bool terms — a present non-bool is malformed (never coerced), and
+    # a true value must survive the roundtrip so a self-emitted anomaly hold is not silently
+    # dropped to releasable.
+    anomaly_active = raw.get("delivery_anomaly_active", False)
+    if not isinstance(anomaly_active, bool):
+        return None
     actionability = raw.get("actionability", ACTIONABILITY_COORDINATOR_ACTIONABLE)
     if not isinstance(actionability, str):
         return None
@@ -141,13 +150,17 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
         lane=lane,
         release_pending=rp,
         reason=reason,
+        delivery_anomaly_active=anomaly_active,
     )
 
 
 def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     """``(lanes, complete)``. ``complete`` is False when any row was malformed (an invalid
     row is NOT silently dropped — it makes the snapshot durable-incomplete so the retention
-    verdict fails closed to hold, Redmine #13967 R2-F2)."""
+    verdict fails closed to hold, Redmine #13967 R2-F2), OR when the same ``(issue, lane)``
+    identity appears twice: a snapshot is an already-composed active lane set, so a duplicated
+    identity is contradictory input and must hold, matching the glance path's one-lane-one-
+    bucket invariant so identity enforcement is uniform across sources (R10-F4)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -158,13 +171,20 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         # and not a silent empty (Redmine #13967 R4-F2).
         return (), False
     lanes: list[DrainLane] = []
+    seen: set[tuple[str, str]] = set()
     complete = True
     for raw in entries:
         lane = _lane_from_mapping(raw)
         if lane is None:
             complete = False  # malformed row -> durable-incomplete, not dropped
-        else:
-            lanes.append(lane)
+            continue
+        key = (lane.issue, lane.lane)
+        if key in seen:
+            # A duplicated (issue, lane) identity is contradictory composed input -> hold
+            # (Redmine #13967 R10-F4), never silently double-counted.
+            complete = False
+        seen.add(key)
+        lanes.append(lane)
     return tuple(lanes), complete
 
 
@@ -299,6 +319,11 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             or not isinstance(stale, bool)
             or not isinstance(active_flag, bool)
             or active_flag != (anomaly != ANOMALY_NONE and not stale)
+            # Producer invariant (Redmine #13967 R10-F3): `_anomaly_is_stale` returns False
+            # whenever `anomaly == none`, so a `none` anomaly is NEVER stale. A row claiming
+            # `none + stale=true` is producer-impossible (contradictory) even though it passes
+            # the has_active_anomaly consistency check above -> hold.
+            or (anomaly == ANOMALY_NONE and stale)
         ):
             complete = False
             continue
@@ -392,12 +417,39 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     return _merge_release_pending(active, release_rows), complete
 
 
+def _delivery_ledger():
+    """The home-scoped Herdr delivery ledger, or None when unavailable (fail-open).
+
+    Mirrors ``cli_workflow_glance._ledger_from_args`` default: the live drain path joins the
+    SAME delivery ledger ``workflow glance`` joins, so a live (non-stale) transport anomaly
+    already recorded on the existing ledger is seen and held rather than missed (Redmine
+    #13967 R10-F2). A missing / unreadable ledger degrades to no join (fail-open), exactly as
+    glance does — an absent ledger never breaks the projection, it only means no anomaly can be
+    observed from that source.
+    """
+    from mozyo_bridge.core.state.herdr_delivery_ledger import (
+        HerdrDeliveryLedger,
+        herdr_delivery_ledger_path,
+    )
+
+    try:
+        return HerdrDeliveryLedger(path=herdr_delivery_ledger_path())
+    except Exception:  # noqa: BLE001 - a missing/unreadable ledger degrades to no join
+        return None
+
+
 def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str, ...]]:
     """Best-effort live enumeration folded through the glance read model.
 
     Returns ``(lanes, degraded, notes)``. Fail-open: an unreadable roster / diagnostic is
-    reported as degraded (never a silent empty). Without the durable Redmine fold a lane may
-    read ``unknown`` — ``--from-glance`` (which folds the Redmine record) is the richer path.
+    reported as degraded (never a silent empty). The **delivery anomaly** dimension IS wired
+    here: this path joins the same home-scoped Herdr delivery ledger ``workflow glance`` joins
+    (:func:`_delivery_ledger`), so a live (non-stale) transport anomaly on the existing ledger
+    holds the process (Redmine #13967 R10-F2). It does NOT, however, join the live Redmine
+    source — so a lane's durable *state* may still read ``unknown`` (degraded, held) without a
+    ``--from-glance`` envelope; ``--from-glance`` (which folds the Redmine record) remains the
+    richer path for durable-state classification. A ledger that is absent / unreadable simply
+    yields no anomaly observation (fail-open), never a crash.
     """
     from mozyo_bridge.core.state.workflow_runtime_store import (
         WorkflowRuntimeStore,
@@ -424,7 +476,7 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
         roster,
         redmine_source=None,
         store=store,
-        ledger=None,
+        ledger=_delivery_ledger(),
         reconcile_store=None,
         authority_index={},
     )
@@ -439,7 +491,8 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
             state_class=r.workflow_state,
             next_action_owner=r.next_owner,
             # A live (non-stale) delivery anomaly holds the process here too (Redmine #13967
-            # R9-F1) — same read model, same non-rollback transport-repair signal.
+            # R9-F1 / R10-F2): the same delivery ledger is joined above, so this is the same
+            # read model and the same non-rollback transport-repair signal glance emits.
             delivery_anomaly_active=r.has_active_anomaly,
         )
         for r in rows
