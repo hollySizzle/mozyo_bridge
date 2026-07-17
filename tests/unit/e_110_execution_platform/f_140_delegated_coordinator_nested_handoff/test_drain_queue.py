@@ -364,6 +364,48 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
 
+    def test_from_glance_collection_identity_invariants(self):
+        # Redmine #13967 R8-F1: the active roster and the non-active lifecycle diagnostic are
+        # disjoint by contract (a lane is active XOR non-active), and identities are unique
+        # within each collection. A cross-collection collision, a duplicate diagnostic
+        # identity (with possibly conflicting state), or a duplicate active identity is
+        # contradictory durable state -> hold.
+        active_row = {
+            "issue_id": "1", "workflow_state": "idle", "state_class": "idle",
+            "lane": "l", "next_owner": "x",
+        }
+
+        def env(rows, diag):
+            return {"rows": rows, "lifecycle_diagnostic": diag, "degraded": False}
+
+        hold_cases = [
+            # same (issue,lane) in both active and diagnostic
+            env([active_row], [{"issue": "1", "lane": "l", "lane_disposition": "hibernated", "process_release": "released"}]),
+            env([active_row], [{"issue": "1", "lane": "l", "lane_disposition": "hibernated", "process_release": "requested"}]),
+            # same diagnostic identity twice with conflicting disposition/release
+            env([], [
+                {"issue": "1", "lane": "l", "lane_disposition": "hibernated", "process_release": "requested"},
+                {"issue": "1", "lane": "l", "lane_disposition": "retired", "process_release": "released"},
+            ]),
+            # duplicated active identity
+            env([active_row, active_row], []),
+        ]
+        for e in hold_cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(e), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, e)
+            self.assertFalse(payload["durable_complete"], e)
+        # Disjoint active + diagnostic identities are complete/releasable.
+        ok = env([active_row], [{"issue": "2", "lane": "l2", "lane_disposition": "retired", "process_release": "released"}])
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ok.json"
+            path.write_text(json.dumps(ok), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+
     def test_from_glance_row_authority_contract(self):
         # Redmine #13967 R7: the canonical glance row contract — active rows carry equal
         # workflow_state/state_class; diagnostic rows carry issue/lane/lane_disposition
