@@ -64,6 +64,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (
     LANE_STATE_IDLE,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
+    ANOMALY_NONE,
+    DELIVERY_ANOMALIES,
+)
 
 # The release-axis values that mean a centralized TestPyPI / installed dogfood is still
 # owed on the dedicated release issue (Redmine #13967 item 2).
@@ -214,7 +218,18 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     exact bool), or a ``degraded=True`` envelope, makes the projection durable-incomplete
     (-> hold). Only the canonical empty envelope (both lists present + ``degraded: false``)
     with no unreadable row is ``complete``. An unreadable row (non-dict / non-string identity
-    or state) also makes it incomplete rather than being silently dropped (R2-F2)."""
+    or state) also makes it incomplete rather than being silently dropped (R2-F2).
+
+    Beyond identity / state, the reader validates the canonical row's **delivery-anomaly**
+    dimension and the envelope's **cardinality / active-issue ownership** (Redmine #13967
+    R9): each row's ``delivery_anomaly`` (closed :data:`DELIVERY_ANOMALIES` vocab),
+    ``delivery_anomaly_stale`` (exact bool) and ``has_active_anomaly`` (exact bool, must equal
+    ``anomaly != none and not stale``); the envelope ``count`` (exact int == ``len(rows)``) and
+    ``active_anomaly_issues`` (a duplicate-free string list whose set equals the row-derived
+    active-anomaly issues); and active-issue uniqueness (one active row per ISSUE). Any breach
+    is a contradictory canonical envelope -> durable-incomplete (hold). A live (non-stale)
+    anomaly flags its lane ``delivery_anomaly_active`` (which forces a hold) WITHOUT rewinding
+    the durable ``state_class`` (the glance non-rollback invariant)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -242,6 +257,8 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
 
     active: list[DrainLane] = []
     active_keys: set[tuple[str, str]] = set()
+    active_issues: set[str] = set()
+    derived_anomaly_issues: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             complete = False
@@ -267,16 +284,69 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             # is malformed (never str-coerced) -> hold.
             complete = False
             continue
+        # Delivery-anomaly dimension (Redmine #13967 R9-F1): the canonical WorkflowGlanceRow
+        # always emits `delivery_anomaly` (a closed DELIVERY_ANOMALIES token), an exact-bool
+        # `delivery_anomaly_stale`, and a derived exact-bool `has_active_anomaly` whose contract
+        # is `has_active_anomaly == (delivery_anomaly != none and not stale)`. Validate all
+        # three (exact type + closed vocab + mutual consistency); any breach is a contradictory
+        # canonical row -> durable-incomplete (hold), never a silently dropped anomaly.
+        anomaly = row.get("delivery_anomaly", _MISSING)
+        stale = row.get("delivery_anomaly_stale", _MISSING)
+        active_flag = row.get("has_active_anomaly", _MISSING)
+        if (
+            not isinstance(anomaly, str)
+            or anomaly not in DELIVERY_ANOMALIES
+            or not isinstance(stale, bool)
+            or not isinstance(active_flag, bool)
+            or active_flag != (anomaly != ANOMALY_NONE and not stale)
+        ):
+            complete = False
+            continue
+        # A live (non-stale) delivery anomaly re-owns the lane to the coordinator as a
+        # transport-repair obligation. It NEVER rewinds the durable workflow_state (the glance
+        # non-rollback invariant): the lane keeps its state_class and is additionally flagged
+        # anomaly-active, which the projection folds into a fail-closed hold.
         key = (issue, lane)
         if key in active_keys:
-            # A duplicated active identity is a contradictory roster -> hold (R8-F1).
+            # A duplicated (issue, lane) active identity is a contradictory roster -> hold (R8-F1).
+            complete = False
+        if issue in active_issues:
+            # The canonical active roster is one row per ISSUE (`active_lane_snapshots` dedups
+            # to a single active row per issue). Two active rows for the same issue is ambiguous
+            # ownership -> hold (Redmine #13967 R9-F2), even when their lanes differ.
             complete = False
         active_keys.add(key)
+        active_issues.add(issue)
+        if active_flag:
+            derived_anomaly_issues.add(issue)
         active.append(
             DrainLane(
-                issue=issue, lane=lane, state_class=state, next_action_owner=next_owner
+                issue=issue,
+                lane=lane,
+                state_class=state,
+                next_action_owner=next_owner,
+                delivery_anomaly_active=active_flag,
             )
         )
+    # Envelope cardinality (Redmine #13967 R9-F2): the canonical producer always emits
+    # `count == len(rows)`. A missing / present-null / non-int (or bool) / mismatched `count`
+    # means the envelope disagrees with its own row roster -> durable-incomplete (hold).
+    count = data.get("count", _MISSING)
+    if isinstance(count, bool) or not isinstance(count, int) or count != len(rows):
+        complete = False
+    # Envelope `active_anomaly_issues` (Redmine #13967 R9-F1): the producer builds it as
+    # `[r.issue_id for r in rows if r.has_active_anomaly]`. Validate it is a list of exact,
+    # duplicate-free strings whose set equals the row-derived active-anomaly issue set — a
+    # missing / non-list / non-string-member / duplicated / disagreeing summary is a
+    # contradictory canonical envelope -> hold.
+    env_anomalies = data.get("active_anomaly_issues", _MISSING)
+    if (
+        not isinstance(env_anomalies, list)
+        or not all(isinstance(x, str) for x in env_anomalies)
+        or len(env_anomalies) != len(set(env_anomalies))
+        or set(env_anomalies) != derived_anomaly_issues
+    ):
+        complete = False
     release_rows: list[tuple[str, str]] = []
     diag_keys: set[tuple[str, str]] = set()
     for diag in diagnostics:
@@ -368,6 +438,9 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
             lane=r.lane,
             state_class=r.workflow_state,
             next_action_owner=r.next_owner,
+            # A live (non-stale) delivery anomaly holds the process here too (Redmine #13967
+            # R9-F1) — same read model, same non-rollback transport-repair signal.
+            delivery_anomaly_active=r.has_active_anomaly,
         )
         for r in rows
     ]

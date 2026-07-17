@@ -47,6 +47,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BUCKET_REVIEW,
     BUCKET_UNKNOWN,
     DRAIN_BUCKETS,
+    HOLD_REASON_DELIVERY_ANOMALY,
     HOLD_REASON_DURABLE_INCOMPLETE,
     HOLD_REASON_UNKNOWN_STATE,
     PROCESS_HOLD,
@@ -73,6 +74,58 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LANE_STATE_RETIRE_READY,
     LANE_STATE_REVIEW_WAITING,
 )
+
+
+def _active_row(
+    issue="1",
+    lane="l",
+    state="idle",
+    next_owner="x",
+    anomaly="none",
+    stale=False,
+    active=None,
+):
+    """A canonical `workflow glance` active row (with the full delivery-anomaly triple).
+
+    Mirrors ``WorkflowGlanceRow.as_payload``: equal ``workflow_state``/``state_class`` and the
+    ``delivery_anomaly`` / ``delivery_anomaly_stale`` / ``has_active_anomaly`` transport
+    dimension (``has_active_anomaly == anomaly != none and not stale`` unless overridden).
+    """
+    if active is None:
+        active = anomaly != "none" and not stale
+    return {
+        "issue_id": issue,
+        "lane": lane,
+        "workflow_state": state,
+        "state_class": state,
+        "next_owner": next_owner,
+        "delivery_anomaly": anomaly,
+        "delivery_anomaly_stale": stale,
+        "has_active_anomaly": active,
+    }
+
+
+def _glance_env(rows=None, diag=None, **overrides):
+    """A canonical `workflow glance --json` envelope: rows + count + active_anomaly_issues +
+    degraded + lifecycle_diagnostic, all derived to be self-consistent unless overridden.
+
+    ``glance_payload`` always emits ``count == len(rows)`` and
+    ``active_anomaly_issues == [r.issue_id for r in rows if r.has_active_anomaly]`` (Redmine
+    #13967 R9), so a faithful fixture must too; a test then overrides exactly the one
+    dimension it probes.
+    """
+    rows = rows or []
+    env = {
+        "rows": rows,
+        "count": len(rows),
+        "active_anomaly_issues": [
+            r["issue_id"] for r in rows if r.get("has_active_anomaly")
+        ],
+        "degraded": False,
+        "lifecycle_diagnostic": diag or [],
+    }
+    env.update(overrides)
+    return env
 
 
 class BucketMappingTests(unittest.TestCase):
@@ -174,6 +227,26 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(projection.process_retention, PROCESS_RELEASABLE)
         self.assertEqual(projection.retirement_pending, 1)
         self.assertEqual(projection.release_dogfood_pending, 1)
+
+    def test_live_delivery_anomaly_holds_without_rewinding_state(self):
+        # Redmine #13967 R9-F1: a lane carrying a live (non-stale) delivery anomaly forces a
+        # PROCESS_HOLD as an orthogonal transport-repair obligation — even when its durable
+        # state (here idle) is otherwise releasable — and never rewinds that state.
+        projection = project_drain_queue(
+            [
+                DrainLane(
+                    issue="1",
+                    state_class=LANE_STATE_IDLE,
+                    actionability=ACTIONABILITY_NON_ACTIONABLE_WAIT,
+                    delivery_anomaly_active=True,
+                )
+            ]
+        )
+        self.assertEqual(projection.process_retention, PROCESS_HOLD)
+        self.assertIn(HOLD_REASON_DELIVERY_ANOMALY, projection.hold_buckets)
+        self.assertEqual(projection.delivery_anomaly_pending, 1)
+        # state not rolled back: the lane is still bucketed idle (a non-drain bucket).
+        self.assertIsNotNone(projection.bucket(BUCKET_IDLE))
 
     def test_out_of_vocabulary_actionability_fails_closed_to_coordinator(self):
         projection = project_drain_queue(
@@ -309,17 +382,16 @@ class CliTests(unittest.TestCase):
     def test_from_glance_derives_lanes_and_release_dogfood(self):
         # A canonical glance envelope: rows carry equal workflow_state/state_class, diagnostics
         # carry a non-active disposition + in-vocabulary process_release, degraded=false.
-        glance_env = {
-            "rows": [
-                {
-                    "issue_id": "200",
-                    "lane": "lane-200",
-                    "workflow_state": LANE_STATE_REVIEW_WAITING,
-                    "state_class": LANE_STATE_REVIEW_WAITING,
-                    "next_owner": "auditor",
-                }
+        glance_env = _glance_env(
+            rows=[
+                _active_row(
+                    issue="200",
+                    lane="lane-200",
+                    state=LANE_STATE_REVIEW_WAITING,
+                    next_owner="auditor",
+                )
             ],
-            "lifecycle_diagnostic": [
+            diag=[
                 {
                     "issue": "201",
                     "lane": "lane-201",
@@ -333,8 +405,7 @@ class CliTests(unittest.TestCase):
                     "process_release": "released",
                 },
             ],
-            "degraded": False,
-        }
+        )
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "glance.json"
             path.write_text(json.dumps(glance_env), encoding="utf-8")
@@ -370,13 +441,10 @@ class CliTests(unittest.TestCase):
         # within each collection. A cross-collection collision, a duplicate diagnostic
         # identity (with possibly conflicting state), or a duplicate active identity is
         # contradictory durable state -> hold.
-        active_row = {
-            "issue_id": "1", "workflow_state": "idle", "state_class": "idle",
-            "lane": "l", "next_owner": "x",
-        }
+        active_row = _active_row(issue="1", lane="l", state="idle")
 
         def env(rows, diag):
-            return {"rows": rows, "lifecycle_diagnostic": diag, "degraded": False}
+            return _glance_env(rows=rows, diag=diag)
 
         hold_cases = [
             # same (issue,lane) in both active and diagnostic
@@ -412,7 +480,7 @@ class CliTests(unittest.TestCase):
         # (non-active) + process_release (closed RELEASE_STATES). A violation is a
         # contradictory/malformed canonical row -> hold, never trusted one-sided.
         def env(rows=None, diag=None):
-            return {"rows": rows or [], "lifecycle_diagnostic": diag or [], "degraded": False}
+            return _glance_env(rows=rows or [], diag=diag or [])
 
         hold_cases = [
             # R7-F1: workflow_state/state_class conflict, or missing/null/non-string state_class.
@@ -435,7 +503,7 @@ class CliTests(unittest.TestCase):
         # A valid canonical row with equal states and an in-vocabulary non-active diagnostic
         # (released, not pending) is complete and releasable.
         ok = env(
-            rows=[{"issue_id": "1", "workflow_state": "idle", "state_class": "idle", "lane": "l", "next_owner": "x"}],
+            rows=[_active_row(issue="1", lane="l", state="idle")],
             diag=[{"issue": "2", "lane": "l2", "lane_disposition": "retired", "process_release": "released"}],
         )
         with tempfile.TemporaryDirectory() as td:
@@ -467,16 +535,121 @@ class CliTests(unittest.TestCase):
                 payload = self._run(from_glance=str(path))
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
-        # The canonical empty envelope is releasable.
+        # The canonical empty envelope (rows + count + active_anomaly_issues + degraded +
+        # lifecycle_diagnostic, all self-consistent) is releasable.
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ok.json"
-            path.write_text(
-                json.dumps({"rows": [], "lifecycle_diagnostic": [], "degraded": False}),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps(_glance_env()), encoding="utf-8")
             payload = self._run(from_glance=str(path))
         self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
         self.assertTrue(payload["durable_complete"])
+
+    def test_from_glance_live_delivery_anomaly_holds(self):
+        # Redmine #13967 R9-F1: a live (non-stale) delivery anomaly on an otherwise
+        # non-blocking (idle) lane is a coordinator transport-repair obligation -> hold,
+        # WITHOUT rewinding the durable state_class (the glance non-rollback invariant): the
+        # envelope is fully readable (durable_complete=True), yet the projection holds and
+        # surfaces the anomaly count + hold reason.
+        env = _glance_env(
+            rows=[_active_row(issue="1", lane="l", state="idle", anomaly="callback_delivery_failed", stale=False)]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "g.json"
+            path.write_text(json.dumps(env), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertTrue(payload["durable_complete"])  # the envelope was readable...
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)  # ...but a live anomaly holds
+        self.assertIn(HOLD_REASON_DELIVERY_ANOMALY, payload["hold_buckets"])
+        self.assertEqual(payload["delivery_anomaly_pending"], 1)
+        # The durable state was NOT rolled back: the lane is still bucketed idle.
+        idle = next(b for b in payload["buckets"] if b["bucket"] == BUCKET_IDLE)
+        self.assertEqual(idle["total"], 1)
+
+    def test_from_glance_stale_anomaly_is_releasable(self):
+        # A stale (superseded) anomaly is NOT active -> it does not hold: has_active_anomaly
+        # is false, so the idle lane is releasable.
+        env = _glance_env(
+            rows=[_active_row(issue="1", lane="l", state="idle", anomaly="callback_delivery_failed", stale=True)]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "g.json"
+            path.write_text(json.dumps(env), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+        self.assertEqual(payload["delivery_anomaly_pending"], 0)
+
+    def test_from_glance_anomaly_contract_violations_hold(self):
+        # Redmine #13967 R9-F1: the delivery-anomaly triple is validated exact-type + closed
+        # vocab + mutual consistency, and the envelope active_anomaly_issues must be a
+        # duplicate-free string list whose set matches the row-derived active-anomaly issues.
+        hold_cases = [
+            # out-of-vocabulary anomaly token
+            _glance_env(rows=[_active_row(anomaly="bogus", stale=False, active=True)]),
+            # non-string anomaly
+            _glance_env(rows=[_active_row(anomaly=1, stale=False, active=True)]),
+            # non-bool stale
+            _glance_env(rows=[_active_row(anomaly="none", stale="false", active=False)]),
+            # non-bool has_active_anomaly
+            _glance_env(rows=[_active_row(anomaly="none", stale=False, active="false")]),
+            # has_active_anomaly inconsistent with anomaly/stale (claims active for none)
+            _glance_env(rows=[_active_row(anomaly="none", stale=False, active=True)]),
+            # has_active_anomaly inconsistent (claims inactive for a live anomaly)
+            _glance_env(rows=[_active_row(anomaly="callback_delivery_failed", stale=False, active=False)]),
+            # missing anomaly triple entirely
+            _glance_env(rows=[{"issue_id": "1", "lane": "l", "workflow_state": "idle",
+                               "state_class": "idle", "next_owner": "x"}]),
+            # envelope active_anomaly_issues disagrees with rows (row is live, summary empty)
+            _glance_env(
+                rows=[_active_row(anomaly="callback_delivery_failed", stale=False)],
+                active_anomaly_issues=[],
+            ),
+            # envelope active_anomaly_issues lists an issue the rows do not
+            _glance_env(rows=[_active_row(state="idle")], active_anomaly_issues=["1"]),
+            # active_anomaly_issues with a duplicate (contradictory summary)
+            _glance_env(
+                rows=[_active_row(issue="1", anomaly="callback_delivery_failed", stale=False)],
+                active_anomaly_issues=["1", "1"],
+            ),
+            # active_anomaly_issues non-list / non-string member / present-null
+            _glance_env(rows=[], active_anomaly_issues="1"),
+            _glance_env(rows=[_active_row(anomaly="callback_delivery_failed", stale=False)],
+                        active_anomaly_issues=[1]),
+            _glance_env(rows=[], active_anomaly_issues=None),
+        ]
+        for env in hold_cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+
+    def test_from_glance_envelope_cardinality_and_active_issue_uniqueness(self):
+        # Redmine #13967 R9-F2: the envelope `count` must be an exact int == len(rows), and
+        # the active roster is one row per ISSUE (not merely per (issue, lane)).
+        hold_cases = [
+            # count disagrees with rows (empty rows, count=1)
+            _glance_env(rows=[], count=1),
+            # count disagrees (one row, count=2)
+            _glance_env(rows=[_active_row()], count=2),
+            # count as bool True (==1) must not satisfy the int contract
+            _glance_env(rows=[_active_row()], count=True),
+            # count present-null / non-int
+            _glance_env(rows=[], count=None),
+            _glance_env(rows=[], count="0"),
+            # count absent entirely
+            {k: v for k, v in _glance_env(rows=[]).items() if k != "count"},
+            # two active rows for the SAME issue (different lanes) -> ambiguous ownership
+            _glance_env(rows=[_active_row(issue="7", lane="l1"), _active_row(issue="7", lane="l2")]),
+        ]
+        for env in hold_cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
 
     def test_present_null_is_malformed_not_absent(self):
         # Redmine #13967 R5-F1: an explicit JSON null is a present non-string value (malformed

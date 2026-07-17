@@ -209,6 +209,11 @@ class DrainLane:
     lane: str = ""
     release_pending: bool = False
     reason: str = ""
+    #: A live (non-stale) delivery/transport anomaly on this lane (Redmine #13967 R9-F1). It
+    #: is a coordinator routing/repair concern — the coordinator must keep an active process to
+    #: clear the stall — so it forces PROCESS_HOLD regardless of the durable state_class (which
+    #: is never rolled back by a delivery anomaly — the glance non-rollback invariant).
+    delivery_anomaly_active: bool = False
 
     @property
     def bucket(self) -> str:
@@ -232,6 +237,7 @@ class DrainLane:
             "actionability": self.effective_actionability,
             "next_action_owner": self.next_action_owner,
             "release_pending": bool(self.release_pending),
+            "delivery_anomaly_active": bool(self.delivery_anomaly_active),
             "reason": self.reason,
         }
 
@@ -274,6 +280,11 @@ class DrainBucketProjection:
 # `releasable` from state it could not read (Redmine #13967 F2).
 HOLD_REASON_UNKNOWN_STATE = "unknown_durable_state"
 HOLD_REASON_DURABLE_INCOMPLETE = "durable_source_incomplete"
+# A live (non-stale) delivery/transport anomaly on any lane forces `hold`: the coordinator
+# must keep an active process to clear the stall, even when the lane's durable state class
+# is otherwise non-blocking (Redmine #13967 R9-F1). This never rewinds the durable
+# workflow_state — it is an orthogonal transport-repair signal projected as a hold.
+HOLD_REASON_DELIVERY_ANOMALY = "active_delivery_anomaly"
 
 
 @dataclass(frozen=True)
@@ -288,6 +299,9 @@ class DrainQueueProjection:
     release_dogfood_pending: int
     lane_count: int
     durable_complete: bool = True
+    #: Count of lanes carrying a live (non-stale) delivery anomaly (Redmine #13967 R9-F1).
+    #: Any positive count forces :data:`PROCESS_HOLD` via :data:`HOLD_REASON_DELIVERY_ANOMALY`.
+    delivery_anomaly_pending: int = 0
 
     @property
     def process_releasable(self) -> bool:
@@ -308,6 +322,7 @@ class DrainQueueProjection:
             "release_dogfood_pending": self.release_dogfood_pending,
             "lane_count": self.lane_count,
             "durable_complete": self.durable_complete,
+            "delivery_anomaly_pending": self.delivery_anomaly_pending,
             "buckets": [b.as_payload() for b in self.buckets],
         }
 
@@ -369,6 +384,12 @@ def project_drain_queue(
         hold_buckets.append(HOLD_REASON_UNKNOWN_STATE)
     if not durable_complete:
         hold_buckets.append(HOLD_REASON_DURABLE_INCOMPLETE)
+    # A live (non-stale) delivery anomaly on any lane is a coordinator transport-repair
+    # obligation — hold, regardless of that lane's (non-rolled-back) durable state class
+    # (Redmine #13967 R9-F1).
+    anomaly_pending = sum(1 for l in lanes if l.delivery_anomaly_active)
+    if anomaly_pending:
+        hold_buckets.append(HOLD_REASON_DELIVERY_ANOMALY)
 
     coordinator_total = sum(
         b.coordinator_actionable for b in buckets if b.bucket in PROCESS_HOLDING_BUCKETS
@@ -389,6 +410,7 @@ def project_drain_queue(
         release_dogfood_pending=release_dogfood,
         lane_count=len(lanes),
         durable_complete=bool(durable_complete),
+        delivery_anomaly_pending=anomaly_pending,
     )
 
 
@@ -473,6 +495,7 @@ __all__ = (
     "PROCESS_RELEASABLE",
     "HOLD_REASON_UNKNOWN_STATE",
     "HOLD_REASON_DURABLE_INCOMPLETE",
+    "HOLD_REASON_DELIVERY_ANOMALY",
     "bucket_for_state",
     "DrainLane",
     "DrainBucketProjection",
