@@ -548,6 +548,68 @@ class StartupTransactionFenceTest(unittest.TestCase):
                 self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
                 self.assertFalse(ops.close_calls)
 
+    def test_falsy_and_coerced_rows_are_corruption_not_empty_or_closed(self):
+        # Review j#81166 R5-F1 (authority loss, not display): a corrupt row that decoded
+        # into a plausible "all participants absent" record let the rail write
+        # completed_rolled_back over a real debt. Every one of these is a malformed
+        # authority — NULL/"" participants, an empty participant object, closed="false"
+        # coercing to True, a NULL identity cell, a fractional revision — and must fail
+        # closed with the phase left byte-unchanged, never coerced into a completion.
+        import sqlite3
+
+        good_participant = (
+            '[{"role":"claude","assigned_name":"mzb1_ws1_claude_lane-1",'
+            '"locator":"w2G:p3","receipt":"w","closed":false}]'
+        )
+
+        def _store(*, participants=good_participant, phase=PHASE_ROLLBACK_OWED,
+                   providers="claude", revision=1, workspace="ws1", lane="lane-1"):
+            home = Path(self._tmp.name) / f"coerce_{len(list(Path(self._tmp.name).iterdir()))}"
+            home.mkdir()
+            fence = StartupTransactionFence(home=home)
+            nonce = "nn"
+            conn = sqlite3.connect(fence.path, isolation_level=None)
+            conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO store_meta VALUES ('store_nonce', ?)", (nonce,))
+            conn.execute(
+                "CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, workspace_id "
+                "TEXT, lane_id TEXT, providers TEXT, phase TEXT, revision, participants "
+                "TEXT, reserved_at TEXT, updated_at TEXT)"
+            )
+            aid = startup_action_id(self.unit, "n1")
+            conn.execute(
+                "INSERT INTO startup_actions VALUES (?,?,?,?,?,?,?,?,?)",
+                (aid, workspace, lane, providers, phase, revision, participants, "t", "t"),
+            )
+            conn.execute(f"PRAGMA user_version={STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+            conn.close()
+            fence.seal_path.write_text(nonce, encoding="utf-8")
+            return fence, aid
+
+        cases = {
+            "participants_null": dict(participants=None),
+            "participants_empty_string": dict(participants=""),
+            "participant_empty_object": dict(participants="[{}]"),
+            "closed_string_false": dict(
+                participants='[{"role":"claude","assigned_name":"n","locator":"w1:p1",'
+                '"closed":"false"}]'
+            ),
+            "workspace_null": dict(workspace=None),
+            "lane_null": dict(lane=None),
+            "revision_fractional": dict(revision=1.5),
+        }
+        for label, kw in cases.items():
+            with self.subTest(shape=label):
+                fence, aid = _store(**kw)
+                with self.assertRaises(StartupTransactionError):
+                    fence.read(aid)
+                ops = _RollbackOps([])
+                verdict = run_session_rollback(
+                    action_id=aid, ops=ops, fence=fence, execute=True
+                )
+                self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+                self.assertFalse(ops.close_calls)
+
     def test_a_reserve_write_failure_is_structured_before_any_side_effect(self):
         # Review j#81122 R4-F2: reserve's SELECT/INSERT were outside the normalization that
         # _write already had, so a write that aborts leaked a raw IntegrityError — and
@@ -1239,6 +1301,53 @@ class SessionRollbackRailTest(unittest.TestCase):
         verdict = self._run(ops, self.fence.read(action.action_id), execute=True)
         self.assertTrue(verdict.ok)
         self.assertTrue(ops.close_calls, "the replay had no targets — it was stuck")
+
+    def test_lock_io_failure_is_a_structured_refusal_not_a_raw_oserror(self):
+        # Review j#81166 R5-F2: the lock that guards the authority is part of the authority.
+        # A mkdir / os.open / flock / unlock failure escaped the public rail as a raw
+        # OSError, breaking run_session_rollback's "never raises". An open failure is now a
+        # structured refusal (and never mistaken for contention, which needs a live fd).
+        from unittest.mock import patch as _patch
+
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        with _patch("os.open", side_effect=PermissionError("denied")):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
+    def test_an_unprobeable_artifact_set_is_a_structured_refusal(self):
+        # Review j#81171 authority-surface inventory: store_shape's os.path.lexists runs
+        # before the connect/lock guards on every read and reserve, so a raw OSError there
+        # escaped the public rail's "never raises". An unprobeable artifact set is a
+        # damaged authority, not an absent one.
+        from unittest.mock import patch as _patch
+
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        with _patch("os.path.lexists", side_effect=OSError("boom")):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_lock_release_failure_is_structured_not_raw(self):
+        # The release half of R5-F2 (authority-surface inventory): a flock(LOCK_UN) that
+        # raises must not escape the public rail as a raw OSError.
+        from unittest.mock import patch as _patch
+        import fcntl as _fcntl
+
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        original = _fcntl.flock
+
+        def _fail_unlock(fd, op):
+            if op == _fcntl.LOCK_UN:
+                raise OSError("unlock denied")
+            return original(fd, op)
+
+        with _patch("fcntl.flock", side_effect=_fail_unlock):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
 
     def test_a_crash_at_health_check_is_still_recoverable(self):
         # Review j#81070 R1-F5: settle() writes `health_check` before it writes the

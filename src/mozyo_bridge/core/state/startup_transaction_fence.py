@@ -236,6 +236,50 @@ class Participant:
             closed=bool(raw.get("closed")),
         )
 
+    @staticmethod
+    def strict_from_payload(raw: object, action_id: str) -> "Participant":
+        """Decode a participant that was READ BACK from the authority (fail-closed).
+
+        Distinct from :meth:`from_payload`, which is the lenient path for a payload this
+        process just built. A participant read from disk is an authority record, so every
+        field must be the type the schema promised (review j#81166 R5-F1): a missing key,
+        a non-string role/name/locator/receipt, or a non-boolean ``closed`` is a corrupt
+        authority, not a value to coerce. ``closed="false"`` becoming ``True`` was the
+        exact coercion that let a corrupt row read as "already closed" and vanish a
+        rollback debt into a terminal completion.
+        """
+        if not isinstance(raw, dict):
+            raise StartupTransactionError(
+                f"startup action {action_id!r} has a non-object participant "
+                f"({type(raw).__name__}); the authority row is malformed"
+            )
+        for key in ("role", "assigned_name", "locator"):
+            value = raw.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise StartupTransactionError(
+                    f"startup action {action_id!r} participant {key} is missing or not a "
+                    f"non-empty string ({value!r}); the authority row is malformed"
+                )
+        receipt = raw.get("receipt", "")
+        if not isinstance(receipt, str):
+            raise StartupTransactionError(
+                f"startup action {action_id!r} participant receipt is not a string "
+                f"({receipt!r}); the authority row is malformed"
+            )
+        closed = raw.get("closed", False)
+        if not isinstance(closed, bool):
+            raise StartupTransactionError(
+                f"startup action {action_id!r} participant closed is not a boolean "
+                f"({closed!r}); refusing to coerce a corrupt flag into a close verdict"
+            )
+        return Participant(
+            role=_norm(raw.get("role")),
+            assigned_name=_norm(raw.get("assigned_name")),
+            locator=_norm(raw.get("locator")),
+            receipt=_norm(receipt),
+            closed=closed,
+        )
+
 
 @dataclass(frozen=True)
 class StartupAction:
@@ -326,8 +370,24 @@ class StartupTransactionFence:
         )
 
     def store_shape(self) -> StoreShape:
-        """Classify the artifact set. ``lexists``: a broken symlink is still evidence."""
-        present = tuple(name for name, p in self._artifact_paths() if os.path.lexists(p))
+        """Classify the artifact set. ``lexists``: a broken symlink is still evidence.
+
+        The artifact probe is normalized (review j#81171 authority-surface inventory):
+        ``os.path.lexists`` can raise ``OSError`` (a permission-denied parent, an embedded
+        NUL), and this runs BEFORE the connect/lock guards on every read and reserve, so a
+        raw error here escaped the public rail's "never raises". An unprobeable artifact
+        set is a damaged authority, not an absent one — fail closed, never bootstrap over it.
+        """
+        try:
+            present = tuple(
+                name for name, p in self._artifact_paths() if os.path.lexists(p)
+            )
+        except OSError as exc:
+            raise StartupTransactionError(
+                f"the startup transaction authority {self.path} artifacts could not be "
+                f"probed ({exc}); fail closed rather than read an unprobeable store as "
+                "absent"
+            ) from exc
         if not present:
             return StoreShape(state=STORE_ABSENT)
         row_bearing = {"db", "wal", "shm", "journal"} & set(present)
@@ -697,14 +757,24 @@ class _FenceLock:
             fence._lock_depth += 1
             self._nested = True
             return self
-        lock = fence.lock_path
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        # The directory-create AND the open are inside the guard (review j#81166 R5-F2):
+        # a `mkdir` / `os.open` that fails on permissions or a bad path is the authority
+        # being unavailable, and it escaped the public rail's "never raises" as a raw
+        # OSError. flock contention stays `StartupTransactionBusy`; every other lock I/O
+        # failure is a structured `StartupTransactionError`, never a stack trace.
+        fd = None
         try:
+            lock = fence.lock_path
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
-            os.close(fd)
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
+            if fd is not None:
+                os.close(fd)
+            if getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN) and fd is not None:
+                # EACCES/EAGAIN from flock is contention (another holder). EACCES from the
+                # open itself is not — but we only reach here with fd set when flock is the
+                # failing call, so a set fd narrows this to the contention case.
                 raise StartupTransactionBusy(
                     "another startup transaction holds this authority; refusing to wait "
                     "or steal it — nothing was started or closed"
@@ -726,46 +796,84 @@ class _FenceLock:
         fd = fence._lock_fd
         fence._lock_fd = None
         fence._lock_depth = 0
+        # Release I/O is normalized too (review j#81166 R5-F2): an unlock / close that
+        # raises must not escape the public rail as a raw OSError. The fd is always closed.
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as exc:
+            raise StartupTransactionError(
+                f"could not release the startup transaction lock ({exc}); fail closed"
+            ) from exc
         finally:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _require_text(value: object, action_id: str, field: str) -> str:
+    """A cell the schema declares NOT NULL text. NULL / non-string is a corrupt row.
+
+    Non-empty is required for the identity fields; ``NULL`` slipping through as an empty
+    string is precisely how a byte-exact workspace / lane was lost (review j#81166 R5-F1).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise StartupTransactionError(
+            f"startup action {action_id!r} field {field!r} is missing or not a non-empty "
+            f"string ({value!r}); the authority row is malformed"
+        )
+    return value
 
 
 def _row_to_action(row) -> StartupAction:
-    """Decode AND validate a row as a versioned authority record (fail-closed).
+    """Validate a row as a versioned authority record, field by field (fail-closed).
 
-    Every cell is checked for the type and shape the schema promises, and any violation
-    raises :class:`StartupTransactionError` (review j#81122 R4-F1). Decoding without
-    validating let a corrupt authority escape the public rail as an ``AttributeError``
-    (``providers`` NULL → ``.split()``; a non-object participant → ``.get()``) or, worse,
-    slip through as a plausible record with an unknown ``phase`` — which the rail then
-    read as ``nothing_owed`` and silently declined to converge. A row is either this exact
-    shape or it is an unreadable authority; there is no in-between that closes panes.
+    Every cell is a strict typed contract, not a value to coerce (review j#81166 R5-F1).
+    The earlier "validate" only rejected the shapes that happened to crash — it still let
+    ``participants`` NULL/"" read as an empty set, ``closed="false"`` coerce to ``True``,
+    ``workspace_id`` NULL pass, and ``revision=1.5`` truncate. Each of those turned a
+    CORRUPT authority row into a plausible "all participants absent" record, so the public
+    rail erased a real rollback debt into a terminal ``completed_rolled_back``. A row read
+    from the store is byte-exact authority (j#80989 Q1/Q3) or it is unreadable; there is
+    no lenient middle that closes — or forgets — panes.
     """
-    action_id = row[0]
-    workspace_id, lane_id, providers_cell, phase, revision_cell, participants_cell = (
-        row[1], row[2], row[3], row[4], row[5], row[6],
-    )
-    if not isinstance(providers_cell, str):
+    if row is None or len(row) != 9:
         raise StartupTransactionError(
-            f"startup action {action_id!r} has a non-text providers cell "
-            f"({type(providers_cell).__name__}); the authority row is malformed"
+            "a startup action row does not have the 9 expected columns; malformed"
         )
+    action_id = _require_text(row[0], "<unknown>", "action_id")
+    workspace_id = _require_text(row[1], action_id, "workspace_id")
+    lane_id = _require_text(row[2], action_id, "lane_id")
+    providers_cell = _require_text(row[3], action_id, "providers")
+    phase = row[4]
+    revision_cell = row[5]
+    participants_cell = row[6]
+    _require_text(row[7], action_id, "reserved_at")
+    _require_text(row[8], action_id, "updated_at")
+
     if phase not in PHASES:
         raise StartupTransactionError(
             f"startup action {action_id!r} has an unknown phase {phase!r}; a corrupt "
             "phase is an unreadable authority, not a no-op action"
         )
-    try:
-        revision = int(revision_cell)
-    except (TypeError, ValueError) as exc:
+    # revision must be an EXACT integer — a stored float (1.5) truncating to 1 is silent
+    # authority drift, so bool / float / non-numeric string are all rejected (bool is an
+    # int subclass, hence the explicit guard).
+    if isinstance(revision_cell, bool) or not isinstance(revision_cell, int):
         raise StartupTransactionError(
-            f"startup action {action_id!r} has a non-integer revision "
-            f"{revision_cell!r}; the authority row is malformed"
-        ) from exc
+            f"startup action {action_id!r} has a non-integer revision {revision_cell!r}; "
+            "the authority row is malformed"
+        )
+    revision = revision_cell
+
+    if not isinstance(participants_cell, str):
+        raise StartupTransactionError(
+            f"startup action {action_id!r} participants cell is not text "
+            f"({type(participants_cell).__name__}); a NULL / non-text cell is malformed, "
+            "not an empty participant set"
+        )
     try:
-        raw_participants = json.loads(participants_cell) if participants_cell else []
+        raw_participants = json.loads(participants_cell)
     except (TypeError, ValueError) as exc:
         raise StartupTransactionError(
             f"startup action {action_id!r} has a participants cell that is not JSON; "
@@ -776,12 +884,9 @@ def _row_to_action(row) -> StartupAction:
             f"startup action {action_id!r} participants is not a JSON array "
             f"({type(raw_participants).__name__}); the authority row is malformed"
         )
-    for entry in raw_participants:
-        if not isinstance(entry, dict):
-            raise StartupTransactionError(
-                f"startup action {action_id!r} has a non-object participant "
-                f"({type(entry).__name__}); the authority row is malformed"
-            )
+    participants = tuple(
+        Participant.strict_from_payload(entry, action_id) for entry in raw_participants
+    )
     return StartupAction(
         action_id=action_id,
         unit=StartupUnit(
@@ -791,7 +896,7 @@ def _row_to_action(row) -> StartupAction:
         ),
         phase=phase,
         revision=revision,
-        participants=tuple(Participant.from_payload(p) for p in raw_participants),
+        participants=participants,
         reserved_at=row[7],
         updated_at=row[8],
     )
