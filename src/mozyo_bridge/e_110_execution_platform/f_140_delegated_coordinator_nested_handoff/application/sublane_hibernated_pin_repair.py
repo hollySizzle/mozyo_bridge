@@ -192,6 +192,7 @@ def run_hibernated_pin_repair(
     )
     from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        is_git_worktree_root,
         repo_backend_is_herdr,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -261,10 +262,11 @@ def run_hibernated_pin_repair(
             detail=f"--worktree does not resolve ({type(exc).__name__})",
             lane_id=lane_label,
         )
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
+    # Redmine #13933 j#81046 Decision 1: the token family is decided by whether the target
+    # root IS a git worktree, probed on that root -- not by ``resolved == repo_root``, which
+    # only holds when repo_root is the coordinator workspace root and otherwise flips the
+    # family on the caller's cwd (the #13846 j#81024 identity split).
+    collapsed_to_root = not is_git_worktree_root(resolved_worktree)
     if collapsed_to_root:
         metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
     else:

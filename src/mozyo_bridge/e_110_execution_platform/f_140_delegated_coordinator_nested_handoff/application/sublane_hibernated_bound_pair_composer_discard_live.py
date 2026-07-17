@@ -547,6 +547,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         status: str,
         transaction,
     ) -> PreparationObservation:
+        faults = self._bound_signature_faults(
+            _convergence_request(request), record, identity
+        )
         try:
             providers = (
                 ("gateway", resolve_gateway_provider(str(self.repo_root))),
@@ -560,10 +563,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 branch=branch,
                 revision=record.revision,
                 generation=record.lane_generation,
-                lifecycle_exact=self._lifecycle_exact(
-                    _convergence_request(request), record, identity
-                ),
+                lifecycle_exact=not faults,
                 pins_empty=not bool(record.declared_slots),
+                bound_faults=faults,
                 worktree_readable=ok_status,
                 worktree_clean=ok_status and not status,
                 branch_matches=ok_branch and branch == request.branch,
@@ -631,10 +633,9 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             branch=branch,
             revision=record.revision,
             generation=record.lane_generation,
-            lifecycle_exact=self._lifecycle_exact(
-                _convergence_request(request), record, identity
-            ),
+            lifecycle_exact=not faults,
             pins_empty=not bool(record.declared_slots),
+            bound_faults=faults,
             inventory_readable=True,
             worktree_readable=ok_status,
             worktree_clean=ok_status and not status,
@@ -680,6 +681,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             generation=base.generation,
             lifecycle_exact=base.lifecycle_exact,
             pins_empty=base.pins_empty,
+            bound_faults=base.bound_faults,
             inventory_readable=base.inventory_readable,
             worktree_readable=base.worktree_readable,
             worktree_clean=base.worktree_clean,

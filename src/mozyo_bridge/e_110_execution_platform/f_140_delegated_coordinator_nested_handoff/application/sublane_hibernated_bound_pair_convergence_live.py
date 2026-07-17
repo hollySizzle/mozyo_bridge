@@ -71,6 +71,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HerdrSublaneActuatorOps,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+    is_git_worktree_root,
     list_herdr_agent_rows,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
@@ -79,6 +80,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_convergence import (
     APPROVAL_GATE,
+    FAULT_IDENTITY_ABSENT,
+    FAULT_IDENTITY_MISMATCH,
+    FAULT_ISSUE_MISMATCH,
+    FAULT_NOT_HIBERNATED,
+    FAULT_NOT_ISSUE_BOUND,
+    FAULT_NOT_RELEASED,
+    FAULT_PINS_NOT_EMPTY,
+    FAULT_PROJECT_SCOPED,
+    FAULT_REPLACEMENT_UNSETTLED,
     ApprovalExpectation,
     BoundSlot,
     decide_transaction_plan,
@@ -113,8 +123,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     decode_assigned_name,
-    derive_directory_lane_token,
-    derive_lane_workspace_token,
+    lane_runtime_identity,
 )
 
 
@@ -299,14 +308,19 @@ class LiveBoundPairConvergenceOps:
     pin_store: LanePinRepairStore = field(default_factory=LanePinRepairStore)
 
     def _worktree(self, request: ConvergeBoundPairRequest) -> tuple[Path | None, str, str]:
+        """Resolve the target lane root and the identity that root derives.
+
+        The identity is a fact about ``request.worktree`` alone.  It deliberately does not
+        consult ``self.repo_root``: that is only the caller's ``--repo`` / cwd here, and
+        keying the token family off ``resolved == repo_root`` made the same lane resolve
+        ``wt_`` from one directory and ``dl_`` from another, so its own row stopped matching
+        itself when the command ran from the lane worktree (#13846 j#81024 / #13933 j#81043).
+        """
         try:
             resolved = Path(request.worktree).expanduser().resolve(strict=True)
             workspace = herdr_workspace_segment(resolved)
-            root = self.repo_root.expanduser().resolve()
-            identity = (
-                derive_directory_lane_token(str(resolved), request.lane)
-                if resolved == root
-                else derive_lane_workspace_token(str(resolved))
+            identity = lane_runtime_identity(
+                str(resolved), request.lane, git_worktree=is_git_worktree_root(resolved)
             )
         except (OSError, ValueError):
             return None, "", ""
@@ -322,17 +336,42 @@ class LiveBoundPairConvergenceOps:
             return None
 
     @staticmethod
-    def _lifecycle_exact(request: ConvergeBoundPairRequest, record, identity: str) -> bool:
-        return bool(
-            record.lane_disposition == DISPOSITION_HIBERNATED
-            and norm(record.binding_kind) == BINDING_KIND_ISSUE
-            and norm(record.issue_id) == norm(request.issue)
-            and not record.project_scope
-            and bool(norm(record.worktree_identity))
-            and norm(record.worktree_identity) == norm(identity)
-            and record.process_release == RELEASE_RELEASED
-            and replacement_settled(record.replacement_state)
-        )
+    def _bound_signature_faults(
+        request: ConvergeBoundPairRequest, record, identity: str
+    ) -> tuple[str, ...]:
+        """Name every bound-signature axis this row fails (Redmine #13933 j#81046 Decision 2).
+
+        The conjunction below is the same one :meth:`_lifecycle_exact` asserts; evaluating it
+        axis-by-axis is what lets a blocked rail say WHICH premise broke instead of only that
+        one did.  Axis names only -- no observed row value is returned, so a caller may put
+        the whole tuple in a public payload.  ``pins`` is not here: each rail states its own
+        pin requirement (this one wants none, the retire rails want exact), so the pin axis is
+        folded in by the caller.
+        """
+        faults: list[str] = []
+        if record.lane_disposition != DISPOSITION_HIBERNATED:
+            faults.append(FAULT_NOT_HIBERNATED)
+        if norm(record.binding_kind) != BINDING_KIND_ISSUE:
+            faults.append(FAULT_NOT_ISSUE_BOUND)
+        if norm(record.issue_id) != norm(request.issue):
+            faults.append(FAULT_ISSUE_MISMATCH)
+        if record.project_scope:
+            faults.append(FAULT_PROJECT_SCOPED)
+        if not norm(record.worktree_identity):
+            faults.append(FAULT_IDENTITY_ABSENT)
+        elif norm(record.worktree_identity) != norm(identity):
+            faults.append(FAULT_IDENTITY_MISMATCH)
+        if record.process_release != RELEASE_RELEASED:
+            faults.append(FAULT_NOT_RELEASED)
+        if not replacement_settled(record.replacement_state):
+            faults.append(FAULT_REPLACEMENT_UNSETTLED)
+        return tuple(faults)
+
+    @classmethod
+    def _lifecycle_exact(cls, request: ConvergeBoundPairRequest, record, identity: str) -> bool:
+        # Delegated, not restated: a second copy of the conjunction could drift from the
+        # typed axes above and let a rail report a fault set that contradicts its own verdict.
+        return not cls._bound_signature_faults(request, record, identity)
 
     def _transaction(self, workspace: str, action_id: str):
         if not action_id:
@@ -364,7 +403,8 @@ class LiveBoundPairConvergenceOps:
                 branch=branch, worktree_readable=ok_status, worktree_clean=ok_status and not status,
                 branch_matches=ok_branch and branch == request.branch, detail="lifecycle absent",
             )
-        exact = self._lifecycle_exact(request, record, identity)
+        faults = self._bound_signature_faults(request, record, identity)
+        exact = not faults
         try:
             rows = tuple(list_herdr_agent_rows(self.env))
             inventory_readable = True
@@ -373,6 +413,7 @@ class LiveBoundPairConvergenceOps:
                 workspace_id=workspace, worktree_path=str(worktree), worktree_identity=identity,
                 branch=branch, revision=record.revision, generation=record.lane_generation,
                 lifecycle_exact=exact, pins_empty=not bool(record.declared_slots),
+                bound_faults=faults,
                 worktree_readable=ok_status, worktree_clean=ok_status and not status,
                 branch_matches=ok_branch and branch == request.branch,
                 detail=f"inventory unreadable ({type(exc).__name__})",
@@ -385,6 +426,7 @@ class LiveBoundPairConvergenceOps:
                 workspace_id=workspace, worktree_path=str(worktree), worktree_identity=identity,
                 branch=branch, revision=record.revision, generation=record.lane_generation,
                 lifecycle_exact=exact, pins_empty=not bool(record.declared_slots),
+                bound_faults=faults,
                 inventory_readable=False,
                 worktree_readable=ok_status, worktree_clean=ok_status and not status,
                 branch_matches=ok_branch and branch == request.branch,
@@ -439,6 +481,7 @@ class LiveBoundPairConvergenceOps:
             lifecycle_exact=exact,
             pins_empty=not bool(record.declared_slots),
             pins_exact=pins_exact,
+            bound_faults=faults,
             inventory_readable=inventory_readable,
             worktree_readable=ok_status,
             worktree_clean=ok_status and not status,

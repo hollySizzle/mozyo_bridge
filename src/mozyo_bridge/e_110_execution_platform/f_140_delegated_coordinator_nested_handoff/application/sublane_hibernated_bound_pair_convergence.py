@@ -35,7 +35,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_WORKTREE_UNSAFE,
     BoundSlot,
     ConvergenceVerdict,
+    FAULT_PINS_NOT_EMPTY,
     TransactionPlanObservation,
+    bound_signature_detail,
     STATE_ACTIONABLE,
     STATE_ALREADY_CONVERGED,
     STATE_BLOCKED,
@@ -77,6 +79,9 @@ class BoundPairObservation:
     worktree_clean: bool = False
     branch_matches: bool = False
     slots: tuple[BoundSlot, ...] = ()
+    #: Typed axes of the bound signature this row fails (Redmine #13933 j#81046 Decision 2).
+    #: Empty whenever ``lifecycle_exact`` holds.  Axis names only -- safe for a public payload.
+    bound_faults: tuple[str, ...] = ()
     detail: str = ""
 
 
@@ -201,8 +206,17 @@ def _classify(
 ) -> tuple[ConvergenceOutcome | None, ApprovalExpectation | None]:
     if not all((request.issue.strip(), request.journal.strip(), request.lane.strip(), request.worktree.strip(), request.branch.strip())):
         return _blocked(request, BLOCK_IDENTITY_INCOMPLETE), None
-    if not obs.lifecycle_exact or (not obs.pins_empty and not obs.pins_exact):
-        return _blocked(request, BLOCK_NOT_BOUND_SIGNATURE, detail=obs.detail, slots=obs.slots), None
+    pins_unsafe = not obs.pins_empty and not obs.pins_exact
+    if not obs.lifecycle_exact or pins_unsafe:
+        # Name the axes that broke.  The collapsed reason alone sent #13846 j#81024 chasing a
+        # partial-effect defect while the real fault (worktree identity) stayed unnamed.  This
+        # rail admits empty OR exact pins, so it owns its own pin axis.
+        faults = obs.bound_faults + ((FAULT_PINS_NOT_EMPTY,) if pins_unsafe else ())
+        return _blocked(
+            request, BLOCK_NOT_BOUND_SIGNATURE,
+            detail=bound_signature_detail(faults) or obs.detail,
+            slots=obs.slots,
+        ), None
     if not obs.inventory_readable:
         return _blocked(request, BLOCK_INVENTORY_UNREADABLE, detail=obs.detail), None
     if not (obs.worktree_readable and obs.worktree_clean and obs.branch_matches):

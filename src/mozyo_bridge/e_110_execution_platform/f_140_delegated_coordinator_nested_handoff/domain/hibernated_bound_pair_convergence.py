@@ -38,6 +38,49 @@ BLOCK_REPLACEMENT_STOPPED = "replacement_stopped"
 BLOCK_FRESH_PAIR_UNPROVEN = "fresh_pair_unproven"
 BLOCK_PIN_CAS_REFUSED = "pin_cas_refused"
 
+# ---------------------------------------------------------------------------
+# Typed bound-signature faults (Redmine #13933 j#81046 Decision 2).
+#
+# ``BLOCK_NOT_BOUND_SIGNATURE`` is a conjunction of independent axes.  Reporting only the
+# collapsed token told an operator that *something* about the row was wrong while naming
+# nothing: #13846 j#81024 read the token as proof of a partial-effect defect, and the real
+# cause -- a worktree identity mismatch -- stayed invisible for a whole correction round
+# (#13933 j#81043).  Each axis therefore gets its own token.  They name the AXIS only; the
+# observed row values stay out of the vocabulary and out of the payload.
+# ---------------------------------------------------------------------------
+#: The lane is not hibernated.
+FAULT_NOT_HIBERNATED = "lane_not_hibernated"
+#: The row is not issue-bound (``binding_kind``).
+FAULT_NOT_ISSUE_BOUND = "binding_not_issue_bound"
+#: The row's issue id is not the requested one.
+FAULT_ISSUE_MISMATCH = "issue_mismatch"
+#: The row is project-scoped, so it is not an exact bound lane.
+FAULT_PROJECT_SCOPED = "project_scoped"
+#: The row carries no worktree identity at all.
+FAULT_IDENTITY_ABSENT = "worktree_identity_absent"
+#: The row's worktree identity is not the one the target root derives.
+FAULT_IDENTITY_MISMATCH = "worktree_identity_mismatch"
+#: The lane's processes are not released.
+FAULT_NOT_RELEASED = "process_not_released"
+#: A receiver replacement generation is still in flight.
+FAULT_REPLACEMENT_UNSETTLED = "replacement_unsettled"
+#: Declared pins are present where this rail requires none.
+FAULT_PINS_NOT_EMPTY = "pins_not_empty"
+
+BOUND_SIGNATURE_FAULTS = (
+    FAULT_NOT_HIBERNATED, FAULT_NOT_ISSUE_BOUND, FAULT_ISSUE_MISMATCH,
+    FAULT_PROJECT_SCOPED, FAULT_IDENTITY_ABSENT, FAULT_IDENTITY_MISMATCH,
+    FAULT_NOT_RELEASED, FAULT_REPLACEMENT_UNSETTLED, FAULT_PINS_NOT_EMPTY,
+)
+
+
+def bound_signature_detail(faults: Sequence[str]) -> str:
+    """Render typed faults as an operator-readable detail (axis names only, no row values)."""
+    named = tuple(fault for fault in faults if fault in BOUND_SIGNATURE_FAULTS)
+    if not named:
+        return ""
+    return "bound signature faults: " + ",".join(named)
+
 PLAN_ADMITTED = "admitted"
 PLAN_OBSERVATION_UNSAFE = "fresh_observation_unsafe"
 PLAN_OBSERVATION_CHANGED = "fresh_observation_changed"
@@ -283,6 +326,10 @@ __all__ = (
     "BLOCK_TRANSACTION_CONFLICT", "BLOCK_REPLACEMENT_STOPPED", "BLOCK_FRESH_PAIR_UNPROVEN",
     "BLOCK_PIN_CAS_REFUSED", "PLAN_ADMITTED", "PLAN_OBSERVATION_UNSAFE",
     "PLAN_OBSERVATION_CHANGED", "PLAN_APPROVAL_SNAPSHOT_MISMATCH",
+    "BOUND_SIGNATURE_FAULTS", "FAULT_NOT_HIBERNATED", "FAULT_NOT_ISSUE_BOUND",
+    "FAULT_ISSUE_MISMATCH", "FAULT_PROJECT_SCOPED", "FAULT_IDENTITY_ABSENT",
+    "FAULT_IDENTITY_MISMATCH", "FAULT_NOT_RELEASED", "FAULT_REPLACEMENT_UNSETTLED",
+    "FAULT_PINS_NOT_EMPTY", "bound_signature_detail",
     "TransactionPlanObservation", "TransactionPlanVerdict", "approval_matches",
     "convergence_action_id", "decide_transaction_plan", "slot_digest", "worktree_digest",
 )

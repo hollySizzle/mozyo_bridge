@@ -623,6 +623,32 @@ Table naming:
         報告しても新しいmarkerはmintせず、既存approvalに束縛したまま `--execute` が全fenceを再検証する。完了後もlaneはhibernatedのまま、declared pins / disposition /
         worktree / branchを変更せず、resume / dispatch / callback sendを行わない。次に通常の
         `sublane converge-bound-pair`を新しいaction-time markerで実行し、fresh pair proofからだけpinsを修復する。
+      - ★**lane identity は target root の KIND で決める。callerのcwdでは決めない** (#13933 R7、live evidence #13846 j#81024、
+        design answer j#81046 Decision 1)。lane の worktree identity token には 2 系統がある: linked git worktree は
+        `derive_lane_workspace_token`(`wt_`)、non-git directory scaffold lane は `derive_directory_lane_token`(`dl_`)。
+        判別子は「その root 自身が git worktree か」であり、`resolved == repo_root` のような caller 相対の偶然ではない。
+        後者の proxy は `repo_root` が本当に coordinator の workspace root のときだけ成立し、`--repo` / cwd が渡る public rail では
+        同一 lane が **実行位置で `wt_`/`dl_` を切替える**。結果、operator が案内された「lane worktree を execution root にする」経路で
+        row の identity と derive が食い違い、lifecycle-signature block が collapse した (#13846 j#81024 / #13933 j#81043)。
+        derive は共有 `is_git_worktree_root`(`git -C <root> rev-parse --show-toplevel == root`) を target root で probe し、
+        `lane_runtime_identity(git_worktree=...)` で family を選ぶ。**persisted row に合わせて family を選ばない**: root の kind が
+        決め、食い違う row は caller が報告すべき real mismatch。
+        - この derive を採るのは **read/repair surface** = `prepare-bound-pair` / `converge-bound-pair` と metadata-only
+          `repair-pins`。3 rail は execution root に依らず同一 identity を derive する (regression:
+          `tests/regressions/test_issue_13933_lane_identity_execution_root.py`)。
+        - **destructive retire 系** (`sublane retire` guarded close / hibernated-bound / hibernated-legacy / live-reconcile) は
+          この derive を採らない。#13754 は「lane worktree を `--repo` と `--worktree` の両方に渡すと token が collapse し、
+          worktree-binding attestation が **意図的に fail-closed** する」ことを安全弁として持つ (false block は安全、false close が
+          防ぐべき欠陥)。identity derive と authority が entangle しているため、git-kind derive への切替は destructive 挙動を
+          変える per-surface 設計判断であり、別 review を要する。**共有 probe は generic authority guard へ統合しない** (design
+          answer j#81046 Decision 4): 各 surface が identity family と fail-closed 条件を自分で決める。
+      - ★**bound-signature block は typed sub-reason で報告する** (#13933 R7、design answer j#81046 Decision 2)。
+        `not_hibernated_released_bound_pins_empty` は独立 axis の連言 (hibernated / issue-bound / issue 一致 / non-project /
+        worktree identity 非空 / identity 一致 / released / replacement settled / pins) であり、collapse した単一 token は
+        「どの前提が破れたか」を隠す。detail は破れた axis 名のみを列挙し (raw row 値は payload に出さない)、
+        resume 不成立時は `resuming=false` に typed `resume_diagnostic` (`approval_source_unreadable` / `no_matching_approval_marker` /
+        `no_action_owned_progress` / `projected_still_blocked:<reason>` / `adopted`) を添えて、credential 欠落と「所有 action 無し」を
+        区別可能にする。
     - **record-less scratch pair retire は本 component を書かない** (`herdr session-retire`、#13892、live evidence #13882
       j#80060 / j#80066)。`herdr session-start` の scratch pair は lane lifecycle row を **一度も持たない**ため、上記 4 契約
       (#13754 guarded close / #13841 migration / #13842 reconcile / #13845 bound retire) は **すべて row の存在を前提**に

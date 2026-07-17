@@ -40,6 +40,28 @@ BLOCK_APPROVAL_MISMATCH = "approval_mismatch"
 BLOCK_TRANSACTION_CONFLICT = "replacement_transaction_conflict"
 BLOCK_REPLACEMENT_STOPPED = "replacement_stopped"
 
+# ---------------------------------------------------------------------------
+# Typed resume diagnostics (Redmine #13933 j#81046 Decision 2).
+#
+# The preflight declines to resume for four genuinely different reasons.  Reporting all of
+# them as a bare ``resuming=false`` / ``action_id=null`` left an operator unable to tell a
+# missing credential from a pair that simply has no in-flight action -- the exact ambiguity
+# that made #13846 j#81024 unreadable.  Each outcome now names which one it was.
+# ---------------------------------------------------------------------------
+#: The approval source could not be read at all (credential / network / journal).  The
+#: failure TYPE is reported; its message is not, so no credential text can escape.
+RESUME_APPROVAL_UNREADABLE = "approval_source_unreadable"
+#: The journal holds no self-consistent approval marker for this issue+lane.
+RESUME_NO_OWNING_APPROVAL = "no_matching_approval_marker"
+#: The approval resolves, but re-observing under its action id changes nothing: no action
+#: owns progress on this pair, so the original block is the truth.
+RESUME_NO_OWNED_PROGRESS = "no_action_owned_progress"
+#: The action owns progress, yet the projected pair is still blocked on its own merits.
+#: Suffixed with the projected block reason -- a typed token, never a row value.
+RESUME_PROJECTED_BLOCKED = "projected_still_blocked"
+#: A replay this action owns was adopted.
+RESUME_ADOPTED = "adopted"
+
 
 def _digest(value: object) -> str:
     encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -187,6 +209,8 @@ __all__ = (
     "BLOCK_INVENTORY_UNREADABLE", "BLOCK_WORKTREE_UNSAFE", "BLOCK_PAIR_AMBIGUOUS",
     "BLOCK_NO_DISCARDABLE_COMPOSER", "BLOCK_PAIR_PRESERVED", "BLOCK_APPROVAL_MISSING",
     "BLOCK_APPROVAL_MISMATCH", "BLOCK_TRANSACTION_CONFLICT", "BLOCK_REPLACEMENT_STOPPED",
+    "RESUME_APPROVAL_UNREADABLE", "RESUME_NO_OWNING_APPROVAL", "RESUME_NO_OWNED_PROGRESS",
+    "RESUME_PROJECTED_BLOCKED", "RESUME_ADOPTED",
     "PreparationExpectation", "approval_matches", "canonical_roles", "expectation_for",
     "preparation_action_id", "roles_token",
 )
