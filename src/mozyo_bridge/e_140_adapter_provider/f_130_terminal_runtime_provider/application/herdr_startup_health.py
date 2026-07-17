@@ -494,18 +494,11 @@ def probe_session_health(
     if not targets:
         return list(slots)
 
-    verdicts: dict = {}
-    attempts = max(1, int(cfg.polls))
-    for attempt in range(attempts):
-        rows = _read_rows(list_rows)  # the round's single view of the live world
-        pending = False
-        for index, slot, disposition in targets:
-            settled = verdicts.get(index)
-            if settled is not None and (
-                settled[0] == HEALTH_HEALTHY or settled[0] not in _RETRYABLE
-            ):
-                continue  # already decided; do not re-read a settled slot
-            health, blocker_id = _observe_once(
+    def _round(rows) -> dict:
+        """Judge EVERY role against one snapshot. No role is carried over from a
+        previous round — the whole verdict set is a function of this one view."""
+        return {
+            index: _observe_once(
                 provider=slot.provider,
                 assigned_name=slot.assigned_name,
                 launched_locator=slot.locator,
@@ -522,10 +515,28 @@ def probe_session_health(
                 ),
                 registry=cfg.registry,
             )
-            verdicts[index] = (health, blocker_id)
-            if health != HEALTH_HEALTHY and health in _RETRYABLE:
-                pending = True
-        if not pending:
+            for index, slot, disposition in targets
+        }
+
+    # Poll until the WHOLE pair is settled in ONE snapshot, then report that snapshot.
+    #
+    # Pinning a role the moment it first reads healthy (review j#81070 R1-F1) made the
+    # final verdict a mix of different rounds: Claude healthy in round 1, gone in round 2,
+    # Codex healthy in round 2 — and the run reported both healthy and exited 0 over a
+    # world Claude was no longer in. That is the partial-pair false green this whole issue
+    # exists to remove, re-introduced by the retry that was supposed to be conservative.
+    #
+    # So every round re-observes every role, and the answer is always one round's answer.
+    # A role that went healthy and then vanished is now simply not healthy, because the
+    # snapshot that decides says so.
+    verdicts: dict = {}
+    attempts = max(1, int(cfg.polls))
+    for attempt in range(attempts):
+        verdicts = _round(_read_rows(list_rows))
+        if not any(
+            health != HEALTH_HEALTHY and health in _RETRYABLE
+            for health, _ in verdicts.values()
+        ):
             break
         if attempt < attempts - 1:
             cfg.sleeper(cfg.interval)

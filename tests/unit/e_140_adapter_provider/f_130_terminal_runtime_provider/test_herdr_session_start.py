@@ -226,6 +226,10 @@ class _Herdr:
         # post-launch health probe reads exactly these two facts, so a frozen fake would
         # make every launch look like the #13882 defect and prove nothing about the code.
         self.started_rows: list = []
+        # Redmine #13948 R1-F1: a hook fired on each `agent list`, so a test can change
+        # the live world BETWEEN poll rounds (e.g. a role that comes up and then vanishes).
+        self._list_round = 0
+        self._on_list = None
         # Providers whose pane the health probe must find gone / residual, to drive the
         # live #13882 shapes deterministically. Keyed by role token (`claude` / `codex`).
         self.exit_after_start: set = set()
@@ -279,6 +283,9 @@ class _Herdr:
                 argv, 2, stdout="", stderr="invalid choice: 'agent-attest'"
             )
         if rest == ["agent", "list"]:
+            self._list_round += 1
+            if self._on_list is not None:
+                self._on_list(self)
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -4015,6 +4022,59 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
                     self.assertEqual(slots["codex"].health, HEALTH_HEALTHY)
                     self.assertFalse(result.ok)
                     self.assertEqual(slots["claude"].compensation, "rollback_owed")
+
+    def test_a_role_that_comes_up_then_vanishes_is_not_a_final_success(self) -> None:
+        # Review j#81070 R1-F1, driven through the real producer. A role that reads healthy
+        # in an early round and is then GONE from the final snapshot must not be reported
+        # healthy — the whole run's success is one snapshot's answer, never a mix of rounds.
+        herdr = _Herdr()
+
+        def _sequence(h):
+            # Round numbers count every `agent list`. Round 1 is pass-1 classify (empty).
+            # The probe starts at round 2. Hold codex as shell residue for the first probe
+            # round so the loop CANNOT settle there (a retryable state), then on the next
+            # round bring codex up healthy AND remove claude. Without the R1-F1 fix, claude
+            # is pinned healthy from round 2 and the mix reports both healthy.
+            if h._list_round == 2:
+                for r in h.started_rows:
+                    if "_codex_" in r["name"]:
+                        r["agent"] = ""  # positive residue -> retryable, forces round 3
+                        r["agent_status"] = "unknown"
+            elif h._list_round >= 3:
+                for r in h.started_rows:
+                    if "_codex_" in r["name"]:
+                        r["agent"] = "codex"
+                        r["agent_status"] = "idle"
+                h.started_rows = [r for r in h.started_rows if "_claude_" not in r["name"]]
+
+        herdr._on_list = _sequence
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, _ = self._fake_launcher_env(tmp)
+            result = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                extra_env=launcher_env,
+            )[0]
+        slots = self._by_provider(result)
+        self.assertEqual(slots["claude"].health, HEALTH_PROVIDER_EXITED)
+        self.assertFalse(result.ok, "reported success over a world claude had left")
+
+    def test_a_failed_run_prints_the_action_id_the_rollback_command_needs(self) -> None:
+        # Review j#81070 R1-F6. The recovery pointer used to name the rail without its one
+        # required argument. Drive the real renderer end to end.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_cli import (  # noqa: E501
+            _render_text,
+        )
+
+        herdr = _Herdr()
+        herdr.exit_after_start = {"claude"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._wrapped(tmp, herdr)
+        text = _render_text(result)
+        self.assertTrue(result.action_id)
+        self.assertIn(result.action_id, text)
+        self.assertIn(f"--action-id {result.action_id}", text)
 
     def test_health_axes_reach_the_json_payload(self) -> None:
         # The operator-facing surface must carry the cause, not just a boolean: `--json`

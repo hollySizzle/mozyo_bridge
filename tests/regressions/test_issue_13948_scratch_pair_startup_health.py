@@ -31,9 +31,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     COMPOSER_PENDING,
     COMPOSER_STARTUP_BLOCKER,
     COMPOSER_UNREADABLE,
+    ROLLBACK_ABSENT,
     ROLLBACK_AGENT_BUSY,
     ROLLBACK_ALREADY_CLOSED,
     ROLLBACK_AMBIGUOUS,
+    ROLLBACK_CLOSE_TARGETS,
+    ROLLBACK_COMPOSER_UNREADABLE,
+    ROLLBACK_SETTLED,
     ROLLBACK_COMPOSER_UNREADABLE,
     ROLLBACK_DETAIL,
     ROLLBACK_ELIGIBLE,
@@ -50,6 +54,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_ACTION_UNKNOWN,
     REASON_ALREADY_ROLLED_BACK,
     REASON_AUTHORITY_UNAVAILABLE,
+    REASON_BLOCKED,
     REASON_BLOCKED,
     REASON_INCOMPLETE,
     REASON_NOTHING_OWED,
@@ -406,6 +411,32 @@ class StartupTransactionFenceTest(unittest.TestCase):
         with self.assertRaises(StartupTransactionError):
             self.fence.reserve(self.unit, "n2")
 
+    def test_a_replaced_store_is_rejected_not_trusted(self):
+        # Review j#81070 R1-F7: the schema check alone let a store swapped for another
+        # valid-schema store answer for actions it never recorded. The seal/DB nonce join
+        # (borrowed from scratch_retirement_fence._verify_identity, and previously dropped)
+        # is what catches a replacement.
+        action = self.fence.reserve(self.unit, "n1")
+        self.assertIsNotNone(self.fence.read(action.action_id))  # trusted while intact
+        self.fence.seal_path.write_text("a-different-store", encoding="utf-8")
+        with self.assertRaises(StartupTransactionError):
+            self.fence.read(action.action_id)
+        # A rollback against the replaced authority closes nothing.
+        ops = _RollbackOps([])
+        verdict = run_session_rollback(
+            action_id=action.action_id, ops=ops, fence=self.fence, execute=True
+        )
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
+    def test_a_non_utf8_seal_is_unreadable_not_a_match(self):
+        # The seal reader catches UnicodeDecodeError (a ValueError) alongside OSError; a
+        # seal of raw bytes must read as "no seal", never crash past the guard.
+        action = self.fence.reserve(self.unit, "n1")
+        self.fence.seal_path.write_bytes(b"\xff\xfe not text")
+        with self.assertRaises(StartupTransactionError):
+            self.fence.read(action.action_id)
+
     def test_participants_are_recorded_with_their_launch_evidence(self):
         action = self.fence.reserve(self.unit, "n1")
         self.fence.record_participant(action.action_id, self._participant("codex"))
@@ -520,12 +551,22 @@ class ClassifyRollbackTest(unittest.TestCase):
             classify_rollback(self._facts(name_matches=2)), ROLLBACK_AMBIGUOUS
         )
 
-    def test_an_absent_participant_is_settled_so_a_partial_rollback_resumes(self):
-        # #13847 R1-F1 / #13892: blocking on a slot a previous attempt already closed is
-        # how an interrupted rollback becomes permanently stuck. Absence is positive.
-        self.assertEqual(
-            classify_rollback(self._facts(name_matches=0)), ROLLBACK_ELIGIBLE
-        )
+    def test_an_absent_participant_is_settled_but_is_never_a_close_target(self):
+        # Two facts, and the first version of this test only pinned one of them (review
+        # j#81070 R1-F2). Absence IS settled — blocking on a slot a previous attempt
+        # already closed is how an interrupted rollback becomes permanently stuck
+        # (#13847 R1-F1 / #13892). Absence is NOT a licence to close the address it used
+        # to live at: `eligible` covered both, so the rail handed the recorded locator to
+        # close and shut down a foreign agent that had since taken that pane id.
+        verdict = classify_rollback(self._facts(name_matches=0))
+        self.assertEqual(verdict, ROLLBACK_ABSENT)
+        self.assertIn(verdict, ROLLBACK_SETTLED)
+        self.assertNotIn(verdict, ROLLBACK_CLOSE_TARGETS)
+
+    def test_only_a_live_ours_verdict_is_ever_a_close_target(self):
+        # The whole close authority in one assertion: exactly one verdict names a pane.
+        self.assertEqual(ROLLBACK_CLOSE_TARGETS, {ROLLBACK_ELIGIBLE})
+        self.assertEqual(classify_rollback(self._facts()), ROLLBACK_ELIGIBLE)
 
     def test_a_drifted_locator_is_never_closed(self):
         # The name matches but the pane does not: this is someone else's process now, or a
@@ -947,6 +988,98 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertEqual(
             self.fence.read(action.action_id).phase, PHASE_COMPLETED_ROLLED_BACK
         )
+
+    def test_a_foreign_agent_on_the_recorded_locator_is_never_closed(self):
+        # Review j#81070 R1-F2 (the worst one): the participant's name is gone from the
+        # inventory, and a DIFFERENT agent now holds the pane id this action once launched
+        # at. Handing the recorded locator to close shut down that foreign agent and
+        # reported success. Absence is settled, never a target.
+        action = self._owed_action()
+        foreign = [
+            {"name": "somebody_elses_agent", "pane_id": "w2G:p3", "agent": "codex",
+             "agent_status": "idle"},
+            {"name": "another_stranger", "pane_id": "w2G:p4", "agent": "claude",
+             "agent_status": "idle"},
+        ]
+        ops = _RollbackOps(foreign)
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(
+            ops.close_calls, f"closed a foreign agent: {ops.close_calls}"
+        )
+        # Both participants are positively absent -> the action is settled, not a failure.
+        self.assertTrue(verdict.ok)
+        self.assertEqual(
+            {p.verdict for p in verdict.participants}, {ROLLBACK_ABSENT}
+        )
+
+    def test_a_mix_of_absent_and_live_closes_only_the_live_one(self):
+        action = self._owed_action()
+        # codex present at its recorded pane; claude's name absent, its pane taken over.
+        rows = [
+            {"name": "mzb1_ws1_codex_lane-1", "pane_id": "w2G:p4", "agent": "codex",
+             "agent_status": "idle"},
+            {"name": "a_stranger", "pane_id": "w2G:p3", "agent": "claude",
+             "agent_status": "idle"},
+        ]
+        ops = _RollbackOps(rows)
+        verdict = self._run(ops, action, execute=True)
+        self.assertEqual([c for c in ops.close_calls[0]], [("codex", "w2G:p4")])
+        self.assertTrue(verdict.ok)
+
+    def test_a_startup_screen_over_an_unreadable_composer_is_preserved(self):
+        # Review j#81070 R1-F3: a recognised trust screen used to license a close even
+        # when the composer could not be read — "we saw no typing" is not "there is no
+        # typing". Only an exact positive read (readable, not pending) is action-owned.
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.blockers["w2G:p3"] = "workspace_trust_confirmation"
+        ops.composers["w2G:p3"] = (False, None)  # unreadable
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(ops.close_calls)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        claude = [p for p in verdict.participants if p.role == "claude"][0]
+        self.assertEqual(claude.verdict, ROLLBACK_COMPOSER_UNREADABLE)
+
+    def test_a_lying_close_never_records_closed_so_the_replay_still_acts(self):
+        # Review j#81070 R1-F4: the durable `closed` flag used to be written from the
+        # close's own report, so a close that returned success but left the pane made the
+        # NEXT run skip it as already-settled — the participant could never be closed
+        # again. The flag must come from the remeasure, which is the only thing that can
+        # see absence.
+        action = self._owed_action()
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        ops.close_is_a_lie = True
+        self.assertFalse(self._run(ops, action, execute=True).ok)
+        # Nothing was recorded closed, because nothing was proven gone.
+        self.assertFalse(
+            any(p.closed for p in self.fence.read(action.action_id).participants)
+        )
+        # A second run with an honest close finishes the job (it still has targets).
+        ops.close_is_a_lie = False
+        ops.close_calls.clear()
+        verdict = self._run(ops, self.fence.read(action.action_id), execute=True)
+        self.assertTrue(verdict.ok)
+        self.assertTrue(ops.close_calls, "the replay had no targets — it was stuck")
+
+    def test_a_crash_at_health_check_is_still_recoverable(self):
+        # Review j#81070 R1-F5: settle() writes `health_check` before it writes the
+        # rollback_owed verdict, so a crash in that window left an action holding live
+        # participants that public recovery refused with `nothing_owed`.
+        from mozyo_bridge.core.state.startup_transaction_fence import PHASE_HEALTH_CHECK
+
+        action = self.fence.reserve(self.unit, "n1")
+        self.fence.record_participant(
+            action.action_id,
+            Participant(role="codex", assigned_name="mzb1_ws1_codex_lane-1",
+                        locator="w2G:p4", receipt="w"),
+        )
+        self.fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)  # crashed here
+        ops = _RollbackOps(self._rows("codex"))
+        verdict = run_session_rollback(
+            action_id=action.action_id, ops=ops, fence=self.fence, execute=True
+        )
+        self.assertTrue(verdict.ok)
+        self.assertEqual({r for r, _ in ops.close_calls[0]}, {"codex"})
 
     def test_a_partial_rollback_resumes_rather_than_sticking(self):
         # The first attempt closes claude and fails on codex; the second finds claude

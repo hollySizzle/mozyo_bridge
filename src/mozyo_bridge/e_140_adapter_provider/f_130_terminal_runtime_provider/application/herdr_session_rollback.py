@@ -29,6 +29,7 @@ from typing import Mapping, Optional, Protocol, Sequence
 
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
+    PHASE_HEALTH_CHECK,
     PHASE_LAUNCHING,
     PHASE_ROLLBACK_OWED,
     StartupTransactionBusy,
@@ -46,13 +47,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
     COMPOSER_EMPTY,
-    ROLLBACK_ALREADY_CLOSED,
     COMPOSER_PENDING,
     COMPOSER_STARTUP_BLOCKER,
     COMPOSER_UNREADABLE,
+    ROLLBACK_CLOSE_TARGETS,
     ROLLBACK_DETAIL,
     ROLLBACK_ELIGIBLE,
     ROLLBACK_INVENTORY_UNREADABLE,
+    ROLLBACK_SETTLED,
     ParticipantFacts,
     classify_rollback,
 )
@@ -68,10 +70,21 @@ REASON_BLOCKED = "rollback_blocked"
 REASON_INCOMPLETE = "rollback_incomplete"
 REASON_PREFLIGHT = "preflight_only"
 
-#: Phases from which a rollback may still act. `launching` is included on purpose: a run
-#: that died between two starts never reached its health check, and its first agent is
-#: exactly the orphan this rail exists for.
-ACTIONABLE_PHASES: frozenset[str] = frozenset({PHASE_ROLLBACK_OWED, PHASE_LAUNCHING})
+#: Phases from which a rollback may still act — every non-terminal phase that can have
+#: participants. A run is only unrecoverable once it has said, durably, how it ended.
+#:
+#: `launching`: died between two starts, never reached its health check. Its first agent
+#: is exactly the orphan this rail exists for.
+#: `health_check`: died mid-probe, or between the probe and its verdict. The phase is
+#: written before the verdict is known, so this window is real and was refused with
+#: `nothing_owed` — an action holding live participants that no one could converge
+#: (review j#81070 R1-F5). A crash is not a claim of success.
+#:
+#: `planned` is absent deliberately: it is the one phase at which no side effect exists,
+#: so there is nothing to compensate and no participant to close.
+ACTIONABLE_PHASES: frozenset[str] = frozenset(
+    {PHASE_LAUNCHING, PHASE_HEALTH_CHECK, PHASE_ROLLBACK_OWED}
+)
 
 
 class StartupRollbackOps(Protocol):
@@ -152,13 +165,19 @@ def _composer_fact(ops: StartupRollbackOps, provider: str, locator: str) -> tupl
     except Exception:  # noqa: BLE001 - an unclassifiable screen is never an empty one
         blocker = ""
     readable, has_pending = ops.observe_composer(locator)
-    if blocker and not (readable and has_pending):
-        # A recognised startup screen with nothing typed into it: action-owned UI. The
-        # order matters — a screen a body has been typed over is pending input first.
-        return COMPOSER_STARTUP_BLOCKER, blocker
+    # Read the composer FIRST and admit nothing on a negative. `not (readable and
+    # has_pending)` used to pass an UNREADABLE composer through as an action-owned startup
+    # screen (review j#81070 R1-F3) — "we could not see any typing" is not the same fact as
+    # "there is no typing", and only the second one licenses a close.
     if not readable or has_pending is None:
         return COMPOSER_UNREADABLE, blocker
-    return (COMPOSER_PENDING if has_pending else COMPOSER_EMPTY), blocker
+    if has_pending:
+        return COMPOSER_PENDING, blocker
+    if blocker:
+        # Positively read, positively empty, and a recognised startup screen: this action's
+        # own launch put that screen there and nobody typed into it. It is NEVER answered.
+        return COMPOSER_STARTUP_BLOCKER, blocker
+    return COMPOSER_EMPTY, blocker
 
 
 def _facts_for(
@@ -330,15 +349,11 @@ def _rollback_locked(action_id, action, ops, fence, *, execute: bool):
             detail=ROLLBACK_DETAIL[ROLLBACK_INVENTORY_UNREADABLE],
             participants=tuple(verdicts),
         )
-    # `already_closed` is SETTLED, not blocked: a previous attempt of this same action
-    # proved that participant gone. Treating it as a blocker is how an interrupted
-    # rollback becomes permanently stuck — the #13847 R1-F1 / #13892 partial-close
-    # discipline, re-derived here because this rail can be resumed too.
-    blocked = [
-        v
-        for v in verdicts
-        if v.verdict not in (ROLLBACK_ELIGIBLE, ROLLBACK_ALREADY_CLOSED)
-    ]
+    # SETTLED (`already_closed` / `absent`) is not blocked: a previous attempt of this same
+    # action proved that participant gone, or it never came up. Treating either as a
+    # blocker is how an interrupted rollback becomes permanently stuck — the #13847 R1-F1 /
+    # #13892 partial-close discipline, re-derived here because this rail resumes too.
+    blocked = [v for v in verdicts if v.verdict not in ROLLBACK_SETTLED]
     if not execute:
         return SessionRollbackVerdict(
             action_id=action_id,
@@ -373,10 +388,23 @@ def _execute_rollback(action_id, action, ops, fence, verdicts):
         if not v.closed and v.locator and _live_target(action, v)
     ]
     settled = list(verdicts)
+    failed: dict = {}
     if targets:
         result = ops.close(action.unit.workspace_id, action.unit.lane_id, targets)
-        closed_roles = {role for role, _ in getattr(result, "closed", ())}
         failed = {role: detail for role, _, detail in getattr(result, "failed", ())}
+    # A close's return code is not evidence of absence (#13892 j#80506 F3), so the durable
+    # `closed` flag is written from the REMEASURE, never from the close's own report
+    # (review j#81070 R1-F4). Believing the report first recorded `closed=True` for a pane
+    # that was still live, and the next replay then skipped it as already-settled — the
+    # participant could never be closed again. Absence is the only thing that proves a
+    # close, and only the remeasure can see it.
+    residue, remeasure_ok = _residual_participants(action, ops)
+    if remeasure_ok:
+        proven_gone = {
+            v.role
+            for v in verdicts
+            if v.assigned_name not in residue and v.verdict in ROLLBACK_SETTLED
+        }
         settled = [
             ParticipantVerdict(
                 role=v.role,
@@ -385,18 +413,13 @@ def _execute_rollback(action_id, action, ops, fence, verdicts):
                 verdict=v.verdict,
                 detail=v.detail,
                 blocker_id=v.blocker_id,
-                closed=v.closed or v.role in closed_roles,
+                closed=v.closed or v.role in proven_gone,
                 close_detail=failed.get(v.role, ""),
             )
             for v in verdicts
         ]
-        for role in closed_roles:
+        for role in proven_gone:
             fence.mark_closed(action_id, role)
-    # A close's return code is not evidence of absence (#13892 j#80506 F3): re-measure the
-    # whole unit and require POSITIVE absence of every participant before claiming a
-    # rollback. The commit-then-withhold shape is deliberate — the record keeps whatever
-    # was proven closed, so an incomplete run replays instead of starting over.
-    residue, remeasure_ok = _residual_participants(action, ops)
     if not remeasure_ok:
         return SessionRollbackVerdict(
             action_id=action_id,
@@ -445,8 +468,14 @@ def _execute_rollback(action_id, action, ops, fence, verdicts):
 
 
 def _live_target(action, verdict) -> bool:
-    """Only close a participant an action-time observation actually found live."""
-    return verdict.verdict == ROLLBACK_ELIGIBLE and not verdict.closed
+    """Only close a participant an action-time observation actually found LIVE and ours.
+
+    Keyed on the closed set of close-target verdicts, never on "settled" (review j#81070
+    R1-F2). `absent` is settled and must not be a target: the recorded locator is an
+    address this action once launched at, and handing it to close after the name is gone
+    closed whoever had since taken that pane id.
+    """
+    return verdict.verdict in ROLLBACK_CLOSE_TARGETS and not verdict.closed
 
 
 def _residual_participants(action, ops) -> tuple[set, bool]:
