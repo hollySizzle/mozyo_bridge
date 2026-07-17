@@ -147,11 +147,31 @@ CREATE TABLE IF NOT EXISTS recovery_receipt (
 )
 """
 
-#: Indexed because every claim asks "has this ACTION been admitted, under any journal?" — the
-#: question review j#81021 F2 showed the key digest alone cannot answer.
+#: The canonical action columns — the fields that say WHICH recovery a row is, independent of the
+#: journal it was published at. This is the authority the prior lookup searches on (review j#81050
+#: R2-F3): ``action_digest`` is derived FROM these, so trusting the digest instead of them made a
+#: single corrupted column read as "this action was never admitted" and re-admit a duplicate. A
+#: derived value can be wrong; the fields it was derived from are the record.
+_ACTION_COLUMNS = (
+    "schema_version",
+    "original_dispatch_anchor",
+    "workspace_id",
+    "lane_id",
+    "lane_generation",
+    "route_identity",
+    "receiver_identity",
+    "action_kind",
+)
+
+#: Indexed on the canonical action columns, because every claim asks "has this ACTION been admitted,
+#: under any journal?" — the question review j#81021 F2 showed the key digest alone cannot answer.
+#:
+#: No schema bump accompanies the R2-F3 change of shape here: the COLUMN set is unchanged, and an
+#: index is an accelerator, not a constraint. A store minted by the prior build keeps its old index
+#: and still answers this query correctly, only without its help.
 _ACTION_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS recovery_receipt_action "
-    "ON recovery_receipt (action_digest, seq)"
+    "ON recovery_receipt (" + ", ".join(_ACTION_COLUMNS) + ", seq)"
 )
 
 _META_TABLE_SQL = """
@@ -262,15 +282,31 @@ class CallbackRecoveryReceipt:
     def seal_state(self) -> str:
         """The seal's state (pure read; fail-soft to :data:`SEAL_INVALID`, never to absent).
 
-        An unreadable or unrecognized seal is :data:`SEAL_INVALID`, NOT :data:`SEAL_ABSENT`:
-        "something is here and I cannot read it" is not evidence that nothing ever ran here, and
-        collapsing the two is what would let a re-mint through.
+        Only a seal that GENUINELY does not exist reads as :data:`SEAL_ABSENT`. Everything else —
+        unreadable, undecodable, unrecognized, or a directory entry pointing at nothing — is
+        :data:`SEAL_INVALID`, because "something is here and I cannot read it" is not evidence that
+        nothing ever ran here, and collapsing the two is what lets a re-mint through.
+
+        Review j#81050 R2-F1. Keeping that promise takes the *directory's* answer, not the
+        reader's: a dangling symlink raises ``FileNotFoundError`` from ``read_text`` even though its
+        entry is right there, so folding that exception straight to ``absent`` silently broke the
+        rule above — a lost pair whose seal was a broken link re-admitted every recovery it had
+        recorded. ``lexists`` sees the entry; ``read_text`` sees through it. :meth:`store_artifacts`
+        in this same module already asked the directory for exactly this reason; the seal reader did
+        not, and that inconsistency was the defect. The sibling authority reached the identical fix
+        (``callback_publication_fence._read_seal_file``, its R19-F2).
         """
         try:
             text = self.seal_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return SEAL_ABSENT
+            # Ask the directory: an entry that exists but resolves to nothing is EVIDENCE, and a
+            # store that cannot read its own evidence must never conclude "fresh install".
+            return SEAL_ABSENT if not os.path.lexists(self.seal_path) else SEAL_INVALID
         except OSError:
+            return SEAL_INVALID     # unreadable is not absent
+        except UnicodeDecodeError:
+            # A ValueError, not an OSError: it slipped past the handler above and leaked raw,
+            # against this docstring's own promise.
             return SEAL_INVALID
         parts = (text.splitlines() or [""])[0].split()
         if (
@@ -559,6 +595,9 @@ class CallbackRecoveryReceipt:
         digest = str(key.digest())
         action = str(key.action_digest())
         fields = dict(key.as_fields())
+        # Asked of the key, not re-derived from a sentinel string: the domain owns what "is a
+        # retry" means, and this layer must not grow a second, drifting opinion about it.
+        declares_retry = bool(key.is_retry)
         stamp = now or _utc_now()
         conn = self._connect()
         try:
@@ -595,15 +634,30 @@ class CallbackRecoveryReceipt:
                     ),
                 )
             # This publication is new. Has the ACTION already been admitted under another journal?
+            # Searched on the canonical action FIELDS, never on the derived digest (R2-F3): the
+            # fields are the record, the digest is an opinion about them.
             prior = conn.execute(
-                "SELECT key_digest, recovery_action_journal, state FROM recovery_receipt "
-                "WHERE action_digest = ? ORDER BY seq DESC LIMIT 1",
-                (action,),
+                f"SELECT key_digest, recovery_action_journal, state, action_digest "
+                f"FROM recovery_receipt "
+                f"WHERE {' AND '.join(f'{c} = ?' for c in _ACTION_COLUMNS)} "
+                f"ORDER BY seq DESC LIMIT 1",
+                tuple(str(fields[c]) for c in _ACTION_COLUMNS),
             ).fetchone()
             if prior is not None:
-                prior_digest, prior_journal, prior_state = (
-                    str(prior[0]), str(prior[1]), str(prior[2])
+                prior_digest, prior_journal, prior_state, prior_action = (
+                    str(prior[0]), str(prior[1]), str(prior[2]), str(prior[3])
                 )
+                # The row's own fields matched this action exactly, so its stored action digest MUST
+                # equal this key's. If it does not, the row has been tampered with or torn — and a
+                # torn authority is never read as "nothing was claimed" (j#80984 Disposition 1/4).
+                if prior_action != action:
+                    conn.execute("COMMIT")
+                    raise CallbackRecoveryReceiptError(
+                        f"callback recovery receipt row for j#{prior_journal} matches this action's "
+                        f"fields but carries a different action_digest ({prior_action!r} != "
+                        f"{action!r}): the row is tampered or torn. Fail closed — a corrupt index "
+                        f"must never read as 'this recovery was never admitted'"
+                    )
                 # Only a retry that names the LATEST admitted key continues the chain. Comparing
                 # against any older link would let a stale linkage be replayed forever.
                 if str(fields["retry_of"]) != prior_digest:
@@ -623,6 +677,24 @@ class CallbackRecoveryReceipt:
                             f"retry must name the exact prior key it retries"
                         ),
                     )
+            elif declares_retry:
+                # R2-F2: a retry with no prior is not a retry. Disposition 4 defines one as
+                # re-issuing an action whose claim is stranded — so a linkage naming a key this
+                # authority never admitted is a claim about a history that does not exist here.
+                # Admitting it would be trusting an assertion precisely where the fail-closed rule
+                # says to refuse one.
+                conn.execute("COMMIT")
+                return ClaimResult(
+                    won=False,
+                    prior_state=RECEIPT_ABSENT,
+                    conflict=True,
+                    detail=(
+                        f"this publication (j#{fields['recovery_action_journal']}) declares "
+                        f"retry_of={fields['retry_of']}, but this authority has never admitted "
+                        f"this recovery: there is no prior claim to retry. A retry continues a "
+                        f"chain; it cannot start one"
+                    ),
+                )
             seq = conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM recovery_receipt"
             ).fetchone()[0]
