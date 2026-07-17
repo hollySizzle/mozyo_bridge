@@ -493,12 +493,83 @@ def _store_gate_index(store) -> dict:
     return index
 
 
+def _active_lane_views(repo_root) -> tuple:
+    """Enumerate the live active-lane views from the sublane read model (herdr / tmux branch).
+
+    Mirrors ``sublane list``'s backend branch (herdr projection vs the tmux lifecycle read
+    model). Extracted so both the host-global :func:`enumerate_active_lanes` (the coordinator
+    cockpit glance) and the workspace-partitioned :func:`enumerate_active_lanes_for_workspace`
+    (the callback supervisor, Redmine #13968) fold the SAME authoritative view source — one seam,
+    one monkeypatch point. Raises on an enumeration failure; the callers translate that into the
+    ``(roster, error)`` degrade contract so a read that could not run is never confused with
+    "nothing active".
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        herdr_sublane_views,
+        repo_backend_is_herdr,
+    )
+
+    if repo_backend_is_herdr(repo_root):
+        return tuple(herdr_sublane_views(repo_root))
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+        LiveSublaneLifecycleOps,
+        SublaneListUseCase,
+    )
+
+    return tuple(SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=repo_root)).run().lanes)
+
+
+def _fold_active_roster(views, *, workspace_id) -> tuple:
+    """Disposition-filter ``views`` into a ``(issue, lane_label)`` roster, optionally partitioned.
+
+    ``workspace_id=None`` keeps every live lane (host-global, the coordinator glance). A
+    non-``None`` ``workspace_id`` keeps ONLY lanes whose durable ``workspace_id`` equals it —
+    the Redmine #13968 authoritative workspace partition: the lane ``workspace_id`` is the
+    registry / anchor identity (``herdr_workspace_segment`` stamps it into every managed slot
+    name), so a foreign / stale registry workspace whose id owns none of the host's live lanes
+    folds to an empty roster (zero-ingest/zero-deliver). A blank requested id matches nothing
+    (live views never carry a blank workspace), so an unidentifiable workspace fails closed to
+    an empty roster rather than supervising the whole host.
+
+    Redmine #13681 W4 (Design Answer j#76630 required correction): the active-capacity roster
+    also excludes a lane the lifecycle authority marks non-active — a superseded / hibernated /
+    retired lane still holding live panes would otherwise consume capacity in the window between
+    the disposition write and the process release. Join the lifecycle records by the lane's
+    ``(workspace_id, lane_id)`` unit; a lane with disposition ``active``, no lifecycle row
+    (owner-unbound), or an unreadable lifecycle store stays in the roster (over-counting capacity
+    is the conservative direction — it never over-dispatches).
+    """
+    disposition_by_unit = _lifecycle_disposition_by_unit()
+    roster = []
+    for view in views:
+        issue = str(getattr(view, "issue", "") or "").strip()
+        lane = str(getattr(view, "lane_label", "") or getattr(view, "lane_id", "") or "").strip()
+        workspace = str(getattr(view, "workspace_id", "") or "").strip()
+        lane_id = str(getattr(view, "lane_id", "") or "").strip()
+        if workspace_id is not None and workspace != workspace_id:
+            # Not this workspace's lane (Redmine #13968): a foreign / stale registry workspace
+            # supervises nothing here. The registry ``workspace_id`` is the authoritative
+            # partition key, never the project name or a shared issue list.
+            continue
+        disposition = disposition_by_unit.get((workspace, lane_id))
+        if disposition is not None and disposition != _DISPOSITION_ACTIVE:
+            # Non-active disposition: excluded from active capacity (kept on the
+            # lifecycle diagnostic roster below).
+            continue
+        if issue:
+            roster.append((issue, lane))
+    return tuple(roster)
+
+
 def enumerate_active_lanes(repo_root) -> tuple:
     """Enumerate the active-lane roster from the sublane read model: ``(roster, error)``.
 
     Mirrors ``sublane list``'s backend branch (herdr projection vs the tmux lifecycle read
     model) so the glance enumerates the *same authoritative active-lane index* rather than
-    whatever happens to be in the workflow-runtime store.
+    whatever happens to be in the workflow-runtime store. This is the **host-global** roster —
+    every live lane on the host (the coordinator's cockpit-wide view). The workspace callback
+    supervisor uses the partitioned :func:`enumerate_active_lanes_for_workspace` instead
+    (Redmine #13968).
 
     Returns a ``(roster, error)`` pair. ``roster`` is a tuple of ``(issue, lane_label)``.
     ``error`` is ``None`` on a successful read (even an empty roster — genuinely "no active
@@ -508,49 +579,32 @@ def enumerate_active_lanes(repo_root) -> tuple:
     Finding 1 fixed, now closed at the roster boundary too.
     """
     try:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-            herdr_sublane_views,
-            repo_backend_is_herdr,
-        )
-
-        if repo_backend_is_herdr(repo_root):
-            views = herdr_sublane_views(repo_root)
-        else:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
-                LiveSublaneLifecycleOps,
-                SublaneListUseCase,
-            )
-
-            views = SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=repo_root)).run().lanes
+        views = _active_lane_views(repo_root)
     except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the glance
         return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
+    return _fold_active_roster(views, workspace_id=None), None
 
-    # Redmine #13681 W4 (Design Answer j#76630 required correction): the active-capacity
-    # roster must exclude a lane the lifecycle authority marks non-active — a superseded /
-    # hibernated / retired lane still holding live panes would otherwise consume capacity
-    # in the window between the disposition write and the process release. Join the
-    # lifecycle records by the lane's `(workspace_id, lane_id)` unit; a lane with
-    # disposition `active`, no lifecycle row (owner-unbound), or an unreadable lifecycle
-    # store stays in the roster (byte-invariant, and over-counting capacity is the
-    # conservative direction — it never over-dispatches). This replaces the dead
-    # `state != "retired"` condition: `view.state` is the pane-liveness projection
-    # (active|gateway_only|worker_only|detached), which never carries `retired`, so the
-    # old filter excluded nothing.
-    disposition_by_unit = _lifecycle_disposition_by_unit()
-    roster = []
-    for view in views:
-        issue = str(getattr(view, "issue", "") or "").strip()
-        lane = str(getattr(view, "lane_label", "") or getattr(view, "lane_id", "") or "").strip()
-        workspace = str(getattr(view, "workspace_id", "") or "").strip()
-        lane_id = str(getattr(view, "lane_id", "") or "").strip()
-        disposition = disposition_by_unit.get((workspace, lane_id))
-        if disposition is not None and disposition != _DISPOSITION_ACTIVE:
-            # Non-active disposition: excluded from active capacity (kept on the
-            # lifecycle diagnostic roster below).
-            continue
-        if issue:
-            roster.append((issue, lane))
-    return tuple(roster), None
+
+def enumerate_active_lanes_for_workspace(repo_root, *, workspace_id: str) -> tuple:
+    """Enumerate ONLY the lanes the registry attributes to ``workspace_id``: ``(roster, error)``.
+
+    The host-global :func:`enumerate_active_lanes` returns every live lane on the host (the
+    coordinator glance's cockpit-wide view — the herdr ``agent list`` enumeration is host-global
+    by the #13331 contract). The workspace callback supervisor instead needs each active issue
+    supervised under exactly ONE authoritative workspace, so a foreign / stale registry workspace
+    ingests and delivers nothing (Redmine #13968 acceptance 1). The partition key is the lane's
+    durable ``workspace_id`` — the registry / anchor identity ``herdr_workspace_segment`` stamps
+    into every managed slot name — matched against the supervised workspace's own registry
+    ``workspace_id`` (acceptance 2: registry identity is the source of truth, never the project
+    name or a shared issue list). Same ``(roster, error)`` degrade contract as the host-global
+    enumeration.
+    """
+    wanted = str(workspace_id or "").strip()
+    try:
+        views = _active_lane_views(repo_root)
+    except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the supervisor
+        return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
+    return _fold_active_roster(views, workspace_id=wanted), None
 
 
 #: Bound lazily so the pure glance path never imports the state layer unless a roster
@@ -829,4 +883,5 @@ __all__ = (
     "store_active_lane_snapshots",
     "active_lane_snapshots",
     "enumerate_active_lanes",
+    "enumerate_active_lanes_for_workspace",
 )

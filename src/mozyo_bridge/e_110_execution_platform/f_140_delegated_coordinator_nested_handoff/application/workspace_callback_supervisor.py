@@ -500,12 +500,26 @@ def default_workspaces(*, home: Optional[Path] = None) -> list[SupervisedWorkspa
 
 
 def default_roster(ws: SupervisedWorkspace) -> tuple[tuple[str, ...], str]:
-    """Resolve a workspace's active-lane issue set via the sublane read model (``(issues, error)``)."""
+    """Resolve THIS workspace's active-lane issue set, partitioned to it (``(issues, error)``).
+
+    Uses the workspace-partitioned enumeration (Redmine #13968) so the supervisor supervises each
+    active issue under exactly ONE authoritative registry workspace. The host's live lane
+    inventory is enumerated host-global (the herdr ``agent list`` is host-wide by the #13331
+    contract), then filtered to lanes whose durable ``workspace_id`` equals this workspace's
+    registry id: a foreign / stale registry workspace that owns none of the host's live lanes gets
+    an empty roster and therefore zero-ingest/zero-deliver (acceptance 1). The partition key is the
+    registry identity stamped into each managed lane slot, never the project name or a shared issue
+    list (acceptance 2). Without this filter every registry workspace received the same host-global
+    roster and re-ingested + re-delivered every active issue into its own outbox partition,
+    amplifying pending / dead-letter on each run.
+    """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (
-        enumerate_active_lanes,
+        enumerate_active_lanes_for_workspace,
     )
 
-    roster, error = enumerate_active_lanes(Path(ws.canonical_path))
+    roster, error = enumerate_active_lanes_for_workspace(
+        Path(ws.canonical_path), workspace_id=ws.workspace_id
+    )
     issues = tuple(
         dict.fromkeys(str(issue).strip() for issue, _lane in roster if str(issue).strip())
     )
