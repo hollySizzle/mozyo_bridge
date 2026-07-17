@@ -501,11 +501,13 @@ class StartupTransactionFence:
                 " WHERE action_id = ?",
                 (_norm(action_id),),
             ).fetchone()
-            # The row read AND its decode are inside the guard (review j#81092 R3-F1): a
-            # malformed `participants` cell raises JSONDecodeError from `_row_to_action`,
-            # and a query against a partial schema raises OperationalError — both are the
-            # authority being unreadable, not the action being absent, so both normalize to
-            # a structured refusal rather than escaping the public rail's "never raises".
+            # The row read AND its decode are inside the guard (review j#81092 R3-F1 /
+            # R4-F1): a query against a partial schema raises OperationalError here, and a
+            # malformed cell raises StartupTransactionError from `_row_to_action` (which
+            # now validates the row's shape, not just decodes it) — that already-structured
+            # error passes through untouched, while a raw DB error normalizes below. Either
+            # way the authority is unreadable, not the action absent, so the public rail's
+            # "never raises" holds.
             return _row_to_action(row) if row else None
         except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
             raise StartupTransactionError(
@@ -534,8 +536,17 @@ class StartupTransactionFence:
                     "the startup transaction store is damaged (a partial artifact set); "
                     "refusing to reserve an action against it — nothing was started"
                 )
-            if shape.absent:
-                self._create_fresh(hashlib.sha256(now.encode("utf-8")).hexdigest())
+            try:
+                if shape.absent:
+                    self._create_fresh(hashlib.sha256(now.encode("utf-8")).hexdigest())
+            except (sqlite3.DatabaseError, OSError) as exc:
+                # A bootstrap write that fails is a reserve that did not happen — surface it
+                # structured, before any side effect, exactly like every other write path
+                # (review j#81122 R4-F2).
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} could not be created "
+                    f"({exc}); nothing was started"
+                ) from exc
             conn = self._connect_rw()
             try:
                 existing = conn.execute(
@@ -563,6 +574,17 @@ class StartupTransactionFence:
                         now,
                     ),
                 )
+            except StartupTransactionError:
+                raise
+            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                # The SELECT/INSERT are normalized like `_write` (review j#81122 R4-F2): a
+                # raw IntegrityError here left the caller unable to tell "reserved" from
+                # "refused", and reserve is the reserve-before-effect anchor of the whole
+                # transaction — it must fail closed, not leak SQLite internals.
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} could not record the "
+                    f"reserve ({exc}); nothing was started"
+                ) from exc
             finally:
                 conn.close()
         return StartupAction(
@@ -711,17 +733,65 @@ class _FenceLock:
 
 
 def _row_to_action(row) -> StartupAction:
-    raw = json.loads(row[6]) if row[6] else []
+    """Decode AND validate a row as a versioned authority record (fail-closed).
+
+    Every cell is checked for the type and shape the schema promises, and any violation
+    raises :class:`StartupTransactionError` (review j#81122 R4-F1). Decoding without
+    validating let a corrupt authority escape the public rail as an ``AttributeError``
+    (``providers`` NULL → ``.split()``; a non-object participant → ``.get()``) or, worse,
+    slip through as a plausible record with an unknown ``phase`` — which the rail then
+    read as ``nothing_owed`` and silently declined to converge. A row is either this exact
+    shape or it is an unreadable authority; there is no in-between that closes panes.
+    """
+    action_id = row[0]
+    workspace_id, lane_id, providers_cell, phase, revision_cell, participants_cell = (
+        row[1], row[2], row[3], row[4], row[5], row[6],
+    )
+    if not isinstance(providers_cell, str):
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has a non-text providers cell "
+            f"({type(providers_cell).__name__}); the authority row is malformed"
+        )
+    if phase not in PHASES:
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has an unknown phase {phase!r}; a corrupt "
+            "phase is an unreadable authority, not a no-op action"
+        )
+    try:
+        revision = int(revision_cell)
+    except (TypeError, ValueError) as exc:
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has a non-integer revision "
+            f"{revision_cell!r}; the authority row is malformed"
+        ) from exc
+    try:
+        raw_participants = json.loads(participants_cell) if participants_cell else []
+    except (TypeError, ValueError) as exc:
+        raise StartupTransactionError(
+            f"startup action {action_id!r} has a participants cell that is not JSON; "
+            "the authority row is malformed"
+        ) from exc
+    if not isinstance(raw_participants, list):
+        raise StartupTransactionError(
+            f"startup action {action_id!r} participants is not a JSON array "
+            f"({type(raw_participants).__name__}); the authority row is malformed"
+        )
+    for entry in raw_participants:
+        if not isinstance(entry, dict):
+            raise StartupTransactionError(
+                f"startup action {action_id!r} has a non-object participant "
+                f"({type(entry).__name__}); the authority row is malformed"
+            )
     return StartupAction(
-        action_id=row[0],
+        action_id=action_id,
         unit=StartupUnit(
-            workspace_id=row[1],
-            lane_id=row[2],
-            providers=tuple(p for p in row[3].split(",") if p),
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            providers=tuple(p for p in providers_cell.split(",") if p),
         ),
-        phase=row[4],
-        revision=int(row[5]),
-        participants=tuple(Participant.from_payload(p) for p in raw),
+        phase=phase,
+        revision=revision,
+        participants=tuple(Participant.from_payload(p) for p in raw_participants),
         reserved_at=row[7],
         updated_at=row[8],
     )
