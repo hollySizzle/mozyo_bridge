@@ -72,8 +72,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     lane_signal_from_gate_facts,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    GATE_BLOCKED,
     GATE_CLOSE,
     GATE_REVIEW as _GATE_REVIEW,
+    GATE_START,
     REVIEW_CHANGES_REQUESTED,
     classify_lane_state,
 )
@@ -466,6 +468,51 @@ class JournalGrammarTest(unittest.TestCase):
             [_j("50", "## Gate: Implementation Request Dispatch (Codex coordinator)\n- x")]
         )
         self.assertEqual(classify_lane_state(lane_signal_from_gate_facts("7", facts)), "implementing")
+
+    def test_bounded_dash_qualifiers_preserve_exact_gate_matching(self):
+        live_implementation_requests = (
+            "## Gate: Implementation Request — R6 partial-effect recovery correction",
+            "## Gate: Implementation Request — receiver-side recovery idempotency",
+            "## Gate: Implementation Request – scratch pair startup health",
+        )
+        for notes in live_implementation_requests:
+            with self.subTest(notes=notes):
+                facts = fold_issue_gate_facts([_j("100", notes)])
+                self.assertEqual(facts.latest_gate, GATE_START)
+
+        review = fold_issue_gate_facts(
+            [_j("101", "## Gate: review — R10 approved\n- 結論: 承認")]
+        )
+        self.assertEqual(review.latest_gate, _GATE_REVIEW)
+        self.assertEqual(review.review_conclusion, REVIEW_APPROVED)
+
+        blocked = fold_issue_gate_facts([_j("102", "## Gate: blocked – credential unavailable")])
+        self.assertEqual(blocked.latest_gate, GATE_BLOCKED)
+        closed = fold_issue_gate_facts([_j("103", "## Gate: close — installed dogfood green")])
+        self.assertEqual(closed.latest_gate, GATE_CLOSE)
+
+    def test_bounded_dash_qualifier_does_not_enable_prefix_guessing_or_collisions(self):
+        for notes in (
+            "## Gate: Implementation Requester — not a governed lifecycle token",
+            "## Gate: Review Finding Verdict — accepted",
+            "## Gate: Design Consultation Answer – option A",
+            "## Gate: review—R10",  # no bounded separator spaces
+        ):
+            with self.subTest(notes=notes):
+                self.assertIsNone(fold_issue_gate_facts([_j("100", notes)]))
+
+    def test_combined_heading_can_carry_a_qualified_final_part(self):
+        facts = fold_issue_gate_facts(
+            [
+                _j(
+                    "100",
+                    "## Gate: Implementation Done + Review Request — R6\n"
+                    "- commit: `abc1234`",
+                )
+            ]
+        )
+        self.assertEqual(facts.latest_gate, GATE_REVIEW_REQUEST)
+        self.assertTrue(facts.commit_bearing)
 
     def test_review_finding_verdicts_is_not_an_audit_review(self):
         # A verdict journal alone must NOT classify as an audit review (collision guard).
