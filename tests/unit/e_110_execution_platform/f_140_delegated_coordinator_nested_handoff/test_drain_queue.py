@@ -359,6 +359,39 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
 
+    def test_from_glance_envelope_completeness(self):
+        # Redmine #13967 R6-F2: the canonical `workflow glance --json` producer always emits
+        # rows + an exact-bool degraded and always appends lifecycle_diagnostic. A missing /
+        # present-null / wrong-type rows/lifecycle_diagnostic/degraded, or degraded=true, is a
+        # partially-read envelope -> hold. ONLY the canonical empty envelope is releasable.
+        hold_cases = [
+            {},
+            {"rows": []},
+            {"rows": [], "lifecycle_diagnostic": []},  # degraded absent
+            {"rows": [], "lifecycle_diagnostic": [], "degraded": None},
+            {"rows": [], "lifecycle_diagnostic": [], "degraded": 0},
+            {"rows": [], "lifecycle_diagnostic": [], "degraded": True},
+            {"rows": None, "lifecycle_diagnostic": [], "degraded": False},
+            {"rows": [], "lifecycle_diagnostic": None, "degraded": False},
+        ]
+        for env in hold_cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+        # The canonical empty envelope is releasable.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ok.json"
+            path.write_text(
+                json.dumps({"rows": [], "lifecycle_diagnostic": [], "degraded": False}),
+                encoding="utf-8",
+            )
+            payload = self._run(from_glance=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+        self.assertTrue(payload["durable_complete"])
+
     def test_present_null_is_malformed_not_absent(self):
         # Redmine #13967 R5-F1: an explicit JSON null is a present non-string value (malformed
         # -> hold), NOT the same as an absent key (which takes the default). An absent field

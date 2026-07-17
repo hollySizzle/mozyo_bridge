@@ -336,6 +336,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["escalation_decision"], "escalate")
         self.assertIn("supervisor", payload["escalating_subsystems"])
 
+    def test_cli_top_level_present_null_envelope_is_indeterminate(self):
+        # Redmine #13967 R6-F1: a present null / "" / wrong-type top-level authority field is
+        # malformed -> indeterminate, never folded into the absent-default.
+        P = "redmine:13967:j#81346"
+        cases = [
+            {"provenance": P, "findings": [], "unreadable_subsystems": None},
+            {"provenance": P, "findings": [], "unreadable_subsystems": ""},
+            {"provenance": P, "findings": [], "unreadable_subsystems": {"x": 1}},
+            {"provenance": P, "findings": [], "threshold": None},
+            {"provenance": P, "findings": [], "threshold": "2"},
+            {"provenance": P, "findings": None},
+        ]
+        for env in cases:
+            payload = self._run(env, add_provenance=False)
+            self.assertEqual(payload["escalation_decision"], "indeterminate", env)
+
+    def test_cli_absent_optional_envelope_fields_still_evaluate(self):
+        # Absent unreadable_subsystems / threshold take the safe defaults (evaluable).
+        payload = self._run(
+            {"provenance": "redmine:13967:j#81346", "findings": []}, add_provenance=False
+        )
+        self.assertEqual(payload["escalation_decision"], "no_escalation")
+        self.assertTrue(payload["evaluated"])
+
     def test_cli_valid_provenance_evaluates(self):
         payload = self._run(
             {
