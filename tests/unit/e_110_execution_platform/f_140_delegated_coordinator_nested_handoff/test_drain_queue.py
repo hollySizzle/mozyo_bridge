@@ -340,6 +340,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertEqual(payload["release_dogfood_pending"], 1)
 
+    def test_glance_type_confusion_fails_closed(self):
+        # Redmine #13967 R4-F2: non-string identity is never str-coerced, and a non-list
+        # container never crashes — every malformed shape holds (durable-incomplete).
+        cases = [
+            {"rows": [], "lifecycle_diagnostic": [
+                {"process_release": "requested", "issue": {"x": 1}, "lane": ["lane"]}]},
+            {"rows": 1, "lifecycle_diagnostic": []},
+            {"rows": [], "lifecycle_diagnostic": 1},
+            {"rows": [{"issue_id": "1", "workflow_state": ["review_waiting"]}]},
+            {"rows": [{"issue_id": {"x": 1}, "workflow_state": "review_waiting"}]},
+        ]
+        for env in cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+
+    def test_snapshot_type_confusion_fails_closed(self):
+        cases = [
+            {"lanes": 1},
+            {"lanes": [{"issue": {"x": 1}, "state_class": "review_waiting"}]},
+            {"lanes": [{"issue": "1", "state_class": ["review_waiting"]}]},
+        ]
+        for env in cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "s.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(snapshot_json=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+
     def test_from_glance_identity_missing_release_row_holds(self):
         # R3-F2: a release-pending lifecycle_diagnostic row with no durable identity must not
         # become a phantom release_dogfood lane that reads releasable — it fails closed to
