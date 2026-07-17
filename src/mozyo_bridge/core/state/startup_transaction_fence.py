@@ -375,11 +375,21 @@ class StartupTransactionFence:
         precedent (`scratch_retirement_fence._verify_identity`) uses for exactly that, and
         omitting it was a hole in the pattern, not a simplification of it.
         """
-        conn = sqlite3.connect(self.path, isolation_level=None)
-        conn.execute("PRAGMA busy_timeout = 2000")
+        # The connect + first reads are INSIDE the guard (review j#81092 R2-F2): a store
+        # whose bytes are not a database raises `sqlite3.DatabaseError` from
+        # `PRAGMA user_version`, and a version cell that is not an int raises TypeError /
+        # ValueError from `int(...)`. Leaving those raw made the public rail's "never
+        # raises" contract false and hid an unreadable authority behind a stack trace
+        # instead of a structured `rollback_authority_unavailable`. The borrowed precedent
+        # normalizes exactly this set in BOTH `_connect_ro` and `_connect_rw`
+        # (`scratch_retirement_fence.py`); porting only `_verify_identity` (R1-F7) left this
+        # half of the same authority-unreadable fail-closed face behind.
+        conn = None
         try:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if int(version) != STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION:
+            conn = sqlite3.connect(self.path, isolation_level=None)
+            conn.execute("PRAGMA busy_timeout = 2000")
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version != STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION:
                 raise StartupTransactionError(
                     f"startup transaction store schema {version!r} is not this runtime's "
                     f"{STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}; fail closed rather than "
@@ -398,8 +408,16 @@ class StartupTransactionFence:
                     "panes on the strength of another store's record"
                 )
         except StartupTransactionError:
-            conn.close()
+            if conn is not None:
+                conn.close()
             raise
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            if conn is not None:
+                conn.close()
+            raise StartupTransactionError(
+                f"the startup transaction authority {self.path} is unreadable ({exc}); "
+                "fail closed rather than treat an unreadable store as an empty one"
+            ) from exc
         return conn
 
     def _hold(self):

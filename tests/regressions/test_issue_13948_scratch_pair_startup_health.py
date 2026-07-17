@@ -38,7 +38,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     ROLLBACK_CLOSE_TARGETS,
     ROLLBACK_COMPOSER_UNREADABLE,
     ROLLBACK_SETTLED,
-    ROLLBACK_COMPOSER_UNREADABLE,
     ROLLBACK_DETAIL,
     ROLLBACK_ELIGIBLE,
     ROLLBACK_IDENTITY_DRIFT,
@@ -54,7 +53,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_ACTION_UNKNOWN,
     REASON_ALREADY_ROLLED_BACK,
     REASON_AUTHORITY_UNAVAILABLE,
-    REASON_BLOCKED,
     REASON_BLOCKED,
     REASON_INCOMPLETE,
     REASON_NOTHING_OWED,
@@ -954,6 +952,37 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertFalse(verdict.ok)
         self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
         self.assertFalse(ops.close_calls)
+
+    def test_a_corrupt_authority_is_a_structured_refusal_not_a_raw_error(self):
+        # Review j#81092 R2-F2: a store whose bytes are not a database raised a raw
+        # sqlite3.DatabaseError straight out of the public rail — the "never raises"
+        # contract was false, and public recovery could not answer
+        # `rollback_authority_unavailable`. The borrowed precedent normalizes exactly this
+        # in _connect_ro/_connect_rw; porting only the identity check (R1-F7) left it out.
+        for label, db_bytes in (
+            ("not a database", b"not-a-sqlite-database"),
+            ("empty file", b""),
+            ("truncated header", b"SQLite format 3\x00truncated"),
+        ):
+            with self.subTest(label=label):
+                home = Path(self._tmp.name) / label.replace(" ", "_")
+                home.mkdir()
+                fence = StartupTransactionFence(home=home)
+                fence.path.write_bytes(db_bytes)
+                fence.seal_path.write_text("some-nonce", encoding="utf-8")
+                # The store is present-shaped (row-bearing artifact + seal), so the rail
+                # reaches _connect rather than short-circuiting on absence.
+                with self.assertRaises(StartupTransactionError):
+                    fence.read(startup_action_id(self.unit, "n1"))
+                ops = _RollbackOps([])
+                verdict = run_session_rollback(
+                    action_id=startup_action_id(self.unit, "n1"),
+                    ops=ops,
+                    fence=fence,
+                    execute=True,
+                )
+                self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+                self.assertFalse(ops.close_calls)
 
     def test_an_absent_authority_never_bootstraps_to_close_something(self):
         # The reserve/rollback asymmetry, driven end to end: a rollback against a store
