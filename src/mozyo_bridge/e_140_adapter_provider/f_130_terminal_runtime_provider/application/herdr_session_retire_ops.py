@@ -259,6 +259,56 @@ class LiveSessionRetireOps:
         ]
         return auths, reviews
 
+    def retirement_transaction(self, unit, *, live_pair_present: bool):
+        """Open the exclusive retirement transaction for the exact pair unit."""
+        from mozyo_bridge.core.state.scratch_retirement_fence import (
+            ScratchRetirementFence,
+        )
+
+        return ScratchRetirementFence().transaction(
+            unit, live_pair_present=live_pair_present
+        )
+
+    def peek_retirement(self, unit):
+        """Read the retirement fence without creating or migrating its store."""
+        from mozyo_bridge.core.state.scratch_retirement_fence import (
+            ScratchRetirementFence,
+        )
+
+        return ScratchRetirementFence().peek(unit)
+
+    def close(self, workspace_id: str, lane_id: str, targets):
+        """Close only the exact role/locator pins admitted by the retire verdict."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+            HerdrRetireClosePlan,
+            execute_herdr_retire_close,
+        )
+
+        plan = HerdrRetireClosePlan(
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            close_targets=tuple(targets),
+            foreign_names=(),
+        )
+        return execute_herdr_retire_close(plan, env=self._environ())
+
+    def record_retirement(self, *, workspace_id: str, lane_id: str, intent: dict) -> str:
+        """Append the best-effort narrative audit after the fence proves completion."""
+        from mozyo_bridge.core.state.managed_events import record_managed_event
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire import (  # noqa: E501
+            EVENT_COMMAND,
+            EVENT_KIND_RETIRED,
+        )
+
+        event = record_managed_event(
+            command=EVENT_COMMAND,
+            event_kind=EVENT_KIND_RETIRED,
+            workspace_id=workspace_id,
+            repo_root=str(self._repo_root),
+            intent=intent,
+        )
+        return "recorded" if event is not None else "not_recorded:append_failed"
+
 def observe_scratch_pair(
     ops: SessionRetireOps,
     *,
