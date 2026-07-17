@@ -508,6 +508,43 @@ Table naming:
       zero-write で拒否する。`--retire-hibernated-bound` は `--execute` / `--migrate-hibernated-legacy` /
       `--reconcile-hibernated-live` と競合する destructive intent ゆえ **2 つ以上の同時指定は command-time zero-write
       error**。
+    - **hibernated bound declared-pin repair** (`LanePinRepairStore.repair_hibernated_bound_pins`,
+      #13879、live evidence #13846 j#79915)。#13809 / #13841 / #13842 / #13845 が **いずれも拒否**する隙間:
+      **hibernated / released** かつ `worktree_identity` **非空**（bound）かつ `declared_slots` が **空**
+      （pins-only gap）で、exact managed pair が **live** に観測されるケース。収束経路が無い: #13809 backfill は
+      **active** row 専用、#13841 / #13842 は `worktree_identity` **空**を要求、#13845 は同じ bound signature だが
+      **live-zero** 側を対象とし terminalize する。結果 `sublane recover-pair` (#13847) が declared pins 必須ゆえ
+      `hibernated_record_missing_pins` を恒久的に返す。この surface は **空の `declared_slots` のみ**を
+      1 本の bounded CAS で充填する — **metadata only**、process launch/close/resume/send も worktree/branch 削除も
+      伴わない。★**#13847 の declared-pins 前提は緩めない**: 本 surface はその前提が読む metadata を repair するだけで、
+      recover-pair 側の preflight / gate は不変（境界は実装と doc の双方で明示）。public high-level path
+      (`sublane repair-pins`、default は preflight・`--execute` で CAS) が **連言検証**する: exact
+      issue+lane+workspace、bound worktree token 一致、そして **live pair の全軸**は #13842 の pure
+      `decide_pair_reconcile` を **無改変で再利用**（present / unique / live / idle-or-turn-ended /
+      composer-settled / locator-bound attested / 別 locator / foreign 無し / inventory readable）。
+      ★**guard の共有ではなく走査の共有**の原則どおり、#13842 の観測 scan は `observe_pair` として公開し
+      （事実収集のみ）、**row-shape CAS は各 surface が literal に自 signature を述べる**（#13845 j#80187 の規律）。
+      #13842 の signature（worktree **空**）と本 surface（worktree **非空 かつ一致**）は **構成上排他**であり、
+      同一 row が双方の対象になることはない。書込は「row 存在 かつ exact `expected_revision` 一致 かつ **exact
+      `expected_generation` 一致**」かつ「`hibernated` / `binding_kind='issue'` / この exact issue 所有 /
+      project scope 無し / `worktree_identity` **非空 かつ token 一致**」かつ「`process_release='released'` /
+      replacement settled」の全成立時のみ。★**generation を revision と併せて guard** する: pins は観測した
+      process generation を名指すので、観測後に再 incarnate した row の空 snapshot は **この pair のものではない**。
+      ★worktree token は CAS 内（row lock 下）で再照合（action-time 観測は診断、CAS が authority）。
+      ★**replay は byte-equal のみ idempotent**（#13879 acceptance 4）: 完全一致は revision を上げない no-op success、
+      **non-empty かつ異なる** snapshot（recycled generation / foreign pin set）は `already_declared` zero-write —
+      既存 snapshot は決して上書きしない。空の pin set は caller error（何も証明しない repair）。
+      ★**書くのは `declared_slots` + decision anchor + revision のみ**。disposition / generation / worktree /
+      release / replacement / `reconcile_phase` は **保持**（`reconcile_phase` は空のままで、#13842
+      reconcile-owed close との区別を維持）。★**pin の `role` は消費者と同一語彙**でなければならない:
+      `recover-pair` は `domain/pair_launch_attestation` の `GATEWAY_ROLE='gateway'` / `WORKER_ROLE='worker'` で
+      `declared_pins` を role 引きする一方、`domain/sublane_lifecycle` は **同名で値が provider**
+      (`'codex'` / `'claude'`) の定数を export する。後者で pin すると recover-pair は role 解決に失敗し、
+      repair が「成功」しても `hibernated_record_missing_pins` が残る（= 本 ticket の defect が生存する）ため、
+      producer と consumer は **同一 module から import** する。`attested_at` は検証済み startup self-attestation の
+      `observed_at`（実証拠）、`runtime_revision` は空（herdr に runtime version 観測 surface が無い、
+      #13809 / #13810 R4-F1 — fabricate しない）。startup self-attestation は generation ごとに 1 回・locator で
+      pin されるので、同 generation の replay は同じ `observed_at` を読み byte-equality が安定する。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。

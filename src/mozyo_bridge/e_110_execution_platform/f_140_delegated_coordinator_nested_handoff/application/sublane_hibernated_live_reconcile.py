@@ -206,7 +206,7 @@ class ReconcileOps(Protocol):
     def read_attestation(self, assigned_name: str): ...
 
 
-def _observe_pair(
+def observe_pair(
     rows: Sequence[Mapping[str, object]],
     ops: ReconcileOps,
     *,
@@ -215,6 +215,12 @@ def _observe_pair(
     managed_pairs: tuple[tuple[str, str], ...],
 ) -> PairObservation:
     """Gather the content-free per-slot facts for the lane's expected managed pair (#13842).
+
+    Public because the #13879 hibernated bound **pin repair** observes the same expected pair
+    the same way (Redmine #13879). This is a **scan**, not a judgment: it gathers facts and
+    leaves every verdict to :func:`decide_pair_reconcile` and to each surface's own row-shape
+    CAS — sharing the scan is what #13845 j#80148 asks for, sharing a row-shape guard is what
+    it forbids (the sibling CAS signatures stay literal and disjoint).
 
     ``managed_pairs`` is ``((gateway_provider, "gateway"), (worker_provider, "worker"))``. For
     each provider role it counts the live rows carrying the expected assigned name (a raw
@@ -569,7 +575,7 @@ def run_hibernated_live_reconcile(
         (gateway_provider, GATEWAY_ROLE),
         (worker_provider, WORKER_ROLE),
     )
-    observation = _observe_pair(
+    observation = observe_pair(
         rows,
         live_ops,
         workspace_id=workspace_id,
@@ -591,7 +597,7 @@ def run_hibernated_live_reconcile(
         ]
 
     def _observe(rows_):
-        return _observe_pair(
+        return observe_pair(
             rows_,
             live_ops,
             workspace_id=workspace_id,
@@ -980,6 +986,7 @@ __all__ = (
     "HibernatedLiveReconcileVerdict",
     "ReconcileOps",
     "LiveReconcileOps",
+    "observe_pair",
     "run_hibernated_live_reconcile",
     "format_reconcile_text",
 )
