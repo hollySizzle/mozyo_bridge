@@ -76,7 +76,7 @@ def register(sub) -> None:
         dest="all_changed",
         action="store_true",
         default=False,
-        help="Use unstaged + untracked changes (instead of unstaged-only).",
+        help="Use staged + unstaged + untracked changes (instead of unstaged-only).",
     )
     resolve.add_argument(
         "--base",

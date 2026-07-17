@@ -20,6 +20,17 @@ from .overlay import OverlayInfo, load_effective_catalog
 IGNORED_PATH_PARTS = frozenset({".git", "__pycache__"})
 IGNORED_SUFFIXES = frozenset({".pyc"})
 
+# ``--no-renames`` is load-bearing, not cosmetic. Rename detection is on by
+# default and is user-configurable (``diff.renames``), so without it the same
+# worktree yields different listings on different machines, and a detected
+# rename collapses to the destination path only — the source path silently
+# vanishes from a gate whose whole job is to surface every affected path.
+# Disabling detection reports a rename as delete + add, which is both the
+# complete set and independent of operator config (Redmine #13919).
+CACHED_DIFF_COMMAND = ("git", "diff", "--cached", "--name-only", "--no-renames")
+WORKTREE_DIFF_COMMAND = ("git", "diff", "--name-only", "--no-renames")
+UNTRACKED_COMMAND = ("git", "ls-files", "--others", "--exclude-standard")
+
 
 def _should_skip_path(path: str) -> bool:
     parts = set(Path(path).parts)
@@ -46,23 +57,35 @@ def git_changed_paths(
 ) -> list[str]:
     """Return repo-relative changed paths from git.
 
-    Selection mirrors the predecessor script: ``--staged`` queries
-    cached changes only, ``--all-changed`` includes unstaged +
-    untracked, neither flag is the unstaged-only default.
+    Selection: ``all_changed`` is the deduplicated union of cached +
+    unstaged + untracked, ``staged`` queries cached changes only, and
+    neither flag is the unstaged-only default. ``all_changed`` wins when
+    both flags are set, since it is a superset of ``staged``.
+
+    ``all_changed`` previously queried unstaged + untracked only, so a
+    fully staged worktree resolved to zero paths and the gate passed
+    silently while the documented contract (and ``--staged``) said
+    otherwise (Redmine #13919). Every source is therefore queried here,
+    and the ``staged`` scope is unchanged.
+
+    Order is deterministic: sources are queried in a fixed order, git
+    lists each source sorted by path, and duplicates keep their
+    first-seen position. Any git failure propagates as
+    :class:`subprocess.CalledProcessError` — an unreadable source must
+    fail the gate, never degrade to a short listing that reads as
+    "nothing changed".
     """
-    commands: list[list[str]] = []
-    if staged:
-        commands.append(["git", "diff", "--cached", "--name-only"])
     if all_changed:
-        commands.append(["git", "diff", "--name-only"])
-        commands.append(["git", "ls-files", "--others", "--exclude-standard"])
-    if not commands:
-        commands.append(["git", "diff", "--name-only"])
+        commands = [CACHED_DIFF_COMMAND, WORKTREE_DIFF_COMMAND, UNTRACKED_COMMAND]
+    elif staged:
+        commands = [CACHED_DIFF_COMMAND]
+    else:
+        commands = [WORKTREE_DIFF_COMMAND]
 
     paths: list[str] = []
     seen: set[str] = set()
     for command in commands:
-        output = subprocess.check_output(command, cwd=repo_root, text=True)
+        output = subprocess.check_output(list(command), cwd=repo_root, text=True)
         _dedup_changed(output.splitlines(), seen, paths)
     return paths
 
@@ -76,10 +99,13 @@ def git_changed_paths_since(repo_root: Path, base: str) -> list[str]:
     is the CI counterpart to :func:`git_changed_paths` (which reads the working
     tree / index); both feed the same impact resolver, so the focused-test
     selection is identical whether the diff is derived locally or in CI against
-    the merge target. The same skip/dedup filtering is applied.
+    the merge target. That parity is why ``--no-renames`` is passed here too:
+    it keeps rename listing identical to :func:`git_changed_paths` and
+    independent of the ambient ``diff.renames`` config. The same skip/dedup
+    filtering is applied.
     """
     output = subprocess.check_output(
-        ["git", "diff", "--name-only", f"{base}...HEAD"],
+        ["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"],
         cwd=repo_root,
         text=True,
     )
