@@ -123,6 +123,7 @@ def _glance_env(rows=None, diag=None, **overrides):
             r["issue_id"] for r in rows if r.get("has_active_anomaly")
         ],
         "degraded": False,
+        "notes": [],
         "lifecycle_diagnostic": diag or [],
     }
     env.update(overrides)
@@ -651,6 +652,36 @@ class CliTests(unittest.TestCase):
                 payload = self._run(from_glance=str(path))
             self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
             self.assertFalse(payload["durable_complete"], env)
+
+    def test_from_glance_notes_source_health_contract(self):
+        # Redmine #13967 R11-F1: the canonical envelope ALWAYS emits `notes: list[str]` bound to
+        # `degraded` by the invariant `degraded == bool(notes)` (GlanceCollection.degraded is
+        # bool(self.notes); every source error appends a note AND sets degraded). The reader
+        # must validate `notes` and that invariant — a missing / null / non-list / non-string
+        # notes, or `degraded: false` with a non-empty notes (a reported source failure the
+        # envelope did not flag degraded), is a contradictory / lost-field envelope -> hold.
+        hold_cases = [
+            {k: v for k, v in _glance_env().items() if k != "notes"},  # notes absent
+            _glance_env(notes=None),  # present-null
+            _glance_env(notes=1),  # non-list
+            _glance_env(notes=[1]),  # non-string member
+            _glance_env(notes=["source failed"]),  # degraded=false + non-empty -> invariant break
+            _glance_env(degraded=True, notes=[]),  # degraded=true + empty -> invariant break
+        ]
+        for env in hold_cases:
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "g.json"
+                path.write_text(json.dumps(env), encoding="utf-8")
+                payload = self._run(from_glance=str(path))
+            self.assertEqual(payload["process_retention"], PROCESS_HOLD, env)
+            self.assertFalse(payload["durable_complete"], env)
+        # Healthy source-health: degraded=false + notes=[] is releasable.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ok.json"
+            path.write_text(json.dumps(_glance_env(notes=[])), encoding="utf-8")
+            payload = self._run(from_glance=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
 
     def test_snapshot_delivery_anomaly_active_roundtrips(self):
         # Redmine #13967 R10-F1: `DrainLane.as_payload()` emits delivery_anomaly_active, so the
