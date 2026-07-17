@@ -458,6 +458,51 @@ def _delivery_ledger():
         return None
 
 
+def _live_identity_notes(roster, diagnostic) -> list[str]:
+    """Source-health notes for raw collection-identity contradictions in the live path.
+
+    The default-live path feeds the raw active roster into ``active_lane_snapshots`` (which
+    dedups by issue via its ``seen`` set) and merges the lifecycle diagnostic through
+    ``_merge_release_pending`` (which merges by ``(issue, lane)``) — both SILENTLY normalize
+    contradictions. So the same collection-identity invariants the ``--from-glance`` reader
+    enforces on the canonical envelope (Redmine #13967 R8-F1 / R9-F2) are checked here on the
+    RAW roster + diagnostic BEFORE that normalization, and any breach is reported so the caller
+    marks the projection degraded -> hold rather than laundering it into a release bucket
+    (R12-F1):
+
+    - active roster issue uniqueness (the canonical active roster is one row per issue);
+    - active roster ``(issue, lane)`` uniqueness;
+    - lifecycle-diagnostic ``(issue, lane)`` uniqueness;
+    - active / diagnostic identity disjointness (a lane is active XOR non-active, never both).
+    """
+    notes: list[str] = []
+    active_issues: set[str] = set()
+    active_keys: set[tuple[str, str]] = set()
+    for issue_raw, lane_raw in roster:
+        issue = str(issue_raw or "").strip()
+        lane = str(lane_raw or "").strip()
+        if not issue:
+            continue
+        if issue in active_issues:
+            notes.append(f"active roster: duplicate active issue {issue}")
+        active_issues.add(issue)
+        key = (issue, lane)
+        if key in active_keys:
+            notes.append(f"active roster: duplicate active identity {issue}/{lane}")
+        active_keys.add(key)
+    diag_keys: set[tuple[str, str]] = set()
+    for entry in diagnostic:
+        issue = str(entry[0] or "").strip()
+        lane = str(entry[1] or "").strip()
+        key = (issue, lane)
+        if key in diag_keys:
+            notes.append(f"lifecycle diagnostic: duplicate identity {issue}/{lane}")
+        diag_keys.add(key)
+    for issue, lane in sorted(active_keys & diag_keys):
+        notes.append(f"active/diagnostic identity collision {issue}/{lane}")
+    return notes
+
+
 def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str, ...]]:
     """Best-effort live enumeration folded through the glance read model.
 
@@ -470,6 +515,13 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     ``--from-glance`` envelope; ``--from-glance`` (which folds the Redmine record) remains the
     richer path for durable-state classification. A ledger that is absent / unreadable simply
     yields no anomaly observation (fail-open), never a crash.
+
+    Before the fold, the RAW roster + diagnostic identities are validated
+    (:func:`_live_identity_notes`) so a contradiction the downstream helpers would otherwise
+    silently normalize (a duplicate active issue dropped by ``active_lane_snapshots``, or an
+    active lane merged with a colliding lifecycle-diagnostic row) is reported degraded -> hold,
+    keeping the live path's collection invariants symmetric with the ``--from-glance`` reader
+    (Redmine #13967 R12-F1).
     """
     from mozyo_bridge.core.state.workflow_runtime_store import (
         WorkflowRuntimeStore,
@@ -522,6 +574,12 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     if diag_error:
         degraded = True
         notes.append(diag_error)
+    # Validate raw collection identities BEFORE active_lane_snapshots / _merge_release_pending
+    # silently normalize any contradiction (Redmine #13967 R12-F1) — a breach holds the process.
+    identity_notes = _live_identity_notes(roster, diagnostic)
+    if identity_notes:
+        degraded = True
+        notes.extend(identity_notes)
     release_rows = [
         (issue, lane)
         for issue, lane, _disposition, process_release in diagnostic

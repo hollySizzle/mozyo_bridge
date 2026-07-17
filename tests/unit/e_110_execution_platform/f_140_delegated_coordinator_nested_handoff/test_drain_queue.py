@@ -801,6 +801,65 @@ class CliTests(unittest.TestCase):
         ):
             self.assertIsNone(_delivery_ledger())
 
+    def test_live_identity_notes_pure(self):
+        # Redmine #13967 R12-F1: the raw-identity validator mirrors the --from-glance reader's
+        # collection invariants on the live roster + diagnostic. Healthy distinct identities
+        # raise no note; a duplicate active issue / active identity / diagnostic identity, or an
+        # active/diagnostic collision, each raises at least one note (-> degraded -> hold).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain import (
+            _live_identity_notes,
+        )
+
+        self.assertEqual(
+            _live_identity_notes((("9", "la"),), (("8", "lb", "retired", "released"),)), []
+        )
+        self.assertTrue(_live_identity_notes((("9", "la"), ("9", "lb")), ()))  # dup active issue
+        self.assertTrue(_live_identity_notes((("9", "la"), ("9", "la")), ()))  # dup active identity
+        self.assertTrue(  # dup diagnostic identity
+            _live_identity_notes(
+                (("9", "la"),),
+                (("8", "lb", "retired", "requested"), ("8", "lb", "hibernated", "released")),
+            )
+        )
+        self.assertTrue(  # active/diagnostic collision
+            _live_identity_notes((("9", "la"),), (("9", "la", "hibernated", "requested"),))
+        )
+
+    def test_live_path_identity_contradiction_holds_with_durable_facts(self):
+        # Redmine #13967 R12-F1: with durable facts present (so the fold is NOT degraded on its
+        # own), an active/diagnostic collision must still hold — it must NOT be silently merged
+        # into a release_dogfood bucket and read releasable. A healthy distinct roster releases.
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+
+        mod = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+        gss = mod + ".application.glance_snapshot_source"
+        drain = mod + ".application.cli_workflow_drain"
+        wrs = "mozyo_bridge.core.state.workflow_runtime_store"
+
+        def run(roster, diag):
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "rt.json"
+                # gate=progress -> the folded lane is `implementing` (durable facts present, not
+                # degraded by itself), so only the identity contradiction can hold it.
+                WorkflowRuntimeStore(path=p).append_events(
+                    [{"event_id": "e", "issue": "9", "gate": "progress"}]
+                )
+                with mock.patch(gss + ".enumerate_active_lanes", return_value=(roster, None)), \
+                        mock.patch(gss + ".enumerate_lifecycle_diagnostic", return_value=(diag, None)), \
+                        mock.patch(drain + "._delivery_ledger", return_value=None), \
+                        mock.patch(wrs + ".workflow_runtime_store_path", return_value=p):
+                    return self._run(repo=td)
+
+        # active (9, la) folds to implementing; a colliding diagnostic (9, la) requested must
+        # NOT launder it into release_dogfood -> hold, durable-incomplete.
+        payload = run((("9", "la"),), (("9", "la", "hibernated", "requested"),))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        # healthy distinct active + diagnostic -> releasable
+        payload = run((("9", "la"),), (("8", "lb", "retired", "released"),))
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+        self.assertTrue(payload["durable_complete"])
+
     def test_present_null_is_malformed_not_absent(self):
         # Redmine #13967 R5-F1: an explicit JSON null is a present non-string value (malformed
         # -> hold), NOT the same as an absent key (which takes the default). An absent field
