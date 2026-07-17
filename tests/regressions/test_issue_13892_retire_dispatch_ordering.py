@@ -50,6 +50,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     STATE_BLOCKED,
     STATE_GREEN,
 )
+from tests.support.herdr_workspace_fixtures import (
+    FIXTURE_WORKSPACE_ID,
+    anchored_repo_root,
+)
 
 LANE, GW, WK = "dogfood13892", "codex", "claude"
 
@@ -64,8 +68,12 @@ class RetireDispatchOrderingTest(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         self.home = Path(d)
-        self.repo = Path(__file__).resolve().parents[2]
+        # The fixture anchors its own repo root (#13924); the source checkout's segment
+        # exists only where an operator registered it, so a fresh CI checkout resolved ""
+        # and every test here died encoding an identity in setUp.
+        self.repo = anchored_repo_root(self)
         self.ws = herdr_workspace_segment(self.repo)
+        self.assertEqual(self.ws, FIXTURE_WORKSPACE_ID)
         self.gw = encode_assigned_name(self.ws, GW, LANE)
         self.wk = encode_assigned_name(self.ws, WK, LANE)
         self.unit = RetirementUnit(self.ws, LANE, slot_digest([self.gw, self.wk]))

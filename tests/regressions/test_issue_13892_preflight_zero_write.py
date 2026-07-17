@@ -36,6 +36,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from tests.support.herdr_workspace_fixtures import (
+    FIXTURE_WORKSPACE_ID,
+    anchored_repo_root,
+)
 
 LANE, GW, WK = "dogfood13892", "codex", "claude"
 
@@ -60,8 +64,12 @@ class PreflightZeroWriteTest(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         self.home = Path(d)
-        self.repo = Path(__file__).resolve().parents[2]
+        # The fixture anchors its own repo root (#13924), so the identity does not come
+        # from the operator's registration of the source checkout. It lives outside
+        # ``self.home``, which stays exactly the set of authorities the preflight may read.
+        self.repo = anchored_repo_root(self)
         self.ws = herdr_workspace_segment(self.repo)
+        self.assertEqual(self.ws, FIXTURE_WORKSPACE_ID)
         self.gw = encode_assigned_name(self.ws, GW, LANE)
         self.wk = encode_assigned_name(self.ws, WK, LANE)
         for mod in (
