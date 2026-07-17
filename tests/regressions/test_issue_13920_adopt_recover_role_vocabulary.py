@@ -35,6 +35,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 _TESTS_ROOT = Path(__file__).resolve().parents[1]
@@ -88,14 +89,32 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ResumeOutcome,
     ResumePreflight,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_gate_producer import (  # noqa: E402,E501
+    build_v3_target_from_observation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_target import (  # noqa: E402,E501
+    ResumeTargetResolver,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (  # noqa: E402,E501
     SlotRecoveryObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate import (  # noqa: E402,E501
+    GateApproval,
+    GateClassification,
+    OriginalRequest,
+    build_required_gate,
+    repo_identity_digest,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.operator_startup_gate_lattice import (  # noqa: E402,E501
+    approve_gate,
+    report_operator_done,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E402,E501
     GATEWAY_ROLE as LEGACY_GATEWAY_ROLE,
     WORKER_ROLE as LEGACY_WORKER_ROLE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
+    AGENT_KEY_NAME,
     encode_assigned_name,
 )
 
@@ -485,6 +504,140 @@ class AmbiguousRowFailsClosedTest(_HomeBackedCase):
         self.assertEqual(outcome.preflight.pins_reason, PIN_PAIR_ABSENT)
         self.assertEqual(ops.closed, [])
         self.assertIsNone(ops.redispatched)
+
+
+class OperatorStartupSeamTest(unittest.TestCase):
+    """A canonical declared row must still resolve an action-time resume target (review j#80598 F1).
+
+    The second consumer of ``ProcessGenerationPin.role``, and the one #13920's first pass got
+    wrong. ``operator_startup_gate_producer`` copies the pin's ``role`` into the gate's
+    ``runtime_role``; ``operator_startup_resume_target`` then fed that to the startup
+    self-attestation join as ``expected_role``. A self-attestation records its herdr identity
+    role — the PROVIDER token — so the two only ever agreed because the pin's role happened to be
+    spelled in the provider vocabulary. Canonicalizing the pin broke it: ``worker`` vs a recorded
+    ``claude`` joins ATTEST_CONFLICT and a healthy lane resolves NO resume target.
+
+    The full suite missed it because every existing fixture sets ``runtime_role == provider_id``
+    (the legacy shape) and the resume-binding tests stub ``evaluate_attestation`` outright. So
+    these drive the REAL producer into the REAL resolver over a REAL ``IdentityAttestationRecord``
+    and the REAL join — the two seams that were stubbed are exactly where the defect lived.
+    """
+
+    _WS = "ws-13920-startup"
+    _LANE = "lane-13920"
+    _NAME = "worker-a"
+    _LOC = "w9:p1"
+    _WORKFLOW_ROLE = "implementation_worker"
+
+    class _Binding:
+        def __init__(self, mapping):
+            self._m = dict(mapping)
+
+        def provider_for(self, role):
+            return self._m.get(role)
+
+    def _record(self, pins):
+        return SimpleNamespace(
+            declared_pins=tuple(pins),
+            repo_workspace_id=self._WS,
+            lane_id=self._LANE,
+            lane_generation=3,
+            revision=1,
+            lane_disposition=DISPOSITION_ACTIVE,
+            issue_id=ISSUE,
+        )
+
+    def _pin(self, role: str, provider: str = "claude") -> ProcessGenerationPin:
+        return ProcessGenerationPin(
+            role=role, provider=provider, assigned_name=self._NAME, locator=self._LOC,
+        )
+
+    def _attestation(self, *, role: str = "claude"):
+        """The REAL record a worker slot writes: its ``role`` is the PROVIDER token."""
+        return IdentityAttestationRecord(
+            assigned_name=self._NAME, workspace_id=self._WS, role=role, lane_id=self._LANE,
+            locator=self._LOC, verdict=VERDICT_PRESENT, observed_at=ATTESTED_AT,
+        )
+
+    def _resolve(self, *, pins, binding_provider="claude", attestation_role="claude"):
+        """Drive producer -> gate -> resolver end to end; return the resolved target or None."""
+        record = self._record(pins)
+        target = build_v3_target_from_observation(
+            record=record,
+            binding=self._Binding({self._WORKFLOW_ROLE: "claude"}),
+            workflow_role=self._WORKFLOW_ROLE,
+            execution_root=".",
+        )
+        gate = report_operator_done(
+            approve_gate(
+                build_required_gate(
+                    gate_id="gate-13920",
+                    action_generation=1,
+                    original_request=OriginalRequest(
+                        source="redmine", issue=ISSUE, journal=JOURNAL, delivery_id="d-1"
+                    ),
+                    target=target,
+                    classification=GateClassification(
+                        blocker_id="first_run_theme", profile_version="2",
+                        classifier_version="1", observed_at=ATTESTED_AT,
+                    ),
+                ),
+                approval=GateApproval(source_journal=APPROVAL_JOURNAL),
+            )
+        )
+        resolver = ResumeTargetResolver(
+            env={},
+            repo_root="/repo/root",
+            lifecycle_get=lambda ws, lane: record,
+            inventory=lambda env: [{AGENT_KEY_NAME: self._NAME, "pane_id": self._LOC}],
+            # The REAL record + the REAL evaluate_attestation — not a stub (review j#80598 F1).
+            attestation_read=lambda name: self._attestation(role=attestation_role),
+            capture=lambda loc, lines: "",
+            workspace_resolve=lambda repo_root, execution_root, env: (
+                self._WS, repo_identity_digest(self._WS), ".",
+            ),
+            binding_resolve=lambda role, repo_root, env: binding_provider,
+        )
+        return resolver.resolve(gate, {})
+
+    def test_canonical_pin_resolves_a_resume_target(self) -> None:
+        """The regression: this returned None (zero-send) on a perfectly healthy lane."""
+        self.assertIsNotNone(
+            self._resolve(pins=(self._pin(PIN_ROLE_WORKER),)),
+            "a canonical declared row resolved no resume target",
+        )
+
+    def test_legacy_pin_still_resolves_a_resume_target(self) -> None:
+        """A pre-#13920 row keeps working — the fix is not a swap of which vocabulary breaks."""
+        self.assertIsNotNone(self._resolve(pins=(self._pin(LEGACY_WORKER_ROLE),)))
+
+    def test_foreign_attestation_role_still_fails_closed(self) -> None:
+        """The join must stay load-bearing: a record for a DIFFERENT provider is refused.
+
+        Without this, 'pass the provider instead of the slot label' could be satisfied by not
+        checking the role at all.
+        """
+        self.assertIsNone(
+            self._resolve(pins=(self._pin(PIN_ROLE_WORKER),), attestation_role="codex")
+        )
+
+    def test_binding_drift_still_fails_closed(self) -> None:
+        """The action-time binding check (j#79405 §A) is untouched by the vocabulary fix."""
+        self.assertIsNone(
+            self._resolve(pins=(self._pin(PIN_ROLE_WORKER),), binding_provider="gemini")
+        )
+
+    def test_gate_runtime_role_carries_the_slot_label(self) -> None:
+        """The producer's contract after #13920: runtime_role is the SLOT, provider_id the provider."""
+        target = build_v3_target_from_observation(
+            record=self._record((self._pin(PIN_ROLE_WORKER),)),
+            binding=self._Binding({self._WORKFLOW_ROLE: "claude"}),
+            workflow_role=self._WORKFLOW_ROLE,
+            execution_root=".",
+        )
+        self.assertEqual(target.runtime_role, PIN_ROLE_WORKER)
+        self.assertEqual(target.provider_id, "claude")
+        self.assertEqual(target.target_role, self._WORKFLOW_ROLE)
 
 
 class PinWriterVocabularySourceTest(unittest.TestCase):

@@ -71,9 +71,14 @@ def build_v3_target_from_observation(
     that provider slot supplies ``(runtime_role, provider_id, assigned_name)``; the record supplies
     ``workspace_id`` (its ``repo_workspace_id``, the registry authority), ``lane_id``,
     ``agent_generation`` (``lane_generation``) and ``lane_revision`` (``revision``). ``runtime_role``
-    is the pin's ``role`` (the provider role), kept distinct from the workflow ``target_role``
-    (j#79405 §A). ``execution_root`` is the repo-relative pointer the gate is pinned to. Any drift
-    raises :class:`GateProducerError` (fail-closed) rather than fabricating a runtime role.
+    is the pin's ``role``, kept distinct from the workflow ``target_role`` (j#79405 §A). Since
+    Redmine #13920 that is the declared SLOT label (``gateway`` / ``worker``, owned by
+    ``core.state.lane_pin_role``) — NOT the herdr identity role. The herdr identity role is the
+    PROVIDER token, carried here as ``provider_id``; a consumer matching a startup
+    self-attestation must use that, never ``runtime_role`` (they coincided only while the pin's
+    role was spelled in the legacy provider vocabulary). ``execution_root`` is the repo-relative
+    pointer the gate is pinned to. Any drift raises :class:`GateProducerError` (fail-closed)
+    rather than fabricating a runtime role.
     """
     provider = None
     try:

@@ -222,6 +222,22 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: declared-pin role vocabulary owner and its writers / consumers
+  patterns:
+  - src/mozyo_bridge/core/state/lane_pin_role.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_adopt_declaration.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_pair_recovery.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_pin_repair.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_live_reconcile.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/operator_startup_gate_producer.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/operator_startup_resume_target.py
+  - tests/regressions/test_issue_13920_adopt_recover_role_vocabulary.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/managed-state-model.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: module-health metrics and oversized-module gate source
   patterns:
   - src/mozyo_bridge/e_150_quality_architecture/f_130_module_health/domain/module_health.py

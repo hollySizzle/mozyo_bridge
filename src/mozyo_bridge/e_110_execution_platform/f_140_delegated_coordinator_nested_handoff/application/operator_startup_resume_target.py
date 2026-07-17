@@ -239,9 +239,13 @@ class ResumeTargetResolver:
         if not bound_provider or bound_provider != target.provider_id:
             return None
 
-        # 2b. Exactly one declared pin with the gate's runtime identity
-        #     ``(runtime_role, provider_id, assigned_name)``. The declared pin's ``role`` is the
-        #     runtime role (``ProcessGenerationPin.role``), NOT the workflow role (j#79405 §A).
+        # 2b. Exactly one declared pin with the gate's declared identity
+        #     ``(runtime_role, provider_id, assigned_name)``. ``runtime_role`` is the declared
+        #     pin's ``role`` (``ProcessGenerationPin.role``), NOT the workflow role (j#79405 §A)
+        #     — since #13920 that is the SLOT label (``gateway`` / ``worker``), and it is matched
+        #     here against the pin it was produced from, so the two always speak one vocabulary.
+        #     The herdr identity role (the provider token) is a DIFFERENT axis, compared as
+        #     ``provider_id`` here and passed to the self-attestation join in step 4.
         wanted = (target.runtime_role, target.provider_id, target.target_assigned_name)
         try:
             pins = [
@@ -272,7 +276,14 @@ class ResumeTargetResolver:
             return None
         try:
             live_pin = ProcessGenerationPin(
-                role=str(row.get("role") or target.runtime_role).strip(),
+                # ``role`` is the DECLARED slot label (``gateway`` / ``worker``), not an
+                # observable of the live row (Redmine #13920). A herdr `agent list` row carries
+                # no slot label at all, and its mzb1 identity ``role`` segment is the PROVIDER
+                # token — a different vocabulary (``herdr_target_resolution``: "the mzb1 role
+                # field is a runtime *provider*"). Reading it here would compare a provider
+                # against a slot label and fail closed on every canonical pin; the provider is
+                # compared on its own axis below.
+                role=target.runtime_role,
                 provider=str(row.get("provider") or target.provider_id).strip(),
                 assigned_name=target.target_assigned_name,
                 locator=live_locator,
@@ -284,6 +295,13 @@ class ResumeTargetResolver:
             return None
 
         # 4. Identity self-attestation for the live locator is ok.
+        #    ``expected_role`` is the PROVIDER, not the gate's ``runtime_role`` (Redmine #13920).
+        #    A startup self-attestation records its herdr identity role, which IS the provider
+        #    token (``codex`` / ``claude``) — the same value #13809's adopt gate passes here
+        #    (``expected_role=provider``). Since #13920 the declared pin's ``role`` is a SLOT
+        #    label (``gateway`` / ``worker``), so feeding ``runtime_role`` in would compare
+        #    ``worker`` against a recorded ``claude`` and join ATTEST_CONFLICT on every
+        #    canonical pin — resolving no resume target for a perfectly healthy lane.
         try:
             from mozyo_bridge.core.state.herdr_identity_attestation import evaluate_attestation
 
@@ -291,7 +309,7 @@ class ResumeTargetResolver:
                 self.attestation_read(target.target_assigned_name),
                 live_locator=live_locator,
                 expected_workspace_id=target.workspace_id,
-                expected_role=target.runtime_role,
+                expected_role=target.provider_id,
                 expected_lane=target.lane_id,
             )
         except Exception:  # noqa: BLE001 - attestation evaluation failure -> fail closed

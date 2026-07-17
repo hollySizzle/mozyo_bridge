@@ -517,7 +517,12 @@ Table naming:
       `hibernated_record_missing_pins` を恒久的に返す。この surface は **空の `declared_slots` のみ**を
       1 本の bounded CAS で充填する — **metadata only**、process launch/close/resume/send も worktree/branch 削除も
       伴わない。★**#13847 の declared-pins 前提は緩めない**: 本 surface はその前提が読む metadata を repair するだけで、
-      recover-pair 側の preflight / gate は不変（境界は実装と doc の双方で明示）。public high-level path
+      recover-pair の **preflight 判断 (どの slot が recoverable か / 何を close するか) は不変**（境界は実装と doc の
+      双方で明示）。★ただし #13920 が recover-pair の **pin 解決**を `### declared pins の role 語彙` の owner 境界へ
+      移し、legacy 綴りの read-compat と blocked reason の細分化 (`hibernated_record_missing_pins:<reason>`) を
+      加えた。これは「非空 pins を有効な証明として扱わない」方向の**強化**であり、緩和ではない: repair が書く
+      canonical snapshot の扱いは変わらず、repair 後に recover-pair が解決できるという本 surface の目的も変わらない。
+      public high-level path
       (`sublane repair-pins`、default は preflight・`--execute` で CAS) が **連言検証**する: exact
       issue+lane+workspace、bound worktree token 一致、そして **live pair の全軸**は #13842 の pure
       `decide_pair_reconcile` を **無改変で再利用**（present / unique / live / idle-or-turn-ended /
@@ -537,11 +542,12 @@ Table naming:
       ★**書くのは `declared_slots` + decision anchor + revision のみ**。disposition / generation / worktree /
       release / replacement / `reconcile_phase` は **保持**（`reconcile_phase` は空のままで、#13842
       reconcile-owed close との区別を維持）。★**pin の `role` は消費者と同一語彙**でなければならない:
-      `recover-pair` は `domain/pair_launch_attestation` の `GATEWAY_ROLE='gateway'` / `WORKER_ROLE='worker'` で
-      `declared_pins` を role 引きする一方、`domain/sublane_lifecycle` は **同名で値が provider**
-      (`'codex'` / `'claude'`) の定数を export する。後者で pin すると recover-pair は role 解決に失敗し、
-      repair が「成功」しても `hibernated_record_missing_pins` が残る（= 本 ticket の defect が生存する）ため、
-      producer と consumer は **同一 module から import** する。`attested_at` は検証済み startup self-attestation の
+      canonical vocabulary の**唯一の owner は `core/state/lane_pin_role.py`**（#13920）であり、pin を書く /
+      読む surface は例外なく `PIN_ROLE_GATEWAY='gateway'` / `PIN_ROLE_WORKER='worker'` をそこから import する
+      （`### declared pins の role 語彙` を読む）。`domain/sublane_lifecycle` は **同名で値が provider**
+      (`'codex'` / `'claude'`) の定数を export するので、後者で pin すると consumer は role 解決に失敗し、
+      repair が「成功」しても `hibernated_record_missing_pins` が残る（= #13879 / #13920 の defect が生存する）。
+      `attested_at` は検証済み startup self-attestation の
       `observed_at`（実証拠）、`runtime_revision` は空（herdr に runtime version 観測 surface が無い、
       #13809 / #13810 R4-F1 — fabricate しない）。startup self-attestation は generation ごとに 1 回・locator で
       pin されるので、同 generation の replay は同じ `observed_at` を読み byte-equality が安定する。
@@ -557,6 +563,64 @@ Ownership rules:
   integrity checks. Do not require hard FK from `rebuildable_cache` tables into authoritative identity tables when that would
   make cache rebuild impossible after partial loss.
 - `state_schema_components` is metadata, not workflow truth. Redmine / owner approval / review / completion remain outside DB.
+
+### declared pins の role 語彙
+
+`ProcessGenerationPin.role` の **canonical vocabulary の正本は `src/mozyo_bridge/core/state/lane_pin_role.py`**（Redmine #13920）。
+pin model は `role` の非空と `(role, provider, assigned_name)` の重複だけを検査し、**語彙は一切検査しない**。よって
+writer と reader が綴りを違えても例外にならず、reader が「pins 無し」と読むだけになる（#13920 の defect: adopt 済み
+lane が hibernate すると pins が row にあるのに `hibernated_record_missing_pins`）。語彙は各 call site が import 元から
+推測する事実にしない。
+
+```yaml
+declared_pin_role:
+  owner: src/mozyo_bridge/core/state/lane_pin_role.py
+  canonical: [PIN_ROLE_GATEWAY='gateway', PIN_ROLE_WORKER='worker']   # 新規 write は必ずこれ
+  legacy_read_compat: {codex: gateway, claude: worker}                 # 読むだけ。write では使わない
+  意味: role は **slot 名**であって provider ではない。writer は binding に関わらず gateway slot に
+        gateway を打つので、legacy 綴りの `codex` も「gateway slot」を意味する (provider は pin の
+        `provider` field が持つ)。よって legacy → canonical の read-compat は健全。
+  非owner (同名・別値。pin には使わない):
+    - domain/sublane_lifecycle: GATEWAY_ROLE='codex' / WORKER_ROLE='claude'
+      # 値は herdr assigned-name の role segment (= provider token)。pane routing / name decode /
+      # provider 値が依存するため **repoint 不可**。pin 用途で import しない。
+    - domain/pair_launch_attestation: GATEWAY_ROLE / WORKER_ROLE
+      # launch-attestation slot label。値は owner と一致させて維持する (domain leaf の import 非依存設計)。
+```
+
+**read-compat / write-canonical**（#13844 / #13882 と同じ discipline）: read は legacy を受理して広く、write は
+canonical のみ、**read が row を書き換えることはない**。明示的な再宣言 rail は `sublane repair-pins`（#13879）。
+
+**「非空」は証明ではない**。`resolve_declared_pin_pair` は pair を一意に名指さない形をすべて fail-closed reason で
+返し、consumer は zero-close / zero-send で停止する。
+
+```yaml
+pin_pair_fail_closed:
+  declared_pins_absent:      pins が無い (create 時 issue lane / v4→v5 の pins-only gap)
+  declared_pins_unreadable:  snapshot が decode 不能 (corrupt / newer envelope)
+  foreign_pin_role:          どちらの語彙にも属さない role
+  mixed_pin_role_vocabulary: 1 row に canonical と legacy が混在 = 別々の writer が触った → provenance 不明
+  duplicate_pin_role:        2 pin が同一 canonical slot へ解決 (例 codex + gateway)
+                             # pin model の stable_identity dedupe は raw role で見るため検出できない
+  incomplete_pin_pair:       片側だけ
+```
+
+`recover-pair` の blocked reason は `hibernated_record_missing_pins:<上記 reason>` を報告する（ambiguous な非空 row と
+真に pin の無い row は同じ fail-closed でも別の operator 問題であるため）。
+
+**consumer 境界 — slot label と herdr identity role を混同しない**（#13920 review j#80598 F1）。同じ「role」という語が
+2 つの異なるものを指すため、consumer は自分がどちらを要求しているか明示する。
+
+| 概念 | 値 | 出所 | 使う場所 |
+| --- | --- | --- | --- |
+| **slot label** | `gateway` / `worker` | `ProcessGenerationPin.role` (owner: `lane_pin_role`) | pin の role 引き、`stable_identity` 照合 |
+| **herdr identity role** | provider token (`codex` / `claude`) | assigned-name の role segment / startup self-attestation の `role` | `evaluate_attestation(expected_role=...)`、live 行の provider 解決 |
+
+- `operator_startup_gate_producer` は pin を **provider で選び**、`runtime_role` に pin の **slot label** を格納する。
+- `operator_startup_resume_target` は `runtime_role` を `stable_identity` 照合に使い、**self-attestation の
+  `expected_role` には `provider_id` を渡す**（attestation が記録するのは herdr identity role = provider のため）。
+  ここに `runtime_role` を渡すと canonical pin は必ず `ATTEST_CONFLICT` になり、健全な lane が resume 不能になる。
+- live 行は slot label を持たない。declared pin の `role` は **宣言の属性であって live の観測値ではない**。
 
 ### schema version / migration
 
