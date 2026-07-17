@@ -43,8 +43,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_OWNER_PENDING,
     BLOCK_PENDING_PROMPT,
     BLOCK_REVIEW_PENDING,
+    BLOCK_UNPUSHED_COMMITS,
     BLOCK_UNRECORDED_BOUNDARY,
     BLOCK_WORKING,
+    PARK_BASIS_DEPENDENCY,
+    PARK_BASIS_EARLY_HIBERNATE,
     HibernateAssertions,
     HibernateRequest,
     LiveSublaneHibernateOps,
@@ -578,6 +581,115 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
             ):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
+
+
+def _early_gates(**overrides) -> HibernateAssertions:
+    """Every early-hibernate precondition + safety gate satisfied unless overridden.
+
+    Redmine #13967 item 1: the early-hibernate basis (review approved + staging integrated
+    + CI green + dogfood delegated + commits pushed) with `explicitly_parked=False`. The
+    generic safety gates are all satisfied too (review approved => no review owed;
+    integrated => no integration pending).
+    """
+    base = dict(
+        explicitly_parked=False,
+        callbacks_drained=True,
+        no_review_pending=True,
+        no_owner_approval_pending=True,
+        no_integration_pending=True,
+        no_pending_prompt=True,
+        not_working=True,
+        worktree_clean=True,
+        boundary_recorded=False,
+        review_approved=True,
+        staging_integrated=True,
+        required_ci_green=True,
+        dogfood_delegated=True,
+        commits_pushed=True,
+    )
+    base.update(overrides)
+    return HibernateAssertions(**base)
+
+
+class SublaneEarlyHibernateTest(unittest.TestCase):
+    """Early hibernate (Redmine #13967 item 1): the alternative affirmative park basis."""
+
+    def _store(self, tmp) -> LaneLifecycleStore:
+        return LaneLifecycleStore(home=Path(tmp))
+
+    def _declare(self, store) -> None:
+        store.declare_active(
+            LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+        )
+
+    def _live_ops(self, **kw) -> _FakeOps:
+        rows = [
+            _row("codex", LANE, f"{WS}:p2"),
+            _row("claude", LANE, f"{WS}:p3"),
+        ]
+        return _FakeOps(rows=rows, **kw)
+
+    def test_early_hibernate_happy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(assertions=_early_gates()), execute=True
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.transition.applied)
+            self.assertEqual(outcome.preflight.park_basis, PARK_BASIS_EARLY_HIBERNATE)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
+
+    def test_early_hibernate_blocks_on_unpushed_commits(self) -> None:
+        # The anchor's explicit unpushed fence: an early hibernate presupposes integrated,
+        # pushed work, so unpushed fails closed (unlike a dependency park).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(assertions=_early_gates(commits_pushed=False)), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_UNPUSHED_COMMITS, outcome.preflight.blocked_reasons)
+            # Not qualified => also not parked (no dependency park either).
+            self.assertIn(BLOCK_NOT_PARKED, outcome.preflight.blocked_reasons)
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_partial_early_basis_blocks_not_parked(self) -> None:
+        # review approved but not integrated / dogfood-delegated: no affirmative basis.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(
+                    assertions=_early_gates(
+                        staging_integrated=False, dogfood_delegated=False
+                    )
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_NOT_PARKED, outcome.preflight.blocked_reasons)
+
+    def test_dependency_park_basis_unaffected(self) -> None:
+        # A dependency park (explicitly_parked=True) with no early flags still hibernates,
+        # and does NOT require commits_pushed (it preserves unpublished commits).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(assertions=_all_gates()), execute=True
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertEqual(outcome.preflight.park_basis, PARK_BASIS_DEPENDENCY)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,17 @@ retire_三義:
             spec-route-identity-ledger (stale pane id ではなく route identity で再解決),
             spec-delegated-coordinator-decision-records (callback target schema)
 
+[4b] hibernate / resume  issue が open のまま lane の常駐 process だけを非破壊的に畳む
+                         (worktree/branch/未push commit/lane metadata/callback route は保存)。
+                         retire ではない (retire は issue closed 前提)。逆遷移は resume。
+      正本: logic-coordinator-sublane-development-flow (Early hibernate ... 節: park basis /
+            drain-queue process retention / dogfood 委譲),
+            skill references/workflow.md `## Sublane hibernate (プロセス解放) と early hibernate`
+      park basis: dependency (依存 wait で park) | early_hibernate (Redmine #13967: review
+            approved + staging integration + CI green + dogfood/close を専用 release issue へ委譲)。
+      注: hibernate は close / dogfood 成功 / owner approval へ読み替えない。safety gate
+          (pending review/callback/integration/work/prompt・dirty/unpushed・identity 不明) は fail-closed。
+
 [5] retire               lane を退役する (pane/worktree/branch)。owner 確認なしに退役してよい条件は所有 doc。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),
             logic-coordinator-sublane-development-flow (retirement drain),
