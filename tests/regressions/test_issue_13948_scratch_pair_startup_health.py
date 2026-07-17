@@ -1688,6 +1688,66 @@ class SessionRollbackRailTest(unittest.TestCase):
         self.assertFalse(ops.close_calls, "re-closed a pane after a concurrent completion")
         self.assertEqual(verdict.reason, REASON_ALREADY_ROLLED_BACK)
 
+    def test_a_participant_added_between_read_and_lock_is_not_closed(self):
+        # Review j#81244 R8-F1: R7 closed the terminal-change race but not the participant-
+        # change one. A concurrent record_participant adds a role between the pre-lock read
+        # and the lock; the under-lock snapshot differs from what the operator's command was
+        # scoped to, so it must refuse — never close a pane added after the operator ran.
+        from unittest.mock import patch as _patch
+
+        action = self._owed_action(roles=("claude",))  # unit is claude+codex; only claude owed
+        ops = _RollbackOps(self._rows("claude", "codex"))
+        real_read = StartupTransactionFence.read
+        calls = {"n": 0}
+
+        def _add_codex_between_read_and_lock(fence_self, aid):
+            calls["n"] += 1
+            result = real_read(fence_self, aid)
+            if calls["n"] == 1:  # after the pre-lock read, a concurrent launch records codex
+                StartupTransactionFence.read = real_read
+                try:
+                    StartupTransactionFence(path=fence_self.path).record_participant(
+                        aid,
+                        Participant(
+                            role="codex",
+                            assigned_name="mzb1_ws1_codex_lane-1",
+                            locator="w2G:p4",
+                        ),
+                    )
+                finally:
+                    StartupTransactionFence.read = _add_codex_between_read_and_lock
+            return result
+
+        with _patch.object(StartupTransactionFence, "read", _add_codex_between_read_and_lock):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_BLOCKED)
+        self.assertFalse(ops.close_calls, "closed a participant added after the operator ran")
+
+    def test_an_action_deleted_between_read_and_lock_closes_nothing(self):
+        # Review j#81244 R8-F1: the action vanishing between the pre-lock read and the lock
+        # is a change too — the under-lock read finds nothing, so it refuses.
+        from unittest.mock import patch as _patch
+        import sqlite3
+
+        action = self._owed_action(roles=("claude",))
+        ops = _RollbackOps(self._rows("claude"))
+        real_read = StartupTransactionFence.read
+        calls = {"n": 0}
+
+        def _delete_between_read_and_lock(fence_self, aid):
+            calls["n"] += 1
+            result = real_read(fence_self, aid)
+            if calls["n"] == 1:
+                conn = sqlite3.connect(fence_self.path, isolation_level=None)
+                conn.execute("DELETE FROM startup_actions WHERE action_id=?", (aid,))
+                conn.close()
+            return result
+
+        with _patch.object(StartupTransactionFence, "read", _delete_between_read_and_lock):
+            verdict = self._run(ops, action, execute=True)
+        self.assertEqual(verdict.reason, REASON_ACTION_UNKNOWN)
+        self.assertFalse(ops.close_calls)
+
     def test_a_runtime_or_composer_port_exception_is_zero_close_not_raw(self):
         # Review j#81224 R7-F4: the live-state ports are herdr CLI calls that can raise. An
         # exception is an unreadable live state, not "idle with an empty composer" — it

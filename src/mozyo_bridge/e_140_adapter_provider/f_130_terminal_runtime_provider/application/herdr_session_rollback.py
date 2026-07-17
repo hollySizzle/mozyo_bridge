@@ -285,9 +285,16 @@ def run_session_rollback(
                 "panes an action did not record as owed"
             ),
         )
+    # The snapshot the operator's command is scoped to, captured BEFORE the lock. The
+    # under-lock re-read must match this exactly (review j#81244 R8-F1): a concurrent
+    # `record_participant` between this read and the lock would otherwise let the same
+    # command close a participant added after the operator decided to run it.
+    pre_lock = _action_fingerprint(action)
     try:
         with fence._hold():
-            return _rollback_locked(action_id, action, ops, fence, execute=execute)
+            return _rollback_locked(
+                action_id, pre_lock, ops, fence, execute=execute
+            )
     except StartupTransactionBusy as exc:
         return SessionRollbackVerdict(
             action_id=action_id, state="blocked", reason=REASON_BUSY, detail=str(exc)
@@ -358,13 +365,27 @@ def _observe(action, ops: StartupRollbackOps) -> tuple[list, bool]:
     return verdicts, inventory_readable
 
 
-def _rollback_locked(action_id, action, ops, fence, *, execute: bool):
+def _action_fingerprint(action) -> tuple:
+    """The identity a rollback is scoped to: phase, revision, and each participant's
+    role/name/locator/closed. Two reads with the same fingerprint saw the same action;
+    any difference is a concurrent change the operator's command must not act through
+    (review j#81244 R8-F1)."""
+    return (
+        action.phase,
+        action.revision,
+        tuple(
+            (p.role, p.assigned_name, p.locator, p.closed)
+            for p in action.participants
+        ),
+    )
+
+
+def _rollback_locked(action_id, pre_lock, ops, fence, *, execute: bool):
     # Re-read the action FRESH under the lock and act only on this snapshot (review j#81224
     # R7-F1). The pre-lock read outside is a fast-path preflight; a concurrent holder can
     # terminalize the action, change its participants, or delete it between that read and
     # the lock, and closing panes on the stale object would re-close a settled authority
-    # (the TOCTOU the nonblocking lock exists to prevent). Everything below decides from
-    # `action`, the under-lock snapshot — never the caller's stale one.
+    # or a newly-added one (the TOCTOU the nonblocking lock exists to prevent).
     action = fence.read(action_id)
     if action is None:
         return SessionRollbackVerdict(
@@ -388,6 +409,23 @@ def _rollback_locked(action_id, action, ops, fence, *, execute: bool):
             detail=(
                 f"under the lock this action is {action.phase!r}: it owes no rollback. "
                 "Refusing to close panes an action did not record as owed"
+            ),
+        )
+    # The under-lock snapshot must match what the operator's command was scoped to (review
+    # j#81244 R8-F1). A concurrent `record_participant` that added a role between the
+    # pre-lock read and this one changes the revision and participant set; closing the new
+    # participant would destroy a pane added after the operator decided to run — so any
+    # divergence is a structured refusal, and the operator re-preflights against the new
+    # shape. (A phase-only change is already handled by the checks above.)
+    if _action_fingerprint(action) != pre_lock:
+        return SessionRollbackVerdict(
+            action_id=action_id,
+            state="blocked",
+            reason=REASON_BLOCKED,
+            detail=(
+                "this action changed between the read and the lock (a concurrent launch "
+                "recorded or a state moved); nothing was closed. Re-run to preflight the "
+                "current shape."
             ),
         )
     verdicts, inventory_readable = _observe(action, ops)
