@@ -31,7 +31,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 #: Close it: this action started it, the world still agrees, and nothing is owed to it.
+#: This verdict — and ONLY this one — names a live pane to close.
 ROLLBACK_ELIGIBLE = "eligible"
+#: Positively absent: the durable name is not in the live inventory at all. Settled, so a
+#: partial rollback resumes past it — but NOT a close target (review j#81070 R1-F2).
+#: Collapsing this into `eligible` made the rail hand the RECORDED locator to close, and a
+#: foreign agent that had since taken that pane id was closed instead. Absence is a reason
+#: to do nothing, never a reason to close an address.
+ROLLBACK_ABSENT = "absent"
 #: The record and the live world disagree about identity: not ours, or not ours any more.
 ROLLBACK_IDENTITY_DRIFT = "identity_drift"
 #: More than one live agent answers to the durable name. Never resolved by guessing.
@@ -51,9 +58,21 @@ ROLLBACK_INVENTORY_UNREADABLE = "inventory_unreadable"
 #: Already proven closed by this same action. Replay is answered from the record.
 ROLLBACK_ALREADY_CLOSED = "already_closed"
 
+#: Verdicts that name a live pane this rollback may close. Exactly one, on purpose: a
+#: caller asking "is this a target?" must not be able to answer it from "is this settled?".
+ROLLBACK_CLOSE_TARGETS: frozenset[str] = frozenset({ROLLBACK_ELIGIBLE})
+
+#: Verdicts that need no further action from this rollback (closed, or never there). A
+#: settled participant does NOT block the run — blocking on one is how an interrupted
+#: rollback becomes permanently stuck (#13847 R1-F1).
+ROLLBACK_SETTLED: frozenset[str] = frozenset(
+    {ROLLBACK_ELIGIBLE, ROLLBACK_ABSENT, ROLLBACK_ALREADY_CLOSED}
+)
+
 ROLLBACK_VERDICTS: frozenset[str] = frozenset(
     {
         ROLLBACK_ELIGIBLE,
+        ROLLBACK_ABSENT,
         ROLLBACK_IDENTITY_DRIFT,
         ROLLBACK_AMBIGUOUS,
         ROLLBACK_WORK_OBLIGATION,
@@ -79,6 +98,11 @@ ROLLBACK_DETAIL: dict[str, str] = {
     ROLLBACK_ELIGIBLE: (
         "this action started this exact pane, the live inventory still agrees, and "
         "nothing is owed to it"
+    ),
+    ROLLBACK_ABSENT: (
+        "this participant's durable name is not in the live inventory: it is already "
+        "gone, so there is nothing to close (the recorded locator is an address, not a "
+        "claim on whoever holds it now)"
     ),
     ROLLBACK_IDENTITY_DRIFT: (
         "the live slot is not the one this action started (name / locator / role no "
@@ -170,10 +194,12 @@ def classify_rollback(facts: ParticipantFacts) -> str:
         return ROLLBACK_AMBIGUOUS
     if facts.name_matches < 1:
         # Positively absent: a prior run of this same rollback closed it, or it never came
-        # up. Either way there is nothing to close and the participant is settled — this
-        # is what makes an interrupted rollback resumable rather than permanently stuck
-        # (#13847 R1-F1 / #13892's partial-close discipline).
-        return ROLLBACK_ELIGIBLE
+        # up. Either way the participant is settled, which is what makes an interrupted
+        # rollback resumable rather than permanently stuck (#13847 R1-F1 / #13892's
+        # partial-close discipline) — but it is NOT a close target. The recorded locator
+        # is an address we once launched at, not a claim on whoever holds it now
+        # (review j#81070 R1-F2: a foreign agent on that pane id was closed).
+        return ROLLBACK_ABSENT
     recorded = (facts.recorded_locator or "").strip()
     live = (facts.live_locator or "").strip()
     if not recorded or not live or recorded != live:
@@ -200,6 +226,9 @@ def classify_rollback(facts: ParticipantFacts) -> str:
 
 __all__ = (
     "COMPOSER_EMPTY",
+    "ROLLBACK_ABSENT",
+    "ROLLBACK_CLOSE_TARGETS",
+    "ROLLBACK_SETTLED",
     "COMPOSER_PENDING",
     "COMPOSER_STARTUP_BLOCKER",
     "COMPOSER_UNREADABLE",

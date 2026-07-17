@@ -343,17 +343,63 @@ class StartupTransactionFence:
         os.replace(temp, self.path)
         self.seal_path.write_text(nonce, encoding="utf-8")
 
+    def _read_seal_nonce(self) -> Optional[str]:
+        """The seal's nonce, or ``None`` when it cannot be read as one.
+
+        ``ValueError`` is caught alongside ``OSError`` deliberately: a seal holding
+        non-UTF-8 bytes raises ``UnicodeDecodeError``, which is a ``ValueError`` and would
+        otherwise escape an ``OSError``-only guard.
+        """
+        try:
+            value = self.seal_path.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return None
+        return value or None
+
+    @staticmethod
+    def _db_nonce(conn: sqlite3.Connection) -> Optional[str]:
+        try:
+            row = conn.execute(
+                "SELECT value FROM store_meta WHERE key = ?", (_STORE_NONCE_KEY,)
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        return str(row[0]) if row is not None else None
+
     def _connect(self) -> sqlite3.Connection:
+        """Open the store and prove it is the one its seal names (fail-closed).
+
+        The schema check alone is not an identity check (review j#81070 R1-F7): a store
+        swapped for another valid-schema store passed it, and this authority then answered
+        for actions it never recorded. The seal/DB nonce join is what the borrowed
+        precedent (`scratch_retirement_fence._verify_identity`) uses for exactly that, and
+        omitting it was a hole in the pattern, not a simplification of it.
+        """
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.execute("PRAGMA busy_timeout = 2000")
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if int(version) != STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION:
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if int(version) != STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION:
+                raise StartupTransactionError(
+                    f"startup transaction store schema {version!r} is not this runtime's "
+                    f"{STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}; fail closed rather than "
+                    "read an unknown shape"
+                )
+            seal = self._read_seal_nonce()
+            if seal is None:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} has no readable "
+                    "identity seal; the actions it holds cannot be trusted"
+                )
+            if self._db_nonce(conn) != seal:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} does not match its "
+                    "identity seal (store replacement); fail closed rather than close "
+                    "panes on the strength of another store's record"
+                )
+        except StartupTransactionError:
             conn.close()
-            raise StartupTransactionError(
-                f"startup transaction store schema {version!r} is not this runtime's "
-                f"{STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}; fail closed rather than "
-                "read an unknown shape"
-            )
+            raise
         return conn
 
     def _hold(self):

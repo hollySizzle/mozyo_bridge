@@ -46,6 +46,11 @@ def _render_text(result: SessionStartResult) -> str:
     ]
     if result.herdr_tab_id:
         lines[0] += f" tab={result.herdr_tab_id}"
+    if result.action_id:
+        # The immutable identity of this run. It is the ONLY handle `session-rollback`
+        # accepts, so it is surfaced on every run that has one — not only on failures,
+        # because an operator reading back a terminal cannot re-derive it.
+        lines[0] += f" action={result.action_id}"
     for slot in result.slots:
         line = (
             f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
@@ -78,16 +83,24 @@ def _render_text(result: SessionStartResult) -> str:
         )
         lines.append(f"tab root pane {result.tab_pane_id}: {state}")
     if not result.ok:
-        # Name the next action. A partial pair used to be silent (exit 0), which is how
-        # #13882 j#80951 spent a dogfood cycle discovering it from a follow-up dry-run.
+        # Name the next action AND hand over the handle it needs. The text used to say
+        # "converge it with the rollback rail" without ever printing the action id that
+        # rail requires (review j#81070 R1-F6) — the operator doc and the rollback help
+        # both promised this line existed, and it did not. A recovery pointer that omits
+        # the one argument of the recovery command is not a pointer.
         lines.append(
             "session-start did NOT fully succeed: at least one requested role is not "
             "live-and-attested (see health above). This run closed nothing."
         )
-        if any(s.compensation != COMPENSATION_NOT_NEEDED for s in result.slots):
+        if result.action_id and any(
+            s.compensation != COMPENSATION_NOT_NEEDED for s in result.slots
+        ):
             lines.append(
-                "  a fresh launch of this run is owed a rollback: converge it with the "
-                "explicit public rollback rail, not by hand."
+                f"  a fresh launch of this run is owed a rollback. Converge it with the "
+                f"explicit public rail (read-only unless --execute):"
+            )
+            lines.append(
+                f"    mozyo-bridge herdr session-rollback --action-id {result.action_id}"
             )
     return "\n".join(lines)
 
