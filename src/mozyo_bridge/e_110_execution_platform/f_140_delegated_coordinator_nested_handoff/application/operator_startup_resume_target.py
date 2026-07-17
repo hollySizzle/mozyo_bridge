@@ -11,14 +11,20 @@ observation to the orchestrator -> zero-send) unless every check passes:
    generation gate; a recycled lane bumps ``lane_generation`` and fails closed);
 2. the repo's action-time provider binding still resolves the workflow ``target_role`` to the
    gate's pinned ``provider_id`` slot (a binding drift / unbound role fails closed), and exactly
-   one declared pin has the gate's runtime identity ``(runtime_role, provider_id,
-   assigned_name)`` ``stable_identity`` — the pin's ``role`` is the runtime role, NOT the
-   workflow role (Design Answer j#79405 §A);
+   one declared pin has the gate's declared identity ``(runtime_role, provider_id,
+   assigned_name)`` ``stable_identity`` — the pin's ``role`` is NOT the workflow role (Design
+   Answer j#79405 §A); since Redmine #13920 it is the declared **slot label** (``gateway`` /
+   ``worker``, owned by ``core.state.lane_pin_role``), matched here against the very pin the
+   gate was produced from, so both sides speak one vocabulary;
 3. exactly one live inventory row carries that ``assigned_name``, and its live locator
    equals the declared pin's ``locator`` (the ``ProcessGenerationPin`` live-generation
    discriminant) — missing / duplicate / foreign / recycled fail closed;
 4. the herdr identity self-attestation for that live locator is ``ok`` for the gate's
-   workspace / ``runtime_role`` / lane.
+   workspace / ``provider_id`` / lane. The attestation's role axis is the **herdr identity
+   role**, which is the PROVIDER token — a different vocabulary from the slot label in step 2,
+   so ``provider_id`` is what it is checked against, never ``runtime_role`` (Redmine #13920:
+   the two coincided only while pins were spelled in the legacy provider vocabulary, and
+   feeding ``runtime_role`` here joins ATTEST_CONFLICT on every canonical pin).
 
 Only then does it bind the #13760 visible read to the live locator and return the live
 :class:`GateTarget` (the gate's pinned identity with ``agent_generation = lane_generation``,
