@@ -157,10 +157,13 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
 def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
     """``(lanes, complete)``. ``complete`` is False when any row was malformed (an invalid
     row is NOT silently dropped — it makes the snapshot durable-incomplete so the retention
-    verdict fails closed to hold, Redmine #13967 R2-F2), OR when the same ``(issue, lane)``
-    identity appears twice: a snapshot is an already-composed active lane set, so a duplicated
-    identity is contradictory input and must hold, matching the glance path's one-lane-one-
-    bucket invariant so identity enforcement is uniform across sources (R10-F4)."""
+    verdict fails closed to hold, Redmine #13967 R2-F2), when the same ``(issue, lane)``
+    identity appears twice (R10-F4), OR when the same ISSUE appears in two rows even with
+    different lanes: a snapshot is an already-composed ACTIVE lane set, and the canonical drain
+    roster holds at most one active lane per issue (the lifecycle model), so two active rows for
+    one issue is contradictory / ambiguous ownership and must hold — the same active-issue
+    uniqueness the ``--from-glance`` (R9-F2) and default-live (R12-F1) paths enforce, keeping
+    identity enforcement symmetric across all three sources (R13-F1)."""
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -172,6 +175,7 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         return (), False
     lanes: list[DrainLane] = []
     seen: set[tuple[str, str]] = set()
+    seen_issues: set[str] = set()
     complete = True
     for raw in entries:
         lane = _lane_from_mapping(raw)
@@ -183,7 +187,12 @@ def _lanes_from_snapshot(path: str) -> tuple[tuple[DrainLane, ...], bool]:
             # A duplicated (issue, lane) identity is contradictory composed input -> hold
             # (Redmine #13967 R10-F4), never silently double-counted.
             complete = False
+        if lane.issue in seen_issues:
+            # Two active rows for the same ISSUE (even with different lanes) is ambiguous active
+            # ownership -> hold (Redmine #13967 R13-F1), symmetric with from-glance / live.
+            complete = False
         seen.add(key)
+        seen_issues.add(lane.issue)
         lanes.append(lane)
     return tuple(lanes), complete
 
@@ -470,8 +479,14 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
     marks the projection degraded -> hold rather than laundering it into a release bucket
     (R12-F1):
 
+    - active roster issue REQUIRED non-empty (an empty active issue is unattributable);
     - active roster issue uniqueness (the canonical active roster is one row per issue);
     - active roster ``(issue, lane)`` uniqueness;
+    - lifecycle-diagnostic issue AND lane REQUIRED non-empty — the ``--from-glance`` reader
+      rejects an empty diagnostic issue/lane (``required=True``); a real unbound lane
+      (``LaneLifecycleStore.declare_active(issue_id="")``) surfaces in the diagnostic with an
+      empty issue, and must NOT become a healthy ``release_dogfood`` row here (Redmine
+      #13967 R13-F2), so it is held rather than silently attributed;
     - lifecycle-diagnostic ``(issue, lane)`` uniqueness;
     - active / diagnostic identity disjointness (a lane is active XOR non-active, never both).
     """
@@ -482,6 +497,7 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
         issue = str(issue_raw or "").strip()
         lane = str(lane_raw or "").strip()
         if not issue:
+            notes.append(f"active roster: row with empty issue identity (lane {lane!r})")
             continue
         if issue in active_issues:
             notes.append(f"active roster: duplicate active issue {issue}")
@@ -494,6 +510,13 @@ def _live_identity_notes(roster, diagnostic) -> list[str]:
     for entry in diagnostic:
         issue = str(entry[0] or "").strip()
         lane = str(entry[1] or "").strip()
+        if not issue or not lane:
+            # An empty diagnostic issue/lane is an unattributable release/lifecycle row — the
+            # from-glance reader rejects it, so the live path holds too (Redmine #13967 R13-F2).
+            notes.append(
+                f"lifecycle diagnostic: row with empty identity ({issue!r}/{lane!r})"
+            )
+            continue
         key = (issue, lane)
         if key in diag_keys:
             notes.append(f"lifecycle diagnostic: duplicate identity {issue}/{lane}")
@@ -583,7 +606,11 @@ def _lanes_live(repo_root: Path) -> tuple[tuple[DrainLane, ...], bool, tuple[str
     release_rows = [
         (issue, lane)
         for issue, lane, _disposition, process_release in diagnostic
+        # An empty issue/lane never becomes a phantom release_dogfood lane (Redmine #13967
+        # R13-F2); it is already reported as a durable-incomplete identity error above.
         if process_release in _RELEASE_PENDING
+        and str(issue or "").strip()
+        and str(lane or "").strip()
     ]
     return _merge_release_pending(active, release_rows), degraded, tuple(notes)
 

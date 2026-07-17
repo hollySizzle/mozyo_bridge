@@ -722,7 +722,7 @@ class CliTests(unittest.TestCase):
     def test_snapshot_duplicate_identity_holds(self):
         # Redmine #13967 R10-F4: a snapshot is an already-composed active lane set, so the same
         # (issue, lane) twice is contradictory input -> hold (durable-incomplete), matching the
-        # glance path's one-lane-one-bucket invariant. Distinct lanes are fine.
+        # glance path's one-lane-one-bucket invariant.
         row = {"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE}
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "s.json"
@@ -730,7 +730,24 @@ class CliTests(unittest.TestCase):
             payload = self._run(snapshot_json=str(path))
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertFalse(payload["durable_complete"])
-        # distinct (issue, lane) identities are complete/releasable
+        # distinct ISSUES are complete/releasable
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [
+                    {"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE},
+                    {"issue": "8", "lane": "l2", "state_class": LANE_STATE_IDLE},
+                ]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+
+    def test_snapshot_active_issue_uniqueness_holds(self):
+        # Redmine #13967 R13-F1: two active rows for the SAME issue (even with different lanes)
+        # is ambiguous active ownership -> hold, symmetric with from-glance (R9-F2) and
+        # default-live (R12-F1). The canonical drain roster is one active lane per issue.
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "s.json"
             path.write_text(
@@ -741,8 +758,8 @@ class CliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             payload = self._run(snapshot_json=str(path))
-        self.assertTrue(payload["durable_complete"])
-        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
 
     def test_live_path_joins_delivery_ledger_for_anomaly_hold(self):
         # Redmine #13967 R10-F2: the default live path must join the SAME home-scoped delivery
@@ -824,6 +841,16 @@ class CliTests(unittest.TestCase):
         self.assertTrue(  # active/diagnostic collision
             _live_identity_notes((("9", "la"),), (("9", "la", "hibernated", "requested"),))
         )
+        # Redmine #13967 R13-F2: an empty active issue, or an empty diagnostic issue/lane (a
+        # real unbound lane), is an unattributable identity -> flagged (-> degraded -> hold),
+        # symmetric with the from-glance reader's required non-empty identity.
+        self.assertTrue(_live_identity_notes((("", "la"),), ()))  # empty active issue
+        self.assertTrue(  # empty diagnostic issue (unbound lane)
+            _live_identity_notes((("9", "la"),), (("", "unbound-lane", "hibernated", "requested"),))
+        )
+        self.assertTrue(  # empty diagnostic lane
+            _live_identity_notes((("9", "la"),), (("8", "", "retired", "requested"),))
+        )
 
     def test_live_path_identity_contradiction_holds_with_durable_facts(self):
         # Redmine #13967 R12-F1: with durable facts present (so the fold is NOT degraded on its
@@ -859,6 +886,75 @@ class CliTests(unittest.TestCase):
         payload = run((("9", "la"),), (("8", "lb", "retired", "released"),))
         self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
         self.assertTrue(payload["durable_complete"])
+
+    def test_live_path_holds_on_real_empty_issue_diagnostic(self):
+        # Redmine #13967 R13-F2: a REAL unbound lane (LaneLifecycleStore.declare_active with
+        # issue_id="") surfaces in the real enumerate_lifecycle_diagnostic with an EMPTY issue.
+        # The default-live drain path must hold on it (never launder it into a healthy
+        # release_dogfood row), symmetric with the from-glance reader's required-identity
+        # contract. Part 1 captures the genuine producer tuple; part 2 drives it through
+        # _lanes_live with durable facts present so only the empty identity can hold it.
+        import os
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DISPOSITION_ACTIVE,
+            DISPOSITION_HIBERNATED,
+            DecisionPointer,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (
+            enumerate_lifecycle_diagnostic,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (
+            herdr_session_start as hss,
+        )
+
+        ws = "wProj"
+        dec = lambda j: DecisionPointer(source="redmine", issue_id="13583", journal_id=j)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = LaneLifecycleStore(home=home)
+            key = LaneLifecycleKey(ws, "unbound-lane")
+            # A legitimate unbound lane: the lane owns no issue (issue_id=""), the decision is
+            # a real anchor. Hibernate it so it lands on the (non-active) diagnostic roster.
+            self.assertTrue(store.declare_active(key, decision=dec("1"), issue_id="").applied)
+            self.assertTrue(
+                store.transition_disposition(
+                    key,
+                    expected_disposition=DISPOSITION_ACTIVE,
+                    expected_revision=1,
+                    target=DISPOSITION_HIBERNATED,
+                    decision=dec("2"),
+                ).applied
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                    patch.object(hss, "herdr_workspace_segment", return_value=ws):
+                real_diag, err = enumerate_lifecycle_diagnostic(Path("."))
+            self.assertIsNone(err)
+            # The real producer emitted an EMPTY-issue diagnostic row.
+            self.assertTrue(any(str(d[0] or "") == "" for d in real_diag), real_diag)
+
+        # Part 2: drive the genuine real_diag through _lanes_live with a healthy active lane
+        # whose durable facts ARE present (so it is not degraded on its own) -> must still hold.
+        mod = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+        gss = mod + ".application.glance_snapshot_source"
+        drain = mod + ".application.cli_workflow_drain"
+        wrs = "mozyo_bridge.core.state.workflow_runtime_store"
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "rt.json"
+            WorkflowRuntimeStore(path=p).append_events(
+                [{"event_id": "e", "issue": "9", "gate": "progress"}]
+            )
+            with mock.patch(gss + ".enumerate_active_lanes", return_value=((("9", "la"),), None)), \
+                    mock.patch(gss + ".enumerate_lifecycle_diagnostic", return_value=(real_diag, None)), \
+                    mock.patch(drain + "._delivery_ledger", return_value=None), \
+                    mock.patch(wrs + ".workflow_runtime_store_path", return_value=p):
+                payload = self._run(repo=td)
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
 
     def test_present_null_is_malformed_not_absent(self):
         # Redmine #13967 R5-F1: an explicit JSON null is a present non-string value (malformed
