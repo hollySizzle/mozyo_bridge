@@ -603,6 +603,112 @@ class StartupTransactionFenceTest(unittest.TestCase):
                 self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
                 self.assertFalse(ops.close_calls)
 
+    def test_relational_row_invariants_are_enforced_on_read(self):
+        # Review j#81224 R7-F2: per-field validity is not enough. A participant role must be
+        # in the requested provider set, roles unique, revision >= 1 — a codex participant
+        # in a claude-only unit is each field valid yet a role the action never started.
+        import sqlite3
+
+        def _store(participants, providers="claude", revision=1):
+            home = Path(self._tmp.name) / f"rel_{len(list(Path(self._tmp.name).iterdir()))}"
+            home.mkdir()
+            fence = StartupTransactionFence(home=home)
+            conn = sqlite3.connect(fence.path, isolation_level=None)
+            conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value)")
+            conn.execute("INSERT INTO store_meta VALUES ('store_nonce', 'nn')")
+            conn.execute(
+                "CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, workspace_id "
+                "TEXT, lane_id TEXT, providers TEXT, phase TEXT, revision, participants "
+                "TEXT, reserved_at TEXT, updated_at TEXT)"
+            )
+            aid = startup_action_id(self.unit, "n1")
+            conn.execute(
+                "INSERT INTO startup_actions VALUES (?,?,?,?,?,?,?,?,?)",
+                (aid, "ws1", "lane-1", providers, PHASE_ROLLBACK_OWED, revision,
+                 participants, "t", "t"),
+            )
+            conn.execute(f"PRAGMA user_version={STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+            conn.close()
+            fence.seal_path.write_text("nn", encoding="utf-8")
+            return fence, aid
+
+        # self.unit is claude+codex; use a claude-only providers cell for the foreign case
+        cases = {
+            "foreign_role": ('[{"role":"codex","assigned_name":"n","locator":"w1:p4","receipt":"","closed":false}]', "claude", 1),
+            "duplicate_role": ('[{"role":"claude","assigned_name":"n","locator":"w1:p1","receipt":"","closed":false},{"role":"claude","assigned_name":"n","locator":"w1:p2","receipt":"","closed":false}]', "claude", 1),
+            "revision_zero": ('[]', "claude", 0),
+            "revision_negative": ('[]', "claude", -1),
+        }
+        for label, (participants, providers, revision) in cases.items():
+            with self.subTest(shape=label):
+                fence, aid = _store(participants, providers=providers, revision=revision)
+                with self.assertRaises(StartupTransactionError):
+                    fence.read(aid)
+                ops = _RollbackOps([])
+                verdict = run_session_rollback(
+                    action_id=aid, ops=ops, fence=fence, execute=True
+                )
+                self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+                self.assertFalse(ops.close_calls)
+
+    def test_record_participant_rejects_a_role_outside_the_requested_set(self):
+        # Review j#81224 R7-F2 write side: the invariant is enforced at record time too, so
+        # a foreign role never lands via the normal API.
+        fence = StartupTransactionFence(home=Path(self._tmp.name) / "rel_write")
+        action = fence.reserve(
+            StartupUnit(workspace_id="ws1", lane_id="lane-1", providers=("claude",)), "n1"
+        )
+        with self.assertRaises(StartupTransactionError):
+            fence.record_participant(
+                action.action_id,
+                Participant(role="codex", assigned_name="n", locator="w1:p4"),
+            )
+
+    def test_a_whitespace_seal_never_matches_a_clean_nonce(self):
+        # Review j#81224 R7-F3: the seal is one half of the identity compare; stripping it
+        # let a whitespace-wrapped seal match a clean stored nonce. R6 fixed only the DB
+        # side of the same coercion.
+        import sqlite3
+
+        home = Path(self._tmp.name) / "ws_seal"
+        home.mkdir()
+        fence = StartupTransactionFence(home=home)
+        conn = sqlite3.connect(fence.path, isolation_level=None)
+        conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value)")
+        conn.execute("INSERT INTO store_meta VALUES ('store_nonce', 'nn')")
+        conn.execute(
+            "CREATE TABLE startup_actions (action_id TEXT PRIMARY KEY, workspace_id TEXT, "
+            "lane_id TEXT, providers TEXT, phase TEXT, revision, participants TEXT, "
+            "reserved_at TEXT, updated_at TEXT)"
+        )
+        aid = startup_action_id(self.unit, "n1")
+        conn.execute(
+            "INSERT INTO startup_actions VALUES (?,?,?,?,?,?,?,?,?)",
+            (aid, "ws1", "lane-1", "claude,codex", PHASE_ROLLBACK_OWED, 1, "[]", "t", "t"),
+        )
+        conn.execute(f"PRAGMA user_version={STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}")
+        conn.close()
+        fence.seal_path.write_text(" nn ", encoding="utf-8")  # whitespace-wrapped
+        with self.assertRaises(StartupTransactionError):
+            fence.read(aid)
+
+    def test_a_non_directory_root_is_unreadable_not_absent(self):
+        # Review j#81224 R7-F3: os.lstat NotADirectoryError (a path component is a file) is
+        # unreadable, not genuine absence. A rollback against it must be
+        # authority_unavailable, not action_unknown.
+        parent = Path(self._tmp.name) / "a_file"
+        parent.write_text("x", encoding="utf-8")
+        fence = StartupTransactionFence(home=parent / "under_a_file")
+        ops = _RollbackOps([])
+        verdict = run_session_rollback(
+            action_id=startup_action_id(self.unit, "n1"),
+            ops=ops,
+            fence=fence,
+            execute=True,
+        )
+        self.assertEqual(verdict.reason, REASON_AUTHORITY_UNAVAILABLE)
+        self.assertFalse(ops.close_calls)
+
     def test_a_blob_nonce_never_coerces_into_an_identity_match(self):
         # Review j#81202 R6-F3.2: str(b"abc") == "b'abc'", so a BLOB DB nonce compared to a
         # seal literally holding b'abc' used to MATCH. The nonce is text or the authority
@@ -1064,9 +1170,9 @@ class SessionRollbackRailTest(unittest.TestCase):
             workspace_id="ws1", lane_id="lane-1", providers=("claude", "codex")
         )
 
-    def _owed_action(self, *, roles=("claude", "codex")):
+    def _owed_action(self, *, roles=("claude", "codex"), nonce="n1"):
         """A run that started `roles` and did not come up: the #13882 partial pair."""
-        action = self.fence.reserve(self.unit, "n1")
+        action = self.fence.reserve(self.unit, nonce)
         for index, role in enumerate(roles):
             self.fence.record_participant(
                 action.action_id,
@@ -1551,6 +1657,77 @@ class SessionRollbackRailTest(unittest.TestCase):
         )
         self.assertTrue(verdict.ok)
         self.assertEqual({r for r, _ in ops.close_calls[0]}, {"codex"})
+
+    def test_a_concurrent_terminalization_is_not_re_closed(self):
+        # Review j#81224 R7-F1: the rail read the action before the lock; a concurrent
+        # holder terminalized it between the read and the lock body, and the pane was
+        # re-closed on the stale snapshot. The rail now re-reads FRESH under the lock and
+        # acts only on that.
+        from unittest.mock import patch as _patch
+        import sqlite3
+
+        action = self._owed_action(roles=("claude",))
+        ops = _RollbackOps(self._rows("claude"))
+        real_read = StartupTransactionFence.read
+        calls = {"n": 0}
+
+        def _racey_read(fence_self, aid):
+            calls["n"] += 1
+            result = real_read(fence_self, aid)
+            if calls["n"] == 1:  # after the pre-lock read, a concurrent rollback completes
+                conn = sqlite3.connect(fence_self.path, isolation_level=None)
+                conn.execute(
+                    "UPDATE startup_actions SET phase=? WHERE action_id=?",
+                    (PHASE_COMPLETED_ROLLED_BACK, aid),
+                )
+                conn.close()
+            return result
+
+        with _patch.object(StartupTransactionFence, "read", _racey_read):
+            verdict = self._run(ops, action, execute=True)
+        self.assertFalse(ops.close_calls, "re-closed a pane after a concurrent completion")
+        self.assertEqual(verdict.reason, REASON_ALREADY_ROLLED_BACK)
+
+    def test_a_runtime_or_composer_port_exception_is_zero_close_not_raw(self):
+        # Review j#81224 R7-F4: the live-state ports are herdr CLI calls that can raise. An
+        # exception is an unreadable live state, not "idle with an empty composer" — it
+        # fails closed to a zero-close verdict, never a raw OSError out of the public rail.
+        for port in ("runtime_state", "observe_composer"):
+            with self.subTest(port=port):
+                action = self._owed_action(roles=("claude",), nonce=f"n_{port}")
+
+                class _RaisingPort(_RollbackOps):
+                    def runtime_state(self, locator):
+                        if port == "runtime_state":
+                            raise OSError("runtime read boom")
+                        return super().runtime_state(locator)
+
+                    def observe_composer(self, locator):
+                        if port == "observe_composer":
+                            raise OSError("composer read boom")
+                        return super().observe_composer(locator)
+
+                ops = _RaisingPort(self._rows("claude"))
+                verdict = self._run(ops, action, execute=True)
+                self.assertEqual(verdict.reason, REASON_BLOCKED)
+                self.assertFalse(ops.close_calls)
+
+    def test_a_close_port_exception_withholds_success_and_keeps_the_debt(self):
+        # Review j#81224 R7-F4: the close port can raise after a partial effect. The
+        # remeasure, not the exception, decides — success is withheld and the debt stands.
+        action = self._owed_action(roles=("claude",))
+
+        class _RaisingClose(_RollbackOps):
+            def close(self, workspace_id, lane_id, targets):
+                raise OSError("close boom")
+
+        ops = _RaisingClose(self._rows("claude"))
+        verdict = self._run(ops, action, execute=True)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, REASON_INCOMPLETE)
+        self.assertEqual(
+            self.fence.read(action.action_id).phase, PHASE_ROLLBACK_OWED
+        )
 
     def test_a_partial_rollback_resumes_rather_than_sticking(self):
         # The first attempt closes claude and fails on codex; the second finds claude

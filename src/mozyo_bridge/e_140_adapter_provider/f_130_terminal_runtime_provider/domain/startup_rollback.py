@@ -55,6 +55,9 @@ ROLLBACK_COMPOSER_UNREADABLE = "composer_unreadable"
 ROLLBACK_AGENT_BUSY = "agent_busy"
 #: The live inventory could not be read. Fail closed; close nothing.
 ROLLBACK_INVENTORY_UNREADABLE = "inventory_unreadable"
+#: A live-state port (runtime state / composer) raised while reading this pane, so its
+#: idle/settle facts are unknown. Fail closed — an unreadable live state is not a settled one.
+ROLLBACK_LIVE_STATE_UNREADABLE = "live_state_unreadable"
 #: Already proven closed by this same action. Replay is answered from the record.
 ROLLBACK_ALREADY_CLOSED = "already_closed"
 
@@ -81,6 +84,7 @@ ROLLBACK_VERDICTS: frozenset[str] = frozenset(
         ROLLBACK_COMPOSER_UNREADABLE,
         ROLLBACK_AGENT_BUSY,
         ROLLBACK_INVENTORY_UNREADABLE,
+        ROLLBACK_LIVE_STATE_UNREADABLE,
         ROLLBACK_ALREADY_CLOSED,
     }
 )
@@ -135,6 +139,10 @@ ROLLBACK_DETAIL: dict[str, str] = {
         "the live inventory could not be read, so this participant cannot be identified; "
         "fail closed and close nothing"
     ),
+    ROLLBACK_LIVE_STATE_UNREADABLE: (
+        "a live-state read (runtime state / composer) failed for this pane, so it cannot "
+        "be shown idle with no pending input; fail closed and close nothing"
+    ),
     ROLLBACK_ALREADY_CLOSED: (
         "this action already proved this participant closed; replay is answered from the "
         "record rather than by closing something again"
@@ -167,6 +175,8 @@ class ParticipantFacts:
     obligation_present: bool = False
     #: The obligation ledger could not be read.
     obligation_unreadable: bool = False
+    #: A live-state port (runtime state / composer read) raised while observing this pane.
+    live_state_unreadable: bool = False
 
 
 def classify_rollback(facts: ParticipantFacts) -> str:
@@ -210,6 +220,11 @@ def classify_rollback(facts: ParticipantFacts) -> str:
         return ROLLBACK_WORK_OBLIGATION
     if facts.shell_residue:
         return ROLLBACK_ELIGIBLE
+    if facts.live_state_unreadable:
+        # A runtime/composer port raised while reading this live, ours pane (review j#81224
+        # R7-F4): we cannot show it is idle with no pending input, so it is not eligible —
+        # an unreadable live state is never a settled one.
+        return ROLLBACK_LIVE_STATE_UNREADABLE
     if not facts.agent_idle:
         return ROLLBACK_AGENT_BUSY
     if facts.composer == COMPOSER_PENDING:
