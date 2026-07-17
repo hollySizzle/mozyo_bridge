@@ -539,6 +539,21 @@ Table naming:
       ★**replay は byte-equal のみ idempotent**（#13879 acceptance 4）: 完全一致は revision を上げない no-op success、
       **non-empty かつ異なる** snapshot（recycled generation / foreign pin set）は `already_declared` zero-write —
       既存 snapshot は決して上書きしない。空の pin set は caller error（何も証明しない repair）。
+      ★**default preflight は `--execute` の結果を全軸で予告する**（review j#80547 F1）。base signature は
+      `declared_slots` を **意図的に未照合**にする（byte-equal replay は正当に non-empty snapshot を見るので
+      「空」は前提条件ではない）が、その結果 preflight 分岐が persisted snapshot を見ずに一律 `repairable` /
+      exit 0 を返すと、**divergent row を exit 0 と予告しながら `--execute` は `declared_pins_divergent` で
+      拒否する**契約分裂を作る（byte-equal row も「repair する」と予告して実際は無書込）。zero-write ではあるが
+      public default が acceptance 4 と矛盾する green signal を operator / automation に返すため defect。
+      preflight は observed pins を **CAS と同一の `validate_declared_slots` → `encode_declared_slots` 経路**で
+      encode して persisted と byte 比較し、空→`repairable` / byte-equal→`already_repaired` / non-empty 相違→
+      `declared_pins_divergent` fail-closed を返す（同一経路でないと「preflight は byte-equal、CAS は divergent」
+      という新たな分裂を作る）。この比較は **preflight 分岐に限定**し `--execute` は常に CAS へ到達させる —
+      診断が authority を先取りすると、read と CAS の間で row が変化した際に stale な診断が
+      authority の受理する row を拒否しうる。★test は各 state を個別に assert するのでは足りず、
+      **preflight と execute の一致（prediction）を性質として pin** する: byte-equal shape では
+      誤 `repairable` と正 `already_repaired` が `ok` / `reason` を共有するため、**state を比較しないと
+      同 defect を取り逃す**。
       ★**書くのは `declared_slots` + decision anchor + revision のみ**。disposition / generation / worktree /
       release / replacement / `reconcile_phase` は **保持**（`reconcile_phase` は空のままで、#13842
       reconcile-owed close との区別を維持）。★**pin の `role` は消費者と同一語彙**でなければならない:

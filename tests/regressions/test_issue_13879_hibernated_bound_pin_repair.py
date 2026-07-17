@@ -859,6 +859,25 @@ class PinRepairCommandTests(unittest.TestCase):
     def _green_ops(self) -> _FakeOps:
         return _FakeOps(_live_pair(), attested=_attest_pair())
 
+    def _reset_row(self) -> None:
+        """Drop the lane's lifecycle row so a subTest can re-seed a fresh shape.
+
+        Test-only teardown of this test's OWN isolated store (MOZYO_BRIDGE_HOME points at a
+        tmpdir); it is not a repair path and never touches a shared home.
+        """
+        path = LaneLifecycleStore().path
+        if not path.exists():
+            return
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "DELETE FROM lane_lifecycle_records WHERE repo_workspace_id = ? AND lane_id = ?",
+                (_WORKSPACE_ID, _LANE),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _assert_pins_unwritten(self) -> None:
         self.assertEqual(
             self._rec().declared_slots, "", "a blocked repair must be zero-write"
@@ -922,6 +941,98 @@ class PinRepairCommandTests(unittest.TestCase):
         self.assertFalse(result.repaired)
         self.assertFalse(result.executed)
         self._assert_pins_unwritten()
+
+    # -- preflight must PREDICT --execute, on every axis (review j#80547 F1) --
+
+    def test_preflight_predicts_execute_on_every_row_shape(self) -> None:
+        """The preflight and the CAS must never disagree about what would happen.
+
+        The defect this pins (j#80547 F1): the base signature deliberately leaves
+        ``declared_slots`` unchecked (a byte-equal replay legitimately finds a NON-empty
+        snapshot), and the preflight branch then returned a bare ``repairable`` regardless of
+        the persisted snapshot -- so a divergent row previewed as exit 0 while --execute
+        refused it, and a byte-equal row previewed as "would repair" while --execute wrote
+        nothing. Asserting each state in isolation would not have caught it; the property is
+        the AGREEMENT between the two paths, so it is asserted as an equivalence over all
+        three row shapes.
+        """
+        # ``expect_preview`` is the preflight's PREDICTION of ``expect_state``; the two differ
+        # only for the empty shape, where the preview cannot claim the write it did not make.
+        # Asserting (ok, reason) alone is NOT enough: on a byte-equal row the pre-fix bare
+        # ``repairable`` and the correct ``already_repaired`` share both, so only the state
+        # distinguishes them.
+        for label, seed_pins, ops, expect_preview, expect_state in (
+            ("empty snapshot", None, self._green_ops(), REPAIR_REPAIRABLE, REPAIR_REPAIRED),
+            ("byte-equal replay", "same", self._green_ops(), REPAIR_ALREADY, REPAIR_ALREADY),
+            (
+                "divergent snapshot",
+                "same",
+                _FakeOps(
+                    _live_pair(gw="w99:p1", wk="w99:p2"),
+                    attested=_attest_pair(gw="w99:p1", wk="w99:p2"),
+                ),
+                REPAIR_BLOCKED,
+                REPAIR_BLOCKED,
+            ),
+        ):
+            with self.subTest(shape=label):
+                self.lifecycle = LaneLifecycleStore()
+                self._reset_row()
+                self._seed()
+                if seed_pins == "same":
+                    self.assertEqual(
+                        self._run(self._green_ops()).state, REPAIR_REPAIRED, label
+                    )
+                before = self._rec().declared_slots
+                preview = self._run(ops, execute=False)
+                self.assertEqual(
+                    self._rec().declared_slots, before, f"{label}: preflight wrote"
+                )
+                actual = self._run(ops, execute=True)
+                self.assertEqual(actual.state, expect_state, f"{label}: execute state")
+                # The property: the preview names the outcome --execute reaches, with the same
+                # exit code and reason, and never writes.
+                self.assertEqual(
+                    preview.state, expect_preview, f"{label}: preflight mispredicts execute"
+                )
+                self.assertEqual(
+                    preview.ok, actual.ok, f"{label}: preflight/execute exit codes disagree"
+                )
+                self.assertEqual(
+                    preview.reason,
+                    actual.reason,
+                    f"{label}: preflight/execute reasons disagree",
+                )
+                self.assertFalse(preview.repaired, f"{label}: preflight claimed a write")
+                self.assertFalse(preview.executed, f"{label}: preflight claimed execution")
+
+    def test_preflight_on_a_divergent_row_is_fail_closed(self) -> None:
+        self._seed()
+        self.assertEqual(self._run(self._green_ops()).state, REPAIR_REPAIRED)
+        filled = self._rec()
+        preview = self._run(
+            _FakeOps(
+                _live_pair(gw="w99:p1", wk="w99:p2"),
+                attested=_attest_pair(gw="w99:p1", wk="w99:p2"),
+            ),
+            execute=False,
+        )
+        self.assertEqual(preview.state, REPAIR_BLOCKED)
+        self.assertEqual(preview.reason, REPAIR_PINS_DIVERGENT)
+        self.assertFalse(preview.ok, "a divergent preview must not exit 0")
+        self.assertEqual(self._rec().declared_slots, filled.declared_slots)
+
+    def test_preflight_on_a_byte_equal_row_reports_already_not_repairable(self) -> None:
+        self._seed()
+        self.assertEqual(self._run(self._green_ops()).state, REPAIR_REPAIRED)
+        preview = self._run(self._green_ops(), execute=False)
+        self.assertEqual(preview.state, REPAIR_ALREADY)
+        self.assertTrue(preview.ok)
+        self.assertFalse(preview.repaired)
+        # The renderer must not tell the operator to run --execute: it would write nothing.
+        text = format_pin_repair_text(preview)
+        self.assertIn("nothing to repair", text)
+        self.assertNotIn("re-run with --execute to repair", text)
 
     # -- replay (acceptance 4) ------------------------------------------------
 
