@@ -745,7 +745,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
 
     def test_snapshot_active_issue_uniqueness_holds(self):
-        # Redmine #13967 R13-F1: two active rows for the SAME issue (even with different lanes)
+        # Redmine #13967 R13-F1: two ACTIVE rows for the SAME issue (even with different lanes)
         # is ambiguous active ownership -> hold, symmetric with from-glance (R9-F2) and
         # default-live (R12-F1). The canonical drain roster is one active lane per issue.
         with tempfile.TemporaryDirectory() as td:
@@ -760,6 +760,76 @@ class CliTests(unittest.TestCase):
             payload = self._run(snapshot_json=str(path))
         self.assertEqual(payload["process_retention"], PROCESS_HOLD)
         self.assertFalse(payload["durable_complete"])
+
+    def test_snapshot_active_plus_same_issue_release_row_is_allowed(self):
+        # Redmine #13967 R14-F3: active-issue uniqueness applies ONLY to active rows. A valid
+        # active recovery lane and its same-issue NON-ACTIVE historical release row
+        # (release_pending=true) co-exist — symmetric with the from-glance active-roster /
+        # lifecycle-diagnostic split — and must NOT be over-rejected.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [
+                    {"issue": "7", "lane": "recovery", "state_class": LANE_STATE_IDLE},
+                    {"issue": "7", "lane": "original", "state_class": LANE_STATE_IDLE,
+                     "release_pending": True},
+                ]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+        self.assertEqual(payload["release_dogfood_pending"], 1)
+        # but the SAME (issue, lane) as both active and release is a contradiction -> hold
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [
+                    {"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE},
+                    {"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE,
+                     "release_pending": True},
+                ]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+
+    def test_snapshot_release_row_requires_non_empty_lane(self):
+        # Redmine #13967 R14-F1: a release row (release_pending=true, a non-active
+        # diagnostic-derived row) carries release authority and requires a non-empty lane, like
+        # the from-glance / default-live diagnostic contract. An active row's lane stays optional.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [{"issue": "7", "state_class": LANE_STATE_IDLE,
+                                       "release_pending": True}]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        # a release row WITH a lane is fine
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [{"issue": "7", "lane": "l1", "state_class": LANE_STATE_IDLE,
+                                       "release_pending": True}]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["release_dogfood_pending"], 1)
+        # an ACTIVE row with an empty lane stays valid (optional lane)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "s.json"
+            path.write_text(
+                json.dumps({"lanes": [{"issue": "7", "state_class": LANE_STATE_IDLE}]}),
+                encoding="utf-8",
+            )
+            payload = self._run(snapshot_json=str(path))
+        self.assertTrue(payload["durable_complete"])
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
 
     def test_live_path_joins_delivery_ledger_for_anomaly_hold(self):
         # Redmine #13967 R10-F2: the default live path must join the SAME home-scoped delivery
@@ -851,6 +921,23 @@ class CliTests(unittest.TestCase):
         self.assertTrue(  # empty diagnostic lane
             _live_identity_notes((("9", "la"),), (("8", "", "retired", "requested"),))
         )
+        # Redmine #13967 R14-F2: an out-of-vocabulary lane_disposition or process_release is
+        # flagged (the lifecycle store cannot enforce the closed vocab, so the reader must),
+        # symmetric with the from-glance _NON_ACTIVE_DISPOSITIONS / RELEASE_STATES checks.
+        self.assertTrue(  # invalid disposition
+            _live_identity_notes((("9", "la"),), (("8", "lb", "bogus", "requested"),))
+        )
+        self.assertTrue(  # invalid process_release
+            _live_identity_notes((("9", "la"),), (("8", "lb", "hibernated", "bogus_release"),))
+        )
+        # an active disposition on the diagnostic roster is also out-of-vocab (non-active only)
+        self.assertTrue(
+            _live_identity_notes((("9", "la"),), (("8", "lb", "active", "requested"),))
+        )
+        # a fully-valid non-active released row raises no note
+        self.assertEqual(
+            _live_identity_notes((("9", "la"),), (("8", "lb", "retired", "released"),)), []
+        )
 
     def test_live_path_identity_contradiction_holds_with_durable_facts(self):
         # Redmine #13967 R12-F1: with durable facts present (so the fold is NOT degraded on its
@@ -886,6 +973,19 @@ class CliTests(unittest.TestCase):
         payload = run((("9", "la"),), (("8", "lb", "retired", "released"),))
         self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
         self.assertTrue(payload["durable_complete"])
+        # Redmine #13967 R14-F2: a diagnostic row with an out-of-vocabulary disposition or
+        # release must hold (never launder into a healthy release row) -- the lifecycle store
+        # has no CHECK constraint, so a corrupted/legacy row is readable and the reader guards it.
+        payload = run((("9", "la"),), (("8", "lb", "bogus", "requested"),))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        payload = run((("9", "la"),), (("8", "lb", "hibernated", "bogus_release"),))
+        self.assertEqual(payload["process_retention"], PROCESS_HOLD)
+        self.assertFalse(payload["durable_complete"])
+        # a fully-valid non-active requested row still folds into a release_dogfood lane
+        payload = run((("9", "la"),), (("8", "lb", "hibernated", "requested"),))
+        self.assertEqual(payload["process_retention"], PROCESS_RELEASABLE)
+        self.assertEqual(payload["release_dogfood_pending"], 1)
 
     def test_live_path_holds_on_real_empty_issue_diagnostic(self):
         # Redmine #13967 R13-F2: a REAL unbound lane (LaneLifecycleStore.declare_active with
