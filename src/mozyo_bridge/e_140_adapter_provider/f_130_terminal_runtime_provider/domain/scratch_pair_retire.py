@@ -229,6 +229,7 @@ def decide_scratch_pair_retire(
     observation: ScratchPairObservation,
     *,
     expected_roles: Sequence[str],
+    allow_pending_composer: bool = False,
 ) -> ScratchPairRetireVerdict:
     """Decide whether this record-less scratch pair may be closed. (pure, fail-closed)
 
@@ -253,8 +254,9 @@ def decide_scratch_pair_retire(
        aggregate — foreign-only occupancy reads as "live 0", #13845 review j#80115 F1);
     5. no expected row that is present-but-unlocatable and not positively stale residue;
     6. a positive absence (zero present slots) is the idempotent, already-retired replay;
-    7. every PRESENT slot must decode to this unit, be idle, and hold no pending composer.
-       Absent slots are skipped, not blocked — that is what makes a partial close
+    7. every PRESENT slot must decode to this unit and be idle. A pending composer blocks
+       by default; the caller may admit it only after a separate, explicit owner-approval
+       gate. Absent slots are skipped, not blocked — that is what makes a partial close
        replayable (#13847 R1-F1);
     8. the present slots' locators must be distinct (two slots at one locator is a
        recycled / ambiguous target).
@@ -345,7 +347,7 @@ def decide_scratch_pair_retire(
                 f"the agent at {slot.assigned_name} is not idle / turn-ended; refusing "
                 "to destroy an in-flight turn",
             )
-        if not slot.composer_settled:
+        if not slot.composer_settled and not allow_pending_composer:
             return _blocked(
                 REASON_PENDING_COMPOSER,
                 f"the agent at {slot.assigned_name} holds unsent composer input; "

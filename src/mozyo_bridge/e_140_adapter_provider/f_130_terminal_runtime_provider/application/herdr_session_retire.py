@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
@@ -124,6 +125,15 @@ REASON_SIGNATURE_LOST = "signature_lost"
 #: but the process does not, so it is a relaunched pair the old attempt cannot close
 #: (Redmine #13892 review j#80523 R3-F2).
 REASON_PIN_DRIFT = "pin_drift"
+#: The only opt-in that may discard unsent composer input is a strict Redmine
+#: ``ISSUE:JOURNAL`` pointer. Missing / malformed authority stays zero-close (#13918).
+REASON_COMPOSER_DISCARD_APPROVAL_INVALID = "composer_discard_approval_invalid"
+#: A historical ``issue_<id>_...`` lane may only use an approval from that same issue.
+REASON_COMPOSER_DISCARD_ISSUE_MISMATCH = "composer_discard_issue_mismatch"
+#: Historical worktree evidence is action-time authority, never a caller assertion.
+REASON_HISTORICAL_WORKTREE_UNREADABLE = "historical_worktree_unreadable"
+REASON_HISTORICAL_WORKTREE_DIRTY = "historical_worktree_dirty"
+REASON_HISTORICAL_BRANCH_MISMATCH = "historical_branch_mismatch"
 
 #: The idempotent replay: this exact unit was proven retired by a prior run and no expected
 #: slot is live now. Exit 0 (design j#80526 rejects an effect-only exit 1).
@@ -136,6 +146,39 @@ STATE_ALREADY_RETIRED = "already_retired"
 #: retirement rather than causing one.
 EVENT_COMMAND = "herdr session-retire"
 EVENT_KIND_RETIRED = "scratch_pair_retired"
+
+_APPROVAL_RE = re.compile(r"([1-9][0-9]*):([1-9][0-9]*)")
+_ISSUE_LANE_RE = re.compile(r"issue_([1-9][0-9]*)(?:_|$)")
+
+
+@dataclass(frozen=True)
+class ComposerDiscardApproval:
+    """The explicit durable pointer authorizing loss of unsent composer input."""
+
+    issue: str
+    journal: str
+
+    @property
+    def token(self) -> str:
+        return f"{self.issue}:{self.journal}"
+
+
+def _composer_discard_approval(
+    args: argparse.Namespace,
+) -> tuple[Optional[ComposerDiscardApproval], str]:
+    # Unlike lane labels, an authority pointer is not a convenience string that may be
+    # normalized.  The CLI must preserve one exact, auditable token; surrounding whitespace
+    # or any other decoration is malformed rather than silently accepted.
+    raw = getattr(args, "pending_composer_discard_approval", "") or ""
+    if not raw:
+        return None, ""
+    match = _APPROVAL_RE.fullmatch(raw)
+    if match is None:
+        return None, (
+            "--pending-composer-discard-approval must be an exact positive "
+            "Redmine ISSUE:JOURNAL pointer"
+        )
+    return ComposerDiscardApproval(issue=match.group(1), journal=match.group(2)), ""
 
 
 @dataclass(frozen=True)
@@ -223,6 +266,10 @@ def run_session_retire(
             "the default lane hosts the coordinator pair and is never a retire target",
         )
 
+    approval, approval_error = _composer_discard_approval(args)
+    if approval_error:
+        return _blocked(REASON_COMPOSER_DISCARD_APPROVAL_INVALID, approval_error)
+
     try:
         resolved_root = Path(repo_root).expanduser().resolve()
     except (OSError, ValueError):
@@ -271,6 +318,45 @@ def run_session_retire(
         )
 
     live_ops = ops or LiveSessionRetireOps(repo_root=resolved_root)
+    historical = _ISSUE_LANE_RE.match(lane_id)
+    if approval is not None and historical is not None:
+        lane_issue = historical.group(1)
+        if approval.issue != lane_issue:
+            return _blocked(
+                REASON_COMPOSER_DISCARD_ISSUE_MISMATCH,
+                f"historical lane {lane_id!r} belongs to Redmine #{lane_issue}, but the "
+                f"composer-discard approval points to #{approval.issue}",
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                expected_names=expected_names,
+            )
+        readable, clean, branch = live_ops.worktree_facts()
+        if not readable:
+            return _blocked(
+                REASON_HISTORICAL_WORKTREE_UNREADABLE,
+                "the historical lane's git status / branch could not be read at action time",
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                expected_names=expected_names,
+            )
+        if not clean:
+            return _blocked(
+                REASON_HISTORICAL_WORKTREE_DIRTY,
+                "the historical lane worktree is dirty; unsaved work must never be discarded "
+                "with its composer",
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                expected_names=expected_names,
+            )
+        if branch != lane_id:
+            return _blocked(
+                REASON_HISTORICAL_BRANCH_MISMATCH,
+                f"the historical lane names branch {lane_id!r}, but the worktree is on "
+                f"{branch or '<detached>'!r}",
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                expected_names=expected_names,
+            )
     observation = observe_scratch_pair(
         live_ops,
         workspace_id=workspace_id,
@@ -278,7 +364,9 @@ def run_session_retire(
         expected_roles=expected_roles,
     )
     verdict: ScratchPairRetireVerdict = decide_scratch_pair_retire(
-        observation, expected_roles=expected_roles
+        observation,
+        expected_roles=expected_roles,
+        allow_pending_composer=approval is not None,
     )
 
     base = dict(
@@ -328,6 +416,7 @@ def run_session_retire(
             workspace_id=workspace_id,
             expected_names=expected_names,
             base=base,
+            approval_token=approval.token if approval is not None else "",
         )
 
     # The retirement transaction (design j#80526). Everything from the authority read through
@@ -494,7 +583,15 @@ def _resume_plan(attempt, live_by_role, base):
 
 
 def _preflight_verdict(
-    live_ops, *, prior, pair_is_live, live_targets, workspace_id, expected_names, base
+    live_ops,
+    *,
+    prior,
+    pair_is_live,
+    live_targets,
+    workspace_id,
+    expected_names,
+    base,
+    approval_token,
 ):
     """The read-only verdict: report what an execute WOULD do, writing nothing."""
     if not pair_is_live:
@@ -526,11 +623,14 @@ def _preflight_verdict(
     blocked = _obligation_refusal(live_ops, workspace_id, expected_names, base)
     if blocked is not None:
         return blocked
+    detail = f"the pair is retirable; re-run with --execute to close {len(live_targets)} slot(s)"
+    if approval_token:
+        detail += (
+            f" and discard pending composer input under Redmine {approval_token}"
+        )
     return SessionRetireVerdict(
         state=STATE_GREEN,
-        detail=(
-            f"the pair is retirable; re-run with --execute to close {len(live_targets)} slot(s)"
-        ),
+        detail=detail,
         executed=False,
         **base,
     )
@@ -666,15 +766,20 @@ def _finish_retirement(
     # The fence row IS the durable outcome (acceptance 4). `managed_events` is appended only
     # AFTER it, purely as lossy narrative audit: its failure is reported but never invalidates
     # a proven retirement, because the load-bearing authority is the fence, not the audit log.
+    approval, _ = _composer_discard_approval(args)
+    approval_token = approval.token if approval is not None else ""
+    intent = {
+        "lane_id": lane_id,
+        "expected_names": list(expected_names),
+        "closed": [{"role": r, "locator": loc} for r, loc in closed],
+        "surface": EVENT_COMMAND,
+    }
+    if approval_token:
+        intent["pending_composer_discard_approval"] = approval_token
     audit = live_ops.record_retirement(
         workspace_id=workspace_id,
         lane_id=lane_id,
-        intent={
-            "lane_id": lane_id,
-            "expected_names": list(expected_names),
-            "closed": [{"role": r, "locator": loc} for r, loc in closed],
-            "surface": EVENT_COMMAND,
-        },
+        intent=intent,
     )
     detail = f"closed {len(closed)} slot(s); the unit re-measured empty on a fresh inventory"
     if repaired:
@@ -682,6 +787,8 @@ def _finish_retirement(
             f"repaired a pending attempt: {len(closed)} slot(s) were already closed and the "
             "unit re-measured empty"
         )
+    if approval_token:
+        detail += f"; pending composer discard approved by Redmine {approval_token}"
     return SessionRetireVerdict(
         state=STATE_GREEN,
         detail=detail,

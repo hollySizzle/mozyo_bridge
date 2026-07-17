@@ -8,6 +8,7 @@ observation here also keeps the decision module readable as one ordered contract
 from __future__ import annotations
 
 import os
+import subprocess  # noqa: S404 - fixed-argv, read-only git probes
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
@@ -52,6 +53,9 @@ class SessionRetireOps(Protocol):
 
     def lifecycle_record_absent(self, workspace_id: str, lane_id: str) -> Optional[bool]:
         """``True`` = no record, ``False`` = a record exists, ``None`` = unreadable."""
+
+    def worktree_facts(self) -> tuple[bool, bool, str]:
+        """Action-time ``(readable, clean, branch)`` for this repo root."""
 
     def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
         """EVERY covered source's blocking obligations; ``None`` = unreadable (fail closed).
@@ -136,6 +140,30 @@ class LiveSessionRetireOps:
         except Exception:  # noqa: BLE001 - unreadable is NOT absent; fail closed
             return None
         return record is None
+
+    def worktree_facts(self) -> tuple[bool, bool, str]:
+        """Read the historical lane worktree without mutating Git state (#13918)."""
+        try:
+            status = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                ["git", "status", "--porcelain=v1"],
+                cwd=self._repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            branch = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                ["git", "branch", "--show-current"],
+                cwd=self._repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except (OSError, ValueError):
+            return (False, False, "")
+        readable = status.returncode == 0 and branch.returncode == 0
+        if not readable:
+            return (False, False, "")
+        return (True, not bool(status.stdout.strip()), branch.stdout.strip())
 
     def open_obligations(self, workspace_id: str, assigned_names):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.scratch_pair_obligations import (  # noqa: E501

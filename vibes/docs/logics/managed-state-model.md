@@ -598,6 +598,12 @@ Table naming:
       ★deadness の positive 証明のみで進む: `classify_named_slot` が `SLOT_STALE` と積極判定した shell residue は agent 不在ゆえ
       turn / composer を持たず close 可 (runtime `unknown` だけで block すると residue が恒久残留する)。process mutation は
       **自 pair の pin-matched close のみ**で、worktree/branch 削除・launch/resume・store 直接 mutation は伴わない。
+      ★#13918 の歴史的 owner-unbound 収束はこの signature / fence / close を再利用し、**pending composer だけ**を exact
+      Redmine `ISSUE:JOURNAL` owner-approval pointer で明示的に破棄できる。approval があっても agent not idle、foreign / duplicate /
+      unreadable、locator ambiguity、durable obligation、record-present は従来どおり zero-close。`issue_<id>_...` lane では approval
+      issue一致と action-time Git `status` clean / current branch==lane も必須で、未保存 worktree と composer を同時に失う経路を
+      作らない。non-issue scratch dogfood は Git worktree authorityを持たないためこの追加Git gateの対象外だが、exact
+      workspace/lane/role/assigned-name と approval pointer は retirement audit に残す。flag無しのdefault semanticsは不変。
       ★**durable obligation は runtime signal で代替できない**（review j#80506 F4）: idle / turn-ended / composer settled は
       `ack-completion-receiver-state.md` の分類で言う **receiver state** であり「その slot に *owed* な work が無い」ことを
       証明しない。close の前に対象 assigned name 宛の **非終端 dispatch-outbox row**（`reserved` / `uncertain`）を bounded read

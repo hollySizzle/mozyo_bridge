@@ -49,7 +49,8 @@ def register_herdr_session_retire_parser(herdr_sub, *, add_repo_option=None) -> 
             "This is the retirement rail for a pair that carries NO lane lifecycle "
             "record; a lane that HAS one is refused here and belongs to `sublane retire`. "
             "Fails closed: an unreadable inventory, a duplicate or foreign occupant, an "
-            "unlocatable slot, a busy agent or a pending composer all close nothing. "
+            "unlocatable slot or a busy agent all close nothing. A pending composer "
+            "also closes nothing unless an exact owner-approval pointer is supplied. "
             "Never removes a worktree or branch, never launches or resumes a process, and "
             "never fabricates a lifecycle record to pass itself."
         ),
@@ -65,6 +66,17 @@ def register_herdr_session_retire_parser(herdr_sub, *, add_repo_option=None) -> 
         help=(
             "Actually close the pair's slots. Without this the command is a read-only "
             "preflight that reports the verdict and closes nothing."
+        ),
+    )
+    parser.add_argument(
+        "--pending-composer-discard-approval",
+        metavar="ISSUE:JOURNAL",
+        help=(
+            "Explicit Redmine owner-approval pointer authorizing this exact pair's "
+            "unsent composer input to be discarded. It overrides only the pending-"
+            "composer refusal; every identity, liveness, obligation, lifecycle and "
+            "retirement-fence guard remains fail-closed. Historical issue lanes also "
+            "require an action-time clean worktree on the matching branch."
         ),
     )
     parser.add_argument(
