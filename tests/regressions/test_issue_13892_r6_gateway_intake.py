@@ -20,7 +20,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     ROLE_DELEGATED_COORDINATOR,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_disposition_intake import (  # noqa: E501
-    LEG_ATTEMPTED,
+    LEG_RECORDED,
     LEG_NOT_APPLICABLE,
     REASON_DISPATCH_AMBIGUOUS,
     REASON_DISPATCH_NOT_FOUND,
@@ -155,7 +155,7 @@ class GatewayDispositionLegTest(unittest.TestCase):
 
     def test_the_gateway_records_the_disposition(self):
         result = self._run()
-        self.assertEqual(result.state, LEG_ATTEMPTED)
+        self.assertEqual(result.state, LEG_RECORDED)
         self.assertTrue(result.wrote, f"the leg must append: {result.reason} {result.detail}")
         self.assertEqual(len(self.appended), 1)
 
@@ -167,11 +167,17 @@ class GatewayDispositionLegTest(unittest.TestCase):
         self.assertEqual(self.appended, [], "zero-write")
 
     def test_a_replay_is_idempotent_and_writes_once(self):
+        """A same-payload replay is a SUCCESS, not a refusal (review j#80667 R8-F2)."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_disposition_intake import (  # noqa: E501
+            LEG_ALREADY_RECORDED,
+        )
+
         self._run()
         second = self._run()
         self.assertEqual(len(self.appended), 1, "the same round must not be recorded twice")
-        self.assertFalse(second.wrote)
-        self.assertTrue(second.ok if hasattr(second, "ok") else True)
+        self.assertFalse(second.wrote, "nothing new was appended")
+        self.assertEqual(second.state, LEG_ALREADY_RECORDED)
+        self.assertTrue(second.ok, "the writer's contract calls an identical replay a success")
 
     def test_an_ambiguous_round_is_zero_write(self):
         self.entries.insert(1, _entry("150", _auth_note(action_id="b")))
@@ -228,6 +234,12 @@ class ProductionEntryReachesTheLegTest(unittest.TestCase):
     """
 
     def _drive(self, *, dry_run=False):
+        """Drive the real `cmd_workflow_step` with a GATEWAY-shaped outcome.
+
+        The outcome must be gateway-shaped or the leg is correctly never reached: since
+        review j#80667 R8-F3, applicability is decided from the role and anchor before
+        anything else, so a non-gateway step is silent by design.
+        """
         import contextlib
         import io
 
@@ -237,7 +249,20 @@ class ProductionEntryReachesTheLegTest(unittest.TestCase):
             cli_workflow,
         )
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_disposition_intake as intake  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (  # noqa: E501
+            EXECUTION_BLOCKED,
+            OWNER_OPERATOR,
+            PRIMITIVE_NONE,
+            STATE_LANE_UNRESOLVED,
+            WorkflowStepOutcome,
+        )
 
+        gateway = WorkflowStepOutcome(
+            state=STATE_LANE_UNRESOLVED, next_action="hold", execution=EXECUTION_BLOCKED,
+            reason="fixture", next_owner=OWNER_OPERATOR, primitive=PRIMITIVE_NONE,
+            durable_anchor=f"redmine:issue={ISSUE}:journal=200",
+            caller_role=ROLE_DELEGATED_COORDINATOR, repo_root=".",
+        )
         seen = []
 
         def _spy(args, outcome):
@@ -250,11 +275,7 @@ class ProductionEntryReachesTheLegTest(unittest.TestCase):
         )
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
-            cli_workflow, "_herdr_step_preflight", lambda _a: None
-        ), patch.object(
-            cli_workflow, "current_pane", lambda: "%self"
-        ), patch.object(
-            cli_workflow, "_discover_candidates", return_value=[]
+            cli_workflow, "_herdr_step_preflight", lambda _a: gateway
         ), patch.object(
             cli_workflow, "_load_store_action", return_value=(None, "store_absent")
         ), patch.object(

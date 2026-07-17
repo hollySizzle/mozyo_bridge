@@ -37,20 +37,39 @@ import argparse
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-#: The lane / gate shape does not call for a disposition. Nothing read, nothing written.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.dispatch_disposition_writer import (  # noqa: E501
+    WRITE_ALREADY_RECORDED,
+    WRITE_RECORDED,
+    WRITE_REFUSED,
+)
+
+#: This step is not a gateway round at all — no disposition is owed. Silent (nothing read,
+#: nothing written, no envelope field): the ONLY states that may be silent.
 LEG_NOT_APPLICABLE = "not_applicable"
-#: The writer ran. `detail` carries its state / reason verbatim.
-LEG_ATTEMPTED = "attempted"
+#: The marker was appended.
+LEG_RECORDED = "recorded"
+#: An identical marker already existed. The writer's contract calls this a **success**
+#: (``WRITE_ALREADY_RECORDED`` / ``ok``), so it must not read as a refusal (review j#80667
+#: R8-F2): a same-payload replay is exactly what an idempotent producer is supposed to do.
+LEG_ALREADY_RECORDED = "already_recorded"
+#: The leg or the writer refused. Zero-write, always reported.
+LEG_REFUSED = "refused"
+#: A gateway round on a dry run: reported, never appended.
+LEG_DRY_RUN = "dry_run"
 #: An unexpected error escaped the leg. Zero-write, and SAID so (review j#80659 R7-F1): a bare
 #: `None` here made a swallowed exception indistinguishable from "nothing to do".
 LEG_ERROR = "error"
 
 REASON_LEG_RAISED = "leg_raised"
-#: A dry run: reported, never appended.
 REASON_DRY_RUN = "dry_run"
 
 REASON_NOT_GATEWAY_LANE = "not_gateway_lane"
 REASON_NO_VERIFIED_ANCHOR = "no_verified_anchor"
+#: The gateway round is real and the anchor verified — but the launch-time herdr identity that
+#: supplies workspace / lane could not be resolved (review j#80667 R8-F1). Distinct from
+#: :data:`REASON_NO_VERIFIED_ANCHOR`, which reports a precondition that is genuinely absent;
+#: conflating them named the wrong cause AND made the refusal silent.
+REASON_SENDER_UNRESOLVED = "sender_identity_unresolved"
 REASON_SOURCE_UNAVAILABLE = "source_unavailable"
 REASON_SOURCE_UNREADABLE = "source_unreadable"
 REASON_NO_WRITE_OPT_IN = "write_opt_in_unset"
@@ -77,32 +96,47 @@ class DispositionLegResult:
     reason: str = ""
     detail: str = ""
     wrote: bool = False
+    #: Did this step concern a gateway round at all? An explicit FACT set by the one place that
+    #: knows — never re-derived from `reason` (review j#80667 R8-F1). Inferring it from a reason
+    #: allowlist meant any new refusal reason that happened to reuse a listed string silently
+    #: vanished from the envelope, which is precisely the failure R7-F1 was meant to end.
+    applicable: bool = True
 
     @property
-    def applicable(self) -> bool:
-        """Did this step actually concern a disposition? (drives whether to report at all)"""
-        return self.state != LEG_NOT_APPLICABLE or self.reason not in (
-            REASON_NOT_GATEWAY_LANE,
-            REASON_NO_VERIFIED_ANCHOR,
-        )
+    def ok(self) -> bool:
+        """Did the round reach its intended durable state?
+
+        A same-payload replay (:data:`LEG_ALREADY_RECORDED`) is a **success**, matching the
+        writer's own ``ok`` (review j#80667 R8-F2). Reporting it as a refusal inverted the
+        idempotency contract for every operator and automation reading this envelope.
+        """
+        return self.state in (LEG_RECORDED, LEG_ALREADY_RECORDED)
 
     def envelope_fields(self) -> dict:
-        """The step envelope's ``dispatch_disposition`` object."""
+        """The step envelope's ``dispatch_disposition`` object.
+
+        ``state`` carries the writer's own semantic answer and ``ok`` makes an idempotent
+        replay machine-checkable — a bare ``wrote`` bool could not distinguish "already
+        recorded" (fine) from "refused" (not fine).
+        """
         return {
             "state": self.state,
             "reason": self.reason,
             "detail": self.detail,
             "wrote": self.wrote,
+            "ok": self.ok,
         }
 
     def describe(self) -> str:
         """One operator-facing line for the text envelope."""
-        if self.wrote:
+        tail = f" — {self.detail}" if self.detail else ""
+        if self.state == LEG_RECORDED:
             return "dispatch disposition: recorded"
-        return (
-            f"dispatch disposition: NOT recorded ({self.reason or self.state})"
-            f"{' — ' + self.detail if self.detail else ''}"
-        )
+        if self.state == LEG_ALREADY_RECORDED:
+            return f"dispatch disposition: already recorded (idempotent replay){tail}"
+        if self.state == LEG_DRY_RUN:
+            return "dispatch disposition: not recorded (dry run)"
+        return f"dispatch disposition: NOT recorded ({self.reason or self.state}){tail}"
 
 
 @dataclass(frozen=True)
@@ -216,6 +250,26 @@ def resolve_round_dispatch(
     return RoundResolution(auth=candidates[0])
 
 
+def gateway_round_of(outcome) -> tuple:
+    """``(issue, terminal_journal)`` iff this step IS a gateway round, else ``("", "")``.
+
+    Applicability is decided here and ONLY here, from the role and the anchor — the two facts
+    that determine whether a disposition is owed at all. Everything downstream (dry run,
+    source, sender, cardinality, write opt-in) concerns an applicable round and is therefore
+    always reported (review j#80667 R8-F1 / R8-F3).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (  # noqa: E501
+        ROLE_DELEGATED_COORDINATOR,
+    )
+
+    if _norm(getattr(outcome, "caller_role", "")) != ROLE_DELEGATED_COORDINATOR:
+        # Only the same-lane gateway attests a discharge. A worker stepping its own lane is
+        # not a producer, however truthful its own report.
+        return ("", "")
+    anchor = _norm(getattr(outcome, "durable_anchor", ""))
+    return (_anchor_field(anchor, "issue"), _anchor_field(anchor, "journal"))
+
+
 def execute_gateway_disposition_leg(
     args: argparse.Namespace,
     outcome,
@@ -227,6 +281,9 @@ def execute_gateway_disposition_leg(
 
     ``source`` / ``append_note`` default to the live, credential-gated compositions and are
     injectable so the contract can be driven end to end without a network.
+
+    Past the applicability gate, EVERY return is ``applicable=True``: an applicable round that
+    records nothing must say so, whatever the cause.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.dispatch_disposition_writer import (  # noqa: E501
         record_dispatch_disposition,
@@ -236,34 +293,44 @@ def execute_gateway_disposition_leg(
         ROLE_DELEGATED_COORDINATOR,
     )
 
-    if _norm(getattr(outcome, "caller_role", "")) != ROLE_DELEGATED_COORDINATOR:
-        # Only the same-lane gateway attests a discharge. A worker stepping its own lane is
-        # not a producer, however truthful its own report.
-        return DispositionLegResult(LEG_NOT_APPLICABLE, REASON_NOT_GATEWAY_LANE)
-
-    anchor = _norm(getattr(outcome, "durable_anchor", ""))
-    issue = _anchor_field(anchor, "issue")
-    terminal_journal = _anchor_field(anchor, "journal")
+    issue, terminal_journal = gateway_round_of(outcome)
     if not issue or not terminal_journal:
-        # An unverified anchor names no round. (The anchor is verified live upstream; an
-        # unverified one never reaches a review action either.)
-        return DispositionLegResult(LEG_NOT_APPLICABLE, REASON_NO_VERIFIED_ANCHOR)
+        is_gateway = (
+            _norm(getattr(outcome, "caller_role", "")) == ROLE_DELEGATED_COORDINATOR
+        )
+        return DispositionLegResult(
+            LEG_NOT_APPLICABLE,
+            REASON_NO_VERIFIED_ANCHOR if is_gateway else REASON_NOT_GATEWAY_LANE,
+            applicable=False,
+        )
+
+    def _refused(reason: str, detail: str = "") -> DispositionLegResult:
+        """An applicable round that will not be recorded. Zero-write, never silent."""
+        return DispositionLegResult(LEG_REFUSED, reason, detail=detail)
 
     if source is None:
         source = _live_source()
     if source is None:
-        return DispositionLegResult(LEG_NOT_APPLICABLE, REASON_SOURCE_UNAVAILABLE)
+        return _refused(
+            REASON_SOURCE_UNAVAILABLE,
+            "no credentialed live journal source; a discharge cannot be attested",
+        )
 
     try:
         entries = list(source.read_entries(issue))
     except Exception as exc:  # noqa: BLE001 - never attest from an unread source
-        return DispositionLegResult(
-            LEG_NOT_APPLICABLE, REASON_SOURCE_UNREADABLE, detail=str(exc)
-        )
+        return _refused(REASON_SOURCE_UNREADABLE, str(exc))
 
     sender = _sender_identity(args)
     if sender is None:
-        return DispositionLegResult(LEG_NOT_APPLICABLE, REASON_NO_VERIFIED_ANCHOR)
+        # The anchor is verified and the round is real; what failed is the launch-time herdr
+        # identity supplying workspace / lane. Reporting this as `no_verified_anchor` named the
+        # wrong cause AND (because that reason was treated as non-applicable) hid the
+        # zero-write entirely — R7-F1's defect in a second shape (review j#80667 R8-F1).
+        return _refused(
+            REASON_SENDER_UNRESOLVED,
+            "the launch-time herdr sender identity (workspace / lane) could not be resolved",
+        )
 
     round_ = resolve_round_dispatch(
         entries,
@@ -274,15 +341,17 @@ def execute_gateway_disposition_leg(
     if not round_.ok:
         # Zero or many: either way this producer cannot name the exact action a discharge
         # would close, so it records nothing — but it says WHICH, so the operator can act.
-        return DispositionLegResult(
-            LEG_NOT_APPLICABLE, round_.reason, detail=round_.detail
-        )
+        return _refused(round_.reason, round_.detail)
     auth = round_.auth
 
     if append_note is None:
         append_note = _live_append_note()
     if append_note is None:
-        return DispositionLegResult(LEG_NOT_APPLICABLE, REASON_NO_WRITE_OPT_IN)
+        return _refused(
+            REASON_NO_WRITE_OPT_IN,
+            "the live Redmine write opt-in (MOZYO_REDMINE_DELIVERY_WRITE) is unset, so the "
+            "marker cannot be appended and this round stays owed",
+        )
 
     result = record_dispatch_disposition(
         issue=issue,
@@ -295,12 +364,23 @@ def execute_gateway_disposition_leg(
         source=source,
         append_note=append_note,
     )
+    # Carry the writer's OWN semantic answer through (review j#80667 R8-F2). Collapsing its
+    # three states into a `wrote` bool made an idempotent replay — which the writer's contract
+    # calls a success — render as `NOT recorded`, inverting that contract on the envelope.
     return DispositionLegResult(
-        LEG_ATTEMPTED,
+        _WRITER_STATE_TO_LEG.get(result.state, LEG_REFUSED),
         reason=result.reason,
-        detail=result.detail or result.state,
+        detail=result.detail,
         wrote=result.wrote,
     )
+
+
+#: The writer's states are the authority on what happened; this leg only relabels them.
+_WRITER_STATE_TO_LEG = {
+    WRITE_RECORDED: LEG_RECORDED,
+    WRITE_ALREADY_RECORDED: LEG_ALREADY_RECORDED,
+    WRITE_REFUSED: LEG_REFUSED,
+}
 
 
 def maybe_record_gateway_disposition(
@@ -311,6 +391,12 @@ def maybe_record_gateway_disposition(
     ``--dry-run`` reports without writing, like every other leg: a dry run that appended a
     durable marker would not be a dry run.
 
+    **Applicability is decided before the dry run** (review j#80667 R8-F3). Answering dry_run
+    first meant a worker's or default coordinator's dry run — steps that concern no disposition
+    whatsoever — grew a `dispatch_disposition` field, breaking the additive contract this leg
+    is supposed to honour. Whether a disposition is owed depends on the role and the anchor,
+    never on how the step was invoked.
+
     Never raises. The leg already fails closed on every unreadable / ambiguous input; this
     boundary additionally refuses to let an unexpected error in a bookkeeping append take down
     the gateway's review action, which is the thing that actually matters.
@@ -319,13 +405,16 @@ def maybe_record_gateway_disposition(
     j#80659 R7-F1): swallowing it made a crashed writer look exactly like a step that had
     nothing to record, and the operator was never told the marker had not landed.
     """
-    if dry_run:
-        return DispositionLegResult(
-            LEG_NOT_APPLICABLE,
-            REASON_DRY_RUN,
-            detail="a dry run reports without appending a durable marker",
-        )
     try:
+        issue, terminal_journal = gateway_round_of(outcome)
+        if not issue or not terminal_journal:
+            return None  # not a gateway round: silent, and the same on a dry run
+        if dry_run:
+            return DispositionLegResult(
+                LEG_DRY_RUN,
+                REASON_DRY_RUN,
+                detail="a dry run reports without appending a durable marker",
+            )
         return execute_gateway_disposition_leg(args, outcome)
     except Exception as exc:  # noqa: BLE001 - never blocks the review action, but never silent
         return DispositionLegResult(LEG_ERROR, REASON_LEG_RAISED, detail=str(exc))
@@ -413,11 +502,16 @@ def _sender_identity(args: argparse.Namespace):
 
 __all__ = (
     "LEG_NOT_APPLICABLE",
-    "LEG_ATTEMPTED",
+    "LEG_RECORDED",
+    "LEG_ALREADY_RECORDED",
+    "LEG_REFUSED",
+    "LEG_DRY_RUN",
     "LEG_ERROR",
     "REASON_LEG_RAISED",
     "REASON_DRY_RUN",
+    "REASON_SENDER_UNRESOLVED",
     "RoundResolution",
+    "gateway_round_of",
     "REASON_NOT_GATEWAY_LANE",
     "REASON_NO_VERIFIED_ANCHOR",
     "REASON_SOURCE_UNAVAILABLE",
