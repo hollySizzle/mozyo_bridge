@@ -385,9 +385,9 @@ def run_hibernated_live_reconcile(
         resolve_gateway_provider,
         resolve_worker_provider,
     )
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
-        GATEWAY_ROLE,
-        WORKER_ROLE,
+    from mozyo_bridge.core.state.lane_pin_role import (
+        PIN_ROLE_GATEWAY,
+        PIN_ROLE_WORKER,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
@@ -571,9 +571,14 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
+    # ``observe_pair`` resolves each live row by its PROVIDER (decoded out of the assigned
+    # name); the role is only the slot label it stamps onto the observation — and onto the
+    # pins re-declared below. So the label is the canonical vocabulary the recover-pair /
+    # repair-pins consumers read (Redmine #13920), which is what this function's own
+    # ``observe_pair`` docstring already specified.
     managed_pairs = (
-        (gateway_provider, GATEWAY_ROLE),
-        (worker_provider, WORKER_ROLE),
+        (gateway_provider, PIN_ROLE_GATEWAY),
+        (worker_provider, PIN_ROLE_WORKER),
     )
     observation = observe_pair(
         rows,

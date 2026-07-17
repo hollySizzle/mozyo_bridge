@@ -73,9 +73,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # Roles + lane identity (literal; machine-readable regardless of UI language).
 # ---------------------------------------------------------------------------
 
-#: The sublane gateway role — the Codex pane the coordinator routes governed kinds to.
+#: The sublane gateway role — the Codex pane the coordinator routes governed kinds to. NOT a declared-pin role: that vocabulary is owned by ``core.state.lane_pin_role`` (Redmine #13920).
 GATEWAY_ROLE = "codex"
-#: The sublane worker role — the same-lane Claude implementer.
+#: The sublane worker role — the same-lane Claude implementer. Not a declared-pin role either (see :data:`GATEWAY_ROLE`).
 WORKER_ROLE = "claude"
 
 #: The reserved non-sublane lane id (cockpit / unmanaged panes carry this).

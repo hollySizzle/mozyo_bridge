@@ -66,9 +66,10 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ProcessGenerationPin,
     ProcessPinError,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
-    GATEWAY_ROLE,
-    WORKER_ROLE,
+from mozyo_bridge.core.state.lane_pin_role import (
+    PIN_ROLE_GATEWAY,
+    PIN_ROLE_WORKER,
+    read_declared_pin_pair,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
@@ -317,9 +318,12 @@ def declare_adopted_owner_row(
         gateway_provider, worker_provider = providers
         pins: list[ProcessGenerationPin] = []
         seen_locators: set[str] = set()
+        # The pin ``role`` names the SLOT, in the canonical vocabulary the recover-pair /
+        # repair-pins consumers read (Redmine #13920). It is deliberately independent of
+        # ``provider``: under a swapped binding the gateway slot is still ``gateway``.
         for provider, role in (
-            (gateway_provider, GATEWAY_ROLE),
-            (worker_provider, WORKER_ROLE),
+            (gateway_provider, PIN_ROLE_GATEWAY),
+            (worker_provider, PIN_ROLE_WORKER),
         ):
             pin, reason = _resolve_attested_slot(
                 rows=rows,
@@ -545,30 +549,32 @@ def _lane_owns_issue_with_binding(
 
 
 def _binding_has_required_pins(record, providers: tuple[str, str]) -> bool:
-    """Does the snapshot bind the gateway + worker roles to THIS provider pair? (fail-closed)
+    """Does the snapshot bind the gateway + worker slots to THIS provider pair? (fail-closed)
 
     The typed-pins half of completeness (review j#79015 F2 / j#79074 F3): a complete binding
-    records the provider-role slots this adopt path declares — the gateway bound to
-    ``gateway_provider`` and the worker to ``worker_provider``. It matches on the
-    ``(role, provider)`` pair, NOT the role label alone: a snapshot from a DIFFERENT provider
-    binding (a swapped / foreign provider pair) carries the same two role labels but the wrong
-    providers, and must not authorize the current provider pair's fail-closed gate (Redmine
-    #13809 j#78945 item 2 — the action-time provider/role pin). ``locator`` / ``runtime_revision``
-    are deliberately NOT compared here, so a recycled generation of the SAME provider pair
-    (same ``(role, provider)``, a fresh locator) still reads complete (preserving #13810).
+    records the provider-role slots this adopt path declares — the gateway slot bound to
+    ``gateway_provider`` and the worker slot to ``worker_provider``. It matches on the slot's
+    provider, NOT the slot label alone: a snapshot from a DIFFERENT provider binding (a
+    swapped / foreign provider pair) names the same two slots with the wrong providers, and
+    must not authorize the current provider pair's fail-closed gate (Redmine #13809 j#78945
+    item 2 — the action-time provider/role pin). ``locator`` / ``runtime_revision`` are
+    deliberately NOT compared here, so a recycled generation of the SAME provider pair (same
+    slot + provider, a fresh locator) still reads complete (preserving #13810).
 
-    An empty snapshot (the v4->v5 pins-only gap), an undecodable one (fail-closed by contract),
-    or one missing either expected role-provider pair is NOT complete.
+    The slots are resolved through the canonical vocabulary boundary (Redmine #13920), so a
+    pre-#13920 row this adopt path itself wrote in the legacy spelling still reads complete
+    (read-compat: it is not re-declared as a side effect of being read). Every shape that
+    does not name an unambiguous pair — an empty snapshot (the v4->v5 pins-only gap), an
+    undecodable one, a foreign / mixed / duplicate / half-pair row — is NOT complete, so
+    "the row has pins" is never the proof.
     """
     gateway_provider, worker_provider = providers
-    try:
-        pins = record.declared_pins  # decode_declared_slots; raises on a corrupt snapshot
-    except ProcessPinError:
+    pair = read_declared_pin_pair(record)
+    if not pair.ok:
         return False
-    role_provider = {(pin.role, pin.provider) for pin in pins}
     return (
-        (GATEWAY_ROLE, _norm(gateway_provider)) in role_provider
-        and (WORKER_ROLE, _norm(worker_provider)) in role_provider
+        _norm(pair.gateway.provider) == _norm(gateway_provider)
+        and _norm(pair.worker.provider) == _norm(worker_provider)
     )
 
 

@@ -69,9 +69,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     hibernated_pair_recovery_action_id,
     slot_recovers,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.pair_launch_attestation import (  # noqa: E501
-    GATEWAY_ROLE,
-    WORKER_ROLE,
+from mozyo_bridge.core.state.lane_pin_role import (
+    PIN_PAIR_ABSENT,
+    PIN_ROLE_GATEWAY,
+    PIN_ROLE_WORKER,
+    read_declared_pin_pair,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
@@ -144,6 +146,11 @@ class RecoverPairPreflight:
     worker: Optional[SlotPlan]
     action_id: str
     detail: str = ""
+    #: WHY the record named no usable pair, from the canonical pin-role vocabulary boundary
+    #: (Redmine #13920): absent, unreadable, or a non-empty row that is foreign / mixed /
+    #: duplicate / half a pair. Empty once the pair resolved. Reported so an operator reads
+    #: "the pins are there but ambiguous" apart from "there are no pins".
+    pins_reason: str = PIN_PAIR_ABSENT
 
     @property
     def slots(self) -> Tuple[SlotPlan, ...]:
@@ -174,7 +181,13 @@ class RecoverPairPreflight:
         if not self.lane_hibernated:
             reasons.append(BLOCK_LANE_NOT_HIBERNATED)
         if not self.record_has_pins or len(self.slots) != 2:
-            reasons.append(BLOCK_MISSING_PINS)
+            # Carry WHY (Redmine #13920): an ambiguous non-empty row and a genuinely pin-less
+            # one are both fail-closed, but they are not the same operator problem.
+            reasons.append(
+                f"{BLOCK_MISSING_PINS}:{self.pins_reason}"
+                if self.pins_reason
+                else BLOCK_MISSING_PINS
+            )
         for slot in self.preserved_slots:
             reasons.append(f"{BLOCK_SLOT_PRESERVED}:{slot.role}={slot.disposition}")
         return tuple(reasons)
@@ -184,6 +197,7 @@ class RecoverPairPreflight:
             "may_recover": self.may_recover,
             "lane_hibernated": self.lane_hibernated,
             "record_has_pins": self.record_has_pins,
+            "pins_reason": self.pins_reason,
             "action_id": self.action_id,
             "gateway": self.gateway.as_payload() if self.gateway else None,
             "worker": self.worker.as_payload() if self.worker else None,
@@ -295,7 +309,13 @@ class SublaneRecoverPairUseCase:
         # The provider binding (which provider is gateway vs worker) comes from the declared
         # pin; the live locator + assigned name come from the live observation (the current
         # generation), so a close pin-matches the live bad pane, never a stale declared pin.
-        provider = _norm(getattr(pin, "provider", "")) or _norm(getattr(pin, "role", ""))
+        # ``provider`` is read ONLY from the pin's own provider field — never defaulted from
+        # its ``role`` (Redmine #13920). Under the legacy spelling that fallback looked
+        # harmless because a role read "codex", a real provider id; in the canonical
+        # vocabulary it would hand "gateway" to a provider-keyed live lookup and resolve
+        # nothing. A decoded pin always carries a non-empty provider (the pin model refuses
+        # an empty one), so there is nothing to fall back to.
+        provider = _norm(getattr(pin, "provider", ""))
         observation, live_locator, assigned_name = self.ops.observe_slot(
             role=role,
             provider=provider,
@@ -358,6 +378,7 @@ class SublaneRecoverPairUseCase:
         action_id = ""
         gateway_plan = worker_plan = None
         record_has_pins = False
+        pins_reason = PIN_PAIR_ABSENT
         if lane_hibernated:
             try:
                 action_id = hibernated_pair_recovery_action_id(
@@ -368,17 +389,21 @@ class SublaneRecoverPairUseCase:
                 )
             except ValueError:
                 action_id = ""
-            declared = _declared_pins_by_role(rec)
-            gw_pin = declared.get(GATEWAY_ROLE)
-            wk_pin = declared.get(WORKER_ROLE)
-            if action_id and gw_pin is not None and wk_pin is not None:
+            # The ONE boundary that decides which pin is which slot (Redmine #13920). It
+            # read-accepts the legacy #13809 spelling, so an adopted-then-hibernated lane
+            # resolves instead of reading pin-less; every ambiguous shape (foreign / mixed /
+            # duplicate / half a pair) returns a reason and no pins, so the recovery closes
+            # and sends nothing on a row whose pins are merely non-empty.
+            pair = read_declared_pin_pair(rec)
+            pins_reason = pair.reason
+            if action_id and pair.ok:
                 record_has_pins = True
                 gateway_plan = self._slot_plan(
-                    role=GATEWAY_ROLE, record=rec, pin=gw_pin,
+                    role=PIN_ROLE_GATEWAY, record=rec, pin=pair.gateway,
                     workspace_id=workspace_id, lane=lane,
                 )
                 worker_plan = self._slot_plan(
-                    role=WORKER_ROLE, record=rec, pin=wk_pin,
+                    role=PIN_ROLE_WORKER, record=rec, pin=pair.worker,
                     workspace_id=workspace_id, lane=lane,
                 )
 
@@ -388,6 +413,7 @@ class SublaneRecoverPairUseCase:
             gateway=gateway_plan,
             worker=worker_plan,
             action_id=action_id,
+            pins_reason=pins_reason,
         )
         if not preflight.may_recover or not execute:
             return RecoverPairOutcome(
@@ -473,19 +499,6 @@ class SublaneRecoverPairUseCase:
             redispatch=redispatch,
             detail="pair recovered; lane resumed to active",
         )
-
-
-def _declared_pins_by_role(record: Any) -> dict:
-    """Map ``{role: pin}`` from the record's declared pins (empty when absent)."""
-    pins = getattr(record, "declared_pins", None)
-    if not pins:
-        return {}
-    out = {}
-    for pin in pins:
-        role = _norm(getattr(pin, "role", ""))
-        if role and role not in out:
-            out[role] = pin
-    return out
 
 
 # ---------------------------------------------------------------------------

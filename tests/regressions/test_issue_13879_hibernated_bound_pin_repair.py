@@ -133,12 +133,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     format_pin_repair_text,
     run_hibernated_pin_repair,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
-    sublane_hibernated_pair_recovery as recover_pair,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.pair_launch_attestation import (  # noqa: E402,E501
-    GATEWAY_ROLE as RECOVER_GATEWAY_ROLE,
-    WORKER_ROLE as RECOVER_WORKER_ROLE,
+from mozyo_bridge.core.state.lane_pin_role import (  # noqa: E402
+    PIN_ROLE_GATEWAY as RECOVER_GATEWAY_ROLE,
+    PIN_ROLE_WORKER as RECOVER_WORKER_ROLE,
+    read_declared_pin_pair,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E402,E501
     GATEWAY_ROLE as LEGACY_GATEWAY_ROLE,
@@ -1102,27 +1100,27 @@ class PinRepairCommandTests(unittest.TestCase):
         """The whole point (acceptance 5): recover-pair must FIND the pins by role.
 
         Not "the repair wrote something" but "the blocker is gone": this reads the repaired row
-        back through ``recover-pair``'s OWN ``_declared_pins_by_role`` + its OWN role constants.
-        The vocabularies are a live trap — ``domain.sublane_lifecycle`` exports ``GATEWAY_ROLE``
-        / ``WORKER_ROLE`` with the same NAMES but the legacy provider VALUES (``codex`` /
+        back through the SAME pin-role boundary ``recover-pair`` resolves its slots with. The
+        vocabularies are a live trap — ``domain.sublane_lifecycle`` exports ``GATEWAY_ROLE`` /
+        ``WORKER_ROLE`` with the same NAMES but the legacy provider VALUES (``codex`` /
         ``claude``), so pinning ``role`` to those writes a snapshot recover-pair cannot resolve
         and the lane stays on ``hibernated_record_missing_pins`` — the exact defect #13879
         exists to clear, surviving a "successful" repair.
+
+        Redmine #13920 moved that resolution behind ``core.state.lane_pin_role``; this reads
+        through the owner, which is what recover-pair itself now calls.
         """
         self._seed()
         self.assertEqual(self._run(self._green_ops()).state, REPAIR_REPAIRED)
         record = self._rec()
-        declared = recover_pair._declared_pins_by_role(record)
-        gw_pin = declared.get(RECOVER_GATEWAY_ROLE)
-        wk_pin = declared.get(RECOVER_WORKER_ROLE)
-        self.assertIsNotNone(gw_pin, "recover-pair could not resolve the repaired gateway pin")
-        self.assertIsNotNone(wk_pin, "recover-pair could not resolve the repaired worker pin")
+        pair = read_declared_pin_pair(record)
+        self.assertTrue(pair.ok, f"recover-pair could not resolve the repaired pins: {pair.reason}")
+        self.assertEqual(pair.gateway.role, RECOVER_GATEWAY_ROLE)
+        self.assertEqual(pair.worker.role, RECOVER_WORKER_ROLE)
         # recover-pair derives the provider binding from the pin; it must name the provider,
         # not the workflow role.
-        self.assertEqual(gw_pin.provider, _GW_PROVIDER)
-        self.assertEqual(wk_pin.provider, _WK_PROVIDER)
-        # ``record_has_pins`` (the blocker) is exactly "both roles resolve".
-        self.assertTrue(gw_pin is not None and wk_pin is not None)
+        self.assertEqual(pair.gateway.provider, _GW_PROVIDER)
+        self.assertEqual(pair.worker.provider, _WK_PROVIDER)
 
     def test_the_two_role_vocabularies_really_do_differ(self) -> None:
         """Pins the trap itself, so a future 'tidy the imports' edit cannot silently re-arm it."""

@@ -38,6 +38,12 @@ from typing import Tuple
 # The two lane roles the pair is composed of, in a stable order (gateway first). Duplicated
 # as literals so this domain leaf imports no provider module; the provider binding
 # (gateway=codex / worker=claude by default) is resolved by the caller, never here.
+#
+# These are the LAUNCH-ATTESTATION slot labels. They agree with the declared-pin vocabulary
+# by value, but that vocabulary's owner is `mozyo_bridge.core.state.lane_pin_role` (Redmine
+# #13920) — pin writers/readers import PIN_ROLE_GATEWAY / PIN_ROLE_WORKER from there. Keep
+# these two in step with it; do NOT "align" them onto the legacy `codex` / `claude` spelling
+# that `domain.sublane_lifecycle` exports under these same NAMES for provider work.
 GATEWAY_ROLE = "gateway"
 WORKER_ROLE = "worker"
 

@@ -212,17 +212,14 @@ def run_hibernated_pin_repair(
         STATE_BLOCKED,
         decide_pair_reconcile,
     )
-    # The workflow-role vocabulary (``gateway`` / ``worker``) — deliberately from
-    # ``pair_launch_attestation``, the SAME module ``recover-pair`` reads its declared pins with
-    # (``_declared_pins_by_role(rec)`` then ``declared.get(GATEWAY_ROLE)``). The sibling
-    # ``domain.sublane_lifecycle`` exports constants of the same NAME whose values are the
-    # legacy provider tokens (``codex`` / ``claude``); pinning ``role`` to those would write a
-    # snapshot ``recover-pair`` cannot find by role, leaving it on the very
-    # ``hibernated_record_missing_pins`` this repair exists to clear. Producer and consumer must
-    # read one vocabulary, so they import from one module (Redmine #13879 acceptance 5).
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.pair_launch_attestation import (  # noqa: E501
-        GATEWAY_ROLE,
-        WORKER_ROLE,
+    # The canonical declared-pin slot vocabulary, from the ONE boundary that owns it
+    # (Redmine #13920). Producer and consumer must spell a slot the same way or the consumer
+    # silently reads the row as pin-less — the trap this repair was built to clear, and which
+    # `domain.sublane_lifecycle`'s same-NAMED constants (valued `codex` / `claude`) still set
+    # for anyone who copies an import from a sibling module.
+    from mozyo_bridge.core.state.lane_pin_role import (
+        PIN_ROLE_GATEWAY,
+        PIN_ROLE_WORKER,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
@@ -401,8 +398,8 @@ def run_hibernated_pin_repair(
             lane_id=lane_label,
         )
     managed_pairs = (
-        (gateway_provider, GATEWAY_ROLE),
-        (worker_provider, WORKER_ROLE),
+        (gateway_provider, PIN_ROLE_GATEWAY),
+        (worker_provider, PIN_ROLE_WORKER),
     )
     observation = observe_pair(
         rows,
