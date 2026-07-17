@@ -317,6 +317,25 @@ class CliTests(unittest.TestCase):
         payload = self._run({"provenance": "redmine:1:j#1", "findings": 1}, add_provenance=False)
         self.assertEqual(payload["escalation_decision"], "indeterminate")
 
+    def test_cli_malformed_unreadable_member_is_indeterminate(self):
+        # Redmine #13967 R5-F2: an empty / whitespace / non-string unreadable_subsystems
+        # member is an explicit unreadable marker we cannot attribute -> indeterminate. It
+        # is never silently dropped nor str-coerced (a null must not become subsystem "None").
+        for member in ("", "   ", None, 5, {"x": 1}):
+            payload = self._run(
+                {"provenance": "redmine:13967:j#81338", "findings": [], "unreadable_subsystems": [member]},
+                add_provenance=False,
+            )
+            self.assertEqual(payload["escalation_decision"], "indeterminate", member)
+
+    def test_cli_valid_unreadable_member_escalates_that_subsystem(self):
+        payload = self._run(
+            {"provenance": "redmine:13967:j#81338", "findings": [], "unreadable_subsystems": ["supervisor"]},
+            add_provenance=False,
+        )
+        self.assertEqual(payload["escalation_decision"], "escalate")
+        self.assertIn("supervisor", payload["escalating_subsystems"])
+
     def test_cli_valid_provenance_evaluates(self):
         payload = self._run(
             {

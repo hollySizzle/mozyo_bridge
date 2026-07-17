@@ -67,14 +67,24 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 _RELEASE_PENDING = frozenset({RELEASE_REQUESTED, RELEASE_PARTIAL})
 
 
-def _exact_str(value: object, *, required: bool = False) -> str | None:
-    """Return the stripped string ONLY when ``value`` is an exact ``str`` (Redmine #13967 R4-F2).
+# Sentinel distinguishing a KEY-ABSENT field from a KEY-PRESENT null / non-string value
+# (Redmine #13967 R5-F1). ``dict.get(k)`` returns None for both, conflating "the caller
+# omitted the field" (take the default) with "the caller gave an explicit null" (malformed).
+_MISSING = object()
 
-    A non-string (dict / list / number / None) is NEVER coerced via ``str(...)`` — it
-    returns None so the caller can treat the field as malformed. When ``required`` a
-    present-but-empty string also returns None. An absent/optional field returns "".
+
+def _exact_str(value: object, *, required: bool = False) -> str | None:
+    """Return the stripped string ONLY when ``value`` is an exact ``str`` (Redmine #13967 R4/R5-F).
+
+    Pass ``value`` via ``raw.get(key, _MISSING)`` so an absent key is distinguishable from a
+    present ``null``:
+
+    - ``_MISSING`` (key absent) -> ``None`` when ``required`` else ``""`` (the optional default);
+    - a present ``None`` (explicit JSON null) or any non-string -> ``None`` (malformed; NEVER
+      ``str(...)``-coerced, and NEVER folded into the absent-default — R5-F1);
+    - a present ``str`` -> its stripped value (``None`` when ``required`` and it is empty).
     """
-    if value is None:
+    if value is _MISSING:
         return None if required else ""
     if not isinstance(value, str):
         return None
@@ -96,11 +106,11 @@ def _lane_from_mapping(raw: object) -> DrainLane | None:
     """
     if not isinstance(raw, dict):
         return None
-    issue = _exact_str(raw.get("issue"), required=True)
-    state_class = _exact_str(raw.get("state_class"), required=True)
-    lane = _exact_str(raw.get("lane"))
-    next_owner = _exact_str(raw.get("next_action_owner"))
-    reason = _exact_str(raw.get("reason"))
+    issue = _exact_str(raw.get("issue", _MISSING), required=True)
+    state_class = _exact_str(raw.get("state_class", _MISSING), required=True)
+    lane = _exact_str(raw.get("lane", _MISSING))
+    next_owner = _exact_str(raw.get("next_action_owner", _MISSING))
+    reason = _exact_str(raw.get("reason", _MISSING))
     if issue is None or state_class is None or lane is None or next_owner is None or reason is None:
         return None
     rp = raw.get("release_pending", False)
@@ -213,10 +223,10 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         if not isinstance(row, dict):
             complete = False
             continue
-        issue = _exact_str(row.get("issue_id"), required=True)
-        state = _exact_str(row.get("workflow_state"), required=True)
-        lane = _exact_str(row.get("lane"))
-        next_owner = _exact_str(row.get("next_owner"))
+        issue = _exact_str(row.get("issue_id", _MISSING), required=True)
+        state = _exact_str(row.get("workflow_state", _MISSING), required=True)
+        lane = _exact_str(row.get("lane", _MISSING))
+        next_owner = _exact_str(row.get("next_owner", _MISSING))
         if issue is None or state is None or lane is None or next_owner is None:
             # Non-string / missing identity or state is malformed (never str-coerced) -> hold.
             complete = False
@@ -231,15 +241,15 @@ def _lanes_from_glance(path: str) -> tuple[tuple[DrainLane, ...], bool]:
         if not isinstance(diag, dict):
             complete = False
             continue
-        pr = _exact_str(diag.get("process_release"))
+        pr = _exact_str(diag.get("process_release", _MISSING))
         if pr is None or pr not in _RELEASE_PENDING:
             # A non-string process_release, or one not in the pending set, is not a release
             # row (a non-string is malformed -> hold; a known non-pending value is skipped).
             if pr is None:
                 complete = False
             continue
-        d_issue = _exact_str(diag.get("issue"), required=True)
-        d_lane = _exact_str(diag.get("lane"), required=True)
+        d_issue = _exact_str(diag.get("issue", _MISSING), required=True)
+        d_lane = _exact_str(diag.get("lane", _MISSING), required=True)
         if d_issue is None or d_lane is None:
             # A release-pending diagnostic row with no exact-string durable identity must NOT
             # become a phantom release_dogfood lane that reads `releasable` — it makes the

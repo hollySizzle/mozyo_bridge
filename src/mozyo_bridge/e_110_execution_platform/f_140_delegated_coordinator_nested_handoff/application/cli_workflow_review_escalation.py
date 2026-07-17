@@ -180,12 +180,19 @@ def cmd_workflow_review_escalation(args: argparse.Namespace) -> int:
         indeterminate_reasons.append("threshold_below_one")
         threshold = DEFAULT_ESCALATION_THRESHOLD
 
-    unreadable = (
-        list(snapshot_unreadable)
-        + list(getattr(args, "unreadable_subsystem", None) or [])
-        + malformed_subsystems
+    # An `unreadable_subsystems` member must be an EXACT non-empty string. A nameable member
+    # escalates that subsystem; an empty / whitespace / non-string member is an explicit
+    # unreadable marker we cannot attribute, so it makes the projection indeterminate — it is
+    # NEVER silently dropped nor str-coerced into an invented name (Redmine #13967 R5-F2).
+    unreadable: list[str] = list(malformed_subsystems)
+    declared_unreadable = list(snapshot_unreadable) + list(
+        getattr(args, "unreadable_subsystem", None) or []
     )
-    unreadable = [str(s).strip() for s in unreadable if str(s).strip()]
+    for member in declared_unreadable:
+        if isinstance(member, str) and member.strip():
+            unreadable.append(member.strip())
+        else:
+            indeterminate_reasons.append("unattributable_unreadable_member")
 
     projection = project_review_escalation(
         findings, threshold=threshold, unreadable_subsystems=unreadable
