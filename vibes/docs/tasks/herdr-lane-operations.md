@@ -116,7 +116,7 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 - fail-closed 軸: inventory unreadable / duplicate assigned name / foreign occupant / locator 欠落 / busy agent / pending composer / 同一 locator への衝突 → すべて **zero-close**。
 - **durable obligation gate** (review j#80506 F4 / j#80523 R3-F1・R3-F3): idle / turn-ended は **receiver state** であって durable obligation の不在証明ではない (skill `references/workflow.md` `### ACK / delivery / completion の分離`)。
   - **ordering は `pending publish → obligation read → close`**。reserve を先に置くのが要点で、**publish して初めて dispatch 側が読める**。逆順 (先に読む) は必ず stale な答えになり、読んだ後に dispatch が reserve できてしまう。
-  - **双方向**: 全 outbox reserve→send edge は send の**前**に retirement authority を確認し、`pending` / `completed` なら **zero-send** (`herdr_dispatch_execution`)。∴ 先に publish した側が勝ち、他方は**必ず何もしない** (retire 先行→`sent=0` / dispatch 先行→`closed=0`)。
+  - **双方向**: **全 covered source の実 send edge** が send の**前**に retirement authority を確認し、`pending` / `completed` なら **zero-send**。対象 edge: `herdr_dispatch_execution.execute_dispatch` / `callback_sweep` / `operator_startup_resume` / **`CallbackOutboxProcessor.deliver`** / **`execute_herdr_forward`** (単一 seam `target_is_retiring` を共有)。★source を covered (=読む) にするだけでは不十分で、**その source の実 send edge を塞ぐ**必要がある (j#80620 R5-F2)。∴ 先に publish した側が勝ち、他方は**必ず何もしない** (retire 先行→`sent=0` / dispatch 先行→`closed=0`)。
   - 読む source は **covered な 3 つ** (下表): dispatch outbox / callback outbox (owed TO) と forward fence (owed **FROM**)。いずれかが **不読なら `obligation_unreadable` で zero-close**。
   - **durable obligation source matrix** (どの store が scratch pair の slot に owed な work を持ちうるか。正本は `tests/regressions/test_issue_13892_obligation_source_matrix.py` が pin):
 
@@ -131,7 +131,21 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 | `SessionInventory` | structurally-inapplicable | pane keyed だが「never the source of truth」な cache。obligation semantics を持たない |
 | `CallbackSweepLease` | structurally-inapplicable | key が `issue` + `anchor` (Redmine anchor) を要求。かつ **attempt lease** であって owed work ではない |
 
-- **`delivered` の相関** (R4-F1): delivery ACK は task completion ではないので単独では通さず、**無条件 block もしない** (それは normal pair を恒久 retire 不能にする)。send の `(issue, journal)` で **durable disposition を相関**し、**positively discharged なら通す / 未完なら owed / 不読・不明なら uncorrelated で block**。
+- **`delivered` の相関** (R4-F1 / R5-F1、設計 j#80629 Option 1A): delivery ACK は task completion ではないので単独では通さず、**無条件 block もしない** (それは normal pair を恒久 retire 不能にする)。**source-of-truth の Redmine issue/journal** を読んで相関する (`RedmineJournalSource` / live は `LiveRedmineJournalSource.from_environment()`)。★**CallbackOutbox は相関 source にしない** — `delivered` は *callback の* delivery ACK、`dead_letter` は「unclassified / retry 枯渇」で、**どちらも元 dispatch が渡した work の completion を所有しない** (j#80620 裁定)。Redmine が読めないことは代替 authority 採用の根拠にならない → **不読は block**。
+
+### `dispatch-disposition` marker (#13892 / j#80629)
+
+`action_id` は元々 **AUTHORIZE marker の 1 箇所にしか書かれず、それを echo する terminal marker が無かった**ため、「どの dispatch **round** が終わったか」を Redmine から証明できなかった。その欠落を埋める専用 channel。
+
+```text
+[mozyo:dispatch-disposition:action_id=<opaque>:dispatch_journal=<AUTHORIZE の journal>:workspace_id=<ws>:lane_id=<lane>:target_assigned_name=<exact name>:terminal_gate=review_request:terminal_journal=<review_request の journal>:conclusion=discharged:recorded_by_role=implementation_gateway]
+```
+
+- **issue identity は marker 本文でなく owning entry から**取る (self-report の spoof 防止)。
+- **`review_request` のみが positive terminal gate**。★**`implementation_done` は terminal ではない** — partial な implementation_done は正当な日常形であり (実例: #13892 j#80627 は「部分修正・未完」を明示した implementation_done)、terminal にすると **worker が work を負ったまま書いた journal が false discharge を生む**。`blocked` / progress / callback delivery / `dead_letter` も discharge しない。
+- **writer は `implementation_gateway` 固定** (worker の自己申告完了は discharge にしない)。canonical writer は記録直前に **credential-gated live Redmine を fresh read** し、(1) `dispatch_journal` に valid な AUTHORIZE が **exactly one** 存在し identity が exact 一致、(2) `terminal_journal` が **dispatch より後**の canonical `review_request`、(3) 記録は terminal より後、(4) 同一 payload は **idempotent no-op** / conflict は **zero-write** を確認する。prose / pane / CallbackOutbox / delivery ACK / issue status からの自動 backfill は禁止。historical repair も同じ producer・同じ検査を通す。
+- **reader (`session-retire`)**: **AUTHORIZE → later `review_request` → later exact disposition の三者一致のみ `discharged`**。zero match は `owed`、不読 / credential 失敗 / blank identity / foreign field / 順序逆転 / invalid fixed field / duplicate conflict は **block**。同一 payload の retry は dedupe、同じ `action_id` に異なる terminal/identity があれば ambiguous block。**issue closed だけ / 後続 gate の存在だけ / CallbackOutbox `delivered|dead_letter` だけでは discharge しない**。changes_requested 後の再 dispatch は **new journal + new `action_id`** なので、旧 disposition は新 action を discharge しない。
+- **workflow gate ではない**: channel は watcher の recognized channels と `GATE_BEARING_KINDS` に **入れない**。correlation を説明する record であって workflow event ではない。
 - **判定の正本は `tests/regressions/test_issue_13892_obligation_source_matrix.py`**。covered は「実際に scratch slot が現れ reader が返す」probe で、inapplicable は「**不可能にしている precondition**」を assert する (store の形が変われば落ちる)。prose は腐るので判定を prose に置かない。
 
 - **partial close は replay 可能**: pending attempt に **pinned locators** と closed progress が durable に残るため、re-run の close authority は **`attempt.pinned` − (positively absent | 既 closed)** の **exact locator のみ**。★**assigned name が一致しても locator が違えば `pin_drift` で non-success** — 同名で relaunch された別 pair を旧 attempt の権限で閉じないため (review j#80523 R3-F2)。crash 位置別の replay: `live + pending` → full preflight 再実行後に close resume / `absent + pending` → whole-unit re-measure 後に **completed へ repair** / `absent + completed` → **idempotent success (exit 0)** / `absent + proof 無し` → `retire_evidence_absent`。fence completion write 失敗は non-success (`completion_unproven`) だが **truthful な closed は保持**し、次回 run が pending から repair する。
