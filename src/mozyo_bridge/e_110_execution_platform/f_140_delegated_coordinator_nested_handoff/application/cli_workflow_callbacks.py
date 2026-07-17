@@ -755,9 +755,13 @@ def register_callbacks(sub) -> None:
     allowlist around. This is the callback family's own registrar and a receiver admission rail is
     a callback subcommand, so the registration is cohesive here.
     """
-    from .cli_workflow_recovery_admission import register_callback_admit
+    from .cli_workflow_recovery_admission import (
+        register_callback_admit,
+        register_callback_receipt,
+    )
 
     register_callback_admit(sub)
+    register_callback_receipt(sub)
     p = sub.add_parser(
         "callbacks",
         description=(

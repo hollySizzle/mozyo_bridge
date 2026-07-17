@@ -38,7 +38,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_recovery_record import (
     build_recovery_recorder,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_recovery_key import (
+    RETRY_OF_NONE,
+    render_recovery_action_marker,
+    resolve_recovery_action_key,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+    SWEEP_RECOVERY_ACTION_ID,
     SWEEP_RECOVERY_RECEIVER,
     resolve_watermark,
 )
@@ -248,6 +254,87 @@ class CrashAndRetryTests(_AdmissionBase):
         if retried.may_actuate:
             effects += 1
         self.assertEqual(effects, 1, "the explicit new-anchor retry actuates exactly once")
+
+
+class DuplicatePublicationTests(_AdmissionBase):
+    """Review j#81021 F2: a new journal id is not authorization, end to end.
+
+    The prior `CrashAndRetryTests` opened a NEW dispatch round for its retry, which changes the
+    action tuple — so it never drove the case that actually broke: the SAME action, re-published.
+    """
+
+    def test_a_copied_record_does_not_actuate_a_second_time(self):
+        """THE F2 regression, through the real producer's own note.
+
+        The record here is verbatim what `build_recovery_recorder` wrote; only the journal it sits
+        at differs — an accidental duplicate publication, or a hand-copied note.
+        """
+        jid = self.produce()
+        first = self.admit(jid)
+        self.assertEqual(first.outcome, ADMIT_ADMITTED, first.detail)
+
+        original_note = next(e.notes for e in self.src.entries if e.journal_id == jid)
+        self.src.entries.append(entry("80900", original_note))
+
+        copied = self.admit("80900")
+        self.assertEqual(copied.outcome, ADMIT_CONFLICT, copied.detail)
+        self.assertFalse(
+            copied.may_actuate, "the same recovery actuated twice under a different journal id"
+        )
+        self.assertNotEqual(copied.key_digest, first.key_digest, "different keys, as expected...")
+        self.assertIn("retry_of", copied.detail, "...caught by the ACTION, not the key")
+
+    def test_an_authorized_retry_is_admitted_end_to_end(self):
+        """The liveness path the coordinator uses after a claim-before-effect crash.
+
+        Disposition 4: the coordinator issues a NEW durable recovery action anchor naming the prior
+        key. `render_recovery_action_marker` is the canonical producer of that linkage.
+        """
+        jid = self.produce()
+        first = self.admit(jid)
+        self.assertEqual(first.outcome, ADMIT_ADMITTED)
+        # ...the receiver crashes before its effect. Claims are never reclaimed, so the coordinator
+        # explicitly re-issues the action, naming the key it retries.
+        retry_marker = render_recovery_action_marker(
+            original_dispatch_anchor=ANCHOR,
+            workspace_id=WS,
+            lane_id=LANE,
+            lane_generation=GEN,
+            route_identity=TARGET,
+            receiver_identity=RECEIVER,
+            action_kind=SWEEP_RECOVERY_ACTION_ID,
+            retry_of=first.key_digest,
+        )
+        self.src.entries.append(
+            entry("81000", f"## Gate: progress_log — recovery retry\n\n{retry_marker}")
+        )
+        retried = self.admit("81000")
+        self.assertEqual(retried.outcome, ADMIT_ADMITTED, retried.detail)
+        self.assertTrue(retried.may_actuate)
+
+    def test_a_forged_retry_linkage_is_refused(self):
+        """`retry_of` must name a key this authority actually admitted."""
+        jid = self.produce()
+        self.assertEqual(self.admit(jid).outcome, ADMIT_ADMITTED)
+        forged = render_recovery_action_marker(
+            original_dispatch_anchor=ANCHOR, workspace_id=WS, lane_id=LANE, lane_generation=GEN,
+            route_identity=TARGET, receiver_identity=RECEIVER,
+            action_kind=SWEEP_RECOVERY_ACTION_ID, retry_of="a" * 64,
+        )
+        self.src.entries.append(entry("81000", f"## retry\n\n{forged}"))
+        out = self.admit("81000")
+        self.assertEqual(out.outcome, ADMIT_CONFLICT, out.detail)
+        self.assertFalse(out.may_actuate)
+
+    def test_the_sweep_never_mints_a_retry(self):
+        """The canonical stall record declares itself NOT a retry — the fail-closed default."""
+        jid = self.produce()
+        lookup = resolve_recovery_action_key(
+            self.src.read_entries(ISSUE), recovery_action_journal=jid
+        )
+        self.assertTrue(lookup.resolved, lookup.detail)
+        self.assertEqual(lookup.key.retry_of, RETRY_OF_NONE)
+        self.assertFalse(lookup.key.is_retry)
 
 
 class SupersedeTests(_AdmissionBase):

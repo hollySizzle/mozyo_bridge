@@ -348,6 +348,8 @@ doctrine としての position:
 - rail は **advisory** である。sidecar が存在しない以上、「rail を呼ばずに effect へ進む」経路を code で塞ぐ手段はない (`## Sidecar の位置づけ`)。義務の所在は recovery record 自身が載せる受領契約であり、機械的 bypass 防止は **別 residual** として `mozyo_bridge_pty` inspector / sidecar workstream が所有する。本 repo の実装が sidecar を仮装してはならない。
 - **claim は reclaim しない** (safety-first)。claim 後に crash した round は失われ、同一 key は再 admit されない。TTL / presumed-dead による自動再開は導入しない。retry が要る場合は coordinator が **新しい recovery action anchor** を durable journal として明示発行し (`retry_of=<prior key>` を記録)、新しい journal id が新しい key を生む。
 - 「次の sweep が自動的に新 anchor を作って救う」は **成立しない**。sender 側 `dispatch_outbox_fence` は一度 `delivered` になった anchor を二度と再送しないため、自動 reissue は存在しない (j#80987 で code 実測)。liveness は明示的な coordinator 判断が担う。
+- **`retry_of` は runtime が検証する契約であり、運用 convention ではない** (review j#81021 F2)。key は publication 単位 (`recovery_action_journal` を含む) と action 単位 (それを含まない) の 2 つの digest を持ち、authority は後者で索引する。同一 action の 2 件目以降の publication は、直前に admit された key を `retry_of` で名指す場合にのみ admit される。名指さない publication — 誤 publication、note の手動複製、非 canonical writer — は `conflict` で zero-actuation。**新しい journal id は authorization ではない**: そう扱うと、reclaim しない claim を journal id の差だけで迂回できてしまう。
+- **store の全損は fresh install と区別する** (review j#81021 F1)。pair (DB + 識別 sidecar) の外側に first-init seal を置き、seal が `operational` を示すのに pair が無い状態は **LOSS として fail-closed**。seal は store より先に書くので、crash 窓は「未 grant で再 mint 可能な `initializing`」側に落ちる。lifecycle 判断は OS advisory lock 下で state を再読して行う。この store に `recover()` は無い (再 mint は既 actuate 済み recovery を再 admit する)。**docstring に書くだけでは性質は生じない**: 初版は「lost store fails closed」と書きながら、両方欠損を常に初回初期化として扱っていた。
 
 ## Cross-References
 
