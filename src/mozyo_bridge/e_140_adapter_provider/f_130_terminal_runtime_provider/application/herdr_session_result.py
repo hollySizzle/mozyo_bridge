@@ -20,6 +20,15 @@ from dataclasses import dataclass, field
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
     SLOT_STALE as LIVENESS_STALE,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
+    COMPENSATION_NOT_NEEDED,
+    DISPOSITION_ADOPTED,
+    DISPOSITION_FRESH_LAUNCHED,
+    DISPOSITION_PLANNED,
+    DISPOSITION_SURFACED,
+    HEALTH_HEALTHY,
+    HEALTH_NOT_PROBED,
+)
 
 
 # Per-slot outcome tokens.
@@ -33,16 +42,67 @@ SLOT_STALE = LIVENESS_STALE
 # env is unverified, so it is surfaced read-only and never blind-adopted.
 SLOT_UNATTESTED = "unattested"
 
+#: The launch-disposition axis is *derived* from the outcome token, deliberately: the
+#: outcome stays the single setter, so the two can never drift apart (Redmine #13948).
+#: Total over the closed outcome vocabulary — an unmapped token raises rather than
+#: defaulting, because a silently-defaulted disposition is how a wrong label survives.
+_DISPOSITION_BY_OUTCOME: dict[str, str] = {
+    SLOT_PLANNED: DISPOSITION_PLANNED,
+    SLOT_ADOPTED: DISPOSITION_ADOPTED,
+    SLOT_LAUNCHED: DISPOSITION_FRESH_LAUNCHED,
+    # Both read-only surfacings of a PRE-EXISTING slot: this run neither planned, adopted,
+    # nor started them, so neither is ever a rollback target.
+    SLOT_STALE: DISPOSITION_SURFACED,
+    SLOT_UNATTESTED: DISPOSITION_SURFACED,
+}
+
 
 @dataclass(frozen=True)
 class SlotResult:
-    """The outcome of preparing one provider slot's durable herdr identity."""
+    """The outcome of preparing one provider slot's durable herdr identity.
+
+    ``outcome`` says what this run *did* with the slot. It never said whether the thing
+    it started came up — that is ``health``, observed after the fact (Redmine #13948,
+    Answer j#80989): a slot is ``launched`` the moment ``agent start`` returns a locator,
+    which is a claim by the launcher, not by the process. The axes are kept separate
+    because collapsing them is the defect: there was previously nowhere to say "started,
+    and nothing is running there".
+
+    ``compensation`` records what this run owes for a side effect it already caused.
+    session-start only ever reports it; the explicit public rollback rail is the only
+    thing that may act on it (Answer j#80991).
+    """
 
     provider: str
     assigned_name: str
     outcome: str
     locator: str = ""
     detail: str = ""
+    #: The startup-health axis (:mod:`...domain.startup_health`). ``not_probed`` until the
+    #: post-launch probe runs — and ``not_probed`` is NOT a success.
+    health: str = HEALTH_NOT_PROBED
+    #: The fixed provider-profile blocker token; non-empty only for a matched startup screen.
+    blocker_id: str = ""
+    #: The compensation axis. Only a fresh launch can ever owe one.
+    compensation: str = COMPENSATION_NOT_NEEDED
+    #: A fixed operator sentence for ``health`` (never observed pane content).
+    health_detail: str = ""
+
+    @property
+    def disposition(self) -> str:
+        """What this run did with the slot, on the closed disposition axis."""
+        try:
+            return _DISPOSITION_BY_OUTCOME[self.outcome]
+        except KeyError:  # pragma: no cover - guards a vocabulary change, not a path
+            raise ValueError(
+                f"slot outcome {self.outcome!r} has no launch disposition; extend "
+                "_DISPOSITION_BY_OUTCOME when the outcome vocabulary grows"
+            ) from None
+
+    @property
+    def healthy(self) -> bool:
+        """True only on a positively observed healthy slot."""
+        return self.health == HEALTH_HEALTHY
 
     def as_payload(self) -> dict:
         return {
@@ -51,6 +111,11 @@ class SlotResult:
             "outcome": self.outcome,
             "locator": self.locator,
             "detail": self.detail,
+            "disposition": self.disposition,
+            "health": self.health,
+            "blocker_id": self.blocker_id,
+            "compensation": self.compensation,
+            "health_detail": self.health_detail,
         }
 
 
@@ -100,11 +165,39 @@ class SessionStartResult:
     tab_pane_id: str = ""
     tab_pane_reclaimed: bool = False
     tab_pane_detail: str = ""
+    #: This run only planned (``--dry-run``): it started nothing, so there is nothing to
+    #: observe and nothing to compensate. A plan is reported successful on its own terms.
+    dry_run: bool = False
+    #: The immutable startup-transaction identity this run reserved before its first side
+    #: effect (Redmine #13948). Blank for a dry run. It is the ONLY handle an explicit
+    #: rollback/replay may act under, so it is surfaced for the operator to pass back.
+    action_id: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """Fully successful iff every requested role was observed healthy (j#80989 Q4).
+
+        This is the contract the defect violated: success used to mean "``agent start``
+        was accepted for every slot", so a pair whose Claude exec'd and exited instantly
+        still exited 0 (#13882 j#80951 / j#80968). It now means every requested role is
+        live at the locator we launched, screen-clear, and locator-matched self-attested.
+
+        A read-only surfacing (``stale`` / ``unattested``) is deliberately NOT success:
+        the pair is not usable, and saying so is the point of the issue.
+        """
+        if self.dry_run:
+            # Nothing was started, so no health claim is made or needed: the deliverable
+            # of a dry run is the plan itself.
+            return True
+        return bool(self.slots) and all(slot.healthy for slot in self.slots)
 
     def as_payload(self) -> dict:
         return {
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
+            "ok": self.ok,
+            "dry_run": self.dry_run,
+            "action_id": self.action_id,
             "slots": [slot.as_payload() for slot in self.slots],
             "herdr_workspace_id": self.herdr_workspace_id,
             "base_pane_id": self.base_pane_id,
