@@ -111,6 +111,24 @@ CREATE TABLE IF NOT EXISTS store_meta (
 """
 _STORE_NONCE_KEY = "store_nonce"
 
+#: The table/column shape that IS part of schema version 1 (review j#81092 R3-F1). A store
+#: at the right `user_version` but missing any of these is a partial schema and fails
+#: closed, rather than raising `no such table` / `no such column` out of a read.
+_EXPECTED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "startup_actions": (
+        "action_id",
+        "workspace_id",
+        "lane_id",
+        "providers",
+        "phase",
+        "revision",
+        "participants",
+        "reserved_at",
+        "updated_at",
+    ),
+    "store_meta": ("key", "value"),
+}
+
 
 class StartupTransactionError(RuntimeError):
     """The startup transaction authority is unusable / was asked for something invalid."""
@@ -366,47 +384,79 @@ class StartupTransactionFence:
             return None
         return str(row[0]) if row is not None else None
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open the store and prove it is the one its seal names (fail-closed).
+    def _verify_shape(self, conn: sqlite3.Connection) -> None:
+        """The table/column shape IS part of the schema (review j#81092 R3-F1).
 
-        The schema check alone is not an identity check (review j#81070 R1-F7): a store
-        swapped for another valid-schema store passed it, and this authority then answered
-        for actions it never recorded. The seal/DB nonce join is what the borrowed
-        precedent (`scratch_retirement_fence._verify_identity`) uses for exactly that, and
-        omitting it was a hole in the pattern, not a simplification of it.
+        A store at the right ``user_version`` but missing the ``startup_actions`` table (or
+        a column of it) is a partial schema, which `managed-state-model.md` requires to
+        fail closed byte-unchanged — not to raise ``no such table`` out of a read. Checking
+        the shape here, under the same normalized guard as the version/seal, is what turns
+        a partial store into a structured `rollback_authority_unavailable` instead of a raw
+        ``OperationalError`` escaping the public rail.
         """
-        # The connect + first reads are INSIDE the guard (review j#81092 R2-F2): a store
-        # whose bytes are not a database raises `sqlite3.DatabaseError` from
-        # `PRAGMA user_version`, and a version cell that is not an int raises TypeError /
-        # ValueError from `int(...)`. Leaving those raw made the public rail's "never
-        # raises" contract false and hid an unreadable authority behind a stack trace
-        # instead of a structured `rollback_authority_unavailable`. The borrowed precedent
-        # normalizes exactly this set in BOTH `_connect_ro` and `_connect_rw`
-        # (`scratch_retirement_fence.py`); porting only `_verify_identity` (R1-F7) left this
-        # half of the same authority-unreadable fail-closed face behind.
+        for table, expected in _EXPECTED_COLUMNS.items():
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            actual = {str(row[1]) for row in rows}
+            if not actual:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} is at the right schema "
+                    f"version but is missing the {table!r} table (partial schema); fail "
+                    "closed rather than read an incomplete authority"
+                )
+            missing = set(expected) - actual
+            if missing:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} {table!r} table is "
+                    f"missing columns {sorted(missing)} (partial schema); fail closed"
+                )
+
+    def _verify(self, conn: sqlite3.Connection) -> sqlite3.Connection:
+        """Prove an open connection is a complete, identity-matched authority (fail-closed).
+
+        Three checks, all normalized to :class:`StartupTransactionError` by the callers'
+        shared guard: the schema *version*, the table/column *shape* (R3-F1), and the
+        seal/DB-nonce *identity* (R1-F7). The schema check alone is not an identity check —
+        a store swapped for another valid-schema store passed it — and neither is enough
+        without the shape, because a right-version store can still be missing its tables.
+        """
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version != STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION:
+            raise StartupTransactionError(
+                f"startup transaction store schema {version!r} is not this runtime's "
+                f"{STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}; fail closed rather than "
+                "read an unknown shape"
+            )
+        self._verify_shape(conn)
+        seal = self._read_seal_nonce()
+        if seal is None:
+            raise StartupTransactionError(
+                f"the startup transaction authority {self.path} has no readable "
+                "identity seal; the actions it holds cannot be trusted"
+            )
+        if self._db_nonce(conn) != seal:
+            raise StartupTransactionError(
+                f"the startup transaction authority {self.path} does not match its "
+                "identity seal (store replacement); fail closed rather than close "
+                "panes on the strength of another store's record"
+            )
+        return conn
+
+    def _open(self, uri: str) -> sqlite3.Connection:
+        """Open + verify a connection, normalizing EVERY unreadable shape (fail-closed).
+
+        The one funnel for both read and write connections. Normalizing here — not just at
+        `PRAGMA user_version` — is the R3-F1 lesson: the same authority-unreadable face has
+        to cover the shape read and (via the callers) the row read and decode too, or a
+        partial store escapes the public rail's "never raises" contract as a raw
+        ``OperationalError`` / ``JSONDecodeError``. `mode` is caller-chosen and always
+        existing-only (`ro` / `rw`, never `rwc`): a read must never *create* the authority
+        it is checking (R3-F1), and a write only ever runs after `reserve` has bootstrapped.
+        """
         conn = None
         try:
-            conn = sqlite3.connect(self.path, isolation_level=None)
+            conn = sqlite3.connect(uri, uri=True, isolation_level=None)
             conn.execute("PRAGMA busy_timeout = 2000")
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version != STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION:
-                raise StartupTransactionError(
-                    f"startup transaction store schema {version!r} is not this runtime's "
-                    f"{STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION}; fail closed rather than "
-                    "read an unknown shape"
-                )
-            seal = self._read_seal_nonce()
-            if seal is None:
-                raise StartupTransactionError(
-                    f"the startup transaction authority {self.path} has no readable "
-                    "identity seal; the actions it holds cannot be trusted"
-                )
-            if self._db_nonce(conn) != seal:
-                raise StartupTransactionError(
-                    f"the startup transaction authority {self.path} does not match its "
-                    "identity seal (store replacement); fail closed rather than close "
-                    "panes on the strength of another store's record"
-                )
+            return self._verify(conn)
         except StartupTransactionError:
             if conn is not None:
                 conn.close()
@@ -418,7 +468,14 @@ class StartupTransactionFence:
                 f"the startup transaction authority {self.path} is unreadable ({exc}); "
                 "fail closed rather than treat an unreadable store as an empty one"
             ) from exc
-        return conn
+
+    def _connect_ro(self) -> sqlite3.Connection:
+        """A strict read-only, existing-only connection (never fabricates the store)."""
+        return self._open(f"file:{self.path}?mode=ro")
+
+    def _connect_rw(self) -> sqlite3.Connection:
+        """A read-write, existing-only connection (a write runs only after reserve)."""
+        return self._open(f"file:{self.path}?mode=rw")
 
     def _hold(self):
         """Take the exclusive, non-blocking advisory lock (contention refuses, never waits)."""
@@ -436,7 +493,7 @@ class StartupTransactionFence:
                 "the startup transaction store is damaged (a partial artifact set); "
                 "refusing to read an authority whose shape cannot be trusted"
             )
-        conn = self._connect()
+        conn = self._connect_ro()
         try:
             row = conn.execute(
                 "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
@@ -444,9 +501,19 @@ class StartupTransactionFence:
                 " WHERE action_id = ?",
                 (_norm(action_id),),
             ).fetchone()
+            # The row read AND its decode are inside the guard (review j#81092 R3-F1): a
+            # malformed `participants` cell raises JSONDecodeError from `_row_to_action`,
+            # and a query against a partial schema raises OperationalError — both are the
+            # authority being unreadable, not the action being absent, so both normalize to
+            # a structured refusal rather than escaping the public rail's "never raises".
+            return _row_to_action(row) if row else None
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise StartupTransactionError(
+                f"the startup transaction authority {self.path} could not be read "
+                f"({exc}); fail closed rather than treat it as empty"
+            ) from exc
         finally:
             conn.close()
-        return _row_to_action(row) if row else None
 
     # -- writes ------------------------------------------------------------
 
@@ -469,7 +536,7 @@ class StartupTransactionFence:
                 )
             if shape.absent:
                 self._create_fresh(hashlib.sha256(now.encode("utf-8")).hexdigest())
-            conn = self._connect()
+            conn = self._connect_rw()
             try:
                 existing = conn.execute(
                     "SELECT phase FROM startup_actions WHERE action_id = ?", (action_id,)
@@ -568,7 +635,7 @@ class StartupTransactionFence:
         return action
 
     def _write(self, action_id: str, *, phase: str, participants) -> None:
-        conn = self._connect()
+        conn = self._connect_rw()
         try:
             conn.execute(
                 "UPDATE startup_actions SET phase = ?, participants = ?, updated_at = ?,"
@@ -580,6 +647,11 @@ class StartupTransactionFence:
                     _norm(action_id),
                 ),
             )
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise StartupTransactionError(
+                f"the startup transaction authority {self.path} could not be written "
+                f"({exc}); fail closed"
+            ) from exc
         finally:
             conn.close()
 
