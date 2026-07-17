@@ -566,6 +566,69 @@ Table naming:
       `observed_at`（実証拠）、`runtime_revision` は空（herdr に runtime version 観測 surface が無い、
       #13809 / #13810 R4-F1 — fabricate しない）。startup self-attestation は generation ごとに 1 回・locator で
       pin されるので、同 generation の replay は同じ `observed_at` を読み byte-equality が安定する。
+    - **record-less scratch pair retire は本 component を書かない** (`herdr session-retire`、#13892、live evidence #13882
+      j#80060 / j#80066)。`herdr session-start` の scratch pair は lane lifecycle row を **一度も持たない**ため、上記 4 契約
+      (#13754 guarded close / #13841 migration / #13842 reconcile / #13845 bound retire) は **すべて row の存在を前提**に
+      しており構造的に拒否する: `--execute` は `attest_retire_target` が `record is None` で `lane_owner_unverified`、
+      他 3 者は `lane_not_declared` / `CAS_UNEXPECTED_STATE`。4 契約の間に収束経路が無く恒久停止する点は #13841 / #13842 /
+      #13845 と同型だが、**解法は反対側**にある: row を作らない。★**row 捏造は却下** (#13882 j#80066): retire を通すためだけに
+      lifecycle row を mint するのは durable authority の fabrication であり、`operator_current_state` の復旧契約
+      (Redmine からの explicit re-declare) を偽の row で汚す。★**row が不要な理由は capacity 経路が live pane 由来だから**:
+      `enumerate_active_lanes` は herdr live pane を畳んで roster を作り、lifecycle disposition は **非 active を除外する
+      filter** としてのみ効く (`glance_snapshot_source.py`)。row を持たない unit は disposition `None` ゆえ roster に残り、
+      **pane が消えること自体**が唯一かつ十分な capacity 回収手段である。★**durable outcome は `scratch_retirement_fence` の row**
+      (設計 j#80526 Option A-prime)。`managed_events` は **不可** — `append_only_lossy` かつ「append 失敗は caller を壊さない」
+      「completion truth にしない」charter (`:153` / `:179` / `:826`) で、F2 が要求する load-bearing な completion と正面から矛盾する。
+      lifecycle row も Acceptance 4 が禁止する。ゆえに **第 4 の state kind** を立てる:
+      **operational action-idempotency / side-effect transaction authority** (workflow truth でも desired-state history でも
+      lifecycle authority でもない)。`managed_events` は fence completed の **後**に best-effort narrative audit として append し、
+      その失敗は proven retirement を無効化しない。★signature は
+      **「lifecycle record が無いこと」** で、record を持つ lane は `lane_record_present` zero-write で既存 surface へ route する
+      (各 surface が自らの signature を literal に述べる規律の適用。共有 predicate へ一般化しない)。lifecycle store が **不読**の
+      場合は「record 無し」と読まず fail-closed。★**attestation を要求しない** (#13892 j#80483、#13842 の意図的反転):
+      #13842 が attestation を要るのは generation-bound pin を row へ **write** するためだが、scratch pair は row も generation も
+      持たず attestation は構造的に取得不能 (session-start は self-attest 前に pane を返す)。要求すれば本 rail が対象とする唯一の
+      shape (live-but-unattested = #13882 の保全 pair そのもの) を恒久 retire 不能にし、**over-block による恒久 stuck**
+      (#13845 が名指しした defect 再生産) を作る。identity は assigned-name の injective encoding + uniqueness
+      (`session-start` が重複名で fail-closed) + foreign 不在 + duplicate 不在 + locator 一意で証明する。★**partial close は
+      block せず resume** (#13847 R1-F1 と同型): 前 run で閉じた slot は positive absence として観測し残りを閉じる。#13842 の
+      `pair_incomplete` block を踏襲すると中断した retire が恒久 stuck になる。acceptance 2 の「expected slot ちょうど 2」は
+      **expected set (binding の gateway + worker)** の濃度であって観測 live 数ではない (観測は 2/1/0 を取りうる)。★raw scan
+      (`expected_slot_rows`) を併読し duplicate は **canonical slot key** で数える (#13845 j#80148 / j#80187 R3-F1 と同じ規律)。
+      ★deadness の positive 証明のみで進む: `classify_named_slot` が `SLOT_STALE` と積極判定した shell residue は agent 不在ゆえ
+      turn / composer を持たず close 可 (runtime `unknown` だけで block すると residue が恒久残留する)。process mutation は
+      **自 pair の pin-matched close のみ**で、worktree/branch 削除・launch/resume・store 直接 mutation は伴わない。
+      ★**durable obligation は runtime signal で代替できない**（review j#80506 F4）: idle / turn-ended / composer settled は
+      `ack-completion-receiver-state.md` の分類で言う **receiver state** であり「その slot に *owed* な work が無い」ことを
+      証明しない。close の前に対象 assigned name 宛の **非終端 dispatch-outbox row**（`reserved` / `uncertain`）を bounded read
+      （`DispatchOutboxFence.obligations_for_targets`。**全 state を causal identity 付きで返す** — `delivered` は delivery ACK であって completion ではないため store 側で捨てない）し、存在すれば `work_obligation_present`、store 不読は
+      `obligation_unreadable` で zero-close。`state_of` は完全な 6-tuple `FenceKey` を要するため「これから閉じる pane に owed な物」
+      を列挙できず、by-target read の新設が要った（既存 guard は不変の read-only 追加）。
+      ★**close の return code は空の証明ではない**（review j#80506 F3。#13842 j#79320 R3 の precedent を自 surface へ適用）:
+      close 後に **fresh inventory** で unit 全体を再測定し expected 全不在 + foreign/duplicate 不在を positive 確認できたときのみ
+      durable 記録 + success。residue は `post_close_residue`、不読は `post_close_unreadable` で、**commit 済み `closed` を保持した
+      まま** non-success。
+      ★**zero-slot は retirement ではない**（review j#80506 F1）: absence は「pair がここに無い」ことの証明であって「**この command が
+      retire した**」ことの証明ではなく、`--lane` typo と never-launched が absence として同一に見える。**exact な prior completion +
+      action-time live-zero を証明できる時だけ** `already_retired`（**exit 0**）、それ以外は `retire_evidence_absent` で
+      non-success / zero-write。★**その proof を持つのが専用 authority `scratch_retirement_fence`**（設計 j#80526 Option A-prime）。
+      置き場の 3 択が同時に閉じていた（`managed_events` は `append_only_lossy` かつ「append 失敗は caller を壊さない」「completion
+      truth にしない」charter（`:153` / `:179` / `:826`）で F2 と矛盾 / lifecycle row は Acceptance 4 が禁止 / isolated ledger は
+      #13842 j#79346 R5 が撤去済み）ため、**第 4 の state kind** を立てた:
+      **operational action-idempotency / side-effect transaction authority**。
+      ★**#13842 の isolated-ledger anti-pattern とは別物**である: あちらは ledger loss が **live pane を抱えたままの恒久 stuck** を
+      作った。本 fence の `pending` は **held / crash-released OS advisory lock 下で resume** され、`completed` の loss は success を
+      捏造せず **withhold する**だけで、その時点で pane は既に消えているので **capacity leak も stuck も生じない**。残余は sibling
+      authority と同じ **local total-loss indistinguishability** のみで、それ以上は主張しない。
+      ★**transaction は OS advisory lock（exclusive / nonblocking）で保持**する: `BEGIN IMMEDIATE` は statement/txn の間しか持続せず
+      **外部 process 操作である close を跨げない**。contention は `retirement_busy` で zero-close（待たない・奪わない）。
+      ordering は reserve pending → close → fresh whole-unit remeasure → fence completed → green。`managed_events` は completed の
+      **後**に best-effort narrative audit として append し、その失敗は proven retirement を無効化しない。
+      ★**store identity**: artifact inventory は `lexists` semantics で DB / `-wal` / `-shm` / `-journal` / seal を見て
+      **absent / present / damaged を三分**する。damaged は `retirement_authority_unavailable` で fail-closed。true first bootstrap は
+      **live exact pair が positively present ∧ 全 artifact absent** の時のみ（同一 lock 下で serialize）で、**zero-slot は決して
+      bootstrap しない**（失われた authority の無言再作成を防ぐ）。★**relaunch 誤認防止**: `completed` の後に新しい live slots が
+      現れたら **新しい attempt（revision+1）** を開き、古い completion を稼働中 pair の proof に流用しない。
     - v1–v5 → v6 migration は backup-first additive（v6 = `reconcile_phase`、#13842）。unknown / newer / partial / foreign schema は
       byte-unchanged fail-closed (上記 container/component guard と同じ)。project-gateway lifecycle
       adapter / generic exact-generation actuator は後続 (#13780 / #13806)。

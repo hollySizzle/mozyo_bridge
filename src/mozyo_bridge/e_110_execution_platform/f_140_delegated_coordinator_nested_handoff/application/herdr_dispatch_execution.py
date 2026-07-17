@@ -21,11 +21,17 @@ are proven without any live delivery.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    _norm,
+    decode_assigned_name,
+)
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     FENCE_ABSENT,
+    FENCE_CANCELLED,
     DispatchOutboxFence,
     DispatchOutboxFenceError,
     FenceKey,
@@ -98,6 +104,96 @@ def fence_key_for(authorization: DispatchAuthorization) -> FenceKey:
     )
 
 
+def _live_locator_for(assigned_name: str) -> str:
+    """The live locator of a named slot, or ``""`` when it cannot be observed. (fail-soft)
+
+    Fail-soft on purpose: an unreadable inventory yields ``""``, which
+    :meth:`ScratchRetirementFence.blocking_attempt_for_target` treats as ambiguous and blocks.
+    The safety decision stays in the authority; this only supplies the fact.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        list_herdr_agent_rows,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        AGENT_KEY_NAME,
+        _agent_locator,
+    )
+
+    want = _norm(assigned_name)
+    try:
+        rows = list_herdr_agent_rows(os.environ)
+    except Exception:  # noqa: BLE001 - unreadable -> "" -> the authority fails closed
+        return ""
+    matches = [
+        r for r in rows
+        if isinstance(r, Mapping) and _norm(r.get(AGENT_KEY_NAME)) == want
+    ]
+    if len(matches) != 1:
+        return ""  # absent or ambiguous -> let the authority decide conservatively
+    return _norm(_agent_locator(matches[0]))
+
+
+def target_is_retiring(target_assigned_name: str) -> tuple[bool, str]:
+    """Is this exact target inside a retirement transaction? (Redmine #13892 R3-F1 / R4-F3)
+
+    The shared guard for EVERY outbox reserve -> send edge. Exported rather than private
+    because `execute_dispatch` is not the only such edge: the callback sweep, the operator
+    startup resume and the hibernated pair redispatch all reserve on the same
+    `DispatchOutboxFence` with a `target_assigned_name` and then send. Wiring only one of
+    them (and claiming all were covered) was review j#80594 R4-F3.
+
+    Reads the retirement authority for the unit this target belongs to. Returns
+    ``(True, reason)`` when a ``pending`` or ``completed`` attempt names the target's slot —
+    the send must not land in panes that are being (or have been) retired.
+
+    Fail-closed on an unreadable authority: a send we cannot prove is safe is not sent. A
+    genuinely absent authority means no retirement was ever recorded, so the send proceeds
+    (this is the ordinary case for every non-scratch lane, and it must not be over-blocked).
+    """
+    from mozyo_bridge.core.state.scratch_retirement_fence import (
+        ScratchRetirementFence,
+        ScratchRetirementFenceError,
+    )
+
+    target = _norm(target_assigned_name)
+    if not target:
+        return (False, "")
+    decode = decode_assigned_name(target)
+    if not decode.ok or decode.identity is None:
+        # Not a managed mzb1 slot: the retirement authority is keyed on decoded units, so it
+        # structurally cannot hold an attempt for this target.
+        return (False, "")
+    identity = decode.identity
+    # The live locator distinguishes "the pane a completed attempt closed" from "a pair
+    # relaunched at the same deterministic name" (review j#80594 R4-F2). Reading it is
+    # fail-soft: an unknown locator makes a completed attempt ambiguous, which blocks.
+    live_locator = _live_locator_for(target)
+    try:
+        fence = ScratchRetirementFence()
+        # A scratch unit's digest is over the pair's full assigned-name set, so a single
+        # target cannot rebuild it. Ask the authority for any attempt that forbids this send.
+        attempt = fence.blocking_attempt_for_target(
+            workspace_id=identity.workspace_id,
+            lane_id=identity.lane_id,
+            target_assigned_name=target,
+            live_locator=live_locator,
+        )
+    except ScratchRetirementFenceError as exc:
+        return (
+            True,
+            f"the retirement authority is unreadable ({exc}); refusing to send into a target "
+            "whose retirement state cannot be established",
+        )
+    if attempt is None:
+        return (False, "")
+    return (
+        True,
+        f"the target {target} is inside a {attempt.state} retirement attempt "
+        f"(revision {attempt.revision}, live locator {live_locator or '<unobservable>'}); "
+        "sending would race a close or land in a pane that was closed",
+    )
+
+
 def execute_dispatch(
     *,
     authorization: DispatchAuthorization,
@@ -136,7 +232,27 @@ def execute_dispatch(
             sent=False,
         )
 
-    # We won the reserve: perform exactly one send attempt.
+    # We won the reserve. Before the send, check whether this exact target is being retired
+    # (Redmine #13892 review j#80523 R3-F1, design j#80526). The retire side publishes its
+    # `pending` intent BEFORE it reads obligations, and this read happens AFTER our reserve, so
+    # one of the two always sees the other:
+    #
+    #   - our reserve lands first  -> the retire's obligation read sees it and closes nothing;
+    #   - the retire's pending lands first -> we see it here and send nothing.
+    #
+    # Without this half, holding the retire lock published nothing to us: a dispatch could
+    # reserve and send into panes that were about to be closed.
+    retiring, detail = target_is_retiring(authorization.target_assigned_name)
+    if retiring:
+        fence.mark_cancelled(key, detail=detail, now=now)
+        return DispatchExecutionResult(
+            result=DISPATCH_SKIPPED,
+            fence_state=FENCE_CANCELLED,
+            detail=f"zero-send: {detail}",
+            sent=False,
+        )
+
+    # We won the reserve and the target is not being retired: perform exactly one send attempt.
     try:
         outcome = send()
     except Exception as exc:  # noqa: BLE001 - the send may have landed; mark uncertain, never retry

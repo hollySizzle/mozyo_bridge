@@ -55,6 +55,7 @@ from typing import Callable, Optional
 
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     FENCE_ABSENT,
+    FENCE_CANCELLED,
     DispatchOutboxFence,
     DispatchOutboxFenceError,
     FenceKey,
@@ -346,6 +347,25 @@ def resume_startup_gate(
             fence_state=FENCE_ABSENT,
             detail=f"idempotency fence unavailable; no send ({exc})",
         )
+
+    # The target must not be inside a retirement (Redmine #13892 R4-F3): this edge reserves on
+    # the same fence with a `target_assigned_name` and then sends, so it carries the same guard
+    # as `execute_dispatch`.
+    if reservation.won:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
+            target_is_retiring,
+        )
+
+        _retiring, _retire_detail = target_is_retiring(key.target_assigned_name)
+        if _retiring:
+            fence.mark_cancelled(key, detail=_retire_detail, now=now)
+            return StartupResumeResult(
+                result=RESUME_SKIPPED,
+                sent=False,
+                reserved=True,
+                fence_state=FENCE_CANCELLED,
+                detail=f"zero-send: {_retire_detail}",
+            )
 
     if not reservation.won:
         # Never-send: duplicate resume re-run / concurrent caller / restart. The gate is

@@ -514,6 +514,52 @@ class ForwardOutboxFence:
         """True when the route currently holds a reserved / delivered / uncertain generation."""
         return self.active(route).state in _ACTIVE_STATES
 
+    def _genuinely_uninitialized(self) -> bool:
+        """True only when BOTH artifacts are truly absent. (tri-state, #13892 R5-F3)
+
+        `_read_sidecar_nonce() is None` is a fail-soft predicate: it covers an EMPTY or
+        UNREADABLE sidecar as well as a missing one, so `nonce is None and not path.exists()`
+        read a DB-absent + empty-sidecar-residue store as "nothing was ever reserved here" —
+        turning damage into a silent "no obligations owed". This is the identical defect the
+        sibling dispatch fence was corrected for (review j#80523 R2-F1); it was re-introduced
+        here by writing the same fail-soft check again.
+
+        Uses `lexists`, so a broken symlink still counts as evidence something was placed here.
+        """
+        import os
+
+        return not os.path.lexists(self.sidecar_path) and not os.path.lexists(self.path)
+
+    def rows_for_sender(
+        self, *, workspace_id: str, from_lane_id: str
+    ) -> tuple[tuple[str, str, str], ...]:
+        """``(from_role, to_role, state)`` for every generation this lane SENT. (read-only)
+
+        Redmine #13892 R4-F3: a destructive action against a lane must know what that lane
+        still owes, not only what is owed to it. A forward generation stays active from the
+        send until its correlated callback returns, so closing the sender mid-generation
+        strands it. :meth:`is_active` cannot answer this — it needs the full route key
+        (including ``to_role`` / ``project_scope``), which a caller that only knows *which
+        panes it is about to close* cannot build.
+
+        Fails closed on a damaged / identity-mismatched store; a never-bootstrapped store has
+        provably no rows and returns empty (the ordinary case, which must not be over-blocked).
+        """
+        if self._genuinely_uninitialized():
+            return ()  # both artifacts absent: nothing was ever reserved here
+        # Any other shape must prove itself through `_connect`, which fails closed on a
+        # missing / empty / foreign / nonce-mismatched store.
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT from_role, to_role, state FROM forward_generation "
+                "WHERE workspace_id=? AND from_lane_id=? ORDER BY from_role, to_role",
+                (workspace_id, from_lane_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        return tuple((str(r[0]), str(r[1]), str(r[2])) for r in rows)
+
 
 __all__ = (
     "FORWARD_OUTBOX_FENCE_FILENAME",

@@ -183,11 +183,18 @@ class DeliveryReport:
 
     recovered: list[CallbackOutboxRow] = field(default_factory=list)
     delivered: list[DeliveryOutcome] = field(default_factory=list)
+    #: Rows whose target slot is inside a retirement (Redmine #13892 R5-F2). Zero-send, and
+    #: surfaced rather than silently dropped so an operator can see why a callback did not fire.
+    skipped_retiring: list[tuple] = field(default_factory=list)
 
     def as_payload(self) -> dict[str, object]:
         return {
             "recovered": [r.as_payload() for r in self.recovered],
             "delivered": [d.as_payload() for d in self.delivered],
+            "skipped_retiring": [
+                {"key": k.as_row() if hasattr(k, "as_row") else str(k), "detail": d}
+                for k, d in self.skipped_retiring
+            ],
         }
 
 
@@ -205,6 +212,35 @@ class SweepReport:
             "pending": [r.as_payload() for r in self.pending],
             "dead_letter": [r.as_payload() for r in self.dead_letter],
         }
+
+
+def _callback_target_is_retiring(row) -> tuple[bool, str]:
+    """Is the slot this callback row targets inside a retirement? (Redmine #13892 R5-F2)
+
+    The row's target identity is its durable ``(workspace_id, target_receiver, target_lane)``,
+    rebuilt into the canonical assigned name exactly as ``BackendNeutralTargetResolver`` does.
+    A row that names no rebuildable target cannot be aimed at a retiring pair, so it proceeds.
+
+    Fail-closed on an unreadable authority; a genuinely absent one means no retirement was ever
+    recorded (the ordinary case for every non-scratch lane) and must not be over-blocked.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
+        target_is_retiring,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        encode_assigned_name,
+    )
+
+    workspace = str(getattr(row, "workspace_id", "") or "").strip()
+    receiver = str(getattr(row, "target_receiver", "") or "").strip()
+    lane = str(getattr(row, "target_lane", "") or "").strip()
+    if not (workspace and receiver and lane):
+        return (False, "")
+    try:
+        name = encode_assigned_name(workspace, receiver, lane)
+    except Exception:  # noqa: BLE001 - an unencodable target names no managed slot
+        return (False, "")
+    return target_is_retiring(name)
 
 
 class CallbackOutboxProcessor:
@@ -372,6 +408,17 @@ class CallbackOutboxProcessor:
             # (its claim was recovered + re-claimed elsewhere) it returns False and we DO NOT
             # send — a de-owned processor never fires a duplicate callback.
             if not self._outbox.mark_sending(row.key, claim_token=token, now=now):
+                continue
+            # The retirement gate (Redmine #13892 R5-F2). This is a real reserve -> send edge
+            # against a slot the row names, so it needs the same guard `execute_dispatch` has:
+            # the retire side publishes its `pending` intent BEFORE it reads obligations, and
+            # this read happens after our claim, so one of the two always sees the other. The
+            # earlier cut only wired the DispatchOutboxFence edges and reported that all send
+            # edges checked — this one could still fire into panes about to close.
+            retiring, retire_detail = _callback_target_is_retiring(row)
+            if retiring:
+                self._outbox.mark_uncertain(row.key, claim_token=token, now=now)
+                report.skipped_retiring.append((row.key, retire_detail))
                 continue
             # The sender may return a bare SEND_* token (legacy / test) or a CallbackSendResult
             # carrying durable-receipt evidence; normalize both (unknown -> uncertain, fail-safe).

@@ -358,6 +358,25 @@ def execute_herdr_forward(
             detail=f"fence not won (prior {reserve.prior_state}); {reserve.detail}",
         )
 
+    # (4b) the retirement gate (Redmine #13892 R5-F2). This is a real reserve -> send edge
+    #      against a resolved slot, so it carries the same guard `execute_dispatch` has: the
+    #      retire side publishes `pending` before reading obligations, and this read happens
+    #      after our reserve, so whichever side publishes first, the other does nothing. Wiring
+    #      only the DispatchOutboxFence edges and reporting that all send edges checked was the
+    #      defect (review j#80620 R5-F2).
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
+        target_is_retiring,
+    )
+
+    _retiring, _retire_detail = target_is_retiring(getattr(target, "assigned_name", ""))
+    if _retiring:
+        fence.mark_uncertain(route, reserve.action_id, detail=_retire_detail)
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status=target.status,
+            fence_state=FENCE_HELD, reason="herdr_forward_target_retiring",
+            detail=f"zero-send: {_retire_detail}",
+        )
+
     # (5) exactly one send with the minted action id; record the outcome guarded by that id.
     outcome = send_port.send(plan, target, reserve.action_id, args=args)
     if outcome.result == SEND_DELIVERED:

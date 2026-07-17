@@ -95,6 +95,10 @@ REDISPATCH_ALREADY = "already_redispatched"  # the fence already holds a deliver
 REDISPATCH_UNCERTAIN = "redispatch_uncertain"  # send fate unknown -> operator reconcile
 REDISPATCH_SKIPPED = "redispatch_not_reached"  # resume did not apply -> nothing to redeliver
 REDISPATCH_FAILED = "redispatch_send_failed"
+#: The target is inside a retirement transaction, so the reserve is cancelled and no send
+#: fires (Redmine #13892 R6-F3). Distinct from `REDISPATCH_SKIPPED` ("resume did not apply"):
+#: here the resume DID apply and the fence WAS reserved — the send is what stops.
+REDISPATCH_TARGET_RETIRING = "redispatch_target_retiring"
 
 
 @dataclass(frozen=True)
@@ -606,6 +610,7 @@ __all__ = (
     "REDISPATCH_DELIVERED",
     "REDISPATCH_FAILED",
     "REDISPATCH_SKIPPED",
+    "REDISPATCH_TARGET_RETIRING",
     "REDISPATCH_UNCERTAIN",
     "HibernatedPairRecoveryOps",
     "RecoverPairOutcome",

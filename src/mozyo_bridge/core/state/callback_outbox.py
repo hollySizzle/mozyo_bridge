@@ -215,6 +215,22 @@ def _row(r: tuple) -> CallbackOutboxRow:
     )
 
 
+def _select_rows(conn, states) -> tuple["CallbackOutboxRow", ...]:
+    """The one row-select both the migrating and the strict read-only reads use."""
+    if states is not None:
+        wanted = list(states)
+        if not wanted:
+            return ()
+        placeholders = ",".join("?" for _ in wanted)
+        rows = conn.execute(
+            _SELECT + f" WHERE state IN ({placeholders}) ORDER BY seq, rowid",
+            tuple(wanted),
+        ).fetchall()
+    else:
+        rows = conn.execute(_SELECT + " ORDER BY seq, rowid").fetchall()
+    return tuple(_row(r) for r in rows)
+
+
 class CallbackOutbox:
     """Read/write access to the callback outbox in the home-scoped workflow-runtime DB.
 
@@ -698,6 +714,37 @@ class CallbackOutbox:
 
     # -- reads -------------------------------------------------------------
 
+    def read_strict_readonly(
+        self, *, states: Optional[Iterable[str]] = None
+    ) -> tuple[CallbackOutboxRow, ...]:
+        """Read WITHOUT migrating. Raises when the store cannot be read as-is. (#13892 R5-F4)
+
+        :meth:`read` calls ``_ensure_migrated_if_exists`` first, so an existing older store is
+        migrated — schema, tables and ``user_version`` are written. That is correct for the
+        callback processor, but a **read-only** caller (``herdr session-retire``'s obligation
+        gate, whose contract is "verdict only; writes nothing") must never mutate a store just
+        by asking a question.
+
+        A store this method cannot interpret as-is is NOT reported empty: it raises, and the
+        obligation gate turns that into `obligation_unreadable` (fail-closed). Migrating it
+        would be a write; reading it as empty would be a silent "nothing owed".
+        """
+        conn = self._connect_ro()
+        if conn is None:
+            return ()  # no store: provably nothing enqueued
+        try:
+            if not self._table_present(conn):
+                return ()
+            try:
+                return _select_rows(conn, states)
+            except sqlite3.DatabaseError as exc:
+                raise WorkflowRuntimeStoreError(
+                    f"the callback outbox cannot be read at its current schema ({exc}); a "
+                    "read-only caller will not migrate it to find out"
+                ) from exc
+        finally:
+            conn.close()
+
     def read(self, *, states: Optional[Iterable[str]] = None) -> tuple[CallbackOutboxRow, ...]:
         """Return persisted callback rows (optionally filtered by state) in ``seq`` order.
 
@@ -710,20 +757,9 @@ class CallbackOutbox:
         try:
             if not self._table_present(conn):
                 return ()
-            if states is not None:
-                wanted = list(states)
-                if not wanted:
-                    return ()
-                placeholders = ",".join("?" for _ in wanted)
-                rows = conn.execute(
-                    _SELECT + f" WHERE state IN ({placeholders}) ORDER BY seq, rowid",
-                    tuple(wanted),
-                ).fetchall()
-            else:
-                rows = conn.execute(_SELECT + " ORDER BY seq, rowid").fetchall()
+            return _select_rows(conn, states)
         finally:
             conn.close()
-        return tuple(_row(r) for r in rows)
 
     def workspace_ids(self) -> tuple[str, ...]:
         """Return the DISTINCT workspace ids actually present across all outbox rows (sorted).

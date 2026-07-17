@@ -38,7 +38,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -125,6 +125,45 @@ class FenceKey:
             self.action_id,
             self.target_assigned_name,
         )
+
+
+@dataclass(frozen=True)
+class TargetObligation:
+    """One fence row aimed at a slot, WITH its causal identity (Redmine #13892 R2-F2).
+
+    ``state`` alone cannot decide whether work is owed: a ``delivered`` row is a delivery ACK,
+    and only its ``issue`` / ``journal`` can be correlated against the durable gate that says
+    whether the handed-off work finished. Dropping that identity (as the first cut did) leaves
+    a caller structurally unable to tell an owed obligation from a discharged one — so it is
+    carried here rather than filtered away at the store.
+    """
+
+    target_assigned_name: str
+    state: str
+    issue: str = ""
+    journal: str = ""
+    action_id: str = ""
+    workspace_id: str = ""
+    lane_id: str = ""
+
+    @property
+    def non_terminal(self) -> bool:
+        """Owed on the fence's own terms: the send's fate is unresolved."""
+        return self.state in (FENCE_RESERVED, FENCE_UNCERTAIN)
+
+    @property
+    def needs_gate_correlation(self) -> bool:
+        """Delivered: handed over, but whether the WORK is discharged lives in Redmine."""
+        return self.state == FENCE_DELIVERED
+
+    def as_payload(self) -> dict:
+        return {
+            "target": self.target_assigned_name,
+            "state": self.state,
+            "issue": self.issue,
+            "journal": self.journal,
+            "action_id": self.action_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -494,6 +533,98 @@ class DispatchOutboxFence:
 
     # -- reads -------------------------------------------------------------
 
+    def _genuinely_uninitialized(self) -> bool:
+        """True only when BOTH the DB and its sidecar are absent. (tri-state, #13892 R2-F1)
+
+        The artifact shape has three cases, and only the first is an absence:
+
+        - **both absent** — no bootstrap ever ran; nothing can be recorded here;
+        - **both present** — the store must prove its identity through :meth:`_connect`;
+        - **exactly one present** — a loss / replacement. NOT an absence: the missing half is
+          evidence something was here.
+
+        :meth:`is_bootstrapped` deliberately collapses every non-healthy case to ``False``
+        (it is a fail-soft diagnostic), so a gate that reads its ``False`` as "nothing is
+        recorded here" turns store damage into a silent permission. Gates use this instead.
+        """
+        return not self.sidecar_path.exists() and not self.path.exists()
+
+    def obligations_for_targets(
+        self, *, workspace_id: str, target_assigned_names: Sequence[str]
+    ) -> tuple["TargetObligation", ...]:
+        """EVERY fence row aimed at any of these assigned names. (read-only, #13892)
+
+        Returns a :class:`TargetObligation` per row — target, state, and the full causal
+        identity (issue / journal / action_id) — for the durable obligations a *destructive*
+        action against those slots must not run over.
+
+        **Every** state is returned, not only the non-terminal ones (review j#80523 R2-F2).
+        ``reserved`` (a send took the write lock, fate unknown) and ``uncertain`` (outcome
+        never resolved) are obviously owed. ``delivered`` is NOT self-evidently discharged:
+        it is a *turn-start delivery ACK*, and the workflow contract is explicit that a
+        delivery ACK is not task completion — the work it handed to that slot may still be
+        owed in Redmine. Filtering ``delivered`` out here would silently make delivery stand
+        in for completion, so the caller receives it WITH its issue / journal identity and
+        must correlate it against the durable gate (and fail closed when it cannot).
+
+        No runtime ``idle`` / ``turn_ended`` observation can rule any of these out: receiver
+        state and durable obligation are different axes.
+
+        :meth:`state_of` cannot answer this: it requires the full six-part
+        :class:`FenceKey` — an action-time caller that only knows *which panes it is about to
+        close* has no issue / journal / action_id to build one, so it could never enumerate
+        what is owed to a target. Hence this bounded by-target read.
+
+        Rows keep their **full causal identity** (issue / journal / action_id), not just the
+        state: a caller cannot correlate a delivered send with its Redmine gate — nor name what
+        is owed in a durable record — from a bare state string (review j#80523 R2-F2).
+
+        Unlike :meth:`state_of` (a fail-soft per-key diagnostic) this is a **gate input**, so
+        it fails closed. Only a *genuinely uninitialized* store (BOTH artifacts absent) returns
+        empty; every other shape — DB-only, sidecar-only, nonce mismatch, schema mismatch,
+        corrupt — raises :class:`DispatchOutboxFenceError` rather than reporting "no
+        obligations". Not observing an obligation is never the same as there being none.
+        """
+        names = tuple(dict.fromkeys(n for n in target_assigned_names if n))
+        if not names:
+            return ()
+        if self._genuinely_uninitialized():
+            # BOTH artifacts absent: no bootstrap ever ran here, so no reserve can ever have
+            # been recorded. This is the ONE shape that is a positive absence.
+            #
+            # `is_bootstrapped()` must NOT be used for this decision (review j#80523 R2-F1):
+            # it is a fail-soft predicate whose False also covers DB-only, sidecar-only, nonce
+            # mismatch, schema mismatch and corrupt — five damage shapes that were all being
+            # reported as "no obligations owed" and closing panes over unknown owed work.
+            return ()
+        # Any other shape must prove itself through `_connect`, which fails closed on a
+        # missing / empty / foreign / nonce-mismatched store.
+        conn = self._connect()
+        try:
+            placeholders = ", ".join("?" * len(names))
+            rows = conn.execute(
+                "SELECT target_assigned_name, state, issue, journal, action_id, "
+                "workspace_id, lane_id "
+                "FROM dispatch_outbox "
+                f"WHERE workspace_id=? AND target_assigned_name IN ({placeholders}) "
+                "ORDER BY target_assigned_name, action_id",
+                (workspace_id, *names),
+            ).fetchall()
+        finally:
+            conn.close()
+        return tuple(
+            TargetObligation(
+                target_assigned_name=str(r[0]),
+                state=str(r[1]),
+                issue=str(r[2]),
+                journal=str(r[3]),
+                action_id=str(r[4]),
+                workspace_id=str(r[5]),
+                lane_id=str(r[6]),
+            )
+            for r in rows
+        )
+
     def state_of(self, key: FenceKey) -> str:
         """The current fence state for the key, or :data:`FENCE_ABSENT` (fail-soft diagnostic).
 
@@ -516,6 +647,7 @@ class DispatchOutboxFence:
 
 __all__ = (
     "DISPATCH_OUTBOX_FENCE_FILENAME",
+    "TargetObligation",
     "DISPATCH_OUTBOX_FENCE_SIDECAR_SUFFIX",
     "DISPATCH_OUTBOX_FENCE_SCHEMA_VERSION",
     "FENCE_RESERVED",
