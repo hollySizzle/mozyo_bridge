@@ -10,6 +10,7 @@ is not actually replaced).
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +26,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _live_lister,
     cmd_herdr_agent_attest,
     perform_self_attestation,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    MOZYO_PROVIDER_ARGV0_ENV,
 )
 
 NAME = "mzb1_ws1_claude_default"
@@ -255,6 +259,73 @@ class CmdAgentAttestTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cmd_herdr_agent_attest(self._args([]))
             execvp.assert_not_called()
+
+
+class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
+    """Redmine #14017: exec the realpath, present the trusted alias as argv[0].
+
+    The exec target is always ``provider_argv[0]`` (the verified realpath); the alias,
+    when the launch injected ``MOZYO_PROVIDER_ARGV0``, is applied as argv[0] DATA only —
+    via ``os.execv`` (explicit path, no PATH search) so the alias itself is never run.
+    """
+
+    def _args(self, provider_argv):
+        return argparse.Namespace(
+            assigned_name=NAME,
+            workspace_id="ws1",
+            role="claude",
+            lane="default",
+            replacement_action_id="",
+            provider_argv=provider_argv,
+        )
+
+    def _run(self, provider_argv, env):
+        base = {
+            "MOZYO_BRIDGE_HOME": "/tmp/x",
+            "MOZYO_HERDR_BINARY": "/x/herdr",
+        }
+        base.update(env)
+        with patch.dict("os.environ", base, clear=True), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest._live_lister",
+            return_value=_lister({"name": NAME, "pane_id": "wY:p2"}),
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest.record_identity_attestation",
+            return_value=None,
+        ), patch("os.execv") as execv, patch("os.execvp") as execvp:
+            execv.side_effect = SystemExit(0)
+            execvp.side_effect = SystemExit(0)
+            with self.assertRaises(SystemExit):
+                cmd_herdr_agent_attest(self._args(provider_argv))
+            leftover = os.environ.get(MOZYO_PROVIDER_ARGV0_ENV)
+        return execv, execvp, leftover
+
+    def test_absolute_alias_env_execs_realpath_with_alias_argv0(self) -> None:
+        execv, execvp, leftover = self._run(
+            ["--", "/opt/claude/cli", "--permission-mode", "auto"],
+            {MOZYO_PROVIDER_ARGV0_ENV: "/home/u/.local/bin/claude"},
+        )
+        execv.assert_called_once_with(
+            "/opt/claude/cli", ["/home/u/.local/bin/claude", "--permission-mode", "auto"]
+        )
+        execvp.assert_not_called()
+        self.assertIsNone(leftover)  # dropped from the provider's inherited env
+
+    def test_no_alias_env_execvp_byte_invariant(self) -> None:
+        execv, execvp, _ = self._run(
+            ["--", "/opt/codex", "-c", "x=1"], {}
+        )
+        execvp.assert_called_once_with("/opt/codex", ["/opt/codex", "-c", "x=1"])
+        execv.assert_not_called()
+
+    def test_relative_alias_env_is_ignored(self) -> None:
+        # A non-absolute alias must never become argv[0]; fall back to execvp(realpath).
+        execv, execvp, _ = self._run(
+            ["--", "/opt/claude/cli"], {MOZYO_PROVIDER_ARGV0_ENV: "claude"}
+        )
+        execvp.assert_called_once_with("/opt/claude/cli", ["/opt/claude/cli"])
+        execv.assert_not_called()
 
 
 if __name__ == "__main__":

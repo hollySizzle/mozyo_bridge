@@ -13,12 +13,20 @@ function.
 Pure: :func:`build_agent_start_argv` is a total string-list transform (no I/O), and
 :func:`resolve_attest_launcher` reads only the passed ``env`` mapping.
 
-argv[0] is the provider's verified absolute executable and the managed policy tokens are
-profile-spelled, but neither is resolved HERE: both arrive pre-resolved on the
-:class:`ResolvedProviderLaunch` that ``preflight_launch_providers`` produced before the
-caller's first side effect (Redmine #13441, review R1-F1). Keeping this builder pure is
-what guarantees it cannot fail after a sibling provider has already been started — the
-partial-lane residue the lazy per-slot resolution used to leave behind.
+The provider command's argv[0] is the provider's verified absolute exec-target realpath
+and the managed policy tokens are profile-spelled, but neither is resolved HERE: both
+arrive pre-resolved on the :class:`ResolvedProviderLaunch` that
+``preflight_launch_providers`` produced before the caller's first side effect (Redmine
+#13441, review R1-F1). Keeping this builder pure is what guarantees it cannot fail after
+a sibling provider has already been started — the partial-lane residue the lazy per-slot
+resolution used to leave behind.
+
+Redmine #14017: the provider command always keeps that realpath as its exec target, but
+a wrapped launch of a provider whose trusted alias differs from the realpath (a
+symlinked ``claude``) also carries the alias on a ``MOZYO_PROVIDER_ARGV0`` ``--env``
+flag, and the wrapper (:mod:`herdr_agent_attest`) execs the realpath while handing the
+process ``argv[0]=<alias>`` — the exec target stays the realpath, only the invocation
+identity is the alias.
 """
 
 from __future__ import annotations
@@ -50,6 +58,20 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 #: the launcher is resolved from the trusted PATH (``shutil.which``); either way an
 #: unresolvable / non-absolute value disables wrapping (byte-invariant fallback).
 MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
+
+#: The launch-env key carrying the provider's trusted ``argv[0]`` alias to the #13637
+#: self-attestation wrapper (Redmine #14017). The provider command after ``--`` keeps
+#: the verified realpath as its first token (the exec target the wrapper runs); this
+#: var, injected via herdr ``--env`` and read from the wrapper's ``os.environ``, tells
+#: the wrapper to hand the process ``argv[0]=<alias>`` instead — decoupling the exec
+#: target (realpath, the trust boundary) from the invocation identity (the trusted
+#: symlink alias Claude requires to stay resident). Emitted ONLY when wrapping AND the
+#: alias actually differs from the realpath, so an unsymlinked provider stays
+#: byte-invariant. A launcher predating this contract simply does not read the var and
+#: execs the realpath on both — the honest unwrapped-equivalent fallback that never
+#: weakens the exec-target trust boundary (a herdr ``--env`` key an older wrapper does
+#: not know is inherited, not an argparse error, so no launch dies of version skew).
+MOZYO_PROVIDER_ARGV0_ENV = "MOZYO_PROVIDER_ARGV0"
 
 #: The wrapper subcommand every managed launch execs the provider THROUGH (Redmine
 #: #13637): ``<launcher> herdr agent-attest ...``. Named once so the wrapper argv
@@ -160,10 +182,13 @@ def _provider_command(
     was the R2-F1 registry split: it RAISED for a provider present only in an injected
     registry, and re-read a possibly-since-changed global inside the "pure" builder.
 
-    argv[0] is the **verified absolute realpath** (Design Answer j#76725 Q1), not the bare
-    provider name: leaving argv[0] bare would let the exec-time ``PATH`` decide which
-    binary runs. It is the one token exempted from byte-invariance; every remaining token,
-    and the render order, are unchanged.
+    The provider command's argv[0] here is the **verified absolute exec-target realpath**
+    (Design Answer j#76725 Q1), not the bare provider name: leaving argv[0] bare would let
+    the exec-time ``PATH`` decide which binary runs. It is the one token exempted from
+    byte-invariance; every remaining token, and the render order, are unchanged. Redmine
+    #14017 keeps the realpath here (it is what the wrapper actually ``exec``s) and carries
+    any distinct trusted alias out-of-band on a ``--env`` flag, so this builder holds no
+    provider branch and the exec target is never the alias.
 
     Reproducible permission mode for managed agents (Redmine #11925 / #13360): without the
     managed tokens here every herdr lane worker boots prompt-gated and stalls on its first
@@ -226,6 +251,14 @@ def build_agent_start_argv(
     read, and a fresh launch's record would read as permanently ``absent``. Injecting
     the launcher's home pins writer and reader to one store. It is always injected
     (harmless when it equals the wrapper's default home).
+
+    Provider argv[0] alias (Redmine #14017): a wrapped launch of a provider whose trusted
+    absolute alias differs from its exec-target realpath additionally injects ``--env
+    MOZYO_PROVIDER_ARGV0=<alias>``; the wrapper reads it and execs the realpath while
+    handing the process ``argv[0]=<alias>``. It rides ``--env`` (not the provider command)
+    so the exec target stays the realpath and an older wrapper that does not read it simply
+    execs the realpath on both. Emitted only when wrapping AND the alias differs, so an
+    unwrapped or unsymlinked launch is byte-invariant.
 
     Lane=tab placement (Redmine #13411) + config-driven split (Redmine #13646): a
     non-default lane's ``--tab`` is inserted right after ``--workspace``, and ``--split
@@ -298,6 +331,16 @@ def build_agent_start_argv(
     # byte-for-byte the pre-#13637 env set (no extra --env).
     if attest_launcher:
         env_flags += ["--env", f"MOZYO_BRIDGE_HOME={store_home}"]
+    # Provider argv[0] alias (Redmine #14017): the provider command keeps the verified
+    # realpath as its exec target (argv[0] token after `--`), but a symlinked provider
+    # whose stable trusted alias differs from that realpath is handed argv[0]=<alias> by
+    # the wrapper. Rides an `--env` flag so it survives herdr's non-inheriting spawn and
+    # is read from the wrapper's own os.environ. Emitted ONLY when wrapping AND the alias
+    # differs, so an unwrapped launch or an unsymlinked provider stays byte-invariant and
+    # the exec target is never the alias.
+    argv0_alias = resolved.argv0 or resolved.executable
+    if attest_launcher and argv0_alias != resolved.executable:
+        env_flags += ["--env", f"{MOZYO_PROVIDER_ARGV0_ENV}={argv0_alias}"]
     launch_argv = [
         "agent",
         "start",
@@ -326,6 +369,7 @@ __all__ = (
     "ATTEST_CAPABILITY_MARKER",
     "ATTEST_WRAPPER_SUBCOMMAND",
     "MOZYO_BRIDGE_LAUNCHER_ENV",
+    "MOZYO_PROVIDER_ARGV0_ENV",
     "build_agent_start_argv",
     "build_attest_capability_probe_argv",
     "resolve_attest_launcher",

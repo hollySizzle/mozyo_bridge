@@ -41,6 +41,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     classify_identity_env,
     record_identity_attestation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    MOZYO_PROVIDER_ARGV0_ENV,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
@@ -146,24 +149,26 @@ def _live_lister(env: Mapping[str, str]) -> Lister:
     still resolves the agent's own row. Returns ``None`` on unresolved binary /
     repeated failure (the caller records an empty locator — fail-closed).
 
-    **Terminal isolation (Redmine #14017).** This lister runs *inside the
-    herdr-spawned pane*, as the wrapper process that is about to ``os.execvp`` the
-    interactive provider into that same pane. The ``agent list`` child is therefore
-    kept off the pane's controlling terminal on **every** standard fd: ``capture_output``
-    already pipes stdout/stderr, and this adds ``stdin=subprocess.DEVNULL`` +
-    ``start_new_session=True`` so the child has no fd pointing at the pane PTY and no
-    controlling-terminal association at all. Without this the child inherits the pane
-    PTY on fd 0 and stays in the pane's session — and a herdr *client* (a terminal
-    multiplexer) run there perturbs the terminal's foreground process group / stdin
-    state. The exec'd provider then inherits a disturbed terminal: Claude's
-    interactive TUI, which requires a TTY on stdin and is sensitive to job-control /
-    foreground state, exits immediately into ``shell_residue``, while Codex's
-    tool-shell (which does not depend on that state) survives — the exact
-    provider-asymmetric exit #14017 reproduces. A bare operator PTY tolerated the
-    perturbation because its terminal was already fully established; the pane's
-    freshly-allocated PTY does not. Detaching the child restores byte-for-byte
-    terminal parity with the unwrapped (pre-#13637) launch, and is provider-neutral:
-    a query command needs neither stdin nor the controlling terminal.
+    **Terminal-hygiene invariant (defensive; NOT the #14017 root cause).** This lister
+    runs *inside the herdr-spawned pane*, as the wrapper process about to exec the
+    interactive provider into that same pane. The ``agent list`` child is kept off the
+    pane's controlling terminal on **every** standard fd: ``capture_output`` already
+    pipes stdout/stderr, and ``stdin=subprocess.DEVNULL`` + ``start_new_session=True``
+    give the child no fd pointing at the pane PTY and no controlling-terminal
+    association — a query command needs neither. This keeps the pre-exec self-lookup
+    from perturbing the terminal the provider inherits and is byte-for-byte parity with
+    the unwrapped (pre-#13637) launch; it is retained as sound hygiene, provider-neutral.
+
+    History (Redmine #14017): R1 (commit 86fc24bc) hypothesised that this lister's
+    inherited controlling terminal WAS the provider-asymmetric ``shell_residue`` exit
+    and shipped this detach as the fix. Installed dogfood **refuted** that: Claude still
+    exited with the wrapper's lister fully detached (j#81858), and even with the whole
+    ``agent-attest`` wrapper removed (j#81867). The isolated root trigger is the
+    provider **argv[0]**: under Herdr, Claude's interactive TUI exits immediately when
+    invoked with its symlink-collapsed realpath as argv[0], and stays resident when
+    invoked with its trusted absolute alias (j#81879). The real correction is the
+    exec-target / argv[0] decoupling in :func:`cmd_herdr_agent_attest`; this detach is
+    kept only as harmless terminal hygiene, not as the fix.
     """
 
     def _list() -> Optional[Sequence[Mapping[str, object]]]:
@@ -202,10 +207,24 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
     Reached only as the wrapped managed launch argv
     (``... herdr agent-attest --assigned-name <NAME> --workspace-id <WS>
     --role <PROVIDER> --lane <LANE> -- <provider argv...>``). Writes the
-    self-attestation (best-effort) and then ``os.execvp``s the provider argv,
-    replacing this process — so the provider is the real herdr pane occupant and
-    inherits exactly the env this wrapper observed. A missing provider argv is the
-    only hard error (nothing to exec); every attestation step is non-blocking.
+    self-attestation (best-effort) and then ``exec``s the provider argv, replacing this
+    process — so the provider is the real herdr pane occupant and inherits exactly the
+    env this wrapper observed. A missing provider argv is the only hard error (nothing
+    to exec); every attestation step is non-blocking.
+
+    **Exec-target / argv[0] decoupling (Redmine #14017).** ``provider_argv[0]`` is the
+    provider's verified absolute exec-target realpath — the file that is run. When the
+    launch injected :data:`MOZYO_PROVIDER_ARGV0_ENV` (a provider whose trusted alias
+    differs from that realpath, e.g. Claude's stable ``~/.local/bin/claude`` symlink),
+    the provider is ``os.execv``'d at that realpath but handed ``argv[0]=<alias>`` — so
+    the exec target stays the trust-pinned realpath while Claude's interactive TUI sees
+    the stable alias it needs to stay resident instead of exiting into ``shell_residue``.
+    The alias is argv[0] DATA only and is never itself executed. The var is dropped from
+    the env the provider inherits so, apart from that one argv[0] token, the provider's
+    launch is byte-invariant. Without the var (a normal / unsymlinked / older-wrapper
+    launch) the provider is ``os.execvp``'d at ``provider_argv[0]`` unchanged — the
+    honest fallback that keeps the realpath on both the exec target and argv[0] and never
+    weakens the trust boundary by execing an alias.
     """
     provider_argv = list(getattr(args, "provider_argv", None) or [])
     # argparse REMAINDER keeps a leading ``--`` separator; drop it so argv[0] is the
@@ -231,6 +250,16 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         replacement_action_id=_norm(getattr(args, "replacement_action_id", "")),
         lister=_live_lister(env),
     )
+    # Redmine #14017: the exec target is always provider_argv[0] (the verified realpath);
+    # the trusted argv[0] alias, if any, arrives out-of-band via MOZYO_PROVIDER_ARGV0. It
+    # is a wrapper instruction, not identity the provider should carry, so drop it from
+    # the inherited env (keeps the provider's env byte-invariant; only argv[0] differs).
+    argv0_alias = _norm(os.environ.pop(MOZYO_PROVIDER_ARGV0_ENV, ""))
+    if argv0_alias and os.path.isabs(argv0_alias):
+        # Exec the verified realpath, but present the trusted alias as argv[0]. os.execv
+        # takes an explicit path, so PATH is never consulted and the alias is never run.
+        os.execv(provider_argv[0], [argv0_alias, *provider_argv[1:]])
+        raise AssertionError("unreachable")  # pragma: no cover - execv replaces process
     os.execvp(provider_argv[0], provider_argv)
     raise AssertionError("unreachable")  # pragma: no cover - execvp replaces process
 

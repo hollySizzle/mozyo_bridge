@@ -33,10 +33,12 @@ if str(_TESTS_ROOT) not in sys.path:
 
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_executable import (
     AgentProviderExecutableError,
+    ResolvedAgentExecutable,
     preflight_launch_providers,
     require_launchable,
     resolve_agent_argv0,
     resolve_agent_executable,
+    resolve_agent_launch,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain import (
     agent_provider_profile as profile_module,
@@ -492,6 +494,90 @@ class ExecutableTrustBoundaryTest(unittest.TestCase):
         with self.assertRaises(AgentProviderExecutableError) as ctx:
             require_launchable(profile)
         self.assertIn("interactive_tui", str(ctx.exception))
+
+
+class ResolveAgentLaunchArgv0DecouplingTest(unittest.TestCase):
+    """Redmine #14017: exec target (realpath) and argv[0] (trusted alias) are distinct.
+
+    ``resolve_agent_executable`` keeps returning the exec-safe realpath;
+    ``resolve_agent_launch`` additionally exposes the trusted absolute alias as argv[0]
+    data. The alias is never executed — the realpath is the exec target on every path.
+    """
+
+    def _symlink_alias(self, base: Path, name: str) -> tuple[str, str]:
+        real = _install_binary(base / "real", f"{name}-real")
+        bindir = base / "bin"
+        bindir.mkdir(parents=True, exist_ok=True)
+        alias = bindir / name
+        os.symlink(real, alias)
+        return str(alias), real
+
+    def test_path_symlink_alias_is_argv0_realpath_is_exec_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            alias, real = self._symlink_alias(base, "claude")
+            env = {"PATH": str(base / "bin"), "MOZYO_AGENT_CLAUDE_BINARY": ""}
+            launch = resolve_agent_launch("claude", env)
+            # The compat accessor still returns the exec-safe realpath (unwrapped sites).
+            compat = resolve_agent_executable("claude", env)
+        self.assertIsInstance(launch, ResolvedAgentExecutable)
+        self.assertEqual(launch.exec_target, real)
+        self.assertEqual(launch.argv0, alias)
+        self.assertEqual(compat, real)
+
+    def test_plain_path_entry_has_equal_exec_target_and_argv0(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            real = _install_binary(base / "bin", "codex")
+            launch = resolve_agent_launch(
+                "codex", {"PATH": str(base / "bin"), "MOZYO_AGENT_CODEX_BINARY": ""}
+            )
+        self.assertEqual(launch.exec_target, real)
+        self.assertEqual(launch.argv0, real)
+
+    def test_absolute_override_symlink_splits_alias_from_realpath(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            alias, real = self._symlink_alias(base, "claude")
+            launch = resolve_agent_launch(
+                "claude", {"PATH": "/nonexistent", "MOZYO_AGENT_CLAUDE_BINARY": alias}
+            )
+        self.assertEqual(launch.exec_target, real)
+        self.assertEqual(launch.argv0, alias)
+
+    def test_ambiguity_check_is_on_distinct_realpaths_not_aliases(self) -> None:
+        # Two PATH aliases that resolve to the SAME realpath are NOT ambiguous — one
+        # exec target — and the first alias is kept as argv[0].
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            real = _install_binary(base / "real", "claude-real")
+            d1 = base / "d1"
+            d2 = base / "d2"
+            d1.mkdir()
+            d2.mkdir()
+            os.symlink(real, d1 / "claude")
+            os.symlink(real, d2 / "claude")
+            launch = resolve_agent_launch(
+                "claude",
+                {
+                    "PATH": f"{d1}{os.pathsep}{d2}",
+                    "MOZYO_AGENT_CLAUDE_BINARY": "",
+                },
+            )
+        self.assertEqual(launch.exec_target, real)
+        self.assertEqual(launch.argv0, str(d1 / "claude"))
+
+    def test_two_distinct_realpaths_still_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            _install_binary(base / "a", "claude")
+            _install_binary(base / "b", "claude")
+            with self.assertRaises(AgentProviderExecutableError) as ctx:
+                resolve_agent_launch(
+                    "claude",
+                    {"PATH": f"{base / 'a'}{os.pathsep}{base / 'b'}", "MOZYO_AGENT_CLAUDE_BINARY": ""},
+                )
+        self.assertIn("ambiguously", str(ctx.exception))
 
 
 class HostileConfigTest(unittest.TestCase):
