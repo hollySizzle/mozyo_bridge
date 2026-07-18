@@ -295,6 +295,11 @@ class WorkspaceSupervisionOutcome:
     non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
+    #: Pre-existing review_return backlog rows this workspace terminally fenced (Redmine #13974 R2):
+    #: rows reserved for a now-hibernated / superseded lane whose issue is no longer in any active
+    #: roster, converged to a terminal zero-send by the own-workspace backlog drain (never a silent
+    #: drop — surfaced so the operator sees a stale backlog stop retrying).
+    backlog_fenced: int = 0
 
     @property
     def events_supplied(self) -> int:
@@ -315,6 +320,7 @@ class WorkspaceSupervisionOutcome:
             "skipped_reason": self.skipped_reason,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
+            "backlog_fenced": self.backlog_fenced,
             "issues": [i.as_payload() for i in self.issues],
         }
 
@@ -343,6 +349,10 @@ class SupervisorReport:
     def delivered(self) -> int:
         return sum(w.delivered for w in self.workspaces)
 
+    @property
+    def backlog_fenced(self) -> int:
+        return sum(w.backlog_fenced for w in self.workspaces)
+
     def as_payload(self) -> dict[str, object]:
         return {
             "action": "run-once",
@@ -353,6 +363,7 @@ class SupervisorReport:
             "workspaces_skipped": self.workspaces_skipped,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
+            "backlog_fenced": self.backlog_fenced,
             "workspaces": [w.as_payload() for w in self.workspaces],
         }
 

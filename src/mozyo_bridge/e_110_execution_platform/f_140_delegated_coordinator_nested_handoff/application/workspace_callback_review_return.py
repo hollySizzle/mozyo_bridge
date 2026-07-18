@@ -22,6 +22,7 @@ composition root; this module owns only the review-return owning-lane authoritie
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
@@ -41,6 +42,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalSource,
+    dispatch_entry_journal_from_source,
     markers_from_source,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
@@ -329,6 +331,237 @@ def build_supervisor_send_edge_fence(
     )
 
 
+def _int_field(obj: object, name: str, default: int = 0) -> int:
+    """Read an integer attribute, tolerant of blank / non-numeric (fail-closed to default)."""
+    try:
+        return int(getattr(obj, name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_lane_facts(
+    lifecycle_store: object, workspace_id: str, issue: str
+) -> "tuple[str, int, str]":
+    """Resolve ``(lane_id, live_generation, lifecycle_disposition)`` for an issue (#13758 / #13968).
+
+    The owning-lane authority (#13681/#13689) resolves the active lane; the lifecycle row's
+    ``lane_generation`` (#13810 incarnation) is the reconcile generation and its ``lane_disposition``
+    gates a terminal close. An unresolved / recordless owner is a fail-closed blank lane (the caller
+    then skips). Extracted move-only from ``build_supervisor`` so the reconcile leg, the candidate
+    fence, AND the #13974 R2 backlog drain resolve the owning generation through ONE authority.
+    """
+    from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+
+    wsid, issue_s = str(workspace_id).strip(), str(issue).strip()
+    owner = lifecycle_store.resolve_owner(wsid, issue_s)
+    if not getattr(owner, "resolved", False):
+        return "", 0, ""
+    lane_id = str(getattr(owner, "lane_id", "") or "").strip()
+    record = lifecycle_store.get(LaneLifecycleKey(wsid, lane_id))
+    if record is None:
+        return lane_id, 0, ""
+    generation = _int_field(record, "lane_generation")
+    disposition = str(getattr(record, "lane_disposition", "") or "").strip()
+    return lane_id, generation, disposition
+
+
+def resolve_dispatch_anchor(source: object, issue: str, lane: str, lane_generation: int) -> str:
+    """The EXACT workflow dispatch anchor: the owning journal of this lane+generation's IR marker.
+
+    Reads the durable ``[mozyo:workflow-event:kind=implementation_request:lane:lane_generation]``
+    marker and returns its OWNING entry journal id (review R5-F3 / j#79507 Q2), exactly-one /
+    verified / zero-send. A legacy prose-only IR (no marker) is fail-closed (blank baseline — no
+    reconcile until a structured IR round). ``None`` / unreadable source -> blank. Extracted move-only
+    from ``build_supervisor``.
+    """
+    if source is None:
+        return ""
+    try:
+        return dispatch_entry_journal_from_source(
+            source, str(issue).strip(), lane=lane, lane_generation=lane_generation
+        )
+    except Exception:  # noqa: BLE001 - an unreadable dispatch anchor baselines fail-safe
+        return ""
+
+
+def build_candidate_anchor_fn(
+    lifecycle_store: object,
+) -> "Callable[[str, str, object], Optional[str]]":
+    """Build the current-generation dispatch-anchor resolver for the general-callback fence (#13968 F2).
+
+    Resolves the owning lane + generation (:func:`resolve_lane_facts`) then its current dispatch entry
+    journal (:func:`resolve_dispatch_anchor`). ``None`` when the owning lane / anchor cannot be pinned
+    (no owner / legacy prose-only IR): the fence then drops every general candidate (fail-closed).
+    Extracted move-only from ``build_supervisor`` so it is reusable outside the supervisor build.
+    """
+
+    def _anchor(workspace_id: str, issue: str, source: object) -> Optional[str]:
+        lane_id, generation, _disposition = resolve_lane_facts(lifecycle_store, workspace_id, issue)
+        if not lane_id:
+            return None
+        anchor = resolve_dispatch_anchor(source, issue, lane_id, generation)
+        return anchor or None
+
+    return _anchor
+
+
+@dataclass(frozen=True)
+class BacklogDrainOutcome:
+    """One workspace's pre-existing review_return backlog drain result (Redmine #13974 R2).
+
+    ``fenced`` is the count of backlog rows a readable provider terminally fenced this drain (zero-send,
+    ``mark_uncertain`` — retry 0, attempts unchanged); ``delivered`` is the count the fence let through
+    to the sender (a still-current row); ``transient_skipped`` is the count of issues left pending
+    because the provider was unreadable (retryable, never terminalized); ``lease_lost`` is True when a
+    takeover stopped the drain mid-sweep.
+    """
+
+    workspace_id: str
+    fenced: int = 0
+    delivered: int = 0
+    transient_skipped: int = 0
+    lease_lost: bool = False
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "workspace_id": self.workspace_id,
+            "fenced": self.fenced,
+            "delivered": self.delivered,
+            "transient_skipped": self.transient_skipped,
+            "lease_lost": self.lease_lost,
+        }
+
+
+def drain_review_return_backlog(
+    outbox: object,
+    workspace_id: str,
+    *,
+    source: object,
+    sender: "Callable[[CallbackOutboxRow], object]",
+    lifecycle_store: object,
+    route: str,
+    lease_guard_fn: "Optional[Callable[[], bool]]" = None,
+    skip_issues: "Optional[frozenset]" = None,
+    now: "Optional[str]" = None,
+) -> BacklogDrainOutcome:
+    """Terminally fence a workspace's PRE-EXISTING previous-generation / hibernated-owner review_return
+    backlog rows that active-issue discovery never revisits (Redmine #13974 R2).
+
+    ``select_supervised_issues`` only drives a fenced deliver pass for issues in the LIVE active-pane
+    roster. A review_return row reserved for a lane that later hibernated / was superseded (its issue is
+    no longer in any roster) keeps bounded-retrying as pending — #13974's backlog-retention failure
+    surviving on a legacy row (installed-a9 finding j#81622). This drains THIS workspace's own pending
+    partition through the SAME action-time send-edge fence (:func:`build_supervisor_send_edge_fence`), so
+    such a row converges to a terminal zero-send (``mark_uncertain``: retry 0, attempts unchanged)
+    instead of retrying forever. A legacy row whose payload carries no head / conclusion can never match
+    the current review identity, so a readable provider always fences it terminally.
+
+    Transient-safe (correction 3, the deterministic-stale vs transient-unreadable split): each issue's
+    identity + dispatch anchor is resolved behind ONE ``try`` over the live provider — a provider read
+    that RAISES (``markers_from_source`` / the lifecycle owner read / the dispatch-anchor read) leaves
+    every row for that issue pending (retryable), so a merely-unreadable provider never terminalizes a
+    possibly-current round. Only a READABLE provider that shows the round is previous-generation /
+    hibernated-owner (a resolved-but-absent owning lane -> ``anchor=None`` -> unresolvable-anchor
+    terminal) / identity-drifted terminalizes it.
+
+    Foreign-partition-safe (Redmine #13968): only rows whose ``workspace_id`` is exactly
+    ``workspace_id`` are read, and the processor claim is workspace-scoped, so a concurrent foreign
+    workspace's rows are never read or claimed. ``lease_guard_fn`` (the supervisor's holder renew) is
+    re-checked before each issue's deliver so a takeover mid-drain stops before the next send.
+    ``skip_issues`` are issues already drained this sweep (the active-issue pass), skipped here.
+    """
+    from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
+        CallbackOutboxProcessor,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
+        current_review_generation_conclusion,
+        current_review_generation_head,
+        current_review_generation_request,
+    )
+
+    wsid = str(workspace_id or "").strip()
+    skip = frozenset(str(i or "").strip() for i in (skip_issues or ()))
+    fenced = delivered = transient = 0
+    # Foreign-partition-safe read: only THIS workspace's pending rows (an unreadable outbox drains
+    # nothing rather than raising). The processor claim below is also workspace-scoped.
+    try:
+        pending = [
+            r for r in outbox.read(states=[CALLBACK_PENDING])
+            if str(getattr(r, "workspace_id", "") or "").strip() == wsid
+        ]
+    except Exception:  # noqa: BLE001 - an unreadable outbox drains nothing (fail-open)
+        return BacklogDrainOutcome(workspace_id=wsid)
+    issues: list[str] = []
+    for r in pending:
+        issue = str(getattr(r, "issue", "") or "").strip()
+        if issue and issue not in skip and issue not in issues:
+            issues.append(issue)
+    for issue in issues:
+        if lease_guard_fn is not None and not lease_guard_fn():
+            return BacklogDrainOutcome(
+                workspace_id=wsid, fenced=fenced, delivered=delivered,
+                transient_skipped=transient, lease_lost=True,
+            )
+        try:
+            # ONE provider read is the transient gate: any read that RAISES leaves this issue's rows
+            # pending (retryable). ``anchor=None`` from a RESOLVED read (no owning lane) is a
+            # deterministic hibernated / superseded signal, NOT a transient failure.
+            markers = list(markers_from_source(source, issue))
+            lane_id, generation, _disposition = resolve_lane_facts(lifecycle_store, wsid, issue)
+            anchor: Optional[str] = None
+            if lane_id:
+                anchor = (
+                    dispatch_entry_journal_from_source(
+                        source, issue, lane=lane_id, lane_generation=generation
+                    )
+                    or None
+                )
+            review_head = current_review_generation_head(markers, issue)
+            review_request = current_review_generation_request(markers, issue)
+            review_conclusion = current_review_generation_conclusion(markers, issue)
+        except Exception:  # noqa: BLE001 - a transiently-unreadable provider -> retryable, never terminal
+            transient += 1
+            continue
+        send_fence_fn = build_supervisor_send_edge_fence(
+            anchor, route, review_head, review_request, review_conclusion
+        )
+        report = CallbackOutboxProcessor(outbox, source, workspace_id=wsid).deliver(
+            sender, send_fence_fn=send_fence_fn, issue=issue, now=now
+        )
+        fenced += len(report.fenced)
+        delivered += len(report.delivered)
+    return BacklogDrainOutcome(
+        workspace_id=wsid, fenced=fenced, delivered=delivered, transient_skipped=transient
+    )
+
+
+def deliver_workspace_backlog(
+    outbox: object,
+    workspace_id: str,
+    *,
+    source: object,
+    sender: "Callable[[CallbackOutboxRow], object]",
+    home: object = None,
+) -> BacklogDrainOutcome:
+    """Operator convenience: drain a workspace's review_return backlog over a readable provider (#13974 R2).
+
+    Wires the home-scoped owning-lane lifecycle authority (the same read-only #13681/#13689 store the
+    supervisor uses) and delegates to :func:`drain_review_return_backlog`, so ``workflow callbacks
+    --deliver`` with ``--poll`` / ``--redmine-json`` converges a previous-generation / hibernated-owner
+    row to a terminal zero-send. Fenced on the default coordinator route (:data:`DEFAULT_CALLBACK_ROUTE`).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (  # noqa: E501
+        default_lifecycle_store,
+    )
+
+    return drain_review_return_backlog(
+        outbox, workspace_id, source=source, sender=sender,
+        lifecycle_store=default_lifecycle_store(home=home),
+        route=DEFAULT_CALLBACK_ROUTE,
+    )
+
+
 __all__ = (
     "coordinator_target_tuple",
     "owning_lane_binding",
@@ -338,5 +571,11 @@ __all__ = (
     "resolve_current_review_identity",
     "build_supervisor_send_edge_fence",
     "discover_fenced_review_returns",
+    "resolve_lane_facts",
+    "resolve_dispatch_anchor",
+    "build_candidate_anchor_fn",
+    "BacklogDrainOutcome",
+    "drain_review_return_backlog",
+    "deliver_workspace_backlog",
     "REVIEW_RETURN_OWNER_READ_ERROR",
 )

@@ -42,7 +42,7 @@ from mozyo_bridge.core.state.supervisor_lease import (
     SUPERVISOR_LEASE_TTL_SECONDS,
     SupervisorLeaseStore,
 )
-from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING, WorkflowRuntimeStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
@@ -57,12 +57,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     # root stays under the module-health threshold. Re-exported here so every caller's import surface
     # (and ``__all__``) is unchanged.
     REVIEW_RETURN_OWNER_READ_ERROR,
+    BacklogDrainOutcome,
+    build_candidate_anchor_fn,
     build_supervisor_send_edge_fence,
     coordinator_target_tuple,
     discover_fenced_review_returns,
+    drain_review_return_backlog,
     owning_lane_binding,
     owning_lane_generation_reader,
     resolve_current_review_identity,
+    resolve_dispatch_anchor,
+    resolve_lane_facts,
     review_round_send_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
@@ -89,14 +94,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _int_field(obj: object, name: str, default: int = 0) -> int:
-    """Read an integer attribute, tolerant of blank / non-numeric (fail-closed to default)."""
-    try:
-        return int(getattr(obj, name, default) or default)
-    except (TypeError, ValueError):
-        return default
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,6 +172,7 @@ class WorkspaceCallbackSupervisor:
         candidate_fence_fn: Optional[
             Callable[[str, str, Optional[RedmineJournalSource]], Optional[str]]
         ] = None,
+        backlog_drain_fn: Optional[Callable[..., BacklogDrainOutcome]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -212,6 +210,10 @@ class WorkspaceCallbackSupervisor:
         # are historical replay and are fenced (0-send) at both the ingest and send edges; ``None``
         # fails closed. Optional (unit fakes unchanged); the production resolver is in build_supervisor.
         self._candidate_fence_fn = candidate_fence_fn
+        # Redmine #13974 R2: the own-workspace review_return backlog drain — after the active-issue pass,
+        # each leased workspace converges ITS OWN pending partition (a hibernated / superseded owning lane
+        # never re-supervised) through the action-time fence. Optional; production drainer in build_supervisor.
+        self._backlog_drain_fn = backlog_drain_fn
 
     # -- public entrypoint -------------------------------------------------
 
@@ -327,7 +329,12 @@ class WorkspaceCallbackSupervisor:
                 )
             else:
                 supervised, non_authoritative = selection.supervised, ()
-            if not supervised:
+            # #13974 R2: a workspace with NO active issues but pending own-partition backlog (every owning
+            # lane hibernated) must STILL drain it — an empty roster short-circuits ONLY when there is
+            # nothing to drain (the probe reads the outbox only on the empty-roster path, ``and`` short).
+            if not supervised and not (
+                self._backlog_drain_fn is not None and self._has_pending_backlog(wsid)
+            ):
                 return WorkspaceSupervisionOutcome(
                     workspace_id=wsid,
                     lease_acquired=True,
@@ -360,6 +367,24 @@ class WorkspaceCallbackSupervisor:
                     # source reads): the lease is gone, so stop before any further workspace work.
                     lease_lost = True
                     break
+            # Redmine #13974 R2: while we still hold the lease, drain THIS workspace's own pending
+            # review_return backlog (issues NOT in the active roster) through the same action-time fence.
+            # The renew guard stops before a send on a takeover; only this workspace's partition is read /
+            # claimed; skip already-supervised issues. Fail-open — a drain error never breaks the sweep.
+            backlog_fenced = 0
+            if not lease_lost and self._backlog_drain_fn is not None:
+                try:
+                    outcome = self._backlog_drain_fn(
+                        wsid, source=source, sender=sender,
+                        skip_issues=frozenset(supervised),
+                        lease_guard_fn=lambda: self._lease_store.renew(
+                            wsid, self._holder, now=self._clock(), ttl_seconds=self._ttl
+                        ),
+                    )
+                    backlog_fenced = outcome.fenced
+                    lease_lost = lease_lost or outcome.lease_lost
+                except Exception:  # noqa: BLE001 - a backlog drain never breaks the sweep
+                    backlog_fenced = 0
             return WorkspaceSupervisionOutcome(
                 workspace_id=wsid,
                 lease_acquired=True,
@@ -369,6 +394,7 @@ class WorkspaceCallbackSupervisor:
                 non_authoritative_issues=non_authoritative,
                 issues=tuple(issue_outcomes),
                 skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
+                backlog_fenced=backlog_fenced,
             )
         finally:
             # A bounded run-once releases each workspace at the end of its sweep so the next
@@ -377,6 +403,17 @@ class WorkspaceCallbackSupervisor:
             # taken-over previous owner can never evict a new owner here.
             if self._release_after:
                 self._lease_store.release(wsid, self._holder)
+
+    def _has_pending_backlog(self, workspace_id: str) -> bool:
+        """True iff THIS workspace's partition holds any pending row (#13974 R2 drain gate; fail-open)."""
+        wsid = str(workspace_id or "").strip()
+        try:
+            return any(
+                str(getattr(r, "workspace_id", "") or "").strip() == wsid
+                for r in self._outbox.read(states=[CALLBACK_PENDING])
+            )
+        except Exception:  # noqa: BLE001 - an unreadable outbox gates no drain (fail-open)
+            return False
 
     # -- per-issue ---------------------------------------------------------
 
@@ -844,7 +881,6 @@ def build_supervisor(
         BackgroundServiceCallbackSender,
     )
 
-    from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
     from mozyo_bridge.core.state.reconcile_state import ReconcileStateStore
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_live_source import (
         lane_worker_runtime,
@@ -853,7 +889,6 @@ def build_supervisor(
         build_reconcile_leg_fn,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-        dispatch_entry_journal_from_source,
         markers_from_source,
     )
 
@@ -892,65 +927,29 @@ def build_supervisor(
             workspace_id, issue, binding, lifecycle_store=lifecycle_store
         )
 
+    # #13758 reconcile leg / #13968 general-callback fence resolve the owning lane + generation + dispatch
+    # anchor through ONE authority — the sibling-leaf resolvers (move-only from the former inline closures).
     def _lane_facts(workspace_id: str, issue: str) -> "tuple[str, int, str]":
-        """Resolve ``(lane_id, live_generation, lifecycle_disposition)`` for the reconcile leg.
+        return resolve_lane_facts(lifecycle_store, workspace_id, issue)
 
-        The owning-lane authority (#13681/#13689) resolves the active lane; the lifecycle row's
-        ``lane_generation`` (#13810 incarnation) is the reconcile generation and its
-        ``lane_disposition`` gates a terminal close. An unresolved / unreadable owner is a
-        fail-closed blank lane (the leg then skips). The exact dispatch anchor (review R4-F3)
-        and the live runtime (review R4-F1) are read by the separate source / inventory seams.
-        """
-        wsid, issue_s = str(workspace_id).strip(), str(issue).strip()
-        owner = lifecycle_store.resolve_owner(wsid, issue_s)
-        if not getattr(owner, "resolved", False):
-            return "", 0, ""
-        lane_id = str(getattr(owner, "lane_id", "") or "").strip()
-        record = lifecycle_store.get(LaneLifecycleKey(wsid, lane_id))
-        if record is None:
-            return lane_id, 0, ""
-        generation = _int_field(record, "lane_generation")
-        disposition = str(getattr(record, "lane_disposition", "") or "").strip()
-        return lane_id, generation, disposition
+    _candidate_fence_fn = build_candidate_anchor_fn(lifecycle_store)
 
-    def _dispatch_anchor_fn(source: object, issue: str, lane: str, lane_generation: int) -> str:
-        """The EXACT workflow dispatch anchor: the owning journal of this lane+generation's IR marker.
-
-        Reads the durable ``[mozyo:workflow-event:kind=implementation_request:lane:lane_generation]``
-        marker and returns its OWNING entry journal id (review R5-F3 / j#79507 Q2), exactly-one /
-        verified / zero-send. A legacy prose-only IR (no marker) is fail-closed (blank baseline —
-        no reconcile until a structured IR round). ``None`` / unreadable source -> blank.
-        """
-        if source is None:
-            return ""
-        try:
-            return dispatch_entry_journal_from_source(
-                source, str(issue).strip(), lane=lane, lane_generation=lane_generation
-            )
-        except Exception:  # noqa: BLE001 - an unreadable dispatch anchor baselines fail-safe
-            return ""
-
-    def _candidate_fence_fn(
-        workspace_id: str, issue: str, source: object
-    ) -> Optional[str]:
-        """The issue's current dispatch anchor journal for the general-callback fence (#13968 F2).
-
-        Resolves the owning lane + generation (``_lane_facts``) then its current dispatch entry
-        journal (``_dispatch_anchor_fn``). ``None`` when the owning lane / anchor cannot be pinned
-        (no owner / legacy prose-only IR): the fence then drops every general candidate (fail-closed).
-        """
-        lane_id, generation, _disposition = _lane_facts(workspace_id, issue)
-        if not lane_id:
-            return None
-        anchor = _dispatch_anchor_fn(source, issue, lane_id, generation)
-        return anchor or None
+    def _backlog_drain_fn(
+        workspace_id: str, *, source, sender, skip_issues, lease_guard_fn
+    ) -> BacklogDrainOutcome:
+        # #13974 R2: drain the own-workspace backlog over the shared outbox + lifecycle authority.
+        return drain_review_return_backlog(
+            outbox, workspace_id, source=source, sender=sender,
+            lifecycle_store=lifecycle_store, route=DEFAULT_CALLBACK_ROUTE,
+            lease_guard_fn=lease_guard_fn, skip_issues=skip_issues,
+        )
 
     reconcile_leg_fn = build_reconcile_leg_fn(
         reconcile_store=reconcile_store,
         outbox=outbox,
         lane_facts_fn=_lane_facts,
         markers_fn=markers_from_source,
-        dispatch_anchor_fn=_dispatch_anchor_fn,
+        dispatch_anchor_fn=resolve_dispatch_anchor,
         runtime_fn=lane_worker_runtime,
     )
 
@@ -971,6 +970,7 @@ def build_supervisor(
         reconcile_leg_fn=reconcile_leg_fn,
         authoritative_fn=lambda: default_authoritative_map(lifecycle_store),
         candidate_fence_fn=_candidate_fence_fn,
+        backlog_drain_fn=_backlog_drain_fn,
     )
 
 
