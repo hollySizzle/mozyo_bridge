@@ -62,6 +62,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     discover_fenced_review_returns,
     owning_lane_binding,
     owning_lane_generation_reader,
+    resolve_current_review_head,
     review_round_send_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
@@ -424,11 +425,15 @@ class WorkspaceCallbackSupervisor:
                     anchor = self._candidate_fence_fn(workspace_id, issue, source)
                     candidates, fenced = fence_candidates_to_anchor(candidates, anchor)
                     historical_fenced = len(fenced)
-                    # R2-F1 / #13974: the SAME anchor also fences PRE-EXISTING pending / recovered
-                    # backlog rows at the send edge — a historical coordinator row AND a
-                    # previous-generation review_return row both reach a terminal disposition instead
-                    # of retrying forever (the ingest fence only stops newly discovered candidates).
-                    send_fence_fn = build_supervisor_send_edge_fence(anchor, self._route)
+                    # R2-F1 / #13974: the SAME anchor (+ the current review generation head, j#81454 A)
+                    # also fences PRE-EXISTING pending / recovered backlog rows at the send edge — a
+                    # historical coordinator row AND a previous-generation / head-drifted review_return
+                    # row both reach a terminal disposition instead of retrying forever (the ingest
+                    # fence only stops newly discovered candidates).
+                    current_review_head = resolve_current_review_head(source, issue)
+                    send_fence_fn = build_supervisor_send_edge_fence(
+                        anchor, self._route, current_review_head
+                    )
                 # #13684/#13974: reserve the correlated review_result return to the issue's owning-lane
                 # Codex gateway, generation-fenced. The sibling helper resolves the owning-lane binding,
                 # threads the current dispatch anchor (a review round predating the current generation is
