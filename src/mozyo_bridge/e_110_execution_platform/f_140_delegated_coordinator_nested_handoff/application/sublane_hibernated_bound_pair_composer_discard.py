@@ -42,6 +42,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FAULT_PINS_NOT_EMPTY,
     BoundSlot,
     bound_signature_detail,
+    worktree_digest,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (
     SLOT_HEALTHY,
@@ -294,6 +295,13 @@ def _rollback_surface_safe(
     failing is a dirty / branch-mismatch / lifecycle-fault / revision-race that the rollback
     rail cannot see, so the command must not be surfaced. Composer-discardability is NOT here:
     the whole reason a rollback is owed is that a live slot occupies the pair.
+
+    ``branch_matches`` alone is request-relative (live branch == this request's branch); it does
+    NOT prove the pair is still the one the owner APPROVED. The marker binds the resolved
+    worktree identity + branch as a digest (`managed-state-model.md`), so the projection's
+    worktree path/identity/branch must re-derive to exactly ``approved.worktree_digest`` — an
+    approval made on ``main`` must not fund a rollback on a worktree since moved to ``other``
+    (review j#82089 F2).
     """
     return bool(
         observation.lifecycle_exact
@@ -304,6 +312,12 @@ def _rollback_surface_safe(
         and observation.branch_matches
         and observation.revision == approved.revision
         and observation.generation == approved.generation
+        and worktree_digest(
+            resolved_path=observation.worktree_path,
+            identity=observation.worktree_identity,
+            branch=observation.branch,
+        )
+        == approved.worktree_digest
     )
 
 
