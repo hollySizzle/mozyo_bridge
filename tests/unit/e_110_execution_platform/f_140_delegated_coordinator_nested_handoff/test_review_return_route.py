@@ -64,6 +64,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     make_review_return_send_edge_fence,
     plan_review_return,
     plan_review_returns,
+    review_request_is_ambiguous,
     review_result_is_ambiguous,
     review_return_callback_route,
     review_return_is_current,
@@ -420,6 +421,41 @@ class ReviewHeadFenceTest(unittest.TestCase):
         plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
         self.assertFalse(plan.emit)
         self.assertEqual(plan.reason, RETURN_AMBIGUOUS_REVIEW_IDENTITY)
+
+    def test_ambiguous_request_head_is_refused(self) -> None:
+        # j#81518 F1: the review_request journal (j110) carries two markers with disagreeing heads.
+        markers = [
+            _review_request("110", head=HEAD_A),
+            _review_request("110", head=HEAD_B),
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+        ]
+        self.assertTrue(review_request_is_ambiguous(markers, ISSUE, "110"))
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_AMBIGUOUS_REVIEW_IDENTITY)
+
+    def test_ambiguous_request_head_collapses_current_head(self) -> None:
+        markers = [_review_request("110", head=HEAD_A), _review_request("110", head=HEAD_B)]
+        self.assertEqual(current_review_generation_head(markers, ISSUE), "")
+
+    def test_ambiguous_request_head_fails_action_time_current(self) -> None:
+        # j#81518 F2: the final re-read (review_return_is_current) itself fails closed on a request
+        # head conflict observed on this read.
+        markers = [
+            _review_request("110", head=HEAD_A),
+            _review_request("110", head=HEAD_B),
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+        ]
+        self.assertFalse(review_return_is_current(markers, ISSUE, "120", "110"))
+
+    def test_ambiguous_result_fails_action_time_current(self) -> None:
+        # j#81518 F2: a same-result-journal conflict observed only at the final re-read fails closed.
+        markers = [
+            _review_request("110", head=HEAD_A),
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+            _review_result("120", head=HEAD_A, req="110", conclusion="changes_requested"),
+        ]
+        self.assertFalse(review_return_is_current(markers, ISSUE, "120", "110"))
 
     def test_identical_duplicate_markers_are_not_ambiguous(self) -> None:
         markers = [

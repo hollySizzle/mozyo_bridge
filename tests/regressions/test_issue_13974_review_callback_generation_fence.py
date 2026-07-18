@@ -240,12 +240,17 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
     def _build_supervisor(
         self, *, wsid, source, transport, anchor, holder="superF",
         inventory_lanes=(LANE,), roster_fn=None, authoritative_fn=None, workspaces_fn=None,
+        round_fence_source=None,
     ):
-        """The REAL WorkspaceCallbackSupervisor with the #13968/#13974 anchor+head fence wired."""
+        """The REAL WorkspaceCallbackSupervisor with the #13968/#13974 anchor+head fence wired.
+
+        ``round_fence_source`` (j#81518 F2) lets the SENDER's final live round fence read a DIFFERENT
+        source than the supervisor's snapshot — the two-read TOCTOU. Defaults to ``source``."""
         inv = lambda: (
             [{"name": encode_assigned_name(wsid, "codex", l), "pane_id": f"%{l}"} for l in inventory_lanes],
             "herdr",
         )
+        fence_src = round_fence_source if round_fence_source is not None else source
 
         def sender_fn(ws):
             resolver = BackendNeutralTargetResolver(
@@ -255,7 +260,7 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
             return BackgroundServiceCallbackSender(
                 workspace_id=ws.workspace_id, holder=holder, lease_store=self.lease,
                 target_resolver=resolver, transport=transport, outbox=self.outbox, now_fn=lambda: NOW,
-                round_fence_fn=review_round_send_fence(lambda: source),
+                round_fence_fn=review_round_send_fence(lambda: fence_src),
             )
 
         return WorkspaceCallbackSupervisor(
@@ -804,6 +809,62 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
         self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
         self.assertIn(RETURN_AMBIGUOUS_REVIEW_IDENTITY, self._refusals(report))
+
+    def _conflicting_request_head_source(self):
+        # j#81518 F1: review_request j110 carries two markers with disagreeing heads.
+        return MappingRedmineJournalSource(payload=_journals(
+            ("110", _req(CUR_HEAD) + "\n" + _req(OLD_HEAD)),
+            ("120", _res(head=CUR_HEAD, req="110", conclusion="approved")),
+        ))
+
+    def test_fs_same_journal_conflicting_request_head_ambiguous_via_supervisor(self) -> None:
+        # j#81518 F1: the SAME review_request journal carries conflicting heads -> ambiguous -> fresh
+        # discovery refuses (0-enqueue), nothing delivers.
+        _wsid, report = self._supervise_current(self._conflicting_request_head_source())
+        self.assertEqual(self._transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_AMBIGUOUS_REVIEW_IDENTITY, self._refusals(report))
+
+    def test_fs_preexisting_row_request_head_conflict_terminal_via_supervisor(self) -> None:
+        # j#81518 F1 (backlog): a valid v2 row was FENCED-enqueued while the request head was unique;
+        # the request journal then gains a conflicting head. The send-edge head fence terminals the row
+        # (current review head collapses to blank on the ambiguous request).
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_fenced_discovery(_current_round_source(), wsid)  # valid full v2 payload
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=self._conflicting_request_head_source(), transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+
+    def test_fs_final_reread_conflict_after_valid_snapshot_sends_zero(self) -> None:
+        # j#81518 F2 (TOCTOU): a valid v2 row is enqueued; the supervisor's SNAPSHOT source is still
+        # valid (send-edge fence passes), but the SENDER's final live round-fence re-read observes a
+        # same-result-journal conflict. review_return_is_current itself fails closed -> send 0.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_fenced_discovery(_current_round_source(), wsid)
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        conflict_reread = MappingRedmineJournalSource(payload=_journals(
+            ("110", _req(CUR_HEAD)),
+            ("120",
+             _res(head=CUR_HEAD, req="110", conclusion="approved") + "\n"
+             + _res(head=CUR_HEAD, req="110", conclusion="changes_requested")),
+        ))
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
+            round_fence_source=conflict_reread,  # the final live re-read disagrees with the snapshot
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])  # the irreversible send never fires
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
 
     def test_producer_cli_fail_closed_validation(self) -> None:
         # j#81487 F2: the canonical --emit-gate writer refuses to emit a head-less / malformed / req-less
