@@ -69,6 +69,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     CURSOR_RELATION_COMPOSER,
     CURSOR_RELATION_ELSEWHERE,
     CURSOR_RELATION_UNKNOWN,
+    RENDER_REASON_AMBIGUOUS_RENDER,
     RENDER_REASON_ANSI_ABSENT,
     RENDER_REASON_ANSI_UNSUPPORTED,
     RENDER_REASON_EMPTY_COMPOSER,
@@ -402,10 +403,27 @@ def _parse_read_payload(stdout: object) -> tuple:
 
 
 # -- composer-render (ANSI style) parsing (Redmine #14065) --------------------
-# A CSI escape sequence: ESC '[' <params> <final-byte>. Only the SGR final byte
-# 'm' changes rendered intensity; every other CSI (cursor move, erase, …) is
-# consumed and discarded so it never leaks into the reconstructed text.
-_ANSI_CSI_RE = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+# Escape-sequence grammars. A full CSI is ESC '[' <parameter bytes> <intermediate
+# bytes 0x20-0x2F> <final byte 0x40-0x7E>. The parameter class spans the private
+# markers ``<=>?`` so a private/mode CSI is *recognised as a complete sequence*
+# (not laundered byte-by-byte into visible text), but such a private CSI is then
+# treated as AMBIGUOUS: a DEC-private / mode-toggle sequence like ``ESC[?25l`` is
+# terminal state, not visible-buffer content, so its presence in a captured render
+# means the screen cannot be trusted (Redmine #14065 review j#82166 finding 2). A
+# standard non-SGR CSI (cursor move / erase, no private marker) is consumed as
+# harmless control so real renders still classify.
+_CSI_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]")
+#: Private / parameter-extension markers that make a CSI non-standard for a visible
+#: render (DEC-private ``?``, and the ``<=>`` extension introducers).
+_PRIVATE_CSI_RE = re.compile(r"[<=>?]")
+# An OSC (e.g. a title set) terminated by BEL or ST, and an nF escape (e.g. a
+# charset selection ``ESC(B``) — both recognised as control and consumed whole.
+_OSC_RE = re.compile(r"\x1b\][^\x1b\x07]*(?:\x07|\x1b\\)")
+_NF_ESC_RE = re.compile(r"\x1b[ -/]+[0-~]")
+# A standard SGR carries only numeric / ``;`` parameters. A final-``m`` CSI whose
+# parameters fall outside that set is a non-standard SGR and is treated as
+# ambiguous rather than applied, so a malformed style can never be trusted.
+_SGR_PARAMS_RE = re.compile(r"^[0-9;]*$")
 
 # The composer prompt marker set + body, mirroring the e110 observer's
 # ``_PROMPT_RE`` (``sublane_quarantine``). Duplicated as a one-line provider-local
@@ -455,13 +473,52 @@ def _apply_sgr(params: str, faint: bool, dim_fg: bool) -> tuple[bool, bool]:
     return faint, dim_fg
 
 
-def _scan_ansi_intensities(ansi: str) -> list:
-    """Reconstruct visible lines as ``[[(char, is_dim), …], …]`` from an ANSI stream.
+def _consume_escape(ansi: str, i: int) -> tuple:
+    """Consume the escape sequence at ``i``: ``(end_index, kind, sgr_params)``.
 
-    Walks the stream tracking the SGR intensity state; every visible character is
-    emitted with the intensity in force when it was drawn. Non-SGR CSI sequences
-    are consumed without emitting a character. The raw text never leaves this
-    module — callers receive only the derived closed classification.
+    ``kind`` is ``"sgr"`` (a standard intensity-changing SGR, with ``sgr_params``),
+    ``"control"`` (any other complete, recognised sequence — consumed and ignored),
+    or ``"ambiguous"`` (an escape that could not be resolved into a complete,
+    recognised sequence). An ambiguous escape must fail the whole render closed
+    rather than dropping the ESC byte and laundering the tail as visible text
+    (Redmine #14065 review j#82166 finding 2).
+    """
+    match = _CSI_RE.match(ansi, i)
+    if match:
+        seq = match.group(0)
+        final = seq[-1]
+        middle = seq[2:-1]  # between the leading ``ESC[`` and the final byte
+        if final == "m":
+            # A standard SGR carries only numeric / ``;`` parameters; a private or
+            # extension-marked SGR is non-standard and cannot be trusted.
+            if _SGR_PARAMS_RE.match(middle):
+                return match.end(), "sgr", middle
+            return match.end(), "ambiguous", None
+        # A non-SGR CSI: consume a standard cursor/erase sequence as harmless
+        # control, but a DEC-private / extension CSI (``?<=>``) in a visible render
+        # is anomalous — fail the render closed rather than trust it.
+        if _PRIVATE_CSI_RE.search(middle):
+            return match.end(), "ambiguous", None
+        return match.end(), "control", None
+    match = _OSC_RE.match(ansi, i)
+    if match:
+        return match.end(), "control", None
+    match = _NF_ESC_RE.match(ansi, i)
+    if match:
+        return match.end(), "control", None
+    return i + 1, "ambiguous", None
+
+
+def _scan_ansi_intensities(ansi: str) -> tuple:
+    """Reconstruct visible lines + an ambiguity flag from an ANSI stream.
+
+    Returns ``([[(char, is_dim), …], …], ambiguous)``. Walks the stream tracking
+    the SGR intensity state; every visible character is emitted with the intensity
+    in force when it was drawn, and every recognised escape (SGR or other control)
+    is consumed without emitting a character. The moment an escape cannot be
+    resolved into a complete recognised sequence, ``ambiguous`` is ``True`` and the
+    scan stops — the classifier fails the render closed rather than trusting a
+    partially-parsed screen. The raw text never leaves this module.
     """
     lines: list = []
     current: list = []
@@ -472,13 +529,13 @@ def _scan_ansi_intensities(ansi: str) -> list:
     while i < n:
         ch = ansi[i]
         if ch == "\x1b":
-            match = _ANSI_CSI_RE.match(ansi, i)
-            if match:
-                if match.group(2) == "m":
-                    faint, dim_fg = _apply_sgr(match.group(1), faint, dim_fg)
-                i = match.end()
-                continue
-            i += 1  # a lone ESC not forming a CSI: drop the byte
+            end, kind, params = _consume_escape(ansi, i)
+            if kind == "ambiguous":
+                lines.append(current)
+                return lines, True
+            if kind == "sgr":
+                faint, dim_fg = _apply_sgr(params, faint, dim_fg)
+            i = end
             continue
         if ch == "\n":
             lines.append(current)
@@ -491,7 +548,7 @@ def _scan_ansi_intensities(ansi: str) -> list:
         current.append((ch, faint or dim_fg))
         i += 1
     lines.append(current)
-    return lines
+    return lines, False
 
 
 def _prompt_body_cells(cells: list) -> list:
@@ -513,9 +570,11 @@ def _classify_composer_style(ansi: str) -> tuple:
     ``reason`` is :data:`RENDER_REASON_OK` with ``prov`` in ``{dim, normal, mixed}``
     only when a composer prompt line with a non-empty body was found and classified;
     otherwise ``prov`` is ``None`` and ``reason`` is the fail-closed cause
-    (``no_composer`` / ``empty_composer``).
+    (``no_composer`` / ``empty_composer`` / ``ambiguous_render``).
     """
-    lines = _scan_ansi_intensities(ansi)
+    lines, ambiguous = _scan_ansi_intensities(ansi)
+    if ambiguous:
+        return (False, -1, None, RENDER_REASON_AMBIGUOUS_RENDER)
     prompt_idx = -1
     prompt_cells: list = []
     for idx, cells in enumerate(lines):

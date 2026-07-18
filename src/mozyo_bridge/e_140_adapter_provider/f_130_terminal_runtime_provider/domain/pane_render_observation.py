@@ -96,6 +96,15 @@ RENDER_REASON_NO_COMPOSER = "no_composer"
 #: A composer prompt line was present but its body was empty (a genuinely idle,
 #: empty composer): nothing to distinguish ghost from real.
 RENDER_REASON_EMPTY_COMPOSER = "empty_composer"
+#: The ANSI stream contained an escape sequence the parser could not resolve into
+#: a complete, recognized control sequence (a malformed / private / unterminated
+#: CSI, an unknown escape type, or a non-standard SGR). The render is ambiguous, so
+#: it fails closed rather than laundering the unparsed bytes into a positive style.
+RENDER_REASON_AMBIGUOUS_RENDER = "ambiguous_render"
+#: The target handle was syntactically valid but could not be authority-resolved to
+#: a managed provider pane in this repo's workspace (a foreign / mismatched /
+#: unresolvable target). The diagnostic reads nothing (Design Answer j#82160 item 5).
+RENDER_REASON_UNKNOWN_PROVIDER = "unknown_provider"
 #: A transport / spawn / exit / payload failure prevented any read.
 RENDER_REASON_UNREADABLE = "unreadable"
 #: The target handle or read source was malformed (fail-closed before any spawn).
@@ -108,6 +117,8 @@ RENDER_OBSERVATION_REASONS: frozenset[str] = frozenset(
         RENDER_REASON_ANSI_ABSENT,
         RENDER_REASON_NO_COMPOSER,
         RENDER_REASON_EMPTY_COMPOSER,
+        RENDER_REASON_AMBIGUOUS_RENDER,
+        RENDER_REASON_UNKNOWN_PROVIDER,
         RENDER_REASON_UNREADABLE,
         RENDER_REASON_INVALID_TARGET,
     }
@@ -244,12 +255,14 @@ __all__ = (
     "PaneRenderObservation",
     "PaneRenderObservationError",
     "RENDER_OBSERVATION_REASONS",
+    "RENDER_REASON_AMBIGUOUS_RENDER",
     "RENDER_REASON_ANSI_ABSENT",
     "RENDER_REASON_ANSI_UNSUPPORTED",
     "RENDER_REASON_EMPTY_COMPOSER",
     "RENDER_REASON_INVALID_TARGET",
     "RENDER_REASON_NO_COMPOSER",
     "RENDER_REASON_OK",
+    "RENDER_REASON_UNKNOWN_PROVIDER",
     "RENDER_REASON_UNREADABLE",
     "STYLE_PROVENANCES",
     "STYLE_PROVENANCE_DIM",

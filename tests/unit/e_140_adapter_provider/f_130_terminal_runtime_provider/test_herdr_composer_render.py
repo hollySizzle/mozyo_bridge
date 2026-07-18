@@ -29,17 +29,21 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
     ComposerRenderView,
+    HerdrInventoryView,
+    HerdrObservedAgent,
     read_composer_render,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (  # noqa: E501
     CURSOR_RELATION_COMPOSER,
     CURSOR_RELATION_ELSEWHERE,
+    RENDER_REASON_AMBIGUOUS_RENDER,
     RENDER_REASON_ANSI_ABSENT,
     RENDER_REASON_ANSI_UNSUPPORTED,
     RENDER_REASON_EMPTY_COMPOSER,
     RENDER_REASON_INVALID_TARGET,
     RENDER_REASON_NO_COMPOSER,
     RENDER_REASON_OK,
+    RENDER_REASON_UNKNOWN_PROVIDER,
     RENDER_REASON_UNREADABLE,
     STYLE_PROVENANCE_DIM,
     STYLE_PROVENANCE_MIXED,
@@ -185,6 +189,49 @@ class AdversarialClassificationTest(unittest.TestCase):
         self.assertEqual(STYLE_PROVENANCE_DIM, obs.style_provenance)
 
 
+class UnrecognizedEscapeFailClosedTest(unittest.TestCase):
+    """Redmine #14065 review j#82166 finding 2: an unrecognized / private / malformed
+    escape must fail the render closed, never launder its tail into a positive style."""
+
+    def test_private_mode_csi_is_ambiguous(self) -> None:
+        # ESC[?25l (DEC cursor-hide) is terminal state, not visible content.
+        obs = _render(_ansi_payload(f"{ESC}[0m> safe {ESC}[?25ltext"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_alt_screen_private_csi_is_ambiguous(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[?1049h{ESC}[2m> ghost"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_malformed_unterminated_csi_is_ambiguous(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[0m> hi {ESC}[99"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_nonstandard_sgr_params_is_ambiguous(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[0m> hi {ESC}[?1m"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_lone_unrecognized_escape_is_ambiguous(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[0m> hi {ESC}\x00 tail"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_standard_erase_csi_is_consumed_not_ambiguous(self) -> None:
+        # A standard, non-private cursor/erase CSI is harmless control: real renders
+        # (full of these) must still classify, not fail closed.
+        obs = _render(_ansi_payload(f"{ESC}[2K{ESC}[2m> ghost{ESC}[0m"))
+        self.assertTrue(obs.readable)
+        self.assertEqual(STYLE_PROVENANCE_DIM, obs.style_provenance)
+
+    def test_standard_cursor_home_csi_is_consumed(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[H{ESC}[0m> typed input"))
+        self.assertTrue(obs.readable)
+        self.assertEqual(STYLE_PROVENANCE_NORMAL, obs.style_provenance)
+
+
 class CursorRelationTest(unittest.TestCase):
     def test_cursor_on_composer_line(self) -> None:
         obs = _render(_ansi_payload(f"line0\n{ESC}[2m> {_BODY}", cursor={"row": 1, "col": 3}))
@@ -261,6 +308,23 @@ class FakeRenderTransport:
         return self._observation
 
 
+_SEG = "8d7b664ffb6f4cb3bda7f20e3406a7af"
+
+
+def _managed_inventory(target: str, *, locator: str = "w1:p2") -> HerdrInventoryView:
+    """An inventory whose managed row (in this repo's segment) resolves ``target``."""
+    return HerdrInventoryView(
+        backend_selected=True,
+        ok=True,
+        workspace_segment=_SEG,
+        agents=(
+            HerdrObservedAgent(
+                name=target, managed=True, workspace_id=_SEG, locator=locator
+            ),
+        ),
+    )
+
+
 class ReadComposerRenderModelTest(unittest.TestCase):
     def test_non_herdr_backend_observes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,26 +332,111 @@ class ReadComposerRenderModelTest(unittest.TestCase):
         self.assertFalse(view.backend_selected)
         self.assertIsNone(view.observation)
 
-    def test_herdr_backend_returns_injected_observation(self) -> None:
+    def test_authority_resolved_target_returns_injected_observation(self) -> None:
         transport = FakeRenderTransport(
             PaneRenderObservation.classified(STYLE_PROVENANCE_DIM)
         )
         with tempfile.TemporaryDirectory() as tmp:
             view = read_composer_render(
-                _herdr_repo(tmp), "poc_claude", env={}, transport=transport
+                _herdr_repo(tmp),
+                "poc_claude",
+                env={},
+                transport=transport,
+                inventory=_managed_inventory("poc_claude"),
             )
         self.assertTrue(view.backend_selected)
         self.assertEqual(["poc_claude"], transport.targets)
         self.assertTrue(view.observation.readable)
         self.assertEqual(STYLE_PROVENANCE_DIM, view.observation.style_provenance)
 
-    def test_invalid_target_fails_closed_without_transport(self) -> None:
+    def test_target_resolves_by_locator(self) -> None:
+        transport = FakeRenderTransport(
+            PaneRenderObservation.classified(STYLE_PROVENANCE_NORMAL)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            view = read_composer_render(
+                _herdr_repo(tmp),
+                "w1:p2",
+                env={},
+                transport=transport,
+                inventory=_managed_inventory("mzb1_name", locator="w1:p2"),
+            )
+        self.assertEqual(["w1:p2"], transport.targets)
+        self.assertTrue(view.observation.readable)
+
+    def test_foreign_target_fails_closed_without_transport(self) -> None:
+        # Redmine #14065 review j#82166 finding 1: a syntactically-valid but
+        # unresolved / foreign target must NOT reach the transport.
+        transport = FakeRenderTransport(
+            PaneRenderObservation.classified(STYLE_PROVENANCE_NORMAL)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            view = read_composer_render(
+                _herdr_repo(tmp),
+                "foreign_lane_worker",
+                env={},
+                transport=transport,
+                inventory=_managed_inventory("poc_claude"),
+            )
+        self.assertTrue(view.backend_selected)
+        self.assertEqual([], transport.targets)  # never reached the transport
+        self.assertEqual(RENDER_REASON_UNKNOWN_PROVIDER, view.observation.reason)
+
+    def test_mismatched_workspace_target_fails_closed(self) -> None:
+        # A managed row whose workspace segment differs from this repo's is foreign.
+        foreign_inv = HerdrInventoryView(
+            backend_selected=True,
+            ok=True,
+            workspace_segment=_SEG,
+            agents=(
+                HerdrObservedAgent(
+                    name="poc_claude", managed=True, workspace_id="other-ws", locator=""
+                ),
+            ),
+        )
+        transport = FakeRenderTransport(
+            PaneRenderObservation.classified(STYLE_PROVENANCE_NORMAL)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            view = read_composer_render(
+                _herdr_repo(tmp),
+                "poc_claude",
+                env={},
+                transport=transport,
+                inventory=foreign_inv,
+            )
+        self.assertEqual([], transport.targets)
+        self.assertEqual(RENDER_REASON_UNKNOWN_PROVIDER, view.observation.reason)
+
+    def test_unreadable_inventory_fails_closed(self) -> None:
+        down_inv = HerdrInventoryView(
+            backend_selected=True, ok=False, reason="transport_error"
+        )
+        transport = FakeRenderTransport(
+            PaneRenderObservation.classified(STYLE_PROVENANCE_NORMAL)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            view = read_composer_render(
+                _herdr_repo(tmp),
+                "poc_claude",
+                env={},
+                transport=transport,
+                inventory=down_inv,
+            )
+        self.assertEqual([], transport.targets)
+        self.assertEqual(RENDER_REASON_UNKNOWN_PROVIDER, view.observation.reason)
+
+    def test_invalid_target_fails_closed_before_authority(self) -> None:
         transport = FakeRenderTransport(
             PaneRenderObservation.classified(STYLE_PROVENANCE_DIM)
         )
         with tempfile.TemporaryDirectory() as tmp:
             view = read_composer_render(
-                _herdr_repo(tmp), "bad target!", env={}, transport=transport
+                _herdr_repo(tmp),
+                "bad target!",
+                env={},
+                transport=transport,
+                inventory=_managed_inventory("bad target!"),
             )
         self.assertTrue(view.backend_selected)
         self.assertEqual([], transport.targets)  # never reached the transport
@@ -299,7 +448,11 @@ class ReadComposerRenderModelTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             view = read_composer_render(
-                _herdr_repo(tmp), "poc_claude", env={}, transport=transport
+                _herdr_repo(tmp),
+                "poc_claude",
+                env={},
+                transport=transport,
+                inventory=_managed_inventory("poc_claude"),
             )
         record = view.to_record()
         blob = json.dumps(record)

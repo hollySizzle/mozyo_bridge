@@ -52,6 +52,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (  # noqa: E501
     RENDER_REASON_INVALID_TARGET,
+    RENDER_REASON_UNKNOWN_PROVIDER,
     RENDER_REASON_UNREADABLE,
     PaneRenderObservation,
 )
@@ -331,24 +332,49 @@ class ComposerRenderView:
         }
 
 
+def _resolve_authority_target(inventory: "HerdrInventoryView", target: str):
+    """The managed inventory row that authority-resolves ``target``, or ``None``.
+
+    A target authority-resolves only when the live inventory read succeeded, this
+    repo's workspace segment is known, and a **managed** row in *that* segment
+    carries the target as its assigned name or transient locator. A foreign,
+    mismatched, or unresolvable target returns ``None`` — so the diagnostic never
+    reads a pane it cannot tie to this repo's workspace (Redmine #14065 review
+    j#82166 finding 1, Design Answer j#82160 item 5).
+    """
+    if inventory is None or not inventory.ok or not inventory.workspace_segment:
+        return None
+    for agent in inventory.agents:
+        if not agent.managed or agent.workspace_id != inventory.workspace_segment:
+            continue
+        if agent.name == target or (agent.locator and agent.locator == target):
+            return agent
+    return None
+
+
 def read_composer_render(
     repo_root: Path,
     target: str,
     *,
     env: Optional[Mapping[str, str]] = None,
     transport=None,
+    inventory: "Optional[HerdrInventoryView]" = None,
 ) -> ComposerRenderView:
     """Observe one pane's composer *style* for ``repo_root`` (fail-closed, no raise).
 
     The measurement instrument's read-only diagnostic entry (Redmine #14065 Design
     Answer j#82160). Authority resolution is fail-closed and layered: the herdr
     backend must be selected (a non-herdr / broken config observes nothing), the
-    ``target`` must be a well-formed handle (:func:`valid_target`), and the binary
-    comes only from the trusted environment (via :func:`resolve_terminal_transport`).
-    Every mechanical failure — an unconfigured / missing binary, a transport error,
-    an unsupported ANSI capability, an unreadable render — becomes a fail-closed
-    :class:`PaneRenderObservation` on the view, never a raise and never a positive
-    signal. ``transport`` / ``env`` are injectable so tests never spawn herdr.
+    ``target`` must be a well-formed handle (:func:`valid_target`), and — critically
+    — it must **authority-resolve** to a managed pane in this repo's workspace
+    segment via the live inventory (:func:`_resolve_authority_target`), so a
+    syntactically-valid but foreign / mismatched target reads *nothing*
+    (``unknown_provider``) rather than reaching the transport (review j#82166
+    finding 1). The binary comes only from the trusted environment. Every mechanical
+    failure — an unconfigured / missing binary, a transport error, an unsupported
+    ANSI capability, an unreadable render — becomes a fail-closed
+    :class:`PaneRenderObservation`, never a raise and never a positive signal.
+    ``transport`` / ``env`` / ``inventory`` are injectable so tests never spawn herdr.
     """
     config = _terminal_transport_config(repo_root)
     if config is None or config.backend != BACKEND_HERDR:
@@ -360,6 +386,17 @@ def read_composer_render(
             observation=PaneRenderObservation.failed(RENDER_REASON_INVALID_TARGET),
         )
     source_env = env if env is not None else os.environ
+    # Authority-resolve the target against this repo's managed inventory BEFORE any
+    # provider read. A foreign / mismatched / unresolvable target fails closed and
+    # the transport is never touched.
+    if inventory is None:
+        inventory = read_herdr_inventory(repo_root, env=source_env)
+    if _resolve_authority_target(inventory, target) is None:
+        return ComposerRenderView(
+            backend_selected=True,
+            target=target,
+            observation=PaneRenderObservation.failed(RENDER_REASON_UNKNOWN_PROVIDER),
+        )
     if transport is None:
         try:
             from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501

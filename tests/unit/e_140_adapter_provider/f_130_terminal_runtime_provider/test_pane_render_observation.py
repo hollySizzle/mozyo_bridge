@@ -19,8 +19,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (  # noqa: E501
     CURSOR_RELATION_COMPOSER,
     CURSOR_RELATION_UNKNOWN,
+    RENDER_OBSERVATION_REASONS,
+    RENDER_REASON_AMBIGUOUS_RENDER,
     RENDER_REASON_ANSI_ABSENT,
     RENDER_REASON_OK,
+    RENDER_REASON_UNKNOWN_PROVIDER,
     STYLE_PROVENANCE_DIM,
     STYLE_PROVENANCE_NORMAL,
     STYLE_PROVENANCE_UNKNOWN,
@@ -59,6 +62,16 @@ class FailedFactoryTest(unittest.TestCase):
         obs = PaneRenderObservation.failed(RENDER_REASON_ANSI_ABSENT, prompt_present=True)
         self.assertFalse(obs.readable)
         self.assertTrue(obs.prompt_present)
+
+    def test_ambiguous_and_unknown_provider_are_closed_fail_reasons(self) -> None:
+        # Redmine #14065 review j#82166: both reasons are part of the closed set and
+        # produce fail-closed observations.
+        for reason in (RENDER_REASON_AMBIGUOUS_RENDER, RENDER_REASON_UNKNOWN_PROVIDER):
+            self.assertIn(reason, RENDER_OBSERVATION_REASONS)
+            obs = PaneRenderObservation.failed(reason)
+            self.assertFalse(obs.readable)
+            self.assertEqual(STYLE_PROVENANCE_UNKNOWN, obs.style_provenance)
+            self.assertEqual(reason, obs.reason)
 
 
 class InvariantTest(unittest.TestCase):
