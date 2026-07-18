@@ -219,17 +219,30 @@ class UnrecognizedEscapeFailClosedTest(unittest.TestCase):
         self.assertFalse(obs.readable)
         self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
 
-    def test_standard_erase_csi_is_consumed_not_ambiguous(self) -> None:
-        # A standard, non-private cursor/erase CSI is harmless control: real renders
-        # (full of these) must still classify, not fail closed.
-        obs = _render(_ansi_payload(f"{ESC}[2K{ESC}[2m> ghost{ESC}[0m"))
+    def test_erase_line_after_prompt_is_ambiguous(self) -> None:
+        # Redmine #14065 review j#82171 finding 2 residual: a dim prompt followed by
+        # an erase-entire-line (CSI 2K) must NOT stay classified as dim — on a real
+        # terminal the prompt is gone. A state-changing CSI fails the render closed.
+        obs = _render(_ansi_payload(f"{ESC}[2m> ghost prompt{ESC}[2K"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_cursor_move_and_overwrite_is_ambiguous(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[2m> ghost{ESC}[H{ESC}[0mreal"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_cursor_column_move_is_ambiguous(self) -> None:
+        obs = _render(_ansi_payload(f"{ESC}[0m> hi{ESC}[5Gxx"))
+        self.assertFalse(obs.readable)
+        self.assertEqual(RENDER_REASON_AMBIGUOUS_RENDER, obs.reason)
+
+    def test_sgr_only_render_still_classifies(self) -> None:
+        # The complement: a render whose only escapes are standard SGR classifies
+        # normally, so the fail-closed rule does not blind the instrument.
+        obs = _render(_ansi_payload(f"{ESC}[1m{ESC}[2m> ghost{ESC}[0m"))
         self.assertTrue(obs.readable)
         self.assertEqual(STYLE_PROVENANCE_DIM, obs.style_provenance)
-
-    def test_standard_cursor_home_csi_is_consumed(self) -> None:
-        obs = _render(_ansi_payload(f"{ESC}[H{ESC}[0m> typed input"))
-        self.assertTrue(obs.readable)
-        self.assertEqual(STYLE_PROVENANCE_NORMAL, obs.style_provenance)
 
 
 class CursorRelationTest(unittest.TestCase):
