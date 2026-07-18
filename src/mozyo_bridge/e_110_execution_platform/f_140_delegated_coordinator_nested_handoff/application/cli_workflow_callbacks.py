@@ -543,18 +543,18 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         sender = _callback_sender(args)  # the real handoff send port (actuates one send per row)
         source = _optional_journal_source(args)
         if source is not None:
-            # Redmine #13974 R2: a readable provider lets `--deliver` CONVERGE a previous-generation /
-            # hibernated-owner review_return backlog row to a terminal zero-send (the supervisor's fence),
-            # not merely attempt-and-retry it. Source-less `--deliver` stays the raw drain below.
+            # #13974 R2: a readable provider lets `--deliver` CONVERGE a stale backlog row to terminal.
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_review_return import deliver_workspace_backlog  # noqa: E501
 
-            outcome = deliver_workspace_backlog(outbox, ws, source=source, sender=sender)
+            outcome = deliver_workspace_backlog(
+                outbox, ws, source=source, sender=sender,
+                limit=int(getattr(args, "limit", 32) or 32),  # F2: --limit is the workspace budget
+            )
             payload = {"action": "deliver", "fenced_source": True, **outcome.as_payload()}
             lines = [
-                "action: deliver",
-                f"fenced: {outcome.fenced}",
-                f"delivered: {outcome.delivered}",
-                f"transient_skipped: {outcome.transient_skipped}",
+                "action: deliver (fenced)",
+                f"fenced: {outcome.fenced} delivered: {outcome.delivered} "
+                f"recovered: {outcome.recovered} transient_skipped: {outcome.transient_skipped}",
             ]
             return _emit(payload, as_json=as_json, text_lines=lines)
         processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=ws)

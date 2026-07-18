@@ -295,11 +295,16 @@ class WorkspaceSupervisionOutcome:
     non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
-    #: Pre-existing review_return backlog rows this workspace terminally fenced (Redmine #13974 R2):
-    #: rows reserved for a now-hibernated / superseded lane whose issue is no longer in any active
-    #: roster, converged to a terminal zero-send by the own-workspace backlog drain (never a silent
-    #: drop — surfaced so the operator sees a stale backlog stop retrying).
+    #: Own-workspace review_return backlog dispositions (Redmine #13974 R2): rows reserved for a
+    #: now-hibernated / superseded lane whose issue is no longer in any active roster, drained under the
+    #: lease. ``backlog_fenced`` terminally converged (zero-send); ``backlog_delivered`` is a REAL send
+    #: side effect (review F4 — it must be rolled into ``delivered``, never reported as 0);
+    #: ``backlog_recovered`` reconciled a stale crashed inflight (review F1); ``backlog_transient_skipped``
+    #: was left pending because the provider was unreadable. All surfaced so no side effect is invisible.
     backlog_fenced: int = 0
+    backlog_delivered: int = 0
+    backlog_recovered: int = 0
+    backlog_transient_skipped: int = 0
 
     @property
     def events_supplied(self) -> int:
@@ -307,7 +312,8 @@ class WorkspaceSupervisionOutcome:
 
     @property
     def delivered(self) -> int:
-        return sum(i.delivered for i in self.issues)
+        # F4: a backlog-drain send is a real delivery — roll it in so the report never under-counts it.
+        return sum(i.delivered for i in self.issues) + self.backlog_delivered
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -321,6 +327,9 @@ class WorkspaceSupervisionOutcome:
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
             "backlog_fenced": self.backlog_fenced,
+            "backlog_delivered": self.backlog_delivered,
+            "backlog_recovered": self.backlog_recovered,
+            "backlog_transient_skipped": self.backlog_transient_skipped,
             "issues": [i.as_payload() for i in self.issues],
         }
 
@@ -353,6 +362,10 @@ class SupervisorReport:
     def backlog_fenced(self) -> int:
         return sum(w.backlog_fenced for w in self.workspaces)
 
+    @property
+    def backlog_recovered(self) -> int:
+        return sum(w.backlog_recovered for w in self.workspaces)
+
     def as_payload(self) -> dict[str, object]:
         return {
             "action": "run-once",
@@ -364,6 +377,7 @@ class SupervisorReport:
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
             "backlog_fenced": self.backlog_fenced,
+            "backlog_recovered": self.backlog_recovered,
             "workspaces": [w.as_payload() for w in self.workspaces],
         }
 

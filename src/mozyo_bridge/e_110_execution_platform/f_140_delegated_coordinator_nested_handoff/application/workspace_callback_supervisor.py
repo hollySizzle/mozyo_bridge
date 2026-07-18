@@ -42,7 +42,7 @@ from mozyo_bridge.core.state.supervisor_lease import (
     SUPERVISOR_LEASE_TTL_SECONDS,
     SupervisorLeaseStore,
 )
-from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING, WorkflowRuntimeStore
+from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_INFLIGHT, CALLBACK_PENDING, WorkflowRuntimeStore  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
@@ -329,9 +329,8 @@ class WorkspaceCallbackSupervisor:
                 )
             else:
                 supervised, non_authoritative = selection.supervised, ()
-            # #13974 R2: a workspace with NO active issues but pending own-partition backlog (every owning
-            # lane hibernated) must STILL drain it — an empty roster short-circuits ONLY when there is
-            # nothing to drain (the probe reads the outbox only on the empty-roster path, ``and`` short).
+            # #13974 R2: a workspace with NO active issues but own-partition backlog (every owning lane
+            # hibernated) must STILL drain it — empty roster short-circuits ONLY when nothing is drainable.
             if not supervised and not (
                 self._backlog_drain_fn is not None and self._has_pending_backlog(wsid)
             ):
@@ -367,24 +366,22 @@ class WorkspaceCallbackSupervisor:
                     # source reads): the lease is gone, so stop before any further workspace work.
                     lease_lost = True
                     break
-            # Redmine #13974 R2: while we still hold the lease, drain THIS workspace's own pending
-            # review_return backlog (issues NOT in the active roster) through the same action-time fence.
-            # The renew guard stops before a send on a takeover; only this workspace's partition is read /
-            # claimed; skip already-supervised issues. Fail-open — a drain error never breaks the sweep.
-            backlog_fenced = 0
+            # Redmine #13974 R2: while we still hold the lease, drain THIS workspace's own pending +
+            # stale-inflight backlog (issues NOT in the active roster) through the same action-time fence
+            # (renew guard stops before a send on takeover; own-partition only; skip supervised issues).
+            # Fail-open. F4: capture ALL dispositions (delivered is a real send the report must not zero).
+            backlog: Optional[BacklogDrainOutcome] = None
             if not lease_lost and self._backlog_drain_fn is not None:
                 try:
-                    outcome = self._backlog_drain_fn(
-                        wsid, source=source, sender=sender,
-                        skip_issues=frozenset(supervised),
+                    backlog = self._backlog_drain_fn(
+                        wsid, source=source, sender=sender, skip_issues=frozenset(supervised),
                         lease_guard_fn=lambda: self._lease_store.renew(
                             wsid, self._holder, now=self._clock(), ttl_seconds=self._ttl
                         ),
                     )
-                    backlog_fenced = outcome.fenced
-                    lease_lost = lease_lost or outcome.lease_lost
+                    lease_lost = lease_lost or backlog.lease_lost
                 except Exception:  # noqa: BLE001 - a backlog drain never breaks the sweep
-                    backlog_fenced = 0
+                    backlog = None
             return WorkspaceSupervisionOutcome(
                 workspace_id=wsid,
                 lease_acquired=True,
@@ -394,7 +391,10 @@ class WorkspaceCallbackSupervisor:
                 non_authoritative_issues=non_authoritative,
                 issues=tuple(issue_outcomes),
                 skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
-                backlog_fenced=backlog_fenced,
+                backlog_fenced=backlog.fenced if backlog else 0,
+                backlog_delivered=backlog.delivered if backlog else 0,
+                backlog_recovered=backlog.recovered if backlog else 0,
+                backlog_transient_skipped=backlog.transient_skipped if backlog else 0,
             )
         finally:
             # A bounded run-once releases each workspace at the end of its sweep so the next
@@ -405,12 +405,12 @@ class WorkspaceCallbackSupervisor:
                 self._lease_store.release(wsid, self._holder)
 
     def _has_pending_backlog(self, workspace_id: str) -> bool:
-        """True iff THIS workspace's partition holds any pending row (#13974 R2 drain gate; fail-open)."""
+        """True iff THIS workspace's partition holds a drainable pending OR stale-inflight row (F1 gate)."""
         wsid = str(workspace_id or "").strip()
         try:
             return any(
                 str(getattr(r, "workspace_id", "") or "").strip() == wsid
-                for r in self._outbox.read(states=[CALLBACK_PENDING])
+                for r in self._outbox.read(states=[CALLBACK_PENDING, CALLBACK_INFLIGHT])
             )
         except Exception:  # noqa: BLE001 - an unreadable outbox gates no drain (fail-open)
             return False
