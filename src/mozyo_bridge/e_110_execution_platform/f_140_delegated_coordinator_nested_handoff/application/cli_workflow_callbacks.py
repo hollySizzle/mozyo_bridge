@@ -197,7 +197,9 @@ _NON_APPROVAL_REVIEW_DECISIONS = frozenset({"changes_requested", "finding", "pro
 REASON_APPROVAL_FENCE_INPUTS_MISSING = "approval_requires_generation_observation_and_consumer"
 
 
-def _review_approval_refusal(args: argparse.Namespace, issue: str, gate: str):
+def _review_approval_refusal(
+    args: argparse.Namespace, issue: str, gate: str, marker_fields: "Optional[dict]" = None
+):
     """Return a fail-closed refusal reason for a review_result APPROVAL write, or ``None`` to allow.
 
     #13518 review R3-F2 / R4-F2: a ``review_result`` APPROVAL is mechanically distinguished from a
@@ -241,6 +243,17 @@ def _review_approval_refusal(args: argparse.Namespace, issue: str, gate: str):
             review_request_journal=str(raw.get("review_request_journal", "")),
             target_head=str(raw.get("target_head", "")),
         )
+        # j#81506 F2: the admission observation's generation identity MUST exact-match the marker write
+        # target — an approval lease for ONE generation must never write another's approved marker.
+        if marker_fields:
+            if str(gen.issue).strip() != str(issue).strip():
+                return "approval_observation_issue_mismatch"
+            if gen.review_request_journal.strip() != str(
+                marker_fields.get("review_request_journal", "") or ""
+            ).strip():
+                return "approval_observation_request_mismatch"
+            if gen.target_head.strip() != str(marker_fields.get("target_head", "") or "").strip():
+                return "approval_observation_head_mismatch"
         decisions = [
             ReviewDecision(
                 generation=gen,
@@ -556,14 +569,14 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         # durable single-consumer generation lease + the pre-approval reread fence refuse a duplicate
         # consumer or a stale approval (a snapshot predating a newer unresolved blocking finding —
         # the #13586 case). Refusal fails closed: nothing is written, exit non-zero.
-        refusal = _review_approval_refusal(args, issue, gate)
         # #13974 j#81487 F2: a review_request / review_result gate MUST carry the v2 marker fields
-        # (exact full target_head; review_result also its answered review_request journal). The
-        # canonical producer refuses to write a head-less / req-less / malformed review marker rather
-        # than emit one the callback generation fence would fail closed — the producer→consumer slice
-        # is closed at the writer, not left to an optional renderer parameter.
+        # (exact full target_head; review_result also its answered review_request journal + conclusion).
+        # The canonical producer refuses to write a head-less / req-less / malformed review marker
+        # rather than emit one the callback generation fence would fail closed. j#81506 F2: an approval
+        # write additionally exact-matches its generation-admission observation to these marker fields —
+        # a lease for another generation must never write this one's approved marker.
         marker_fields, marker_refusal = _review_gate_marker_fields(args, gate)
-        refusal = refusal or marker_refusal
+        refusal = marker_refusal or _review_approval_refusal(args, issue, gate, marker_fields)
         if refusal is not None:
             payload = {"action": "emit-gate", "issue": issue, "gate": gate,
                        "recorded": False, "reason": refusal}

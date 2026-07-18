@@ -567,9 +567,13 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
     MANDATORY — an approval can never bypass it by omitting the flags (fail-closed by default). Only
     an explicit non-approval decision (changes_requested / finding / progress) is unfenced."""
 
+    #: A well-formed full commit head (v2 contract #13974): the marker write + the observation share it
+    #: so the identity exact-match (j#81506 F2) is satisfied and these tests isolate the admission fence.
+    _HEAD = "a" * 40
+
     def _obs(self, decisions, source_request_seq=10, **top):
         base = {
-            "issue": "13586", "review_request_journal": "75719", "target_head": "deadbeef",
+            "issue": "13586", "review_request_journal": "75719", "target_head": self._HEAD,
             "source_request_seq": source_request_seq, "decisions": decisions,
         }
         base.update(top)
@@ -578,9 +582,12 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
         return str(p)
 
     def _emit_args(self, **over):
+        # v2 (#13974): a review_result carries full head + answered req; the admission-fence tests
+        # supply v2-compliant marker flags matching the observation so only the fence dimension varies.
         base = dict(
             emit_gate=True, json=True, issue="13586", gate="review_result", body="",
             store_path=str(self.store_path),
+            target_head=self._HEAD, review_request_journal="75719",
             review_generation_json=None, consumer_id=None, review_decision=None,
         )
         base.update(over)

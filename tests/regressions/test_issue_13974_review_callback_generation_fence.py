@@ -72,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     RETURN_MALFORMED_REVIEW_HEAD,
+    RETURN_MISSING_REVIEW_CONCLUSION,
     RETURN_MISSING_REVIEW_HEAD,
     RETURN_PREVIOUS_GENERATION,
     RETURN_REVIEW_HEAD_DRIFT,
@@ -609,16 +610,19 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
 
     # -- F2 producer->consumer vertical slice (ACTUAL CLI emits v2) -----------
 
-    def _emit_gate_via_cli(self, writer, gate, *extra):
+    def _run_emit_gate_cli(self, writer, gate, *extra):
         """Drive the ACTUAL `workflow callbacks --emit-gate` CLI (not emit_gate_record) against a
-        recording transport; return the posted note. This exercises the real producer path (j#81496 F2)."""
+        recording transport, hermetic on this test's temp home + store; return ``rc``."""
+        import os
+
         from mozyo_bridge.application.cli import build_parser
 
         parser = build_parser()
         args = parser.parse_args(
-            ["workflow", "callbacks", "--emit-gate", "--issue", ISSUE, "--gate", gate, *extra, "--json"]
+            ["workflow", "callbacks", "--emit-gate", "--issue", ISSUE, "--gate", gate,
+             "--store-path", str(self.store_path), *extra, "--json"]
         )
-        with mock.patch(
+        with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}), mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
             "redmine_note_transport.redmine_delivery_transport_from_env",
             return_value=writer,
@@ -627,9 +631,27 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
             "application.cli_workflow_callbacks._activate_supervisor_process",
             lambda: None,
         ):
-            rc = args.func(args)
+            return args.func(args)
+
+    def _emit_gate_via_cli(self, writer, gate, *extra):
+        """As :meth:`_run_emit_gate_cli` but asserts a successful record and returns the posted note."""
+        rc = self._run_emit_gate_cli(writer, gate, *extra)
         self.assertEqual(rc, 0, f"--emit-gate {gate} should record")
         return writer.notes[-1]
+
+    def _write_observation(self, *, req, head, name="reviewgen.json"):
+        """Write a durable review-generation observation JSON for an approval admission."""
+        import json as _json
+
+        p = self.home / name
+        p.write_text(
+            _json.dumps({
+                "issue": ISSUE, "review_request_journal": req, "target_head": head,
+                "source_request_seq": 10, "decisions": [{"kind": "approval", "seq": 11}],
+            }),
+            encoding="utf-8",
+        )
+        return str(p)
 
     def test_producer_cli_e2e_current_row_delivers_exactly_once(self) -> None:
         # j#81496 F2: the ACTUAL --emit-gate CLI emits the v2 marker fields (head + req + conclusion),
@@ -659,6 +681,83 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
         supervisor.run_once()  # idempotent
         self.assertEqual(len(transport.calls), 1)
+
+    def test_producer_cli_e2e_approval_identity_match_delivers(self) -> None:
+        # j#81506 F2: an ACTUAL CLI approval whose generation-admission observation exact-matches the
+        # marker write target records `conclusion=approved:head:req` and delivers exactly once.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        writer = _CapturingNoteTransport()
+        obs = self._write_observation(req="110", head=CUR_HEAD)
+        req_note = self._emit_gate_via_cli(writer, "review_request", "--target-head", CUR_HEAD)
+        res_note = self._emit_gate_via_cli(
+            writer, "review_result", "--target-head", CUR_HEAD, "--review-request-journal", "110",
+            "--review-decision", "approval", "--review-generation-json", obs, "--consumer-id", "reviewer-A",
+        )
+        self.assertIn("conclusion=approved", res_note)
+        source = MappingRedmineJournalSource(payload={"issue": {"id": ISSUE}, "journals": [
+            {"id": "110", "notes": req_note}, {"id": "120", "notes": res_note},
+        ]})
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(wsid=wsid, source=source, transport=transport, anchor=ANCHOR)
+        supervisor.run_once()
+        self.assertEqual([t[1].lane for t in transport.calls], [LANE])
+        self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
+
+    def test_producer_cli_e2e_approval_identity_mismatch_writes_nothing(self) -> None:
+        # j#81506 F2: an approval lease held for a DIFFERENT generation (observation head=OLD/req=999)
+        # must NOT write this generation's approved marker (write flags head=CUR/req=110). The CLI
+        # refuses (write 0), so no journal is captured and the supervisor delivers nothing.
+        writer = _CapturingNoteTransport()
+        obs = self._write_observation(req="999", head=OLD_HEAD)  # a DIFFERENT generation's lease
+        rc = self._run_emit_gate_cli(
+            writer, "review_result", "--target-head", CUR_HEAD, "--review-request-journal", "110",
+            "--review-decision", "approval", "--review-generation-json", obs, "--consumer-id", "reviewer-A",
+        )
+        self.assertEqual(rc, 1)  # identity mismatch -> write refused
+        self.assertEqual(writer.notes, [])  # nothing written
+
+    # -- Full-surface conclusion boundary matrix (escalation j#81497) ---------
+
+    def test_fs_discovery_missing_conclusion_refused_via_supervisor(self) -> None:
+        # conclusion MISSING at DISCOVERY: the review_result marker omits conclusion (-> pending intake).
+        _wsid, report = self._supervise_current(_current_round_source(conclusion=None))
+        self.assertEqual(self._transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_MISSING_REVIEW_CONCLUSION, self._refusals(report))
+
+    def test_fs_preexisting_live_conclusion_missing_terminal_via_supervisor(self) -> None:
+        # conclusion MISSING at the SEND EDGE: a row enqueued with a valid conclusion, then the LIVE
+        # marker's conclusion is removed (-> pending). The send edge terminally fences the row.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(_current_round_source(), wsid)  # recorded conclusion approved
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(conclusion=None), transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+
+    def test_fs_preexisting_live_conclusion_drift_terminal_via_supervisor(self) -> None:
+        # conclusion DRIFT at the SEND EDGE: the row recorded approved, the LIVE marker now says
+        # changes_requested. The send edge terminally fences the drifted row.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(_current_round_source(conclusion="approved"), wsid)
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(conclusion="changes_requested"),
+            transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
 
     def test_producer_cli_fail_closed_validation(self) -> None:
         # j#81487 F2: the canonical --emit-gate writer refuses to emit a head-less / malformed / req-less

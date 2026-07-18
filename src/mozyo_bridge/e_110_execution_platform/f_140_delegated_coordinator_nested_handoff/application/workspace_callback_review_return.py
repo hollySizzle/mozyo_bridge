@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OWNER_RESOLVED,
     OWNER_UNKNOWN,
     OwningLaneBinding,
+    current_review_generation_conclusion,
     current_review_generation_head,
     current_review_generation_request,
     is_review_return_route,
@@ -253,46 +254,52 @@ def review_return_discovery_anchor(fence_active: bool, anchor: object) -> "Optio
     return (str(anchor or "")) if fence_active else None
 
 
-def resolve_current_review_identity(source: object, issue: str) -> "tuple[str, str]":
-    """The CURRENT review generation ``(head, request)`` for ``issue`` from its markers (Redmine #13974).
+def resolve_current_review_identity(source: object, issue: str) -> "tuple[str, str, str]":
+    """The CURRENT review generation ``(head, request, conclusion)`` from ``issue``'s markers (#13974).
 
     ``head`` is the latest ``review_request`` marker's ``target_head``
     (:func:`current_review_generation_head`); ``request`` is the latest review_result's LIVE declared
-    ``req`` iff it equals its correlated request (:func:`current_review_generation_request`, j#81496 F1)
-    — the two action-time authorities a reserved ``review_return`` row must still match. Fail-safe: an
-    unreadable source, or a missing / drifted head / req, yields blanks so the send-edge fence treats
-    the row as unconfirmed → terminal. Never parses prose; the structured marker is the authority.
+    ``req`` iff it equals its correlated request (:func:`current_review_generation_request`, j#81496 F1);
+    ``conclusion`` is the latest review_result's LIVE explicit conclusion
+    (:func:`current_review_generation_conclusion`, j#81506) — the three action-time authorities a
+    reserved ``review_return`` row must still match. Fail-safe: an unreadable source, or a missing /
+    drifted head / req / conclusion, yields blanks so the send-edge fence treats the row as unconfirmed
+    → terminal. Never parses prose; the structured marker is the authority.
     """
     if source is None:
-        return "", ""
+        return "", "", ""
     try:
         markers = list(markers_from_source(source, str(issue).strip()))
     except Exception:  # noqa: BLE001 - an unreadable source is a fail-closed blank identity
-        return "", ""
+        return "", "", ""
     issue_s = str(issue).strip()
     return (
         current_review_generation_head(markers, issue_s),
         current_review_generation_request(markers, issue_s),
+        current_review_generation_conclusion(markers, issue_s),
     )
 
 
 def build_supervisor_send_edge_fence(
     anchor: object, coordinator_route: str,
     current_review_head: object = None, current_review_request: object = None,
+    current_review_conclusion: object = None,
 ) -> "Callable[[CallbackOutboxRow], tuple[bool, str]]":
     """Compose the supervisor's per-row send-edge fence (Redmine #13974).
 
     One ``send_fence_fn`` that terminally fences BOTH a historical coordinator row
-    (:func:`...workspace_supervisor.make_send_edge_fence`) and a previous-generation / head-drifted /
-    req-drifted review_return row (:func:`...review_return_route.make_review_return_send_edge_fence`,
-    conjoining the current review generation ``head`` (j#81454 A) AND ``request`` (j#81496 F1)) in the
-    same deliver pass, each exempt on the other's rows. The deliver pass marks a fenced row terminally
-    uncertain (zero-send, no retry), so a pre-existing misbound backlog row converges instead of
-    retrying forever.
+    (:func:`...workspace_supervisor.make_send_edge_fence`) and a previous-generation / head- / req- /
+    conclusion-drifted review_return row (:func:`...review_return_route.make_review_return_send_edge_fence`,
+    conjoining the current review generation ``head`` (j#81454 A), ``request`` (j#81496 F1), AND
+    ``conclusion`` (j#81506)) in the same deliver pass, each exempt on the other's rows. The deliver
+    pass marks a fenced row terminally uncertain (zero-send, no retry), so a pre-existing misbound
+    backlog row converges instead of retrying forever.
     """
     return compose_send_edge_fences(
         make_send_edge_fence(anchor, coordinator_route),
-        make_review_return_send_edge_fence(anchor, current_review_head, current_review_request),
+        make_review_return_send_edge_fence(
+            anchor, current_review_head, current_review_request, current_review_conclusion
+        ),
     )
 
 
