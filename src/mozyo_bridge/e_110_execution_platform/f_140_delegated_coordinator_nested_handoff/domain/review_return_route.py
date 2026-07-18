@@ -86,9 +86,19 @@ RETURN_BLANK_GENERATION = "blank_owning_generation"  # the owning lane carries n
 #: an uncorrelated review outcome is never returned (#13684 review R1-F2 / j#77892 correction 3: the
 #: result must bind to its review_request / action identity).
 RETURN_NO_REVIEW_REQUEST = "no_correlated_review_request"
+#: The review round this result answers belongs to a PREVIOUS lane generation (Redmine #13974): its
+#: correlated ``review_request`` journal predates the current owning lane's dispatch anchor (the
+#: ``implementation_request`` journal that opened the live generation). The latest-review fence
+#: (:data:`RETURN_NOT_LATEST`) only compares review markers against each other, so an old-generation
+#: result that is still the newest review MARKER on the issue (a new generation has restarted the lane
+#: but not yet produced its own review) slips through — this reason fails it closed so a stale result
+#: is never retargeted onto the new generation's gateway. Only meaningful when a dispatch anchor is
+#: supplied (the fenced production supervisor); an unresolvable anchor under fenced mode also lands
+#: here (fail-closed — a generation we cannot pin never authorizes a return).
+RETURN_PREVIOUS_GENERATION = "previous_generation_review"
 
 #: The refusal reasons — every one is a fail-closed no-return (never a guessed / self / stale /
-#: uncorrelated send).
+#: uncorrelated / previous-generation send).
 RETURN_REFUSAL_REASONS = frozenset(
     {
         RETURN_NO_OWNER,
@@ -99,6 +109,7 @@ RETURN_REFUSAL_REASONS = frozenset(
         RETURN_NOT_REVIEW_RESULT,
         RETURN_BLANK_GENERATION,
         RETURN_NO_REVIEW_REQUEST,
+        RETURN_PREVIOUS_GENERATION,
     }
 )
 
@@ -245,6 +256,25 @@ def _refuse(reason: str, review_journal: str = "") -> ReviewReturnPlan:
     return ReviewReturnPlan(emit=False, reason=reason, review_journal=review_journal)
 
 
+def review_round_within_generation(request_journal: str, dispatch_anchor_journal: str) -> bool:
+    """Whether a review round belongs to the current lane generation (pure; Redmine #13974).
+
+    ``dispatch_anchor_journal`` is the current owning lane+generation's dispatch anchor — the OWNING
+    journal of its ``implementation_request`` marker. A review round's identity is the
+    ``review_request`` journal the result answers. Redmine journal ids are monotonic, and a
+    generation opens at its ``implementation_request``, so the round is part of the current generation
+    iff its request journal is at or after the anchor. A round whose request predates the anchor is a
+    previous generation's round (the lane restarted and this is an OLD review). Fail-closed: an
+    unresolvable / blank / non-numeric anchor, or a blank / non-numeric request journal, is NOT within
+    the current generation (a generation we cannot pin never authorizes a return).
+    """
+    anchor_int = _as_int(dispatch_anchor_journal)
+    request_int = _as_int(request_journal)
+    if anchor_int is None or request_int is None:
+        return False
+    return request_int >= anchor_int
+
+
 def latest_review_result_journal(markers: Iterable[JournalMarker], issue: str) -> str:
     """The journal id of the LATEST review_result (``review`` gate) on ``issue``, or ``""`` (pure).
 
@@ -384,10 +414,12 @@ def plan_review_return(
     issue: str,
     review_journal: str,
     owner: OwningLaneBinding,
+    *,
+    dispatch_anchor_journal: Optional[str] = None,
 ) -> ReviewReturnPlan:
     """Plan the return of the review_result on ``(issue, review_journal)`` to its owning gateway (pure).
 
-    Ordered, fail-closed checks (design answer j#77892 corrections 2 + 3 + 4):
+    Ordered, fail-closed checks (design answer j#77892 corrections 2 + 3 + 4; #13974 generation fence):
 
     1. the anchored journal must carry a review_result (``review`` gate) marker on this issue
        (:data:`RETURN_NOT_REVIEW_RESULT` otherwise — a callback is never returned against a
@@ -399,6 +431,14 @@ def plan_review_return(
        (:data:`RETURN_NO_REVIEW_REQUEST` otherwise; #13684 review R1-F2 / j#77892 correction 3: an
        uncorrelated review outcome is never returned, and the correlated request journal is carried on
        the plan so the send authority can re-verify the round at action time);
+    2c. when a ``dispatch_anchor_journal`` is supplied (the fenced production supervisor), the review
+       round it answers must belong to the CURRENT lane generation — its correlated ``review_request``
+       journal must be at or after the anchor (:data:`RETURN_PREVIOUS_GENERATION` otherwise; #13974).
+       The latest-review fence (step 2) only compares review markers against each other, so an
+       old-generation result that is still the newest review MARKER on the issue (the lane restarted
+       into a new generation but has not produced its own review yet) would otherwise be retargeted
+       onto the new generation's gateway. ``dispatch_anchor_journal=None`` skips this check (unfenced
+       callers — behavior unchanged); a supplied-but-unresolvable anchor is fail-closed here.
     3. the issue must have exactly one active owning lane from the durable binding
        (:data:`RETURN_NO_OWNER` / :data:`RETURN_AMBIGUOUS_OWNER` otherwise — never "the newest lane" or
        a pane guess);
@@ -446,6 +486,16 @@ def plan_review_return(
     if not request_journal:
         return _refuse(RETURN_NO_REVIEW_REQUEST, review_journal_s)
 
+    # 2c. generation fence (#13974): when the caller supplies the current dispatch anchor, the review
+    # round must belong to the CURRENT lane generation. An old-generation result that is still the
+    # newest review marker on the issue (the lane restarted but has not produced its own review yet)
+    # would otherwise be retargeted onto the new generation's gateway. Fail-closed on an unresolvable
+    # anchor (a generation we cannot pin never authorizes a return). ``None`` skips the fence.
+    if dispatch_anchor_journal is not None and not review_round_within_generation(
+        request_journal, dispatch_anchor_journal
+    ):
+        return _refuse(RETURN_PREVIOUS_GENERATION, review_journal_s)
+
     # 3. owning-lane binding is the target authority (never a pane / issue-id guess).
     if owner.status == OWNER_AMBIGUOUS:
         return _refuse(RETURN_AMBIGUOUS_OWNER, review_journal_s)
@@ -481,6 +531,8 @@ def plan_review_returns(
     markers: Iterable[JournalMarker],
     issue: str,
     owner: OwningLaneBinding,
+    *,
+    dispatch_anchor_journal: Optional[str] = None,
 ) -> tuple[ReviewReturnPlan, ...]:
     """Plan every returnable review_result on ``issue`` (pure).
 
@@ -488,6 +540,10 @@ def plan_review_returns(
     markers to the single newest, unshadowed one), but the function is total over the issue's markers
     so the caller enumerates without pre-filtering. Only :data:`RETURN_OK` plans carry a route; the
     refusals are returned too so the caller can record why nothing was returned (observability).
+
+    ``dispatch_anchor_journal`` (Redmine #13974) is threaded to each :func:`plan_review_return` so the
+    generation fence refuses a review round that predates the current lane generation. ``None`` (the
+    default) leaves every plan unfenced (behavior unchanged for pre-#13974 callers).
     """
     review_journals: list[str] = []
     issue_s = str(issue).strip()
@@ -499,8 +555,57 @@ def plan_review_returns(
         if jid and jid not in review_journals:
             review_journals.append(jid)
     return tuple(
-        plan_review_return(marker_list, issue, journal, owner) for journal in review_journals
+        plan_review_return(
+            marker_list, issue, journal, owner,
+            dispatch_anchor_journal=dispatch_anchor_journal,
+        )
+        for journal in review_journals
     )
+
+
+#: The secret-safe send-edge fence reason tokens for a review_return backlog row (#13974). Literal
+#: regardless of UI language (they land in the redaction-safe supervisor report).
+REVIEW_RETURN_FENCE_PREVIOUS_GENERATION = "superseded: review round older than current dispatch anchor"
+REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR = "fenced: dispatch anchor unresolvable"
+REVIEW_RETURN_FENCE_NO_CORRELATION = "fenced: review_return row missing round correlation"
+
+
+def make_review_return_send_edge_fence(dispatch_anchor_journal: object):
+    """Build the terminal send-edge fence for pre-existing ``review_return`` backlog rows (#13974).
+
+    Returns ``send_fence_fn(row) -> (fence, reason)``. The #13974 discovery-side generation fence
+    stops NEW previous-generation candidates from enqueuing, but a row already pending from an earlier
+    pass (when it WAS the current generation, or before the fence existed) must also reach a terminal
+    disposition rather than retry forever. This fence, composed into the supervisor's ``send_fence_fn``,
+    makes the outbox deliver pass mark such a row terminally uncertain (zero-send, no retry, never
+    dead-lettered — a stale backlog neither replays nor amplifies).
+
+    A row is fenced when it is a ``review_return:<lane>`` route AND its correlated ``review_request``
+    journal (decoded from the row payload) is NOT within the current lane generation
+    (:func:`review_round_within_generation` — older than the anchor, or an unresolvable anchor, or a
+    row missing its round correlation). A current-generation row (request >= anchor) is NOT fenced:
+    its exactly-once delivery is handled by the #13684 send authorities (owning-lane live generation +
+    review-round re-verification). Non-``review_return`` routes are exempt (the coordinator route has
+    its own :func:`...workspace_supervisor.make_send_edge_fence`). Pure; duck-typed on
+    ``row.callback_route`` / ``row.payload``.
+    """
+    anchor_int = _as_int(dispatch_anchor_journal)
+    anchor_blank = not str(dispatch_anchor_journal or "").strip()
+
+    def _fence(row) -> "tuple[bool, str]":
+        route = str(getattr(row, "callback_route", "") or "").strip()
+        if not is_review_return_route(route):
+            return (False, "")  # coordinator / other: own fence, exempt here
+        request_journal = decode_review_return_payload(str(getattr(row, "payload", "") or ""))
+        if review_round_within_generation(request_journal, str(dispatch_anchor_journal or "")):
+            return (False, "")  # current generation -> #13684 send authorities own exactly-once
+        if anchor_int is None:
+            return (True, REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR)
+        if _as_int(request_journal) is None:
+            return (True, REVIEW_RETURN_FENCE_NO_CORRELATION)
+        return (True, REVIEW_RETURN_FENCE_PREVIOUS_GENERATION)
+
+    return _fence
 
 
 __all__ = (
@@ -515,7 +620,11 @@ __all__ = (
     "RETURN_NOT_REVIEW_RESULT",
     "RETURN_BLANK_GENERATION",
     "RETURN_NO_REVIEW_REQUEST",
+    "RETURN_PREVIOUS_GENERATION",
     "RETURN_REFUSAL_REASONS",
+    "REVIEW_RETURN_FENCE_PREVIOUS_GENERATION",
+    "REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR",
+    "REVIEW_RETURN_FENCE_NO_CORRELATION",
     "OWNER_RESOLVED",
     "OWNER_ABSENT",
     "OWNER_AMBIGUOUS",
@@ -527,6 +636,8 @@ __all__ = (
     "latest_review_result_journal",
     "correlated_review_request_journal",
     "review_return_is_current",
+    "review_round_within_generation",
+    "make_review_return_send_edge_fence",
     "encode_review_return_payload",
     "decode_review_return_payload",
     "plan_review_return",
