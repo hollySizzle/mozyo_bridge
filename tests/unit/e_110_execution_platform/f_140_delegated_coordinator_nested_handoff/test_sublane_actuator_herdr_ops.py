@@ -29,6 +29,12 @@ from mozyo_bridge.core.state.workspace_registry import read_anchor, register_wor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
+    HEAL_REASON_PAIR_INCOMPLETE,
+    HEAL_REASON_PAIR_SPLIT,
+    HEAL_REASON_TARGET_ABSENT,
+    SublaneHealError,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SUBLANE_STATE_ACTIVE,
     SUBLANE_STATE_GATEWAY_ONLY,
@@ -820,6 +826,79 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                     ops.heal_lane_column(str(worktree))
         self.assertIn("postcondition", str(ctx.exception))
         self.assertIn("split or incomplete", str(ctx.exception))
+        # Redmine #13933 R11: the full-pair heal's typed reason distinguishes an incomplete
+        # pair from a live split.
+        self.assertIsInstance(ctx.exception, SublaneHealError)
+        self.assertEqual(ctx.exception.reason, HEAL_REASON_PAIR_INCOMPLETE)
+
+    def test_target_scoped_heal_tolerates_absent_sibling(self) -> None:
+        # Redmine #13933 R11 j#81429 #3: the pair-level launcher, driven for ONE owed
+        # participant (the worker), converges an approved partial pair — the still-absent
+        # sibling (gateway) is a partial state a later leg converges, NOT a launch failure.
+        # This is the exact live shape (#13846) the full-pair postcondition fenced into a
+        # permanent effect_failed; a target-scoped launch must NOT raise.
+        herdr = _ListControlHerdr(drop_role_after_start="_codex_")
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr.start_argvs.clear()  # arm the drop for the HEAL's relaunch only
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                # No raise: the worker (target) is live; the absent gateway is tolerated.
+                ops.heal_lane_column(str(worktree), target_provider="claude")
+
+    def test_target_scoped_heal_fails_closed_when_its_own_slot_is_absent(self) -> None:
+        # Redmine #13933 R11: tolerance is only for the SIBLING. If the target provider's
+        # own owed slot did not come up live, the launch genuinely failed — fail closed with
+        # the typed `launch_target_absent` reason (never a silent success on a dead target).
+        herdr = _ListControlHerdr(drop_role_after_start="_codex_")
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr.start_argvs.clear()
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                with self.assertRaises(SublaneHealError) as ctx:
+                    ops.heal_lane_column(str(worktree), target_provider="codex")
+        self.assertEqual(ctx.exception.reason, HEAL_REASON_TARGET_ABSENT)
+
+    def test_target_scoped_heal_still_fails_closed_on_a_live_split(self) -> None:
+        # Redmine #13933 R11 j#81429 #3: a target-scoped launch NEVER bypasses same-tab
+        # placement. When the sibling is ALSO live, a relaunch that split the pair across
+        # tabs still fails closed with the typed `pair_split` reason.
+        herdr = _SplitOnHealHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                herdr.split_next_start = True
+                with self.assertRaises(SublaneHealError) as ctx:
+                    ops.heal_lane_column(str(worktree), target_provider="codex")
+        self.assertIn("pair is split", str(ctx.exception))
+        self.assertEqual(ctx.exception.reason, HEAL_REASON_PAIR_SPLIT)
+
+    def test_target_scoped_heal_converges_a_healthy_pair(self) -> None:
+        # A target-scoped launch whose sibling DOES come up healthy and co-located passes
+        # exactly like the full-pair heal (the ordinary converge path where the sibling is a
+        # live participant): no raise, both slots active on read-back.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                ops.heal_lane_column(str(worktree), target_provider="codex")  # no raise
+                view = ops.read_lane(str(worktree))
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
 
     def test_front_door_fingerprint_gate_blocks_drifted_runtime_zero_side_effect(
         self,

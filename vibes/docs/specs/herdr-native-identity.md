@@ -489,7 +489,16 @@ provenance を照合しない**ことにある。
   **R1-F3 fail-closed**: preflight の inventory read 不能は side-effect 前 block、compatible
   heal 後の same-tab postcondition は inventory 不能・slot 欠落・非 co-located をいずれも
   fail-closed (unknown は success にしない)。legacy loose pair は既知 key `(wN, "")` の
-  co-located として扱い unknown と混同しない。
+  co-located として扱い unknown と混同しない。**R11 target-scoped postcondition (Redmine
+  #13933 j#81429)**: pure contract は `sublane_runtime_fence.enforce_heal_postcondition`。
+  default (`target_provider=None`) は上記 full-pair 契約を byte-identical に保つ。
+  `heal_lane_column(target_provider=<provider>)` で単一 owed participant を launch する時
+  (bound-pair convergence の 1 leg) は、target slot が live であることを要求し、sibling も
+  live なら依然 co-located を要求 (live split は `pair_split` で fail-closed=same-tab placement
+  を bypass しない) 一方、sibling **absent** は後続 leg が収束させる partial state として許容し、
+  承認済み partial pair を恒久 `effect_failed` へ fence しない。fence は typed `SublaneHealError`
+  (`launch_target_absent` / `pair_split` / `pair_incomplete`) を raise し、public outcome が
+  `launch:<reason>` を surface する。
 - **`pair_split` degraded projection + admission (R1-F2)**: projection
   (`project_herdr_sublanes` / `herdr_lane_view_for_worktree` / actuator `read_lane`) は各
   slot の `(herdr_workspace, tab_id)` を比較し、live pair が単一 container を共有しなければ

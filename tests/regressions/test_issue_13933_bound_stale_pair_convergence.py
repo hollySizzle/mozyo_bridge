@@ -21,7 +21,20 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence_live import (
     _BoundPairActuatorPort,
     _SnapshotRecoveryOps,
+    _launch_detail,
     LiveBoundPairConvergenceOps,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
+    ACTUATION_EFFECT_FAILED,
+    ACTUATION_PRESERVATION_BLOCKED,
+    LAUNCH_ERROR,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    SublaneLauncherIncompatibleError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (
+    HEAL_REASON_TARGET_ABSENT,
+    SublaneHealError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_convergence import (
     APPROVAL_GATE,
@@ -268,8 +281,8 @@ class LiveActuatorBoundaryTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 calls.append(("init", kwargs))
 
-            def heal_lane_column(self, worktree):
-                calls.append(("heal", worktree))
+            def heal_lane_column(self, worktree, *, target_provider=None):
+                calls.append(("heal", worktree, target_provider))
 
         module = (
             "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
@@ -279,7 +292,12 @@ class LiveActuatorBoundaryTests(unittest.TestCase):
             result = port.launch_action_bound("action-13933", self._pin())
         self.assertEqual(result, LAUNCH_DONE)
         self.assertEqual(calls[0][1]["replacement_action_id"], "action-13933")
-        self.assertEqual(calls[1], ("heal", REQ.worktree))
+        # Redmine #13933 R11 j#81429 #3: the launch is scoped to THIS owed participant's
+        # provider so the pair-level launcher's same-tab postcondition converges an
+        # approved partial pair instead of fencing on the still-owed / absent sibling.
+        self.assertEqual(calls[1], ("heal", REQ.worktree, "codex"))
+        # A clean launch records no failure reason (j#81429 #2).
+        self.assertEqual(getattr(port, "launch_failure_reason", ""), "")
 
     def _close_boundary(self, record, *, branch=REQ.branch, status=""):
         owner = LiveBoundPairConvergenceOps(repo_root=Path("/coordinator"), env={})
@@ -527,6 +545,94 @@ class LiveActuatorBoundaryTests(unittest.TestCase):
         outcome = run_bound_pair_convergence(REQ, execute=True, ops=ops)
         self.assertEqual(outcome.verdict.state, STATE_ALREADY_CONVERGED)
         self.assertEqual(ops.calls, [("observe", "")])
+
+
+class LaunchReasonSurfacingTests(unittest.TestCase):
+    """The typed heal reason is captured by the port and surfaced publicly (j#81429 #2)."""
+
+    def _port(self):
+        owner = SimpleNamespace(repo_root=Path("/coordinator"), env={})
+        live = _SnapshotRecoveryOps(
+            repo_root=owner.repo_root, request_issue=REQ.issue,
+            request_lane=REQ.lane, request_journal=REQ.journal, env={},
+        )
+        return _BoundPairActuatorPort(owner, REQ, object(), live)
+
+    def _pin(self):
+        return ParticipantPin(
+            lane_id=REQ.lane, role="worker", provider="claude",
+            assigned_name="managed-worker", old_locator="w1:p2",
+            is_self=False, lane_revision="4", lane_generation="1",
+        )
+
+    def _launch_with(self, raiser):
+        port = self._port()
+
+        class FakeActuator:
+            def __init__(self, **kwargs):
+                pass
+
+            def heal_lane_column(self, worktree, *, target_provider=None):
+                raiser()
+
+        module = (
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_hibernated_bound_pair_convergence_live.HerdrSublaneActuatorOps"
+        )
+        with mock.patch(module, FakeActuator):
+            result = port.launch_action_bound("action-13933", self._pin())
+        return result, port
+
+    def test_heal_error_reason_is_captured_not_swallowed(self):
+        def raiser():
+            raise SublaneHealError("boom", reason=HEAL_REASON_TARGET_ABSENT)
+
+        result, port = self._launch_with(raiser)
+        self.assertEqual(result, LAUNCH_ERROR)
+        self.assertEqual(port.launch_failure_reason, HEAL_REASON_TARGET_ABSENT)
+
+    def test_launcher_incompatible_reason_is_captured(self):
+        def raiser():
+            raise SublaneLauncherIncompatibleError("skew", reason="launcher_runtime_incompatible")
+
+        result, port = self._launch_with(raiser)
+        self.assertEqual(result, LAUNCH_ERROR)
+        self.assertEqual(port.launch_failure_reason, "launcher_runtime_incompatible")
+
+    def test_unexpected_exception_is_a_stable_generic_reason(self):
+        def raiser():
+            raise RuntimeError("some preflight fence (never a raw path)")
+
+        result, port = self._launch_with(raiser)
+        self.assertEqual(result, LAUNCH_ERROR)
+        # A stable token, never the raw message (no path / credential leak).
+        self.assertEqual(port.launch_failure_reason, "launch_error")
+
+    def test_launch_detail_surfaces_typed_reason_only_for_launch_effect_failed(self):
+        port = SimpleNamespace(launch_failure_reason=HEAL_REASON_TARGET_ABSENT)
+        launch_failed = SimpleNamespace(
+            status=ACTUATION_EFFECT_FAILED, detail="launch", preservation_reasons=()
+        )
+        self.assertEqual(
+            _launch_detail(launch_failed, port), f"launch:{HEAL_REASON_TARGET_ABSENT}"
+        )
+        # A different effect_failed leg (e.g. a close) is NOT relabelled.
+        close_failed = SimpleNamespace(
+            status=ACTUATION_EFFECT_FAILED, detail="close", preservation_reasons=()
+        )
+        self.assertEqual(_launch_detail(close_failed, port), "close")
+        # A preservation block keeps its own reasons.
+        blocked = SimpleNamespace(
+            status=ACTUATION_PRESERVATION_BLOCKED, detail="", preservation_reasons=("dirty",)
+        )
+        self.assertEqual(_launch_detail(blocked, port), "dirty")
+
+    def test_launch_detail_without_a_captured_reason_stays_bare_launch(self):
+        port = SimpleNamespace(launch_failure_reason="")
+        launch_failed = SimpleNamespace(
+            status=ACTUATION_EFFECT_FAILED, detail="launch", preservation_reasons=()
+        )
+        self.assertEqual(_launch_detail(launch_failed, port), "launch")
 
 
 if __name__ == "__main__":
