@@ -1955,12 +1955,13 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
 
     def _seamed_ops(self, coord, env, ws, gw_name, wk_name, gw_old, wk_old, worktree, *,
                     worktree_clean=True, branch_matches=True, lifecycle_exact=True,
-                    revision=4, generation=1):
+                    revision=4, generation=1, approved_branch="main",
+                    observed_branch=None, observed_identity="wt_fc"):
         """A real ``LiveBoundPairPreparationOps`` with observe/approval seamed (external
         inputs) but the REAL rollback detection. Returns (ops, expectation)."""
         expectation = expectation_for(
             issue=self.ISSUE, lane=self.LANE, revision=4, generation=1,
-            resolved_worktree=str(worktree), worktree_identity="wt_fc", branch="main",
+            resolved_worktree=str(worktree), worktree_identity="wt_fc", branch=approved_branch,
             slots=(
                 BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
                           locator=gw_old, disposition=SLOT_HEALTHY),
@@ -1969,9 +1970,11 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             ),
             discard_roles=("worker",),
         )
+        if observed_branch is None:
+            observed_branch = approved_branch if branch_matches else "other"
         blocked_obs = PreparationObservation(
-            workspace_id=ws, worktree_path=str(worktree), worktree_identity="wt_fc",
-            branch="main" if branch_matches else "other", revision=revision,
+            workspace_id=ws, worktree_path=str(worktree), worktree_identity=observed_identity,
+            branch=observed_branch, revision=revision,
             generation=generation, lifecycle_exact=lifecycle_exact, pins_empty=True,
             pins_known=True, inventory_readable=True, worktree_readable=True,
             worktree_clean=worktree_clean, branch_matches=branch_matches,
@@ -2094,6 +2097,41 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
                 )
                 ops, expectation = self._seamed_ops(
                     coord, env, ws, gw_name, wk_name, gw_old, wk_old, worktree, **kw
+                )
+                self._seed_partial(
+                    home, ws, gw_name, gw_old, action=expectation.action_id,
+                    old_locator="w1:pPREV",
+                )
+                with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                     mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                    outcome = run_bound_pair_preparation(request, execute=False, ops=ops)
+                self.assertNotEqual(
+                    outcome.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED, label
+                )
+                self.assertEqual(outcome.startup_rollback_action_id, "", label)
+
+    def test_approval_worktree_digest_drift_never_surfaces_rollback(self):
+        # F2 (review j#82089): request-relative `branch_matches` is not enough. An approval made
+        # on `main` must not fund a rollback on a worktree since moved to `other` (or a changed
+        # worktree identity), even when every request-relative axis is true and the revision /
+        # generation are unchanged — the marker binds the resolved worktree identity + branch.
+        for label, kw in (
+            ("branch_drift", {"approved_branch": "main", "observed_branch": "other"}),
+            ("identity_drift", {"observed_identity": "wt_moved"}),
+        ):
+            with self.subTest(drift=label), tempfile.TemporaryDirectory() as tmp:
+                home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                    _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+                )
+                request = PrepareBoundPairRequest(
+                    issue=self.ISSUE, journal="80925", lane=self.LANE,
+                    worktree=str(worktree), branch="main",
+                )
+                # branch_matches / all safe axes stay true; only the APPROVED worktree digest
+                # differs from the current projection.
+                ops, expectation = self._seamed_ops(
+                    coord, env, ws, gw_name, wk_name, gw_old, wk_old, worktree,
+                    branch_matches=True, **kw
                 )
                 self._seed_partial(
                     home, ws, gw_name, gw_old, action=expectation.action_id,
