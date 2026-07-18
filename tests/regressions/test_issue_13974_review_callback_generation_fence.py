@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]  # tests/regressions/<file> -> repo root
 sys.path.insert(0, str(ROOT / "src"))
@@ -515,29 +516,141 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
         self.assertEqual(self.outbox.read(states=[CALLBACK_PENDING]), ())
 
-    # -- F2 producer->consumer vertical slice (canonical writer emits v2) -----
+    # -- Full-surface adversarial matrix (escalation j#81497): req / head / source_sequence
+    #    at the discovery, persisted-payload, and send-edge boundaries, all through the supervisor ---
 
-    def test_producer_e2e_current_row_delivers_exactly_once(self) -> None:
-        # j#81487 F2: the CANONICAL producer (emit_gate_record, the --emit-gate writer) emits v2 marker
-        # fields, so a fresh structured review round flows producer -> Redmine journal -> supervisor and
-        # delivers the current review_return exactly once (the vertical slice is closed at the writer).
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
-            emit_gate_record,
+    def _supervise_current(self, source, *, anchor=ANCHOR):
+        """Own+lease a fresh workspace and run the fenced supervisor over ``source``; return report."""
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._transport = _CapturingTransport()
+        supervisor = self._build_supervisor(wsid=wsid, source=source, transport=self._transport, anchor=anchor)
+        return wsid, supervisor.run_once()
+
+    def test_fs_discovery_req_mismatch_refused_via_supervisor(self) -> None:
+        # req MISMATCH at DISCOVERY: the result marker declares req=999 != correlated request j110.
+        mismatch = MappingRedmineJournalSource(
+            payload=_journals(("110", _req(CUR_HEAD)), ("120", _res(head=CUR_HEAD, req="999")))
         )
+        _wsid, report = self._supervise_current(mismatch)
+        self.assertEqual(self._transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_REVIEW_REQUEST_UNCONFIRMED, self._refusals(report))
 
+    def test_fs_preexisting_live_req_missing_terminal_via_supervisor(self) -> None:
+        # req MISSING at the SEND EDGE: a row enqueued with a valid live req, then the LIVE review_result
+        # marker declares NO req (broken action identity). The send edge terminally fences the row.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(_current_round_source(), wsid)  # recorded req=110
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        broken = MappingRedmineJournalSource(
+            payload=_journals(("110", _req(CUR_HEAD)), ("120", _res(head=CUR_HEAD, req=None)))
+        )
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(wsid=wsid, source=broken, transport=transport, anchor=ANCHOR)
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+
+    def test_fs_preexisting_live_req_mismatch_terminal_via_supervisor(self) -> None:
+        # req MISMATCH at the SEND EDGE: the LIVE review_result marker's declared req drifted to 999.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(_current_round_source(), wsid)  # recorded req=110
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        drifted = MappingRedmineJournalSource(
+            payload=_journals(("110", _req(CUR_HEAD)), ("120", _res(head=CUR_HEAD, req="999")))
+        )
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(wsid=wsid, source=drifted, transport=transport, anchor=ANCHOR)
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+
+    def test_fs_preexisting_malformed_head_terminal_via_supervisor(self) -> None:
+        # head MALFORMED at the SEND EDGE: a row enqueued (unfenced) with a non-full-hex recorded head
+        # reaches a terminal disposition through the fenced supervisor.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(
+            MappingRedmineJournalSource(
+                payload=_journals(("110", _req("deadbeef")), ("120", _res(head="deadbeef", req="110")))
+            ),
+            wsid,
+        )
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+
+    def test_fs_source_sequence_is_the_review_result_journal(self) -> None:
+        # source_sequence: the delivered row is keyed on the PROVIDER's review_result journal id (j120),
+        # and a re-discovery of the same source_sequence is idempotent (no duplicate delivery).
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        delivered = self._return_rows([CALLBACK_DELIVERED])
+        self.assertEqual([r.journal for r in delivered], ["120"])  # source_sequence = review_result journal
+        supervisor.run_once()  # same source_sequence re-discovered -> idempotent
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
+
+    # -- F2 producer->consumer vertical slice (ACTUAL CLI emits v2) -----------
+
+    def _emit_gate_via_cli(self, writer, gate, *extra):
+        """Drive the ACTUAL `workflow callbacks --emit-gate` CLI (not emit_gate_record) against a
+        recording transport; return the posted note. This exercises the real producer path (j#81496 F2)."""
+        from mozyo_bridge.application.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(
+            ["workflow", "callbacks", "--emit-gate", "--issue", ISSUE, "--gate", gate, *extra, "--json"]
+        )
+        with mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            return_value=writer,
+        ), mock.patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.cli_workflow_callbacks._activate_supervisor_process",
+            lambda: None,
+        ):
+            rc = args.func(args)
+        self.assertEqual(rc, 0, f"--emit-gate {gate} should record")
+        return writer.notes[-1]
+
+    def test_producer_cli_e2e_current_row_delivers_exactly_once(self) -> None:
+        # j#81496 F2: the ACTUAL --emit-gate CLI emits the v2 marker fields (head + req + conclusion),
+        # so a fresh structured review round flows CLI -> captured Redmine journal -> supervisor and
+        # delivers the current review_return exactly once. The vertical slice is closed at the real CLI.
         wsid = self._register_ws()
         self._own_and_lease(wsid)
         writer = _CapturingNoteTransport()
-        r1 = emit_gate_record(ISSUE, "review_request", transport=writer, marker_fields={"target_head": CUR_HEAD})
-        r2 = emit_gate_record(
-            ISSUE, "review_result", transport=writer,
-            marker_fields={"conclusion": "approved", "target_head": CUR_HEAD, "review_request_journal": "110"},
+        req_note = self._emit_gate_via_cli(writer, "review_request", "--target-head", CUR_HEAD)
+        res_note = self._emit_gate_via_cli(
+            writer, "review_result", "--target-head", CUR_HEAD,
+            "--review-request-journal", "110", "--review-decision", "changes_requested",
         )
-        self.assertTrue(r1.recorded and r2.recorded)
+        # The CLI-emitted review_result marker carries conclusion + head + req (not head/req only).
+        self.assertIn("head=" + CUR_HEAD, res_note)
+        self.assertIn("req=110", res_note)
+        self.assertIn("conclusion=changes_requested", res_note)
         # Redmine assigns the journal ids; assemble the exact source the supervisor re-reads.
         source = MappingRedmineJournalSource(payload={"issue": {"id": ISSUE}, "journals": [
-            {"id": "110", "notes": writer.notes[0]},
-            {"id": "120", "notes": writer.notes[1]},
+            {"id": "110", "notes": req_note},
+            {"id": "120", "notes": res_note},
         ]})
         transport = _CapturingTransport()
         supervisor = self._build_supervisor(wsid=wsid, source=source, transport=transport, anchor=ANCHOR)
@@ -557,15 +670,22 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         )
 
         def _fields(gate, **kw):
-            ns = argparse.Namespace(target_head=kw.get("head"), review_request_journal=kw.get("req"))
+            ns = argparse.Namespace(
+                target_head=kw.get("head"), review_request_journal=kw.get("req"),
+                review_decision=kw.get("decision"),
+            )
             return _review_gate_marker_fields(ns, gate)
 
         self.assertEqual(_fields("review_request")[1], "review_marker_missing_target_head")
         self.assertEqual(_fields("review_request", head="deadbeef")[1], "review_marker_malformed_target_head")
         self.assertEqual(_fields("review_result", head=CUR_HEAD)[1], "review_marker_missing_review_request_journal")
-        fields, refusal = _fields("review_result", head=CUR_HEAD, req="110")
+        # A review_result carries head + req + conclusion (v2). changes_requested -> changes_requested.
+        fields, refusal = _fields("review_result", head=CUR_HEAD, req="110", decision="changes_requested")
         self.assertIsNone(refusal)
-        self.assertEqual(fields, {"target_head": CUR_HEAD, "review_request_journal": "110"})
+        self.assertEqual(fields, {"target_head": CUR_HEAD, "review_request_journal": "110", "conclusion": "changes_requested"})
+        # An unspecified / approval decision -> conclusion approved.
+        self.assertEqual(_fields("review_result", head=CUR_HEAD, req="110")[0]["conclusion"], "approved")
+        self.assertEqual(_fields("review_result", head=CUR_HEAD, req="110", decision="approval")[0]["conclusion"], "approved")
         # A non-review gate carries no v2 fields (unchanged).
         self.assertEqual(_fields("implementation_done"), ({}, None))
 

@@ -42,11 +42,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REVIEW_RETURN_FENCE_MALFORMED_HEAD,
     REVIEW_RETURN_FENCE_NO_CORRELATION,
     REVIEW_RETURN_FENCE_PREVIOUS_GENERATION,
+    REVIEW_RETURN_FENCE_REQ_UNCONFIRMED,
     REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR,
     REVIEW_RETURN_ROUTE_PREFIX,
     OwningLaneBinding,
     correlated_review_request_journal,
     current_review_generation_head,
+    current_review_generation_request,
     decode_review_return_payload,
     decode_review_return_target_head,
     encode_review_return_payload,
@@ -145,7 +147,8 @@ class ReviewReturnRouteTest(unittest.TestCase):
         self.assertTrue(plan_review_return(markers, ISSUE, "35", _owner()).emit)
 
     def test_review_return_is_current_action_time_fence(self) -> None:
-        markers = [_review_request("10"), _review_result("20")]
+        # The live review_result marker DECLARES its req (j#81496 F1) — the action identity authority.
+        markers = [_review_request("10"), _review_result("20", req="10")]
         # Reserved round is still current.
         self.assertTrue(review_return_is_current(markers, ISSUE, "20", "10"))
         # A newer review_request landed after reserve -> the round restarted -> stale.
@@ -159,6 +162,10 @@ class ReviewReturnRouteTest(unittest.TestCase):
         # R1-re-review F2: a blank recorded correlation is fail-closed (never a wildcard), even with a
         # valid live review round present.
         self.assertFalse(review_return_is_current(markers, ISSUE, "20", ""))
+        # j#81496 F1: the LIVE marker declares no req -> fail-closed even if the recorded req matches.
+        self.assertFalse(review_return_is_current([_review_request("10"), _review_result("20")], ISSUE, "20", "10"))
+        # j#81496 F1: the LIVE marker's declared req drifted from the correlated request -> stale.
+        self.assertFalse(review_return_is_current([_review_request("10"), _review_result("20", req="7")], ISSUE, "20", "10"))
         # An uncorrelated result (no request) is not current.
         self.assertFalse(review_return_is_current([_review_result("20")], ISSUE, "20", ""))
 
@@ -367,6 +374,19 @@ class ReviewHeadFenceTest(unittest.TestCase):
         self.assertEqual(current_review_generation_head(markers, ISSUE), HEAD_B)
         self.assertEqual(current_review_generation_head([], ISSUE), "")
 
+    def test_current_review_generation_request_is_live_declared_req(self) -> None:
+        # j#81496 F1: the live authoritative req is the latest review_result's DECLARED req when it
+        # equals its correlated request.
+        markers = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="110")]
+        self.assertEqual(current_review_generation_request(markers, ISSUE), "110")
+        # A live marker declaring no req -> fail-closed blank.
+        m2 = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="")]
+        self.assertEqual(current_review_generation_request(m2, ISSUE), "")
+        # A live marker whose declared req drifted from the correlated request -> fail-closed blank.
+        m3 = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="999")]
+        self.assertEqual(current_review_generation_request(m3, ISSUE), "")
+        self.assertEqual(current_review_generation_request([], ISSUE), "")
+
 
 class _Row:
     """The minimal outbox-row shape the send-edge fence reads (route + payload)."""
@@ -379,6 +399,9 @@ class _Row:
 class ReviewReturnSendEdgeFenceTest(unittest.TestCase):
     """Redmine #13974 / j#81454 A: terminal send-edge fence (generation + head) for backlog rows."""
 
+    def _fence(self, anchor="100", head=HEAD_A, req="110"):
+        return make_review_return_send_edge_fence(anchor, head, req)
+
     def _row(self, request_journal: str, head: str = HEAD_A, lane: str = "issue_13684"):
         return _Row(
             review_return_callback_route(lane),
@@ -386,61 +409,64 @@ class ReviewReturnSendEdgeFenceTest(unittest.TestCase):
         )
 
     def test_previous_generation_row_is_fenced_terminal(self) -> None:
-        fence = make_review_return_send_edge_fence("100", HEAD_A)
-        blocked, reason = fence(self._row("10"))  # round j10 predates anchor j100
+        blocked, reason = self._fence()(self._row("10"))  # round j10 predates anchor j100
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_PREVIOUS_GENERATION)
 
-    def test_current_generation_current_head_row_is_exempt(self) -> None:
-        # Current generation (round >= anchor) AND head matches the current review generation head ->
+    def test_current_generation_current_head_and_req_row_is_exempt(self) -> None:
+        # Current generation (round >= anchor) AND head + req match the current review generation ->
         # NOT fenced; the #13684 send authorities own its exactly-once delivery.
-        fence = make_review_return_send_edge_fence("100", HEAD_A)
-        blocked, _ = fence(self._row("110", head=HEAD_A))
+        blocked, _ = self._fence(head=HEAD_A, req="110")(self._row("110", head=HEAD_A))
         self.assertFalse(blocked)
 
+    def test_current_generation_req_drift_row_is_fenced_terminal(self) -> None:
+        # j#81496 F1: the recorded req drifted from the current live request -> fenced terminal.
+        blocked, reason = self._fence(req="999")(self._row("110", head=HEAD_A))
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_REQ_UNCONFIRMED)
+
+    def test_unresolvable_current_req_fences_current_generation_row(self) -> None:
+        # j#81496 F1: a blank current review request (live marker req missing/drifted) fails closed.
+        blocked, reason = self._fence(req="")(self._row("110", head=HEAD_A))
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_REQ_UNCONFIRMED)
+
     def test_current_generation_head_drift_row_is_fenced_terminal(self) -> None:
-        # Current generation round but the recorded head drifted from the current review head -> fenced.
-        fence = make_review_return_send_edge_fence("100", HEAD_B)
-        blocked, reason = fence(self._row("110", head=HEAD_A))
+        # Current generation round + req but the recorded head drifted from the current head -> fenced.
+        blocked, reason = self._fence(head=HEAD_B, req="110")(self._row("110", head=HEAD_A))
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_HEAD_DRIFT)
 
     def test_malformed_recorded_head_is_fenced_terminal(self) -> None:
         # j#81487 F1: a non-full-hex recorded head is fenced at the send edge (action-time terminal).
-        fence = make_review_return_send_edge_fence("100", HEAD_A)
-        blocked, reason = fence(self._row("110", head="deadbeef"))  # abbreviated, not full
+        blocked, reason = self._fence()(self._row("110", head="deadbeef"))  # abbreviated, not full
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_MALFORMED_HEAD)
 
     def test_missing_recorded_head_is_fenced_terminal(self) -> None:
         # A legacy row with no recorded head (pre-#13974 payload) fails closed at the current generation.
-        fence = make_review_return_send_edge_fence("100", HEAD_A)
         row = _Row(review_return_callback_route("issue_13684"), encode_review_return_payload("110"))
-        blocked, reason = fence(row)
+        blocked, reason = self._fence()(row)
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED)
 
     def test_unresolvable_current_head_fences_current_generation_row(self) -> None:
         # A blank current review head (head-less generation) fails a would-be-current row closed.
-        fence = make_review_return_send_edge_fence("100", "")
-        blocked, reason = fence(self._row("110", head=HEAD_A))
+        blocked, reason = self._fence(head="")(self._row("110", head=HEAD_A))
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED)
 
     def test_coordinator_row_is_exempt(self) -> None:
-        fence = make_review_return_send_edge_fence("100", HEAD_A)
-        blocked, _ = fence(_Row("coordinator", ""))
+        blocked, _ = self._fence()(_Row("coordinator", ""))
         self.assertFalse(blocked)
 
     def test_unresolvable_anchor_fences_every_review_return_row(self) -> None:
-        fence = make_review_return_send_edge_fence(None, HEAD_A)
-        blocked, reason = fence(self._row("110"))  # even a would-be-current row fails closed
+        blocked, reason = make_review_return_send_edge_fence(None, HEAD_A, "110")(self._row("110"))
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR)
 
     def test_missing_round_correlation_is_fenced(self) -> None:
-        fence = make_review_return_send_edge_fence("100", HEAD_A)
-        blocked, reason = fence(_Row(review_return_callback_route("issue_13684"), payload=""))
+        blocked, reason = self._fence()(_Row(review_return_callback_route("issue_13684"), payload=""))
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_NO_CORRELATION)
 

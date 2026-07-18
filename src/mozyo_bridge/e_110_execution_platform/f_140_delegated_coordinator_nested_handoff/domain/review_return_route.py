@@ -442,6 +442,26 @@ def current_review_generation_head(markers: Iterable[JournalMarker], issue: str)
     return best_head
 
 
+def current_review_generation_request(markers: Iterable[JournalMarker], issue: str) -> str:
+    """The LIVE authoritative review_request journal of the current review generation (#13974 j#81496).
+
+    The latest review_result's OWN declared ``req``, but ONLY when it is present AND equals its derived
+    correlated request — otherwise ``""`` (fail-closed). A reserved ``review_return`` row's recorded req
+    must still match this at the send edge; a live marker whose declared req is missing / drifted
+    collapses this to ``""`` so every review_return row for the issue fails closed (never sent on a
+    stale / broken action identity).
+    """
+    marker_list = list(markers)
+    latest = latest_review_result_journal(marker_list, issue)
+    if not latest:
+        return ""
+    declared = review_result_marker_request(marker_list, issue, latest)
+    correlated = correlated_review_request_journal(marker_list, issue, latest)
+    if not declared or not correlated or declared != correlated:
+        return ""
+    return declared
+
+
 def _has_newer_marker(
     markers: Iterable[JournalMarker], issue: str, gate: str, journal_int: int
 ) -> bool:
@@ -549,6 +569,13 @@ def review_return_is_current(
     # correlation is fail-closed, never a wildcard re-derived from the live markers.
     recorded = str(review_request_journal or "").strip()
     if not recorded or recorded != current_request:
+        return False
+    # j#81496 F1: the LIVE review_result marker's OWN declared ``req`` is also the authority at action
+    # time (not only the persisted payload). A live marker whose declared req is missing or has drifted
+    # from the correlated request (or from the recorded req) is fail-closed — a pre-existing row is
+    # re-verified against the live marker, never trusted solely on its stamped-at-ingest payload.
+    live_declared = review_result_marker_request(markers, issue, review_journal)
+    if not live_declared or live_declared != current_request or live_declared != recorded:
         return False
     return True
 
@@ -741,10 +768,13 @@ REVIEW_RETURN_FENCE_NO_CORRELATION = "fenced: review_return row missing round co
 REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED = "fenced: review head unconfirmed against current generation"
 REVIEW_RETURN_FENCE_HEAD_DRIFT = "superseded: review head drifted from current review generation"
 REVIEW_RETURN_FENCE_MALFORMED_HEAD = "fenced: review head not a full commit head"
+REVIEW_RETURN_FENCE_REQ_UNCONFIRMED = "fenced: review request unconfirmed against current generation"
 
 
 def make_review_return_send_edge_fence(
-    dispatch_anchor_journal: object, current_review_head: object = None
+    dispatch_anchor_journal: object,
+    current_review_head: object = None,
+    current_review_request: object = None,
 ):
     """Build the terminal send-edge fence for pre-existing ``review_return`` backlog rows (#13974).
 
@@ -774,6 +804,7 @@ def make_review_return_send_edge_fence(
     """
     anchor_int = _as_int(dispatch_anchor_journal)
     cur_head = str(current_review_head or "").strip()
+    cur_request = str(current_review_request or "").strip()
 
     def _fence(row) -> "tuple[bool, str]":
         route = str(getattr(row, "callback_route", "") or "").strip()
@@ -787,7 +818,13 @@ def make_review_return_send_edge_fence(
             if _as_int(request_journal) is None:
                 return (True, REVIEW_RETURN_FENCE_NO_CORRELATION)
             return (True, REVIEW_RETURN_FENCE_PREVIOUS_GENERATION)
-        # Current lane generation: conjoin the review-generation head (#13974 / j#81454 A + j#81487 F1).
+        # Current lane generation: conjoin the LIVE review-request identity (#13974 j#81496 F1). The
+        # row's recorded req must still equal the current generation's live authoritative request — a
+        # live marker whose declared req is missing / drifted collapses ``cur_request`` to "" and fails
+        # the row closed at the send edge, so a pre-existing row is never sent on a stale action id.
+        if not cur_request or request_journal != cur_request:
+            return (True, REVIEW_RETURN_FENCE_REQ_UNCONFIRMED)
+        # ...and the review-generation head (#13974 / j#81454 A + j#81487 F1).
         recorded_head = decode_review_return_target_head(payload)
         if not cur_head or not recorded_head:
             return (True, REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED)
@@ -824,6 +861,7 @@ __all__ = (
     "REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED",
     "REVIEW_RETURN_FENCE_HEAD_DRIFT",
     "REVIEW_RETURN_FENCE_MALFORMED_HEAD",
+    "REVIEW_RETURN_FENCE_REQ_UNCONFIRMED",
     "OWNER_RESOLVED",
     "OWNER_ABSENT",
     "OWNER_AMBIGUOUS",
@@ -839,6 +877,7 @@ __all__ = (
     "review_result_marker_request",
     "is_full_commit_head",
     "current_review_generation_head",
+    "current_review_generation_request",
     "review_return_is_current",
     "review_round_within_generation",
     "make_review_return_send_edge_fence",
