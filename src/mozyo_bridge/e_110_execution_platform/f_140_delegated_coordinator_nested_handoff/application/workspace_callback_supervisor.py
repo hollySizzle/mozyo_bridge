@@ -49,14 +49,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
     DEFAULT_CALLBACK_ROUTE,
     discover_candidates,
-    discover_review_returns,
     run_once,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_review_return import (
-    # Redmine #13844 R7 move-only split: the review-return owning-lane send authorities live in a
-    # sibling leaf so this composition root stays under the module-health threshold. Re-exported
-    # here so every caller's import surface (and ``__all__``) is unchanged.
+    # Redmine #13844 R7 / #13974 move-only split: the review-return owning-lane send authorities and
+    # the generation-fenced discovery/send-edge helpers live in a sibling leaf so this composition
+    # root stays under the module-health threshold. Re-exported here so every caller's import surface
+    # (and ``__all__``) is unchanged.
+    REVIEW_RETURN_OWNER_READ_ERROR,
+    build_supervisor_send_edge_fence,
     coordinator_target_tuple,
+    discover_fenced_review_returns,
     owning_lane_binding,
     owning_lane_generation_reader,
     review_round_send_fence,
@@ -78,7 +81,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkspaceSupervisionOutcome,
     authoritative_workspace_by_issue,
     fence_candidates_to_anchor,
-    make_send_edge_fence,
     partition_authoritative,
     select_supervised_issues,
 )
@@ -129,11 +131,8 @@ ISSUE_PASS_ERROR = "issue_pass_error"
 #: A per-issue error token: the send-boundary ownership fence tripped (a takeover during this
 #: issue's source reads), so the outbox delivery was skipped — zero-send (Redmine #13683 R2-F1).
 ISSUE_LEASE_LOST = "lease_lost_before_send"
-
-#: A review-return refusal token (#13684 review R1-F3): resolving the owning-lane binding raised, so
-#: no correlated return was reserved. Surfaced in the issue outcome so the zero-send is
-#: operator-visible (secret-safe; carries no pane id / path / credential).
-REVIEW_RETURN_OWNER_READ_ERROR = "owner_binding_read_error"
+# ``REVIEW_RETURN_OWNER_READ_ERROR`` (#13684 R1-F3) now lives in the sibling leaf; imported above and
+# re-exported via ``__all__`` for a stable import surface.
 
 #: The launch-time lane-identity env a background supervisor must NOT inherit (Redmine #13683
 #: R2-F3). A supervisor is not a lane agent, so carrying another lane's role / lane / workspace id
@@ -400,6 +399,7 @@ class WorkspaceCallbackSupervisor:
         historical_fenced = 0
         send_fence_fn = None
         review_return_refusals: tuple[str, ...] = ()
+        anchor: Optional[str] = None
         try:
             if source is not None:
                 events_supplied = self._supply_events(issue, source, binding)
@@ -424,32 +424,24 @@ class WorkspaceCallbackSupervisor:
                     anchor = self._candidate_fence_fn(workspace_id, issue, source)
                     candidates, fenced = fence_candidates_to_anchor(candidates, anchor)
                     historical_fenced = len(fenced)
-                    # R2-F1: the SAME anchor also fences PRE-EXISTING pending / recovered backlog
-                    # rows at the send edge — the ingest fence above only stops newly discovered
-                    # candidates, but the outbox deliver pass claims + sends every pending row in
-                    # the partition (including historical rows enqueued by a previous generation).
-                    send_fence_fn = make_send_edge_fence(anchor, self._route)
-                # #13684: reserve the correlated review_result return to the issue's owning-lane
-                # Codex gateway. The pure policy (:func:`...review_return_route.plan_review_returns`)
-                # consults the durable owning-lane binding + the latest-review fence; only a returnable
-                # review_result becomes a candidate carrying the ``review_return:<lane>`` route (a
-                # distinct outbox key) + the expected owning-lane generation. Fail-open per issue: an
-                # owner-read failure leaves the coordinator candidates intact and returns nothing.
+                    # R2-F1 / #13974: the SAME anchor also fences PRE-EXISTING pending / recovered
+                    # backlog rows at the send edge — a historical coordinator row AND a
+                    # previous-generation review_return row both reach a terminal disposition instead
+                    # of retrying forever (the ingest fence only stops newly discovered candidates).
+                    send_fence_fn = build_supervisor_send_edge_fence(anchor, self._route)
+                # #13684/#13974: reserve the correlated review_result return to the issue's owning-lane
+                # Codex gateway, generation-fenced. The sibling helper resolves the owning-lane binding,
+                # threads the current dispatch anchor (a review round predating the current generation is
+                # refused at discovery — 0-enqueue), and returns the candidates + the refusal reasons
+                # (R1-F3: a fail-closed zero-send is operator-visible, not a silent drop). Fail-open per
+                # issue: an owner-read failure returns nothing and leaves the coordinator candidates.
                 if self._owner_binding_fn is not None:
-                    try:
-                        owner = self._owner_binding_fn(workspace_id, issue, binding)
-                        return_candidates, plans = discover_review_returns(
-                            source, issue, owner, workspace_id=workspace_id
-                        )
-                        candidates = candidates + tuple(return_candidates)
-                        # R1-F3: surface WHY a return was refused (secret-safe reason tokens) so a
-                        # fail-closed zero-send is operator-visible in the supervisor report, not a
-                        # silent drop.
-                        review_return_refusals = tuple(
-                            p.reason for p in plans if not p.emit
-                        )
-                    except Exception:  # noqa: BLE001 - an owner-read failure never aborts the issue pass
-                        review_return_refusals = (REVIEW_RETURN_OWNER_READ_ERROR,)
+                    return_candidates, review_return_refusals = discover_fenced_review_returns(
+                        self._owner_binding_fn, source,
+                        workspace_id=workspace_id, issue=issue, binding=binding,
+                        fence_active=self._candidate_fence_fn is not None, anchor=anchor,
+                    )
+                    candidates = candidates + tuple(return_candidates)
             else:
                 error = ISSUE_SOURCE_UNREADABLE
         except Exception:  # noqa: BLE001 - a source read failure degrades this issue, never the sweep

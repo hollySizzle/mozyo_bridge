@@ -90,6 +90,7 @@ def discover_review_returns(
     owner: OwningLaneBinding,
     *,
     workspace_id: str = "",
+    dispatch_anchor_journal: Optional[str] = None,
 ) -> tuple[list[CallbackCandidate], list[ReviewReturnPlan]]:
     """Discover correlated review_result return candidates for an issue (Redmine #13684).
 
@@ -102,13 +103,22 @@ def discover_review_returns(
     (lane / gateway receiver / owning-lane generation) the background_service delivery authority binds
     the re-resolved live target + independently-read live generation to.
 
+    ``dispatch_anchor_journal`` (Redmine #13974) is the current owning lane+generation's dispatch
+    anchor. When supplied (the fenced production supervisor), a review_result whose review round
+    predates the anchor is a previous-generation round and is refused (not enqueued) — the missing
+    admission-edge generation fence that let an old review_result be retargeted onto a new lane
+    generation. ``None`` (the default) leaves discovery unfenced (behavior unchanged); a
+    supplied-but-unresolvable anchor (``""``) fails closed (no return candidate this pass).
+
     Returns ``(candidates, plans)``: the candidates to enqueue, plus every plan (incl. refusals) so the
     caller can record why nothing was returned (observability). A read failure propagates to the caller
     (handled fail-closed per candidate downstream); an issue with no returnable review_result yields no
     candidate — never a guess.
     """
     markers = markers_from_source(source, issue)
-    plans = list(plan_review_returns(markers, issue, owner))
+    plans = list(
+        plan_review_returns(markers, issue, owner, dispatch_anchor_journal=dispatch_anchor_journal)
+    )
     candidates: list[CallbackCandidate] = []
     for plan in plans:
         if not plan.emit:

@@ -186,6 +186,29 @@ def make_send_edge_fence(anchor: object, coordinator_route: str):
     return _fence
 
 
+def compose_send_edge_fences(*fences):
+    """Combine per-row send-edge fences into one; the first that fires wins (pure; Redmine #13974).
+
+    Each ``fence`` is a ``send_fence_fn(row) -> (fenced, reason)`` (or ``None``, skipped). The
+    supervisor composes the coordinator-route fence (:func:`make_send_edge_fence`) with the
+    review_return-route fence (:func:`...review_return_route.make_review_return_send_edge_fence`) so a
+    single ``send_fence_fn`` terminally fences BOTH a historical coordinator row and a
+    previous-generation review_return row in the same deliver pass. Each route-specific fence is exempt
+    on the other's rows, so at most one ever fires for a given row. Returns ``(False, "")`` when no
+    fence fires.
+    """
+    active = tuple(f for f in fences if f is not None)
+
+    def _fence(row) -> tuple[bool, str]:
+        for fence in active:
+            fenced, reason = fence(row)
+            if fenced:
+                return (True, reason)
+        return (False, "")
+
+    return _fence
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -417,6 +440,7 @@ __all__ = (
     "partition_authoritative",
     "fence_candidates_to_anchor",
     "make_send_edge_fence",
+    "compose_send_edge_fences",
     "IssueSelection",
     "select_supervised_issues",
     "IssueSupervisionOutcome",

@@ -27,15 +27,21 @@ from typing import Callable, Optional
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
     DEFAULT_CALLBACK_ROUTE,
+    discover_review_returns,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     OWNER_RESOLVED,
     OWNER_UNKNOWN,
     OwningLaneBinding,
     is_review_return_route,
+    make_review_return_send_edge_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalSource,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    compose_send_edge_fences,
+    make_send_edge_fence,
 )
 
 
@@ -199,9 +205,75 @@ def review_round_send_fence(
     return _fence
 
 
+#: A review_return discovery pass whose owning-lane binding read raised (fail-open per issue): the
+#: issue pass records this single refusal token and returns no candidate, never aborting the sweep.
+REVIEW_RETURN_OWNER_READ_ERROR = "owner_binding_read_error"
+
+
+def discover_fenced_review_returns(
+    owner_binding_fn: Callable[[str, str, object], OwningLaneBinding],
+    source: object,
+    *,
+    workspace_id: str,
+    issue: str,
+    binding: object,
+    fence_active: bool,
+    anchor: object,
+) -> "tuple[tuple, tuple[str, ...]]":
+    """Resolve the issue owner + discover generation-fenced review_return candidates (Redmine #13974).
+
+    Returns ``(return_candidates, refusal_reasons)``. In a fenced pass the current dispatch anchor is
+    threaded (:func:`review_return_discovery_anchor`) so a review round predating the current lane
+    generation is refused at discovery (0-enqueue) rather than retargeted onto the new generation's
+    gateway. The refusal reasons are surfaced for observability (a fail-closed zero-send is not a
+    silent drop). Fail-open per issue: an owner-read failure yields no candidate + a single
+    :data:`REVIEW_RETURN_OWNER_READ_ERROR` token, never aborting the issue pass.
+    """
+    try:
+        owner = owner_binding_fn(workspace_id, issue, binding)
+        return_candidates, plans = discover_review_returns(
+            source, issue, owner, workspace_id=workspace_id,
+            dispatch_anchor_journal=review_return_discovery_anchor(fence_active, anchor),
+        )
+        return tuple(return_candidates), tuple(p.reason for p in plans if not p.emit)
+    except Exception:  # noqa: BLE001 - an owner-read failure never aborts the issue pass
+        return (), (REVIEW_RETURN_OWNER_READ_ERROR,)
+
+
+def review_return_discovery_anchor(fence_active: bool, anchor: object) -> "Optional[str]":
+    """The dispatch anchor to thread into review_return discovery (Redmine #13974).
+
+    In a fenced production pass the current dispatch anchor is threaded so a review round predating
+    the current lane generation is refused at discovery (an unresolvable anchor becomes ``""`` — fail
+    closed). The unfenced supervisor passes ``None`` so discovery behaves exactly as pre-#13974.
+    """
+    return (str(anchor or "")) if fence_active else None
+
+
+def build_supervisor_send_edge_fence(
+    anchor: object, coordinator_route: str
+) -> "Callable[[CallbackOutboxRow], tuple[bool, str]]":
+    """Compose the supervisor's per-row send-edge fence (Redmine #13974).
+
+    One ``send_fence_fn`` that terminally fences BOTH a historical coordinator row
+    (:func:`...workspace_supervisor.make_send_edge_fence`) and a previous-generation review_return row
+    (:func:`...review_return_route.make_review_return_send_edge_fence`) in the same deliver pass, each
+    exempt on the other's rows. The deliver pass marks a fenced row terminally uncertain (zero-send, no
+    retry), so a pre-existing misbound backlog row converges instead of retrying forever.
+    """
+    return compose_send_edge_fences(
+        make_send_edge_fence(anchor, coordinator_route),
+        make_review_return_send_edge_fence(anchor),
+    )
+
+
 __all__ = (
     "coordinator_target_tuple",
     "owning_lane_binding",
     "owning_lane_generation_reader",
     "review_round_send_fence",
+    "review_return_discovery_anchor",
+    "build_supervisor_send_edge_fence",
+    "discover_fenced_review_returns",
+    "REVIEW_RETURN_OWNER_READ_ERROR",
 )
