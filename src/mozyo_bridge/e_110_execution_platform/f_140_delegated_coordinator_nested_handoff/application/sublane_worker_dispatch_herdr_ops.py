@@ -44,6 +44,7 @@ def _generation_binding_detail(
     declared_attestation_current: bool,
     live_generation_current: bool,
     live_present: bool,
+    fresh_live_provider_consistent: bool = True,
 ) -> str:
     """A value-free token naming WHICH generation authority did not bind (Redmine #13846 R4).
 
@@ -52,10 +53,10 @@ def _generation_binding_detail(
     structured outcome (installed acceptance finding j#82030). This returns a token identifying
     the failing sub-authority — a declared-pin identity mismatch, a live locator / runtime
     revision divergence from the declared pin, a startup self-attestation not generation-bound,
-    a slot-less fresh row whose live attestation is not generation-bound, or an unresolvable
-    declared-pin shape (carrying only the pair-resolution reason token). Every token is a
-    vocabulary label; no locator, raw output, or secret is exposed. Empty when the binding is
-    current.
+    a slot-less fresh row whose live provider disagrees (review F1) or whose live attestation is
+    not generation-bound, or an unresolvable declared-pin shape (carrying only the pair-resolution
+    reason token). Every token is a vocabulary label — no locator, provider VALUE, raw output, or
+    secret is exposed. Empty when the binding is current.
     """
     if current:
         return ""
@@ -68,6 +69,10 @@ def _generation_binding_detail(
             return "startup_self_attestation_not_generation_bound_to_declared_pin"
         return "declared_generation_unbound"
     if declared_slots_absent:
+        # Redmine #13846 R4 review F1: distinguish a wrong live provider from an unattested /
+        # stale slot so the operator sees the failing identity axis (a field label, not a value).
+        if not fresh_live_provider_consistent:
+            return "fresh_live_provider_mismatch"
         return "fresh_startup_self_attestation_not_generation_bound"
     return f"declared_slots_unresolved:{declared_reason}"
 
@@ -266,12 +271,30 @@ class HerdrWorkerDispatchOps:
         # (workspace/role/lane) and locator-current; the assigned_name is verified explicitly,
         # exactly as the declared path does. A slot-less row whose live worker is absent,
         # unattested, or stale (a drifted locator) has no such authority and fails closed.
+        #
+        # Redmine #13846 R4 review F1: the slot-less path must ALSO reject a wrong live provider,
+        # exactly as the declared path does through ``binds_same_generation`` (``live_pin.provider``).
+        # The live row surfaces the bound provider two ways — its ``provider`` field and its
+        # detected-agent field (``agent``, which on a live pane holds the provider id). A row whose
+        # surfaced provider / detected agent disagrees with the resolved worker provider is a
+        # foreign / mis-bound process even when the name and locator line up, so it is never this
+        # generation's worker (provider is an identity-authority field). An UNsurfaced field falls
+        # back to the name-encoded provider — the declared path's ``... or norm(provider)`` shape —
+        # never fabricating a match.
+        want_provider = norm(provider)
+        live_row_provider = norm(row.get("provider")) if row is not None else ""
+        live_detected_agent = norm(row.get("agent")) if row is not None else ""
+        fresh_live_provider_consistent = (
+            (not live_row_provider or live_row_provider == want_provider)
+            and (not live_detected_agent or live_detected_agent == want_provider)
+        )
         fresh_attested_generation_current = bool(
             declared_slots_absent
             and row is not None
             and locator
             and joined.ok
             and norm(getattr(attestation, "assigned_name", "")) == norm(assigned_name)
+            and fresh_live_provider_consistent
         )
 
         # The action-time process-generation binding, from whichever authority the
@@ -297,6 +320,7 @@ class HerdrWorkerDispatchOps:
             declared_attestation_current=declared_attestation_current,
             live_generation_current=live_generation_current,
             live_present=bool(locator),
+            fresh_live_provider_consistent=fresh_live_provider_consistent,
         )
         lifecycle_action = norm(
             getattr(lifecycle, "replacement_action_id", "") if lifecycle else ""
