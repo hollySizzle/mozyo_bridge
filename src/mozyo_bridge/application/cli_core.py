@@ -829,6 +829,12 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     )
 
     register_herdr_recovery_surfaces(herdr_sub, add_repo_option=add_repo_option)
+    # Redmine #14065: the read-only composer-render measurement diagnostic (phase 1).
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_composer_render_cli import (  # noqa: E501
+        register_herdr_composer_render_parser,
+    )
+
+    register_herdr_composer_render_parser(herdr_sub)
     herdr_session_start = herdr_sub.add_parser(
         "session-start",
         help=(
