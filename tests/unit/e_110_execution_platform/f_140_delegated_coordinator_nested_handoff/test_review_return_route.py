@@ -30,16 +30,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RETURN_NO_REVIEW_REQUEST,
     RETURN_NOT_LATEST,
     RETURN_NOT_REVIEW_RESULT,
+    RETURN_MISSING_REVIEW_HEAD,
     RETURN_OK,
     RETURN_PREVIOUS_GENERATION,
+    RETURN_REVIEW_HEAD_DRIFT,
     RETURN_SELF_ROUTE,
+    REVIEW_RETURN_FENCE_HEAD_DRIFT,
+    REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED,
     REVIEW_RETURN_FENCE_NO_CORRELATION,
     REVIEW_RETURN_FENCE_PREVIOUS_GENERATION,
     REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR,
     REVIEW_RETURN_ROUTE_PREFIX,
     OwningLaneBinding,
     correlated_review_request_journal,
+    current_review_generation_head,
     decode_review_return_payload,
+    decode_review_return_target_head,
     encode_review_return_payload,
     is_review_return_route,
     latest_review_result_journal,
@@ -54,12 +60,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 ISSUE = "13684"
 
 
-def _review_result(journal: str, *, issue: str = ISSUE, conclusion: str = "approved"):
-    return build_marker(issue, journal, "review_result", review_conclusion=conclusion)
+def _review_result(
+    journal: str, *, issue: str = ISSUE, conclusion: str = "approved", head: str = "", req: str = ""
+):
+    return build_marker(
+        issue, journal, "review_result", review_conclusion=conclusion,
+        target_head=head, review_request_journal=req,
+    )
 
 
-def _review_request(journal: str, *, issue: str = ISSUE):
-    return build_marker(issue, journal, "review_request")
+def _review_request(journal: str, *, issue: str = ISSUE, head: str = ""):
+    return build_marker(issue, journal, "review_request", target_head=head)
 
 
 def _impl_done(journal: str, *, issue: str = ISSUE):
@@ -250,16 +261,18 @@ class GenerationFenceTest(unittest.TestCase):
         self.assertEqual(plan.reason, RETURN_PREVIOUS_GENERATION)
 
     def test_current_generation_review_still_emits(self) -> None:
-        # A review round produced UNDER the current generation (request j110 >= anchor j100) emits.
-        markers = [_review_request("110"), _review_result("120")]
+        # A review round produced UNDER the current generation (request j110 >= anchor j100) emits,
+        # carrying the reviewed head (both request + result marker heads agree; #13974 / j#81454 A).
+        markers = [_review_request("110", head="hEAD1"), _review_result("120", head="hEAD1", req="110")]
         plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
         self.assertTrue(plan.emit)
         self.assertEqual(plan.reason, RETURN_OK)
         self.assertEqual(plan.review_request_journal, "110")
+        self.assertEqual(plan.target_head, "hEAD1")
 
     def test_request_exactly_at_anchor_is_current(self) -> None:
         # Boundary: a request journal equal to the anchor is part of the current generation.
-        markers = [_review_request("100"), _review_result("120")]
+        markers = [_review_request("100", head="hEAD1"), _review_result("120", head="hEAD1")]
         self.assertTrue(
             plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100").emit
         )
@@ -283,6 +296,40 @@ class GenerationFenceTest(unittest.TestCase):
         self.assertEqual(plans[0].reason, RETURN_PREVIOUS_GENERATION)
 
 
+class ReviewHeadFenceTest(unittest.TestCase):
+    """Redmine #13974 / j#81454 A: the review-gate head conjunction at discovery."""
+
+    def test_missing_head_on_result_is_fail_closed(self) -> None:
+        # Current-generation round, but the review_result marker carries no head -> fail-closed.
+        markers = [_review_request("110", head="H1"), _review_result("120", head="", req="110")]
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_MISSING_REVIEW_HEAD)
+
+    def test_missing_head_on_request_is_fail_closed(self) -> None:
+        markers = [_review_request("110", head=""), _review_result("120", head="H1", req="110")]
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_MISSING_REVIEW_HEAD)
+
+    def test_head_drift_between_request_and_result_is_refused(self) -> None:
+        # The result reviewed a DIFFERENT head than the request pinned -> drift -> refused.
+        markers = [_review_request("110", head="H1"), _review_result("120", head="H2", req="110")]
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_REVIEW_HEAD_DRIFT)
+
+    def test_head_fence_skipped_when_unfenced(self) -> None:
+        # An unfenced caller (anchor=None) does not enforce the head dimension (behavior unchanged).
+        markers = [_review_request("110", head=""), _review_result("120", head="", req="110")]
+        self.assertTrue(plan_review_return(markers, ISSUE, "120", _owner()).emit)
+
+    def test_current_review_generation_head_is_latest_request_head(self) -> None:
+        markers = [_review_request("110", head="H1"), _review_request("130", head="H2")]
+        self.assertEqual(current_review_generation_head(markers, ISSUE), "H2")
+        self.assertEqual(current_review_generation_head([], ISSUE), "")
+
+
 class _Row:
     """The minimal outbox-row shape the send-edge fence reads (route + payload)."""
 
@@ -292,40 +339,72 @@ class _Row:
 
 
 class ReviewReturnSendEdgeFenceTest(unittest.TestCase):
-    """Redmine #13974: the terminal send-edge fence for pre-existing review_return backlog rows."""
+    """Redmine #13974 / j#81454 A: terminal send-edge fence (generation + head) for backlog rows."""
 
-    def _row(self, request_journal: str, lane: str = "issue_13684"):
-        return _Row(review_return_callback_route(lane), encode_review_return_payload(request_journal))
+    def _row(self, request_journal: str, head: str = "H1", lane: str = "issue_13684"):
+        return _Row(
+            review_return_callback_route(lane),
+            encode_review_return_payload(request_journal, head),
+        )
 
     def test_previous_generation_row_is_fenced_terminal(self) -> None:
-        fence = make_review_return_send_edge_fence("100")
+        fence = make_review_return_send_edge_fence("100", "H1")
         blocked, reason = fence(self._row("10"))  # round j10 predates anchor j100
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_PREVIOUS_GENERATION)
 
-    def test_current_generation_row_is_exempt(self) -> None:
-        # A current-generation row (round >= anchor) is NOT fenced here — the #13684 send authorities
-        # own its exactly-once delivery. Fencing it would break exactly-once for the live round.
-        fence = make_review_return_send_edge_fence("100")
-        blocked, _ = fence(self._row("110"))
+    def test_current_generation_current_head_row_is_exempt(self) -> None:
+        # Current generation (round >= anchor) AND head matches the current review generation head ->
+        # NOT fenced; the #13684 send authorities own its exactly-once delivery.
+        fence = make_review_return_send_edge_fence("100", "H1")
+        blocked, _ = fence(self._row("110", head="H1"))
         self.assertFalse(blocked)
 
+    def test_current_generation_head_drift_row_is_fenced_terminal(self) -> None:
+        # Current generation round but the recorded head drifted from the current review head -> fenced.
+        fence = make_review_return_send_edge_fence("100", "H2")
+        blocked, reason = fence(self._row("110", head="H1"))
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_HEAD_DRIFT)
+
+    def test_missing_recorded_head_is_fenced_terminal(self) -> None:
+        # A legacy row with no recorded head (pre-#13974 payload) fails closed at the current generation.
+        fence = make_review_return_send_edge_fence("100", "H1")
+        row = _Row(review_return_callback_route("issue_13684"), encode_review_return_payload("110"))
+        blocked, reason = fence(row)
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED)
+
+    def test_unresolvable_current_head_fences_current_generation_row(self) -> None:
+        # A blank current review head (head-less generation) fails a would-be-current row closed.
+        fence = make_review_return_send_edge_fence("100", "")
+        blocked, reason = fence(self._row("110", head="H1"))
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED)
+
     def test_coordinator_row_is_exempt(self) -> None:
-        fence = make_review_return_send_edge_fence("100")
+        fence = make_review_return_send_edge_fence("100", "H1")
         blocked, _ = fence(_Row("coordinator", ""))
         self.assertFalse(blocked)
 
     def test_unresolvable_anchor_fences_every_review_return_row(self) -> None:
-        fence = make_review_return_send_edge_fence(None)
+        fence = make_review_return_send_edge_fence(None, "H1")
         blocked, reason = fence(self._row("110"))  # even a would-be-current row fails closed
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR)
 
     def test_missing_round_correlation_is_fenced(self) -> None:
-        fence = make_review_return_send_edge_fence("100")
+        fence = make_review_return_send_edge_fence("100", "H1")
         blocked, reason = fence(_Row(review_return_callback_route("issue_13684"), payload=""))
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_NO_CORRELATION)
+
+    def test_payload_round_trips_the_head(self) -> None:
+        p = encode_review_return_payload("110", "H1")
+        self.assertEqual(decode_review_return_payload(p), "110")
+        self.assertEqual(decode_review_return_target_head(p), "H1")
+        # legacy head-less payload decodes to a blank head (fail-closed at the fence).
+        self.assertEqual(decode_review_return_target_head(encode_review_return_payload("110")), "")
 
 
 if __name__ == "__main__":

@@ -129,9 +129,12 @@ def discover_review_returns(
                 journal=str(plan.review_journal).strip(),
                 callback_route=plan.callback_route,
                 notification_kind="review_result",
-                # The correlated review_request (action identity) the row is bound to, persisted on
-                # the outbox row so the send authority can re-verify the round at action time (R1-F2).
-                payload=encode_review_return_payload(plan.review_request_journal),
+                # The correlated review_request (action identity) + the reviewed target_head (#13974)
+                # the row is bound to, persisted on the outbox row so the send authority re-verifies the
+                # round AND the head against the current review generation at action time (R1-F2 / j#81454).
+                payload=encode_review_return_payload(
+                    plan.review_request_journal, plan.target_head
+                ),
                 workspace_id=str(workspace_id or "").strip(),
                 target_lane=plan.target_lane,
                 target_receiver=plan.target_receiver,

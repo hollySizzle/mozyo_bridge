@@ -33,11 +33,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OWNER_RESOLVED,
     OWNER_UNKNOWN,
     OwningLaneBinding,
+    current_review_generation_head,
     is_review_return_route,
     make_review_return_send_edge_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalSource,
+    markers_from_source,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     compose_send_edge_fences,
@@ -250,20 +252,38 @@ def review_return_discovery_anchor(fence_active: bool, anchor: object) -> "Optio
     return (str(anchor or "")) if fence_active else None
 
 
+def resolve_current_review_head(source: object, issue: str) -> str:
+    """The CURRENT review generation head for ``issue`` from its structured markers (Redmine #13974).
+
+    The ``target_head`` of the latest ``review_request`` marker (:func:`current_review_generation_head`)
+    — the action-time head authority a reserved ``review_return`` row must still match. Fail-safe: an
+    unreadable source / no head-bearing request marker yields ``""`` (the send-edge head fence then
+    treats every review_return row as head-unconfirmed → terminal, per j#81454 A). Never parses prose.
+    """
+    if source is None:
+        return ""
+    try:
+        markers = markers_from_source(source, str(issue).strip())
+    except Exception:  # noqa: BLE001 - an unreadable source is a fail-closed blank head
+        return ""
+    return current_review_generation_head(markers, str(issue).strip())
+
+
 def build_supervisor_send_edge_fence(
-    anchor: object, coordinator_route: str
+    anchor: object, coordinator_route: str, current_review_head: object = None
 ) -> "Callable[[CallbackOutboxRow], tuple[bool, str]]":
     """Compose the supervisor's per-row send-edge fence (Redmine #13974).
 
     One ``send_fence_fn`` that terminally fences BOTH a historical coordinator row
-    (:func:`...workspace_supervisor.make_send_edge_fence`) and a previous-generation review_return row
-    (:func:`...review_return_route.make_review_return_send_edge_fence`) in the same deliver pass, each
-    exempt on the other's rows. The deliver pass marks a fenced row terminally uncertain (zero-send, no
-    retry), so a pre-existing misbound backlog row converges instead of retrying forever.
+    (:func:`...workspace_supervisor.make_send_edge_fence`) and a previous-generation / head-drifted
+    review_return row (:func:`...review_return_route.make_review_return_send_edge_fence`, conjoining
+    ``current_review_head`` per j#81454 A) in the same deliver pass, each exempt on the other's rows.
+    The deliver pass marks a fenced row terminally uncertain (zero-send, no retry), so a pre-existing
+    misbound backlog row converges instead of retrying forever.
     """
     return compose_send_edge_fences(
         make_send_edge_fence(anchor, coordinator_route),
-        make_review_return_send_edge_fence(anchor),
+        make_review_return_send_edge_fence(anchor, current_review_head),
     )
 
 
@@ -273,6 +293,7 @@ __all__ = (
     "owning_lane_generation_reader",
     "review_round_send_fence",
     "review_return_discovery_anchor",
+    "resolve_current_review_head",
     "build_supervisor_send_edge_fence",
     "discover_fenced_review_returns",
     "REVIEW_RETURN_OWNER_READ_ERROR",

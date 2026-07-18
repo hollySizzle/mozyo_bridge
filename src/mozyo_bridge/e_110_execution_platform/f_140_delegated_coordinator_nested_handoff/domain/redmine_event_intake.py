@@ -180,6 +180,14 @@ class JournalMarker:
     integration_recorded: bool = False
     issue_open: bool = True
     blocker_recorded: bool = False
+    #: Redmine #13974 (additive review-gate contract): the exact full commit head this review gate
+    #: reviewed / requested (``target_head``), and — on a ``review_result`` — the exact
+    #: ``review_request_journal`` it answers. Blank on non-review gates and on legacy markers written
+    #: before the contract. The callback generation fence conjoins them (with lane identity + lifecycle
+    #: generation + the provider-authoritative review_result journal id as source sequence) and fails
+    #: closed when a review row's head / round drifts or is missing — never parsed from prose.
+    target_head: str = ""
+    review_request_journal: str = ""
 
     @property
     def event_id(self) -> str:
@@ -221,6 +229,8 @@ def build_marker(
     integration_recorded: bool = False,
     issue_open: bool = True,
     blocker_recorded: bool = False,
+    target_head: str = "",
+    review_request_journal: str = "",
 ) -> JournalMarker:
     """Validate + normalize a structured marker into a :class:`JournalMarker` (pure).
 
@@ -262,6 +272,8 @@ def build_marker(
         integration_recorded=bool(integration_recorded),
         issue_open=bool(issue_open),
         blocker_recorded=bool(blocker_recorded),
+        target_head=str(target_head or "").strip(),
+        review_request_journal=str(review_request_journal or "").strip(),
     )
 
 

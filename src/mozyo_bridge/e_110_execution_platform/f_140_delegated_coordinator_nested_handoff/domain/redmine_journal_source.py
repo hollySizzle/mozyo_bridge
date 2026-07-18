@@ -180,6 +180,11 @@ def _gate_marker_from_fields(
             integration_recorded=_flag("integrated", False),
             issue_open=_flag("open", True),
             blocker_recorded=_flag("blocker", False),
+            # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``)
+            # and, on a review_result, the answered review_request journal (``req``). Absent on
+            # legacy markers -> blank (the callback fence fails such a review row closed).
+            target_head=(fields.get("head") or "").strip(),
+            review_request_journal=(fields.get("req") or "").strip(),
         )
     except (JournalMarkerError, ValueError):
         # A structured marker carrying an out-of-vocabulary conclusion / callback is skipped
@@ -474,6 +479,8 @@ def render_workflow_event_marker(
     integration_recorded: bool | None = None,
     issue_open: bool | None = None,
     blocker_recorded: bool | None = None,
+    target_head: str | None = None,
+    review_request_journal: str | None = None,
 ) -> str:
     """Render the structured ``[mozyo:workflow-event:...]`` gate marker for a gate journal (pure).
 
@@ -485,6 +492,18 @@ def render_workflow_event_marker(
     gate). ``gate`` must be a gate-bearing kind (:data:`GATE_BEARING_KINDS`); anything else is a
     programming error and raises. The output round-trips through
     :func:`extract_markers_from_note` back to the same :class:`JournalMarker`.
+
+    **Review-gate producer contract (Redmine #13974 / j#81454 A, additive).** A review-gate producer
+    MUST carry the reviewed commit head so the callback generation fence can conjoin the target-head
+    dimension (never parsed from prose): a ``review_request`` marker carries ``target_head`` (the exact
+    full commit head the round pins); a ``review_result`` marker carries ``target_head`` (the head it
+    reviewed) AND ``review_request_journal`` (the request it answers) AND its ``conclusion``.
+    ``source_sequence`` is NOT self-declared — it is the Redmine provider's own ``review_result``
+    journal id (the durable record authority). A head-less marker (a legacy producer) is accepted for
+    back-compat but fails the callback head fence closed, so a review returns to the current lane only
+    when its head still matches the current review generation head. The agent-facing producer
+    instruction co-records with the release rollout (j#81454 migration order); this renderer is the
+    machine contract's authority.
     """
     gate_s = str(gate).strip()
     if gate_s not in GATE_BEARING_KINDS:
@@ -505,6 +524,13 @@ def render_workflow_event_marker(
     ):
         if value is not None:
             fields.append(f"{key}={'1' if value else '0'}")
+    # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``) and, on a
+    # review_result, the answered review_request journal (``req``). A git SHA is hex and a journal id
+    # numeric, so neither collides with the ``:``/``=`` marker grammar. Only emitted when supplied.
+    if target_head is not None:
+        fields.append(f"head={str(target_head).strip()}")
+    if review_request_journal is not None:
+        fields.append(f"req={str(review_request_journal).strip()}")
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
 
 
