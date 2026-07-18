@@ -815,8 +815,12 @@ def _prepare_session_locked(
         )
     if transaction is not None:
         # Record the debt, never discharge it: closing what this run started is the
-        # explicit public rollback rail's authority alone (Answer j#80991).
-        transaction.settle(ok=result.ok, launched=bool(launch_plans))
+        # explicit public rollback rail's authority alone (Answer j#80991). The debt is
+        # scoped to what THIS run freshly launched, not the pair aggregate (Redmine #13933
+        # R13, j#82038): a healthy fresh launch that adopted a non-green sibling owes no
+        # rollback, so the transaction must not strand it at `rollback_owed` — the v1
+        # replacement bind reads that phase and stalled the whole a14 convergence on it.
+        transaction.settle(owed=result.owes_rollback, launched=bool(launch_plans))
     return result
 
 
