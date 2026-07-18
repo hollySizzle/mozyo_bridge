@@ -330,6 +330,13 @@ def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
     return LiveRedmineJournalSource.from_environment(since=since)
 
 
+def _optional_journal_source(args: argparse.Namespace) -> Optional[RedmineJournalSource]:
+    """A Redmine source iff ``--poll`` / ``--redmine-json`` was given, else ``None`` (no raise; #13974 R2)."""
+    if (getattr(args, "redmine_json", None) or "").strip() or getattr(args, "poll", False):
+        return _journal_source(args)
+    return None
+
+
 def _journal_source(args: argparse.Namespace) -> RedmineJournalSource:
     """Resolve the exact-journal source for classification: ``--redmine-json`` or ``--poll``.
 
@@ -534,6 +541,22 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
     if getattr(args, "deliver", False):
         ws = _require_partition_workspace_id(args)  # R3-F3: fail-closed before any claim / send
         sender = _callback_sender(args)  # the real handoff send port (actuates one send per row)
+        source = _optional_journal_source(args)
+        if source is not None:
+            # Redmine #13974 R2: a readable provider lets `--deliver` CONVERGE a previous-generation /
+            # hibernated-owner review_return backlog row to a terminal zero-send (the supervisor's fence),
+            # not merely attempt-and-retry it. Source-less `--deliver` stays the raw drain below.
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_review_return import deliver_workspace_backlog  # noqa: E501
+
+            outcome = deliver_workspace_backlog(outbox, ws, source=source, sender=sender)
+            payload = {"action": "deliver", "fenced_source": True, **outcome.as_payload()}
+            lines = [
+                "action: deliver",
+                f"fenced: {outcome.fenced}",
+                f"delivered: {outcome.delivered}",
+                f"transient_skipped: {outcome.transient_skipped}",
+            ]
+            return _emit(payload, as_json=as_json, text_lines=lines)
         processor = CallbackOutboxProcessor(outbox, _NULL_SOURCE, workspace_id=ws)
         report = processor.deliver(sender, limit=int(getattr(args, "limit", 32) or 32))
         payload = {"action": "deliver", **report.as_payload()}
