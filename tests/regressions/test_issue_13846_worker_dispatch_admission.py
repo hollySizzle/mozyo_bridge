@@ -36,6 +36,7 @@ def _facts(**overrides) -> WorkerDispatchAdmissionFacts:
         slot_state="live",
         locator_present=True,
         receiver_state="awaiting_input",
+        generation_binding_current=True,
         workspace_id="ws",
         lane_id="issue_13846_lane",
         lane_generation=7,
@@ -129,12 +130,34 @@ class AdmissionDecisionTests(unittest.TestCase):
     def test_missing_generation_attestation_or_duplicate_delivery_conflicts(self):
         for changes in (
             {"lifecycle_current": False},
+            {"generation_binding_current": False},
             {"identity_attested": False},
             {"duplicate_or_uncertain_delivery": True},
         ):
             with self.subTest(changes=changes):
                 self.assertEqual(
                     _decision(**changes).decision,
+                    ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+                )
+
+    def test_terminal_absence_with_stale_anchor_or_action_is_conflict(self):
+        base = dict(
+            slot_state="absent",
+            locator_present=False,
+            worker_locator=None,
+            receiver_state="absent",
+            identity_attested=False,
+            terminal_absence_authoritative=True,
+        )
+        for changes in (
+            {"anchor_current": False},
+            {"action_binding_current": False},
+            {"generation_binding_current": False},
+            {"duplicate_or_uncertain_delivery": True},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(
+                    _decision(**base, **changes).decision,
                     ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
                 )
 

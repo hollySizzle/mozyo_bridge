@@ -106,6 +106,7 @@ class WorkerDispatchAdmissionFacts:
     slot_state: str
     locator_present: bool
     receiver_state: str
+    generation_binding_current: bool = False
     terminal_absence_authoritative: bool = False
     duplicate_or_uncertain_delivery: bool = False
     workspace_id: Optional[str] = None
@@ -138,6 +139,24 @@ def decide_worker_dispatch_admission(
     facts: WorkerDispatchAdmissionFacts,
 ) -> WorkerDispatchAdmission:
     """Fail closed over lifecycle, attestation, receiver and delivery causality."""
+    authority_checks = (
+        (facts.lifecycle_current, "lane lifecycle generation is not current"),
+        (facts.anchor_current, "dispatch anchor is not the current lane decision"),
+        (
+            facts.generation_binding_current,
+            "the live or absent worker is not bound to the current declared process generation",
+        ),
+        (facts.action_binding_current, "replacement/action binding is not current"),
+        (
+            not facts.duplicate_or_uncertain_delivery,
+            "an earlier exact dispatch may already have injected this request",
+        ),
+    )
+    for ok, reason in authority_checks:
+        if not ok:
+            return WorkerDispatchAdmission(
+                ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT, reason, facts
+            )
     if facts.terminal_absence_authoritative and not facts.locator_present:
         return WorkerDispatchAdmission(
             ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
@@ -146,19 +165,12 @@ def decide_worker_dispatch_admission(
             facts,
         )
     checks = (
-        (facts.lifecycle_current, "lane lifecycle generation is not current"),
-        (facts.anchor_current, "dispatch anchor is not the current lane decision"),
         (facts.identity_attested, "worker startup identity/generation is not attested"),
-        (facts.action_binding_current, "replacement/action binding is not current"),
         (facts.slot_state == "live", "named worker slot is not positively live"),
         (facts.locator_present, "worker locator is absent"),
         (
             facts.receiver_state in ("awaiting_input", "turn_ended"),
             "worker receiver is not presently dispatch-admissible",
-        ),
-        (
-            not facts.duplicate_or_uncertain_delivery,
-            "an earlier exact dispatch may already have injected this request",
         ),
     )
     for ok, reason in checks:

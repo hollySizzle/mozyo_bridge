@@ -133,6 +133,7 @@ class FakeWorkerDispatchOps:
             "live",
             True,
             "awaiting_input",
+            generation_binding_current=True,
             lane_generation=1,
             worker_assigned_name="mzb1_ws_claude_l1",
             worker_locator=getattr(kwargs["lane"], "worker_pane", None),

@@ -105,8 +105,13 @@ class HerdrWorkerDispatchOps:
             HerdrIdentityAttestationStore,
             evaluate_attestation,
         )
+        from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
         from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
-        from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            LaneLifecycleKey,
+            ProcessGenerationPin,
+            norm,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
             list_herdr_agent_rows,
             repo_scope_workspace_id,
@@ -161,11 +166,67 @@ class HerdrWorkerDispatchOps:
             expected_role=provider,
             expected_lane=lane.lane_id,
         )
-        action_binding_current = bool(
-            lifecycle
-            and attestation
-            and lifecycle.replacement_action_id == attestation.replacement_action_id
+        declared_pair = read_declared_pin_pair(lifecycle) if lifecycle else None
+        worker_pin = declared_pair.worker if declared_pair and declared_pair.ok else None
+        declared_identity_current = bool(
+            worker_pin
+            and norm(worker_pin.provider) == norm(provider)
+            and norm(worker_pin.assigned_name) == norm(assigned_name)
         )
+        declared_attestation_current = False
+        if declared_identity_current and attestation is not None:
+            declared_attestation_current = bool(
+                norm(getattr(attestation, "assigned_name", "")) == norm(assigned_name)
+                and evaluate_attestation(
+                    attestation,
+                    live_locator=worker_pin.locator,
+                    expected_workspace_id=lane.workspace_id,
+                    expected_role=provider,
+                    expected_lane=lane.lane_id,
+                ).ok
+            )
+
+        live_generation_current = False
+        if declared_identity_current and row is not None and locator:
+            try:
+                live_pin = ProcessGenerationPin(
+                    # The slot label is declaration authority; a live row does not expose it.
+                    role=worker_pin.role,
+                    provider=norm(row.get("provider")) or norm(provider),
+                    assigned_name=assigned_name,
+                    locator=locator,
+                    runtime_revision=norm(row.get("runtime_revision")),
+                )
+            except (TypeError, ValueError):
+                live_generation_current = False
+            else:
+                live_generation_current = live_pin.match_key == worker_pin.match_key
+
+        # A live receiver must match the declaration's full process-generation pin.
+        # For an absent receiver, the stored self-attestation must match that pin; this
+        # proves which declared generation is absent without fabricating live presence.
+        generation_binding_current = (
+            (live_generation_current and declared_attestation_current)
+            if locator else declared_attestation_current
+        )
+        lifecycle_action = norm(
+            getattr(lifecycle, "replacement_action_id", "") if lifecycle else ""
+        )
+        attestation_action = norm(
+            getattr(attestation, "replacement_action_id", "")
+            if attestation is not None
+            else ""
+        )
+        if lifecycle_action or attestation_action:
+            action_binding_current = bool(
+                declared_attestation_current
+                and lifecycle_action
+                and lifecycle_action == attestation_action
+            )
+        else:
+            # A normal launch has no replacement transaction. Its exact declared process
+            # pin is generation-bound authority; empty strings alone are not authority.
+            action_binding_current = generation_binding_current
         duplicate = any(
             record.journal_id == (request.journal or "").strip()
             and (record.receiver == provider or record.provider == provider)
@@ -173,12 +234,13 @@ class HerdrWorkerDispatchOps:
             for record in HerdrDeliveryLedger().records_for_issue(request.issue)
         )
         terminal_absence = bool(
-            (len(matches) == 0 and lifecycle_current)
+            (len(matches) == 0 and lifecycle_current and declared_identity_current)
             or (
                 len(matches) == 1
                 and slot_state == SLOT_STALE
                 and not locator
                 and lifecycle_current
+                and declared_identity_current
             )
         )
         facts = WorkerDispatchAdmissionFacts(
@@ -189,6 +251,7 @@ class HerdrWorkerDispatchOps:
             slot_state=(slot_state if len(matches) == 1 else "ambiguous"),
             locator_present=bool(locator),
             receiver_state=receiver_state,
+            generation_binding_current=generation_binding_current,
             terminal_absence_authoritative=terminal_absence,
             duplicate_or_uncertain_delivery=duplicate,
             workspace_id=scope or None,
@@ -197,11 +260,11 @@ class HerdrWorkerDispatchOps:
             worker_assigned_name=assigned_name,
             worker_locator=locator or None,
             action_id=(
-                lifecycle.replacement_action_id
-                if lifecycle and lifecycle.replacement_action_id
+                lifecycle_action
+                if lifecycle_action
                 else (
                     f"lane_generation_{lifecycle.lane_generation}"
-                    if lifecycle
+                    if lifecycle and generation_binding_current
                     else None
                 )
             ),

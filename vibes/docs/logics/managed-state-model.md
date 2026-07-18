@@ -832,14 +832,18 @@ pin_pair_fail_closed:
 
 `sublane dispatch-worker` は assigned name / locator / `stale_named_slot` の単独観測を送信権限にしない。送信直前に
 current lifecycle generation・current Redmine decision anchor・startup self-attestation の identity/locator generation・
-receiver runtime state・replacement action binding・同一 issue/journal/receiver の既送達/不確実 delivery を一つの
+current lifecycle の exact declared worker process pin・receiver runtime state・replacement action binding・同一
+issue/journal/receiver の既送達/不確実 delivery を一つの
 observation に join し、次の typed decision を返す。
 
 - `healthy`: 全 authority が一致し receiver が dispatch-admissible。送信直前の再観測も byte-equivalent な場合だけ 1 回 inject。
-- `stale_worker_recovery_required`: current lifecycle に対して exact slot の terminal absence が positive に証明された場合だけ。
+- `stale_worker_recovery_required`: current lifecycle / decision anchor / declared worker generation / action authority が
+  すべて current で、その generation の exact slot の terminal absence が positive に証明された場合だけ。
   close/relaunch はせず、owner-governed #13806 recovery へ route する。
-- `worker_liveness_authority_conflict`: locator-bearing stale token、duplicate row、missing/foreign attestation、generation/action
-  drift、busy/unknown receiver、既送達または送達不確実を含む。それらはすべて zero-send / zero-close / no auto retry。
+- `worker_liveness_authority_conflict`: locator-bearing stale token、duplicate row、missing/ambiguous declared pin、declared
+  locator/provider/name/runtime-revision drift、missing/foreign attestation、generation/action drift、busy/unknown receiver、
+  既送達または送達不確実を含む。それらはすべて zero-send / zero-close / no auto retry。replacement action id が空の
+  normal launch は、exact declared process pin が一致する場合だけ lane generation binding を authority として使う。
 
 queue-enter / transport ACK と worker uptake は別の causal fact である。`worker_dispatched=true` は admission=`healthy`、
 transport=`sent/ok`、かつ exact delivery に結び付く event-driven turn-start=`started` の連言だけで記録する。ACK 後に

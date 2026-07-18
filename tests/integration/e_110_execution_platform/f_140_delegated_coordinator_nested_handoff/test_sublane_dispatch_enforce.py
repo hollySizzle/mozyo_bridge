@@ -47,6 +47,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    ADMISSION_HEALTHY,
+    TURN_START_STARTED,
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
     WorkerDispatchRequest,
     render_worker_dispatch_journal,
 )
@@ -344,9 +348,41 @@ class FakeWorkerDispatchOps:
         # tests; report ready immediately so the bounded wait resolves in one probe.
         return True
 
+    def observe_worker_dispatch_admission(self, **kwargs):
+        return WorkerDispatchAdmission(
+            ADMISSION_HEALTHY,
+            "fixture authority is current",
+            WorkerDispatchAdmissionFacts(
+                lifecycle_current=True,
+                anchor_current=True,
+                identity_attested=True,
+                action_binding_current=True,
+                slot_state="live",
+                locator_present=True,
+                receiver_state="awaiting_input",
+                generation_binding_current=True,
+                workspace_id="ws",
+                lane_id="l1",
+                lane_generation=1,
+                worker_assigned_name="mzb1_ws_claude_l1",
+                worker_locator="%291",
+                action_id="lane_generation_1",
+            ),
+        )
+
+    def reserve_worker_dispatch(self, **kwargs):
+        return True, "reserved"
+
     def dispatch_to_worker(self, **kwargs):
         self.calls.append("dispatch")
         return 0
+
+    def dispatch_to_worker_turn_start(self, **kwargs):
+        kwargs.pop("worker_assigned_name", None)
+        return self.dispatch_to_worker(**kwargs), TURN_START_STARTED
+
+    def complete_worker_dispatch(self, **kwargs):
+        return True
 
 
 def _worker_req(**kw):
