@@ -501,9 +501,12 @@ def render_workflow_event_marker(
     ``source_sequence`` is NOT self-declared — it is the Redmine provider's own ``review_result``
     journal id (the durable record authority). A head-less marker (a legacy producer) is accepted for
     back-compat but fails the callback head fence closed, so a review returns to the current lane only
-    when its head still matches the current review generation head. The agent-facing producer
-    instruction co-records with the release rollout (j#81454 migration order); this renderer is the
-    machine contract's authority.
+    when its head still matches the current review generation head. The canonical production writer is
+    ``mozyo-bridge workflow callbacks --emit-gate`` (:func:`...callback_gate_record.emit_gate_record` ->
+    :func:`render_gate_note`), which fail-closed-refuses a review gate lacking a full ``target_head``
+    (and, on a ``review_result``, the answered ``review_request`` journal). This renderer is the machine
+    contract's authority; the agent-facing producer rule lives in the governed preset's
+    ``### Review Generation Marker Contract v2``.
     """
     gate_s = str(gate).strip()
     if gate_s not in GATE_BEARING_KINDS:

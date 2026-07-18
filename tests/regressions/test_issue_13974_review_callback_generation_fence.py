@@ -70,16 +70,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RoleProviderBinding,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+    RETURN_MALFORMED_REVIEW_HEAD,
     RETURN_MISSING_REVIEW_HEAD,
     RETURN_PREVIOUS_GENERATION,
     RETURN_REVIEW_HEAD_DRIFT,
+    RETURN_REVIEW_REQUEST_UNCONFIRMED,
     is_review_return_route,
-    make_review_return_send_edge_fence,
     review_return_callback_route,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
-    compose_send_edge_fences,
-    make_send_edge_fence,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
@@ -92,10 +89,11 @@ LANE = "issue_13974"
 #: The current generation's dispatch anchor: the OLD round (j10/j20) precedes it; a current round
 #: (j110/j120) follows it. Redmine journal ids are monotonic, so a numeric compare is chronological.
 ANCHOR = "100"
-#: The exact commit heads (#13974 / j#81454 A): the current generation reviewed CUR_HEAD, the old one
-#: OLD_HEAD. A git SHA is hex, safe inside the marker grammar.
-CUR_HEAD = "cur00head"
-OLD_HEAD = "old00head"
+#: The exact FULL commit heads (#13974 / j#81454 A + j#81487 F1): the current generation reviewed
+#: CUR_HEAD, the old one OLD_HEAD. Full heads are 40 (or 64) lowercase hex; the v2 fence rejects any
+#: non-full head, so fixtures must use well-formed SHAs.
+CUR_HEAD = "c" * 40
+OLD_HEAD = "d" * 40
 
 
 def _journals(*entries):
@@ -181,13 +179,6 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
             now_fn=lambda: NOW, round_fence_fn=fence,
         )
 
-    def _composed_fence(self, anchor, current_review_head=CUR_HEAD):
-        """The exact send-edge fence the production supervisor composes for a fenced pass (#13974)."""
-        return compose_send_edge_fences(
-            make_send_edge_fence(anchor, "coordinator"),
-            make_review_return_send_edge_fence(anchor, current_review_head),
-        )
-
     # -- discovery-edge fence --------------------------------------------
 
     def test_previous_generation_review_is_refused_at_discovery(self) -> None:
@@ -219,86 +210,22 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertTrue(any(p.reason == RETURN_PREVIOUS_GENERATION for p in plans))
 
-    def test_current_generation_round_still_delivers_exactly_once(self) -> None:
-        # Exactly-once for the CURRENT generation (requirement 4): a round produced under the current
-        # generation (request j110 >= anchor j100) emits and delivers once, unaffected by the fence.
+    def test_without_the_anchor_the_misbound_row_stays_pending_witness(self) -> None:
+        # Adversarial witness (direct, intentionally UNFENCED): without the composed fence the misbound
+        # row is NOT terminal — the send-time refusal path leaves it pending/retryable (the
+        # backlog-growth symptom). Proves the fence is load-bearing; the fenced matrix runs through the
+        # supervisor below.
         self._declare_owner()
-        source = _current_round_source()
-        candidates, _ = discover_review_returns(
-            source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal=ANCHOR
-        )
-        self.assertEqual(len(candidates), 1)
-        transport = _CapturingTransport()
-        proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
-        run_once(
-            proc, self._sender(transport, fence_source=source), candidates=candidates, now=NOW,
-            send_fence_fn=self._composed_fence(ANCHOR),
-        )
-        self.assertEqual([t[1].lane for t in transport.calls], [LANE])
-        self.assertEqual(len(self.outbox.read(states=[CALLBACK_DELIVERED])), 1)
-
-    # -- send-edge terminal fence (pre-existing misbound rows) -----------
-
-    def _ingest_misbound_row(self):
-        """Enqueue the misbound OLD-round return row exactly as the pre-#13974 supervisor would have."""
         source = _old_round_source()
         candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
-        self.assertEqual(len(candidates), 1)  # unfenced discovery produced the misbound row
         proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
         proc.ingest(candidates, now=NOW)
-        self.assertTrue(self.outbox.read(states=[CALLBACK_PENDING]))
-        return source
-
-    def test_preexisting_misbound_row_reaches_terminal_not_retryable(self) -> None:
-        self._declare_owner()
-        source = self._ingest_misbound_row()
         transport = _CapturingTransport()
-        proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
-        run_once(
-            proc, self._sender(transport, fence_source=source), now=NOW,
-            send_fence_fn=self._composed_fence(ANCHOR),
-        )
-        # Zero-send, terminal (uncertain), and NOT left pending/retryable.
-        self.assertEqual(transport.calls, [])
-        self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
-        self.assertEqual(self.outbox.read(states=[CALLBACK_PENDING]), ())
-        self.assertTrue(self.outbox.read(states=[CALLBACK_UNCERTAIN]))
-
-    def test_without_the_send_fence_the_misbound_row_stays_pending(self) -> None:
-        # Adversarial witness: WITHOUT the composed fence, the misbound row is NOT terminal — the
-        # send-time refusal path leaves it pending/retryable (the backlog-growth symptom).
-        self._declare_owner()
-        source = self._ingest_misbound_row()
-        transport = _CapturingTransport()
-        proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
-        # No send_fence_fn; but a NEWER request lands so the sender's round fence still zero-sends.
+        # No send_fence_fn; a NEWER request lands so the sender's round fence still zero-sends.
         run_once(proc, self._sender(transport, fence_source=_old_round_source(("30", _req()))), now=NOW)
         self.assertEqual(transport.calls, [])
-        # The row is NOT terminal — it remains pending (retryable), proving the send fence is needed.
         self.assertTrue(self.outbox.read(states=[CALLBACK_PENDING]))
         self.assertEqual(self.outbox.read(states=[CALLBACK_UNCERTAIN]), ())
-
-    def test_terminally_fenced_row_is_not_resurrected_on_restart(self) -> None:
-        # Restart / backlog-replay: after the row is terminally fenced, a second fenced pass never
-        # resurrects it to pending nor re-delivers it.
-        self._declare_owner()
-        source = self._ingest_misbound_row()
-        proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
-        run_once(proc, self._sender(_CapturingTransport(), fence_source=source), now=NOW,
-                 send_fence_fn=self._composed_fence(ANCHOR))
-        self.assertTrue(self.outbox.read(states=[CALLBACK_UNCERTAIN]))
-        # Second pass (restart): re-discover (fenced -> 0 new) + re-deliver.
-        candidates, _ = discover_review_returns(
-            source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal=ANCHOR
-        )
-        self.assertEqual(candidates, [])
-        transport2 = _CapturingTransport()
-        proc2 = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
-        run_once(proc2, self._sender(transport2, fence_source=source), candidates=candidates, now=NOW,
-                 send_fence_fn=self._composed_fence(ANCHOR))
-        self.assertEqual(transport2.calls, [])
-        self.assertEqual(self.outbox.read(states=[CALLBACK_PENDING]), ())
-        self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
 
     # -- full supervisor fan-out with the anchor + head fence wired ------
 
@@ -351,6 +278,22 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         also spawn separate coordinator-route callbacks; those are out of scope for these assertions)."""
         return [r for r in self.outbox.read(states=states) if is_review_return_route(r.callback_route)]
 
+    def _own_and_lease(self, wsid, journal="100"):
+        """Declare the issue owner under ``wsid`` and hold the workspace lease (supervisor prereqs)."""
+        self.life.declare_active(
+            LaneLifecycleKey(wsid, LANE),
+            decision=DecisionPointer("redmine", ISSUE, journal), issue_id=ISSUE, now=NOW,
+        )
+        self.lease.acquire(wsid, "superF", now=NOW, ttl_seconds=600)
+
+    def _enqueue_via_unfenced_discovery(self, source, wsid):
+        """Enqueue a review_return row exactly as a pre-#13974 (unfenced) supervisor pass would have,
+        so the terminal cases exercise a row that ALREADY exists when the fenced supervisor runs."""
+        owner = owning_lane_binding(wsid, ISSUE, RoleProviderBinding.default(), lifecycle_store=self.life)
+        candidates, _ = discover_review_returns(source, ISSUE, owner, workspace_id=wsid)
+        CallbackOutboxProcessor(self.outbox, source, workspace_id=wsid).ingest(candidates, now=NOW)
+        return candidates
+
     def test_full_supervisor_fences_the_previous_generation_return(self) -> None:
         wsid = self._register_ws()
         self.life.declare_active(
@@ -371,24 +314,35 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
 
     # -- F2 required adversarial matrix (through the same production composition) ---
 
+    def test_matrix_current_approval_delivers_exactly_once(self) -> None:
+        # Required matrix: a CURRENT-generation approval delivers exactly once through the full fenced
+        # supervisor; a second pass is idempotent (no second send).
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        self.assertEqual([t[1].lane for t in transport.calls], [LANE])
+        self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        supervisor.run_once()
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
+
     def test_matrix_current_changes_requested_delivers_exactly_once(self) -> None:
         # Required matrix: a CURRENT-generation changes_requested (not just approval) is a valid review
         # outcome and must deliver exactly once through the full fenced supervisor.
         wsid = self._register_ws()
-        self.life.declare_active(
-            LaneLifecycleKey(wsid, LANE),
-            decision=DecisionPointer("redmine", ISSUE, "100"), issue_id=ISSUE, now=NOW,
-        )
-        self.lease.acquire(wsid, "superF", now=NOW, ttl_seconds=600)
+        self._own_and_lease(wsid)
         transport = _CapturingTransport()
         source = _current_round_source(conclusion="changes_requested")
         supervisor = self._build_supervisor(wsid=wsid, source=source, transport=transport, anchor=ANCHOR)
         supervisor.run_once()
-        # enqueue 1 -> send 1 -> delivered 1 review_return row to the owning lane, none left pending.
         self.assertEqual([t[1].lane for t in transport.calls], [LANE])
         self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
         self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
-        # A second pass re-discovers the same review_result: idempotent, no second send.
         supervisor.run_once()
         self.assertEqual(len(transport.calls), 1)
         self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
@@ -397,11 +351,7 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         # Required matrix: a current-generation round whose review markers carry NO head (a legacy /
         # head-less producer) is head-unconfirmable -> refused at discovery (0-enqueue), never sent.
         wsid = self._register_ws()
-        self.life.declare_active(
-            LaneLifecycleKey(wsid, LANE),
-            decision=DecisionPointer("redmine", ISSUE, "100"), issue_id=ISSUE, now=NOW,
-        )
-        self.lease.acquire(wsid, "superF", now=NOW, ttl_seconds=600)
+        self._own_and_lease(wsid)
         transport = _CapturingTransport()
         headless = _current_round_source(head=None)  # req/result markers carry no head
         supervisor = self._build_supervisor(wsid=wsid, source=headless, transport=transport, anchor=ANCHOR)
@@ -411,43 +361,96 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
         self.assertIn(RETURN_MISSING_REVIEW_HEAD, self._refusals(report))
 
-    def test_matrix_head_drift_row_is_refused(self) -> None:
-        # Required matrix (head witness): the result reviewed a DIFFERENT head than its request pinned
-        # -> drift -> refused at discovery, never returned to the current lane.
-        self._declare_owner()
-        drift = MappingRedmineJournalSource(
-            payload=_journals(("110", _req(CUR_HEAD)), ("120", _res(head="otherhead", req="110")))
-        )
-        candidates, plans = discover_review_returns(
-            drift, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal=ANCHOR
-        )
-        self.assertEqual(candidates, [])
-        self.assertTrue(any(p.reason == RETURN_REVIEW_HEAD_DRIFT for p in plans))
-
-    def test_matrix_preexisting_current_row_with_drifted_head_is_terminal(self) -> None:
-        # A row enqueued for a head that has since been superseded (the current review generation moved
-        # to a new head) must reach a terminal disposition at the send edge, not retry.
-        self._declare_owner()
-        # Enqueue a current-generation row recording OLD_HEAD via unfenced discovery of a head-bearing
-        # round whose request is >= anchor.
-        stale_head_source = MappingRedmineJournalSource(
-            payload=_journals(("110", _req(OLD_HEAD)), ("120", _res(head=OLD_HEAD, req="110")))
-        )
-        candidates, _ = discover_review_returns(
-            stale_head_source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal=ANCHOR
-        )
-        self.assertEqual(len(candidates), 1)  # emitted while OLD_HEAD was current
-        proc = CallbackOutboxProcessor(self.outbox, stale_head_source, workspace_id=WS)
-        proc.ingest(candidates, now=NOW)
-        # The current review generation head has since advanced to CUR_HEAD; the pending row drifted.
+    def test_matrix_missing_declared_req_is_terminal_zero_send(self) -> None:
+        # Required matrix (F1 witness): a review_result marker that declares no `req` is refused at
+        # discovery through the supervisor (0-enqueue / 0-send).
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
         transport = _CapturingTransport()
-        run_once(
-            proc, self._sender(transport, fence_source=stale_head_source), now=NOW,
-            send_fence_fn=self._composed_fence(ANCHOR, current_review_head=CUR_HEAD),
+        no_req = MappingRedmineJournalSource(
+            payload=_journals(("110", _req(CUR_HEAD)), ("120", _res(head=CUR_HEAD, req=None)))
         )
+        supervisor = self._build_supervisor(wsid=wsid, source=no_req, transport=transport, anchor=ANCHOR)
+        report = supervisor.run_once()
         self.assertEqual(transport.calls, [])
-        self.assertEqual(self.outbox.read(states=[CALLBACK_PENDING]), ())
-        self.assertTrue(self.outbox.read(states=[CALLBACK_UNCERTAIN]))
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_REVIEW_REQUEST_UNCONFIRMED, self._refusals(report))
+
+    def test_matrix_malformed_head_is_terminal_zero_send(self) -> None:
+        # Required matrix (F1 witness): a matching but NON-full-hex head is malformed -> refused at
+        # discovery through the supervisor.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        transport = _CapturingTransport()
+        bad = MappingRedmineJournalSource(
+            payload=_journals(("110", _req("deadbeef")), ("120", _res(head="deadbeef", req="110")))
+        )
+        supervisor = self._build_supervisor(wsid=wsid, source=bad, transport=transport, anchor=ANCHOR)
+        report = supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_MALFORMED_REVIEW_HEAD, self._refusals(report))
+
+    def test_matrix_head_drift_is_refused(self) -> None:
+        # Required matrix (head witness): the result reviewed a DIFFERENT head than its request pinned
+        # -> drift -> refused at discovery through the supervisor, never returned to the current lane.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        transport = _CapturingTransport()
+        drift = MappingRedmineJournalSource(
+            payload=_journals(("110", _req(CUR_HEAD)), ("120", _res(head=OLD_HEAD, req="110")))
+        )
+        supervisor = self._build_supervisor(wsid=wsid, source=drift, transport=transport, anchor=ANCHOR)
+        report = supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_REVIEW_HEAD_DRIFT, self._refusals(report))
+
+    def test_matrix_preexisting_misbound_row_terminal_and_restart(self) -> None:
+        # Required matrix: a PRE-EXISTING misbound (old-round) pending row reaches a terminal
+        # disposition through the fenced supervisor and is not resurrected on restart / backlog replay.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(_old_round_source(), wsid)
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))  # a real pre-existing row
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_old_round_source(), transport=transport, anchor=ANCHOR,
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+        # Restart / backlog replay: a second supervisor pass never resurrects it to pending / delivered.
+        supervisor.run_once()
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+
+    def test_matrix_preexisting_drifted_head_row_terminal_via_supervisor(self) -> None:
+        # Required matrix: a current-generation row enqueued for OLD_HEAD, then the review generation
+        # head advances (a newer review_request pins CUR_HEAD). The fenced supervisor terminally fences
+        # the drifted pending row at the send edge.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_unfenced_discovery(
+            MappingRedmineJournalSource(
+                payload=_journals(("110", _req(OLD_HEAD)), ("120", _res(head=OLD_HEAD, req="110")))
+            ),
+            wsid,
+        )
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))  # enqueued while OLD_HEAD was current
+        # The current review generation head advanced to CUR_HEAD via a newer review_request (j130).
+        advanced = MappingRedmineJournalSource(
+            payload=_journals(
+                ("110", _req(OLD_HEAD)), ("120", _res(head=OLD_HEAD, req="110")), ("130", _req(CUR_HEAD))
+            )
+        )
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(wsid=wsid, source=advanced, transport=transport, anchor=ANCHOR)
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
 
     def test_matrix_hibernate_resume_previous_generation_fenced(self) -> None:
         # Required matrix: after a lane hibernates and resumes, the dispatch anchor advances to the
@@ -511,6 +514,71 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])
         self.assertEqual(self.outbox.read(states=[CALLBACK_DELIVERED]), ())
         self.assertEqual(self.outbox.read(states=[CALLBACK_PENDING]), ())
+
+    # -- F2 producer->consumer vertical slice (canonical writer emits v2) -----
+
+    def test_producer_e2e_current_row_delivers_exactly_once(self) -> None:
+        # j#81487 F2: the CANONICAL producer (emit_gate_record, the --emit-gate writer) emits v2 marker
+        # fields, so a fresh structured review round flows producer -> Redmine journal -> supervisor and
+        # delivers the current review_return exactly once (the vertical slice is closed at the writer).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
+            emit_gate_record,
+        )
+
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        writer = _CapturingNoteTransport()
+        r1 = emit_gate_record(ISSUE, "review_request", transport=writer, marker_fields={"target_head": CUR_HEAD})
+        r2 = emit_gate_record(
+            ISSUE, "review_result", transport=writer,
+            marker_fields={"conclusion": "approved", "target_head": CUR_HEAD, "review_request_journal": "110"},
+        )
+        self.assertTrue(r1.recorded and r2.recorded)
+        # Redmine assigns the journal ids; assemble the exact source the supervisor re-reads.
+        source = MappingRedmineJournalSource(payload={"issue": {"id": ISSUE}, "journals": [
+            {"id": "110", "notes": writer.notes[0]},
+            {"id": "120", "notes": writer.notes[1]},
+        ]})
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(wsid=wsid, source=source, transport=transport, anchor=ANCHOR)
+        supervisor.run_once()
+        self.assertEqual([t[1].lane for t in transport.calls], [LANE])
+        self.assertEqual(len(self._return_rows([CALLBACK_DELIVERED])), 1)
+        supervisor.run_once()  # idempotent
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_producer_cli_fail_closed_validation(self) -> None:
+        # j#81487 F2: the canonical --emit-gate writer refuses to emit a head-less / malformed / req-less
+        # review marker rather than write one the callback fence would reject.
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callbacks import (
+            _review_gate_marker_fields,
+        )
+
+        def _fields(gate, **kw):
+            ns = argparse.Namespace(target_head=kw.get("head"), review_request_journal=kw.get("req"))
+            return _review_gate_marker_fields(ns, gate)
+
+        self.assertEqual(_fields("review_request")[1], "review_marker_missing_target_head")
+        self.assertEqual(_fields("review_request", head="deadbeef")[1], "review_marker_malformed_target_head")
+        self.assertEqual(_fields("review_result", head=CUR_HEAD)[1], "review_marker_missing_review_request_journal")
+        fields, refusal = _fields("review_result", head=CUR_HEAD, req="110")
+        self.assertIsNone(refusal)
+        self.assertEqual(fields, {"target_head": CUR_HEAD, "review_request_journal": "110"})
+        # A non-review gate carries no v2 fields (unchanged).
+        self.assertEqual(_fields("implementation_done"), ({}, None))
+
+
+class _CapturingNoteTransport:
+    """A fake :class:`NoteWriteTransport` that records every posted note (F2 producer E2E)."""
+
+    def __init__(self) -> None:
+        self.notes: list = []
+
+    def post_issue_note(self, issue_id: str, notes: str) -> str:
+        self.notes.append(notes)
+        return f"redmine:issue={issue_id}"
 
 
 if __name__ == "__main__":

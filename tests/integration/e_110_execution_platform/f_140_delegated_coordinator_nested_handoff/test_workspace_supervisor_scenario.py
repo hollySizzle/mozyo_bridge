@@ -156,7 +156,7 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(
             ["workflow", "callbacks", "--emit-gate", "--issue", "13683",
-             "--gate", "review_request", "--json"]
+             "--gate", "review_request", "--target-head", "a" * 40, "--json"]
         )
         # Force the credential-gated transport to a recording fake so the gate RECORDS; stub the
         # activation to a no-op so this test observes the enqueue deterministically (the activation
@@ -266,7 +266,7 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(
             ["workflow", "callbacks", "--emit-gate", "--issue", "13683",
-             "--gate", "review_request", "--json"]
+             "--gate", "review_request", "--target-head", "a" * 40, "--json"]
         )
         # gate emit -> records the gate -> enqueues the wake -> ACTIVATES the supervisor (the seam
         # is patched to run in-process; the test does not call run_once).

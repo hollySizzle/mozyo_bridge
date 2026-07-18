@@ -263,6 +263,42 @@ def _review_approval_refusal(args: argparse.Namespace, issue: str, gate: str):
         return "review_generation_observation_unreadable"
 
 
+#: The review gates that MUST carry Review Generation Marker Contract v2 marker fields (#13974 j#81487
+#: F2): the canonical producer refuses to write one head-less / req-less rather than emitting a marker
+#: the callback generation fence would fail closed.
+_REVIEW_REQUEST_GATE = "review_request"
+_REVIEW_RESULT_GATE = "review_result"
+
+
+def _review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dict, Optional[str]]":
+    """Build + fail-closed-validate the v2 marker fields for a review gate (#13974 j#81487 F2).
+
+    Returns ``(marker_fields, refusal)``. For a ``review_request`` gate ``--target-head`` is required
+    and must be a full commit head; for a ``review_result`` gate ``--target-head`` (full head) AND
+    ``--review-request-journal`` are required. A missing / malformed input yields a fixed refusal token
+    (nothing is written — the producer never emits a marker the fence would reject). A non-review gate
+    carries no v2 fields (``({}, None)``).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
+        is_full_commit_head,
+    )
+
+    if gate not in (_REVIEW_REQUEST_GATE, _REVIEW_RESULT_GATE):
+        return {}, None
+    head = (getattr(args, "target_head", None) or "").strip()
+    if not head:
+        return {}, "review_marker_missing_target_head"
+    if not is_full_commit_head(head):
+        return {}, "review_marker_malformed_target_head"
+    fields: dict = {"target_head": head}
+    if gate == _REVIEW_RESULT_GATE:
+        req = (getattr(args, "review_request_journal", None) or "").strip()
+        if not req:
+            return {}, "review_marker_missing_review_request_journal"
+        fields["review_request_journal"] = req
+    return fields, None
+
+
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
     """Build the live poll source from daemon-trusted credentials (patchable test seam)."""
     since = (getattr(args, "since", None) or "").strip() or None
@@ -509,6 +545,13 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         # consumer or a stale approval (a snapshot predating a newer unresolved blocking finding —
         # the #13586 case). Refusal fails closed: nothing is written, exit non-zero.
         refusal = _review_approval_refusal(args, issue, gate)
+        # #13974 j#81487 F2: a review_request / review_result gate MUST carry the v2 marker fields
+        # (exact full target_head; review_result also its answered review_request journal). The
+        # canonical producer refuses to write a head-less / req-less / malformed review marker rather
+        # than emit one the callback generation fence would fail closed — the producer→consumer slice
+        # is closed at the writer, not left to an optional renderer parameter.
+        marker_fields, marker_refusal = _review_gate_marker_fields(args, gate)
+        refusal = refusal or marker_refusal
         if refusal is not None:
             payload = {"action": "emit-gate", "issue": issue, "gate": gate,
                        "recorded": False, "reason": refusal}
@@ -521,7 +564,8 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         # write_optin_unset (nothing written, fail-closed — never a silent success).
         transport = redmine_delivery_transport_from_env()
         receipt = emit_gate_record(
-            issue, gate, body=(getattr(args, "body", None) or ""), transport=transport
+            issue, gate, body=(getattr(args, "body", None) or ""), transport=transport,
+            marker_fields=marker_fields,
         )
         payload = {"action": "emit-gate", "issue": issue, "gate": gate, **receipt.as_payload()}
         lines = [
@@ -851,6 +895,16 @@ def register_callbacks(sub) -> None:
              "non-approval decision (changes_requested / finding / progress) is unfenced.",
     )
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
+    p.add_argument(
+        "--target-head", dest="target_head",
+        help="Review Generation Marker Contract v2 (#13974): the exact full commit head this review "
+             "gate reviews/requests. Required + full-hex for --emit-gate review_request / review_result.",
+    )
+    p.add_argument(
+        "--review-request-journal", dest="review_request_journal",
+        help="Review Generation Marker Contract v2 (#13974): the review_request journal a review_result "
+             "answers. Required for --emit-gate review_result.",
+    )
     p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")
     p.add_argument(
         "--wake-interval", dest="wake_interval", type=float, default=0.0,

@@ -105,6 +105,15 @@ RETURN_MISSING_REVIEW_HEAD = "missing_review_head"
 #: #13974): ``result.target_head != request.target_head``. The pushed head drifted under the round, so
 #: the review outcome is against a stale head and is never returned.
 RETURN_REVIEW_HEAD_DRIFT = "review_head_drift"
+#: The review_result marker did not DECLARE the review_request it answers, or its declared ``req``
+#: does not exact-match the provider-correlated review_request (Redmine #13974 / j#81487 F1). The v2
+#: contract makes the marker's own ``review_request_journal`` the action identity; a missing or drifted
+#: declared req is fail-closed — the round correlation is never silently re-derived as a substitute.
+RETURN_REVIEW_REQUEST_UNCONFIRMED = "review_request_unconfirmed"
+#: A review-gate ``target_head`` is not a well-formed full commit head (Redmine #13974 / j#81487 F1):
+#: not exactly 40 (SHA-1) or 64 (SHA-256) lowercase hex chars. A truncated / abbreviated / non-hex head
+#: cannot be exact-matched against the durable review generation, so it is fail-closed.
+RETURN_MALFORMED_REVIEW_HEAD = "malformed_review_head"
 
 #: The refusal reasons — every one is a fail-closed no-return (never a guessed / self / stale /
 #: uncorrelated / previous-generation / head-unconfirmed send).
@@ -121,6 +130,8 @@ RETURN_REFUSAL_REASONS = frozenset(
         RETURN_PREVIOUS_GENERATION,
         RETURN_MISSING_REVIEW_HEAD,
         RETURN_REVIEW_HEAD_DRIFT,
+        RETURN_REVIEW_REQUEST_UNCONFIRMED,
+        RETURN_MALFORMED_REVIEW_HEAD,
     }
 )
 
@@ -333,6 +344,43 @@ def latest_review_result_journal(markers: Iterable[JournalMarker], issue: str) -
             best_id = jid
             best_journal = str(mk.journal).strip()
     return best_journal
+
+
+#: The exact lengths of a full git commit head: SHA-1 (40) or SHA-256 (64) hex characters.
+_FULL_COMMIT_HEAD_LENGTHS = frozenset({40, 64})
+
+
+def is_full_commit_head(head: object) -> bool:
+    """Whether ``head`` is a well-formed FULL commit head (pure; Redmine #13974 / j#81487 F1).
+
+    A full head is exactly 40 (SHA-1) or 64 (SHA-256) lowercase hex characters. A truncated /
+    abbreviated / upper-case / non-hex / blank head is NOT full — it cannot be exact-matched against
+    the durable review generation, so the callback fence treats it as malformed and fails closed.
+    """
+    token = str(head or "").strip()
+    if len(token) not in _FULL_COMMIT_HEAD_LENGTHS:
+        return False
+    return all(c in "0123456789abcdef" for c in token)
+
+
+def review_result_marker_request(
+    markers: Iterable[JournalMarker], issue: str, review_journal: str
+) -> str:
+    """The ``review_request_journal`` DECLARED on the review_result marker at ``review_journal`` (pure).
+
+    Redmine #13974 / j#81487 F1: the v2 marker's own ``req`` is the action identity, read from the
+    structured marker (never re-derived). Blank when the marker is legacy / declares no request.
+    """
+    issue_s = str(issue).strip()
+    journal_s = str(review_journal).strip()
+    for mk in markers:
+        if (
+            str(mk.issue).strip() == issue_s
+            and str(mk.journal).strip() == journal_s
+            and str(mk.gate).strip() == GATE_REVIEW
+        ):
+            return str(getattr(mk, "review_request_journal", "") or "").strip()
+    return ""
 
 
 def review_result_head(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
@@ -592,18 +640,28 @@ def plan_review_return(
     ):
         return _refuse(RETURN_PREVIOUS_GENERATION, review_journal_s)
 
-    # 2d. review-gate head fence (#13974 / j#81454 A): in a fenced pass, conjoin the exact commit head.
-    # The review_result and the review_request it answers must BOTH carry a ``target_head`` (read from
-    # the structured marker, never prose) and they must MATCH — the result reviewed the head the round
-    # pinned. A missing head (legacy / malformed marker) or a head drift is fail-closed. Only enforced
-    # when fenced (``dispatch_anchor_journal is not None``); the recorded head is carried on the plan so
-    # the send authority re-verifies it against the current review generation head at action time.
+    # 2d. review-gate v2 fence (#13974 / j#81454 A + j#81487 F1): in a fenced pass, conjoin the exact
+    # review_request identity AND the exact commit head, all from the structured marker (never prose):
+    #  (a) the review_result marker must DECLARE the review_request it answers (``req``) and that
+    #      declared request must exact-match the provider-correlated request — a missing / drifted
+    #      declared req is fail-closed (never re-derived as a wildcard substitute);
+    #  (b) the review_result and its review_request must BOTH carry a ``target_head``;
+    #  (c) both heads must be well-formed FULL commit heads (40/64 hex — a truncated / malformed head
+    #      cannot be exact-matched against the durable review generation);
+    #  (d) and the two heads must be EQUAL (the result reviewed the head the round pinned).
+    # Only enforced when fenced; the recorded head is carried on the plan so the send authority
+    # re-verifies it against the current review generation head at action time.
     result_head = ""
     if dispatch_anchor_journal is not None:
+        declared_req = review_result_marker_request(markers, issue, review_journal_s)
+        if not declared_req or declared_req != request_journal:
+            return _refuse(RETURN_REVIEW_REQUEST_UNCONFIRMED, review_journal_s)
         result_head = review_result_head(markers, issue, review_journal_s)
         req_head = review_request_head(markers, issue, request_journal)
         if not result_head or not req_head:
             return _refuse(RETURN_MISSING_REVIEW_HEAD, review_journal_s)
+        if not is_full_commit_head(result_head) or not is_full_commit_head(req_head):
+            return _refuse(RETURN_MALFORMED_REVIEW_HEAD, review_journal_s)
         if result_head != req_head:
             return _refuse(RETURN_REVIEW_HEAD_DRIFT, review_journal_s)
 
@@ -682,6 +740,7 @@ REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR = "fenced: dispatch anchor unresolvable"
 REVIEW_RETURN_FENCE_NO_CORRELATION = "fenced: review_return row missing round correlation"
 REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED = "fenced: review head unconfirmed against current generation"
 REVIEW_RETURN_FENCE_HEAD_DRIFT = "superseded: review head drifted from current review generation"
+REVIEW_RETURN_FENCE_MALFORMED_HEAD = "fenced: review head not a full commit head"
 
 
 def make_review_return_send_edge_fence(
@@ -728,10 +787,12 @@ def make_review_return_send_edge_fence(
             if _as_int(request_journal) is None:
                 return (True, REVIEW_RETURN_FENCE_NO_CORRELATION)
             return (True, REVIEW_RETURN_FENCE_PREVIOUS_GENERATION)
-        # Current lane generation: conjoin the review-generation head (#13974 / j#81454 A).
+        # Current lane generation: conjoin the review-generation head (#13974 / j#81454 A + j#81487 F1).
         recorded_head = decode_review_return_target_head(payload)
         if not cur_head or not recorded_head:
             return (True, REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED)
+        if not is_full_commit_head(recorded_head) or not is_full_commit_head(cur_head):
+            return (True, REVIEW_RETURN_FENCE_MALFORMED_HEAD)  # malformed head -> action-time terminal
         if recorded_head != cur_head:
             return (True, REVIEW_RETURN_FENCE_HEAD_DRIFT)
         return (False, "")  # current generation + current head -> #13684 authorities own exactly-once
@@ -754,12 +815,15 @@ __all__ = (
     "RETURN_PREVIOUS_GENERATION",
     "RETURN_MISSING_REVIEW_HEAD",
     "RETURN_REVIEW_HEAD_DRIFT",
+    "RETURN_REVIEW_REQUEST_UNCONFIRMED",
+    "RETURN_MALFORMED_REVIEW_HEAD",
     "RETURN_REFUSAL_REASONS",
     "REVIEW_RETURN_FENCE_PREVIOUS_GENERATION",
     "REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR",
     "REVIEW_RETURN_FENCE_NO_CORRELATION",
     "REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED",
     "REVIEW_RETURN_FENCE_HEAD_DRIFT",
+    "REVIEW_RETURN_FENCE_MALFORMED_HEAD",
     "OWNER_RESOLVED",
     "OWNER_ABSENT",
     "OWNER_AMBIGUOUS",
@@ -772,6 +836,8 @@ __all__ = (
     "correlated_review_request_journal",
     "review_result_head",
     "review_request_head",
+    "review_result_marker_request",
+    "is_full_commit_head",
     "current_review_generation_head",
     "review_return_is_current",
     "review_round_within_generation",
