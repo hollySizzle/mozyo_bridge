@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import stat
@@ -27,7 +28,16 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     AttestationStoreLockBusy,
     attestation_store_lock,
 )
-from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer, ProcessGenerationPin
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
+    RELEASE_RELEASED,
+    DecisionPointer,
+    LaneLifecycleKey,
+    LaneLifecycleStore,
+    ProcessGenerationPin,
+    ReleasePin,
+)
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
     PHASE_COMPLETED_SUCCESS,
@@ -80,6 +90,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveBoundPairConvergenceOps,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    sublane_hibernated_bound_pair_composer_discard_live as PDL,
     sublane_hibernated_bound_pair_convergence_live as CL,
     sublane_prepare_readonly_projection as PRP,
     sublane_quarantine as QM,
@@ -88,6 +99,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PrepareBoundPairRequest,
     PreparationObservation,
     STATE_BLOCKED,
+    STATE_PREPARED,
     run_bound_pair_preparation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard_live import (
@@ -115,7 +127,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 from tests.support.agent_provider_binaries import with_provider_path
-from tests.support.herdr_fake import FakeHerdr
+from tests.support.herdr_fake import FakeHerdr, _Agent as _FakeAgent
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     SublaneLauncherIncompatibleError,
 )
@@ -2076,6 +2088,327 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
                     expected_old_locator=old_locator, home=home,
                 )
             )
+
+    @staticmethod
+    def _git_init(worktree: Path) -> None:
+        """A real clean git checkout on ``main`` so ``probe_worktree_resolved`` clears."""
+        import subprocess
+
+        def run(*args):
+            subprocess.run(
+                ("git", "-C", str(worktree), *args),
+                check=True, capture_output=True, text=True,
+            )
+
+        run("init", "-q", "-b", "main")
+        run("config", "user.email", "t@example.invalid")
+        run("config", "user.name", "t")
+        (worktree / "seed.txt").write_text("x", encoding="utf-8")
+        run("add", ".")
+        run("commit", "-q", "-m", "seed")
+
+    def _seed_released_bound_lifecycle(self, home, workspace, identity, *, gw_name, gw_old):
+        """A REAL hibernated / released / pins-empty lifecycle record at the derived identity.
+
+        The real ``observe`` needs this to pass the bound signature (mocking ``_lifecycle``
+        alone is insufficient — ``_generation_not_newer`` reads the real store). Declares
+        active, hibernates, then drives a release generation to ``released`` so the row reads
+        exactly ``hibernated / issue-bound / released / replacement-settled / declared-slots
+        empty`` at revision 4 — the same bound signature the convergence rail requires.
+        """
+        store = LaneLifecycleStore(home=home)
+        key = LaneLifecycleKey(workspace, self.LANE)
+
+        def decision():
+            return DecisionPointer(source="redmine", issue_id=self.ISSUE, journal_id="80925")
+
+        self.assertTrue(
+            store.declare_active(
+                key, decision=decision(), issue_id=self.ISSUE, worktree_identity=identity
+            ).applied
+        )
+        self.assertTrue(
+            store.transition_disposition(
+                key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=1,
+                target=DISPOSITION_HIBERNATED, decision=decision(),
+            ).applied
+        )
+        self.assertTrue(
+            store.request_release(
+                key, expected_revision=store.get(key).revision,
+                action_id=f"hibernate:{self.LANE}",
+                pins=[ReleasePin(role="codex", assigned_name=gw_name, locator=gw_old)],
+            ).applied
+        )
+        self.assertTrue(
+            store.record_release_outcome(
+                key, action_id=f"hibernate:{self.LANE}",
+                expected_revision=store.get(key).revision, target=RELEASE_RELEASED,
+            ).applied
+        )
+        record = store.get(key)
+        self.assertEqual(record.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(record.process_release, RELEASE_RELEASED)
+        self.assertEqual(record.worktree_identity, identity)
+        self.assertFalse(record.declared_slots)
+        self.assertEqual(record.revision, 4)
+
+    def test_public_execute_replay_resumes_outer_transaction_through_real_observe(self):
+        # Redmine #13933 R13 (review j#82094): the faithful public-rail acceptance of the whole
+        # "a14 partial -> public rollback -> public-execute replay" recovery chain, driven end to
+        # end by the REAL production observe/drive (never a scripted PreparationObservation).
+        #
+        # One causally-continuous run under one temp home / one outer transaction / one outer
+        # action id: (1) the public prepare preflight classifies a hibernated bound pair with a
+        # discardable pending-composer worker and hands out its structured owner marker; (2) the
+        # public SETUP execute closes that worker for real, then its relaunch fails (the fake
+        # drops the launch) so the outer transaction strands at ``launch_owed`` with the old
+        # target closed exactly once and no live target -- an a14 partial: a fresh launch this
+        # action owns that its session-start left durably ``rollback_owed``. (3) That partial is
+        # completed live+attested at its own startup participant locator (via the public stores +
+        # the fake), so (4) the public prepare preflight now surfaces ``rollback_required`` and
+        # the exact inner startup ``--action-id``; (5,6) the public ``run_session_rollback`` rail
+        # preflights zero-close then closes ONLY that legacy locator and drives the startup action
+        # to ``completed_rolled_back``; (7) the SAME public prepare ``--execute`` replay resumes
+        # the outer transaction, relaunches + v1-binds the target, and completes the transaction.
+        #
+        # Only the external inputs are seamed: a REAL seeded lifecycle record (never a mocked
+        # ``_lifecycle``); ``_git`` branch/status; ``approval_fields`` (the Redmine marker); and
+        # the Herdr runner / process boundary (the FakeHerdr behind ``list_herdr_agent_rows`` +
+        # the actuator / ``_SnapshotRecoveryOps`` factories + the quarantine composer read). The
+        # observe/drive, ``_ComposerDiscardActuatorPort._fresh_authority``, the real transaction
+        # store, ``ReplacementActuatorUseCase.drive_worker_recovery``, close/launch/v1-bind/verify
+        # /``_finish`` and the public ``run_session_rollback`` FSM all run unmodified.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            self._git_init(worktree)
+            request = PrepareBoundPairRequest(
+                issue=self.ISSUE, journal="80925", lane=self.LANE,
+                worktree=str(worktree), branch="main",
+            )
+            txn_store = ReplacementTransactionStore(home=home)
+
+            def make_ops(cls=LiveBoundPairPreparationOps):
+                return cls(
+                    repo_root=coord, env=env,
+                    lifecycle_store=LaneLifecycleStore(home=home),
+                    transaction_store=txn_store,
+                )
+
+            base_ops = make_ops()
+            # The identity the REAL ``_worktree`` derives from the git checkout is what the
+            # seeded lifecycle row must carry (never a guessed token).
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                _wt, workspace, identity = base_ops._worktree(
+                    ConvergeBoundPairRequest(
+                        issue=self.ISSUE, journal="80925", lane=self.LANE,
+                        worktree=str(worktree), branch="main",
+                    )
+                )
+            self.assertEqual(workspace, ws)
+            self._seed_released_bound_lifecycle(
+                home, workspace, identity, gw_name=gw_name, gw_old=gw_old
+            )
+
+            # Real inventory: the FakeHerdr rows enriched with the ``revision`` / ``foreground_cwd``
+            # fields real herdr carries (the fake omits them) so the real pending-composer
+            # classifier can run.
+            def rows(_env):
+                return [
+                    {**row, "revision": 4, "foreground_cwd": str(worktree)}
+                    for row in _agent_list_rows(fake)
+                ]
+
+            # The old worker is a pending, discardable composer; the gateway is not. Keyed on the
+            # OLD worker locator so a freshly relaunched slot reads non-pending (healthy).
+            def composer_for(content):
+                return (
+                    QM.ComposerObservation(True, True, ())
+                    if content == wk_old
+                    else QM.ComposerObservation(True, False)
+                )
+
+            drive_closes: list = []
+            orig_close = QM.LiveSublaneQuarantineOps.close_receiver
+
+            def counting_close(ops_self, req, pin):
+                res = orig_close(ops_self, req, pin)
+                if res.closed:
+                    drive_closes.append(pin.locator)
+                return res
+
+            @contextlib.contextmanager
+            def seams():
+                with contextlib.ExitStack() as es:
+                    p = es.enter_context
+                    p(mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False))
+                    for module in (PRP, CL, PDL, QM):
+                        p(mock.patch.object(module, "list_herdr_agent_rows", rows))
+                    git_seam = lambda _wt, *a: (
+                        (True, "main") if a == ("branch", "--show-current") else (True, "")
+                    )
+                    p(mock.patch.object(CL, "_git", side_effect=git_seam))
+                    p(mock.patch.object(PDL, "_git", side_effect=git_seam))
+                    p(mock.patch.object(
+                        CL, "HerdrSublaneActuatorOps",
+                        lambda **kw: HerdrSublaneActuatorOps(**kw, runner=fake.run),
+                    ))
+                    p(mock.patch.object(
+                        PDL, "_SnapshotRecoveryOps",
+                        lambda **kw: _SnapshotRecoveryOps(**kw, runner=fake.run),
+                    ))
+                    p(mock.patch.object(QM, "repo_scope_workspace_id", return_value=ws))
+                    p(mock.patch.object(QM, "resolve_gateway_provider", return_value="codex"))
+                    p(mock.patch.object(QM, "resolve_worker_provider", return_value="claude"))
+                    p(mock.patch.object(QM, "_resolve_binary_or_die", return_value="herdr"))
+                    p(mock.patch.object(
+                        QM.LiveSublaneQuarantineOps, "close_receiver", counting_close
+                    ))
+                    state = p(mock.patch.object(QM, "HerdrCliAgentStateReader"))
+                    transport = p(mock.patch.object(QM, "HerdrCliTransport"))
+                    p(mock.patch.object(QM, "observe_composer_text", side_effect=composer_for))
+                    state.return_value.read_agent_state.return_value = SimpleNamespace(
+                        ok=True, state="idle"
+                    )
+                    transport.return_value.read_pane.side_effect = (
+                        lambda locator, lines=80: SimpleNamespace(ok=True, content=locator)
+                    )
+                    yield
+
+            # 1. Public prepare preflight -> actionable, hands out the outer marker/action id.
+            with seams():
+                preflight = run_bound_pair_preparation(request, execute=False, ops=base_ops)
+            self.assertEqual(preflight.state, STATE_ACTIONABLE)
+            self.assertEqual(preflight.discard_roles, ("worker",))
+            outer_action = preflight.action_id
+            self.assertTrue(outer_action)
+            (_channel, marker_fields), = marker_fields_in_note(preflight.approval_marker)
+
+            class _MarkerOps(LiveBoundPairPreparationOps):
+                # ``approval_fields`` (the Redmine journal read) is the one external input the
+                # test supplies; ``observe`` / ``drive`` stay the REAL production path.
+                def approval_fields(self_inner, issue, journal):
+                    return (marker_fields,)
+
+            ops = make_ops(_MarkerOps)
+
+            # 2. Public SETUP execute: the worker close succeeds, its relaunch fails -> the outer
+            #    transaction strands at ``launch_owed`` with the old target closed exactly once.
+            fake.fail_launch_provider = "claude"
+            with seams():
+                setup = run_bound_pair_preparation(request, execute=True, ops=ops)
+            self.assertTrue(setup.executed)
+            self.assertEqual(setup.state, STATE_BLOCKED)
+            self.assertEqual(setup.replacement_status, ACTUATION_EFFECT_FAILED)
+            self.assertEqual(setup.action_id, outer_action)
+            outer_key = ReplacementTransactionKey(ws, outer_action)
+            setup_txn = txn_store.get(outer_key)
+            worker_participant = setup_txn.find_participant((self.LANE, "worker", "claude", wk_name))
+            self.assertEqual(worker_participant.phase, PARTICIPANT_LAUNCH_OWED)
+            self.assertIsNone(fake.agent_named(wk_name))  # the relaunch target is absent
+            self.assertEqual(drive_closes, [wk_old])  # the old worker closed exactly once
+
+            # 3. Complete the a14 partial the outer transaction owns into a live+attested slot at
+            #    ITS OWN durable startup participant locator (public stores + the fake only). The
+            #    reserved side binding + rollback-owed startup were written by the real SETUP; the
+            #    fake's dropped launch left no live row / fresh attestation, so we add exactly
+            #    those, keyed to the startup participant the run recorded.
+            worker_binding = HerdrIdentityReplacementBindingStore(home=home).read(
+                outer_action, wk_name
+            )
+            self.assertIsNotNone(worker_binding)
+            legacy_startup_id = worker_binding.startup_action_id
+            legacy_startup = StartupTransactionFence(home=home).read(legacy_startup_id)
+            self.assertEqual(legacy_startup.phase, PHASE_ROLLBACK_OWED)
+            legacy_locator = legacy_startup.participant_for("claude").locator
+            self.assertNotIn(legacy_locator, {wk_old, gw_old})
+            reference = fake._agents[gw_old]
+            fake._agents[legacy_locator] = _FakeAgent(
+                name=wk_name, pane_id=legacy_locator, workspace_id=reference.workspace_id,
+                provider="claude", tab_id=reference.tab_id,
+            )
+            HerdrIdentityAttestationStore(home=home).upsert(
+                IdentityAttestationRecord(
+                    assigned_name=wk_name, workspace_id=ws, role="claude", lane_id=self.LANE,
+                    locator=legacy_locator, verdict=VERDICT_PRESENT,
+                    observed_at="2099-07-18T00:00:00+00:00", replacement_action_id="",
+                )
+            )
+
+            # 4. Public prepare preflight again -> surfaces the exact rollback --action-id.
+            with seams():
+                surfacing = run_bound_pair_preparation(request, execute=False, ops=ops)
+            self.assertEqual(surfacing.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED)
+            self.assertEqual(surfacing.startup_rollback_action_id, legacy_startup_id)
+
+            # 5. Public rollback preflight -> actionable, zero close.
+            rb_ops = _FakeBackedRollbackOps(fake)
+            rb_pre = run_session_rollback(
+                action_id=legacy_startup_id, ops=rb_ops, home=home, execute=False
+            )
+            self.assertEqual(rb_pre.state, "actionable")
+            self.assertFalse(rb_ops.close_calls)
+
+            # 6. Public rollback execute -> closes ONLY the legacy locator; startup rolled back.
+            rb_done = run_session_rollback(
+                action_id=legacy_startup_id, ops=rb_ops, home=home, execute=True
+            )
+            self.assertTrue(rb_done.ok)
+            self.assertEqual(rb_done.reason, REASON_OK)
+            self.assertEqual(rb_ops.close_calls, [[("claude", legacy_locator)]])
+            self.assertIsNone(fake.agent_named(wk_name))
+            self.assertEqual(
+                StartupTransactionFence(home=home).read(legacy_startup_id).phase,
+                PHASE_COMPLETED_ROLLED_BACK,
+            )
+
+            # 7. The SAME public prepare --execute replay resumes the outer transaction, relaunches
+            #    + v1-binds the target, and completes the transaction.
+            with seams():
+                replay = run_bound_pair_preparation(request, execute=True, ops=ops)
+
+            self.assertEqual(replay.state, STATE_PREPARED)
+            self.assertTrue(replay.executed)
+            self.assertEqual(replay.action_id, outer_action)
+            self.assertEqual(replay.replacement_status, ACTUATION_RECOVERED)
+            # The old worker was never re-closed on the replay (still exactly one drive close).
+            self.assertEqual(drive_closes, [wk_old])
+            replay_txn = txn_store.get(outer_key)
+            self.assertEqual(replay_txn.phase, PHASE_COMPLETED)
+            self.assertEqual(
+                replay_txn.find_participant((self.LANE, "worker", "claude", wk_name)).phase,
+                PARTICIPANT_REPLACED,
+            )
+            worker_live = fake.agent_named(wk_name)
+            self.assertIsNotNone(worker_live)
+            # A fresh generation distinct from BOTH the old and the rolled-back legacy locator.
+            self.assertNotIn(worker_live["pane_id"], {wk_old, legacy_locator})
+            record = HerdrIdentityAttestationStore(home=home).read(wk_name)
+            self.assertTrue(
+                replacement_action_is_bound(
+                    record, action_id=outer_action, live_locator=worker_live["pane_id"],
+                    expected_workspace_id=ws, expected_role="claude", expected_lane=self.LANE,
+                    expected_assigned_name=wk_name, expected_old_locator=wk_old, home=home,
+                )
+            )
+            # The replay reached a NEW durable startup success, distinct from the rolled-back one.
+            replayed_binding = HerdrIdentityReplacementBindingStore(home=home).read(
+                outer_action, wk_name
+            )
+            self.assertNotEqual(replayed_binding.startup_action_id, legacy_startup_id)
+            self.assertEqual(
+                StartupTransactionFence(home=home).read(
+                    replayed_binding.startup_action_id
+                ).phase,
+                PHASE_COMPLETED_SUCCESS,
+            )
+            # A second preflight no longer surfaces any rollback id (the debt is durably cleared).
+            with seams():
+                second = run_bound_pair_preparation(request, execute=False, ops=ops)
+            self.assertNotEqual(second.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED)
+            self.assertEqual(second.startup_rollback_action_id, "")
 
     def test_dirty_or_raced_pair_never_surfaces_a_rollback_command(self):
         # F2 negative: the public rollback surface must not bypass acceptance-3 safety. A
