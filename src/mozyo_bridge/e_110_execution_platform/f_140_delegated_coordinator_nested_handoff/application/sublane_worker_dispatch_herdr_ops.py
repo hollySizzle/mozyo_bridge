@@ -200,7 +200,13 @@ class HerdrWorkerDispatchOps:
             except (TypeError, ValueError):
                 live_generation_current = False
             else:
-                live_generation_current = live_pin.match_key == worker_pin.match_key
+                # Redmine #13846: bind on the (role/provider/assigned_name/locator) identity,
+                # treating runtime_revision as supplementary evidence. A full match_key equality
+                # rejects a current fresh generation whose declared pin never observed a runtime
+                # version while the live `agent list` row surfaces one (locator still matches) —
+                # the false `worker_liveness_authority_conflict`. A same-name process re-launched
+                # at a newer revision (both observed, differ) or a locator drift still fails closed.
+                live_generation_current = worker_pin.binds_same_generation(live_pin)
 
         # A live receiver must match the declaration's full process-generation pin.
         # For an absent receiver, the stored self-attestation must match that pin; this

@@ -334,7 +334,17 @@ Table naming:
       検証済み startup self-attestation の `observed_at` を保存する。observation surface を持つ
       richer 宣言経路は runtime_revision を供給してよく `match_key` に入る。current liveness では
       なく **観測 snapshot** であり、存在確認は毎回 live inventory を読む。既存 release/replacement
-      `ReleasePin` の後方互換 decode は維持。
+      `ReleasePin` の後方互換 decode は維持。★**action-time の current-liveness 世代照合**
+      (`ProcessGenerationPin.binds_same_generation`, #13846) は identity tuple
+      (`role/provider/assigned_name/locator`) を **strict 一致**で束ね、`runtime_revision` は
+      **どちらか一方が空なら非 discriminant**（declared は herdr runtime version 観測 surface が無く空、
+      live `agent list` row は供給しうる）として扱い、**両側が観測して差異があるときだけ** re-launch
+      された別世代として fail-closed する。full `match_key` 等価は「declared 空 vs live 非空」を mismatch と
+      誤読し、current な fresh generation を `worker_liveness_authority_conflict` で拒否していた
+      (#13846)。これは #13845 の「CAS を共有 predicate へ一般化しない (「空 or 一致」)」警告が対象とする
+      **row-shape CAS write** の共有述語一般化ではなく、上で optional evidence と定義済みの
+      `runtime_revision` を **read-time liveness 照合**で
+      その定義どおり非 identity として扱うだけであり、identity 4 field には空許容を持ち込まない。
     - **common declaration service** (`LaneDeclarationStore.declare_lane`) が issue / project 双方を
       fail-closed に宣言する。exact duplicate は idempotent (#13809 live-adopt)、既存 owner conflict /
       別 issue-or-scope / 不読・ambiguous inventory は zero-write。bulk / implicit backfill は禁止。

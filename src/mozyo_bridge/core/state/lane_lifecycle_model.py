@@ -496,6 +496,20 @@ class ProcessGenerationPin:
         return (self.role, self.provider, self.assigned_name, self.locator,
                 self.runtime_revision)
 
+    def binds_same_generation(self, live: "ProcessGenerationPin") -> bool:
+        """Same process generation as ``live`` (#13846): bind on the four identity fields;
+        ``runtime_revision`` is supplementary evidence, so an empty revision on either side is
+        never a discriminant and only a both-observed mismatch (a re-launched newer generation)
+        fails closed. Full ``match_key`` equality would wrongly reject a fresh generation whose
+        declared revision is empty while the live row surfaces one (the #13846 false conflict)."""
+        if (self.role, self.provider, self.assigned_name, self.locator) != (
+            live.role, live.provider, live.assigned_name, live.locator
+        ):
+            return False
+        if self.runtime_revision and live.runtime_revision:
+            return self.runtime_revision == live.runtime_revision
+        return True
+
     def as_payload(self) -> dict[str, str]:
         return {
             "role": self.role,

@@ -268,6 +268,77 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
         self.assertEqual(result.decision, ADMISSION_HEALTHY)
         self.assertEqual(result.facts.lane_generation, 7)
 
+    def test_fresh_generation_live_runtime_revision_is_healthy_not_conflict(self):
+        # Redmine #13846: the declared worker pin carries no runtime_revision (the fixture's
+        # declared_pins leave it empty, exactly as adopt/hibernate declarations do — the
+        # generation discriminant is the live locator), yet the live `agent list` row DOES
+        # surface a runtime_revision. A full match_key equality treated that asymmetry as a
+        # mismatch and raised a false `worker_liveness_authority_conflict`; binding on the
+        # (role/provider/assigned_name/locator) identity keeps this current fresh generation
+        # healthy while the locator still matches.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "runtime_revision": "cli-2.1.0",
+                }
+            ],
+            self._attestation(),
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertTrue(result.facts.generation_binding_current)
+
+    def test_live_runtime_revision_diverging_from_declared_is_conflict(self):
+        # Adversarial: when the declared pin DID observe a runtime revision and the live row
+        # surfaces a DIFFERENT one (a same-name process re-launched at a newer runtime), that
+        # is a distinct generation and must fail closed even though the locator matches.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        declared_pins = (
+            ProcessGenerationPin(
+                role="gateway",
+                provider="codex",
+                assigned_name=encode_assigned_name("ws", "codex", LANE_LABEL),
+                locator="w28:p74",
+            ),
+            ProcessGenerationPin(
+                role="worker",
+                provider="claude",
+                assigned_name=name,
+                locator="w28:p75",
+                runtime_revision="cli-1.0.0",
+            ),
+        )
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "runtime_revision": "cli-2.1.0",
+                }
+            ],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": declared_pins},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
     def test_locator_bearing_stale_row_is_authority_conflict(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
             encode_assigned_name,
