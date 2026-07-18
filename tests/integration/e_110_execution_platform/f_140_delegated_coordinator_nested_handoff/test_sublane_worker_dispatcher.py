@@ -52,10 +52,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    ADMISSION_HEALTHY,
     REASON_LANE_NOT_RESOLVED,
     REASON_LANE_PANE_MISSING,
     REASON_WORKER_DISPATCH_FAILED,
     WORKER_DISPATCH_DELIVERY_FAILED,
+    WORKER_DISPATCH_TURN_START_UNCONFIRMED,
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
     WorkerDispatchOutcome,
     WorkerDispatchRequest,
 )
@@ -91,6 +95,8 @@ class FakeWorkerDispatchOps:
         dispatch_error=None,
         worker_ready=True,
         worker_ready_sequence=None,
+        admission_sequence=None,
+        turn_start="started",
     ):
         self._lane = lane
         self._dispatch_rc = dispatch_rc
@@ -101,6 +107,8 @@ class FakeWorkerDispatchOps:
             if worker_ready_sequence is not None
             else None
         )
+        self._admission_sequence = list(admission_sequence or [])
+        self._turn_start = turn_start
         self.calls = []
 
     def read_lane(self, worktree_path):
@@ -113,11 +121,41 @@ class FakeWorkerDispatchOps:
             return self._worker_ready_sequence.pop(0)
         return self._worker_ready
 
+    def observe_worker_dispatch_admission(self, **kwargs):
+        self.calls.append(("admission", kwargs))
+        if self._admission_sequence:
+            return self._admission_sequence.pop(0)
+        facts = WorkerDispatchAdmissionFacts(
+            True,
+            True,
+            True,
+            True,
+            "live",
+            True,
+            "awaiting_input",
+            lane_generation=1,
+            worker_assigned_name="mzb1_ws_claude_l1",
+            worker_locator=getattr(kwargs["lane"], "worker_pane", None),
+        )
+        return WorkerDispatchAdmission(ADMISSION_HEALTHY, "healthy", facts)
+
     def dispatch_to_worker(self, **kwargs):
         self.calls.append(("dispatch", kwargs))
         if self._dispatch_error is not None:
             raise self._dispatch_error
         return self._dispatch_rc
+
+    def dispatch_to_worker_turn_start(self, **kwargs):
+        kwargs.pop("worker_assigned_name", None)
+        return self.dispatch_to_worker(**kwargs), self._turn_start
+
+    def reserve_worker_dispatch(self, **kwargs):
+        self.calls.append(("reserve", kwargs))
+        return True, "reserved"
+
+    def complete_worker_dispatch(self, **kwargs):
+        self.calls.append(("complete", kwargs))
+        return True
 
     def _names(self):
         return [c[0] for c in self.calls]
@@ -167,7 +205,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(outcome.dispatch_result, DISPATCH_WORKER_DISPATCHED)
         self.assertTrue(outcome.worker_dispatch_confirmed)
         # The confirmed reason stays a delivery ACK, never progress/completion.
-        self.assertIn("delivery ACK only", outcome.reason)
+        self.assertIn("turn-start observed", outcome.reason)
         dispatched = dict(ops.calls)["dispatch"]
         self.assertEqual(dispatched["worker_pane"], "%177")
         self.assertEqual(dispatched["gateway_callback_target"], "%176")
@@ -184,6 +222,16 @@ class ExecuteTests(unittest.TestCase):
         self.assertFalse(outcome.worker_dispatch_confirmed)
         self.assertIn(REASON_WORKER_DISPATCH_FAILED, outcome.blocked_reasons)
         self.assertIn("gateway_notified", outcome.reason)
+
+    def test_delivery_ack_without_turn_start_is_non_retryable_and_unconfirmed(self):
+        ops = FakeWorkerDispatchOps(lane=_lane(), dispatch_rc=0, turn_start="unknown")
+        outcome = WorkerDispatchUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(
+            outcome.dispatch_result, WORKER_DISPATCH_TURN_START_UNCONFIRMED
+        )
+        self.assertFalse(outcome.worker_dispatch_confirmed)
+        self.assertFalse(outcome.retry_allowed)
 
     def test_raising_send_is_delivery_failed_not_promoted(self):
         ops = FakeWorkerDispatchOps(lane=_lane(), dispatch_error=RuntimeError("boom"))
@@ -250,24 +298,21 @@ class WorkerReadinessWaitTests(unittest.TestCase):
         self.assertEqual(sleeps, [])
         self.assertIn("dispatch", ops._names())
         # The probe targets the resolved worker pane, before the send.
-        self.assertEqual(("probe_worker_ready", "%177"), ops.calls[1])
+        self.assertEqual(("probe_worker_ready", "%177"), ops.calls[2])
 
-    def test_unconfirmed_readiness_degrades_but_still_forwards(self):
-        # A worker that never reports ready must NOT hard-block: worker_ready=false
-        # is recorded and the forward proceeds (the queue-enter Enter-only retry is
-        # the landing safety net).
+    def test_unconfirmed_readiness_blocks_before_forward(self):
         ops = FakeWorkerDispatchOps(lane=_lane(), worker_ready=False)
         sleeps = []
         outcome = self._use_case(ops, probes=3, sleeps=sleeps).run(
             _req(), execute=True
         )
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
         self.assertFalse(outcome.worker_ready)
-        self.assertTrue(outcome.worker_dispatch_confirmed)
+        self.assertFalse(outcome.worker_dispatch_confirmed)
         # Bounded: 3 probes, 2 inter-probe sleeps (no trailing sleep).
         self.assertEqual(ops._names().count("probe_worker_ready"), 3)
         self.assertEqual(len(sleeps), 2)
-        self.assertIn("dispatch", ops._names())
+        self.assertNotIn("dispatch", ops._names())
 
     def test_still_booting_worker_becomes_ready_within_window(self):
         ops = FakeWorkerDispatchOps(

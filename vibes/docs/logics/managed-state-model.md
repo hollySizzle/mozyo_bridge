@@ -828,6 +828,23 @@ pin_pair_fail_closed:
   ここに `runtime_role` を渡すと canonical pin は必ず `ATTEST_CONFLICT` になり、健全な lane が resume 不能になる。
 - live 行は slot label を持たない。declared pin の `role` は **宣言の属性であって live の観測値ではない**。
 
+### Worker dispatch action-time admission (#13846)
+
+`sublane dispatch-worker` は assigned name / locator / `stale_named_slot` の単独観測を送信権限にしない。送信直前に
+current lifecycle generation・current Redmine decision anchor・startup self-attestation の identity/locator generation・
+receiver runtime state・replacement action binding・同一 issue/journal/receiver の既送達/不確実 delivery を一つの
+observation に join し、次の typed decision を返す。
+
+- `healthy`: 全 authority が一致し receiver が dispatch-admissible。送信直前の再観測も byte-equivalent な場合だけ 1 回 inject。
+- `stale_worker_recovery_required`: current lifecycle に対して exact slot の terminal absence が positive に証明された場合だけ。
+  close/relaunch はせず、owner-governed #13806 recovery へ route する。
+- `worker_liveness_authority_conflict`: locator-bearing stale token、duplicate row、missing/foreign attestation、generation/action
+  drift、busy/unknown receiver、既送達または送達不確実を含む。それらはすべて zero-send / zero-close / no auto retry。
+
+queue-enter / transport ACK と worker uptake は別の causal fact である。`worker_dispatched=true` は admission=`healthy`、
+transport=`sent/ok`、かつ exact delivery に結び付く event-driven turn-start=`started` の連言だけで記録する。ACK 後に
+turn-start が観測不能なら `turn_start_unconfirmed` とし、inject 済みの可能性があるため自動再送しない。
+
 ### schema version / migration
 
 Use a two-level version model:

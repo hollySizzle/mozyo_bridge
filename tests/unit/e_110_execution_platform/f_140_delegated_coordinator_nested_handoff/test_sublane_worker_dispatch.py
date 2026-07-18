@@ -26,9 +26,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    ADMISSION_HEALTHY,
     REASON_WORKER_DISPATCH_FAILED,
     WORKER_DISPATCH_DELIVERY_FAILED,
     WORKER_DISPATCH_RESULTS,
+    WORKER_DISPATCH_TURN_START_UNCONFIRMED,
     WorkerDispatchOutcome,
     WorkerDispatchRequest,
     lane_identity_matches,
@@ -66,6 +68,8 @@ def _outcome(**kw):
         dispatch_result=DISPATCH_WORKER_DISPATCHED,
         durable_anchor="71524",
         command="mozyo-bridge handoff send --to claude ...",
+        admission_decision=ADMISSION_HEALTHY,
+        turn_start_outcome="started",
     )
     base.update(kw)
     return WorkerDispatchOutcome(**base)
@@ -128,15 +132,17 @@ class OutcomeTests(unittest.TestCase):
             {
                 DISPATCH_WORKER_DISPATCHED,
                 WORKER_DISPATCH_DELIVERY_FAILED,
+                WORKER_DISPATCH_TURN_START_UNCONFIRMED,
                 DISPATCH_NOT_ATTEMPTED,
             },
         )
 
     def test_confirmed_only_on_worker_dispatched(self):
-        # #12988 acceptance: no false promotion — only the explicit
-        # worker_dispatched token confirms; delivery_failed / not_attempted stay
-        # unconfirmed.
+        # #13846: the result token, healthy authority and causally-bound turn-start
+        # are all required; transport ACK alone never promotes.
         self.assertTrue(_outcome().worker_dispatch_confirmed)
+        self.assertFalse(_outcome(turn_start_outcome="unknown").worker_dispatch_confirmed)
+        self.assertFalse(_outcome(admission_decision=None).worker_dispatch_confirmed)
         self.assertFalse(
             _outcome(
                 dispatch_result=WORKER_DISPATCH_DELIVERY_FAILED
@@ -174,7 +180,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("- dispatch_result: worker_dispatched", text)
         self.assertIn("- worker_dispatch_confirmed: true", text)
         # The confirmed record must not read as worker progress / completion.
-        self.assertIn("delivery ACK only", text)
+        self.assertIn("turn-start observed", text)
         self.assertIn("not worker progress or completion", text)
 
     def test_delivery_failed_render_keeps_gateway_notified_semantics(self):
@@ -191,8 +197,9 @@ class RenderTests(unittest.TestCase):
         self.assertIn("`gateway_notified`", text)
         self.assertIn("fail-closed", text)
         self.assertIn("- blocked_reasons: worker_dispatch_failed", text)
-        # Recovery pointers stay replayable.
-        self.assertIn("callback-recovery", text)
+        # An uncertain injection is never advertised as safely replayable.
+        self.assertIn("Do not auto-retry", text)
+        self.assertIn("#13806", text)
         self.assertIn("- command:", text)
 
     def test_render_records_worker_ready_and_route_exception(self):

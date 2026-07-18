@@ -1,47 +1,9 @@
-"""herdr-backend worker-dispatch ack-drive IO for ``sublane dispatch-worker`` (Redmine #13357).
+"""Herdr worker-dispatch authority and IO adapter (#13357, #13846).
 
-The tmux :class:`~...application.sublane_worker_dispatcher.LiveWorkerDispatchOps` reads the
-lane from the tmux pane inventory and forwards the anchored ``implementation_request`` to
-the same-lane Claude worker pane over the queue-enter tmux rail. Under
-``terminal_transport.backend: herdr`` (Redmine #13331, option A) a lane is its own per-lane
-herdr workspace whose managed agents are ``mzb1_<lane-ws>_codex_default`` (gateway) /
-``mzb1_<lane-ws>_claude_default`` (worker) — there is no tmux pane to read or type into, so
-the #12988 measured-ACK drive had no herdr leg (gap audit #13331 j#73370, loss #1).
-
-:class:`HerdrWorkerDispatchOps` implements the SAME
-:class:`~...application.sublane_worker_dispatcher.WorkerDispatchOps` port the tmux adapter
-does, so the pure fail-closed
-:class:`~...application.sublane_worker_dispatcher.WorkerDispatchUseCase` choreography — and
-with it the #12988 contract (only a measured delivery ACK promotes to
-``worker_dispatched`` / ``worker_dispatch_confirmed=true``; every failure keeps the lane's
-recorded ``gateway_notified`` state, fail-closed) — is unchanged. Only the side effects
-differ:
-
-* ``read_lane`` — resolves the lane from the **live herdr inventory**, delegating to the
-  #13331 :class:`~...application.sublane_actuator_herdr_ops.HerdrSublaneActuatorOps` fold
-  (worktree → workspace segment via the shared resolver, ``agent list`` ``mzb1`` decode);
-* ``probe_worker_ready`` — the #13301 pre-forward readiness wait's herdr form: a non-fatal
-  live-presence check of the worker locator. A herdr agent is server-spawned (no TUI boot /
-  render race to wait out) and the herdr send rail self-heals the landing (turn-start
-  observation + Enter-resend, #13322), so readiness is simply "the worker locator is live
-  in the inventory now" — the same rationale as the #13331 gateway probe;
-* ``dispatch_to_worker`` — the identical governed ``handoff send --to claude ... --mode
-  queue-enter`` CLI contract, composed through the shared argv builder and driven with the
-  shared j#71597 SystemExit / stdout containment. The worker locator is a non-``%pane``
-  target, so the send rides the **herdr rail** (#13320 effective-backend predicate): the
-  same-workspace route authority resolves the worker slot (#13305) — pinned to the lane's
-  **stable ``(workspace, lane_label, claude)`` identity** by an explicit ``--target-lane``
-  (Redmine #13485) so it is never re-derived from the sender's own lane — the queue-enter
-  rail injects + submits with the #13322 Enter-resend self-healing, and the delivery is
-  recorded to the #13296 herdr ledger with the queue-enter turn-start observation (#13292).
-  Exit 0 is the submit-complete delivery-ACK measurement to that stable worker target —
-  nothing more (the ``ack-completion-receiver-state.md`` separation holds: no completion
-  detector; the turn-start observation is separate telemetry, never conflated with the ACK).
-
-The tmux path is untouched: this adapter is only selected by
-``_resolve_worker_dispatch_ops`` when the repo-local config selects ``backend: herdr``
-(:func:`~...application.sublane_herdr_projection.repo_backend_is_herdr`); any other /
-absent / broken config keeps :class:`LiveWorkerDispatchOps` byte-for-byte.
+The adapter joins lifecycle generation, startup attestation, live receiver state,
+action binding and prior delivery; reserves the shared ``DispatchOutboxFence``;
+then separates queue ACK from ledger-backed turn-start.  It never closes or
+relaunches a slot, and only a durable delivered fence outcome can promote.
 """
 
 from __future__ import annotations
@@ -59,6 +21,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SublaneLaneView,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
+    WorkerDispatchRequest,
+    decide_worker_dispatch_admission,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
@@ -128,6 +96,118 @@ class HerdrWorkerDispatchOps:
         """The #13331 live-inventory lane read-back (worktree → workspace → slots)."""
         return self._actuator_ops().read_lane(worktree_path)
 
+    def observe_worker_dispatch_admission(
+        self, *, lane: SublaneLaneView, request: WorkerDispatchRequest
+    ) -> WorkerDispatchAdmission:
+        """Join the current lifecycle, attestation, live receiver and exact delivery."""
+        from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            evaluate_attestation,
+        )
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+        from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+            list_herdr_agent_rows,
+            repo_scope_workspace_id,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            AGENT_KEY_NAME,
+            _agent_locator,
+            encode_assigned_name,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
+            SLOT_STALE,
+            classify_named_slot,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
+            agent_row_runtime_state,
+        )
+
+        provider = self.worker_provider()
+        assigned_name = encode_assigned_name(lane.workspace_id, provider, lane.lane_id)
+        rows = list_herdr_agent_rows(self.env)
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping)
+            and str(row.get(AGENT_KEY_NAME, "")).strip() == assigned_name
+        ]
+        row = matches[0] if len(matches) == 1 else None
+        locator = _agent_locator(row) if row is not None else ""
+        slot_state = classify_named_slot(row) if row is not None else "absent"
+        receiver_state = agent_row_runtime_state(row) if row is not None else "absent"
+
+        scope = repo_scope_workspace_id(self.repo_root)
+        lifecycle = (
+            LaneLifecycleStore().get(LaneLifecycleKey(scope, request.lane_label))
+            if scope
+            else None
+        )
+        lifecycle_current = bool(
+            lifecycle
+            and lifecycle.issue_id == request.issue
+            and lifecycle.lane_disposition == "active"
+            and lifecycle.lane_generation > 0
+        )
+        anchor_current = bool(
+            lifecycle and lifecycle.decision_journal == (request.journal or "").strip()
+        )
+        attestation = HerdrIdentityAttestationStore().read(assigned_name)
+        joined = evaluate_attestation(
+            attestation,
+            live_locator=locator,
+            expected_workspace_id=lane.workspace_id,
+            expected_role=provider,
+            expected_lane=lane.lane_id,
+        )
+        action_binding_current = bool(
+            lifecycle
+            and attestation
+            and lifecycle.replacement_action_id == attestation.replacement_action_id
+        )
+        duplicate = any(
+            record.journal_id == (request.journal or "").strip()
+            and (record.receiver == provider or record.provider == provider)
+            and record.target in {assigned_name, locator}
+            for record in HerdrDeliveryLedger().records_for_issue(request.issue)
+        )
+        terminal_absence = bool(
+            (len(matches) == 0 and lifecycle_current)
+            or (
+                len(matches) == 1
+                and slot_state == SLOT_STALE
+                and not locator
+                and lifecycle_current
+            )
+        )
+        facts = WorkerDispatchAdmissionFacts(
+            lifecycle_current=lifecycle_current,
+            anchor_current=anchor_current,
+            identity_attested=joined.ok,
+            action_binding_current=action_binding_current,
+            slot_state=(slot_state if len(matches) == 1 else "ambiguous"),
+            locator_present=bool(locator),
+            receiver_state=receiver_state,
+            terminal_absence_authoritative=terminal_absence,
+            duplicate_or_uncertain_delivery=duplicate,
+            workspace_id=scope or None,
+            lane_id=request.lane_label,
+            lane_generation=(lifecycle.lane_generation if lifecycle else None),
+            worker_assigned_name=assigned_name,
+            worker_locator=locator or None,
+            action_id=(
+                lifecycle.replacement_action_id
+                if lifecycle and lifecycle.replacement_action_id
+                else (
+                    f"lane_generation_{lifecycle.lane_generation}"
+                    if lifecycle
+                    else None
+                )
+            ),
+        )
+        return decide_worker_dispatch_admission(facts)
+
     def probe_worker_ready(self, worker_pane: str) -> bool:
         """One non-fatal live-presence snapshot of the worker locator (#13301 herdr form).
 
@@ -138,6 +218,85 @@ class HerdrWorkerDispatchOps:
         its bounded window exactly as it does the tmux probe.
         """
         return self._actuator_ops().probe_gateway_ready(worker_pane)
+
+    @staticmethod
+    def _fence_key(admission: WorkerDispatchAdmission, request: WorkerDispatchRequest):
+        from mozyo_bridge.core.state.dispatch_outbox_fence import FenceKey
+
+        facts = admission.facts
+        required = (
+            facts.workspace_id,
+            facts.lane_id,
+            request.issue,
+            request.journal,
+            facts.action_id,
+            facts.worker_assigned_name,
+        )
+        if not admission.is_healthy or not all(required):
+            return None
+        return FenceKey(*(str(value) for value in required))
+
+    def reserve_worker_dispatch(
+        self, *, admission: WorkerDispatchAdmission, request: WorkerDispatchRequest
+    ) -> tuple[bool, str]:
+        """Atomically reserve the sole exact send before injection."""
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            DispatchOutboxFence,
+            DispatchOutboxFenceError,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (
+            target_is_retiring,
+        )
+
+        key = self._fence_key(admission, request)
+        if key is None:
+            return False, "incomplete deterministic fence key"
+        fence = DispatchOutboxFence()
+        try:
+            fence.bootstrap()
+            reservation = fence.reserve(key)
+            if not reservation.won:
+                return False, (
+                    f"exact send key already {reservation.current_state}; "
+                    "prior injection is never replayed"
+                )
+            retiring, detail = target_is_retiring(key.target_assigned_name)
+            if retiring:
+                fence.mark_cancelled(key, detail=detail)
+                return False, detail
+        except DispatchOutboxFenceError as exc:
+            return False, f"dispatch outbox authority unavailable: {exc}"
+        except Exception as exc:  # noqa: BLE001 - a reserved pre-send key stays never-send
+            return False, f"dispatch retirement/fence preflight failed: {type(exc).__name__}"
+        return True, reservation.current_state
+
+    def complete_worker_dispatch(
+        self,
+        *,
+        admission: WorkerDispatchAdmission,
+        request: WorkerDispatchRequest,
+        delivered: bool,
+        detail: str,
+    ) -> bool:
+        """Persist delivered only for turn-start; every other send is uncertain."""
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            DispatchOutboxFence,
+            DispatchOutboxFenceError,
+        )
+
+        key = self._fence_key(admission, request)
+        if key is None:
+            return False
+        fence = DispatchOutboxFence()
+        try:
+            if delivered and fence.mark_delivered(key, detail=detail):
+                return True
+            fence.record_uncertain(key, detail=detail or "worker send outcome uncertain")
+        except DispatchOutboxFenceError:
+            return False
+        except Exception:  # noqa: BLE001 - an unconfirmed outcome is never delivered
+            return False
+        return not delivered
 
     def dispatch_to_worker(
         self,
@@ -239,44 +398,49 @@ class HerdrWorkerDispatchOps:
         )
         if int(rc or 0) != 0:
             return rc, "not_started"
-        return rc, self._observe_worker_turn_start(worker_assigned_name)
-
-    def _observe_worker_turn_start(self, worker_assigned_name: str) -> str:
-        """The exact worker's post-ACK herdr runtime turn-start signal (fail-soft)."""
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
-            list_herdr_agent_rows,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
-            HerdrSessionStartError,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
-            AGENT_KEY_NAME,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
-            agent_row_runtime_state,
+        return rc, self._observe_worker_turn_start(
+            worker_assigned_name,
+            issue=issue,
+            journal=journal,
+            worker_locator=worker_pane,
         )
 
-        want = (worker_assigned_name or "").strip()
-        if not want:
-            return "unknown"
+    def _observe_worker_turn_start(
+        self,
+        worker_assigned_name: str,
+        *,
+        issue: str,
+        journal: str,
+        worker_locator: str,
+    ) -> str:
+        """Read exact ledger event/queue telemetry; never take a fresh runtime snapshot."""
+        from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+
         try:
-            rows = list_herdr_agent_rows(self.env)
-        except HerdrSessionStartError:
+            records = HerdrDeliveryLedger().records_for_issue(issue)
+        except Exception:  # noqa: BLE001 - unobservable telemetry is unknown
             return "unknown"
-        except Exception:  # noqa: BLE001 - an unobservable runtime is conservatively unknown
-            return "unknown"
-        matches = [
-            row
-            for row in rows
-            if isinstance(row, Mapping) and str(row.get(AGENT_KEY_NAME, "")).strip() == want
+        exact = [
+            record
+            for record in records
+            if record.journal_id == journal
+            and (
+                record.receiver == self.worker_provider()
+                or record.provider == self.worker_provider()
+            )
+            and record.target in {worker_assigned_name, worker_locator}
         ]
-        if len(matches) != 1:
-            return "unknown"
-        runtime = agent_row_runtime_state(matches[0])
-        if runtime in ("busy", "working"):
-            return "started"
-        if runtime == "awaiting_input":
-            return "delivered_not_started"
+        for record in reversed(exact):
+            event = record.turn_start_outcome or {}
+            event_token = str(event.get("outcome", "")).strip()
+            if event_token in {"started", "delivered_not_started"}:
+                return event_token
+            queue = record.queue_enter_observation or {}
+            runtime = str(queue.get("runtime_state", "")).strip()
+            if runtime in {"busy", "working"}:
+                return "started"
+            if runtime == "awaiting_input":
+                return "delivered_not_started"
         return "unknown"
 
 
