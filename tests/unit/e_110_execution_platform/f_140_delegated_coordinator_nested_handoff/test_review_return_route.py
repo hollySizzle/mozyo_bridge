@@ -155,27 +155,36 @@ class ReviewReturnRouteTest(unittest.TestCase):
         self.assertTrue(plan_review_return(markers, ISSUE, "35", _owner()).emit)
 
     def test_review_return_is_current_action_time_fence(self) -> None:
-        # The live review_result marker DECLARES its req (j#81496 F1) — the action identity authority.
-        markers = [_review_request("10"), _review_result("20", req="10")]
-        # Reserved round is still current.
-        self.assertTrue(review_return_is_current(markers, ISSUE, "20", "10"))
-        # A newer review_request landed after reserve -> the round restarted -> stale.
-        self.assertFalse(review_return_is_current(markers + [_review_request("30")], ISSUE, "20", "10"))
-        # A newer review_result landed -> stale.
-        self.assertFalse(review_return_is_current(markers + [_review_result("40")], ISSUE, "20", "10"))
-        # R1-re-review F1: a newer implementation_done correction landed -> stale.
-        self.assertFalse(review_return_is_current(markers + [_impl_done("30")], ISSUE, "20", "10"))
-        # The recorded correlation drifted from the current one -> stale.
-        self.assertFalse(review_return_is_current(markers, ISSUE, "20", "7"))
-        # R1-re-review F2: a blank recorded correlation is fail-closed (never a wildcard), even with a
-        # valid live review round present.
-        self.assertFalse(review_return_is_current(markers, ISSUE, "20", ""))
-        # j#81496 F1: the LIVE marker declares no req -> fail-closed even if the recorded req matches.
-        self.assertFalse(review_return_is_current([_review_request("10"), _review_result("20")], ISSUE, "20", "10"))
-        # j#81496 F1: the LIVE marker's declared req drifted from the correlated request -> stale.
-        self.assertFalse(review_return_is_current([_review_request("10"), _review_result("20", req="7")], ISSUE, "20", "10"))
+        # The live markers carry the full v2 identity; the row's recorded (req, head, conclusion) is
+        # exact-matched against them (j#81496 / j#81506 / j#81525).
+        markers = [_review_request("10", head=HEAD_A), _review_result("20", req="10", head=HEAD_A, conclusion="approved")]
+
+        def _cur(mk, recorded_req="10", head=HEAD_A, conclusion="approved"):
+            return review_return_is_current(mk, ISSUE, "20", recorded_req, head, conclusion)
+
+        self.assertTrue(_cur(markers))  # reserved round still current + identity matches
+        # A newer review_request / review_result / correction landed -> stale.
+        self.assertFalse(_cur(markers + [_review_request("30", head=HEAD_A)]))
+        self.assertFalse(_cur(markers + [_review_result("40", req="10", head=HEAD_A, conclusion="approved")]))
+        self.assertFalse(_cur(markers + [_impl_done("30")]))
+        # A drifted / blank recorded correlation is fail-closed.
+        self.assertFalse(_cur(markers, recorded_req="7"))
+        self.assertFalse(_cur(markers, recorded_req=""))
+        # j#81496: a live marker declaring no / drifted req is fail-closed.
+        self.assertFalse(_cur([_review_request("10", head=HEAD_A), _review_result("20", head=HEAD_A, conclusion="approved")]))
+        self.assertFalse(_cur([_review_request("10", head=HEAD_A), _review_result("20", req="7", head=HEAD_A, conclusion="approved")]))
+        # j#81525 F1: a single-marker HEAD drift on this re-read (live head != recorded) -> stale.
+        drift_head = [_review_request("10", head=HEAD_B), _review_result("20", req="10", head=HEAD_B, conclusion="approved")]
+        self.assertFalse(_cur(drift_head, head=HEAD_A))  # recorded HEAD_A, live HEAD_B
+        # j#81525 F1: an explicit-to-explicit CONCLUSION drift (approved -> changes_requested) -> stale.
+        drift_concl = [_review_request("10", head=HEAD_A), _review_result("20", req="10", head=HEAD_A, conclusion="changes_requested")]
+        self.assertFalse(_cur(drift_concl, conclusion="approved"))  # recorded approved, live changes_requested
+        # A blank / malformed recorded head or non-explicit recorded conclusion is fail-closed.
+        self.assertFalse(_cur(markers, head=""))
+        self.assertFalse(_cur(markers, head="deadbeef"))
+        self.assertFalse(_cur(markers, conclusion="pending"))
         # An uncorrelated result (no request) is not current.
-        self.assertFalse(review_return_is_current([_review_result("20")], ISSUE, "20", ""))
+        self.assertFalse(_cur([_review_result("20", req="10", head=HEAD_A, conclusion="approved")]))
 
     def test_newer_implementation_done_correction_refuses_at_discovery(self) -> None:
         # R1-re-review F1: a correction (implementation_done j30) after the result stales the return.

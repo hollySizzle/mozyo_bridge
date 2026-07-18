@@ -866,6 +866,35 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])  # the irreversible send never fires
         self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
 
+    def _final_reread_drift_sends_zero(self, reread_source):
+        """Enqueue a valid v2 row, keep the supervisor snapshot valid, but hand the SENDER's final
+        round-fence a DRIFTED single-marker re-read; assert the irreversible send never fires (j#81525)."""
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_fenced_discovery(_current_round_source(), wsid)  # recorded head=CUR, approved
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
+            round_fence_source=reread_source,
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+
+    def test_fs_final_reread_head_drift_sends_zero(self) -> None:
+        # j#81525 F1: the final re-read's single review_result reviewed a DIFFERENT head than recorded.
+        self._final_reread_drift_sends_zero(MappingRedmineJournalSource(payload=_journals(
+            ("110", _req(OLD_HEAD)), ("120", _res(head=OLD_HEAD, req="110", conclusion="approved")),
+        )))
+
+    def test_fs_final_reread_conclusion_drift_sends_zero(self) -> None:
+        # j#81525 F1: the final re-read's conclusion drifted approved -> changes_requested (explicit-to-
+        # explicit); the recorded conclusion no longer matches, so the irreversible send never fires.
+        self._final_reread_drift_sends_zero(MappingRedmineJournalSource(payload=_journals(
+            ("110", _req(CUR_HEAD)), ("120", _res(head=CUR_HEAD, req="110", conclusion="changes_requested")),
+        )))
+
     def test_producer_cli_fail_closed_validation(self) -> None:
         # j#81487 F2: the canonical --emit-gate writer refuses to emit a head-less / malformed / req-less
         # review marker rather than write one the callback fence would reject.
