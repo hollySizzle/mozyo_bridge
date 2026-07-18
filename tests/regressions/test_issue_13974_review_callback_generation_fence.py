@@ -71,6 +71,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RoleProviderBinding,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+    RETURN_AMBIGUOUS_REVIEW_IDENTITY,
     RETURN_MALFORMED_REVIEW_HEAD,
     RETURN_MISSING_REVIEW_CONCLUSION,
     RETURN_MISSING_REVIEW_HEAD,
@@ -293,6 +294,18 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         so the terminal cases exercise a row that ALREADY exists when the fenced supervisor runs."""
         owner = owning_lane_binding(wsid, ISSUE, RoleProviderBinding.default(), lifecycle_store=self.life)
         candidates, _ = discover_review_returns(source, ISSUE, owner, workspace_id=wsid)
+        CallbackOutboxProcessor(self.outbox, source, workspace_id=wsid).ingest(candidates, now=NOW)
+        return candidates
+
+    def _enqueue_via_fenced_discovery(self, source, wsid):
+        """Enqueue a row via FENCED discovery so the payload carries the full v2 identity
+        (req + head + conclusion) — the load-bearing witness for the send-edge conclusion/head fences
+        (j#81512 F2): without this the payload lacks head/conclusion and the head fence fires first."""
+        owner = owning_lane_binding(wsid, ISSUE, RoleProviderBinding.default(), lifecycle_store=self.life)
+        candidates, _ = discover_review_returns(
+            source, ISSUE, owner, workspace_id=wsid, dispatch_anchor_journal=ANCHOR
+        )
+        self.assertEqual(len(candidates), 1, "fenced discovery should emit a full-identity row")
         CallbackOutboxProcessor(self.outbox, source, workspace_id=wsid).ingest(candidates, now=NOW)
         return candidates
 
@@ -727,11 +740,12 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertIn(RETURN_MISSING_REVIEW_CONCLUSION, self._refusals(report))
 
     def test_fs_preexisting_live_conclusion_missing_terminal_via_supervisor(self) -> None:
-        # conclusion MISSING at the SEND EDGE: a row enqueued with a valid conclusion, then the LIVE
-        # marker's conclusion is removed (-> pending). The send edge terminally fences the row.
+        # conclusion MISSING at the SEND EDGE: a row FENCED-enqueued with a full v2 payload
+        # (req+head+conclusion=approved), then the LIVE marker's conclusion is removed (-> pending). The
+        # payload's head/req still match, so the CONCLUSION fence is the load-bearing terminal (j#81512 F2).
         wsid = self._register_ws()
         self._own_and_lease(wsid)
-        self._enqueue_via_unfenced_discovery(_current_round_source(), wsid)  # recorded conclusion approved
+        self._enqueue_via_fenced_discovery(_current_round_source(), wsid)  # payload conclusion=approved
         self.assertTrue(self._return_rows([CALLBACK_PENDING]))
         transport = _CapturingTransport()
         supervisor = self._build_supervisor(
@@ -743,11 +757,12 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
 
     def test_fs_preexisting_live_conclusion_drift_terminal_via_supervisor(self) -> None:
-        # conclusion DRIFT at the SEND EDGE: the row recorded approved, the LIVE marker now says
-        # changes_requested. The send edge terminally fences the drifted row.
+        # conclusion DRIFT at the SEND EDGE: the row FENCED-enqueued with conclusion=approved (full v2
+        # payload), the LIVE marker now says changes_requested. head/req match -> the CONCLUSION fence
+        # is the load-bearing terminal (j#81512 F2).
         wsid = self._register_ws()
         self._own_and_lease(wsid)
-        self._enqueue_via_unfenced_discovery(_current_round_source(conclusion="approved"), wsid)
+        self._enqueue_via_fenced_discovery(_current_round_source(conclusion="approved"), wsid)
         self.assertTrue(self._return_rows([CALLBACK_PENDING]))
         transport = _CapturingTransport()
         supervisor = self._build_supervisor(
@@ -758,6 +773,37 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])
         self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
         self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
+
+    def test_fs_newer_malformed_conclusion_shadows_old_valid_via_supervisor(self) -> None:
+        # j#81512 F1 case A: an OLD valid approved result (j120) followed by a NEWER review_result (j130)
+        # with a malformed conclusion. The malformed newer result stays recognized (pending) and
+        # SHADOWS the old one, so nothing delivers — the old result is not sent as "current".
+        malformed_newer = MappingRedmineJournalSource(payload=_journals(
+            ("110", _req(CUR_HEAD)),
+            ("120", _res(head=CUR_HEAD, req="110", conclusion="approved")),
+            ("130", _res(head=CUR_HEAD, req="110", conclusion="bogus")),  # newer, out-of-vocab
+        ))
+        _wsid, report = self._supervise_current(malformed_newer)
+        self.assertEqual(self._transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        # j130 (malformed -> pending) is the latest; its return is refused for a non-explicit conclusion.
+        self.assertIn(RETURN_MISSING_REVIEW_CONCLUSION, self._refusals(report))
+
+    def test_fs_same_journal_conflicting_conclusion_ambiguous_via_supervisor(self) -> None:
+        # j#81512 F1 case B: the SAME provider journal (j120) carries two review_result markers with
+        # disagreeing conclusions. The identity is ambiguous -> fail-closed, nothing delivers.
+        conflicting = MappingRedmineJournalSource(payload=_journals(
+            ("110", _req(CUR_HEAD)),
+            ("120",
+             _res(head=CUR_HEAD, req="110", conclusion="approved") + "\n"
+             + _res(head=CUR_HEAD, req="110", conclusion="changes_requested")),
+        ))
+        _wsid, report = self._supervise_current(conflicting)
+        self.assertEqual(self._transport.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertIn(RETURN_AMBIGUOUS_REVIEW_IDENTITY, self._refusals(report))
 
     def test_producer_cli_fail_closed_validation(self) -> None:
         # j#81487 F2: the canonical --emit-gate writer refuses to emit a head-less / malformed / req-less

@@ -125,6 +125,10 @@ RETURN_MALFORMED_REVIEW_HEAD = "malformed_review_head"
 #: conclusion is normalized to ``pending`` at intake, which is not a real review outcome. Only an
 #: explicit ``approved`` / ``changes_requested`` is returnable.
 RETURN_MISSING_REVIEW_CONCLUSION = "missing_review_conclusion"
+#: The provider journal carries MORE THAN ONE review_result marker on the same ``(issue, journal)`` that
+#: disagree on identity — conclusion / head / req (Redmine #13974 / j#81512): a single ``source_sequence``
+#: with conflicting review outcomes is not a unique action authority, so it is fail-closed.
+RETURN_AMBIGUOUS_REVIEW_IDENTITY = "ambiguous_review_identity"
 
 #: The refusal reasons — every one is a fail-closed no-return (never a guessed / self / stale /
 #: uncorrelated / previous-generation / head-unconfirmed send).
@@ -144,6 +148,7 @@ RETURN_REFUSAL_REASONS = frozenset(
         RETURN_REVIEW_REQUEST_UNCONFIRMED,
         RETURN_MALFORMED_REVIEW_HEAD,
         RETURN_MISSING_REVIEW_CONCLUSION,
+        RETURN_AMBIGUOUS_REVIEW_IDENTITY,
     }
 )
 
@@ -397,43 +402,33 @@ def is_full_commit_head(head: object) -> bool:
     return all(c in "0123456789abcdef" for c in token)
 
 
-def review_result_marker_request(
-    markers: Iterable[JournalMarker], issue: str, review_journal: str
+def _review_marker_field(
+    markers: Iterable[JournalMarker], issue: str, journal: str, gate: str, attr: str
 ) -> str:
-    """The ``review_request_journal`` DECLARED on the review_result marker at ``review_journal`` (pure).
+    """The ``attr`` of the first ``gate`` marker on ``(issue, journal)``, or ``""`` (pure).
 
-    Redmine #13974 / j#81487 F1: the v2 marker's own ``req`` is the action identity, read from the
-    structured marker (never re-derived). Blank when the marker is legacy / declares no request.
+    The shared reader the v2 identity accessors are built on — the structured marker is the authority
+    (never prose). Blank when no such marker / a legacy marker lacks the field.
     """
-    issue_s = str(issue).strip()
-    journal_s = str(review_journal).strip()
+    issue_s, journal_s, gate_s = str(issue).strip(), str(journal).strip(), str(gate).strip()
     for mk in markers:
         if (
             str(mk.issue).strip() == issue_s
             and str(mk.journal).strip() == journal_s
-            and str(mk.gate).strip() == GATE_REVIEW
+            and str(mk.gate).strip() == gate_s
         ):
-            return str(getattr(mk, "review_request_journal", "") or "").strip()
+            return str(getattr(mk, attr, "") or "").strip()
     return ""
+
+
+def review_result_marker_request(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
+    """The ``review_request_journal`` DECLARED on the review_result marker (v2 action identity; j#81487)."""
+    return _review_marker_field(markers, issue, review_journal, GATE_REVIEW, "review_request_journal")
 
 
 def review_result_head(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
-    """The reviewed ``target_head`` on the review_result marker at ``review_journal``, or ``""`` (pure).
-
-    Redmine #13974 (j#81454 A): the callback conjoins the exact commit head the review reviewed, read
-    ONLY from the structured marker's ``target_head`` (never parsed from prose). Blank when the marker
-    is legacy / head-less.
-    """
-    issue_s = str(issue).strip()
-    journal_s = str(review_journal).strip()
-    for mk in markers:
-        if (
-            str(mk.issue).strip() == issue_s
-            and str(mk.journal).strip() == journal_s
-            and str(mk.gate).strip() == GATE_REVIEW
-        ):
-            return str(getattr(mk, "target_head", "") or "").strip()
-    return ""
+    """The reviewed ``target_head`` on the review_result marker (read only from the marker; j#81454 A)."""
+    return _review_marker_field(markers, issue, review_journal, GATE_REVIEW, "target_head")
 
 
 def is_explicit_review_conclusion(conclusion: object) -> bool:
@@ -445,18 +440,36 @@ def is_explicit_review_conclusion(conclusion: object) -> bool:
     return str(conclusion or "").strip() in _EXPLICIT_REVIEW_CONCLUSIONS
 
 
-def review_result_conclusion(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
-    """The ``review_conclusion`` on the review_result marker at ``review_journal``, or ``""`` (pure)."""
+def review_result_is_ambiguous(
+    markers: Iterable[JournalMarker], issue: str, review_journal: str
+) -> bool:
+    """Whether ``(issue, review_journal)`` carries CONFLICTING review_result markers (pure; j#81512).
+
+    A single provider journal id (``source_sequence``) must resolve to exactly one review outcome. If
+    two or more ``review_result`` markers on the same anchor disagree on ``(conclusion, head, req)``,
+    the identity is not unique and is fail-closed — a conflicting source_sequence is never an action
+    authority. Zero or one marker (or several identical ones) is unambiguous.
+    """
     issue_s = str(issue).strip()
     journal_s = str(review_journal).strip()
+    identities = set()
     for mk in markers:
         if (
             str(mk.issue).strip() == issue_s
             and str(mk.journal).strip() == journal_s
             and str(mk.gate).strip() == GATE_REVIEW
         ):
-            return str(getattr(mk, "review_conclusion", "") or "").strip()
-    return ""
+            identities.add((
+                str(getattr(mk, "review_conclusion", "") or "").strip(),
+                str(getattr(mk, "target_head", "") or "").strip(),
+                str(getattr(mk, "review_request_journal", "") or "").strip(),
+            ))
+    return len(identities) > 1
+
+
+def review_result_conclusion(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
+    """The ``review_conclusion`` on the review_result marker at ``review_journal``, or ``""`` (pure)."""
+    return _review_marker_field(markers, issue, review_journal, GATE_REVIEW, "review_conclusion")
 
 
 def current_review_generation_conclusion(markers: Iterable[JournalMarker], issue: str) -> str:
@@ -469,27 +482,15 @@ def current_review_generation_conclusion(markers: Iterable[JournalMarker], issue
     """
     marker_list = list(markers)
     latest = latest_review_result_journal(marker_list, issue)
-    if not latest:
-        return ""
+    if not latest or review_result_is_ambiguous(marker_list, issue, latest):
+        return ""  # j#81512: an ambiguous latest identity is never an action authority
     conclusion = review_result_conclusion(marker_list, issue, latest)
     return conclusion if is_explicit_review_conclusion(conclusion) else ""
 
 
 def review_request_head(markers: Iterable[JournalMarker], issue: str, request_journal: str) -> str:
-    """The requested ``target_head`` on the review_request marker at ``request_journal``, or ``""`` (pure).
-
-    The head the review round pinned (#13974). Blank when the request marker is legacy / head-less.
-    """
-    issue_s = str(issue).strip()
-    journal_s = str(request_journal).strip()
-    for mk in markers:
-        if (
-            str(mk.issue).strip() == issue_s
-            and str(mk.journal).strip() == journal_s
-            and str(mk.gate).strip() == GATE_REVIEW_REQUEST
-        ):
-            return str(getattr(mk, "target_head", "") or "").strip()
-    return ""
+    """The requested ``target_head`` on the review_request marker (the head the round pinned; #13974)."""
+    return _review_marker_field(markers, issue, request_journal, GATE_REVIEW_REQUEST, "target_head")
 
 
 def current_review_generation_head(markers: Iterable[JournalMarker], issue: str) -> str:
@@ -526,8 +527,8 @@ def current_review_generation_request(markers: Iterable[JournalMarker], issue: s
     """
     marker_list = list(markers)
     latest = latest_review_result_journal(marker_list, issue)
-    if not latest:
-        return ""
+    if not latest or review_result_is_ambiguous(marker_list, issue, latest):
+        return ""  # j#81512: an ambiguous latest identity is never an action authority
     declared = review_result_marker_request(marker_list, issue, latest)
     correlated = correlated_review_request_journal(marker_list, issue, latest)
     if not declared or not correlated or declared != correlated:
@@ -760,6 +761,10 @@ def plan_review_return(
     result_head = ""
     result_conclusion = ""
     if dispatch_anchor_journal is not None:
+        # j#81512: a single provider journal with conflicting review_result markers is not a unique
+        # action authority — fail closed before reading any single marker's identity.
+        if review_result_is_ambiguous(markers, issue, review_journal_s):
+            return _refuse(RETURN_AMBIGUOUS_REVIEW_IDENTITY, review_journal_s)
         declared_req = review_result_marker_request(markers, issue, review_journal_s)
         if not declared_req or declared_req != request_journal:
             return _refuse(RETURN_REVIEW_REQUEST_UNCONFIRMED, review_journal_s)
@@ -952,6 +957,7 @@ __all__ = (
     "RETURN_REVIEW_REQUEST_UNCONFIRMED",
     "RETURN_MALFORMED_REVIEW_HEAD",
     "RETURN_MISSING_REVIEW_CONCLUSION",
+    "RETURN_AMBIGUOUS_REVIEW_IDENTITY",
     "RETURN_REFUSAL_REASONS",
     "REVIEW_RETURN_FENCE_PREVIOUS_GENERATION",
     "REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR",
@@ -975,6 +981,7 @@ __all__ = (
     "review_request_head",
     "review_result_marker_request",
     "review_result_conclusion",
+    "review_result_is_ambiguous",
     "is_full_commit_head",
     "is_explicit_review_conclusion",
     "current_review_generation_head",

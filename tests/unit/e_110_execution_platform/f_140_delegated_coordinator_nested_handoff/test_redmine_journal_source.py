@@ -79,9 +79,15 @@ class ExtractFromNoteTest(unittest.TestCase):
         note = "[mozyo:unknownchannel:gate=review_request]"
         self.assertEqual(extract_markers_from_note("12672", "1", note), ())
 
-    def test_malformed_conclusion_fails_closed_skipped(self):
+    def test_malformed_conclusion_is_recognized_as_non_explicit(self):
+        # Redmine #13974 j#81512: a RECOGNIZED review_result gate with an out-of-vocabulary conclusion
+        # is NOT dropped (that would let a newer malformed result be invisible so an older valid result
+        # stays "latest" and delivers). It stays recognized with a non-explicit (pending) conclusion so
+        # it shadows the old result; the callback fence then refuses the non-explicit conclusion.
         note = "[mozyo:workflow-event:gate=review_result:conclusion=maybe]"
-        self.assertEqual(extract_markers_from_note("12672", "1", note), ())
+        markers = extract_markers_from_note("12672", "1", note)
+        self.assertEqual([m.gate for m in markers], ["review"])
+        self.assertEqual(markers[0].review_conclusion, "pending")
 
     def test_multiple_markers_in_one_note(self):
         note = (

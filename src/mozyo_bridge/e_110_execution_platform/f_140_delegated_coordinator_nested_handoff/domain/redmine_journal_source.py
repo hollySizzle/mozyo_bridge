@@ -49,6 +49,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     build_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    CALLBACK_NONE,
+    CALLBACK_STATES,
+    REVIEW_CONCLUSIONS,
     REVIEW_PENDING,
 )
 
@@ -168,14 +171,26 @@ def _gate_marker_from_fields(
             return default
         return raw.strip().lower() in ("1", "true", "yes", "y")
 
+    # Redmine #13974 j#81512: a RECOGNIZED gate-bearing marker is never made invisible by an
+    # out-of-vocabulary ``conclusion`` / ``callback`` — that would let a NEWER malformed review_result
+    # (e.g. ``conclusion=bogus``) be dropped so an OLDER valid result stays "latest" and delivers.
+    # Instead the bad sub-field fails closed to its non-explicit default (``pending`` / ``none``), so
+    # the marker still counts in the latest computation and SHADOWS the old result; the callback fence
+    # then refuses the non-explicit conclusion (discovery 0-enqueue / send-edge terminal).
+    conclusion = (fields.get("conclusion") or REVIEW_PENDING).strip() or REVIEW_PENDING
+    if conclusion not in REVIEW_CONCLUSIONS:
+        conclusion = REVIEW_PENDING
+    callback = (fields.get("callback") or CALLBACK_NONE).strip() or CALLBACK_NONE
+    if callback not in CALLBACK_STATES:
+        callback = CALLBACK_NONE
+
     try:
         return build_marker(
             entry.issue_id,
             entry.journal_id,
             kind,  # build_marker maps review_result -> review and validates the vocabulary
-            review_conclusion=(fields.get("conclusion") or REVIEW_PENDING).strip()
-            or REVIEW_PENDING,
-            callback_state=(fields.get("callback") or "none").strip() or "none",
+            review_conclusion=conclusion,
+            callback_state=callback,
             commit_bearing=_flag("commit", False),
             integration_recorded=_flag("integrated", False),
             issue_open=_flag("open", True),
