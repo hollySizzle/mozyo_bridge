@@ -355,6 +355,10 @@ Table naming:
       worker pin が無いので generation authority は **live worker の startup self-attestation を LIVE
       locator に generation-bound したもの** (herdr の世代 discriminant は live locator、attestation store
       は runtime version を保存しない — `herdr-native-identity.md`) とし、assigned_name も明示照合する。
+      **live row の provider / detected agent (`agent` field) が resolved worker provider と一致する
+      ことも fail-closed 照合する** (#13846 R4 review F1): declared 経路の `binds_same_generation`
+      (`live_pin.provider`) が持つ provider 軸を slot-less 経路でも保ち、name+locator 一致でも
+      wrong-provider row を zero-send する (surface されない field は name-encoded provider に fallback)。
       R3 の `binds_same_generation` は declared pin が存在する前提だったため経路 (b) では発火せず、空
       snapshot が false `worker_liveness_authority_conflict` を生んで installed fresh E2E 全体を止めていた。
       経路 (b) は **`PIN_PAIR_ABSENT` (真に slot-less な row) のみ**に適用し、positively suspicious な

@@ -443,6 +443,40 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
                     result.reason,
                 )
 
+    def test_fresh_create_wrong_live_provider_stays_conflict(self):
+        # Redmine #13846 R4 review F1: a slot-less fresh row whose live `provider` / detected
+        # `agent` disagrees with the resolved worker provider is a foreign / mis-bound process
+        # even though the assigned name and locator line up and the startup attestation is
+        # present. The declared path rejects this via `binds_same_generation` (`live_pin.provider`);
+        # the slot-less path must fail closed on the same identity axis instead of promoting to
+        # healthy — the provider VALUE is never exposed, only the field-label detail token.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        # name still encodes the expected `claude` slot (so the row is name-matched), but the live
+        # row surfaces a foreign provider + detected agent. `agent=codex` keeps the slot LIVE
+        # (positive detection), so `slot_state` alone does not block it.
+        wrong_provider_row = {
+            "name": name,
+            "pane_id": "w28:p75",
+            "provider": "codex",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        result = self._observe(
+            [wrong_provider_row],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": ()},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertFalse(result.facts.generation_binding_current)
+        self.assertIn("fresh_live_provider_mismatch", result.reason)
+        self.assertNotIn("codex", result.reason)
+
     def test_incomplete_or_foreign_declared_pair_stays_conflict(self):
         # A positively suspicious declared shape is NEVER the slot-less fresh path: a half pair
         # (worker without gateway -> incomplete) and a foreign pin role are ambiguous provenance
