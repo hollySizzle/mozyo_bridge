@@ -76,7 +76,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     sublane_hibernated_bound_pair_convergence_live as CL,
+    sublane_prepare_readonly_projection as PRP,
     sublane_quarantine as QM,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import (
+    PrepareBoundPairRequest,
+    PreparationObservation,
+    STATE_BLOCKED,
+    run_bound_pair_preparation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard_live import (
+    LiveBoundPairPreparationOps,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_composer_discard import (
+    RESUME_STARTUP_ROLLBACK_REQUIRED,
+    expectation_for,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (
     ReplacementActuatorUseCase,
@@ -749,6 +763,35 @@ def _agent_list_rows(fake: FakeHerdr):
     return json.loads(out).get("agents", [])
 
 
+def _append_v1_lane(tmp: str, *, lane: str, issue: str):
+    """Seed a v1 home + registered lane workspace with a live, normal-v1-attested pair."""
+    home = Path(tmp) / "home"
+    home.mkdir()
+    _seed_v1_attestation_store(home)
+    coord = Path(tmp) / "coord"
+    coord.mkdir()
+    worktree = Path(tmp) / "lane-wt"
+    worktree.mkdir()
+    env = with_provider_path(
+        {
+            HERDR_ENV: str(_fake_binary(tmp)),
+            "MOZYO_BRIDGE_HOME": str(home),
+            "MOZYO_BRIDGE_LAUNCHER": str(_fake_attest_launcher(tmp)),
+        }
+    )
+    fake = _V1AttestingHerdr(attestation_home=home)
+    with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+        HerdrSublaneActuatorOps(
+            repo_root=coord, lane_label=lane, issue=issue, env=env, runner=fake.run,
+        ).append_lane_column(str(worktree))
+    ws = read_anchor(worktree)["workspace_id"]
+    gw_name = encode_assigned_name(ws, "codex", lane)
+    wk_name = encode_assigned_name(ws, "claude", lane)
+    gw_old = fake.agent_named(gw_name)["pane_id"]
+    wk_old = fake.agent_named(wk_name)["pane_id"]
+    return home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old
+
+
 class _AttestingHerdr(FakeHerdr):
     """FakeHerdr that self-attests each real launch and can drop one launch of a provider.
 
@@ -1371,32 +1414,7 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
     ACTION = "partial-bind-act-1"
 
     def _append_v1_pair(self, tmp: str):
-        home = Path(tmp) / "home"
-        home.mkdir()
-        _seed_v1_attestation_store(home)
-        coord = Path(tmp) / "coord"
-        coord.mkdir()
-        worktree = Path(tmp) / "lane-wt"
-        worktree.mkdir()
-        env = with_provider_path(
-            {
-                HERDR_ENV: str(_fake_binary(tmp)),
-                "MOZYO_BRIDGE_HOME": str(home),
-                "MOZYO_BRIDGE_LAUNCHER": str(_fake_attest_launcher(tmp)),
-            }
-        )
-        fake = _V1AttestingHerdr(attestation_home=home)
-        with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
-            HerdrSublaneActuatorOps(
-                repo_root=coord, lane_label=self.LANE, issue=self.ISSUE,
-                env=env, runner=fake.run,
-            ).append_lane_column(str(worktree))
-        ws = read_anchor(worktree)["workspace_id"]
-        gw_name = encode_assigned_name(ws, "codex", self.LANE)
-        wk_name = encode_assigned_name(ws, "claude", self.LANE)
-        gw_old = fake.agent_named(gw_name)["pane_id"]
-        wk_old = fake.agent_named(wk_name)["pane_id"]
-        return home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old
+        return _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
 
     def _heal_gateway(self, home, coord, worktree, env, fake, gw_name, gw_old):
         ops = HerdrSublaneActuatorOps(
@@ -1645,6 +1663,271 @@ class SeededA14PartialProjectionTests(unittest.TestCase):
                 with self.assertRaises(V1ReplacementBindingFailure) as caught:
                     self._resume(home, gw_name, gw_old, rows, existing)
             self.assertEqual(caught.exception.reason, V1_BINDING_STARTUP_DEBT)
+
+
+class A14PartialPreflightSurfaceTests(unittest.TestCase):
+    """Redmine #13933 R13 F1 (review j#82079): the read-only ``prepare-bound-pair`` preflight
+    both NAMES the durable a14 rollback-owed partial and hands the operator the exact inner
+    startup ``--action-id`` the public rollback rail needs — through the public entry point,
+    with the REAL cross-store detection (side binding + startup fence + attestation)."""
+
+    LANE = "issue_13846_preflight_surface"
+    ISSUE = "13846"
+
+    def _seed_partial(
+        self, home, ws, gw_name, gw_live, *, action, receipt="workspace=w1",
+        phase=PHASE_ROLLBACK_OWED, old_locator="w1:pPREV", attest_locator=None,
+    ):
+        nonce = f"preflight-nonce-{action}"
+        managed = ("claude", "codex")
+        unit = StartupUnit(ws, self.LANE, managed)
+        sa_id = startup_action_id(unit, nonce)
+        HerdrIdentityReplacementBindingStore(home=home).reserve(
+            action_id=action, assigned_name=gw_name, workspace_id=ws, role="codex",
+            lane_id=self.LANE, old_locator=old_locator, startup_nonce=nonce,
+            startup_action_id=sa_id,
+        )
+        fence = StartupTransactionFence(home=home)
+        fence.reserve(unit, nonce)
+        fence.record_participant(
+            sa_id, Participant(role="codex", assigned_name=gw_name,
+                               locator=gw_live, receipt=receipt)
+        )
+        fence.set_phase(sa_id, PHASE_HEALTH_CHECK)
+        fence.set_phase(sa_id, phase)
+        if attest_locator is not None:  # override the append's clean normal-v1 row
+            HerdrIdentityAttestationStore(home=home).upsert(
+                IdentityAttestationRecord(
+                    assigned_name=gw_name, workspace_id=ws, role="codex",
+                    lane_id=self.LANE, locator=attest_locator, verdict=VERDICT_PRESENT,
+                    observed_at="2099-07-18T00:00:00+00:00", replacement_action_id="",
+                )
+            )
+        return sa_id
+
+    def test_real_detection_returns_exact_startup_id_and_fails_shut_on_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            request = PrepareBoundPairRequest(
+                issue=self.ISSUE, journal="80925", lane=self.LANE,
+                worktree=str(worktree), branch="main",
+            )
+            ops = LiveBoundPairPreparationOps(repo_root=coord, env=env)
+
+            def _detect(action):
+                with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                     mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                    return ops.rollback_owed_startup_action(request, action_id=action)
+
+            # Happy path: the gateway is live at gw_old (a fresh slot vs the synthetic prior
+            # locator), normal-v1 attested by the append, and its startup txn is rollback_owed.
+            sa_id = self._seed_partial(home, ws, gw_name, gw_old, action="act-happy")
+            self.assertEqual(_detect("act-happy"), sa_id)
+
+            # Mismatch matrix -> "" (never this owned partial; left to the generic block).
+            self._seed_partial(home, ws, gw_name, gw_old, action="act-no-receipt", receipt="")
+            self.assertEqual(_detect("act-no-receipt"), "")
+            self._seed_partial(home, ws, gw_name, gw_old, action="act-not-owed",
+                               phase=PHASE_COMPLETED_SUCCESS)
+            self.assertEqual(_detect("act-not-owed"), "")
+            self._seed_partial(home, ws, gw_name, gw_old, action="act-stale-locator",
+                               old_locator=gw_old)  # live == old -> not a fresh launch
+            self.assertEqual(_detect("act-stale-locator"), "")
+            self._seed_partial(home, ws, gw_name, gw_old, action="act-foreign-attest",
+                               attest_locator="w9:pGHOST")  # attestation mismatches live
+            self.assertEqual(_detect("act-foreign-attest"), "")
+            # No side binding at all for this action.
+            self.assertEqual(_detect("act-never-reserved"), "")
+
+    def test_public_preflight_surfaces_rollback_command_with_startup_action_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            request = PrepareBoundPairRequest(
+                issue=self.ISSUE, journal="80925", lane=self.LANE,
+                worktree=str(worktree), branch="main",
+            )
+            # A self-consistent distinct-owner marker; its action id is the prep/replacement
+            # action that keys the side binding (they are one id, #13933).
+            expectation = expectation_for(
+                issue=self.ISSUE, lane=self.LANE, revision=4, generation=1,
+                resolved_worktree=str(worktree), worktree_identity="wt_preflight",
+                branch="main",
+                slots=(
+                    BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
+                              locator=gw_old, disposition=SLOT_HEALTHY),
+                    BoundSlot(role="worker", provider="claude", assigned_name=wk_name,
+                              locator=wk_old, disposition=SLOT_RECOVER),
+                ),
+                discard_roles=("worker",),
+            )
+            sa_id = self._seed_partial(home, ws, gw_name, gw_old, action=expectation.action_id)
+
+            # A blocked observation (no discardable composer) so the preflight consults the
+            # resume path; the marker + REAL rollback detection do the rest.
+            blocked_obs = PreparationObservation(
+                workspace_id=ws, worktree_path=str(worktree), worktree_identity="wt_preflight",
+                branch="main", revision=4, generation=1, lifecycle_exact=True,
+                pins_empty=True, pins_known=True, inventory_readable=True,
+                worktree_readable=True, worktree_clean=True, branch_matches=True,
+                slots=(
+                    BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
+                              locator=gw_old, disposition=SLOT_HEALTHY),
+                    BoundSlot(role="worker", provider="claude", assigned_name=wk_name,
+                              locator=wk_old, disposition=SLOT_HEALTHY),
+                ),
+                discard_roles=(),
+            )
+
+            class _SeamedPreflightOps(LiveBoundPairPreparationOps):
+                # observe (lifecycle projection) and approval_fields (Redmine journal) are the
+                # external inputs the test supplies deterministically; rollback_owed_startup_action
+                # stays the REAL cross-store detection under test.
+                def observe(self_inner, req, *, action_id=""):
+                    return blocked_obs
+
+                def approval_fields(self_inner, issue, journal):
+                    return (expectation.marker_fields(),)
+
+            ops = _SeamedPreflightOps(repo_root=coord, env=env)
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                 mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                outcome = run_bound_pair_preparation(request, execute=False, ops=ops)
+
+            self.assertEqual(outcome.state, STATE_BLOCKED)
+            self.assertEqual(outcome.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED)
+            self.assertEqual(outcome.startup_rollback_action_id, sa_id)
+            self.assertFalse(outcome.executed)
+            # The operator gets a ready-to-run public rollback command carrying the exact id.
+            self.assertIn(f"--action-id {sa_id}", outcome.detail)
+            self.assertIn("session-rollback", outcome.detail)
+            # Value-safe: no locator / receipt bytes leak into the public surface.
+            for secret in (gw_old, wk_old, "workspace=w1"):
+                self.assertNotIn(secret, outcome.detail)
+            self.assertEqual(outcome.as_payload()["startup_rollback_action_id"], sa_id)
+
+    def test_without_a_rollback_owed_partial_the_old_no_progress_stands(self):
+        # Negative control: identical seam, but NO seeded a14 partial. The preflight must fall
+        # back to the prior `no_action_owned_progress` diagnostic (the surface is specific to
+        # the real owned partial, never a blanket relabel of the resume path).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            request = PrepareBoundPairRequest(
+                issue=self.ISSUE, journal="80925", lane=self.LANE,
+                worktree=str(worktree), branch="main",
+            )
+            expectation = expectation_for(
+                issue=self.ISSUE, lane=self.LANE, revision=4, generation=1,
+                resolved_worktree=str(worktree), worktree_identity="wt_preflight",
+                branch="main",
+                slots=(
+                    BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
+                              locator=gw_old, disposition=SLOT_HEALTHY),
+                    BoundSlot(role="worker", provider="claude", assigned_name=wk_name,
+                              locator=wk_old, disposition=SLOT_RECOVER),
+                ),
+                discard_roles=("worker",),
+            )
+            blocked_obs = PreparationObservation(
+                workspace_id=ws, worktree_path=str(worktree), worktree_identity="wt_preflight",
+                branch="main", revision=4, generation=1, lifecycle_exact=True,
+                pins_empty=True, pins_known=True, inventory_readable=True,
+                worktree_readable=True, worktree_clean=True, branch_matches=True,
+                slots=(
+                    BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
+                              locator=gw_old, disposition=SLOT_HEALTHY),
+                    BoundSlot(role="worker", provider="claude", assigned_name=wk_name,
+                              locator=wk_old, disposition=SLOT_HEALTHY),
+                ),
+                discard_roles=(),
+            )
+
+            class _SeamedPreflightOps(LiveBoundPairPreparationOps):
+                def observe(self_inner, req, *, action_id=""):
+                    return blocked_obs
+
+                def approval_fields(self_inner, issue, journal):
+                    return (expectation.marker_fields(),)
+
+            ops = _SeamedPreflightOps(repo_root=coord, env=env)
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                 mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                outcome = run_bound_pair_preparation(request, execute=False, ops=ops)
+            self.assertNotEqual(outcome.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED)
+            self.assertEqual(outcome.startup_rollback_action_id, "")
+
+    def test_full_chain_preflight_id_then_public_rollback_then_replay_binds(self):
+        # The threaded recovery chain (review j#82079 #2): seed the actual a14 partial -> the
+        # read-only detection hands out the exact startup id -> the public rollback rail's
+        # durable transition (mark_closed + completed_rolled_back, herdr_session_rollback.py
+        # lines 520/546) closes the fresh slot -> replaying the SAME prepare/replacement action
+        # relaunches and binds. No blind retry, no raw rollback, no old-slot re-close.
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence as _Fence,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            request = PrepareBoundPairRequest(
+                issue=self.ISSUE, journal="80925", lane=self.LANE,
+                worktree=str(worktree), branch="main",
+            )
+            action = "prep-full-chain-act"
+            old_locator = "w1:pPREV"
+            sa_id = self._seed_partial(
+                home, ws, gw_name, gw_old, action=action, old_locator=old_locator
+            )
+
+            ops = LiveBoundPairPreparationOps(repo_root=coord, env=env)
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                 mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                # 1. Read-only preflight detection hands out the exact public rollback id.
+                self.assertEqual(
+                    ops.rollback_owed_startup_action(request, action_id=action), sa_id
+                )
+
+                # 2. The public rollback rail's durable effect: the fresh slot is closed and
+                #    the startup transaction is terminal-rolled-back.
+                for pane, agent in list(fake._agents.items()):
+                    if agent.name == gw_name:
+                        del fake._agents[pane]
+                fence = _Fence(home=home)
+                fence.mark_closed(sa_id, "codex")
+                fence.set_phase(sa_id, PHASE_COMPLETED_ROLLED_BACK)
+
+                # 3. Replay the SAME action -> fresh relaunch + bind (never re-close gw_old).
+                HerdrSublaneActuatorOps(
+                    repo_root=coord, lane_label=self.LANE, issue=self.ISSUE, journal="80925",
+                    env=env, runner=fake.run, replacement_action_id=action,
+                    replacement_assigned_name=gw_name, replacement_old_locator=old_locator,
+                ).heal_lane_column(str(worktree), target_provider="codex")
+
+            gw_live = fake.agent_named(gw_name)
+            self.assertIsNotNone(gw_live)
+            self.assertNotIn(gw_live["pane_id"], {gw_old, old_locator})  # fresh generation
+            record = HerdrIdentityAttestationStore(home=home).read(gw_name)
+            self.assertTrue(
+                replacement_action_is_bound(
+                    record, action_id=action, live_locator=gw_live["pane_id"],
+                    expected_workspace_id=ws, expected_role="codex",
+                    expected_lane=self.LANE, expected_assigned_name=gw_name,
+                    expected_old_locator=old_locator, home=home,
+                )
+            )
+            # The replay reached a NEW durable startup success, and the same id is no longer
+            # rollback-owed, so a second preflight no longer offers a rollback.
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                 mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                self.assertEqual(
+                    ops.rollback_owed_startup_action(request, action_id=action), ""
+                )
 
 
 if __name__ == "__main__":

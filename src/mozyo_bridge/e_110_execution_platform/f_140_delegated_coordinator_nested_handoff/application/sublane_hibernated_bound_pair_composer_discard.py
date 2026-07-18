@@ -29,6 +29,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RESUME_NO_OWNED_PROGRESS,
     RESUME_NO_OWNING_APPROVAL,
     RESUME_PROJECTED_BLOCKED,
+    RESUME_STARTUP_ROLLBACK_REQUIRED,
     STATE_ACTIONABLE,
     STATE_BLOCKED,
     STATE_PREPARED,
@@ -104,6 +105,10 @@ class PreparationOutcome:
     resuming: bool = False
     #: Why the preflight did or did not adopt this pair's in-flight action (#13933 j#81046).
     resume_diagnostic: str = ""
+    #: The exact inner startup action id the public rollback rail needs when this action owns
+    #: a durably rollback-owed fresh launch (#13933 R13 F1). Blank otherwise. A value-safe
+    #: hash id, never a locator/receipt; the ready-to-run command is echoed in ``detail``.
+    startup_rollback_action_id: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -127,6 +132,7 @@ class PreparationOutcome:
             "replacement_status": self.replacement_status or None,
             "resuming": self.resuming,
             "resume_diagnostic": self.resume_diagnostic or None,
+            "startup_rollback_action_id": self.startup_rollback_action_id or None,
             "is_blocked": self.is_blocked,
             "pins_repaired": False,
             "resumed": False,
@@ -278,6 +284,35 @@ def _approved(fields: Sequence[Mapping[str, str]]) -> PreparationExpectation | N
     return None
 
 
+def _rollback_required_outcome(
+    request: PrepareBoundPairRequest,
+    approved: PreparationExpectation,
+    startup_action_id: str,
+) -> PreparationOutcome:
+    """A read-only block that hands the operator the exact public rollback command.
+
+    The pair cannot be prepared until the durably rollback-owed fresh launch this action owns
+    is cleared by the explicit public rail; naming the axis without the ``--action-id`` left
+    the operator unable to start recovery (review j#82079 F1). The id is a value-safe hash,
+    never a locator/receipt, and the ready-to-run command is echoed for the operator.
+    """
+    return PreparationOutcome(
+        request=request,
+        state=STATE_BLOCKED,
+        reason=BLOCK_REPLACEMENT_STOPPED,
+        detail=(
+            "an exact fresh launch this action owns is durably rollback-owed; run "
+            f"`mozyo-bridge herdr session-rollback --action-id {startup_action_id}`, then "
+            "replay this same prepare action to relaunch and bind"
+        ),
+        action_id=approved.action_id,
+        approval_marker=approved.marker(),
+        discard_roles=approved.discard_roles,
+        resume_diagnostic=RESUME_STARTUP_ROLLBACK_REQUIRED,
+        startup_rollback_action_id=startup_action_id,
+    )
+
+
 def _resume_preflight(
     request: PrepareBoundPairRequest,
     ops: BoundPairPreparationOps,
@@ -305,6 +340,25 @@ def _resume_preflight(
     approved = _approved(fields)
     if approved is None or approved.issue != request.issue or approved.lane != request.lane:
         return None, RESUME_NO_OWNING_APPROVAL
+    # An exact fresh launch THIS action owns that the embedded session-start left durably
+    # rollback-owed (the installed a14 partial, #13933 R13 F1 / review j#82079) is neither
+    # "adopted" nor "no owned progress": the durable startup record distrusts the live slot's
+    # health, so a silent bind is refused. Name it in the read-only preflight AND hand the
+    # operator the exact `--action-id` the public startup rollback rail needs, so the
+    # rollback -> replay recovery chain has an entry point instead of the old dead end.
+    # Discovered via getattr so transaction-blind ops (test doubles / non-herdr adapters)
+    # simply skip it and keep their prior behaviour.
+    resolver = getattr(ops, "rollback_owed_startup_action", None)
+    rollback_startup_id = (
+        (resolver(request, action_id=approved.action_id) or "").strip()
+        if callable(resolver)
+        else ""
+    )
+    if rollback_startup_id:
+        return (
+            _rollback_required_outcome(request, approved, rollback_startup_id),
+            RESUME_STARTUP_ROLLBACK_REQUIRED,
+        )
     projected = ops.observe(request, action_id=approved.action_id)
     if projected == initial:
         return None, RESUME_NO_OWNED_PROGRESS

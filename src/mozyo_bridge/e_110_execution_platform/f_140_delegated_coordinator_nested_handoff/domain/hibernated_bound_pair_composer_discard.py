@@ -61,6 +61,12 @@ RESUME_NO_OWNED_PROGRESS = "no_action_owned_progress"
 RESUME_PROJECTED_BLOCKED = "projected_still_blocked"
 #: A replay this action owns was adopted.
 RESUME_ADOPTED = "adopted"
+#: This action owns an exact fresh launch the embedded session-start left durably
+#: rollback-owed (the installed a14 partial, Redmine #13933 R13 F1 / review j#82079). The
+#: read-only preflight names it AND surfaces the exact inner startup action id, so the
+#: operator can run the public startup rollback rail and then replay this same prepare action.
+#: Not adopted and not silently bound: the durable record distrusts the live slot's health.
+RESUME_STARTUP_ROLLBACK_REQUIRED = "action_owned_startup_rollback_required"
 
 
 def _digest(value: object) -> str:
@@ -210,7 +216,7 @@ __all__ = (
     "BLOCK_NO_DISCARDABLE_COMPOSER", "BLOCK_PAIR_PRESERVED", "BLOCK_APPROVAL_MISSING",
     "BLOCK_APPROVAL_MISMATCH", "BLOCK_TRANSACTION_CONFLICT", "BLOCK_REPLACEMENT_STOPPED",
     "RESUME_APPROVAL_UNREADABLE", "RESUME_NO_OWNING_APPROVAL", "RESUME_NO_OWNED_PROGRESS",
-    "RESUME_PROJECTED_BLOCKED", "RESUME_ADOPTED",
+    "RESUME_PROJECTED_BLOCKED", "RESUME_ADOPTED", "RESUME_STARTUP_ROLLBACK_REQUIRED",
     "PreparationExpectation", "approval_matches", "canonical_roles", "expectation_for",
     "preparation_action_id", "roles_token",
 )
