@@ -24,6 +24,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OWNER_AMBIGUOUS,
     OWNER_RESOLVED,
     RETURN_AMBIGUOUS_OWNER,
+    RETURN_AMBIGUOUS_REVIEW_IDENTITY,
     RETURN_BLANK_GENERATION,
     RETURN_NO_GATEWAY,
     RETURN_NO_OWNER,
@@ -63,6 +64,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     make_review_return_send_edge_fence,
     plan_review_return,
     plan_review_returns,
+    review_result_is_ambiguous,
     review_return_callback_route,
     review_return_is_current,
     review_round_within_generation,
@@ -405,6 +407,36 @@ class ReviewHeadFenceTest(unittest.TestCase):
         self.assertEqual(current_review_generation_conclusion(markers, ISSUE), "approved")
         m2 = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="110", conclusion="pending")]
         self.assertEqual(current_review_generation_conclusion(m2, ISSUE), "")
+
+    def test_ambiguous_same_journal_identity_is_refused(self) -> None:
+        # j#81512: two review_result markers on the SAME (issue, journal) with disagreeing conclusions
+        # are not a unique action authority -> ambiguous -> refused.
+        markers = [
+            _review_request("110", head=HEAD_A),
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+            _review_result("120", head=HEAD_A, req="110", conclusion="changes_requested"),
+        ]
+        self.assertTrue(review_result_is_ambiguous(markers, ISSUE, "120"))
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_AMBIGUOUS_REVIEW_IDENTITY)
+
+    def test_identical_duplicate_markers_are_not_ambiguous(self) -> None:
+        markers = [
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+        ]
+        self.assertFalse(review_result_is_ambiguous(markers, ISSUE, "120"))
+
+    def test_ambiguous_latest_collapses_current_identity(self) -> None:
+        # An ambiguous latest review_result makes the live request / conclusion authorities blank.
+        markers = [
+            _review_request("110", head=HEAD_A),
+            _review_result("120", head=HEAD_A, req="110", conclusion="approved"),
+            _review_result("120", head=HEAD_A, req="110", conclusion="changes_requested"),
+        ]
+        self.assertEqual(current_review_generation_request(markers, ISSUE), "")
+        self.assertEqual(current_review_generation_conclusion(markers, ISSUE), "")
 
     def test_payload_round_trips_conclusion(self) -> None:
         p = encode_review_return_payload("110", HEAD_A, "changes_requested")
