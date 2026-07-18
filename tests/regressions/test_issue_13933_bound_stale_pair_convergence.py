@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from mozyo_bridge.core.state.lane_lifecycle import ProcessGenerationPin
-from mozyo_bridge.core.state.replacement_preservation import assess_preservation
-from mozyo_bridge.core.state.replacement_transaction import ParticipantPin
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer, ProcessGenerationPin
+from mozyo_bridge.core.state.replacement_preservation import (
+    PreservationObservation,
+    assess_preservation,
+)
+from mozyo_bridge.core.state.replacement_transaction import (
+    ContinuationPointer,
+    ParticipantPin,
+    ReplacementTransactionKey,
+    ReplacementTransactionStore,
+)
+from mozyo_bridge.core.state.replacement_transaction_model import (
+    PARTICIPANT_LAUNCH_OWED,
+    PARTICIPANT_REPLACED,
+    PHASE_COMPLETED,
+)
+from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import (
     BoundPairObservation,
     ConvergeBoundPairRequest,
@@ -24,11 +46,29 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _launch_detail,
     LiveBoundPairConvergenceOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    sublane_hibernated_bound_pair_convergence_live as CL,
+    sublane_quarantine as QM,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (
+    ReplacementActuatorUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (
+    HerdrSublaneActuatorOps,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
     ACTUATION_EFFECT_FAILED,
     ACTUATION_PRESERVATION_BLOCKED,
+    ACTUATION_RECOVERED,
     LAUNCH_ERROR,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    decode_assigned_name,
+    encode_assigned_name,
+)
+
+from tests.support.agent_provider_binaries import with_provider_path
+from tests.support.herdr_fake import FakeHerdr
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     SublaneLauncherIncompatibleError,
 )
@@ -633,6 +673,247 @@ class LaunchReasonSurfacingTests(unittest.TestCase):
             status=ACTUATION_EFFECT_FAILED, detail="launch", preservation_reasons=()
         )
         self.assertEqual(_launch_detail(launch_failed, port), "launch")
+
+
+HERDR_ENV = "MOZYO_HERDR_BINARY"
+
+
+def _fake_binary(tmp: str) -> Path:
+    binpath = Path(tmp) / "fake-herdr"
+    binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return binpath
+
+
+def _agent_list_rows(fake: FakeHerdr):
+    import json
+
+    out = fake.run(["herdr", "agent", "list"]).stdout
+    return json.loads(out).get("agents", [])
+
+
+class _AttestingHerdr(FakeHerdr):
+    """FakeHerdr that self-attests each real launch and can drop one launch of a provider.
+
+    On a successful ``agent start`` it upserts the launched slot's startup self-attestation
+    bound to ``action_id`` (what the #13637 attest wrapper would write live — the fake runs no
+    wrapper). ``fail_launch_provider`` makes the NEXT ``agent start`` of that provider return an
+    ``agent_started`` envelope WITHOUT a live row, so the real heal's same-tab postcondition
+    fences on the absent target (``launch_target_absent``) — a real launch failure, not a
+    scripted one.
+    """
+
+    def __init__(self, *, attestation_home: Path, **kw):
+        super().__init__(**kw)
+        self._attestation_home = attestation_home
+        self.action_id = ""
+        self.fail_launch_provider = ""
+
+    def _cmd_agent_start(self, argv, rest):
+        import json
+
+        name = rest[2] if len(rest) > 2 else ""
+        decoded = decode_assigned_name(name)
+        provider = decoded.identity.role if (decoded.ok and decoded.identity) else ""
+        if self.fail_launch_provider and provider == self.fail_launch_provider:
+            self.fail_launch_provider = ""
+            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
+            tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
+            return __import__("subprocess").CompletedProcess(
+                argv, 0,
+                stdout=json.dumps({"result": {"type": "agent_started", "agent": {
+                    "name": name, "pane_id": f"{wid}:pX", "workspace_id": wid, "tab_id": tab}}}),
+                stderr="",
+            )
+        result = super()._cmd_agent_start(argv, rest)
+        live = self.agent_named(name)
+        if live and self.action_id and decoded.ok and decoded.identity is not None:
+            HerdrIdentityAttestationStore(home=self._attestation_home).upsert(
+                IdentityAttestationRecord(
+                    assigned_name=name,
+                    workspace_id=decoded.identity.workspace_id,
+                    role=decoded.identity.role,
+                    lane_id=decoded.identity.lane_id,
+                    locator=live["pane_id"],
+                    verdict=VERDICT_PRESENT,
+                    observed_at="2099-07-18T00:00:00+00:00",
+                    replacement_action_id=self.action_id,
+                )
+            )
+        return result
+
+
+class _CleanPreservationPort(_BoundPairActuatorPort):
+    """The real convergence port with ONLY the read-only close-boundary observation modeled.
+
+    Reconstructing an exact bound lifecycle row + a colocated git-worktree identity purely so a
+    READ-ONLY :meth:`observe_preservation` clears is disproportionate; the pure
+    :func:`assess_preservation` policy still decides, and every EFFECT leg — the real quarantine
+    close, the real ``heal_lane_column`` launch, the real attestation-store verify, the real
+    transaction + completion — runs unmodified against the live fake state.
+    """
+
+    def observe_preservation(self, pin):
+        return PreservationObservation(identity_matches=True, attestation_fresh=True)
+
+
+class RealLauncherCompositionTests(unittest.TestCase):
+    """Redmine #13933 R11 F1 (review j#81456): the REAL launcher composes end to end.
+
+    One fixture drives the REAL :meth:`HerdrSublaneActuatorOps.heal_lane_column` (a shared
+    ``FakeHerdr`` at the subprocess Runner boundary — NOT a counting launcher) through the REAL
+    :class:`_BoundPairActuatorPort` + REAL :class:`ReplacementTransactionStore` +
+    ``ReplacementActuatorUseCase.drive_worker_recovery`` + the production completion leg
+    (:meth:`LiveBoundPairConvergenceOps.finish_replacement`). It excludes the installed-a8
+    (j#81426) failure class "converges under a test double but stalls at the real launcher
+    composition" that three separately-green layers could not.
+
+    Shape = the exact #13846 partial pair: gateway absent, worker stale-live-unattested. Run 1
+    closes the worker for real, then its heal launch fails (the real same-tab postcondition
+    fences on the target that did not come up -> ``launch_target_absent``). Run 2 replays the
+    SAME immutable action: never re-closes, relaunches, and BOTH roles reach a fresh locator +
+    an ``action_id``-bound startup attestation; the transaction reaches ``PHASE_COMPLETED``.
+    """
+
+    ACTION = "conv-real-act-1"
+    LANE = "issue_13846_real_conv"
+    ISSUE = "13846"
+    FIXED = "2099-07-18T12:00:00+00:00"
+
+    def _drive(self, use_case_key, holder):
+        store, key, port = use_case_key
+        return ReplacementActuatorUseCase(
+            store, port, preservation_policy=assess_preservation, clock=lambda: self.FIXED,
+        ).drive_worker_recovery(key, holder=holder, expected_action_generation=1)
+
+    def test_real_heal_composes_partial_convergence_replay_and_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir()
+            coord = Path(tmp) / "coord"; coord.mkdir()
+            worktree = Path(tmp) / "lane-wt"; worktree.mkdir()
+            env = with_provider_path(
+                {HERDR_ENV: str(_fake_binary(tmp)), "MOZYO_BRIDGE_HOME": str(home)}
+            )
+            fake = _AttestingHerdr(attestation_home=home)
+
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                # Real append mints the lane workspace + a live (unattested) gateway/worker pair.
+                HerdrSublaneActuatorOps(
+                    repo_root=coord, lane_label=self.LANE, issue=self.ISSUE,
+                    env=env, runner=fake.run,
+                ).append_lane_column(str(worktree))
+                ws = read_anchor(worktree)["workspace_id"]
+                gw_name = encode_assigned_name(ws, "codex", self.LANE)
+                wk_name = encode_assigned_name(ws, "claude", self.LANE)
+                gw_old = fake.agent_named(gw_name)["pane_id"]
+                wk_old = fake.agent_named(wk_name)["pane_id"]
+
+                # Partial shape: gateway absent, worker stale-live.
+                for pane, agent in list(fake._agents.items()):
+                    if agent.name == gw_name:
+                        del fake._agents[pane]
+                fake.action_id = self.ACTION
+
+                store = ReplacementTransactionStore(home=home)
+                key = ReplacementTransactionKey(ws, self.ACTION)
+                gw_pin = ParticipantPin(
+                    lane_id=self.LANE, role="gateway", provider="codex",
+                    assigned_name=gw_name, old_locator=gw_old,
+                    lane_revision="1", lane_generation="1",
+                )
+                wk_pin = ParticipantPin(
+                    lane_id=self.LANE, role="worker", provider="claude",
+                    assigned_name=wk_name, old_locator=wk_old,
+                    lane_revision="1", lane_generation="1",
+                )
+                store.plan_transaction(
+                    key, action_generation=1,
+                    decision=DecisionPointer(source="redmine", issue_id=self.ISSUE, journal_id="80925"),
+                    continuation=ContinuationPointer(
+                        source="redmine", issue_id=self.ISSUE, journal_id="80925",
+                        expected_gate="bound_pair_convergence_approval",
+                        next_semantic_action="repair_pins",
+                    ),
+                    participants=[gw_pin, wk_pin],
+                )
+
+                owner = LiveBoundPairConvergenceOps(
+                    repo_root=coord, env=env, transaction_store=store
+                )
+                request = ConvergeBoundPairRequest(
+                    issue=self.ISSUE, journal="80925", lane=self.LANE,
+                    worktree=str(worktree), branch="main",
+                )
+                # The live ops resolve the quarantine-close workspace from the worktree (the
+                # lane worktree inherits the project workspace in production); the fake runner
+                # drives its close + heal.
+                live = _SnapshotRecoveryOps(
+                    repo_root=Path(str(worktree)), request_issue=self.ISSUE,
+                    request_lane=self.LANE, request_journal="80925", env=env, runner=fake.run,
+                )
+                live.target_workspace_id = ws
+                expectation = SimpleNamespace(action_id=self.ACTION, action_generation=1)
+                port = _CleanPreservationPort(owner, request, expectation, live)
+                holder = f"converge:{self.ACTION}:g1"
+
+                closes: list = []
+                orig_close = QM.LiveSublaneQuarantineOps.close_receiver
+
+                def counting_close(ops_self, req, pin):
+                    res = orig_close(ops_self, req, pin)
+                    if res.closed:
+                        closes.append(pin.locator)
+                    return res
+
+                def refresh_and_drive():
+                    live.snapshot_rows = tuple(_agent_list_rows(fake))
+                    return self._drive((store, key, port), holder)
+
+                with mock.patch.object(CL, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)), \
+                     mock.patch.object(QM, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)), \
+                     mock.patch.object(QM.LiveSublaneQuarantineOps, "close_receiver", counting_close), \
+                     mock.patch.object(
+                         CL, "HerdrSublaneActuatorOps",
+                         lambda **kw: HerdrSublaneActuatorOps(**kw, runner=fake.run),
+                     ):
+                    # Run 1: the worker closes for real, then its heal launch fails.
+                    fake.fail_launch_provider = "claude"
+                    run1 = refresh_and_drive()
+                    self.assertEqual(run1.status, ACTUATION_EFFECT_FAILED)
+                    # The real same-tab postcondition raised a typed reason the real port captured.
+                    self.assertEqual(port.launch_failure_reason, "launch_target_absent")
+                    self.assertEqual(
+                        store.get(key).find_participant(wk_pin.identity).phase,
+                        PARTICIPANT_LAUNCH_OWED,
+                    )
+                    self.assertEqual(closes, [wk_old])  # the worker was closed exactly once
+
+                    # Run 2: same immutable action; launch now succeeds.
+                    run2 = refresh_and_drive()
+                    self.assertEqual(run2.status, ACTUATION_RECOVERED)
+                    self.assertEqual(closes, [wk_old])  # NEVER re-closed on the replay
+
+                    completed = owner.finish_replacement(expectation)
+
+                # Both roles converged to `replaced`.
+                for pin in (gw_pin, wk_pin):
+                    self.assertEqual(
+                        store.get(key).find_participant(pin.identity).phase,
+                        PARTICIPANT_REPLACED,
+                        pin.role,
+                    )
+                # Both roles are live at a FRESH locator with an action-bound attestation.
+                attest_store = HerdrIdentityAttestationStore(home=home)
+                for name, old in ((gw_name, gw_old), (wk_name, wk_old)):
+                    live_row = fake.agent_named(name)
+                    self.assertIsNotNone(live_row)
+                    self.assertNotEqual(live_row["pane_id"], old)  # fresh generation
+                    record = attest_store.read(name)
+                    self.assertEqual(record.replacement_action_id, self.ACTION)
+                    self.assertEqual(record.locator, live_row["pane_id"])
+                # The production completion leg reached PHASE_COMPLETED.
+                self.assertTrue(completed)
+                self.assertEqual(store.get(key).phase, PHASE_COMPLETED)
 
 
 if __name__ == "__main__":
