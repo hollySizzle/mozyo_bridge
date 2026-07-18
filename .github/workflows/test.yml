@@ -1,107 +1,40 @@
 name: Test
 
-# Tiered CI gate (Redmine #13734, parent US #13732) built on the quick/full
-# unittest lane split (Redmine #12753).
+# Quick + full unittest lane split (Redmine #12753).
 #
-# The matrix was ALREADY parallel; the reform is about how OFTEN each tier
-# fires and the 4-environment duplicate build on every branch push — not a lack
-# of parallelism (Redmine #13734 j#77169 invariant #1). Risk tiers:
-#
-# - Pull request / issue-branch push -> `quick` lane only: lint/health + docs
-#   gate plus the AFFECTED tests resolved from the diff, on a SINGLE Python.
-#   Fast feedback; an issue-branch push NEVER auto-fires the full Python matrix.
-# - Integration push (`main` / `int_*` / `integration_*`) -> `integration` batch
-#   ONCE against the exact integration SHA: clean Linux single-Python FULL
-#   `unittest discover` + health/docs + wheel/sdist build + fresh-install smoke.
-# - Nightly schedule / manual `full` dispatch -> `full-matrix`: the supported
-#   Python 3.10-3.13 full matrix safety lane.
-#
-# TAG pushes are NOT a tier of this workflow (Redmine #13734 j#78399, from the
-# #13735 j#78390 F2 verification finding). `on.push.branches: ["**"]` is a branch
-# ALLOWLIST: a `branches` filter makes a push event match branch refs only, so
-# `refs/tags/*` never enters this workflow. The `quick` job and the concurrency
-# expression additionally require a `refs/heads/` ref, so a tag ref is still
-# fail-closed at the job layer if the trigger filter is ever loosened. Release
-# tags are gated by publish.yml (`release: published` + immutable `github.sha`),
-# not here.
+# - Pull requests run the `quick` lane only: the lint/health + docs gate plus
+#   the AFFECTED tests resolved from the PR diff. Fast feedback on the common
+#   path.
+# - Everything else (push / merge to a branch, the nightly schedule, and manual
+#   dispatch) runs the `full` lane: `python -m unittest discover -s tests` across
+#   the whole Python matrix, the merge / nightly / release safety gate.
 #
 # The quick lane reuses the SAME #12752 impact resolver the local command uses
 # (`mozyo-bridge tests resolve`), so local and CI selection stay identical. A
-# fail-closed `full` recommendation makes the quick lane run the whole suite on
-# its single Python, so an unmapped change is never silently under-tested. The
-# CI-internal test authority stays `unittest discover` / `tests profile`
-# (Redmine #13734 keeps the authoritative serial runner; it does not depend on
-# the #13733 local parallel runner). See
-# vibes/docs/logics/tiered-ci-gate-policy.md and
-# vibes/docs/logics/ci-quick-full-lane-policy.md.
+# fail-closed `full` recommendation makes the quick lane run the whole suite, so
+# an unmapped change is never silently under-tested. See
+# vibes/docs/logics/ci-quick-full-lane-policy.md for the full-lane failure /
+# release-gate handling.
 
 on:
   push:
-    # Branch allowlist: a `branches` filter restricts the push event to branch
-    # refs, so `refs/tags/*` pushes do NOT trigger this workflow at all. `**`
-    # keeps every branch (including slashed names) on its existing tier.
-    branches:
-      - "**"
   pull_request:
   schedule:
     # Nightly full-suite safety lane (07:00 JST = 22:00 UTC).
     - cron: "0 22 * * *"
   workflow_dispatch:
-    inputs:
-      lane:
-        description: "Lane to run on manual dispatch (full = whole 3.10-3.13 matrix; quick = affected tests only)."
-        type: choice
-        options:
-          - full
-          - quick
-        default: full
-
-# Duplicate push/run cancellation (Redmine #13734): one in-flight run per
-# (workflow, event, ref). Superseded PR updates and issue-branch pushes cancel
-# so stale commits stop consuming runners. Integration pushes (main / int_* /
-# integration_*), the nightly schedule, and manual dispatch NEVER cancel: each
-# integration SHA, scheduled sweep, and on-demand run keeps its own
-# authoritative verdict (the TestPyPI auto dev path keys on the head_sha of a
-# COMPLETED main `Test` run, so cancelling a main run would drop that gate).
-# The `refs/heads/` guard keeps a non-branch ref (e.g. a tag, already excluded by
-# the trigger filter) out of the cancelling class rather than defaulting it in.
-concurrency:
-  group: test-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: >-
-    ${{ github.event_name == 'pull_request'
-        || (github.event_name == 'push'
-            && startsWith(github.ref, 'refs/heads/')
-            && github.ref != 'refs/heads/main'
-            && !startsWith(github.ref, 'refs/heads/int_')
-            && !startsWith(github.ref, 'refs/heads/integration_')) }}
 
 jobs:
   quick:
-    # Fast feedback lane: PR, issue-branch push, or manual `quick` dispatch.
-    # Single Python; lint/health + docs gate + affected tests only. An
-    # issue-branch push routes here instead of the full matrix (Redmine #13734).
-    #
-    # The push arm requires a `refs/heads/` ref and THEN excludes the integration
-    # branches: an issue BRANCH is the only push that routes here. A tag ref is
-    # excluded by construction (it is not a branch), so it cannot fall into this
-    # lane by default the way a bare "not main / not int_*" test let it
-    # (Redmine #13734 j#78399 / #13735 j#78390 F2).
+    # Fast PR feedback lane: lint/health + docs gate + affected tests only.
     name: Quick lane (affected tests)
-    if: >-
-      github.event_name == 'pull_request'
-      || (github.event_name == 'push'
-          && startsWith(github.ref, 'refs/heads/')
-          && github.ref != 'refs/heads/main'
-          && !startsWith(github.ref, 'refs/heads/int_')
-          && !startsWith(github.ref, 'refs/heads/integration_'))
-      || (github.event_name == 'workflow_dispatch' && inputs.lane == 'quick')
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
         with:
-          # Need history to diff the branch against its base for impact
-          # resolution.
+          # Need history to diff the PR branch against its merge target.
           fetch-depth: 0
 
       - name: Set up Python
@@ -122,148 +55,28 @@ jobs:
         # its generated artifacts consistent before running tests.
         run: mozyo-bridge docs validate --repo .
 
-      - name: Resolve affected-test base
-        id: base
-        env:
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.ref }}
-        run: |
-          set -euo pipefail
-          # PR: diff against the PR merge target. push / manual quick: diff
-          # against `main` (the trunk). Diffing an issue branch against main
-          # over-selects when the branch sits on an integration base, which is
-          # SAFE (more tests, single Python); an unresolvable base still fails
-          # closed to the whole suite below.
-          if [ "$EVENT" = "pull_request" ]; then
-            BASE_REF="$PR_BASE"
-          else
-            BASE_REF="main"
-          fi
-          git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
-          echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
-
       - name: Run affected tests
-        # Resolve the changed source paths to focused targets via the SAME
+        # Resolve the PR-changed source paths to focused targets via the SAME
         # resolver the local command uses (Redmine #12752 / #12753), then run
         # them. The resolver fails CLOSED: an unmapped change recommends `full`,
         # which `--format targets` emits as `discover -s tests`, so the quick
-        # lane runs the WHOLE suite (single Python) rather than silently
-        # nothing. It never emits an empty target list, so the pipe always runs
-        # a real selection.
+        # lane runs the WHOLE suite rather than silently nothing. It never emits
+        # an empty target list, so the pipe always runs a real selection.
         env:
-          BASE_REF: ${{ steps.base.outputs.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          set -euo pipefail
-          mozyo-bridge tests resolve --base "$BASE_REF" --format targets \
+          git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+          mozyo-bridge tests resolve --base "origin/$BASE_REF" --format targets \
             | xargs python -m unittest
 
-      - name: Quick lane summary
-        if: always()
-        env:
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          SHA: ${{ github.sha }}
-          BASE_REF: ${{ steps.base.outputs.ref }}
-        run: |
-          {
-            echo "### Quick lane (affected tests)"
-            echo ""
-            echo "- event: \`$EVENT\`"
-            echo "- ref: \`$REF\`"
-            echo "- SHA: \`$SHA\`"
-            echo "- impact base: \`$BASE_REF\` (fail-closed -> whole suite)"
-            echo "- Python: 3.12 (single)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  integration:
-    # Integration batch (Redmine #13734): runs ONCE against the exact
-    # integration SHA when an issue branch is integrated to `main` or an
-    # `int_*` / `integration_*` branch. Clean Linux single-Python FULL suite +
-    # health/docs + wheel/sdist build + fresh-install smoke. This is the
-    # `Test` success the automatic TestPyPI dev path (testpypi.yml) keys on for
-    # `main`.
-    name: Integration batch (single-Python full + smoke)
-    if: >-
-      github.event_name == 'push'
-      && (github.ref == 'refs/heads/main'
-          || startsWith(github.ref, 'refs/heads/int_')
-          || startsWith(github.ref, 'refs/heads/integration_'))
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install package
-        run: python -m pip install .
-
-      - name: Module-health gate
-        run: mozyo-bridge health check
-
-      - name: Docs catalog validate
-        run: mozyo-bridge docs validate --repo .
-
-      - name: Run full suite (single Python, whole discover)
-        # Clean single-Python FULL gate: `tests profile` runs the SAME discovery
-        # as `python -m unittest discover -s tests`; the suite verdict drives the
-        # exit code. Slow-test budget is reported, not enforced (no `--enforce`),
-        # so timing variance never makes CI flaky (Redmine #12754).
-        run: mozyo-bridge tests profile --slowest 20
-
-      - name: Build wheel and sdist
-        run: |
-          set -euo pipefail
-          python -m pip install build
-          python -m build
-
-      - name: Fresh-install smoke (built artifact)
-        # Install the just-built wheel into an ISOLATED venv (not the editable
-        # checkout) and exercise both console entry points. Proves the shipped
-        # artifact imports and exposes `mozyo-bridge` / `mozyo` before any
-        # integration SHA becomes a TestPyPI publish candidate.
-        run: |
-          set -euo pipefail
-          python -m venv /tmp/smoke-venv
-          /tmp/smoke-venv/bin/python -m pip install --upgrade pip
-          WHEEL="$(ls dist/*.whl | head -n1)"
-          if [ -z "$WHEEL" ]; then
-            echo "::error::no wheel built for install smoke"; exit 1
-          fi
-          /tmp/smoke-venv/bin/python -m pip install "$WHEEL"
-          /tmp/smoke-venv/bin/mozyo-bridge --version
-          /tmp/smoke-venv/bin/mozyo-bridge --help > /dev/null
-          /tmp/smoke-venv/bin/mozyo --help > /dev/null
-
-      - name: Integration batch summary
-        if: always()
-        env:
-          REF: ${{ github.ref }}
-          SHA: ${{ github.sha }}
-        run: |
-          {
-            echo "### Integration batch (exact SHA)"
-            echo ""
-            echo "- ref: \`$REF\`"
-            echo "- exact SHA: \`$SHA\`"
-            echo "- Python: 3.12 (clean Linux single-Python full)"
-            echo "- gates: health check, docs validate, full \`unittest discover\`,"
-            echo "  wheel+sdist build, fresh-install smoke (\`mozyo-bridge\` / \`mozyo\`)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  full-matrix:
-    # Supported-Python full matrix safety lane: nightly schedule + manual `full`
-    # dispatch. Preserves `unittest discover -s tests` across 3.10-3.13 as the
-    # nightly / on-demand safety gate (Redmine #12753 acceptance, #13734
-    # invariant #4). Slow-test budget violations are reported but do NOT fail
-    # the run (no `--enforce`).
-    name: Full matrix (nightly / on-demand)
-    if: >-
-      github.event_name == 'schedule'
-      || (github.event_name == 'workflow_dispatch' && inputs.lane == 'full')
+  full:
+    # Full-suite safety lane: push / merge, nightly schedule, manual dispatch.
+    # Preserves `python -m unittest discover -s tests` as the merge / nightly /
+    # release gate (Redmine #12753 acceptance). Slow-test budget violations are
+    # reported but do NOT fail the run (no `--enforce`), so timing variance
+    # never makes CI flaky — only the suite verdict is authoritative.
+    name: Full lane (whole suite)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -285,6 +98,10 @@ jobs:
         run: mozyo-bridge health check
 
       - name: Run unit tests (full discover with runtime summary)
+        # Default lane (Redmine #12754): quiet output plus a measured runtime
+        # summary. `tests profile` runs the SAME discovery as
+        # `python -m unittest discover -s tests`; the suite verdict drives the
+        # exit code. See vibes/docs/logics/test-runtime-profiling-policy.md.
         run: mozyo-bridge tests profile --slowest 20
 
       - name: Build wheel
