@@ -48,6 +48,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+    REVIEW_ROUND_CURRENT,
+    REVIEW_ROUND_STALE,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
     discover_review_returns,
     run_once,
@@ -266,6 +270,24 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
 
     def test_unknown_opaque_object_fence_return_is_retryable(self) -> None:
         self._unknown_fence_return_is_retryable(object())
+
+    def test_unhashable_str_subclass_fence_return_is_retryable(self) -> None:
+        # j#81562 F1: a `str` SUBCLASS passes an isinstance() guard yet can be unhashable — masquerading
+        # as a valid token string while raising TypeError on the frozenset membership test. It must NOT
+        # crash the sender; it normalizes to the retryable UNVERIFIABLE (a non-builtin token is untrusted).
+        class _UnhashableToken(str):
+            __hash__ = None  # type: ignore[assignment]
+
+        self._unknown_fence_return_is_retryable(_UnhashableToken(REVIEW_ROUND_CURRENT))
+
+    def test_hostile_hash_str_subclass_fence_return_is_retryable(self) -> None:
+        # j#81562 F1: a `str` subclass whose __hash__ RAISES also passes isinstance() and would blow up
+        # the membership test outside the fence try. The defensive fold keeps it retryable, not a crash.
+        class _HostileHashToken(str):
+            def __hash__(self):  # noqa: D401 - hostile probe
+                raise RuntimeError("hostile __hash__")
+
+        self._unknown_fence_return_is_retryable(_HostileHashToken(REVIEW_ROUND_STALE))
 
     # -- full supervisor fan-out with the anchor + head fence wired ------
 
