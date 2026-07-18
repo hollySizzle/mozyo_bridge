@@ -17,12 +17,15 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    BINDING_RESERVED,
     HerdrIdentityReplacementBindingStore,
 )
 from mozyo_bridge.core.state.lane_lifecycle import norm
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_ROLLBACK_OWED,
     StartupTransactionFence,
+    StartupUnit,
+    startup_action_id,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
@@ -117,6 +120,7 @@ def resolve_rollback_owed_startup_action(
             resolve_gateway_provider(str(repo_root)),
             resolve_worker_provider(str(repo_root)),
         )
+        managed_pair = tuple(providers)
         rows = tuple(list_herdr_agent_rows(env))
         home = mozyo_bridge_home()
         binding_store = HerdrIdentityReplacementBindingStore(home=home)
@@ -125,6 +129,28 @@ def resolve_rollback_owed_startup_action(
             assigned_name = encode_assigned_name(workspace, provider, lane)
             intent = binding_store.read(action_id, assigned_name)
             if intent is None:
+                continue
+            # Mirror the authoritative bind path's exact identity + unit join
+            # (herdr_session_start_v1_replacement_binding._binding_identity_matches, review
+            # j#82084 F1): the stored binding is trusted only when its immutable identity is
+            # this exact unit AND its startup id re-derives from that unit + the reserved
+            # nonce. A binding whose stored workspace/role/lane, or whose startup unit, belongs
+            # to another generation must never lend its startup id to a rollback aimed here.
+            if (
+                intent.phase != BINDING_RESERVED
+                or norm(intent.workspace_id) != workspace
+                or norm(intent.role) != norm(provider)
+                or norm(intent.lane_id) != norm(lane)
+                or norm(intent.assigned_name) != norm(assigned_name)
+            ):
+                continue
+            try:
+                expected_startup = startup_action_id(
+                    StartupUnit(workspace, lane, managed_pair), intent.startup_nonce
+                )
+            except ValueError:
+                continue
+            if norm(intent.startup_action_id) != expected_startup:
                 continue
             named = [
                 row
@@ -136,8 +162,15 @@ def resolve_rollback_owed_startup_action(
             live_locator = _agent_locator(named[0])
             if not live_locator or live_locator == norm(intent.old_locator):
                 continue
-            startup = fence.read(intent.startup_action_id)
-            if startup is None or startup.phase != PHASE_ROLLBACK_OWED:
+            startup = fence.read(expected_startup)
+            if (
+                startup is None
+                or startup.phase != PHASE_ROLLBACK_OWED
+                or startup.action_id != expected_startup
+                or norm(startup.unit.workspace_id) != workspace
+                or norm(startup.unit.lane_id) != norm(lane)
+                or tuple(startup.unit.providers) != tuple(sorted(set(managed_pair)))
+            ):
                 continue
             owed = startup.participant_for(intent.role)
             if (

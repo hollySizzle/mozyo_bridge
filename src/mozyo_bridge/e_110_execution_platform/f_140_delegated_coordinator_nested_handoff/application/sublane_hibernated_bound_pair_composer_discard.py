@@ -284,6 +284,29 @@ def _approved(fields: Sequence[Mapping[str, str]]) -> PreparationExpectation | N
     return None
 
 
+def _rollback_surface_safe(
+    observation: PreparationObservation, approved: PreparationExpectation
+) -> bool:
+    """The non-exempt safety axes a public rollback surface must clear (review j#82084 F2).
+
+    The approval-bound projection must be lifecycle-exact, pins-empty, inventory-readable, and
+    on a clean, branch-matched worktree still at the approved revision+generation. Any of those
+    failing is a dirty / branch-mismatch / lifecycle-fault / revision-race that the rollback
+    rail cannot see, so the command must not be surfaced. Composer-discardability is NOT here:
+    the whole reason a rollback is owed is that a live slot occupies the pair.
+    """
+    return bool(
+        observation.lifecycle_exact
+        and observation.pins_empty
+        and observation.inventory_readable
+        and observation.worktree_readable
+        and observation.worktree_clean
+        and observation.branch_matches
+        and observation.revision == approved.revision
+        and observation.generation == approved.generation
+    )
+
+
 def _rollback_required_outcome(
     request: PrepareBoundPairRequest,
     approved: PreparationExpectation,
@@ -340,26 +363,31 @@ def _resume_preflight(
     approved = _approved(fields)
     if approved is None or approved.issue != request.issue or approved.lane != request.lane:
         return None, RESUME_NO_OWNING_APPROVAL
+    projected = ops.observe(request, action_id=approved.action_id)
     # An exact fresh launch THIS action owns that the embedded session-start left durably
     # rollback-owed (the installed a14 partial, #13933 R13 F1 / review j#82079) is neither
     # "adopted" nor "no owned progress": the durable startup record distrusts the live slot's
     # health, so a silent bind is refused. Name it in the read-only preflight AND hand the
-    # operator the exact `--action-id` the public startup rollback rail needs, so the
-    # rollback -> replay recovery chain has an entry point instead of the old dead end.
-    # Discovered via getattr so transaction-blind ops (test doubles / non-herdr adapters)
-    # simply skip it and keep their prior behaviour.
-    resolver = getattr(ops, "rollback_owed_startup_action", None)
-    rollback_startup_id = (
-        (resolver(request, action_id=approved.action_id) or "").strip()
-        if callable(resolver)
-        else ""
-    )
-    if rollback_startup_id:
-        return (
-            _rollback_required_outcome(request, approved, rollback_startup_id),
-            RESUME_STARTUP_ROLLBACK_REQUIRED,
+    # operator the exact `--action-id` the public startup rollback rail needs.
+    #
+    # The surface must NOT bypass acceptance-3 safety (review j#82084 F2): the public rollback
+    # rail has no lifecycle / worktree gate of its own, so this preflight is the boundary that
+    # refuses to hand out a rollback command for a dirty / branch-mismatched / lifecycle-faulted
+    # / revision-raced pair. Composer-discardability is deliberately exempt — a live
+    # rollback-owed gateway is exactly why there is no discardable composer. Discovered via
+    # getattr so transaction-blind ops (test doubles / non-herdr adapters) keep prior behaviour.
+    if _rollback_surface_safe(projected, approved):
+        resolver = getattr(ops, "rollback_owed_startup_action", None)
+        rollback_startup_id = (
+            (resolver(request, action_id=approved.action_id) or "").strip()
+            if callable(resolver)
+            else ""
         )
-    projected = ops.observe(request, action_id=approved.action_id)
+        if rollback_startup_id:
+            return (
+                _rollback_required_outcome(request, approved, rollback_startup_id),
+                RESUME_STARTUP_ROLLBACK_REQUIRED,
+            )
     if projected == initial:
         return None, RESUME_NO_OWNED_PROGRESS
     terminal, _expected = _classify(request, projected)
