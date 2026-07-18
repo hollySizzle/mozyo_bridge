@@ -221,10 +221,12 @@ review_request:
     - 未確認事項
     - 受信agent
     - 受領方法
+  structured_marker (Redmine #13974): review_request journal に structured gate marker `[mozyo:workflow-event:gate=review_request:head=<target_head>]` を埋め込む。`target_head` は review 対象の exact full commit head である。callback generation fence はこの head を machine-readable に読み、現行 review generation の head と連言する (散文から SHA を parse しない)。head を欠く marker は fence を fail-closed にする。marker は `render_gate_note` / `mozyo-bridge handoff ... --kind review_request` producer 経路が付与する。
 review:
   actor: 監査者
   標準粒度: UserStory。対象 commit だけでなく配下 Task / Test / Bug の issue / journal / docs / residual risk を横断して読む
   必須: [対象commit_or_diff, remote_verification, 配下issue確認結果 (US-levelのみ), resolved_docs, 照合規約, 指摘事項, 指摘事項_根拠出所, 未確認事項, 再review要否, 結論]
+  structured_marker (Redmine #13974): review (review_result) journal に structured gate marker `[mozyo:workflow-event:gate=review_result:conclusion=<結論>:head=<target_head>:req=<review_request_journal>]` を埋め込む。`head` は review した exact full commit head、`req` は答えた review_request の journal id である。source_sequence は marker の自己申告でなく Redmine provider が返す当該 review_result journal id を authority とする。missing / drift head の review callback は zero-send terminal になる。
   remote_verification: 対象 commit 群が origin (共有 remote) 上に到達可能であることを read-only で確認する。確認できない場合は事実指摘ではなく blocker とし close へ進めない (`### Commit Hash Origin 到達可能性`)
   指摘事項_分類:
     - 事実: コード・設定・docs で確認済みの不整合のみ
