@@ -217,6 +217,35 @@ class GenerationBindingRuntimeRevisionTests(unittest.TestCase):
         )
 
 
+class GenerationBindingDetailReasonTests(unittest.TestCase):
+    """#13846 R4: a generation-binding conflict names WHICH authority field failed in the
+    public structured reason, so an installed recurrence (the j#82030 finding — the reason only
+    said "not bound to the current declared process generation") is diagnosable without exposing
+    a private locator / raw output / secret."""
+
+    def test_detail_token_surfaces_in_generation_conflict_reason(self):
+        result = _decision(
+            generation_binding_current=False,
+            generation_binding_detail="fresh_startup_self_attestation_not_generation_bound",
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertIn(
+            "fresh_startup_self_attestation_not_generation_bound", result.reason
+        )
+
+    def test_non_generation_conflict_never_borrows_the_generation_detail(self):
+        # A conflict raised by an EARLIER authority check (lifecycle) must not be annotated with
+        # the generation-binding detail — the suffix is scoped to the generation check.
+        result = _decision(lifecycle_current=False, generation_binding_detail="unused")
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertIn("lane lifecycle generation", result.reason)
+        self.assertNotIn("unused", result.reason)
+
+
 class ActionBoundaryTests(unittest.TestCase):
     def test_post_probe_authority_change_is_zero_send(self):
         ops = _Ops(

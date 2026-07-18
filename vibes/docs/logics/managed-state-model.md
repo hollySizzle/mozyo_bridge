@@ -345,6 +345,28 @@ Table naming:
       **row-shape CAS write** の共有述語一般化ではなく、上で optional evidence と定義済みの
       `runtime_revision` を **read-time liveness 照合**で
       その定義どおり非 identity として扱うだけであり、identity 4 field には空許容を持ち込まない。
+      ★★**action-time 世代 authority の 2 source** (#13846 R4、installed 実機証拠 #14062 j#82028):
+      worker dispatch admission の `generation_binding_current` は **どの宣言 surface が authority を
+      供給したか**で 2 経路を持つ。**(a) declared worker pin 経路** (adopt / hibernate-repair が
+      `declared_slots` を書いた row): 上記 `binds_same_generation` で live pin と束ね、かつ startup
+      self-attestation を declared locator に照合する (最強 — locator drift / both-observed revision
+      mismatch を fail-closed)。**(b) slot-less create 経路** (`sublane create --no-dispatch` は
+      `declare_active` を通り `declared_slots` を **一切書かない** — 正当な generation-1 shape): declared
+      worker pin が無いので generation authority は **live worker の startup self-attestation を LIVE
+      locator に generation-bound したもの** (herdr の世代 discriminant は live locator、attestation store
+      は runtime version を保存しない — `herdr-native-identity.md`) とし、assigned_name も明示照合する。
+      R3 の `binds_same_generation` は declared pin が存在する前提だったため経路 (b) では発火せず、空
+      snapshot が false `worker_liveness_authority_conflict` を生んで installed fresh E2E 全体を止めていた。
+      経路 (b) は **`PIN_PAIR_ABSENT` (真に slot-less な row) のみ**に適用し、positively suspicious な
+      declared shape (foreign / mixed / duplicate / incomplete / unreadable) と、live 側が absent /
+      unattested / stale (locator drift) な slot-less row は従来どおり fail-closed (「row に pin がある」
+      ことは current generation の証明にならない)。field 分類: **identity authority** =
+      role/provider/assigned_name/locator、**generation authority** = live locator に bound した startup
+      self-attestation (declared pin 存在時は locator-drift / both-observed-revision fail-closed を加える)、
+      **observation metadata** = runtime_revision (both-observed かつ差異のときのみ discriminant)。
+      conflict reason には **どの authority field が不一致か**の value-free token
+      (`_generation_binding_detail`、locator / raw output / secret を露出しない) を付す (#13846 R4、
+      finding j#82030)。
     - **common declaration service** (`LaneDeclarationStore.declare_lane`) が issue / project 双方を
       fail-closed に宣言する。exact duplicate は idempotent (#13809 live-adopt)、既存 owner conflict /
       別 issue-or-scope / 不読・ambiguous inventory は zero-write。bulk / implicit backfill は禁止。
