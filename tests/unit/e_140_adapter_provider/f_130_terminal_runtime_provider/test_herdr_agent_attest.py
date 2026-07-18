@@ -22,6 +22,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     VERDICT_PRESENT,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (
+    _live_lister,
     cmd_herdr_agent_attest,
     perform_self_attestation,
 )
@@ -148,6 +149,49 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 home=Path(tmp),
             )
             self.assertEqual(rec.replacement_action_id, "")
+
+
+class LiveListerTerminalIsolationTest(unittest.TestCase):
+    """The pre-exec self-attestation lister must never touch the pane terminal (#14017).
+
+    The wrapper runs inside the herdr-spawned pane and is about to ``execvp`` the
+    interactive provider into that same pane. Its ``herdr agent list`` child is kept
+    off the pane's controlling terminal on every fd, so it can never perturb the
+    stdin / foreground state the provider inherits — the disturbance that made Claude
+    exit into ``shell_residue`` while Codex survived.
+    """
+
+    _ENV = {"MOZYO_HERDR_BINARY": "/x/herdr", "PATH": "/usr/bin"}
+
+    def _run_lister(self, run_mock):
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest.resolve_herdr_binary",
+            return_value=argparse.Namespace(path="/x/herdr"),
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest.subprocess.run",
+            run_mock,
+        ):
+            return _live_lister(self._ENV)()
+
+    def test_list_subprocess_detaches_from_pane_terminal(self) -> None:
+        import subprocess as _sp
+
+        def _run(argv, **kwargs):
+            self.assertEqual(argv, ["/x/herdr", "agent", "list"])
+            # Off the pane terminal on every standard fd: stdout/stderr piped,
+            # stdin from /dev/null, and its own session (no controlling terminal).
+            self.assertEqual(kwargs.get("stdin"), _sp.DEVNULL)
+            self.assertTrue(kwargs.get("start_new_session"))
+            self.assertTrue(kwargs.get("capture_output"))
+            return argparse.Namespace(
+                returncode=0, stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}]'
+            )
+
+        rows = self._run_lister(_run)
+        # The isolation kwargs do not change functionality: a valid payload still parses.
+        self.assertEqual(rows, [{"name": NAME, "pane_id": "wY:p2"}])
 
 
 class CmdAgentAttestTest(unittest.TestCase):

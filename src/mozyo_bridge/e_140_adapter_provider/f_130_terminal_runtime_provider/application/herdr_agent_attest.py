@@ -145,6 +145,25 @@ def _live_lister(env: Mapping[str, str]) -> Lister:
     :data:`_ATTEST_LIST_RETRIES` times so a herdr-registration lag right after start
     still resolves the agent's own row. Returns ``None`` on unresolved binary /
     repeated failure (the caller records an empty locator — fail-closed).
+
+    **Terminal isolation (Redmine #14017).** This lister runs *inside the
+    herdr-spawned pane*, as the wrapper process that is about to ``os.execvp`` the
+    interactive provider into that same pane. The ``agent list`` child is therefore
+    kept off the pane's controlling terminal on **every** standard fd: ``capture_output``
+    already pipes stdout/stderr, and this adds ``stdin=subprocess.DEVNULL`` +
+    ``start_new_session=True`` so the child has no fd pointing at the pane PTY and no
+    controlling-terminal association at all. Without this the child inherits the pane
+    PTY on fd 0 and stays in the pane's session — and a herdr *client* (a terminal
+    multiplexer) run there perturbs the terminal's foreground process group / stdin
+    state. The exec'd provider then inherits a disturbed terminal: Claude's
+    interactive TUI, which requires a TTY on stdin and is sensitive to job-control /
+    foreground state, exits immediately into ``shell_residue``, while Codex's
+    tool-shell (which does not depend on that state) survives — the exact
+    provider-asymmetric exit #14017 reproduces. A bare operator PTY tolerated the
+    perturbation because its terminal was already fully established; the pane's
+    freshly-allocated PTY does not. Detaching the child restores byte-for-byte
+    terminal parity with the unwrapped (pre-#13637) launch, and is provider-neutral:
+    a query command needs neither stdin nor the controlling terminal.
     """
 
     def _list() -> Optional[Sequence[Mapping[str, object]]]:
@@ -161,6 +180,8 @@ def _live_lister(env: Mapping[str, str]) -> Lister:
                     text=True,
                     timeout=COMMAND_TIMEOUT_SECONDS,
                     env=dict(env),
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
             except (OSError, subprocess.SubprocessError):
                 continue
