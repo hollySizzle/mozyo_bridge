@@ -194,12 +194,12 @@ class Argv0LaunchArgvTest(unittest.TestCase):
         resolved = ResolvedProviderLaunch(
             provider_id="claude",
             executable="/opt/claude/2.1.214/cli",
-            argv0="/home/u/.local/bin/claude",
+            argv0="/usr/local/bin/claude",
             managed_argv=("--permission-mode", "auto"),
         )
         argv = _build(resolved, attest_launcher="/abs/mozyo-bridge")
         env = _env_pairs(argv)
-        self.assertEqual(env.get(MOZYO_PROVIDER_ARGV0_ENV), "/home/u/.local/bin/claude")
+        self.assertEqual(env.get(MOZYO_PROVIDER_ARGV0_ENV), "/usr/local/bin/claude")
         # The provider command after the LAST `--` (the wrapper's provider separator; the
         # first `--` is herdr's own run-command separator) still starts with the realpath
         # exec target — the alias travels only on --env, never as the exec token.
@@ -225,7 +225,7 @@ class Argv0LaunchArgvTest(unittest.TestCase):
         resolved = ResolvedProviderLaunch(
             provider_id="claude",
             executable="/opt/claude/2.1.214/cli",
-            argv0="/home/u/.local/bin/claude",
+            argv0="/usr/local/bin/claude",
             managed_argv=("--permission-mode", "auto"),
         )
         argv = _build(resolved, attest_launcher="")
