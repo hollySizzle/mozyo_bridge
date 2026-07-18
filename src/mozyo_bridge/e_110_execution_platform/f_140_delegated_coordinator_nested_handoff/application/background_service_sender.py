@@ -297,9 +297,10 @@ class BackgroundServiceCallbackSender:
         - a modern fence returns the disposition token directly;
         - a legacy ``bool`` fence maps True -> ``CURRENT`` and False -> ``STALE`` (a bool "not the
           current round" is a deterministic supersession, hence terminal);
-        - a fence that raises, or returns an unrecognized value, is :data:`REVIEW_ROUND_UNVERIFIABLE`
-          — we could not re-verify the round, so it is retryable, never terminally dropped (a possibly
-          genuinely-current callback must not be lost to a transient fence failure).
+        - a fence that raises, or returns an unrecognized value (including an unhashable list / dict /
+          opaque object), is :data:`REVIEW_ROUND_UNVERIFIABLE` — we could not re-verify the round, so it
+          is retryable, never terminally dropped (a possibly genuinely-current callback must not be lost
+          to a transient fence-adapter failure).
         """
         if self.round_fence_fn is None:
             return REVIEW_ROUND_CURRENT
@@ -309,8 +310,14 @@ class BackgroundServiceCallbackSender:
             return REVIEW_ROUND_UNVERIFIABLE
         if isinstance(result, bool):
             return REVIEW_ROUND_CURRENT if result else REVIEW_ROUND_STALE
-        if result in REVIEW_ROUND_DISPOSITIONS:
-            return str(result)
+        # Narrow to ``str`` BEFORE the frozenset membership test: an unhashable unknown return
+        # (list / dict / opaque object) would raise ``TypeError`` on ``in`` — and that raise is
+        # OUTSIDE the fence-call try above, so it would crash the sender and leave the current row
+        # inflight (crash-recovery then terminalizes it as uncertain, dropping a genuinely-current
+        # callback). Every non-token return therefore normalizes to the retryable UNVERIFIABLE, on
+        # the same classification surface as a fence that raises.
+        if isinstance(result, str) and result in REVIEW_ROUND_DISPOSITIONS:
+            return result
         return REVIEW_ROUND_UNVERIFIABLE
 
     def _holds_claim(self, row: CallbackOutboxRow) -> bool:

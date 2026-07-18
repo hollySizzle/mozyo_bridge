@@ -169,13 +169,17 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         rows = [{"name": encode_assigned_name(WS, "codex", lane), "pane_id": f"%{lane}"} for lane in lanes]
         return lambda: (rows, "herdr")
 
-    def _sender(self, transport, *, inventory_lanes=(LANE,), fence_source=None):
+    def _sender(self, transport, *, inventory_lanes=(LANE,), fence_source=None, round_fence_fn=None):
         resolver = BackendNeutralTargetResolver(
             workspace_id=WS,
             inventory=self._inventory(*inventory_lanes),
             live_generation_fn=owning_lane_generation_reader(WS, lifecycle_store=self.life),
         )
-        fence = review_round_send_fence(lambda: fence_source) if fence_source is not None else None
+        # ``round_fence_fn`` (an override) wires a RAW fence directly — used to probe a fence adapter
+        # that returns a non-token value; otherwise ``fence_source`` wraps the production fence.
+        fence = round_fence_fn or (
+            review_round_send_fence(lambda: fence_source) if fence_source is not None else None
+        )
         return BackgroundServiceCallbackSender(
             workspace_id=WS, holder="superX", lease_store=self.lease,
             target_resolver=resolver, transport=transport, outbox=self.outbox,
@@ -232,6 +236,36 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         terminal = self.outbox.read(states=[CALLBACK_UNCERTAIN])
         self.assertTrue(terminal)  # terminal zero-send
         self.assertEqual([r.attempts for r in terminal], [0])  # retry 0 — never bounded-retried
+
+    def _unknown_fence_return_is_retryable(self, bad_value) -> None:
+        # j#81549 F1: a fence ADAPTER that returns a non-token value (an unhashable list / dict, or an
+        # opaque object) must NOT crash the sender. A `TypeError` on the frozenset membership test would
+        # escape the fence-call try and leave the current row inflight -> crash-recovery terminalizes it
+        # as uncertain, dropping a genuinely-current callback. It must normalize to the retryable
+        # UNVERIFIABLE (SEND_NOT_SENT), on the SAME classification surface as a fence that raises.
+        self._declare_owner()
+        source = _current_round_source()
+        candidates, _ = discover_review_returns(
+            source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal=ANCHOR
+        )
+        proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
+        proc.ingest(candidates, now=NOW)
+        transport = _CapturingTransport()
+        run_once(proc, self._sender(transport, round_fence_fn=lambda row: bad_value), now=NOW)
+        self.assertEqual(transport.calls, [])  # zero-send (no exception escaped)
+        self.assertEqual(self.outbox.read(states=[CALLBACK_UNCERTAIN]), ())  # NOT terminally dropped
+        pending = [r for r in self.outbox.read(states=[CALLBACK_PENDING]) if is_review_return_route(r.callback_route)]
+        self.assertEqual(len(pending), 1)  # retryable — the current callback survives the adapter fault
+        self.assertEqual([r.attempts for r in pending], [1])  # bounded-retry bumped attempts
+
+    def test_unknown_unhashable_list_fence_return_is_retryable(self) -> None:
+        self._unknown_fence_return_is_retryable([])
+
+    def test_unknown_unhashable_dict_fence_return_is_retryable(self) -> None:
+        self._unknown_fence_return_is_retryable({})
+
+    def test_unknown_opaque_object_fence_return_is_retryable(self) -> None:
+        self._unknown_fence_return_is_retryable(object())
 
     # -- full supervisor fan-out with the anchor + head fence wired ------
 
