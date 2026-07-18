@@ -107,6 +107,12 @@ class WorkerDispatchAdmissionFacts:
     locator_present: bool
     receiver_state: str
     generation_binding_current: bool = False
+    # #13846 R4: a value-free token naming WHICH generation authority did not bind when
+    # ``generation_binding_current`` is False (e.g. a slot-less fresh row whose live startup
+    # self-attestation is not generation-bound, or a declared-pin identity / locator / revision
+    # divergence). Empty when current. Surfaced in the conflict reason so a recurrence is
+    # diagnosable from the public structured outcome without exposing a locator / secret.
+    generation_binding_detail: str = ""
     terminal_absence_authoritative: bool = False
     duplicate_or_uncertain_delivery: bool = False
     workspace_id: Optional[str] = None
@@ -144,7 +150,12 @@ def decide_worker_dispatch_admission(
         (facts.anchor_current, "dispatch anchor is not the current lane decision"),
         (
             facts.generation_binding_current,
-            "the live or absent worker is not bound to the current declared process generation",
+            "the live or absent worker is not bound to the current declared process generation"
+            + (
+                f" ({facts.generation_binding_detail})"
+                if facts.generation_binding_detail
+                else ""
+            ),
         ),
         (facts.action_binding_current, "replacement/action binding is not current"),
         (
