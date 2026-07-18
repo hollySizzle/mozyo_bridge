@@ -91,8 +91,12 @@ def _review_request_note():
     return render_workflow_event_marker("review_request")
 
 
-def _review_result_note(conclusion="approved"):
-    return render_workflow_event_marker("review_result", conclusion=conclusion)
+def _review_result_note(conclusion="approved", req="10"):
+    # The v2 review_result marker declares the review_request it answers (#13974 j#81496); the round in
+    # these #13684 scenarios is review_request j10 -> review_result j20, so the result answers j10.
+    return render_workflow_event_marker(
+        "review_result", conclusion=conclusion, review_request_journal=req
+    )
 
 
 def _round_source(*extra):

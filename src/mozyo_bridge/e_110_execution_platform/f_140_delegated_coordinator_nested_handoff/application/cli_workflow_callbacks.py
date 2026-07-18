@@ -283,6 +283,11 @@ def _review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[di
         is_full_commit_head,
     )
 
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+        REVIEW_APPROVED,
+        REVIEW_CHANGES_REQUESTED,
+    )
+
     if gate not in (_REVIEW_REQUEST_GATE, _REVIEW_RESULT_GATE):
         return {}, None
     head = (getattr(args, "target_head", None) or "").strip()
@@ -296,6 +301,13 @@ def _review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[di
         if not req:
             return {}, "review_marker_missing_review_request_journal"
         fields["review_request_journal"] = req
+        # v2 (`### Gate Schema`): a review_result marker carries its conclusion. The `--review-decision`
+        # maps to the marker vocabulary — an approval / unspecified decision is ``approved``, any
+        # explicit non-approval outcome (changes_requested / finding / progress) is ``changes_requested``.
+        decision = (getattr(args, "review_decision", None) or "").strip().lower()
+        fields["conclusion"] = (
+            REVIEW_APPROVED if decision in ("", "approval") else REVIEW_CHANGES_REQUESTED
+        )
     return fields, None
 
 
