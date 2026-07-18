@@ -50,17 +50,25 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
+
+if TYPE_CHECKING:
+    from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    selected_attestation_store_is_v1,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    AttestationStoreLockBusy,
+    AttestationStoreLockUnavailable,
+    attestation_store_lock,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     GATEWAY_READY_CAPTURE_LINES,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
-    COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     GATEWAY_ROLE,
@@ -70,13 +78,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     RuntimePlacementFingerprint,
+    SublaneHealError,
     enforce_heal_postcondition,
     evaluate_heal_runtime_fence,
     production_placement_fingerprint,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
-    _tab_id_of_row,
-    _workspace_prefix,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     HerdrLauncherIncompatibleError,
@@ -89,15 +94,25 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
     _resolve_binary_or_die,
     herdr_workspace_segment,
-    prepare_session,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E501
+    V1_BINDING_MAINTENANCE_BUSY,
+    V1_BINDING_STORE_UNUSABLE,
+    V1ReplacementBindingFailure,
+    launch_or_resume_v1_replacement,
+    prepare_actuator_lane_session,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_lane_resolution import (  # noqa: E501
+    lane_slots,
+    pair_colocation as _pair_colocation,
+    resolve_lane_slots,
+)
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
     _agent_locator,
     _norm,
-    _norm_lane,
-    decode_assigned_name,
     derive_directory_lane_token,
     derive_lane_workspace_token,
 )
@@ -112,32 +127,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 
 #: The two provider slots a herdr lane workspace is launched with (gateway + worker).
 HERDR_LANE_PROVIDERS: tuple[str, ...] = (GATEWAY_ROLE, WORKER_ROLE)
-
-
-def _pair_colocation(
-    slots: Mapping[str, tuple[str, str]],
-    pair: "tuple[str, str] | None" = None,
-) -> Optional[bool]:
-    """Whether a live gateway/worker pair shares one placement container (#13705).
-
-    ``slots`` maps role -> ``(locator, placement_key)``. ``True`` when both slots are
-    live and share one ``(herdr_workspace, tab_id)`` key (an operable same-tab pair),
-    ``False`` when both are live but the keys differ (a ``pair_split``), and ``None``
-    when fewer than two slots are live (the ordinary single-provider heal — not
-    applicable, so the fence never blocks on it).
-
-    ``pair`` is the (gateway, worker) provider pair to check (Redmine #13569 R2-F2): the
-    heal fence passes the binding-resolved pair so a rebound lane's fence keys on its own
-    providers, not the fixed ``codex/claude``. ``None`` uses the built-in pair
-    (``GATEWAY_ROLE`` / ``WORKER_ROLE``), byte-identical.
-    """
-    gw_role, wk_role = pair if pair is not None else (GATEWAY_ROLE, WORKER_ROLE)
-    gateway = slots.get(gw_role)
-    worker = slots.get(wk_role)
-    if gateway is None or worker is None:
-        return None
-    return gateway[1] == worker[1]
-
 
 @dataclass
 class HerdrSublaneActuatorOps:
@@ -184,6 +173,10 @@ class HerdrSublaneActuatorOps:
     #: The #13806 tranche D replacement ``action_id`` a worker-recovery relaunch carries into
     #: the fresh process's startup self-attestation (empty on a normal heal = byte-invariant).
     replacement_action_id: str = ""
+    #: Exact immutable participant identity for the narrow v1 action-binding fallback
+    #: (Redmine #13933 R12). Empty on every normal create/heal.
+    replacement_assigned_name: str = ""
+    replacement_old_locator: str = ""
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 
@@ -355,35 +348,40 @@ class HerdrSublaneActuatorOps:
         # coordinator's), never `worktree_path`: the committed config is identical after
         # creation and this keeps one config source (the same rule the tmux
         # `resolve_append_lane_argv` follows). An unconfigured repo appends nothing.
-        from mozyo_bridge.application.repo_local_config_loader import (
-            load_repo_local_config,
-        )
+        self._prepare_lane_session(worktree_path)
 
-        # Config-driven pane placement (Redmine #13646): the lane's slots are the `sublane`
-        # lane_class, so the config's `lane_placement.sublane` split / order decides the
-        # gateway/worker pair's geometry inside the lane tab and which provider occupies it
-        # first. Read from the SAME source checkout as `agent_launch` (one config source).
-        # An unconfigured repo keeps the legacy `--split right` and the requested order.
-        repo_config = load_repo_local_config(self.repo_root)
-        agent_launch = repo_config.agent_launch
+    def _prepare_lane_session(
+        self,
+        worktree_path: str,
+        *,
+        replacement_action_id: "str | None" = None,
+        action_nonce: str = "",
+        startup_fence: "StartupTransactionFence | None" = None,
+        admission_lock_held: bool = False,
+    ):
+        """Run the production session composition and return its durable launch result.
+
+        ``append_lane_column`` intentionally keeps its historical ``None`` port contract.
+        The v1 replacement adapter needs the result internally so it can require a real
+        startup participant receipt; an adopted slot is never action-bound.
+        """
         try:
-            prepare_session(
-                repo_root=Path(worktree_path),
-                providers=list(self._launch_providers()),
+            result = prepare_actuator_lane_session(
+                worktree_path=worktree_path,
+                config_repo_root=self.repo_root,
+                providers=self._launch_providers(),
                 lane_id=self.lane_label,
                 env=self.env,
                 runner=self.runner,
                 timeout=self.timeout,
-                lane_placement=repo_config.lane_placement,
-                # Lane creation is a managed-pane chokepoint: pass the cockpit /
-                # sublane policy default (#11925) so lane Claude workers launch
-                # reproducibly auto, exactly like the tmux `cockpit append` path
-                # (#13360 — without this every herdr lane worker stalls on its
-                # first permission prompt).
-                claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-                agent_launch=agent_launch,
-                # #13806 R2-F2: carry the recovery's action_id into the fresh startup attestation.
-                replacement_action_id=self.replacement_action_id,
+                replacement_action_id=(
+                    self.replacement_action_id
+                    if replacement_action_id is None
+                    else replacement_action_id
+                ),
+                action_nonce=action_nonce,
+                startup_fence=startup_fence,
+                admission_lock_held=admission_lock_held,
             )
         except HerdrLauncherIncompatibleError as exc:
             # Redmine #13847: typed launcher-compat error (not a generic pane-create failure),
@@ -399,6 +397,7 @@ class HerdrSublaneActuatorOps:
         # shared-model projections join on. A metadata write failure never breaks the
         # actuation — the projections fail open (`lane_record_missing`).
         self._record_lane_metadata(worktree_path)
+        return result
 
     def _record_lane_metadata(self, worktree_path: str) -> None:
         """Upsert the lane's display-metadata record (best-effort, never raises)."""
@@ -670,7 +669,63 @@ class HerdrSublaneActuatorOps:
         if not verdict.ok:
             raise RuntimeError(f"lane heal fenced ({verdict.reason}): {verdict.detail}")
 
-        self.append_lane_column(worktree_path)
+        used_v1_binding = False
+        if (self.replacement_action_id or "").strip():
+            home = mozyo_bridge_home()
+            try:
+                # Pin the selected main-store generation from the v1 decision through
+                # reserve, launch/self-attestation, startup receipt, and side bind.  The
+                # child self-attestation writer takes a compatible shared lock; explicit
+                # maintenance (exclusive) cannot overtake this action.
+                with attestation_store_lock(
+                    home, exclusive=False, blocking=False
+                ):
+                    if selected_attestation_store_is_v1(home):
+                        launch_or_resume_v1_replacement(
+                            home=home,
+                            action_id=self.replacement_action_id,
+                            assigned_name=self.replacement_assigned_name,
+                            old_locator=self.replacement_old_locator,
+                            target_provider=target_provider,
+                            workspace_id=_ws,
+                            lane_id=self.lane_label,
+                            managed_pair=managed_pair,
+                            rows=rows,
+                            existing=existing,
+                            launch=lambda nonce, startup_fence: self._prepare_lane_session(
+                                worktree_path,
+                                replacement_action_id="",
+                                action_nonce=nonce,
+                                startup_fence=startup_fence,
+                                admission_lock_held=True,
+                            ),
+                        )
+                        used_v1_binding = True
+            except V1ReplacementBindingFailure as exc:
+                raise SublaneHealError(
+                    f"lane heal fenced ({exc.reason}): {exc.detail}",
+                    reason=exc.reason,
+                ) from exc
+            except AttestationStoreLockBusy as exc:
+                raise SublaneHealError(
+                    "lane heal fenced (replacement_binding_maintenance_busy): "
+                    "the attestation store is under maintenance",
+                    reason=V1_BINDING_MAINTENANCE_BUSY,
+                ) from exc
+            except AttestationStoreLockUnavailable as exc:
+                raise SublaneHealError(
+                    "lane heal fenced (replacement_binding_store_unusable): "
+                    "the attestation-store generation lock is unavailable",
+                    reason=V1_BINDING_STORE_UNUSABLE,
+                ) from exc
+            except OSError as exc:
+                raise SublaneHealError(
+                    "lane heal fenced (replacement_binding_store_unusable): "
+                    "the attestation-store generation lock could not be opened",
+                    reason=V1_BINDING_STORE_UNUSABLE,
+                ) from exc
+        if not used_v1_binding:
+            self.append_lane_column(worktree_path)
 
         # Same-tab postcondition (Redmine #13705 R1-F3): the compatible heal must have
         # restored the gateway/worker pair in ONE `(herdr_workspace, tab_id)` container.
@@ -740,53 +795,8 @@ class HerdrSublaneActuatorOps:
         rows: Sequence[Mapping[str, object]],
         managed: "tuple[str, ...] | None" = None,
     ) -> dict[str, tuple[str, str]]:
-        """Map ``{role: (locator, placement_key)}`` for the lane unit's managed slots.
-
-        Decodes each ``agent list`` row's ``mzb1`` name (#13247); a row is a managed lane
-        slot iff it decodes to ``(workspace_id, lane_id, role)``. Undecodable / foreign
-        rows are skipped. A row that decodes to a managed slot but carries no live locator is
-        skipped (a blank target is never a resolved pane), so the use case reads it as a
-        missing pane and fails closed rather than adopting a locator-less lane.
-
-        ``managed`` is the (gateway, worker) provider pair the lane is expected to run
-        (Redmine #13569 R2-F2). It must match the pair :meth:`_launch_providers` launched,
-        so a lane whose binding rebound its providers is READ BACK by its own providers
-        rather than being judged "no lane" against a fixed ``codex/claude``. ``None`` uses
-        the built-in pair, byte-identical.
-
-        ``placement_key`` is the slot's ``(herdr_workspace, tab_id)`` container
-        (Redmine #13705): two slots sharing one key are an operable same-tab pair; a
-        differing key is the ``pair_split`` a runtime skew produced. Keeping both the
-        locator and the placement key in the value lets the #13569 provider read-back and
-        the #13705 pair-split fence resolve off one pass over the managed pair.
-        """
-        managed_pair = managed if managed is not None else (GATEWAY_ROLE, WORKER_ROLE)
-        want_lane = _norm_lane(lane_id)
-        slots: dict[str, tuple[str, str]] = {}
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
-            if not decode.ok or decode.identity is None:
-                continue
-            identity = decode.identity
-            if identity.workspace_id != workspace_id:
-                continue
-            if _norm_lane(identity.lane_id) != want_lane:
-                continue
-            if identity.role not in managed_pair:
-                continue
-            locator = _agent_locator(row)
-            if not locator:
-                continue
-            # First live locator wins; a duplicate managed name is a session-start
-            # fail-closed condition, not this read's to resolve.
-            if identity.role not in slots:
-                slots[identity.role] = (
-                    locator,
-                    (_workspace_prefix(locator), _tab_id_of_row(row)),
-                )
-        return slots
+        """Compatibility port for the extracted shared lane-slot resolver."""
+        return lane_slots(workspace_id, lane_id, rows, managed)
 
     def _resolve_lane_slots(
         self,
@@ -806,23 +816,7 @@ class HerdrSublaneActuatorOps:
         the #13705 pair-split fence built on the resulting slots — keys on the same pair a
         rebound lane actually launched. ``None`` uses the built-in pair, byte-identical.
         """
-        try:
-            resolved = Path(worktree_path).expanduser().resolve()
-            workspace_id = herdr_workspace_segment(resolved)
-        except (OSError, ValueError):
-            return "", "", {}
-        lane_id = _norm_lane(self.lane_label)
-        slots: dict[str, tuple[str, str]] = {}
-        if workspace_id:
-            slots = self._lane_slots(workspace_id, lane_id, rows, managed)
-        if not slots:
-            # Legacy compatibility (pre-#13377): the lane's agents live in their own
-            # `wt_<hash>` workspace under the default lane.
-            legacy_ws = derive_lane_workspace_token(str(resolved))
-            legacy_slots = self._lane_slots(legacy_ws, DEFAULT_LANE, rows, managed)
-            if legacy_slots:
-                workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, legacy_slots
-        return workspace_id, lane_id, slots
+        return resolve_lane_slots(worktree_path, self.lane_label, rows, managed)
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         """Resolve the lane from the live herdr inventory for this worktree (fail-safe).

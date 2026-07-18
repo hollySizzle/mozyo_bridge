@@ -935,6 +935,18 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
   (`write_drops_replacement_action_id`), because a dropped binding would leave a fresh worker a replacement recovery matches on
   exactly (`sublane_stale_worker_recovery_live`) permanently unverifiable. The best-effort writer still never raises into a boot —
   the refusal is surfaced by the **preflight, before the launch**, not by crashing the child.
+- **The bounded-pair v1 recovery exception does not drop that field** (#13933 R12). General replacement launches remain refused on
+  v1. The reviewed hibernated bound-pair convergence rail instead reserves a separate home-scoped action-binding row **before** its
+  launch, writes the fresh process's ordinary v1 self-attestation, then binds only after the startup transaction proves one exact
+  successful participant receipt. The immutable join is action + assigned name + workspace + role + lane + old locator + startup
+  nonce/action, and the bound join additionally pins the fresh locator and attestation timestamp. A retry resumes that same durable
+  startup receipt; an already-live slot with no prior reservation is foreign and is never adopted or retroactively bound.
+  Publication is an atomic private `0600` SQLite v1 side store with strict shape validation and compare-and-set writes; it never
+  migrates or repairs an unknown shape. The main-store shared generation lock spans v1 selection, reserve, launch/self-attestation,
+  receipt read, and bind, so explicit maintenance cannot overtake the action. Readers accept the side binding only while the selected
+  main store is still recognized v1 and every identity/generation field matches. Native v2 continues to carry
+  `replacement_action_id` directly; migration, a different action/generation, unreadable authority, unsafe permissions, or a torn
+  schema all fail closed. This is therefore a two-record exact binding, not an implicit migration or a silent field drop.
 - **Admission joins the launcher against the REAL store, before any actuation.** `probe_store_schema` (read-only; creates nothing;
   an unopenable file is `store_unreadable`, never folded into "absent") + `decide_store_compatibility` run at the #13748/#13847
   preflight boundary in `prepare_session`, i.e. before the first herdr `workspace` / `tab` / `agent` write, so an incompatible store

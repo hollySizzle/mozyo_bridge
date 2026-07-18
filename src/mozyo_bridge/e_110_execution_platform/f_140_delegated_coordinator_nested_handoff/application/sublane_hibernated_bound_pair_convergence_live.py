@@ -17,6 +17,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    replacement_action_is_bound,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     BINDING_KIND_ISSUE,
     DISPOSITION_HIBERNATED,
@@ -132,6 +135,33 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     lane_runtime_identity,
 )
+
+
+def _action_bound_after_identity_join(
+    record,
+    *,
+    action_id: str,
+    live_locator: str,
+    workspace_id: str,
+    role: str,
+    lane: str,
+    assigned_name: str,
+    old_locator: str,
+) -> bool:
+    """Accept native-v2 directly, or the exact v1 side binding after identity join."""
+    direct_action = norm(getattr(record, "replacement_action_id", ""))
+    if direct_action:
+        return direct_action == norm(action_id)
+    return replacement_action_is_bound(
+        record,
+        action_id=norm(action_id),
+        live_locator=live_locator,
+        expected_workspace_id=workspace_id,
+        expected_role=role,
+        expected_lane=lane,
+        expected_assigned_name=assigned_name,
+        expected_old_locator=old_locator,
+    )
 
 
 def _launch_detail(result, port) -> str:
@@ -293,6 +323,8 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
                 journal=norm(self.request.journal),
                 env=self.owner.env,
                 replacement_action_id=norm(action_id),
+                replacement_assigned_name=norm(pin.assigned_name),
+                replacement_old_locator=norm(pin.old_locator),
             ).heal_lane_column(self.request.worktree, target_provider=norm(pin.provider))
         except SublaneHealError as exc:
             self.launch_failure_reason = norm(exc.reason) or "launch_error"
@@ -332,7 +364,20 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
         )
         if not join.ok:
             return ATTEST_PENDING
-        return ATTEST_BOUND if norm(record.replacement_action_id) == norm(action_id) else ATTEST_MISMATCH
+        return (
+            ATTEST_BOUND
+            if _action_bound_after_identity_join(
+                record,
+                action_id=norm(action_id),
+                live_locator=locator,
+                workspace_id=self.live.workspace_id(),
+                role=pin.provider,
+                lane=self.request.lane,
+                assigned_name=pin.assigned_name,
+                old_locator=pin.old_locator,
+            )
+            else ATTEST_MISMATCH
+        )
 
 
 @dataclass
@@ -666,9 +711,6 @@ class LiveBoundPairConvergenceOps:
     ) -> tuple[BoundPairObservation, tuple[ProcessGenerationPin, ...]]:
         observation = self.observe(request, action_id=action_id)
         transaction = self._transaction(observation.workspace_id, action_id)
-        participant_names = {
-            participant.assigned_name for participant in (transaction.participants if transaction else ())
-        }
         pins: list[ProcessGenerationPin] = []
         for slot in observation.slots:
             if slot.disposition != SLOT_HEALTHY or not slot.locator:
@@ -686,7 +728,24 @@ class LiveBoundPairConvergenceOps:
             )
             if not join.ok:
                 return observation, ()
-            if slot.assigned_name in participant_names and norm(attestation.replacement_action_id) != norm(action_id):
+            participant = next(
+                (
+                    item
+                    for item in (transaction.participants if transaction else ())
+                    if item.assigned_name == slot.assigned_name
+                ),
+                None,
+            )
+            if participant is not None and not _action_bound_after_identity_join(
+                attestation,
+                action_id=norm(action_id),
+                live_locator=slot.locator,
+                workspace_id=observation.workspace_id,
+                role=slot.provider,
+                lane=request.lane,
+                assigned_name=slot.assigned_name,
+                old_locator=participant.old_locator,
+            ):
                 return observation, ()
             pins.append(
                 ProcessGenerationPin(
