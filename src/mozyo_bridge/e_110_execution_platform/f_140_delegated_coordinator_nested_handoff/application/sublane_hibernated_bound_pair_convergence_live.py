@@ -70,6 +70,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (
     HerdrSublaneActuatorOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    SublaneLauncherIncompatibleError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (
+    SublaneHealError,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
     is_git_worktree_root,
     list_herdr_agent_rows,
@@ -103,6 +109,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
+    ACTUATION_EFFECT_FAILED,
     ACTUATION_RECOVERED,
     ATTEST_BOUND,
     ATTEST_MISMATCH,
@@ -125,6 +132,22 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     lane_runtime_identity,
 )
+
+
+def _launch_detail(result, port) -> str:
+    """Surface a fenced launch's typed reason in the public drive detail (Redmine #13933 R11).
+
+    The generic actuator records a hardcoded ``detail="launch"`` for any ``effect_failed`` at
+    the launch leg (:meth:`ReplacementActuatorUseCase._step_launch_owed`).  The port stashed
+    the stable, path/credential-free reason token the heal fence raised, so the public outcome
+    carries ``launch:<reason>`` (j#81429 #2) instead of a bare swallowed exception.  Every
+    other status keeps its own detail unchanged.
+    """
+    detail = result.detail or ",".join(result.preservation_reasons)
+    reason = norm(getattr(port, "launch_failure_reason", ""))
+    if result.status == ACTUATION_EFFECT_FAILED and norm(result.detail) == "launch" and reason:
+        return f"launch:{reason}"
+    return detail
 
 
 def _git(worktree: Path, *args: str) -> tuple[bool, str]:
@@ -255,8 +278,13 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
         return CLOSE_DONE if ok else CLOSE_ERROR
 
     def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
-        # ``heal_lane_column`` is the high-level idempotent launcher.  It may be called once
-        # per participant by the generic actuator; already-healthy/new slots are adopted.
+        # ``heal_lane_column`` is the high-level idempotent launcher.  It is driven once per
+        # participant; ``target_provider`` scopes its same-tab postcondition to THIS owed slot
+        # so an approved partial pair (a still-owed / legitimately absent sibling) converges
+        # without tripping the full-pair postcondition, while a LIVE split still fails closed
+        # (Redmine #13933 R11 j#81429 #3).  A fenced launch records its stable, typed reason
+        # (no path / credential) so the public outcome surfaces WHY (j#81429 #2), instead of a
+        # bare swallowed exception under ``effect_failed / launch``.
         try:
             HerdrSublaneActuatorOps(
                 repo_root=self.owner.repo_root,
@@ -265,9 +293,17 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
                 journal=norm(self.request.journal),
                 env=self.owner.env,
                 replacement_action_id=norm(action_id),
-            ).heal_lane_column(self.request.worktree)
-        except Exception:  # noqa: BLE001 - a fixed relaunch failure
+            ).heal_lane_column(self.request.worktree, target_provider=norm(pin.provider))
+        except SublaneHealError as exc:
+            self.launch_failure_reason = norm(exc.reason) or "launch_error"
             return LAUNCH_ERROR
+        except SublaneLauncherIncompatibleError as exc:
+            self.launch_failure_reason = norm(exc.reason) or "launcher_incompatible"
+            return LAUNCH_ERROR
+        except Exception:  # noqa: BLE001 - any other relaunch failure is a fixed launch error
+            self.launch_failure_reason = "launch_error"
+            return LAUNCH_ERROR
+        self.launch_failure_reason = ""
         return LAUNCH_DONE
 
     def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
@@ -622,7 +658,7 @@ class LiveBoundPairConvergenceOps:
         return ReplacementDrive(
             result.status == ACTUATION_RECOVERED,
             result.status,
-            result.detail or ",".join(result.preservation_reasons),
+            _launch_detail(result, port),
         )
 
     def final_pins(

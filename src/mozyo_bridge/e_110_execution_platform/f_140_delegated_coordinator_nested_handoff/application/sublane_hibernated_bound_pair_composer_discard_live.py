@@ -54,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _BoundPairActuatorPort,
     _SnapshotRecoveryOps,
     _git,
+    _launch_detail,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (
     LiveSublaneQuarantineOps,
@@ -975,7 +976,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             return PreparationDrive(
                 False,
                 result.status,
-                result.detail or ",".join(result.preservation_reasons),
+                _launch_detail(result, port),
             )
         if not self._finish(key, expectation, holder, port):
             return PreparationDrive(False, "completion_stopped", "transaction completion CAS stopped")

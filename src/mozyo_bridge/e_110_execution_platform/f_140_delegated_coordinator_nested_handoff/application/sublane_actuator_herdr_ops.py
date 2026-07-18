@@ -70,6 +70,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     RuntimePlacementFingerprint,
+    enforce_heal_postcondition,
     evaluate_heal_runtime_fence,
     production_placement_fingerprint,
 )
@@ -596,7 +597,7 @@ class HerdrSublaneActuatorOps:
             lane=self.lane_label or "",
         )
 
-    def heal_lane_column(self, worktree_path: str) -> None:
+    def heal_lane_column(self, worktree_path: str, *, target_provider: "str | None" = None) -> None:
         """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).
 
         A lane gateway can die between its launch and the first dispatch for reasons
@@ -625,6 +626,12 @@ class HerdrSublaneActuatorOps:
         split). After a compatible relaunch a same-tab **postcondition** verifies
         both slots share one ``(herdr_workspace, tab_id)`` container, so a heal that
         nonetheless split the pair is surfaced rather than reported healed.
+
+        ``target_provider`` (Redmine #13933 R11 j#81429) scopes that postcondition to one
+        owed participant so a single-leg convergence launch converges an approved partial
+        pair without bypassing a live split; the pure, target-aware contract (raising the
+        typed :class:`SublaneHealError`) is :func:`enforce_heal_postcondition`, and default
+        ``None`` keeps the full-pair postcondition byte-identical.
         """
         # Preflight fence — read-only, BEFORE any side effect. An unreadable inventory
         # is fail-closed (Redmine #13705 R1-F3): the pair invariant is unverifiable, so
@@ -661,9 +668,7 @@ class HerdrSublaneActuatorOps:
             existing_pair_colocated=_pair_colocation(existing, managed_pair),
         )
         if not verdict.ok:
-            raise RuntimeError(
-                f"lane heal fenced ({verdict.reason}): {verdict.detail}"
-            )
+            raise RuntimeError(f"lane heal fenced ({verdict.reason}): {verdict.detail}")
 
         self.append_lane_column(worktree_path)
 
@@ -683,18 +688,9 @@ class HerdrSublaneActuatorOps:
         _ws, _lane, healed = self._resolve_lane_slots(
             worktree_path, post_rows, managed_pair
         )
-        if _pair_colocation(healed, managed_pair) is not True:
-            gateway = healed.get(managed_pair[0])
-            worker = healed.get(managed_pair[1])
-            raise RuntimeError(
-                "lane heal postcondition failed: the gateway "
-                f"{gateway[0] if gateway else '<none>'} and worker "
-                f"{worker[0] if worker else '<none>'} are not confirmed in one "
-                f"placement container after the relaunch (gateway placement "
-                f"{gateway[1] if gateway else None}, worker placement "
-                f"{worker[1] if worker else None}); the pair is split or incomplete "
-                "(Redmine #13705) — fail-closed"
-            )
+        # ``target_provider=None`` keeps the full-pair postcondition; a scoped launch
+        # converges an approved partial pair without bypassing a live split (#13933 R11).
+        enforce_heal_postcondition(healed, managed_pair, target_provider=target_provider)
 
     def _live_rows(self) -> Sequence[Mapping[str, object]]:
         binary = _resolve_binary_or_die(self.env)

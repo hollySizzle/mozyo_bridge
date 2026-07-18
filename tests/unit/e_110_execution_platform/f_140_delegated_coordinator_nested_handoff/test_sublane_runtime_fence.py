@@ -20,12 +20,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FENCE_PAIR_ALREADY_SPLIT,
     FENCE_PROVENANCE_UNKNOWN,
     FENCE_RUNTIME_LACKS_CONTRACT,
+    HEAL_REASON_PAIR_INCOMPLETE,
+    HEAL_REASON_PAIR_SPLIT,
+    HEAL_REASON_TARGET_ABSENT,
     PLACEMENT_CONTRACT_SAME_TAB_PAIR,
     RUNTIME_PLACEMENT_CAPABILITIES,
     RuntimePlacementFingerprint,
+    SublaneHealError,
+    enforce_heal_postcondition,
     evaluate_heal_runtime_fence,
     production_placement_fingerprint,
 )
+
+PAIR = ("codex", "claude")
+#: healed row shape: provider -> (locator, placement_key)
+_GW = ("wL:p2", "wL:t1")
+_WK = ("wL:p3", "wL:t1")
+_WK_SPLIT = ("wL:p3", "wL:t2")
 
 
 def _compatible(version="0.11.0"):
@@ -97,6 +108,60 @@ class HealRuntimeFenceTest(unittest.TestCase):
         self.assertIn(PLACEMENT_CONTRACT_SAME_TAB_PAIR, fp.capabilities)
         self.assertTrue(fp.version)  # the running build has a version
         self.assertTrue(evaluate_heal_runtime_fence(fp).ok)
+
+
+class HealPostconditionTest(unittest.TestCase):
+    """The pure same-tab postcondition (Redmine #13933 R11 j#81429 #3)."""
+
+    def _reason(self, healed, *, target_provider=None):
+        with self.assertRaises(SublaneHealError) as ctx:
+            enforce_heal_postcondition(healed, PAIR, target_provider=target_provider)
+        return ctx.exception.reason
+
+    # -- full-pair contract (target_provider=None) stays byte-identical -----------
+
+    def test_full_pair_both_colocated_passes(self) -> None:
+        enforce_heal_postcondition({"codex": _GW, "claude": _WK}, PAIR)  # no raise
+
+    def test_full_pair_missing_slot_fails_incomplete(self) -> None:
+        self.assertEqual(self._reason({"claude": _WK}), HEAL_REASON_PAIR_INCOMPLETE)
+
+    def test_full_pair_live_split_fails_split(self) -> None:
+        self.assertEqual(
+            self._reason({"codex": _GW, "claude": _WK_SPLIT}), HEAL_REASON_PAIR_SPLIT
+        )
+
+    # -- target-scoped contract: tolerate an absent sibling, never a split -------
+
+    def test_target_scoped_absent_sibling_is_tolerated(self) -> None:
+        # The worker (target) is live; the gateway sibling is absent -> converge, no raise.
+        enforce_heal_postcondition({"claude": _WK}, PAIR, target_provider="claude")
+
+    def test_target_scoped_absent_target_fails_target_absent(self) -> None:
+        # The target's OWN slot is absent -> the launch genuinely failed, fail closed.
+        self.assertEqual(
+            self._reason({"claude": _WK}, target_provider="codex"),
+            HEAL_REASON_TARGET_ABSENT,
+        )
+
+    def test_target_scoped_live_split_still_fails_split(self) -> None:
+        # Sibling ALSO live but split -> never bypass same-tab placement.
+        self.assertEqual(
+            self._reason(
+                {"codex": _GW, "claude": _WK_SPLIT}, target_provider="claude"
+            ),
+            HEAL_REASON_PAIR_SPLIT,
+        )
+
+    def test_target_scoped_healthy_pair_passes(self) -> None:
+        enforce_heal_postcondition(
+            {"codex": _GW, "claude": _WK}, PAIR, target_provider="claude"
+        )  # no raise
+
+    def test_target_provider_match_is_whitespace_normalized(self) -> None:
+        # The target provider is matched against the healed row key under the same
+        # normalization the rest of the identity code uses (whitespace-trimmed).
+        enforce_heal_postcondition({"claude": _WK}, PAIR, target_provider=" claude ")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -37,7 +37,11 @@ from a runtime whose source and installed fingerprints agree — Redmine #13524)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
+
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    _norm,
+)
 
 #: The placement-contract capability token a runtime advertises when it ships the
 #: Redmine #13411 lane=tab same-tab pair placement + heal contract (the surviving
@@ -176,15 +180,107 @@ def evaluate_heal_runtime_fence(
     )
 
 
+# -- same-tab postcondition (verified AFTER the relaunch) -----------------------
+#
+# The preflight fence above proves the runtime CAN honour same-tab placement; this
+# postcondition proves the relaunch DID (Redmine #13705). Redmine #13933 R11 (j#81429)
+# scopes it to a single owed participant so a pair-level launcher driven for ONE
+# replacement leg converges an approved partial pair — without ever bypassing the
+# same-tab placement contract (a live split still fails closed).
+
+#: Both slots are live but in different placement containers — a live pair_split. Never
+#: bypassed: a target-scoped heal still fails closed on a live split.
+HEAL_REASON_PAIR_SPLIT = "pair_split"
+#: A full-pair heal did not leave BOTH slots live and co-located.
+HEAL_REASON_PAIR_INCOMPLETE = "pair_incomplete"
+#: A target-scoped heal's own owed participant slot did not come up live.
+HEAL_REASON_TARGET_ABSENT = "launch_target_absent"
+
+
+class SublaneHealError(RuntimeError):
+    """A mutating lane heal was fenced (preflight or same-tab postcondition, #13705).
+
+    Subclasses :class:`RuntimeError` so every caller catching ``RuntimeError`` /
+    ``Exception`` and every test asserting the fence's message substring is unchanged.
+    It additionally carries a stable, credential/path-free ``reason`` token so a
+    single-participant convergence launch surfaces WHY the launcher fenced in its public
+    outcome instead of a bare ``effect_failed / launch`` (Redmine #13933 R11 j#81429 #2).
+    """
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def enforce_heal_postcondition(
+    healed: "Mapping[str, tuple[str, str]]",
+    pair: "tuple[str, str]",
+    *,
+    target_provider: "Optional[str]" = None,
+) -> None:
+    """Verify the same-tab pair placement after a relaunch, or raise (pure, #13705).
+
+    ``healed`` maps provider -> the live ``(locator, placement_key)`` on the post-heal
+    read-back; ``pair`` is the binding-resolved ``(gateway, worker)`` providers.
+    ``target_provider`` selects the postcondition contract:
+
+    - ``None`` — a **full-pair** heal (#13378 / #13705 self-heal): BOTH slots must be
+      live and share one placement container. A missing slot or a split fails closed.
+      The byte-identical historical contract.
+    - a provider — a **single-participant** convergence launch (Redmine #13933 R11
+      j#81429 #3): the pair-level launcher is driven for ONE owed replacement leg while
+      its sibling may still be a stale participant awaiting its own leg or, for an
+      approved partial pair, legitimately absent. That provider's slot must be live and
+      — whenever the sibling is ALSO live — the pair must still be co-located (a live
+      split is NEVER tolerated, so same-tab placement is not bypassed); an absent sibling
+      is a partial state a later leg converges, not a launch failure.
+
+    Raises :class:`SublaneHealError` with a stable ``reason`` token on any failure; the
+    message names the observed slots for the journal (locators only — no path / credential).
+    """
+    gateway = healed.get(pair[0])
+    worker = healed.get(pair[1])
+    colocation = None if gateway is None or worker is None else gateway[1] == worker[1]
+    if target_provider is None:
+        target_present = None
+        ok = colocation is True
+    else:
+        target_present = any(_norm(role) == _norm(target_provider) for role in healed)
+        ok = target_present and colocation is not False
+    if ok:
+        return
+    if colocation is False:
+        reason = HEAL_REASON_PAIR_SPLIT
+    elif target_present is False:
+        reason = HEAL_REASON_TARGET_ABSENT
+    else:
+        reason = HEAL_REASON_PAIR_INCOMPLETE
+    raise SublaneHealError(
+        "lane heal postcondition failed: the gateway "
+        f"{gateway[0] if gateway else '<none>'} and worker "
+        f"{worker[0] if worker else '<none>'} are not confirmed in one "
+        f"placement container after the relaunch (gateway placement "
+        f"{gateway[1] if gateway else None}, worker placement "
+        f"{worker[1] if worker else None}); the pair is split or incomplete "
+        "(Redmine #13705) — fail-closed",
+        reason=reason,
+    )
+
+
 __all__ = (
     "FENCE_OK",
     "FENCE_PAIR_ALREADY_SPLIT",
     "FENCE_PROVENANCE_UNKNOWN",
     "FENCE_RUNTIME_LACKS_CONTRACT",
+    "HEAL_REASON_PAIR_INCOMPLETE",
+    "HEAL_REASON_PAIR_SPLIT",
+    "HEAL_REASON_TARGET_ABSENT",
     "HealFenceVerdict",
     "PLACEMENT_CONTRACT_SAME_TAB_PAIR",
     "RUNTIME_PLACEMENT_CAPABILITIES",
     "RuntimePlacementFingerprint",
+    "SublaneHealError",
+    "enforce_heal_postcondition",
     "evaluate_heal_runtime_fence",
     "production_placement_fingerprint",
 )
