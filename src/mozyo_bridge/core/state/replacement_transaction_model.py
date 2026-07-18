@@ -307,6 +307,21 @@ def transaction_has_zero_actuation_effect(
     )
 
 
+def _supersede_participant_signature(
+    pin: "ParticipantPin",
+) -> tuple[str, str, str, str, str, bool]:
+    """The immutable-across-supersede signature of a participant. (pure)
+
+    Everything a supersede re-anchor may NOT change: the stable identity ``(lane_id, role,
+    provider, assigned_name)`` PLUS ``old_locator`` (the exact live-generation evidence, and the
+    token the recovery action-id is derived from) and ``is_self`` (self-close ordering). Only
+    the lane-lifecycle evidence (``lane_revision`` / ``lane_generation``) — the mis-bound field
+    the convergence exists to correct — is deliberately excluded (Redmine #13806 R2 F1).
+    """
+    lane_id, role, provider, assigned_name = pin.identity
+    return (lane_id, role, provider, assigned_name, pin.old_locator, pin.is_self)
+
+
 def supersede_refusal_reason(
     existing: "ReplacementTransactionRecord",
     *,
@@ -325,9 +340,14 @@ def supersede_refusal_reason(
     1. an ACTUATED or in-flight row — not :func:`transaction_has_zero_actuation_effect`, or a
        still-live lease — is refused :data:`CAS_UNEXPECTED_STATE`. Once a close / launch / send
        happened, or a different holder is live, the header is immutable, zero-write;
-    2. a row whose decision / continuation pointers OR participant-identity set diverges from
-       the request is not the **same exact action** — refused :data:`CAS_ACTION_MISMATCH`, so a
-       supersede corrects EVIDENCE only, never re-targets a different worker / gate / approval;
+    2. a row whose decision / continuation pointers OR participant **signature set** diverges
+       from the request is not the **same exact action** — refused :data:`CAS_ACTION_MISMATCH`.
+       The signature is :func:`_supersede_participant_signature` — the identity ``(lane_id,
+       role, provider, assigned_name)`` PLUS ``old_locator`` (the exact live-generation
+       evidence) and ``is_self`` (which governs self-close ordering). The ONLY drift a supersede
+       may correct is the mis-bound lane-lifecycle evidence (``lane_revision`` /
+       ``lane_generation``); a re-anchor may never re-target a different worker locator, a
+       self/non-self topology, or a different gate / approval (Redmine #13806 R2 F1);
     3. a new generation not **strictly greater** than the stored one is refused
        :data:`CAS_GENERATION_MISMATCH` — a monotonic, owner-approved supersede only.
 
@@ -336,12 +356,16 @@ def supersede_refusal_reason(
     """
     if not transaction_has_zero_actuation_effect(existing) or existing.lease_is_live(now):
         return CAS_UNEXPECTED_STATE
-    stored_identities = frozenset(p.identity for p in existing.participants)
-    new_identities = frozenset(p.identity for p in new_participants)
+    stored_signatures = frozenset(
+        _supersede_participant_signature(p) for p in existing.participants
+    )
+    new_signatures = frozenset(
+        _supersede_participant_signature(p) for p in new_participants
+    )
     if (
         existing.decision != decision
         or existing.continuation != continuation
-        or stored_identities != new_identities
+        or stored_signatures != new_signatures
     ):
         return CAS_ACTION_MISMATCH
     if new_action_generation <= existing.action_generation:

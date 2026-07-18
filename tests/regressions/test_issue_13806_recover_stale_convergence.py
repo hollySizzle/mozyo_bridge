@@ -323,6 +323,50 @@ class SupersedeStoreTests(unittest.TestCase):
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_ACTION_MISMATCH)
 
+    def test_supersede_refused_on_old_locator_drift(self):
+        # Redmine #13806 R2 F1: the exact live-generation locator is NOT re-anchorable — only the
+        # mis-bound lane-lifecycle evidence is. A locator drift is a different worker generation.
+        self._plan_zero_effect(worker=_worker(lane_revision="0"))
+        before = self.store.get(self.key)
+        drifted = ParticipantPin(
+            lane_id=LANE, role=ROLE, provider=PROVIDER, assigned_name=NAME,
+            old_locator="w28:pDRIFT", is_self=False, lane_revision="5", lane_generation="1",
+        )
+        out = self._supersede(worker=drifted)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ACTION_MISMATCH)
+        # zero-write: manifest + revision unchanged, the exact locator preserved
+        after = self.store.get(self.key)
+        self.assertEqual(after.revision, before.revision)
+        self.assertEqual(after.find_participant(WK_IDENTITY).old_locator, LOCATOR)
+
+    def test_supersede_refused_on_is_self_drift(self):
+        # Redmine #13806 R2 F1: is_self governs self-close ordering — a supersede may never flip a
+        # non-self worker recovery into a self topology.
+        self._plan_zero_effect(worker=_worker(lane_revision="0"))
+        before = self.store.get(self.key)
+        drifted = ParticipantPin(
+            lane_id=LANE, role=ROLE, provider=PROVIDER, assigned_name=NAME,
+            old_locator=LOCATOR, is_self=True, lane_revision="5", lane_generation="1",
+        )
+        out = self._supersede(worker=drifted)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_ACTION_MISMATCH)
+        after = self.store.get(self.key)
+        self.assertEqual(after.revision, before.revision)
+        self.assertFalse(after.find_participant(WK_IDENTITY).is_self)
+
+    def test_supersede_reanchors_only_lane_lifecycle_evidence(self):
+        # The permitted correction: identity + old_locator + is_self identical, ONLY the
+        # lane-lifecycle (revision, generation) evidence differs → applied.
+        self._plan_zero_effect(worker=_worker(lane_revision="0", lane_generation="9"))
+        out = self._supersede(worker=_worker(lane_revision="5", lane_generation="1"))
+        self.assertTrue(out.applied)
+        pin = self.store.get(self.key).find_participant(WK_IDENTITY)
+        self.assertEqual((pin.lane_revision, pin.lane_generation), ("5", "1"))
+        self.assertEqual(pin.old_locator, LOCATOR)  # locator preserved
+        self.assertFalse(pin.is_self)
+
     def test_supersede_requires_strictly_greater_generation(self):
         self._plan_zero_effect(worker=_worker(lane_revision="0"), gen=GEN)
         same = self._supersede(gen=GEN, worker=_worker(lane_revision="5"))
