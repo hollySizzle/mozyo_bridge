@@ -67,6 +67,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     GATEWAY_READY_CAPTURE_LINES,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_startup_projection import (
+    project_sublane_startup,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
@@ -88,6 +91,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _list_rows,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneStartupObservation,
     SublaneLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
@@ -325,7 +329,7 @@ class HerdrSublaneActuatorOps:
             argv += ["--agent", provider]
         return argv
 
-    def append_lane_column(self, worktree_path: str) -> None:
+    def append_lane_column(self, worktree_path: str) -> SublaneStartupObservation:
         """Stand the lane's slots up inside the dedicated sublane host workspace.
 
         Delegates to the #13330 :func:`prepare_session` on the LANE worktree with
@@ -348,7 +352,7 @@ class HerdrSublaneActuatorOps:
         # coordinator's), never `worktree_path`: the committed config is identical after
         # creation and this keeps one config source (the same rule the tmux
         # `resolve_append_lane_argv` follows). An unconfigured repo appends nothing.
-        self._prepare_lane_session(worktree_path)
+        return project_sublane_startup(self._prepare_lane_session(worktree_path))
 
     def _prepare_lane_session(
         self,
@@ -361,9 +365,9 @@ class HerdrSublaneActuatorOps:
     ):
         """Run the production session composition and return its durable launch result.
 
-        ``append_lane_column`` intentionally keeps its historical ``None`` port contract.
-        The v1 replacement adapter needs the result internally so it can require a real
-        startup participant receipt; an adopted slot is never action-bound.
+        The raw result remains private because the v1 replacement adapter requires its
+        exact action participant receipt. The public append boundary projects it into the
+        actuator's typed startup observation; an adopted slot is never action-bound.
         """
         try:
             result = prepare_actuator_lane_session(

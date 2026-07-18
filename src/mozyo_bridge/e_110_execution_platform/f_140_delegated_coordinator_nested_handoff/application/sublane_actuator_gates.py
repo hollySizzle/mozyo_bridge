@@ -23,10 +23,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_PAIR_SPLIT,
     REASON_PARTIAL_PAIR_RECOVERY,
     REASON_RUNTIME_FINGERPRINT,
+    REASON_STARTUP_HEALTH_UNCONFIRMED,
     STEP_BLOCKED,
     STEP_EXECUTED,
     ActuationStep,
     SublaneActuationOutcome,
+    SublaneStartupObservation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.pair_launch_attestation import (  # noqa: E501
     decide_pair_launch_attestation,
@@ -119,6 +121,56 @@ def pair_split_admission(
         gateway_pane=lane.gateway_pane,
         worker_pane=lane.worker_pane,
         adopted=adopted,
+        fill_decision=fill_decision,
+        fill_override_reason=fill_override_reason,
+    )
+
+
+def startup_health_admission(
+    use_case,
+    request,
+    observation: Optional[SublaneStartupObservation],
+    *,
+    launch_action,
+    dispatch: bool,
+    steps: list,
+    fill_decision,
+    fill_override_reason,
+) -> Optional[SublaneActuationOutcome]:
+    """Block a non-positive embedded startup before inventory read-back or dispatch.
+
+    ``None`` preserves legacy non-herdr adapters only. Herdr always returns a typed
+    observation; any result other than ``ok=True`` is terminal for this actuation. The
+    action may owe explicit rollback, but this gate never closes a participant itself.
+    """
+    if observation is None or observation.ok:
+        return None
+    rollback_command = (
+        "mozyo-bridge herdr session-rollback "
+        f"--action-id {observation.action_id}"
+        if observation.rollback_owed and observation.action_id
+        else None
+    )
+    steps.append(
+        ActuationStep(
+            order=2,
+            title="confirm embedded startup health",
+            status=STEP_BLOCKED,
+            detail="session-start did not positively confirm every role "
+            f"({observation.health_summary()}); refusing read-back, attestation, "
+            "readiness, and dispatch. Explicit rollback remains operator-owned.",
+            command=rollback_command,
+        )
+    )
+    return use_case._blocked(
+        request,
+        launch_action=launch_action,
+        reason="embedded session-start health was not positively confirmed; blocked "
+        "before post-append read-back and dispatch",
+        reasons=(REASON_STARTUP_HEALTH_UNCONFIRMED,),
+        dispatch=dispatch,
+        steps=tuple(steps),
+        startup=observation,
         fill_decision=fill_decision,
         fill_override_reason=fill_override_reason,
     )
@@ -233,4 +285,5 @@ __all__ = (
     "pair_attestation_admission",
     "pair_split_admission",
     "runtime_placement_gate",
+    "startup_health_admission",
 )

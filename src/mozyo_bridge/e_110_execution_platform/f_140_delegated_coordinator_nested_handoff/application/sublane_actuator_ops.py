@@ -43,6 +43,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
     project_sublanes,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    SublaneStartupObservation,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +110,11 @@ class SublaneActuatorOps(Protocol):
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
     ) -> None: ...
 
-    def append_lane_column(self, worktree_path: str) -> None: ...
+    def append_lane_column(
+        self, worktree_path: str
+    ) -> Optional[SublaneStartupObservation]:
+        """Launch a pair; ``None`` is reserved for legacy non-herdr adapters."""
+        ...
 
     def append_lane_argv(self, worktree_path: str) -> list[str]: ...
 

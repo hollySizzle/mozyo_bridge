@@ -111,6 +111,20 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     StartupHealthError,
     classify_startup_health,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
+    SublaneActuateUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    ACTUATE_BLOCKED,
+    ACTUATE_EXECUTED,
+    REASON_STARTUP_HEALTH_UNCONFIRMED,
+    SublaneStartupObservation,
+    SublaneStartupRoleHealth,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+    SublaneCreateRequest,
+    SublaneLaneView,
+)
 
 
 def _facts(**over):
@@ -1878,6 +1892,138 @@ class SessionRollbackRailTest(unittest.TestCase):
         ops.close_fails = set()
         verdict = self._run(ops, self.fence.read(action.action_id), execute=True)
         self.assertTrue(verdict.ok)
+
+
+class _EmbeddedStartupOps:
+    """Minimal actuator port exposing an embedded startup observation."""
+
+    def __init__(self, startup):
+        self.startup = startup
+        self.reads = 0
+        self.dispatches = 0
+
+    def is_git_workspace(self):
+        return True
+
+    def worktree_exists(self, branch):
+        return True
+
+    def create_worktree(self, **kwargs):  # pragma: no cover - reuse path
+        raise AssertionError("worktree creation must not run")
+
+    def append_lane_column(self, worktree_path):
+        return self.startup
+
+    def append_lane_argv(self, worktree_path):
+        return ["herdr", "session-start", "--repo", worktree_path]
+
+    def read_lane(self, worktree_path):
+        self.reads += 1
+        if self.reads == 1:
+            return None
+        return SublaneLaneView(
+            workspace_id="ws",
+            lane_id="issue_13948_health",
+            lane_label="issue_13948_health",
+            issue="13948",
+            branch="issue_13948_health",
+            repo_root=worktree_path,
+            gateway_pane="wH:p2",
+            worker_pane="wH:p3",
+            state="active",
+        )
+
+    def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        return ADOPT_DECL_NOT_ADOPTED
+
+    def dispatch_implementation_request(self, **kwargs):
+        self.dispatches += 1
+        return 0
+
+
+def _embedded_request():
+    return SublaneCreateRequest(
+        issue="13948",
+        lane_label="issue_13948_health",
+        branch="issue_13948_health",
+        worktree_path="/tmp/issue_13948_health",
+        journal="81719",
+    )
+
+
+def _embedded_startup(*, ok, health, compensation, action_id="act_13948"):
+    return SublaneStartupObservation(
+        ok=ok,
+        action_id=action_id,
+        roles=(
+            SublaneStartupRoleHealth(
+                provider="claude",
+                disposition=DISPOSITION_FRESH_LAUNCHED,
+                health=health,
+                compensation=compensation,
+            ),
+        ),
+        rollback_owed=compensation == COMPENSATION_ROLLBACK_OWED,
+    )
+
+
+class EmbeddedStartupAdmissionRegressionTest(unittest.TestCase):
+    def test_unhealthy_start_blocks_before_readback_and_dispatch_with_rollback_pointer(self):
+        ops = _EmbeddedStartupOps(
+            _embedded_startup(
+                ok=False,
+                health=HEALTH_PROVIDER_EXITED,
+                compensation=COMPENSATION_ROLLBACK_OWED,
+            )
+        )
+        outcome = SublaneActuateUseCase(ops).run(_embedded_request(), execute=True)
+
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(
+            outcome.blocked_reasons, (REASON_STARTUP_HEALTH_UNCONFIRMED,)
+        )
+        self.assertEqual(ops.reads, 1, "post-append inventory read must not run")
+        self.assertEqual(ops.dispatches, 0)
+        self.assertEqual(outcome.startup.action_id, "act_13948")
+        self.assertEqual(
+            outcome.steps[-1].command,
+            "mozyo-bridge herdr session-rollback --action-id act_13948",
+        )
+        self.assertNotIn("--execute", outcome.steps[-1].command)
+
+    def test_uncertain_start_without_debt_blocks_without_rollback_command(self):
+        ops = _EmbeddedStartupOps(
+            _embedded_startup(
+                ok=False,
+                health=HEALTH_RECEIVER_UNREADABLE,
+                compensation=COMPENSATION_NOT_NEEDED,
+            )
+        )
+        outcome = SublaneActuateUseCase(ops).run(_embedded_request(), execute=True)
+
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(ops.reads, 1)
+        self.assertIsNone(outcome.steps[-1].command)
+
+    def test_healthy_typed_and_legacy_none_results_continue(self):
+        healthy = _embedded_startup(
+            ok=True,
+            health=HEALTH_HEALTHY,
+            compensation=COMPENSATION_NOT_NEEDED,
+        )
+        for startup in (healthy, None):
+            with self.subTest(startup="typed" if startup else "legacy_none"):
+                ops = _EmbeddedStartupOps(startup)
+                outcome = SublaneActuateUseCase(ops).run(
+                    _embedded_request(), execute=True, dispatch=False
+                )
+                self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+                self.assertEqual(ops.reads, 2)
+                self.assertEqual(ops.dispatches, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
