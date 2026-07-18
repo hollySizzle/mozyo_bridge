@@ -15,6 +15,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    replacement_action_is_bound,
+)
 from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer, norm
 from mozyo_bridge.core.state.replacement_preservation import (
     PreservationObservation,
@@ -505,9 +508,19 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             expected_role=slot.provider,
             expected_lane=request.lane,
         )
-        return bool(
-            join.ok
-            and norm(record.replacement_action_id) == norm(expectation.action_id)
+        direct_action = norm(getattr(record, "replacement_action_id", ""))
+        return join.ok and (
+            direct_action == norm(expectation.action_id)
+            if direct_action
+            else replacement_action_is_bound(
+                record,
+                action_id=norm(expectation.action_id),
+                live_locator=slot.locator,
+                expected_workspace_id=observation.workspace_id,
+                expected_role=slot.provider, expected_lane=request.lane,
+                expected_assigned_name=slot.assigned_name,
+                expected_old_locator=participant.old_locator,
+            )
         )
 
     def _progress_proven_roles(

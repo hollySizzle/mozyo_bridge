@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -14,6 +15,17 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
     VERDICT_PRESENT,
+    herdr_identity_attestation_path,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    HerdrIdentityReplacementBindingStore,
+    ReplacementActionBindingError,
+    herdr_identity_replacement_binding_path,
+    replacement_action_is_bound,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    AttestationStoreLockBusy,
+    attestation_store_lock,
 )
 from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer, ProcessGenerationPin
 from mozyo_bridge.core.state.replacement_preservation import (
@@ -677,12 +689,41 @@ class LaunchReasonSurfacingTests(unittest.TestCase):
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
+_V1_ATTESTATION_DDL = (
+    "CREATE TABLE herdr_identity_attestations ("
+    "assigned_name TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, role TEXT NOT NULL, "
+    "lane_id TEXT NOT NULL, locator TEXT NOT NULL, verdict TEXT NOT NULL, "
+    "detail TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)"
+)
+
+
+def _seed_v1_attestation_store(home: Path) -> Path:
+    path = herdr_identity_attestation_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA user_version=1")
+        conn.execute(_V1_ATTESTATION_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
 
 def _fake_binary(tmp: str) -> Path:
     binpath = Path(tmp) / "fake-herdr"
     binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return binpath
+
+
+def _fake_attest_launcher(tmp: str) -> Path:
+    launcher = Path(tmp) / "fake-mozyo-bridge"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(
+        launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+    )
+    return launcher
 
 
 def _agent_list_rows(fake: FakeHerdr):
@@ -743,6 +784,57 @@ class _AttestingHerdr(FakeHerdr):
         return result
 
 
+class _V1AttestingHerdr(_AttestingHerdr):
+    """The installed mixed-runtime shape: healthy launch, normal v1 row, no action field."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.start_calls: list[str] = []
+        self.start_hook = None
+
+    def run(self, argv, *args, **kwargs):
+        if list(argv[1:]) == ["herdr", "agent-attest", "--help"]:
+            return __import__("subprocess").CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "usage: mozyo-bridge herdr agent-attest --assigned-name NAME\n"
+                    "mozyo_attest_capability_schema=2\n"
+                    "mozyo_attest_capability_stores=1_2\n"
+                ),
+                stderr="",
+            )
+        return super().run(argv, *args, **kwargs)
+
+    def _cmd_agent_start(self, argv, rest):
+        self.start_calls.append(rest[2] if len(rest) > 2 else "")
+        if self.start_hook is not None:
+            self.start_hook()
+        desired_action = self.action_id
+        self.action_id = ""
+        try:
+            result = super()._cmd_agent_start(argv, rest)
+        finally:
+            self.action_id = desired_action
+        name = rest[2] if len(rest) > 2 else ""
+        decoded = decode_assigned_name(name)
+        live = self.agent_named(name)
+        if live and decoded.ok and decoded.identity is not None:
+            HerdrIdentityAttestationStore(home=self._attestation_home).upsert(
+                IdentityAttestationRecord(
+                    assigned_name=name,
+                    workspace_id=decoded.identity.workspace_id,
+                    role=decoded.identity.role,
+                    lane_id=decoded.identity.lane_id,
+                    locator=live["pane_id"],
+                    verdict=VERDICT_PRESENT,
+                    observed_at="2099-07-18T00:00:00+00:00",
+                    replacement_action_id="",
+                )
+            )
+        return result
+
+
 class _CleanPreservationPort(_BoundPairActuatorPort):
     """The real convergence port with ONLY the read-only close-boundary observation modeled.
 
@@ -755,6 +847,122 @@ class _CleanPreservationPort(_BoundPairActuatorPort):
 
     def observe_preservation(self, pin):
         return PreservationObservation(identity_matches=True, attestation_fresh=True)
+
+
+class V1ReplacementBindingStoreTests(unittest.TestCase):
+    ACTION = "conv-v1-action-1"
+    NAME = "mzb1_ws1_claude_lane1"
+
+    def _reserve(self, home: Path, **over):
+        values = dict(
+            action_id=self.ACTION,
+            assigned_name=self.NAME,
+            workspace_id="ws1",
+            role="claude",
+            lane_id="lane1",
+            old_locator="w1:p-old",
+            startup_nonce="nonce-1",
+            startup_action_id="startup-1",
+        )
+        values.update(over)
+        return HerdrIdentityReplacementBindingStore(home=home).reserve(**values)
+
+    def test_exact_binding_is_idempotent_and_generation_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _seed_v1_attestation_store(home)
+            store = HerdrIdentityReplacementBindingStore(home=home)
+            intent = self._reserve(home)
+            self.assertEqual(self._reserve(home), intent)
+            record = HerdrIdentityAttestationStore(home=home).upsert(
+                IdentityAttestationRecord(
+                    assigned_name=self.NAME,
+                    workspace_id="ws1",
+                    role="claude",
+                    lane_id="lane1",
+                    locator="w1:p-new",
+                    verdict=VERDICT_PRESENT,
+                    observed_at="2099-07-18T00:00:00+00:00",
+                )
+            )
+            bound = store.bind(
+                intent,
+                attestation=record,
+                receipt_startup_action_id="startup-1",
+                receipt_role="claude",
+                receipt_assigned_name=self.NAME,
+                receipt_locator="w1:p-new",
+                receipt_present=True,
+            )
+            self.assertEqual(store.bind(
+                intent,
+                attestation=record,
+                receipt_startup_action_id="startup-1",
+                receipt_role="claude",
+                receipt_assigned_name=self.NAME,
+                receipt_locator="w1:p-new",
+                receipt_present=True,
+            ), bound)
+            check = dict(
+                action_id=self.ACTION,
+                live_locator="w1:p-new",
+                expected_workspace_id="ws1",
+                expected_role="claude",
+                expected_lane="lane1",
+                expected_assigned_name=self.NAME,
+                expected_old_locator="w1:p-old",
+                home=home,
+            )
+            self.assertTrue(replacement_action_is_bound(record, **check))
+            for key, foreign in (
+                ("action_id", "foreign-action"),
+                ("live_locator", "w1:p-other"),
+                ("expected_workspace_id", "foreign-ws"),
+                ("expected_role", "codex"),
+                ("expected_lane", "foreign-lane"),
+                ("expected_assigned_name", "foreign-name"),
+                ("expected_old_locator", "w1:p-foreign-old"),
+            ):
+                candidate = dict(check)
+                candidate[key] = foreign
+                self.assertFalse(replacement_action_is_bound(record, **candidate), key)
+
+    def test_foreign_attempt_and_unsafe_file_shape_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _seed_v1_attestation_store(home)
+            self._reserve(home)
+            with self.assertRaises(ReplacementActionBindingError):
+                self._reserve(home, startup_nonce="nonce-foreign")
+            with self.assertRaises(ReplacementActionBindingError):
+                self._reserve(Path(tmp) / "empty-old", old_locator="")
+
+            path = herdr_identity_replacement_binding_path(home)
+            os.chmod(path, 0o644)
+            with self.assertRaises(ReplacementActionBindingError):
+                HerdrIdentityReplacementBindingStore(home=home).read(
+                    self.ACTION, self.NAME
+                )
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_unknown_schema_is_not_repaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _seed_v1_attestation_store(home)
+            self._reserve(home)
+            path = herdr_identity_replacement_binding_path(home)
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("ALTER TABLE replacement_action_bindings ADD COLUMN junk TEXT")
+                conn.commit()
+            finally:
+                conn.close()
+            before = path.read_bytes()
+            with self.assertRaises(ReplacementActionBindingError):
+                HerdrIdentityReplacementBindingStore(home=home).read(
+                    self.ACTION, self.NAME
+                )
+            self.assertEqual(path.read_bytes(), before)
 
 
 class RealLauncherCompositionTests(unittest.TestCase):
@@ -914,6 +1122,208 @@ class RealLauncherCompositionTests(unittest.TestCase):
                 # The production completion leg reached PHASE_COMPLETED.
                 self.assertTrue(completed)
                 self.assertEqual(store.get(key).phase, PHASE_COMPLETED)
+
+    def _exercise_v1_side_binding(self, *, fail_first_bind: bool) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            _seed_v1_attestation_store(home)
+            coord = Path(tmp) / "coord"
+            coord.mkdir()
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            env = with_provider_path(
+                {
+                    HERDR_ENV: str(_fake_binary(tmp)),
+                    "MOZYO_BRIDGE_HOME": str(home),
+                    "MOZYO_BRIDGE_LAUNCHER": str(_fake_attest_launcher(tmp)),
+                }
+            )
+            fake = _V1AttestingHerdr(attestation_home=home)
+
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                HerdrSublaneActuatorOps(
+                    repo_root=coord,
+                    lane_label=self.LANE,
+                    issue=self.ISSUE,
+                    env=env,
+                    runner=fake.run,
+                ).append_lane_column(str(worktree))
+                ws = read_anchor(worktree)["workspace_id"]
+                gw_name = encode_assigned_name(ws, "codex", self.LANE)
+                wk_name = encode_assigned_name(ws, "claude", self.LANE)
+                gw_old = fake.agent_named(gw_name)["pane_id"]
+                wk_old = fake.agent_named(wk_name)["pane_id"]
+
+                # A normal-v1 live generation with no reserve-before-launch side binding
+                # is foreign to a replacement action.  Never adopt/fabricate a binding.
+                with self.assertRaises(SublaneHealError) as unbound:
+                    HerdrSublaneActuatorOps(
+                        repo_root=coord,
+                        lane_label=self.LANE,
+                        issue=self.ISSUE,
+                        journal="80925",
+                        env=env,
+                        runner=fake.run,
+                        replacement_action_id="foreign-action",
+                        replacement_assigned_name=gw_name,
+                        replacement_old_locator=gw_old,
+                    ).heal_lane_column(str(worktree), target_provider="codex")
+                self.assertEqual(
+                    unbound.exception.reason,
+                    "replacement_binding_authority_conflict",
+                )
+                self.assertEqual(len(fake.start_calls), 2)
+                for pane, agent in list(fake._agents.items()):
+                    if agent.name == gw_name:
+                        del fake._agents[pane]
+
+                maintenance_attempts: list[str] = []
+
+                def assert_generation_is_pinned():
+                    try:
+                        with attestation_store_lock(
+                            home, exclusive=True, blocking=False
+                        ):
+                            maintenance_attempts.append("unexpectedly_acquired")
+                    except AttestationStoreLockBusy:
+                        maintenance_attempts.append("busy")
+
+                fake.start_hook = assert_generation_is_pinned
+
+                store = ReplacementTransactionStore(home=home)
+                key = ReplacementTransactionKey(ws, self.ACTION)
+                gw_pin = ParticipantPin(
+                    lane_id=self.LANE,
+                    role="gateway",
+                    provider="codex",
+                    assigned_name=gw_name,
+                    old_locator=gw_old,
+                    lane_revision="1",
+                    lane_generation="1",
+                )
+                wk_pin = ParticipantPin(
+                    lane_id=self.LANE,
+                    role="worker",
+                    provider="claude",
+                    assigned_name=wk_name,
+                    old_locator=wk_old,
+                    lane_revision="1",
+                    lane_generation="1",
+                )
+                store.plan_transaction(
+                    key,
+                    action_generation=1,
+                    decision=DecisionPointer(
+                        source="redmine", issue_id=self.ISSUE, journal_id="80925"
+                    ),
+                    continuation=ContinuationPointer(
+                        source="redmine",
+                        issue_id=self.ISSUE,
+                        journal_id="80925",
+                        expected_gate="bound_pair_convergence_approval",
+                        next_semantic_action="repair_pins",
+                    ),
+                    participants=[gw_pin, wk_pin],
+                )
+                owner = LiveBoundPairConvergenceOps(
+                    repo_root=coord, env=env, transaction_store=store
+                )
+                request = ConvergeBoundPairRequest(
+                    issue=self.ISSUE,
+                    journal="80925",
+                    lane=self.LANE,
+                    worktree=str(worktree),
+                    branch="main",
+                )
+                live = _SnapshotRecoveryOps(
+                    repo_root=Path(str(worktree)),
+                    request_issue=self.ISSUE,
+                    request_lane=self.LANE,
+                    request_journal="80925",
+                    env=env,
+                    runner=fake.run,
+                )
+                live.target_workspace_id = ws
+                expectation = SimpleNamespace(action_id=self.ACTION, action_generation=1)
+                port = _CleanPreservationPort(owner, request, expectation, live)
+                holder = f"converge:{self.ACTION}:g1"
+
+                def refresh_and_drive():
+                    live.snapshot_rows = tuple(_agent_list_rows(fake))
+                    return self._drive((store, key, port), holder)
+
+                real_bind = HerdrIdentityReplacementBindingStore.bind
+                bind_calls = 0
+
+                def maybe_fail_bind(binding_self, *args, **kwargs):
+                    nonlocal bind_calls
+                    bind_calls += 1
+                    if fail_first_bind and bind_calls == 1:
+                        raise ReplacementActionBindingError("simulated bind interruption")
+                    return real_bind(binding_self, *args, **kwargs)
+
+                with mock.patch.object(
+                    CL, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)
+                ), mock.patch.object(
+                    QM, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)
+                ), mock.patch.object(
+                    CL,
+                    "HerdrSublaneActuatorOps",
+                    lambda **kw: HerdrSublaneActuatorOps(**kw, runner=fake.run),
+                ), mock.patch.object(
+                    HerdrIdentityReplacementBindingStore, "bind", maybe_fail_bind
+                ):
+                    first = refresh_and_drive()
+                    if fail_first_bind:
+                        self.assertEqual(first.status, ACTUATION_EFFECT_FAILED)
+                        self.assertEqual(
+                            port.launch_failure_reason,
+                            "replacement_binding_authority_conflict",
+                        )
+                        second = refresh_and_drive()
+                        self.assertEqual(second.status, ACTUATION_RECOVERED)
+                    else:
+                        self.assertEqual(first.status, ACTUATION_RECOVERED)
+
+                # Initial pair + one fresh launch per role.  Replaying an interrupted
+                # side bind resumes the exact startup receipt; it never relaunches the
+                # already-live gateway.
+                self.assertEqual(len(fake.start_calls), 4)
+                self.assertEqual(maintenance_attempts, ["busy", "busy"])
+                attestation_store = HerdrIdentityAttestationStore(home=home)
+                for pin in (gw_pin, wk_pin):
+                    live_row = fake.agent_named(pin.assigned_name)
+                    self.assertIsNotNone(live_row)
+                    record = attestation_store.read(pin.assigned_name)
+                    self.assertEqual(record.replacement_action_id, "")
+                    self.assertTrue(
+                        replacement_action_is_bound(
+                            record,
+                            action_id=self.ACTION,
+                            live_locator=live_row["pane_id"],
+                            expected_workspace_id=ws,
+                            expected_role=pin.provider,
+                            expected_lane=self.LANE,
+                            expected_assigned_name=pin.assigned_name,
+                            expected_old_locator=pin.old_locator,
+                            home=home,
+                        )
+                    )
+                    self.assertEqual(
+                        store.get(key).find_participant(pin.identity).phase,
+                        PARTICIPANT_REPLACED,
+                    )
+                self.assertTrue(owner.finish_replacement(expectation))
+                self.assertEqual(store.get(key).phase, PHASE_COMPLETED)
+                with sqlite3.connect(herdr_identity_attestation_path(home)) as conn:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+    def test_real_v1_store_uses_exact_side_binding_without_migration(self):
+        self._exercise_v1_side_binding(fail_first_bind=False)
+
+    def test_real_v1_store_replays_interrupted_bind_without_relaunch(self):
+        self._exercise_v1_side_binding(fail_first_bind=True)
 
 
 if __name__ == "__main__":
