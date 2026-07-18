@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _resolve_worker_dispatch_ops,
     _worker_dispatch_argv,
 )
+from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
@@ -79,6 +80,7 @@ def _healthy_admission() -> WorkerDispatchAdmission:
             "live",
             True,
             "awaiting_input",
+            generation_binding_current=True,
             lane_generation=1,
             worker_assigned_name="mzb1_ws_claude_lane",
             workspace_id="ws",
@@ -179,18 +181,39 @@ class WorkerReadinessProbeTests(unittest.TestCase):
 
 
 class WorkerAdmissionObservationTests(unittest.TestCase):
-    def _observe(self, rows, attestation):
+    def _observe(self, rows, attestation, *, lifecycle_overrides=None):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
         lane = SimpleNamespace(
             workspace_id="ws", lane_id=LANE_LABEL, worker_pane="w28:p75"
         )
         request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "81683")
-        lifecycle = SimpleNamespace(
+        worker_name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        lifecycle_values = dict(
             issue_id=ISSUE,
             lane_disposition="active",
             lane_generation=7,
             decision_journal="81683",
             replacement_action_id="",
+            declared_pins=(
+                ProcessGenerationPin(
+                    role="gateway",
+                    provider="codex",
+                    assigned_name=encode_assigned_name("ws", "codex", LANE_LABEL),
+                    locator="w28:p74",
+                ),
+                ProcessGenerationPin(
+                    role="worker",
+                    provider="claude",
+                    assigned_name=worker_name,
+                    locator="w28:p75",
+                ),
+            ),
         )
+        lifecycle_values.update(lifecycle_overrides or {})
+        lifecycle = SimpleNamespace(**lifecycle_values)
         ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
         with patch.object(ops, "worker_provider", return_value="claude"), patch(
             "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
@@ -211,7 +234,12 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             return ops.observe_worker_dispatch_admission(lane=lane, request=request)
 
     def _attestation(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
         return SimpleNamespace(
+            assigned_name=encode_assigned_name("ws", "claude", LANE_LABEL),
             workspace_id="ws",
             role="claude",
             lane_id=LANE_LABEL,
@@ -255,10 +283,80 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
         )
 
     def test_current_slot_absence_routes_recovery_without_send_authority(self):
-        result = self._observe([], None)
+        attestation = self._attestation()
+        attestation.replacement_action_id = "replace-7"
+        result = self._observe(
+            [],
+            attestation,
+            lifecycle_overrides={"replacement_action_id": "replace-7"},
+        )
         self.assertEqual(
             result.decision, ADMISSION_STALE_WORKER_RECOVERY_REQUIRED
         )
+
+    def test_live_locator_drift_from_declared_worker_pin_is_conflict(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        attestation = self._attestation()
+        attestation.locator = "w28:p-new"
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p-new",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                }
+            ],
+            attestation,
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
+    def test_missing_or_incomplete_declared_pair_is_conflict(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        row = {
+            "name": name,
+            "pane_id": "w28:p75",
+            "provider": "claude",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        incomplete = (
+            ProcessGenerationPin("worker", "claude", name, "w28:p75"),
+        )
+        for pins in ((), incomplete):
+            with self.subTest(pins=pins):
+                result = self._observe(
+                    [row],
+                    self._attestation(),
+                    lifecycle_overrides={"declared_pins": pins},
+                )
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
+
+    def test_terminal_absence_with_stale_anchor_or_action_is_conflict(self):
+        attestation = self._attestation()
+        attestation.replacement_action_id = "replace-old"
+        for overrides in (
+            {"decision_journal": "old", "replacement_action_id": "replace-old"},
+            {"replacement_action_id": "replace-new"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self._observe([], attestation, lifecycle_overrides=overrides)
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
 
 
 class DispatchContainmentTests(unittest.TestCase):

@@ -195,6 +195,7 @@ class LiveWorkerDispatchOps:
             slot_state="unknown",
             locator_present=bool(lane.worker_pane),
             receiver_state="unknown",
+            generation_binding_current=False,
             worker_locator=lane.worker_pane,
         )
         return WorkerDispatchAdmission(
