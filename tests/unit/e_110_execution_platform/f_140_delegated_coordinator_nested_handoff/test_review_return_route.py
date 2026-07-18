@@ -31,12 +31,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RETURN_NOT_LATEST,
     RETURN_NOT_REVIEW_RESULT,
     RETURN_MALFORMED_REVIEW_HEAD,
+    RETURN_MISSING_REVIEW_CONCLUSION,
     RETURN_MISSING_REVIEW_HEAD,
     RETURN_OK,
     RETURN_PREVIOUS_GENERATION,
     RETURN_REVIEW_HEAD_DRIFT,
     RETURN_REVIEW_REQUEST_UNCONFIRMED,
     RETURN_SELF_ROUTE,
+    REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED,
     REVIEW_RETURN_FENCE_HEAD_DRIFT,
     REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED,
     REVIEW_RETURN_FENCE_MALFORMED_HEAD,
@@ -47,11 +49,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REVIEW_RETURN_ROUTE_PREFIX,
     OwningLaneBinding,
     correlated_review_request_journal,
+    current_review_generation_conclusion,
     current_review_generation_head,
     current_review_generation_request,
+    decode_review_return_conclusion,
     decode_review_return_payload,
     decode_review_return_target_head,
     encode_review_return_payload,
+    is_explicit_review_conclusion,
     is_full_commit_head,
     is_review_return_route,
     latest_review_result_journal,
@@ -374,6 +379,38 @@ class ReviewHeadFenceTest(unittest.TestCase):
         self.assertEqual(current_review_generation_head(markers, ISSUE), HEAD_B)
         self.assertEqual(current_review_generation_head([], ISSUE), "")
 
+    def test_missing_conclusion_is_refused_at_discovery(self) -> None:
+        # j#81506: a review_result whose conclusion is pending (the value a missing conclusion is
+        # normalized to at intake) is not a real review outcome -> refused.
+        markers = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="110", conclusion="pending")]
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, RETURN_MISSING_REVIEW_CONCLUSION)
+
+    def test_explicit_conclusion_is_bound_on_the_plan(self) -> None:
+        markers = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="110", conclusion="changes_requested")]
+        plan = plan_review_return(markers, ISSUE, "120", _owner(), dispatch_anchor_journal="100")
+        self.assertTrue(plan.emit)
+        self.assertEqual(plan.conclusion, "changes_requested")
+
+    def test_is_explicit_review_conclusion_truth_table(self) -> None:
+        self.assertTrue(is_explicit_review_conclusion("approved"))
+        self.assertTrue(is_explicit_review_conclusion("changes_requested"))
+        self.assertFalse(is_explicit_review_conclusion("pending"))
+        self.assertFalse(is_explicit_review_conclusion(""))
+        self.assertFalse(is_explicit_review_conclusion("bogus"))
+
+    def test_current_review_generation_conclusion_is_live_explicit(self) -> None:
+        markers = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="110", conclusion="approved")]
+        self.assertEqual(current_review_generation_conclusion(markers, ISSUE), "approved")
+        m2 = [_review_request("110", head=HEAD_A), _review_result("120", head=HEAD_A, req="110", conclusion="pending")]
+        self.assertEqual(current_review_generation_conclusion(m2, ISSUE), "")
+
+    def test_payload_round_trips_conclusion(self) -> None:
+        p = encode_review_return_payload("110", HEAD_A, "changes_requested")
+        self.assertEqual(decode_review_return_conclusion(p), "changes_requested")
+        self.assertEqual(decode_review_return_conclusion(encode_review_return_payload("110", HEAD_A)), "")
+
     def test_current_review_generation_request_is_live_declared_req(self) -> None:
         # j#81496 F1: the live authoritative req is the latest review_result's DECLARED req when it
         # equals its correlated request.
@@ -399,13 +436,14 @@ class _Row:
 class ReviewReturnSendEdgeFenceTest(unittest.TestCase):
     """Redmine #13974 / j#81454 A: terminal send-edge fence (generation + head) for backlog rows."""
 
-    def _fence(self, anchor="100", head=HEAD_A, req="110"):
-        return make_review_return_send_edge_fence(anchor, head, req)
+    def _fence(self, anchor="100", head=HEAD_A, req="110", conclusion="approved"):
+        return make_review_return_send_edge_fence(anchor, head, req, conclusion)
 
-    def _row(self, request_journal: str, head: str = HEAD_A, lane: str = "issue_13684"):
+    def _row(self, request_journal: str, head: str = HEAD_A, conclusion: str = "approved",
+             lane: str = "issue_13684"):
         return _Row(
             review_return_callback_route(lane),
-            encode_review_return_payload(request_journal, head),
+            encode_review_return_payload(request_journal, head, conclusion),
         )
 
     def test_previous_generation_row_is_fenced_terminal(self) -> None:
@@ -413,11 +451,34 @@ class ReviewReturnSendEdgeFenceTest(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertEqual(reason, REVIEW_RETURN_FENCE_PREVIOUS_GENERATION)
 
-    def test_current_generation_current_head_and_req_row_is_exempt(self) -> None:
-        # Current generation (round >= anchor) AND head + req match the current review generation ->
-        # NOT fenced; the #13684 send authorities own its exactly-once delivery.
-        blocked, _ = self._fence(head=HEAD_A, req="110")(self._row("110", head=HEAD_A))
+    def test_current_generation_current_identity_row_is_exempt(self) -> None:
+        # Current generation (round >= anchor) AND head + req + conclusion match the current review
+        # generation -> NOT fenced; the #13684 send authorities own its exactly-once delivery.
+        blocked, _ = self._fence(head=HEAD_A, req="110", conclusion="approved")(
+            self._row("110", head=HEAD_A, conclusion="approved")
+        )
         self.assertFalse(blocked)
+
+    def test_current_generation_conclusion_drift_row_is_fenced_terminal(self) -> None:
+        # j#81506: the recorded conclusion drifted from the current live conclusion -> fenced terminal.
+        blocked, reason = self._fence(conclusion="changes_requested")(
+            self._row("110", head=HEAD_A, conclusion="approved")
+        )
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED)
+
+    def test_missing_recorded_conclusion_is_fenced_terminal(self) -> None:
+        # j#81506: a row with no recorded conclusion (pre-conclusion payload) fails closed.
+        row = _Row(review_return_callback_route("issue_13684"), encode_review_return_payload("110", HEAD_A))
+        blocked, reason = self._fence()(row)
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED)
+
+    def test_unresolvable_current_conclusion_fences_current_generation_row(self) -> None:
+        # j#81506: a blank/pending current conclusion (live marker conclusion missing) fails closed.
+        blocked, reason = self._fence(conclusion="")(self._row("110", head=HEAD_A, conclusion="approved"))
+        self.assertTrue(blocked)
+        self.assertEqual(reason, REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED)
 
     def test_current_generation_req_drift_row_is_fenced_terminal(self) -> None:
         # j#81496 F1: the recorded req drifted from the current live request -> fenced terminal.

@@ -430,9 +430,11 @@ class WorkspaceCallbackSupervisor:
                     # rows at the send edge — a historical coordinator row AND a previous-generation /
                     # head-drifted / req-drifted review_return row both reach a terminal disposition
                     # instead of retrying forever (the ingest fence only stops newly discovered rows).
-                    review_head, review_request = resolve_current_review_identity(source, issue)
+                    review_head, review_request, review_conclusion = resolve_current_review_identity(
+                        source, issue
+                    )
                     send_fence_fn = build_supervisor_send_edge_fence(
-                        anchor, self._route, review_head, review_request
+                        anchor, self._route, review_head, review_request, review_conclusion
                     )
                 # #13684/#13974: reserve the correlated review_result return to the issue's owning-lane
                 # Codex gateway, generation-fenced. The sibling helper resolves the owning-lane binding,

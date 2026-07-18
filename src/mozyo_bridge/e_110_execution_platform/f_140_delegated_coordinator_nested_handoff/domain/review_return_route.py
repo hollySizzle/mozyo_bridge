@@ -56,7 +56,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GATE_IMPLEMENTATION_DONE,
     GATE_REVIEW,
     GATE_REVIEW_REQUEST,
+    REVIEW_APPROVED,
+    REVIEW_CHANGES_REQUESTED,
 )
+
+#: The explicit review outcomes a returnable ``review_result`` must carry (#13974 j#81506): a marker
+#: with a missing conclusion is normalized to ``pending`` at intake, which is NOT an explicit outcome
+#: and is never returned. Only these two are a real review result.
+_EXPLICIT_REVIEW_CONCLUSIONS = frozenset({REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED})
 
 #: The callback-route prefix for a returned review_result. It is part of the outbox idempotency key
 #: (``callback_route``), so a return to lane A and a return to lane B (a recovery-lane switch) are
@@ -114,6 +121,10 @@ RETURN_REVIEW_REQUEST_UNCONFIRMED = "review_request_unconfirmed"
 #: not exactly 40 (SHA-1) or 64 (SHA-256) lowercase hex chars. A truncated / abbreviated / non-hex head
 #: cannot be exact-matched against the durable review generation, so it is fail-closed.
 RETURN_MALFORMED_REVIEW_HEAD = "malformed_review_head"
+#: The review_result marker carries no EXPLICIT conclusion (Redmine #13974 / j#81506): a missing
+#: conclusion is normalized to ``pending`` at intake, which is not a real review outcome. Only an
+#: explicit ``approved`` / ``changes_requested`` is returnable.
+RETURN_MISSING_REVIEW_CONCLUSION = "missing_review_conclusion"
 
 #: The refusal reasons — every one is a fail-closed no-return (never a guessed / self / stale /
 #: uncorrelated / previous-generation / head-unconfirmed send).
@@ -132,6 +143,7 @@ RETURN_REFUSAL_REASONS = frozenset(
         RETURN_REVIEW_HEAD_DRIFT,
         RETURN_REVIEW_REQUEST_UNCONFIRMED,
         RETURN_MALFORMED_REVIEW_HEAD,
+        RETURN_MISSING_REVIEW_CONCLUSION,
     }
 )
 
@@ -213,6 +225,11 @@ class ReviewReturnPlan:
     #: markers' ``target_head`` (never prose). Recorded on the outbox row so the send authority conjoins
     #: it with the current review generation head at action time — a head drift / mismatch zero-sends.
     target_head: str = ""
+    #: The explicit review conclusion (Redmine #13974 j#81506): ``approved`` / ``changes_requested``,
+    #: read from the marker (never a normalized ``pending``). Recorded on the row so the send authority
+    #: re-verifies it against the live conclusion at action time — a missing / drifted conclusion
+    #: zero-sends.
+    conclusion: str = ""
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -225,6 +242,7 @@ class ReviewReturnPlan:
             "review_journal": self.review_journal,
             "review_request_journal": self.review_request_journal,
             "target_head": self.target_head,
+            "conclusion": self.conclusion,
         }
 
 
@@ -235,15 +253,19 @@ _PAYLOAD_REVIEW_REQUEST_JOURNAL = "review_request_journal"
 #: The outbox-row payload key carrying the reviewed head (Redmine #13974). Kept in the row ``payload``
 #: (not a new column) so the existing outbox idempotency key is untouched.
 _PAYLOAD_TARGET_HEAD = "target_head"
+#: The outbox-row payload key carrying the explicit review conclusion (Redmine #13974 j#81506).
+_PAYLOAD_CONCLUSION = "conclusion"
 
 
-def encode_review_return_payload(review_request_journal: str, target_head: str = "") -> str:
+def encode_review_return_payload(
+    review_request_journal: str, target_head: str = "", conclusion: str = ""
+) -> str:
     """Encode the review-return correlation into a compact JSON outbox payload (pure).
 
-    Carries the correlated ``review_request_journal`` (the action identity the return is bound to) and
-    the reviewed ``target_head`` (Redmine #13974) so the send authority can re-verify the review round
-    AND the head at action time. Returns ``""`` for a blank request journal (nothing to carry); the
-    ``target_head`` is included when present.
+    Carries the correlated ``review_request_journal`` (the action identity the return is bound to), the
+    reviewed ``target_head`` (Redmine #13974), and the explicit ``conclusion`` (j#81506) so the send
+    authority can re-verify the review round, head, AND conclusion at action time. Returns ``""`` for a
+    blank request journal (nothing to carry); ``target_head`` / ``conclusion`` are included when present.
     """
     j = str(review_request_journal or "").strip()
     if not j:
@@ -252,6 +274,9 @@ def encode_review_return_payload(review_request_journal: str, target_head: str =
     head = str(target_head or "").strip()
     if head:
         obj[_PAYLOAD_TARGET_HEAD] = head
+    concl = str(conclusion or "").strip()
+    if concl:
+        obj[_PAYLOAD_CONCLUSION] = concl
     return json.dumps(obj, sort_keys=True)
 
 
@@ -282,6 +307,15 @@ def decode_review_return_target_head(payload: str) -> str:
     yields ``""`` — which the send-edge head fence treats as a fail-closed missing head (terminal).
     """
     return str(_decode_payload_obj(payload).get(_PAYLOAD_TARGET_HEAD, "") or "").strip()
+
+
+def decode_review_return_conclusion(payload: str) -> str:
+    """Read the recorded explicit ``conclusion`` from an outbox-row payload, or ``""`` (pure; j#81506).
+
+    Fail-safe: a blank / non-JSON / conclusion-less payload yields ``""`` — the send-edge conclusion
+    fence treats it as a fail-closed missing conclusion (terminal).
+    """
+    return str(_decode_payload_obj(payload).get(_PAYLOAD_CONCLUSION, "") or "").strip()
 
 
 def _as_int(journal: object) -> Optional[int]:
@@ -400,6 +434,45 @@ def review_result_head(markers: Iterable[JournalMarker], issue: str, review_jour
         ):
             return str(getattr(mk, "target_head", "") or "").strip()
     return ""
+
+
+def is_explicit_review_conclusion(conclusion: object) -> bool:
+    """Whether ``conclusion`` is an EXPLICIT review outcome (pure; Redmine #13974 j#81506).
+
+    Only ``approved`` / ``changes_requested`` are real review results; ``pending`` (the value a
+    missing conclusion is normalized to at intake) and any blank / other value are NOT explicit.
+    """
+    return str(conclusion or "").strip() in _EXPLICIT_REVIEW_CONCLUSIONS
+
+
+def review_result_conclusion(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
+    """The ``review_conclusion`` on the review_result marker at ``review_journal``, or ``""`` (pure)."""
+    issue_s = str(issue).strip()
+    journal_s = str(review_journal).strip()
+    for mk in markers:
+        if (
+            str(mk.issue).strip() == issue_s
+            and str(mk.journal).strip() == journal_s
+            and str(mk.gate).strip() == GATE_REVIEW
+        ):
+            return str(getattr(mk, "review_conclusion", "") or "").strip()
+    return ""
+
+
+def current_review_generation_conclusion(markers: Iterable[JournalMarker], issue: str) -> str:
+    """The LIVE explicit conclusion of the current review generation (pure; Redmine #13974 j#81506).
+
+    The latest review_result's ``review_conclusion`` iff it is EXPLICIT (approved / changes_requested);
+    otherwise ``""`` (fail-closed). A reserved ``review_return`` row's recorded conclusion must still
+    equal this at the send edge — a missing / pending / drifted live conclusion collapses it to ``""``
+    so every review_return row for the issue fails closed.
+    """
+    marker_list = list(markers)
+    latest = latest_review_result_journal(marker_list, issue)
+    if not latest:
+        return ""
+    conclusion = review_result_conclusion(marker_list, issue, latest)
+    return conclusion if is_explicit_review_conclusion(conclusion) else ""
 
 
 def review_request_head(markers: Iterable[JournalMarker], issue: str, request_journal: str) -> str:
@@ -577,6 +650,10 @@ def review_return_is_current(
     live_declared = review_result_marker_request(markers, issue, review_journal)
     if not live_declared or live_declared != current_request or live_declared != recorded:
         return False
+    # j#81506: the LIVE review_result must still carry an EXPLICIT conclusion (approved /
+    # changes_requested). A missing / pending / drifted-away conclusion is not a real review result.
+    if not is_explicit_review_conclusion(review_result_conclusion(markers, issue, review_journal)):
+        return False
     return True
 
 
@@ -675,10 +752,13 @@ def plan_review_return(
     #  (b) the review_result and its review_request must BOTH carry a ``target_head``;
     #  (c) both heads must be well-formed FULL commit heads (40/64 hex — a truncated / malformed head
     #      cannot be exact-matched against the durable review generation);
-    #  (d) and the two heads must be EQUAL (the result reviewed the head the round pinned).
-    # Only enforced when fenced; the recorded head is carried on the plan so the send authority
-    # re-verifies it against the current review generation head at action time.
+    #  (d) the two heads must be EQUAL (the result reviewed the head the round pinned); and
+    #  (e) the review_result must carry an EXPLICIT conclusion — approved / changes_requested (j#81506):
+    #      a missing conclusion is normalized to ``pending`` at intake and is never a real review result.
+    # Only enforced when fenced; the recorded head + conclusion are carried on the plan so the send
+    # authority re-verifies them against the current review generation at action time.
     result_head = ""
+    result_conclusion = ""
     if dispatch_anchor_journal is not None:
         declared_req = review_result_marker_request(markers, issue, review_journal_s)
         if not declared_req or declared_req != request_journal:
@@ -691,6 +771,9 @@ def plan_review_return(
             return _refuse(RETURN_MALFORMED_REVIEW_HEAD, review_journal_s)
         if result_head != req_head:
             return _refuse(RETURN_REVIEW_HEAD_DRIFT, review_journal_s)
+        result_conclusion = review_result_conclusion(markers, issue, review_journal_s)
+        if not is_explicit_review_conclusion(result_conclusion):
+            return _refuse(RETURN_MISSING_REVIEW_CONCLUSION, review_journal_s)
 
     # 3. owning-lane binding is the target authority (never a pane / issue-id guess).
     if owner.status == OWNER_AMBIGUOUS:
@@ -721,6 +804,7 @@ def plan_review_return(
         review_journal=review_journal_s,
         review_request_journal=request_journal,
         target_head=result_head,
+        conclusion=result_conclusion,
     )
 
 
@@ -769,12 +853,14 @@ REVIEW_RETURN_FENCE_HEAD_UNCONFIRMED = "fenced: review head unconfirmed against 
 REVIEW_RETURN_FENCE_HEAD_DRIFT = "superseded: review head drifted from current review generation"
 REVIEW_RETURN_FENCE_MALFORMED_HEAD = "fenced: review head not a full commit head"
 REVIEW_RETURN_FENCE_REQ_UNCONFIRMED = "fenced: review request unconfirmed against current generation"
+REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED = "fenced: review conclusion unconfirmed against current generation"
 
 
 def make_review_return_send_edge_fence(
     dispatch_anchor_journal: object,
     current_review_head: object = None,
     current_review_request: object = None,
+    current_review_conclusion: object = None,
 ):
     """Build the terminal send-edge fence for pre-existing ``review_return`` backlog rows (#13974).
 
@@ -805,6 +891,7 @@ def make_review_return_send_edge_fence(
     anchor_int = _as_int(dispatch_anchor_journal)
     cur_head = str(current_review_head or "").strip()
     cur_request = str(current_review_request or "").strip()
+    cur_conclusion = str(current_review_conclusion or "").strip()
 
     def _fence(row) -> "tuple[bool, str]":
         route = str(getattr(row, "callback_route", "") or "").strip()
@@ -832,7 +919,17 @@ def make_review_return_send_edge_fence(
             return (True, REVIEW_RETURN_FENCE_MALFORMED_HEAD)  # malformed head -> action-time terminal
         if recorded_head != cur_head:
             return (True, REVIEW_RETURN_FENCE_HEAD_DRIFT)
-        return (False, "")  # current generation + current head -> #13684 authorities own exactly-once
+        # ...and the explicit review conclusion (#13974 j#81506). The row's recorded conclusion must be
+        # explicit AND still equal the current live conclusion — a missing / pending / drifted-away live
+        # conclusion collapses ``cur_conclusion`` to "" and fails the row closed at the send edge.
+        recorded_conclusion = decode_review_return_conclusion(payload)
+        if (
+            not is_explicit_review_conclusion(cur_conclusion)
+            or not is_explicit_review_conclusion(recorded_conclusion)
+            or recorded_conclusion != cur_conclusion
+        ):
+            return (True, REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED)
+        return (False, "")  # current gen + head + conclusion -> #13684 authorities own exactly-once
 
     return _fence
 
@@ -854,6 +951,7 @@ __all__ = (
     "RETURN_REVIEW_HEAD_DRIFT",
     "RETURN_REVIEW_REQUEST_UNCONFIRMED",
     "RETURN_MALFORMED_REVIEW_HEAD",
+    "RETURN_MISSING_REVIEW_CONCLUSION",
     "RETURN_REFUSAL_REASONS",
     "REVIEW_RETURN_FENCE_PREVIOUS_GENERATION",
     "REVIEW_RETURN_FENCE_UNRESOLVED_ANCHOR",
@@ -862,6 +960,7 @@ __all__ = (
     "REVIEW_RETURN_FENCE_HEAD_DRIFT",
     "REVIEW_RETURN_FENCE_MALFORMED_HEAD",
     "REVIEW_RETURN_FENCE_REQ_UNCONFIRMED",
+    "REVIEW_RETURN_FENCE_CONCLUSION_UNCONFIRMED",
     "OWNER_RESOLVED",
     "OWNER_ABSENT",
     "OWNER_AMBIGUOUS",
@@ -875,15 +974,19 @@ __all__ = (
     "review_result_head",
     "review_request_head",
     "review_result_marker_request",
+    "review_result_conclusion",
     "is_full_commit_head",
+    "is_explicit_review_conclusion",
     "current_review_generation_head",
     "current_review_generation_request",
+    "current_review_generation_conclusion",
     "review_return_is_current",
     "review_round_within_generation",
     "make_review_return_send_edge_fence",
     "encode_review_return_payload",
     "decode_review_return_payload",
     "decode_review_return_target_head",
+    "decode_review_return_conclusion",
     "plan_review_return",
     "plan_review_returns",
 )
