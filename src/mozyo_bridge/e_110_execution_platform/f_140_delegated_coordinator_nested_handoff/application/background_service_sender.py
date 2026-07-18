@@ -310,14 +310,19 @@ class BackgroundServiceCallbackSender:
             return REVIEW_ROUND_UNVERIFIABLE
         if isinstance(result, bool):
             return REVIEW_ROUND_CURRENT if result else REVIEW_ROUND_STALE
-        # Narrow to ``str`` BEFORE the frozenset membership test: an unhashable unknown return
-        # (list / dict / opaque object) would raise ``TypeError`` on ``in`` — and that raise is
-        # OUTSIDE the fence-call try above, so it would crash the sender and leave the current row
-        # inflight (crash-recovery then terminalizes it as uncertain, dropping a genuinely-current
-        # callback). Every non-token return therefore normalizes to the retryable UNVERIFIABLE, on
-        # the same classification surface as a fence that raises.
-        if isinstance(result, str) and result in REVIEW_ROUND_DISPOSITIONS:
-            return result
+        # Membership-test ONLY an exact builtin ``str``. ``isinstance(result, str)`` is not enough: a
+        # ``str`` SUBCLASS passes it yet can override ``__hash__`` (to ``None``, or to a raiser), so
+        # ``result in REVIEW_ROUND_DISPOSITIONS`` would raise OUTSIDE the fence-call try above — crashing
+        # the sender and leaving the current row inflight (crash-recovery then terminalizes it as
+        # uncertain, dropping a genuinely-current callback). ``type(result) is str`` keeps production
+        # tokens (builtin str literals) passing while every subclass / non-str / unhashable value
+        # normalizes to the retryable UNVERIFIABLE, on the same surface as a fence that raises. The try
+        # is defense-in-depth against any residual hostile comparison.
+        try:
+            if type(result) is str and result in REVIEW_ROUND_DISPOSITIONS:
+                return result
+        except Exception:  # noqa: BLE001 - a hostile token comparison is retryable, never a crash
+            return REVIEW_ROUND_UNVERIFIABLE
         return REVIEW_ROUND_UNVERIFIABLE
 
     def _holds_claim(self, row: CallbackOutboxRow) -> bool:
