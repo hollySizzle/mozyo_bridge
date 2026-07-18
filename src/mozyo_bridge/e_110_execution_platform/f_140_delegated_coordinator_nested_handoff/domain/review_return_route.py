@@ -1,46 +1,18 @@
-"""Correlated review_result return routing (Redmine #13684).
+"""Correlated review_result return routing (Redmine #13684, extended #13974).
 
-Phase A (#13683) built the whole background_service callback delivery machinery — supervisor lease
-+ outbox claim, route re-resolution against the live inventory, and a **mandatory
-generation-correlated authority** (:func:`...domain.background_service_delivery.authorize_background_delivery`
-requires a non-blank expected generation AND a non-blank live generation AND their exact match).
-It deliberately left DELIVERY fail-closed-disabled: Phase A had no live generation authority, so a
-blank live generation failed every send closed (#13683 R6-F1 / R7).
+The pure policy that ties a coordinator-recorded ``review_result`` back to the exact target-lane Codex
+gateway that **owns the issue**, so the review outcome returns generation-correlated rather than via a
+manual relay / self-route. It authorizes nothing and reads no I/O — the application layer reads the
+owning-lane binding + the Redmine journal markers and consults these pure evaluators.
 
-This module is the pure heart of #13684's correlated review_result return: the durable correlation
-that ties a coordinator-recorded ``review_result`` back to the exact target-lane Codex gateway that
-**owns the issue**, so the review outcome returns generation-correlated rather than depending on a
-manual gateway relay or self-route (the issue's verified gap). It authorizes nothing and reads no
-I/O — the application layer reads the owning-lane binding + the Redmine journal markers and consults
-these pure evaluators.
-
-Boundaries the design answer (j#77892 ``accepted_with_corrections``) pins, enforced here as pure
-policy:
-
-- **return route identity (correction 4).** The callback route for a returned review_result encodes
-  the OWNING LANE (``review_return:<lane_id>``), so it is a distinct outbox idempotency key from the
-  coordinator callback and from a *different* owning lane. A recovery-lane switch (supersession, #13681)
-  therefore reserves a NEW row for the new owner while the old-owner row fails closed — the existing
-  ``(workspace, source, issue, journal, normalized_gate, callback_route)`` idempotency is preserved,
-  never a second delivery ledger.
-- **owning-lane binding is the target authority (correction 2).** The return target lane / receiver /
-  generation come from the durable #13681/#13689 owning-lane binding (``resolve_owner`` + the lane's
-  revision), never a pane locator, an issue-id scan, or a "current-looking" pane. An absent /
-  ambiguous / coordinator-self owner yields no return candidate (fail-closed; no self-route, no
-  cross-lane Claude direct send — the receiver is the lane's Codex gateway).
-- **latest-review fence (correction 3).** A review_result is returnable only when it is the LATEST
-  review outcome on the issue AND no newer ``review_request`` restarted the round: the re-fetched
-  Redmine structured gate markers are the authority, never a notification's claimed kind. A stale
-  review_result (a newer finding / correction / review request exists) is never returned.
-- **generation is EXPECTED-only here; the live generation is read independently at delivery
-  (correction 1).** This module stamps the row's *expected* generation from the owning-lane revision
-  observed at ingest. The delivery authority re-reads the *live* owning-lane generation and refuses
-  unless both are non-blank and match — this module never copies one side onto the other and never
-  authorizes a send.
-
-The module is pure: total functions over the plain owning-lane facts + already-read
-:class:`...domain.redmine_event_intake.JournalMarker` values. Reading the owning-lane store and the
-Redmine journal, and firing the delivery, are the application layer's job.
+Design-answer boundaries (j#77892), enforced here as pure policy: the callback route encodes the
+owning lane (``review_return:<lane_id>``) so it is a distinct outbox idempotency key per owner; the
+target lane / receiver / generation come only from the durable #13681/#13689 owning-lane binding (never
+a pane / issue-id guess); a review_result is returnable only when it is the LATEST outcome unshadowed by
+a newer request / correction; and the row stamps only the *expected* generation (the live one is read
+independently at delivery). Redmine #13974 adds the review-generation identity conjunction — the exact
+``head`` / ``req`` / ``conclusion`` and provider ``source_sequence``, fail-closed on missing / malformed
+/ mismatch / drift / ambiguous identity at discovery and at the action-time send edge.
 """
 
 from __future__ import annotations
@@ -440,31 +412,47 @@ def is_explicit_review_conclusion(conclusion: object) -> bool:
     return str(conclusion or "").strip() in _EXPLICIT_REVIEW_CONCLUSIONS
 
 
-def review_result_is_ambiguous(
-    markers: Iterable[JournalMarker], issue: str, review_journal: str
+def _marker_identity_ambiguous(
+    markers: Iterable[JournalMarker], issue: str, journal: str, gate: str, attrs: "tuple[str, ...]"
 ) -> bool:
-    """Whether ``(issue, review_journal)`` carries CONFLICTING review_result markers (pure; j#81512).
+    """Whether ``(issue, journal, gate)`` carries markers that DISAGREE on ``attrs`` (pure; j#81512).
 
-    A single provider journal id (``source_sequence``) must resolve to exactly one review outcome. If
-    two or more ``review_result`` markers on the same anchor disagree on ``(conclusion, head, req)``,
-    the identity is not unique and is fail-closed — a conflicting source_sequence is never an action
-    authority. Zero or one marker (or several identical ones) is unambiguous.
+    A single provider journal id (``source_sequence``) must resolve to exactly one identity. Two or
+    more markers on the same anchor whose ``attrs`` tuple differs is fail-closed — a conflicting
+    source_sequence is never an action authority. Zero / one marker (or several identical) is fine.
     """
-    issue_s = str(issue).strip()
-    journal_s = str(review_journal).strip()
+    issue_s, journal_s, gate_s = str(issue).strip(), str(journal).strip(), str(gate).strip()
     identities = set()
     for mk in markers:
         if (
             str(mk.issue).strip() == issue_s
             and str(mk.journal).strip() == journal_s
-            and str(mk.gate).strip() == GATE_REVIEW
+            and str(mk.gate).strip() == gate_s
         ):
-            identities.add((
-                str(getattr(mk, "review_conclusion", "") or "").strip(),
-                str(getattr(mk, "target_head", "") or "").strip(),
-                str(getattr(mk, "review_request_journal", "") or "").strip(),
-            ))
+            identities.add(tuple(str(getattr(mk, a, "") or "").strip() for a in attrs))
     return len(identities) > 1
+
+
+def review_result_is_ambiguous(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> bool:
+    """Whether ``(issue, review_journal)`` carries conflicting review_result markers (j#81512).
+
+    Two review_result markers disagreeing on ``(conclusion, head, req)`` are not a unique action id.
+    """
+    return _marker_identity_ambiguous(
+        markers, issue, review_journal, GATE_REVIEW,
+        ("review_conclusion", "target_head", "review_request_journal"),
+    )
+
+
+def review_request_is_ambiguous(markers: Iterable[JournalMarker], issue: str, request_journal: str) -> bool:
+    """Whether ``(issue, request_journal)`` carries conflicting review_request markers (j#81518 F1).
+
+    Two review_request markers disagreeing on ``target_head`` mean the round's pinned head is not
+    unique — the review generation head authority is ambiguous and fails closed.
+    """
+    return _marker_identity_ambiguous(
+        markers, issue, request_journal, GATE_REVIEW_REQUEST, ("target_head",)
+    )
 
 
 def review_result_conclusion(markers: Iterable[JournalMarker], issue: str, review_journal: str) -> str:
@@ -497,23 +485,24 @@ def current_review_generation_head(markers: Iterable[JournalMarker], issue: str)
     """The ``target_head`` of the LATEST review_request marker on ``issue``, or ``""`` (pure; #13974).
 
     The head of the issue's current review generation — the action-time authority a reserved
-    review_return row's recorded head must still match. The latest review_request is the one with the
-    greatest numeric journal id (Redmine ids are monotonic). Blank when no review_request marker
-    carries a head (legacy) — a generation head we cannot confirm fails the callback closed.
+    review_return row's recorded head must still match. The latest review_request is the greatest
+    numeric journal id (Redmine ids are monotonic). Blank when no head-bearing request marker exists,
+    OR (j#81518 F1) when that latest request journal carries CONFLICTING head markers (ambiguous head is
+    not an authority) — a generation head we cannot uniquely confirm fails the callback closed.
     """
+    marker_list = list(markers)
     issue_s = str(issue).strip()
     best_id: Optional[int] = None
-    best_head = ""
-    for mk in markers:
+    latest_req = ""
+    for mk in marker_list:
         if str(mk.issue).strip() != issue_s or str(mk.gate).strip() != GATE_REVIEW_REQUEST:
             continue
         rid = _as_int(mk.journal)
-        if rid is None:
-            continue
-        if best_id is None or rid > best_id:
-            best_id = rid
-            best_head = str(getattr(mk, "target_head", "") or "").strip()
-    return best_head
+        if rid is not None and (best_id is None or rid > best_id):
+            best_id, latest_req = rid, str(mk.journal).strip()
+    if not latest_req or review_request_is_ambiguous(marker_list, issue, latest_req):
+        return ""
+    return review_request_head(marker_list, issue, latest_req)
 
 
 def current_review_generation_request(markers: Iterable[JournalMarker], issue: str) -> str:
@@ -627,8 +616,14 @@ def review_return_is_current(
     Any failure is a stale / uncorrelated row -> the caller zero-sends. The re-fetched Redmine
     structured gate is the authority (never a notification kind).
     """
+    marker_list = list(markers)
+    markers = marker_list
     review_int = _as_int(review_journal)
     if review_int is None:
+        return False
+    # j#81518 F2: the final action-time re-read verifies identity ambiguity ITSELF — a conflict observed
+    # only on this second provider read (after the supervisor's snapshot) still fails closed here.
+    if review_result_is_ambiguous(marker_list, issue, review_journal):
         return False
     if str(review_journal).strip() != latest_review_result_journal(markers, issue):
         return False
@@ -639,6 +634,8 @@ def review_return_is_current(
     current_request = correlated_review_request_journal(markers, issue, review_journal)
     if not current_request:
         return False
+    if review_request_is_ambiguous(markers, issue, current_request):
+        return False  # j#81518 F2: a conflicting request head on the live re-read is fail-closed
     # R1-re-review F2: the recorded correlation must be present AND match — a blank recorded
     # correlation is fail-closed, never a wildcard re-derived from the live markers.
     recorded = str(review_request_journal or "").strip()
@@ -761,13 +758,15 @@ def plan_review_return(
     result_head = ""
     result_conclusion = ""
     if dispatch_anchor_journal is not None:
-        # j#81512: a single provider journal with conflicting review_result markers is not a unique
-        # action authority — fail closed before reading any single marker's identity.
+        # j#81512 / j#81518: a single provider journal with conflicting review_result OR review_request
+        # markers is not a unique action authority — fail closed before reading any single marker.
         if review_result_is_ambiguous(markers, issue, review_journal_s):
             return _refuse(RETURN_AMBIGUOUS_REVIEW_IDENTITY, review_journal_s)
         declared_req = review_result_marker_request(markers, issue, review_journal_s)
         if not declared_req or declared_req != request_journal:
             return _refuse(RETURN_REVIEW_REQUEST_UNCONFIRMED, review_journal_s)
+        if review_request_is_ambiguous(markers, issue, request_journal):
+            return _refuse(RETURN_AMBIGUOUS_REVIEW_IDENTITY, review_journal_s)
         result_head = review_result_head(markers, issue, review_journal_s)
         req_head = review_request_head(markers, issue, request_journal)
         if not result_head or not req_head:
@@ -982,6 +981,7 @@ __all__ = (
     "review_result_marker_request",
     "review_result_conclusion",
     "review_result_is_ambiguous",
+    "review_request_is_ambiguous",
     "is_full_commit_head",
     "is_explicit_review_conclusion",
     "current_review_generation_head",
