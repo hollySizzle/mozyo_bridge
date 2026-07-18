@@ -596,25 +596,19 @@ def review_return_is_current(
     issue: str,
     review_journal: str,
     review_request_journal: str = "",
+    target_head: str = "",
+    conclusion: str = "",
 ) -> bool:
-    """Whether a reserved review_result return is STILL the current round at action time (pure).
+    """Whether a reserved review_result return is STILL the current round at the action-time re-read (pure).
 
-    #13684 review R1-F1: the latest-review fence must be re-verified at the reserve / irreversible
-    send edge, not only at discovery — a newer review_request / review_result landing after the row
-    was reserved makes the reserved result stale. Re-reading the issue's structured markers, the
-    return is current iff:
-
-    1. ``review_journal`` is still the LATEST review_result on the issue (no newer review outcome);
-    2. no ``review_request`` is newer than it (the round did not restart) AND no ``implementation_done``
-       correction is newer than it (the finding is not already being addressed) — the "newer finding /
-       correction" arm of correction 3 (R1-re-review F1);
-    3. it still correlates to a preceding review_request, and the row's recorded correlation is
-       **non-blank and equal** to that current one (R1-re-review F2): a review_return row without a
-       durable recorded action identity fails closed here — a blank / lost / drifted correlation is
-       never re-derived from the live markers as a substitute (the payload is the authority).
-
-    Any failure is a stale / uncorrelated row -> the caller zero-sends. The re-fetched Redmine
-    structured gate is the authority (never a notification kind).
+    The final independent re-read before the irreversible send re-verifies the FULL review-generation
+    identity itself (j#81525): the review_result must still be the latest, unshadowed by a newer request
+    / correction, unambiguous (result + request), and its LIVE ``req`` / ``head`` / ``conclusion`` plus
+    the correlated review_request's ``head`` must EXACT-MATCH the row's recorded identity
+    (``review_request_journal`` / ``target_head`` / ``conclusion``, the payload authority). A blank /
+    malformed / single-marker-drifted / conflicting identity between the supervisor snapshot and this
+    read is fail-closed. Any failure -> the caller zero-sends. The re-fetched structured gate is the
+    authority, never a notification kind.
     """
     marker_list = list(markers)
     markers = marker_list
@@ -636,21 +630,26 @@ def review_return_is_current(
         return False
     if review_request_is_ambiguous(markers, issue, current_request):
         return False  # j#81518 F2: a conflicting request head on the live re-read is fail-closed
-    # R1-re-review F2: the recorded correlation must be present AND match — a blank recorded
-    # correlation is fail-closed, never a wildcard re-derived from the live markers.
+    # The recorded identity (payload authority) must itself be well-formed: non-blank req, full head,
+    # explicit conclusion — a review_return row without a durable recorded identity fails closed.
     recorded = str(review_request_journal or "").strip()
+    rec_head, rec_concl = str(target_head or "").strip(), str(conclusion or "").strip()
     if not recorded or recorded != current_request:
         return False
-    # j#81496 F1: the LIVE review_result marker's OWN declared ``req`` is also the authority at action
-    # time (not only the persisted payload). A live marker whose declared req is missing or has drifted
-    # from the correlated request (or from the recorded req) is fail-closed — a pre-existing row is
-    # re-verified against the live marker, never trusted solely on its stamped-at-ingest payload.
-    live_declared = review_result_marker_request(markers, issue, review_journal)
-    if not live_declared or live_declared != current_request or live_declared != recorded:
+    if not is_full_commit_head(rec_head) or not is_explicit_review_conclusion(rec_concl):
         return False
-    # j#81506: the LIVE review_result must still carry an EXPLICIT conclusion (approved /
-    # changes_requested). A missing / pending / drifted-away conclusion is not a real review result.
-    if not is_explicit_review_conclusion(review_result_conclusion(markers, issue, review_journal)):
+    # j#81496 / j#81506 / j#81525: the LIVE review_result's declared req / head / conclusion AND the
+    # correlated review_request's head must EXACT-MATCH the recorded identity — a single-marker drift
+    # between the supervisor snapshot and this final re-read (a new head, or approved<->changes_requested)
+    # is fail-closed, never trusted on the stamped-at-ingest payload alone.
+    live_req = review_result_marker_request(markers, issue, review_journal)
+    if not live_req or live_req != current_request or live_req != recorded:
+        return False
+    if review_result_head(markers, issue, review_journal) != rec_head:
+        return False
+    if review_request_head(markers, issue, current_request) != rec_head:
+        return False
+    if review_result_conclusion(markers, issue, review_journal) != rec_concl:
         return False
     return True
 

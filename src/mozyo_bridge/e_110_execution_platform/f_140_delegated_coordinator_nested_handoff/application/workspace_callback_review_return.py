@@ -182,7 +182,9 @@ def review_round_send_fence(
         markers_from_source,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+        decode_review_return_conclusion,
         decode_review_return_payload,
+        decode_review_return_target_head,
         review_return_is_current,
     )
 
@@ -203,8 +205,16 @@ def review_round_send_fence(
             markers = markers_from_source(source, issue)
         except Exception:  # noqa: BLE001 - an unreadable source is a fail-closed stale round
             return False
-        request_journal = decode_review_return_payload(str(getattr(row, "payload", "") or ""))
-        return review_return_is_current(markers, issue, review_journal, request_journal)
+        # j#81525: decode the FULL persisted identity (req + head + conclusion) so the final action-time
+        # re-read exact-matches it against the live markers — a single-marker head / conclusion drift
+        # appearing only on this second provider read is fail-closed before the irreversible send.
+        payload = str(getattr(row, "payload", "") or "")
+        return review_return_is_current(
+            markers, issue, review_journal,
+            decode_review_return_payload(payload),
+            decode_review_return_target_head(payload),
+            decode_review_return_conclusion(payload),
+        )
 
     return _fence
 

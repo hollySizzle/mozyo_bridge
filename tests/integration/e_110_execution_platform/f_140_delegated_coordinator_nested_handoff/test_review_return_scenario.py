@@ -87,15 +87,20 @@ def _journals(*entries):
     return {"issue": {"id": ISSUE}, "journals": [{"id": jid, "notes": notes} for jid, notes in entries]}
 
 
-def _review_request_note():
-    return render_workflow_event_marker("review_request")
+#: The v2 review-gate identity these #13684 scenarios pin: a full commit head (#13974 j#81487) shared
+#: by the review_request and the review_result it answers.
+HEAD = "a" * 40
 
 
-def _review_result_note(conclusion="approved", req="10"):
-    # The v2 review_result marker declares the review_request it answers (#13974 j#81496); the round in
-    # these #13684 scenarios is review_request j10 -> review_result j20, so the result answers j10.
+def _review_request_note(head=HEAD):
+    return render_workflow_event_marker("review_request", target_head=head)
+
+
+def _review_result_note(conclusion="approved", req="10", head=HEAD):
+    # The v2 review_result marker declares the review_request it answers + the reviewed head (#13974
+    # j#81496/j#81487); the round is review_request j10 -> review_result j20, so the result answers j10.
     return render_workflow_event_marker(
-        "review_result", conclusion=conclusion, review_request_journal=req
+        "review_result", conclusion=conclusion, review_request_journal=req, target_head=head
     )
 
 
@@ -173,7 +178,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
     def _run(self, source, transport, *, inventory_lanes=(LANE,), candidates=None, fence_source=None):
         proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
         if candidates is None:
-            candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+            candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         sender = self._sender(
             transport, inventory_lanes=inventory_lanes,
             fence_source=fence_source if fence_source is not None else source,
@@ -187,7 +192,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         source = MappingRedmineJournalSource(
             payload=_journals(("10", _review_request_note()), ("20", _review_result_note()))
         )
-        candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(len(candidates), 1)
         c = candidates[0]
         self.assertEqual(c.callback_route, "review_return:issue_13684")
@@ -218,7 +223,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         self._declare_owner()
         # Round j10→j20, then a newer review_request (j30) restarted the round after the result.
         source = _round_source(("30", _review_request_note()))
-        candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(candidates, [])
         transport = _CapturingTransport()
         self._run(source, transport, candidates=candidates)
@@ -232,7 +237,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # not enough.
         self._declare_owner()
         discovery_source = _round_source()  # j10 req, j20 result — current at reserve
-        candidates, _ = discover_review_returns(discovery_source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, _ = discover_review_returns(discovery_source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(len(candidates), 1)
         proc = CallbackOutboxProcessor(self.outbox, discovery_source, workspace_id=WS)
         proc.ingest(candidates, now=NOW)  # reserve the return row while the round is current
@@ -245,7 +250,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # Without the action-time fence the same row WOULD have delivered — prove the fence is load-bearing.
         self.setUp()  # fresh stores
         self._declare_owner()
-        candidates2, _ = discover_review_returns(_round_source(), ISSUE, self._owner(), workspace_id=WS)
+        candidates2, _ = discover_review_returns(_round_source(), ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         proc2 = CallbackOutboxProcessor(self.outbox, _round_source(), workspace_id=WS)
         proc2.ingest(candidates2, now=NOW)
         t2 = _CapturingTransport()
@@ -257,7 +262,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # An L1 return row was reserved while L1 owned the issue.
         self._declare_owner(lane=LANE)
         source = _round_source()
-        candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
         proc.ingest(candidates, now=NOW)  # enqueue the L1 return row, do not deliver yet
         # Now a supersession hands ownership to the recovery lane — the L1 row is stale.
@@ -276,7 +281,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         self._declare_owner(lane=LANE)
         self._supersede()  # owner is now RECOVERY_LANE
         source = _round_source()
-        candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].callback_route, f"review_return:{RECOVERY_LANE}")
         self.assertEqual(candidates[0].target_lane, RECOVERY_LANE)
@@ -288,14 +293,14 @@ class ReviewReturnScenarioTest(unittest.TestCase):
     def test_self_route_owned_by_coordinator_lane_emits_nothing(self) -> None:
         self._declare_owner(lane="default")  # the coordinator's own lane owns the issue
         source = _round_source()
-        candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, plans = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(candidates, [])
         self.assertTrue(any(p.reason == "self_route" for p in plans))
 
     def test_missing_owner_emits_nothing(self) -> None:
         # No lifecycle owner row for the issue -> fail-closed, no return.
         source = _round_source()
-        candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
+        candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(candidates, [])
 
     def test_gateway_absent_from_live_inventory_zero_sends(self) -> None:
@@ -325,7 +330,7 @@ class ReviewReturnScenarioTest(unittest.TestCase):
         # implementation_done (correction) lands before the send edge. The action-time round fence
         # must zero-send the now-stale row (the finding is already being addressed).
         self._declare_owner()
-        candidates, _ = discover_review_returns(_round_source(), ISSUE, self._owner(), workspace_id=WS)
+        candidates, _ = discover_review_returns(_round_source(), ISSUE, self._owner(), workspace_id=WS, dispatch_anchor_journal="1")
         self.assertEqual(len(candidates), 1)
         proc = CallbackOutboxProcessor(self.outbox, _round_source(), workspace_id=WS)
         proc.ingest(candidates, now=NOW)
@@ -396,6 +401,9 @@ class ReviewReturnScenarioTest(unittest.TestCase):
             owner_binding_fn=lambda w, i, b: owning_lane_binding(w, i, b, lifecycle_store=self.life),
             release_after=False,
             clock=lambda: NOW,
+            # v2 (#13974): the production supervisor is always fenced, so the row carries the full
+            # recorded identity the final action-time re-read exact-matches. Anchor "1" <= the round's j10.
+            candidate_fence_fn=lambda w, i, s: "1",
         )
         supervisor.run_once()
         # The correlated return was delivered to the owning gateway through the full fan-out.
