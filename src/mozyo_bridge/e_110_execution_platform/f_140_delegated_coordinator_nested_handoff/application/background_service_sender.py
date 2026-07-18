@@ -53,6 +53,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
     CallbackSendResult,
+    REVIEW_ROUND_CURRENT,
+    REVIEW_ROUND_STALE,
+    REVIEW_ROUND_UNVERIFIABLE,
+    REVIEW_ROUND_DISPOSITIONS,
     SEND_NOT_SENT,
     SEND_UNCERTAIN,
     send_outcome_for_delivery,
@@ -63,11 +67,17 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-#: The action-time round-fence refusal (Redmine #13684 review R1-F1): a reserved review_result return
-#: was found stale at the send edge (a newer review_request / result / correction superseded its
-#: round). A deterministic zero-send — the transport is never invoked and the row bounded-retries then
-#: dead-letters (operator-visible), never a blind delivery of a stale review outcome.
+#: The action-time round-fence refusal (Redmine #13684 R1-F1 / #13974 R8-F1): a reserved review_result
+#: return was found DETERMINISTICALLY stale at the send edge (a *readable* provider superseded its
+#: round — a newer review_request / result / correction, an identity drift, or an ambiguous / conflicting
+#: identity). A terminal zero-send — the transport is never invoked and the row is marked terminally
+#: (retry 0, operator-visible), never a bounded-retry pending row that keeps #13974's backlog alive.
 ROUND_STALE = "review_round_stale"
+#: The action-time round-fence could not re-verify the round because the provider read failed
+#: transiently (source unresolvable / ``None`` / markers unreadable). A retryable zero-send — the
+#: transport is never invoked but the row bounded-retries, so a genuinely-current callback that hit a
+#: transient outage is re-delivered rather than terminally dropped (#13974 R8-F1).
+ROUND_UNVERIFIABLE = "review_round_unverifiable"
 
 
 class TargetResolver(Protocol):
@@ -203,12 +213,14 @@ class BackgroundServiceCallbackSender:
     outbox: Optional[CallbackOutbox] = None
     now_fn: Callable[[], str] = _utc_now_iso
     claim_stale_seconds: int = CALLBACK_CLAIM_LEASE_SECONDS
-    #: #13684 review R1-F1 — the action-time round fence. For a correlated review_result return row it
-    #: re-reads the issue's live structured markers at the send edge and returns True only when the
-    #: reserved result is STILL the current review round (no newer request / result / correction). A
-    #: stale row returns False -> a deterministic zero-send (never a blind delivery of a stale result).
-    #: ``None`` (default) applies no fence — a non-return row / a pure-mechanism test is unaffected.
-    round_fence_fn: Optional[Callable[[CallbackOutboxRow], bool]] = None
+    #: #13684 R1-F1 / #13974 R8-F1 — the action-time round fence. For a correlated review_result return
+    #: row it re-reads the issue's live structured markers at the send edge and returns a THREE-state
+    #: disposition (:data:`REVIEW_ROUND_CURRENT` / ``STALE`` / ``UNVERIFIABLE``): current -> deliver, a
+    #: deterministically-superseded round -> terminal zero-send (retry 0), a transiently-unreadable
+    #: provider -> retryable zero-send. A legacy ``bool`` fence is still accepted (True=current,
+    #: False=deterministic stale). ``None`` (default) applies no fence — a non-return row / a
+    #: pure-mechanism test is unaffected.
+    round_fence_fn: Optional[Callable[[CallbackOutboxRow], object]] = None
 
     def __call__(self, row: CallbackOutboxRow) -> CallbackSendResult:
         # Boundary 2 (claim): the durable outbox claim must still be OURS and unexpired at send time
@@ -250,14 +262,22 @@ class BackgroundServiceCallbackSender:
             return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_LEASE)
         if not self._holds_claim(row):
             return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_CLAIM)
-        # R1-F1 action-time round fence: for a correlated review_result return, re-verify at the send
-        # edge that the reserved result is STILL the current review round (a newer review_request /
-        # result landing after reserve makes it stale). A stale round is a deterministic zero-send —
-        # the transport is NEVER invoked, and the row stays retryable then bounded-dead-letters
-        # (operator-visible), never a blind delivery of a stale review outcome.
-        if not self._round_is_current(row):
+        # R1-F1 / R8-F1 action-time round fence: for a correlated review_result return, re-verify at the
+        # send edge that the reserved result is STILL the current review round. The transport is NEVER
+        # invoked on any refusal, but the DISPOSITION of the zero-send differs (R8-F1):
+        #  - a DETERMINISTIC supersession (a readable provider says the round is stale / invalid) is
+        #    TERMINAL (SEND_UNCERTAIN -> mark_uncertain: retry 0, operator-visible) so #13974's
+        #    backlog-retention failure does not survive as a bounded-retry pending row;
+        #  - a TRANSIENT unreadable provider is RETRYABLE (SEND_NOT_SENT -> bounded retry) so a
+        #    genuinely-current callback that hit an outage is re-delivered, never terminally dropped.
+        disposition = self._round_disposition(row)
+        if disposition == REVIEW_ROUND_STALE:
             return CallbackSendResult(
-                SEND_NOT_SENT, persist_ok=False, persist_reason=ROUND_STALE
+                SEND_UNCERTAIN, persist_ok=False, persist_reason=ROUND_STALE
+            )
+        if disposition == REVIEW_ROUND_UNVERIFIABLE:
+            return CallbackSendResult(
+                SEND_NOT_SENT, persist_ok=False, persist_reason=ROUND_UNVERIFIABLE
             )
         try:
             result = self.transport.deliver(row, decision.target)
@@ -268,19 +288,30 @@ class BackgroundServiceCallbackSender:
             outcome, persist_ok=result.persist_ok, persist_reason=result.persist_reason
         )
 
-    def _round_is_current(self, row: CallbackOutboxRow) -> bool:
-        """True iff the row's reserved review round is still current at the send edge (R1-F1).
+    def _round_disposition(self, row: CallbackOutboxRow) -> str:
+        """Classify the row's reserved review round at the send edge (R1-F1 / R8-F1).
 
-        No fence wired, or a non-review-return row -> True (unaffected). With a fence, delegate to it;
-        a fence that raises is fail-closed (a round we cannot re-verify is treated as stale so a
-        possibly-superseded result is never delivered).
+        Returns a member of :data:`REVIEW_ROUND_DISPOSITIONS`:
+        - no fence wired -> :data:`REVIEW_ROUND_CURRENT` (a non-return row / pure-mechanism test is
+          unaffected);
+        - a modern fence returns the disposition token directly;
+        - a legacy ``bool`` fence maps True -> ``CURRENT`` and False -> ``STALE`` (a bool "not the
+          current round" is a deterministic supersession, hence terminal);
+        - a fence that raises, or returns an unrecognized value, is :data:`REVIEW_ROUND_UNVERIFIABLE`
+          — we could not re-verify the round, so it is retryable, never terminally dropped (a possibly
+          genuinely-current callback must not be lost to a transient fence failure).
         """
         if self.round_fence_fn is None:
-            return True
+            return REVIEW_ROUND_CURRENT
         try:
-            return bool(self.round_fence_fn(row))
-        except Exception:  # noqa: BLE001 - an unverifiable round is fail-closed stale (no blind send)
-            return False
+            result = self.round_fence_fn(row)
+        except Exception:  # noqa: BLE001 - an unverifiable round is retryable (not terminally dropped)
+            return REVIEW_ROUND_UNVERIFIABLE
+        if isinstance(result, bool):
+            return REVIEW_ROUND_CURRENT if result else REVIEW_ROUND_STALE
+        if result in REVIEW_ROUND_DISPOSITIONS:
+            return str(result)
+        return REVIEW_ROUND_UNVERIFIABLE
 
     def _holds_claim(self, row: CallbackOutboxRow) -> bool:
         """True iff this row's outbox claim is still OURS and unexpired at send time (R3-F4).
@@ -316,6 +347,7 @@ class BackgroundServiceCallbackSender:
 
 __all__ = (
     "ROUND_STALE",
+    "ROUND_UNVERIFIABLE",
     "TargetResolver",
     "BackendNeutralTargetResolver",
     "DeliveryTransport",

@@ -166,18 +166,30 @@ def owning_lane_generation_reader(
 
 def review_round_send_fence(
     source_fn: Callable[[], Optional[RedmineJournalSource]]
-) -> "Callable[[CallbackOutboxRow], bool]":
-    """The action-time review-round fence for a review_result return row (#13684 review R1-F1).
+) -> "Callable[[CallbackOutboxRow], str]":
+    """The action-time review-round fence for a review_result return row (#13684 R1-F1 / #13974 R8-F1).
 
     At the send edge the sender calls this to re-verify a correlated ``review_return`` row is STILL
     the current review round: it re-reads the issue's live structured markers through ``source_fn``
     (the ticket-provider boundary — Redmine is the authority, never a notification kind), decodes the
-    row's correlated ``review_request_journal`` from its payload, and delegates to the pure
-    :func:`...review_return_route.review_return_is_current`. A newer review_request / review_result /
-    correction landing after the row was reserved makes it stale -> False -> the sender zero-sends. A
-    non-return row is not fenced (True); an unreadable source is fail-closed (False) — a round we
-    cannot re-verify is never delivered.
+    row's FULL persisted identity (req + head + conclusion) from its payload, and delegates to the pure
+    :func:`...review_return_route.review_return_is_current`.
+
+    #13974 R8-F1: the fence returns a THREE-state disposition, not a bool, so the sender does not
+    collapse every refusal into a retryable pending row. A *readable* provider that deterministically
+    supersedes / invalidates the round (a newer review_request / result / correction, a single-marker
+    head / conclusion drift, an ambiguous / conflicting identity, or a row with no verifiable identity)
+    yields :data:`REVIEW_ROUND_STALE` -> a terminal zero-send (retry 0, operator-visible). A merely
+    *unreadable* provider (source unresolvable / ``None`` / markers unreadable) yields
+    :data:`REVIEW_ROUND_UNVERIFIABLE` -> a retryable zero-send, so a genuinely-current callback that hit
+    a transient outage is never terminally dropped. A non-return row is unaffected
+    (:data:`REVIEW_ROUND_CURRENT`).
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+        REVIEW_ROUND_CURRENT,
+        REVIEW_ROUND_STALE,
+        REVIEW_ROUND_UNVERIFIABLE,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
         markers_from_source,
     )
@@ -188,33 +200,37 @@ def review_round_send_fence(
         review_return_is_current,
     )
 
-    def _fence(row: CallbackOutboxRow) -> bool:
+    def _fence(row: CallbackOutboxRow) -> str:
         if not is_review_return_route(str(getattr(row, "callback_route", "") or "")):
-            return True
+            return REVIEW_ROUND_CURRENT  # a non-return row is not fenced
         issue = str(getattr(row, "issue", "") or "").strip()
         review_journal = str(getattr(row, "journal", "") or "").strip()
         if not issue or not review_journal:
-            return False
+            # A review_return row with no verifiable (issue, journal) identity can NEVER be re-verified
+            # as current -> deterministic terminal, not a transient we should keep retrying.
+            return REVIEW_ROUND_STALE
         try:
             source = source_fn()
-        except Exception:  # noqa: BLE001 - an unresolvable source is a fail-closed stale round
-            return False
+        except Exception:  # noqa: BLE001 - a transient unresolvable source -> retryable, not dropped
+            return REVIEW_ROUND_UNVERIFIABLE
         if source is None:
-            return False
+            return REVIEW_ROUND_UNVERIFIABLE
         try:
             markers = markers_from_source(source, issue)
-        except Exception:  # noqa: BLE001 - an unreadable source is a fail-closed stale round
-            return False
-        # j#81525: decode the FULL persisted identity (req + head + conclusion) so the final action-time
-        # re-read exact-matches it against the live markers — a single-marker head / conclusion drift
-        # appearing only on this second provider read is fail-closed before the irreversible send.
+        except Exception:  # noqa: BLE001 - a transient unreadable source -> retryable, not dropped
+            return REVIEW_ROUND_UNVERIFIABLE
+        # The provider IS readable here: decode the FULL persisted identity (req + head + conclusion)
+        # and exact-match it against the live markers. A mismatch / drift / ambiguity / conflict is a
+        # DETERMINISTIC supersession -> terminal (the round is genuinely no longer current), never a
+        # retryable pending row.
         payload = str(getattr(row, "payload", "") or "")
-        return review_return_is_current(
+        is_current = review_return_is_current(
             markers, issue, review_journal,
             decode_review_return_payload(payload),
             decode_review_return_target_head(payload),
             decode_review_return_conclusion(payload),
         )
+        return REVIEW_ROUND_CURRENT if is_current else REVIEW_ROUND_STALE
 
     return _fence
 

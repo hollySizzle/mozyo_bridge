@@ -88,6 +88,33 @@ SEND_UNCERTAIN = "uncertain"
 SEND_OUTCOMES = frozenset({SEND_DELIVERED, SEND_NOT_SENT, SEND_UNCERTAIN})
 
 
+# ---------------------------------------------------------------------------
+# Action-time review-round disposition (#13974 review R8-F1)
+# ---------------------------------------------------------------------------
+# The final send-edge round fence must NOT collapse every refusal into the retryable
+# ``SEND_NOT_SENT`` bucket. A review round that a *readable* provider says is deterministically
+# superseded / invalid must be terminal (zero-send, retry 0, operator-visible) — otherwise the row
+# bounded-retries as pending and #13974's backlog-retention failure survives at the final authority.
+# But an *unreadable* provider (a transient read failure) must stay retryable, or a genuinely-current
+# callback is dropped forever. The fence therefore returns one of three dispositions, not a bool.
+
+#: The reserved review round is STILL current at the send edge -> proceed to the transport.
+REVIEW_ROUND_CURRENT = "review_round_current"
+#: A *readable* provider deterministically supersedes / invalidates the round (identity
+#: mismatch / missing / malformed / drift / ambiguity / conflict, or a row with no verifiable
+#: identity) -> terminal zero-send (mapped to :data:`SEND_UNCERTAIN` -> ``mark_uncertain``: retry 0,
+#: no auto-retry, operator-visible), never a bounded-retry pending row.
+REVIEW_ROUND_STALE = "review_round_stale_terminal"
+#: The provider read itself failed transiently (source unresolvable / ``None`` / markers unreadable /
+#: the fence raised) -> retryable zero-send (mapped to :data:`SEND_NOT_SENT` -> bounded retry then
+#: dead-letter). A round we merely could not re-verify is never terminally dropped.
+REVIEW_ROUND_UNVERIFIABLE = "review_round_unverifiable"
+
+REVIEW_ROUND_DISPOSITIONS = frozenset(
+    {REVIEW_ROUND_CURRENT, REVIEW_ROUND_STALE, REVIEW_ROUND_UNVERIFIABLE}
+)
+
+
 @dataclass(frozen=True)
 class CallbackSendResult:
     """A send's closed outcome plus best-effort durable-receipt evidence (#13520 review R2-F6).
@@ -310,6 +337,10 @@ __all__ = (
     "SEND_NOT_SENT",
     "SEND_UNCERTAIN",
     "SEND_OUTCOMES",
+    "REVIEW_ROUND_CURRENT",
+    "REVIEW_ROUND_STALE",
+    "REVIEW_ROUND_UNVERIFIABLE",
+    "REVIEW_ROUND_DISPOSITIONS",
     "CallbackSendResult",
     "normalize_send_result",
     "send_outcome_for_delivery",

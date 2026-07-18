@@ -213,22 +213,25 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertTrue(any(p.reason == RETURN_PREVIOUS_GENERATION for p in plans))
 
-    def test_without_the_anchor_the_misbound_row_stays_pending_witness(self) -> None:
-        # Adversarial witness (direct, intentionally UNFENCED): without the composed fence the misbound
-        # row is NOT terminal — the send-time refusal path leaves it pending/retryable (the
-        # backlog-growth symptom). Proves the fence is load-bearing; the fenced matrix runs through the
-        # supervisor below.
+    def test_send_time_round_fence_terminalizes_deterministic_stale_row(self) -> None:
+        # R8-F1: even with ONLY the action-time round fence wired (no composed send-edge fence), a
+        # misbound row that a READABLE provider deterministically supersedes is TERMINAL at the send
+        # edge — zero-send, marked uncertain (retry 0, operator-visible), NOT a bounded-retry pending
+        # row. This is the #13974 backlog-retention failure closed at the final authority: previously
+        # this same path left the row pending (attempts=1). The fenced supervisor matrix runs below.
         self._declare_owner()
         source = _old_round_source()
         candidates, _ = discover_review_returns(source, ISSUE, self._owner(), workspace_id=WS)
         proc = CallbackOutboxProcessor(self.outbox, source, workspace_id=WS)
         proc.ingest(candidates, now=NOW)
         transport = _CapturingTransport()
-        # No send_fence_fn; a NEWER request lands so the sender's round fence still zero-sends.
+        # No send_fence_fn; a NEWER request (j30) lands so the round fence sees a deterministic stale.
         run_once(proc, self._sender(transport, fence_source=_old_round_source(("30", _req()))), now=NOW)
         self.assertEqual(transport.calls, [])
-        self.assertTrue(self.outbox.read(states=[CALLBACK_PENDING]))
-        self.assertEqual(self.outbox.read(states=[CALLBACK_UNCERTAIN]), ())
+        self.assertEqual(self.outbox.read(states=[CALLBACK_PENDING]), ())  # no longer retryable-pending
+        terminal = self.outbox.read(states=[CALLBACK_UNCERTAIN])
+        self.assertTrue(terminal)  # terminal zero-send
+        self.assertEqual([r.attempts for r in terminal], [0])  # retry 0 — never bounded-retried
 
     # -- full supervisor fan-out with the anchor + head fence wired ------
 
@@ -866,34 +869,87 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])  # the irreversible send never fires
         self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
 
-    def _final_reread_drift_sends_zero(self, reread_source):
-        """Enqueue a valid v2 row, keep the supervisor snapshot valid, but hand the SENDER's final
-        round-fence a DRIFTED single-marker re-read; assert the irreversible send never fires (j#81525)."""
+    def _final_reread_drift_is_terminal_zero_send(self, recorded_source, reread_source):
+        """A valid v2 row is enqueued from ``recorded_source`` and the supervisor SNAPSHOT stays valid,
+        but the SENDER's final live round-fence re-reads ``reread_source`` — a single-marker head /
+        conclusion DRIFT that a readable provider deterministically supersedes. Assert (j#81525 F1 +
+        R8-F1): the irreversible send never fires AND the row is TERMINAL zero-send (uncertain, retry 0,
+        no delivered, no retryable-pending) — not a bounded-retry pending row that keeps the backlog."""
         wsid = self._register_ws()
         self._own_and_lease(wsid)
-        self._enqueue_via_fenced_discovery(_current_round_source(), wsid)  # recorded head=CUR, approved
+        self._enqueue_via_fenced_discovery(recorded_source, wsid)
         self.assertTrue(self._return_rows([CALLBACK_PENDING]))
         transport = _CapturingTransport()
         supervisor = self._build_supervisor(
-            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
-            round_fence_source=reread_source,
+            wsid=wsid, source=recorded_source, transport=transport, anchor=ANCHOR,
+            round_fence_source=reread_source,  # the final live re-read drifts from the snapshot
         )
         supervisor.run_once()
         self.assertEqual(transport.calls, [])
         self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])  # R8-F1: not retryable-pending
+        terminal = self._return_rows([CALLBACK_UNCERTAIN])
+        self.assertEqual(len(terminal), 1)  # terminal zero-send row
+        self.assertEqual([r.attempts for r in terminal], [0])  # retry 0 — never bounded-retried
 
-    def test_fs_final_reread_head_drift_sends_zero(self) -> None:
-        # j#81525 F1: the final re-read's single review_result reviewed a DIFFERENT head than recorded.
-        self._final_reread_drift_sends_zero(MappingRedmineJournalSource(payload=_journals(
-            ("110", _req(OLD_HEAD)), ("120", _res(head=OLD_HEAD, req="110", conclusion="approved")),
-        )))
+    def test_fs_final_reread_head_drift_is_terminal_zero_send(self) -> None:
+        # j#81525 F1 + R8-F1: the final re-read's single review_result reviewed a DIFFERENT head than
+        # recorded -> deterministic supersession -> terminal zero-send (retry 0), not pending.
+        self._final_reread_drift_is_terminal_zero_send(
+            _current_round_source(),
+            MappingRedmineJournalSource(payload=_journals(
+                ("110", _req(OLD_HEAD)), ("120", _res(head=OLD_HEAD, req="110", conclusion="approved")),
+            )),
+        )
 
-    def test_fs_final_reread_conclusion_drift_sends_zero(self) -> None:
-        # j#81525 F1: the final re-read's conclusion drifted approved -> changes_requested (explicit-to-
-        # explicit); the recorded conclusion no longer matches, so the irreversible send never fires.
-        self._final_reread_drift_sends_zero(MappingRedmineJournalSource(payload=_journals(
-            ("110", _req(CUR_HEAD)), ("120", _res(head=CUR_HEAD, req="110", conclusion="changes_requested")),
-        )))
+    def test_fs_final_reread_conclusion_drift_approved_to_changes_is_terminal(self) -> None:
+        # j#81525 F1 + R8-F1: recorded=approved, final re-read=changes_requested (explicit-to-explicit
+        # drift) -> deterministic supersession -> terminal zero-send (retry 0), not pending.
+        self._final_reread_drift_is_terminal_zero_send(
+            _current_round_source(conclusion="approved"),
+            MappingRedmineJournalSource(payload=_journals(
+                ("110", _req(CUR_HEAD)),
+                ("120", _res(head=CUR_HEAD, req="110", conclusion="changes_requested")),
+            )),
+        )
+
+    def test_fs_final_reread_conclusion_drift_changes_to_approved_is_terminal(self) -> None:
+        # j#81525 F1 + R8-F1 (reverse direction): recorded=changes_requested, final re-read=approved ->
+        # deterministic supersession -> terminal zero-send (retry 0), not pending. Fixes BOTH drift
+        # directions so a stale approval and a stale changes_requested are equally terminal.
+        self._final_reread_drift_is_terminal_zero_send(
+            _current_round_source(conclusion="changes_requested"),
+            MappingRedmineJournalSource(payload=_journals(
+                ("110", _req(CUR_HEAD)),
+                ("120", _res(head=CUR_HEAD, req="110", conclusion="approved")),
+            )),
+        )
+
+    def test_fs_final_reread_unreadable_provider_is_retryable_not_terminal(self) -> None:
+        # R8-F1 (the discriminating case): a valid v2 row, valid snapshot, but the SENDER's final
+        # round-fence provider read RAISES transiently. This must stay RETRYABLE (pending, bounded
+        # retry) — a genuinely-current callback must not be terminally dropped by a transient outage.
+        wsid = self._register_ws()
+        self._own_and_lease(wsid)
+        self._enqueue_via_fenced_discovery(_current_round_source(), wsid)
+        self.assertTrue(self._return_rows([CALLBACK_PENDING]))
+
+        class _RaisingSource:
+            def read_entries(self, *a, **k):
+                raise RuntimeError("transient provider outage")
+
+        transport = _CapturingTransport()
+        supervisor = self._build_supervisor(
+            wsid=wsid, source=_current_round_source(), transport=transport, anchor=ANCHOR,
+            round_fence_source=_RaisingSource(),
+        )
+        supervisor.run_once()
+        self.assertEqual(transport.calls, [])  # still zero-send (fail-closed)
+        self.assertEqual(self._return_rows([CALLBACK_DELIVERED]), [])
+        self.assertEqual(self._return_rows([CALLBACK_UNCERTAIN]), [])  # NOT terminally dropped
+        pending = self._return_rows([CALLBACK_PENDING])
+        self.assertEqual(len(pending), 1)  # retryable — the current callback survives the outage
+        self.assertEqual([r.attempts for r in pending], [1])  # bounded-retry bumped attempts
 
     def test_producer_cli_fail_closed_validation(self) -> None:
         # j#81487 F2: the canonical --emit-gate writer refuses to emit a head-less / malformed / req-less
