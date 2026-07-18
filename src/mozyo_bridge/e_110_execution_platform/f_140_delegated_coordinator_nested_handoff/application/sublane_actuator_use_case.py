@@ -1,15 +1,9 @@
 """Fail-closed creation-side actuation use case for ``sublane start`` (Redmine #13299).
 
-Byte-preserving carve of :class:`SublaneActuateUseCase` out of the #12973
-``sublane_actuator`` facade (module-health decomposition of the at-ceiling use case;
-the facade re-exports this class, so the public import surface is unchanged).
-
-The use case holds the fail-closed decision flow and never touches IO: it drives the
-injected :class:`...application.sublane_actuator_ops.SublaneActuatorOps` port, consults the
-pure :func:`decide_worktree_launch` launch policy and the #13290
-:func:`evaluate_dispatch_admission` gate (the single #12855 fill-decision authority), and
-assembles the replayable :class:`SublaneActuationOutcome`. Concrete side effects live
-behind the port.
+The use case owns the decision flow and never touches IO. It drives the injected
+:class:`...application.sublane_actuator_ops.SublaneActuatorOps` port, consults the pure
+launch and dispatch gates, and assembles the replayable
+:class:`SublaneActuationOutcome`; concrete side effects live behind the port.
 """
 
 from __future__ import annotations
@@ -44,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ActuationStep,
     SublaneActuationOutcome,
     SublaneLauncherIncompatibleError,
+    SublaneStartupObservation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
     evaluate_dispatch_admission,
@@ -77,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     pair_attestation_admission,
     pair_split_admission,
     runtime_placement_gate,
+    startup_health_admission,
 )
 
 
@@ -173,8 +169,7 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 2. Work-unit granularity gate (#13002): an epic / feature unit is never
-        # actuated / dispatched without an explicit owner / operator decision anchor.
+        # 2. Epic/feature units require an explicit owner decision anchor (#13002).
         unit_decision = request.work_unit_decision()
         if not unit_decision.is_allowed:
             return self._blocked(
@@ -197,9 +192,7 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3b. Dispatch admission gate (#13290, live-dispatch only): consult the fill
-        # decision (#12855 authority) and fail closed on a concrete stop unless overridden.
-        # Unarmed without fill context; scoped to ``execute and dispatch`` (j#72744 #2).
+        # 3b. Live dispatch fails closed on a fill stop unless explicitly overridden.
         fill_decision_token: Optional[str] = None
         fill_override_reason: Optional[str] = None
         if execute and dispatch:
@@ -236,9 +229,7 @@ class SublaneActuateUseCase:
                         fill_override_reason=fill_override_reason,
                     )
 
-        # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
-        # identity field present (step 1 passed) the pure decision does not currently
-        # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
+        # 4. Resolve the launch decision and preserve a fail-closed future contract.
         launch = decide_create_launch(self.ops, request, self.policy)
         if launch.action == LAUNCH_BLOCKED:
             return self._blocked(
@@ -249,8 +240,7 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 4b. Redmine #13705 R1-F1: action-time runtime fingerprint front door (in
-        # ``sublane_actuator_gates``). ``execute`` scope fences ``--no-dispatch`` too.
+        # 4b. Action-time runtime fingerprint gate; includes ``--no-dispatch`` (#13705).
         if execute:
             gate_outcome = runtime_placement_gate(
                 self, request, launch_action=launch.action, dispatch=dispatch,
@@ -290,6 +280,7 @@ class SublaneActuateUseCase:
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
         gateway_ready: Optional[bool] = None,
+        startup: Optional[SublaneStartupObservation] = None,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_BLOCKED,
@@ -311,6 +302,7 @@ class SublaneActuateUseCase:
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
+            startup=startup,
         )
 
     @staticmethod
@@ -499,10 +491,7 @@ class SublaneActuateUseCase:
                 )
             )
 
-        # Step 2 — append (or adopt) the cockpit lane column. A lane already resolving for
-        # this worktree MUST match the requested identity before adopt / dispatch: a
-        # repo-root / basename collision with a different / stale lane is an ambiguous
-        # target and fails closed here, never misdelivering to the wrong gateway (j#70250).
+        # Step 2 — adopt/append only after the resolved lane identity matches (j#70250).
         existing = self.ops.read_lane(lane_runtime_root)
         if existing is not None and not self._identity_matches(existing, request):
             steps.append(
@@ -546,13 +535,9 @@ class SublaneActuateUseCase:
             )
         else:
             try:
-                self.ops.append_lane_column(lane_runtime_root)
+                startup = self.ops.append_lane_column(lane_runtime_root)
             except SublaneLauncherIncompatibleError as exc:
-                # Redmine #13847: the managed-launch capability preflight refused BEFORE any
-                # process launch — the launcher's attestation-store schema does not match this
-                # runtime's, so its self-attestations would be dropped and the pair would boot
-                # live-but-unattested. Zero-actuation with a DISTINCT typed blocker (not a
-                # transient pane-create failure): the recovery is to upgrade the launcher.
+                # Capability skew is a typed pre-launch block, not a transient append error.
                 steps.append(
                     ActuationStep(
                         order=2,
@@ -594,6 +579,18 @@ class SublaneActuateUseCase:
                     fill_decision=fill_decision,
                     fill_override_reason=fill_override_reason,
                 )
+            startup_block = startup_health_admission(
+                self,
+                request,
+                startup,
+                launch_action=launch.action,
+                dispatch=dispatch,
+                steps=steps,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
+            )
+            if startup_block is not None:
+                return startup_block
             lane = self.ops.read_lane(lane_runtime_root)
             if not (lane and lane.gateway_pane and lane.worker_pane):
                 steps.append(

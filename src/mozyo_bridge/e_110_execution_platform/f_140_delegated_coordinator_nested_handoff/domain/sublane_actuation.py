@@ -110,6 +110,10 @@ REASON_LAUNCHER_INCOMPATIBLE = "launcher_runtime_incompatible"
 #: promote it to ``executed`` and returns this typed blocker with a durable recovery
 #: pointer to the public exact-pair recovery, never a false success.
 REASON_PARTIAL_PAIR_RECOVERY = "partial_pair_recovery_required"
+#: The embedded herdr ``session-start`` action did not positively confirm every role's
+#: startup health. The action result is authoritative before inventory read-back: a live
+#: locator or later pane visibility must never turn an unhealthy launch into success.
+REASON_STARTUP_HEALTH_UNCONFIRMED = "startup_health_unconfirmed"
 #: The appended / adopted lane did not carry the expected identity stamps (repo-root /
 #: lane) on read-back, so the lane could not be positively confirmed.
 REASON_STAMP_FAILED = "stamp_failed"
@@ -170,6 +174,7 @@ BLOCKED_REASONS = frozenset(
         REASON_RUNTIME_FINGERPRINT,
         REASON_LAUNCHER_INCOMPATIBLE,
         REASON_PARTIAL_PAIR_RECOVERY,
+        REASON_STARTUP_HEALTH_UNCONFIRMED,
         REASON_FILL_STOP,
     }
 )
@@ -267,6 +272,52 @@ class ActuationStep:
 
 
 @dataclass(frozen=True)
+class SublaneStartupRoleHealth:
+    """Safe projection of one embedded session-start participant's result."""
+
+    provider: str
+    disposition: str
+    health: str
+    compensation: str
+    blocker_id: str = ""
+    detail: str = ""
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "provider": self.provider,
+            "disposition": self.disposition,
+            "health": self.health,
+            "compensation": self.compensation,
+            "blocker_id": self.blocker_id,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class SublaneStartupObservation:
+    """Typed embedded startup result propagated across the actuator port."""
+
+    ok: bool
+    action_id: str
+    roles: Tuple[SublaneStartupRoleHealth, ...]
+    rollback_owed: bool
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "action_id": self.action_id,
+            "roles": [role.as_payload() for role in self.roles],
+            "rollback_owed": self.rollback_owed,
+        }
+
+    def health_summary(self) -> str:
+        """Return fixed role-health tokens only; never pane output or locators."""
+        return ", ".join(
+            f"{role.provider}={role.health}/{role.compensation}" for role in self.roles
+        ) or "no_roles"
+
+
+@dataclass(frozen=True)
 class SublaneActuationOutcome:
     """The machine-readable result of a ``sublane start`` plan / actuation.
 
@@ -295,6 +346,7 @@ class SublaneActuationOutcome:
     adopted: bool = False
     steps: Tuple[ActuationStep, ...] = ()
     blocked_reasons: Tuple[str, ...] = ()
+    startup: Optional[SublaneStartupObservation] = None
     # #13290 dispatch admission gate: the concrete FILL_* token the caller-supplied
     # fill decision resolved to (``None`` when the gate was not armed), and the
     # explicit override reason recorded when a stop was intentionally proceeded past.
@@ -351,6 +403,8 @@ class SublaneActuationOutcome:
             "fill_override_reason": self.fill_override_reason,
             "gateway_ready": self.gateway_ready,
         }
+        if self.startup is not None:
+            payload["startup"] = self.startup.as_payload()
         if self.is_blocked and "sender_attestation" in self.blocked_reasons:
             payload["next_action"] = {
                 "action": "restore_attested_coordinator_shell",
@@ -419,6 +473,15 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
     # stays byte-for-byte unchanged.
     if outcome.gateway_ready is not None:
         lines.append(f"- gateway_ready: {str(outcome.gateway_ready).lower()}")
+    if outcome.startup is not None:
+        lines.extend(
+            (
+                f"- startup_action_id: {outcome.startup.action_id or '-'}",
+                f"- startup_ok: {str(outcome.startup.ok).lower()}",
+                f"- startup_health: {outcome.startup.health_summary()}",
+                f"- startup_rollback_owed: {str(outcome.startup.rollback_owed).lower()}",
+            )
+        )
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
         if "sender_attestation" in outcome.blocked_reasons:
@@ -494,6 +557,7 @@ __all__ = (
     "REASON_WORK_UNIT_BLOCKED",
     "REASON_PAIR_SPLIT",
     "REASON_RUNTIME_FINGERPRINT",
+    "REASON_STARTUP_HEALTH_UNCONFIRMED",
     "REASON_FILL_STOP",
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",
@@ -502,6 +566,8 @@ __all__ = (
     "DISPATCH_NOT_ATTEMPTED",
     "DISPATCH_RESULTS",
     "ActuationStep",
+    "SublaneStartupRoleHealth",
+    "SublaneStartupObservation",
     "SublaneActuationOutcome",
     "render_actuation_journal",
 )

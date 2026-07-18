@@ -26,6 +26,12 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+    record_identity_attestation,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
@@ -42,6 +48,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     RuntimePlacementFingerprint,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+    build_attest_capability_contract_line,
 )
 
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
@@ -85,9 +94,22 @@ class _StatefulHerdr:
         # #13378: rendered pane text served by `agent read`; set to "" to simulate a
         # live-but-still-booting TUI (blank render).
         self.read_text = "codex composer rendered"
+        self.attest_home = None
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
+        if rest[:2] == ["herdr", "agent-attest"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "usage: mozyo-bridge herdr agent-attest --assigned-name ...\n"
+                    + build_attest_capability_contract_line(
+                        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+                    )
+                ),
+                stderr="",
+            )
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self.agents}), stderr=""
@@ -157,6 +179,24 @@ class _StatefulHerdr:
             if tab_id:
                 row["tab_id"] = tab_id
             self.agents.append(row)
+            launch_env = {}
+            for index, token in enumerate(rest):
+                if token == "--env" and index + 1 < len(rest):
+                    key, _, value = rest[index + 1].partition("=")
+                    launch_env[key] = value
+            if "agent-attest" in rest and self.attest_home is not None:
+                record_identity_attestation(
+                    IdentityAttestationRecord(
+                        assigned_name=name,
+                        workspace_id=launch_env.get("MOZYO_WORKSPACE_ID", ""),
+                        role=launch_env.get("MOZYO_AGENT_ROLE", ""),
+                        lane_id=launch_env.get("MOZYO_LANE_ID", ""),
+                        locator=pane_id,
+                        verdict=VERDICT_PRESENT,
+                        observed_at="2026-07-18T00:00:00+00:00",
+                    ),
+                    home=Path(self.attest_home),
+                )
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -185,6 +225,16 @@ def _fake_binary(tmp: str) -> Path:
     binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return binpath
+
+
+def _with_launcher_path(tmp: str, env: dict[str, str]) -> dict[str, str]:
+    """Put a capable source-style launcher beside the hermetic provider binaries."""
+    launcher_bin = Path(tmp) / "launcher-bin"
+    launcher_bin.mkdir(exist_ok=True)
+    launcher = launcher_bin / "mozyo-bridge"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return {**env, "PATH": os.pathsep.join((str(launcher_bin), env["PATH"]))}
 
 
 class _SplitOnHealHerdr(_StatefulHerdr):
@@ -286,7 +336,11 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         coord = Path(tmp) / "coord"
         coord.mkdir(exist_ok=True)
         binpath = _fake_binary(tmp)
-        env = with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)})
+        env = _with_launcher_path(
+            tmp,
+            with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}),
+        )
+        herdr.attest_home = home
         ops = HerdrSublaneActuatorOps(
             repo_root=coord,
             lane_label=lane_label,
@@ -395,9 +449,13 @@ class HerdrSublaneOpsTest(unittest.TestCase):
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 # A fresh worktree has no herdr workspace yet -> read_lane is absent.
                 self.assertIsNone(ops.read_lane(str(worktree)))
-                ops.append_lane_column(str(worktree))
+                startup = ops.append_lane_column(str(worktree))
                 view = ops.read_lane(str(worktree))
                 lane_ws = read_anchor(worktree)["workspace_id"]
+        self.assertTrue(startup.ok)
+        self.assertTrue(startup.action_id)
+        self.assertEqual({role.provider for role in startup.roles}, {"codex", "claude"})
+        self.assertTrue(all(role.health == "healthy" for role in startup.roles))
         self.assertIsNotNone(view)
         self.assertEqual(view.workspace_id, lane_ws)
         # The lane label IS the mzb1 lane segment (#13377 shared model).
@@ -426,8 +484,9 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 ops.append_lane_column(str(worktree))
         by_provider = {}
         for argv in herdr.start_argvs:
-            # argv[0] is the resolved absolute executable (#13441), not the label.
-            argv0 = argv[argv.index("--") + 1]
+            # A wrapped provider follows the final ``--`` (the launcher follows the first).
+            last_sep = len(argv) - 1 - argv[::-1].index("--")
+            argv0 = argv[last_sep + 1]
             provider = next(
                 (p for p in ("claude", "codex") if argv0 == provider_bin_path(p)),
                 argv0,
@@ -436,7 +495,7 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         claude = by_provider["claude"]
         idx = claude.index("--permission-mode")
         self.assertEqual(claude[idx + 1], "auto")
-        self.assertGreater(idx, claude.index("--"))
+        self.assertGreater(idx, len(claude) - 1 - claude[::-1].index("--"))
         self.assertNotIn("--permission-mode", by_provider["codex"])
 
     def test_append_upserts_lane_metadata_record(self) -> None:
@@ -686,7 +745,8 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 view = ops.read_lane(str(worktree))
         self.assertEqual(len(herdr.start_argvs), launches_before + 1)
         relaunch = herdr.start_argvs[-1]
-        self.assertEqual(relaunch[relaunch.index("--") + 1], provider_bin_path("codex"))
+        last_sep = len(relaunch) - 1 - relaunch[::-1].index("--")
+        self.assertEqual(relaunch[last_sep + 1], provider_bin_path("codex"))
         # The relaunch is pinned into the surviving worker's workspace (adopt pin),
         # so no second workspace (and no new base pane) is created.
         self.assertEqual(relaunch[relaunch.index("--workspace") + 1], "wL")
@@ -1304,9 +1364,15 @@ class HerdrUseCaseIntegrationTest(unittest.TestCase):
             repo_root=coord,
             lane_label="issue_13331_lane",
             issue="13331",
-            env=with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}),
+            env=_with_launcher_path(
+                tmp,
+                with_provider_path(
+                    {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+                ),
+            ),
             runner=herdr.run,
         )
+        herdr.attest_home = home
         request = SublaneCreateRequest(
             issue="13331",
             lane_label="issue_13331_lane",

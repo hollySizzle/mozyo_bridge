@@ -749,6 +749,11 @@ Table naming:
         無言で再作成し、その上で pane を閉じることになる。
       - `session-start` は **debt を記録するだけで close しない** (j#80991)。destructive compensation は explicit public rail
         `herdr session-rollback --action-id <id> [--execute]` のみが行い、対象は **同 action の participant** に限る。
+        embedded caller (`sublane create/start --execute`) は Herdr adapter が返す typed な action id / role health /
+        rollback debt を **append 直後**に判定し、`ok=true` の positive health だけを後続へ通す。non-positive は
+        `startup_health_unconfirmed` として post-append inventory read-back / pair attestation / readiness / dispatch の前で
+        zero-send にし、同 action の public rollback command を pointer として示すだけで auto rollback / auto close しない。
+        `None` は startup result を持たない legacy non-Herdr adapter の互換値に限り、Herdr 成功の代用にしない。
         adopted / foreign / newer / identity drift / duplicate / obligation-present / busy / unreadable は zero-close。
         composer は 3 値を保つ: 捨てられるのは **transaction 自身が生んだ startup UI** (認識済み provider startup blocker で、
         誰も打鍵していないもの) だけで、LLM / operator が投入した composer body は **owner approval の有無に関わらず preserve**
