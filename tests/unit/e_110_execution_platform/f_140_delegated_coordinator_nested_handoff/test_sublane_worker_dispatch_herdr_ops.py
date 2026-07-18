@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -45,7 +46,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_WORKER_DISPATCHED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    ADMISSION_HEALTHY,
+    ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
+    ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
     WORKER_DISPATCH_DELIVERY_FAILED,
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
     WorkerDispatchRequest,
     lane_identity_matches,
 )
@@ -59,6 +65,27 @@ from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_hand
 
 LANE_LABEL = "issue_13357_dispatch_worker_herdr"
 ISSUE = "13357"
+
+
+def _healthy_admission() -> WorkerDispatchAdmission:
+    return WorkerDispatchAdmission(
+        ADMISSION_HEALTHY,
+        "healthy",
+        WorkerDispatchAdmissionFacts(
+            True,
+            True,
+            True,
+            True,
+            "live",
+            True,
+            "awaiting_input",
+            lane_generation=1,
+            worker_assigned_name="mzb1_ws_claude_lane",
+            workspace_id="ws",
+            lane_id=LANE_LABEL,
+            action_id="lane_generation_1",
+        ),
+    )
 
 
 class _HerdrLaneFixture:
@@ -151,6 +178,89 @@ class WorkerReadinessProbeTests(unittest.TestCase):
                 self.assertFalse(ops.probe_worker_ready(""))
 
 
+class WorkerAdmissionObservationTests(unittest.TestCase):
+    def _observe(self, rows, attestation):
+        lane = SimpleNamespace(
+            workspace_id="ws", lane_id=LANE_LABEL, worker_pane="w28:p75"
+        )
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "81683")
+        lifecycle = SimpleNamespace(
+            issue_id=ISSUE,
+            lane_disposition="active",
+            lane_generation=7,
+            decision_journal="81683",
+            replacement_action_id="",
+        )
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with patch.object(ops, "worker_provider", return_value="claude"), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=rows,
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.repo_scope_workspace_id",
+            return_value="ws",
+        ), patch(
+            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore.get",
+            return_value=lifecycle,
+        ), patch(
+            "mozyo_bridge.core.state.herdr_identity_attestation.HerdrIdentityAttestationStore.read",
+            return_value=attestation,
+        ), patch(
+            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
+            return_value=[],
+        ):
+            return ops.observe_worker_dispatch_admission(lane=lane, request=request)
+
+    def _attestation(self):
+        return SimpleNamespace(
+            workspace_id="ws",
+            role="claude",
+            lane_id=LANE_LABEL,
+            locator="w28:p75",
+            verdict="present",
+            replacement_action_id="",
+        )
+
+    def test_current_live_attested_idle_receiver_is_healthy(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                }
+            ],
+            self._attestation(),
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertEqual(result.facts.lane_generation, 7)
+
+    def test_locator_bearing_stale_row_is_authority_conflict(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [{"name": name, "pane_id": "w28:p75", "agent": "", "status": "unknown"}],
+            self._attestation(),
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
+    def test_current_slot_absence_routes_recovery_without_send_authority(self):
+        result = self._observe([], None)
+        self.assertEqual(
+            result.decision, ADMISSION_STALE_WORKER_RECOVERY_REQUIRED
+        )
+
+
 class DispatchContainmentTests(unittest.TestCase):
     """The herdr adapter drives the shared composed-CLI containment (j#71597)."""
 
@@ -233,6 +343,72 @@ class DispatchContainmentTests(unittest.TestCase):
         )
         self.assertEqual(rc, 1)
         self.assertEqual(out, "")
+
+
+class TurnStartLedgerTests(unittest.TestCase):
+    def _observe(self, record):
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with patch.object(ops, "worker_provider", return_value="claude"), patch(
+            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
+            return_value=[record],
+        ):
+            return ops._observe_worker_turn_start(
+                "mzb1_ws_claude_lane",
+                issue=ISSUE,
+                journal="81683",
+                worker_locator="w28:p75",
+            )
+
+    def test_queue_event_busy_is_causally_started_even_without_provider_projection(self):
+        record = SimpleNamespace(
+            journal_id="81683",
+            receiver="claude",
+            provider=None,
+            target="w28:p75",
+            turn_start_outcome=None,
+            queue_enter_observation={"runtime_state": "busy"},
+        )
+        self.assertEqual(self._observe(record), "started")
+
+    def test_queue_event_awaiting_input_is_delivered_not_started(self):
+        record = SimpleNamespace(
+            journal_id="81683",
+            receiver="claude",
+            provider=None,
+            target="w28:p75",
+            turn_start_outcome=None,
+            queue_enter_observation={"runtime_state": "awaiting_input"},
+        )
+        self.assertEqual(self._observe(record), "delivered_not_started")
+
+
+class DispatchOutboxAdmissionTests(unittest.TestCase):
+    def test_exact_key_is_reserved_once_and_turn_start_marks_delivered(self):
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "81683")
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": tmp}, clear=False
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution.target_is_retiring",
+            return_value=(False, ""),
+        ):
+            won, _state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+            self.assertTrue(won)
+            self.assertTrue(
+                ops.complete_worker_dispatch(
+                    admission=_healthy_admission(),
+                    request=request,
+                    delivered=True,
+                    detail="turn started",
+                )
+            )
+            replay_won, replay_state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+        self.assertFalse(replay_won)
+        self.assertIn("delivered", replay_state)
 
 
 class TargetLanePinArgvTests(unittest.TestCase):
@@ -346,9 +522,13 @@ class ReplayCommandAuthorityTests(unittest.TestCase):
                 os.environ, {"MOZYO_BRIDGE_HOME": str(fx.home)}, clear=False
             ):
                 fx.stand_up_lane()
-                outcome = WorkerDispatchUseCase(
-                    fx.ops(), worker_ready_probes=0
-                ).run(request, execute=False)
+                ops = fx.ops()
+                with patch.object(
+                    ops, "observe_worker_dispatch_admission", return_value=_healthy_admission()
+                ):
+                    outcome = WorkerDispatchUseCase(
+                        ops, worker_ready_probes=0
+                    ).run(request, execute=False)
         self.assertIn(f"--target-lane {LANE_LABEL}", outcome.command)
         self.assertIn("--repo", outcome.command)
         # And the replayed command's argv is exactly what the herdr adapter drives.
@@ -414,10 +594,19 @@ class HerdrUseCaseDriveTests(unittest.TestCase):
             os.environ, {"MOZYO_BRIDGE_HOME": str(fx.home)}, clear=False
         ):
             fx.stand_up_lane()
+            ops = fx.ops()
             use_case = WorkerDispatchUseCase(
-                fx.ops(), worker_ready_probes=1, sleep=lambda s: None
+                ops, worker_ready_probes=1, sleep=lambda s: None
             )
-            with patch(
+            with patch.object(
+                ops, "observe_worker_dispatch_admission", return_value=_healthy_admission()
+            ), patch.object(
+                ops, "reserve_worker_dispatch", return_value=(True, "reserved")
+            ), patch.object(
+                ops, "complete_worker_dispatch", return_value=True
+            ), patch.object(
+                ops, "_observe_worker_turn_start", return_value="started"
+            ), patch(
                 "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher._drive_worker_send_argv",  # noqa: E501
                 return_value=send_rc,
             ) as drive:
