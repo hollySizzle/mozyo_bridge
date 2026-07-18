@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.replacement_transaction_model import (
+    CAS_ACTION_MISMATCH,
     CAS_ALREADY_DECLARED,
     CAS_APPLIED,
     CAS_FORBIDDEN_TRANSITION,
@@ -42,6 +43,7 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_NOT_FOUND,
     CAS_PARTICIPANT_NOT_FOUND,
     CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
     PARTICIPANT_PHASES,
     PHASE_PLANNED,
     TRANSACTION_PHASES,
@@ -56,6 +58,7 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     norm,
     participant_actuation_phase_allowed,
     participant_transition_allowed,
+    supersede_refusal_reason,
     transaction_phase_prerequisite_met,
     transaction_transition_allowed,
     validate_participants,
@@ -337,6 +340,100 @@ class ReplacementTransactionStore:
             _rollback(conn)
             raise ReplacementTransactionError(
                 f"replacement transaction plan failed ({type(exc).__name__}); fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def supersede_transaction(
+        self,
+        key: ReplacementTransactionKey,
+        *,
+        new_action_generation: int,
+        decision: DecisionPointer,
+        continuation: ContinuationPointer,
+        participants: Sequence[ParticipantPin],
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Re-anchor a **zero-effect** stuck transaction to a fresh generation (Redmine #13806).
+
+        The convergence path the recover-stale revision-authority split needs: an installed
+        binary can leave a durable transaction pinned to *mis-bound* lane-lifecycle evidence, so
+        it can never actuate, and a corrected re-run trips the use case's authority-conflict
+        fence. This CAS lets the SAME approved action supersede that row to a new generation
+        carrying the corrected pin evidence, WITHOUT raw-DB surgery, and only while it is
+        provably safe. The fail-closed guards are the pure :func:`supersede_refusal_reason`
+        (immutable fence / same-action / monotonic-generation); an absent row is
+        :data:`CAS_NOT_FOUND`. On success the header is rewritten at the new generation with the
+        corrected (all-``close_owed``) manifest, reset to :data:`PHASE_PLANNED`, the lease
+        cleared, and the CAS revision bumped — the drive then proceeds from ``planned``.
+        """
+        if not isinstance(new_action_generation, int) or isinstance(
+            new_action_generation, bool
+        ):
+            raise ValueError("new_action_generation must be an integer")
+        if new_action_generation < 1:
+            raise ValueError("new_action_generation is a positive counter (>= 1)")
+        pinned = validate_participants(tuple(participants))
+        encoded = encode_participants(pinned)
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = _locked_row(conn, key)
+            if existing is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            refusal = supersede_refusal_reason(
+                existing, new_action_generation=new_action_generation, decision=decision,
+                continuation=continuation, new_participants=pinned, now=stamp,
+            )
+            if refusal is not None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=refusal, revision=existing.revision
+                )
+            revision = existing.revision + 1
+            # ``created_at`` is reset to the supersede moment (the attestation freshness boundary
+            # ``verify_attestation`` reads as ``fresh_after``): a new generation anchors that
+            # fence to its OWN start, so a slot predating the supersede never passes as fresh.
+            conn.execute(
+                f"UPDATE {_TABLE} SET action_generation = ?, phase = ?, revision = ?, "
+                "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
+                "continuation_source = ?, continuation_issue_id = ?, continuation_journal = ?, "
+                "continuation_expected_gate = ?, continuation_next_action = ?, "
+                "participants_manifest = ?, lease_holder = ?, lease_epoch = ?, "
+                "lease_expires_at = ?, created_at = ?, updated_at = ? "
+                "WHERE workspace_id = ? AND action_id = ? AND revision = ?",
+                (
+                    new_action_generation,
+                    PHASE_PLANNED,
+                    revision,
+                    decision.source,
+                    decision.issue_id,
+                    decision.journal_id,
+                    continuation.source,
+                    continuation.issue_id,
+                    continuation.journal_id,
+                    continuation.expected_gate,
+                    continuation.next_semantic_action,
+                    encoded,
+                    "",  # lease_holder (cleared — the superseded lease never carries forward)
+                    0,  # lease_epoch
+                    "",  # lease_expires_at
+                    stamp,  # created_at (the fresh generation's freshness boundary)
+                    stamp,  # updated_at
+                    key.workspace_id,
+                    key.action_id,
+                    existing.revision,
+                ),
+            )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise ReplacementTransactionError(
+                f"replacement transaction supersede failed "
+                f"({type(exc).__name__}); fail closed"
             ) from exc
         finally:
             conn.close()
@@ -876,6 +973,7 @@ __all__ = (
     "REPLACEMENT_TRANSACTION_RECOVERY_POLICY",
     "REPLACEMENT_TRANSACTION_SCHEMA_VERSION",
     # re-exported from the model so the component has one import surface
+    "CAS_ACTION_MISMATCH",
     "CAS_ALREADY_DECLARED",
     "CAS_APPLIED",
     "CAS_FORBIDDEN_TRANSITION",
@@ -885,6 +983,7 @@ __all__ = (
     "CAS_NOT_FOUND",
     "CAS_PARTICIPANT_NOT_FOUND",
     "CAS_STALE_REVISION",
+    "CAS_UNEXPECTED_STATE",
     "CasOutcome",
     "ContinuationPointer",
     "DecisionPointer",

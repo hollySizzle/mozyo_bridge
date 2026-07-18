@@ -111,6 +111,33 @@ class RecoverStaleCliTests(unittest.TestCase):
         self.assertEqual(payload["verdict"], "identity_unknown")
         self.assertEqual(rc, 1)
 
+    def test_worker_revision_flag_drives_preflight_generation_gate(self):
+        # Redmine #13806 R2: --worker-revision is the preflight generation authority, compared
+        # to the live worker ROW revision (3). A mismatch is a stale generation, exit 0
+        # (informational preflight).
+        rc, text = self._run(
+            BASE + ["--worker-revision", "9", "--json"], rows=[_stale_row()]
+        )
+        payload = json.loads(text)
+        self.assertEqual(payload["verdict"], "stale_generation")
+        self.assertEqual(payload["status"], "preflight")
+        self.assertEqual(rc, 0)
+
+    def test_worker_revision_and_lane_revision_are_separate_flags(self):
+        # Both flags exist and are distinct destinations (the authority split).
+        parser = build_parser(None)
+        ns = parser.parse_args(
+            BASE + ["--worker-revision", "0", "--lane-revision", "5", "--lane-generation", "1"]
+        )
+        self.assertEqual(ns.worker_revision, "0")
+        self.assertEqual(ns.lane_revision, "5")
+        self.assertEqual(ns.lane_generation, "1")
+
+    def test_supersede_flag_parses_and_defaults_false(self):
+        parser = build_parser(None)
+        self.assertFalse(parser.parse_args(BASE).supersede)
+        self.assertTrue(parser.parse_args(BASE + ["--supersede"]).supersede)
+
 
 if __name__ == "__main__":
     unittest.main()

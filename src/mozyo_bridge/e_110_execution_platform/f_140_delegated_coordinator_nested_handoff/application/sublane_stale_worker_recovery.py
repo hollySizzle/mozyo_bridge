@@ -145,9 +145,27 @@ class RecoveryRequest:
     action_id: str = ""
     #: The immutable approved generation counter (>= 1). The transaction's authority token.
     action_generation: int = 0
-    #: The lane lifecycle ``(revision, generation)`` pinned at approval time (evidence).
+    #: The LIVE WORKER INVENTORY row revision pinned at approval time — a *distinct* authority
+    #: from the lane lifecycle below (Redmine #13806 recover-stale revision-authority split).
+    #: The preflight ``generation_matches`` gate compares this to the live worker row's own
+    #: ``revision`` (a same-name recycle at a bumped row revision is a stale generation). Empty
+    #: matches any present row revision (the row shape may not carry one). This is NOT the lane
+    #: lifecycle revision: conflating the two left an installed binary unable to satisfy both
+    #: fences with one field.
+    worker_revision: str = ""
+    #: The LANE LIFECYCLE ``(revision, generation)`` pinned at approval time — the evidence the
+    #: close-boundary preservation fence re-verifies against the live lane lifecycle store. A
+    #: separate authority from :attr:`worker_revision`; the two are compared to two different
+    #: live sources and must be pinned independently.
     lane_revision: str = ""
     lane_generation: str = ""
+    #: Owner-approved convergence of a stuck same-action transaction (Redmine #13806): when the
+    #: durable transaction was pinned to mis-bound lane-lifecycle evidence by an earlier
+    #: (installed) run, a corrected re-run trips the authority-conflict fence. With ``supersede``
+    #: AND a strictly-greater :attr:`action_generation`, the recovery re-anchors that row to the
+    #: corrected evidence at the new generation — but ONLY while it has actuated nothing
+    #: (zero close / launch / send). Never a raw-DB edit; never past an actuated fence.
+    supersede: bool = False
     #: The durable gate the coordinator must find + the one semantic action to redispatch once.
     expected_gate: str = ""
     next_semantic_action: str = ""
@@ -176,6 +194,14 @@ class RecoveryOutcome:
     revision: int = 0
     detail: str = ""
     observation: Optional[dict[str, bool]] = None
+    #: The closed preservation reason(s) that fenced a close (Redmine #13806): the exact
+    #: :data:`PRESERVE_*` tokens (identity_mismatch / running_process / pending_approval), not a
+    #: generic ``preservation_blocked`` — so the durable record names which fence stopped it and
+    #: on which comparison axis (carried in ``detail``). Empty unless a preservation fence fired.
+    preservation_reasons: tuple[str, ...] = ()
+    #: Whether this --execute re-anchored a stuck same-action transaction to a new generation
+    #: before driving (the owner-approved supersede convergence). Diagnostic only.
+    converged_supersede: bool = False
 
     @property
     def is_blocked(self) -> bool:
@@ -202,6 +228,8 @@ class RecoveryOutcome:
             "is_blocked": self.is_blocked,
             "detail": self.detail,
             "observation": self.observation,
+            "preservation_reasons": list(self.preservation_reasons),
+            "converged_supersede": self.converged_supersede,
         }
 
 
@@ -418,7 +446,7 @@ class StaleWorkerRecoveryUseCase:
         # ``(revision, generation)`` evidence, so an approval that differs ONLY in those pins is
         # explicitly refused here rather than silently resuming the stored worker's evidence.
         stored_worker = current.find_participant(worker.identity)
-        if (
+        diverged = (
             current.action_generation != gen
             or current.decision != decision
             or current.continuation != continuation
@@ -427,12 +455,46 @@ class StaleWorkerRecoveryUseCase:
             or stored_worker.old_locator != worker.old_locator
             or stored_worker.lane_revision != worker.lane_revision
             or stored_worker.lane_generation != worker.lane_generation
-        ):
-            return self._outcome(
-                request, verdict, status=RECOVERY_REFUSED, executed=True,
-                observation=observation, phase=current.phase, revision=current.revision,
-                detail="a different recovery authority is already in flight for this worker",
+        )
+        converged_supersede = False
+        if diverged:
+            if not request.supersede:
+                return self._outcome(
+                    request, verdict, status=RECOVERY_REFUSED, executed=True,
+                    observation=observation, phase=current.phase, revision=current.revision,
+                    detail=(
+                        "a different recovery authority is already in flight for this worker; "
+                        "pass --supersede with a higher --action-generation to re-anchor a "
+                        "zero-effect stuck transaction to the corrected evidence"
+                    ),
+                )
+            # Owner-approved convergence (Redmine #13806): the stuck row was pinned to mis-bound
+            # lane-lifecycle evidence by an earlier run and can never actuate. Re-anchor it to
+            # THIS new generation + corrected evidence — but the CAS re-anchors ONLY while the
+            # row has run zero close / launch / send and is the same exact action; a close /
+            # launch / send / foreign / in-flight row is an immutable fence, zero-write.
+            sup = self._store.supersede_transaction(
+                key, new_action_generation=gen, decision=decision,
+                continuation=continuation, participants=[worker],
             )
+            if not sup.applied:
+                return self._outcome(
+                    request, verdict, status=RECOVERY_REFUSED, executed=True,
+                    observation=observation, phase=current.phase, revision=current.revision,
+                    detail=(
+                        f"supersede refused ({sup.reason}); the stuck transaction is not a "
+                        "zero-effect same-action row (a close / launch / send / foreign / "
+                        "in-flight transaction keeps its immutable fence)"
+                    ),
+                )
+            current = self._store.get(key)
+            if current is None:
+                return self._outcome(
+                    request, verdict, status=RECOVERY_STOPPED, executed=True,
+                    observation=observation,
+                    detail="transaction row vanished after supersede",
+                )
+            converged_supersede = True
 
         # 3. Drive the guarded close → launch → attest (tranche B actuator, byte-preserving).
         actuator = ReplacementActuatorUseCase(
@@ -447,12 +509,21 @@ class StaleWorkerRecoveryUseCase:
         worker_pin = after.find_participant(worker.identity) if after else None
         if recov.status != ACTUATION_RECOVERED:
             # The recovery stopped fail-closed; the durable transaction holds the replay fence.
+            # Surface the CLOSED preservation reason(s) + comparison axis (Redmine #13806) so a
+            # preservation_blocked names identity_mismatch / running_process / pending_approval
+            # and the diverging axis, not a generic block.
             return self._outcome(
                 request, verdict, status=RECOVERY_STOPPED, executed=True,
                 observation=observation, recovery_status=recov.status,
                 closed_old_worker=self._closed_old_worker(worker_pin),
                 phase=after.phase if after else "", revision=after.revision if after else 0,
-                detail=f"worker recovery stopped ({recov.status}); re-run resumes",
+                preservation_reasons=tuple(recov.preservation_reasons),
+                converged_supersede=converged_supersede,
+                detail=(
+                    f"worker recovery stopped ({recov.status}"
+                    + (f": {recov.detail}" if norm(recov.detail) else "")
+                    + "); re-run resumes"
+                ),
             )
 
         # 4. Fresh receiver attested — redispatch the ORIGINAL gate exactly once.
@@ -469,6 +540,7 @@ class StaleWorkerRecoveryUseCase:
             closed_old_worker=self._closed_old_worker(worker_pin),
             fresh_slot_attested=True,
             phase=final.phase if final else "", revision=final.revision if final else 0,
+            converged_supersede=converged_supersede,
             detail=(
                 "worker replaced and original gate redispatched exactly once"
                 if redis == REDISPATCH_CONFIRMED
@@ -607,6 +679,8 @@ class StaleWorkerRecoveryUseCase:
         phase: str = "",
         revision: int = 0,
         detail: str = "",
+        preservation_reasons: tuple[str, ...] = (),
+        converged_supersede: bool = False,
     ) -> RecoveryOutcome:
         return RecoveryOutcome(
             issue=norm(request.issue),
@@ -623,6 +697,8 @@ class StaleWorkerRecoveryUseCase:
             revision=revision,
             detail=detail,
             observation=observation.as_payload() if observation is not None else None,
+            preservation_reasons=tuple(preservation_reasons),
+            converged_supersede=converged_supersede,
         )
 
 
@@ -711,10 +787,12 @@ def cmd_sublane_recover_stale(args: argparse.Namespace) -> int:
         journal=getattr(args, "journal", "") or "",
         action_id=getattr(args, "action_id", "") or "",
         action_generation=int(getattr(args, "action_generation", 0) or 0),
+        worker_revision=getattr(args, "worker_revision", "") or "",
         lane_revision=getattr(args, "lane_revision", "") or "",
         lane_generation=getattr(args, "lane_generation", "") or "",
         expected_gate=getattr(args, "expected_gate", "") or "",
         next_semantic_action=getattr(args, "next_semantic_action", "") or "",
+        supersede=bool(getattr(args, "supersede", False)),
     )
     execute = bool(getattr(args, "execute", False))
     outcome = _run_live_recovery(args, request, execute=execute)
@@ -749,8 +827,22 @@ def register_sublane_recover_stale_parser(sublane_sub: Any) -> None:
     for flag, dest, help_text in (
         ("--journal", "journal", "Positive owner approval journal id (--execute)"),
         ("--action-id", "action_id", "Exact recover:<lane>:<role>:<provider>:<name>:<locator> id"),
-        ("--lane-revision", "lane_revision", "Lane lifecycle revision pinned at approval"),
-        ("--lane-generation", "lane_generation", "Lane lifecycle generation pinned at approval"),
+        (
+            "--worker-revision",
+            "worker_revision",
+            "Live worker inventory row revision pinned at approval (preflight generation gate; "
+            "distinct from the lane lifecycle revision)",
+        ),
+        (
+            "--lane-revision",
+            "lane_revision",
+            "Lane LIFECYCLE revision pinned at approval (close-boundary preservation fence)",
+        ),
+        (
+            "--lane-generation",
+            "lane_generation",
+            "Lane LIFECYCLE generation pinned at approval (close-boundary preservation fence)",
+        ),
         ("--expected-gate", "expected_gate", "The durable gate the fresh worker must resume"),
         (
             "--next-semantic-action",
@@ -762,6 +854,14 @@ def register_sublane_recover_stale_parser(sublane_sub: Any) -> None:
     parser.add_argument(
         "--action-generation", dest="action_generation", type=int, default=0,
         help="Immutable approved generation counter (>= 1) (--execute)",
+    )
+    parser.add_argument(
+        "--supersede", action="store_true",
+        help=(
+            "With a higher --action-generation, re-anchor a zero-effect stuck same-action "
+            "transaction to the corrected evidence (converges a mis-bound residue without raw "
+            "DB; refused once any close / launch / send happened)"
+        ),
     )
     parser.add_argument(
         "--execute", action="store_true",

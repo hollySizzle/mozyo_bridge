@@ -92,8 +92,11 @@ def _request(**overrides):
     base = dict(
         issue="13806", lane=LANE, role=ROLE, provider=ROLE, assigned_name=NAME,
         locator=LOCATOR, journal="79485", action_id="", action_generation=7,
-        lane_revision="3", lane_generation="2", expected_gate="implementation_request",
-        next_semantic_action="dispatch_once",
+        # worker_revision (preflight generation gate) and lane_revision/lane_generation (the
+        # lane-lifecycle preservation fence) are DISTINCT authorities (Redmine #13806 split):
+        # the default row carries revision 3, so the worker pin matches at "3".
+        worker_revision="3", lane_revision="3", lane_generation="2",
+        expected_gate="implementation_request", next_semantic_action="dispatch_once",
     )
     base.update(overrides)
     return RecoveryRequest(**base)
@@ -181,9 +184,25 @@ class ObserveTargetTests(_LiveCase):
         obs = self._ops([_row(agent="claude", status="working")]).observe_target(_request())
         self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_PRODUCTIVE)
 
-    def test_revision_mismatch_is_stale_generation(self):
-        obs = self._ops([_row(revision=9)]).observe_target(_request(lane_revision="3"))
+    def test_worker_revision_mismatch_is_stale_generation(self):
+        # The preflight generation gate compares the live worker ROW revision to the pinned
+        # WORKER revision — NOT the lane lifecycle revision (Redmine #13806 authority split).
+        obs = self._ops([_row(revision=9)]).observe_target(_request(worker_revision="3"))
         self.assertEqual(decide_recovery(obs), RECOVER_BLOCK_STALE_GENERATION)
+
+    def test_lane_revision_does_not_drive_preflight_generation(self):
+        # The #13811 shape: worker row revision 0, lane lifecycle revision 5. A --lane-revision
+        # that differs from the row revision must NOT trip the preflight generation gate — that
+        # authority is the worker revision. So a worker row (revision 0) with worker_revision
+        # pinned to "0" is actionable even while --lane-revision is a different lifecycle value.
+        obs = self._ops([_row(revision=0)]).observe_target(
+            _request(worker_revision="0", lane_revision="5", lane_generation="1")
+        )
+        self.assertEqual(decide_recovery(obs), RECOVER_ACTIONABLE)
+
+    def test_empty_worker_revision_matches_any_present_row_revision(self):
+        obs = self._ops([_row(revision=0)]).observe_target(_request(worker_revision=""))
+        self.assertEqual(decide_recovery(obs), RECOVER_ACTIONABLE)
 
 
 class ObserveOldSlotTests(_LiveCase):

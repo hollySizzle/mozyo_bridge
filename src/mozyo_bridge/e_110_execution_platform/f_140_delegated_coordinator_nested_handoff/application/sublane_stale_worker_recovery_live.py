@@ -237,6 +237,12 @@ class LiveRecoveryActuatorPort:
                 observed_lane_generation=live_gen,
             )
         )
+        # When the identity fence fires, name the comparison AXIS in the (never-secret) detail
+        # so a durable ``identity_mismatch`` says which authority diverged and its observed vs
+        # pinned values (Redmine #13806 recover-stale: the lane lifecycle is the axis the
+        # revision-authority split exposed). Only the lane-lifecycle counters + locator are
+        # emitted — no worktree bytes, journal content, or credentials.
+        detail = "" if identity_ok else self._preservation_axis_detail(pin, row, live_rev, live_gen)
         # For a worker recovery only running_process / identity_mismatch block (the recovery
         # preservation policy byte-preserves a dirty worktree). attestation_fresh is set True so
         # the (unused-by-recovery-policy) attestation fence never spuriously fires.
@@ -244,7 +250,28 @@ class LiveRecoveryActuatorPort:
             running_process=_row_runtime_state(row) == RUNTIME_BUSY,
             identity_matches=identity_ok,
             attestation_fresh=True,
+            detail=detail,
         )
+
+    @staticmethod
+    def _preservation_axis_detail(
+        pin: ParticipantPin, row: Mapping[str, object], live_rev: str, live_gen: str
+    ) -> str:
+        """Name the diverging identity axis: lane lifecycle first, then locator (no secrets)."""
+        if pin.lane_revision and pin.lane_revision != _norm(live_rev):
+            return (
+                f"lane_lifecycle_revision observed={_norm(live_rev)!r} "
+                f"pinned={pin.lane_revision!r}"
+            )
+        if pin.lane_generation and pin.lane_generation != _norm(live_gen):
+            return (
+                f"lane_lifecycle_generation observed={_norm(live_gen)!r} "
+                f"pinned={pin.lane_generation!r}"
+            )
+        observed_locator = _agent_locator(row)
+        if pin.old_locator != _norm(observed_locator):
+            return f"locator observed={_norm(observed_locator)!r} pinned={pin.old_locator!r}"
+        return "stable_identity_mismatch"
 
     def _live_lifecycle_generation(self, pin: ParticipantPin) -> tuple[str, str]:
         """The live lane lifecycle ``(revision, generation)`` as strings, or ``("", "")``.
@@ -417,14 +444,20 @@ class LiveStaleWorkerRecoveryOps:
             and _norm(request.provider) == worker_provider
             and _norm(request.provider) != gateway_provider
         )
-        # a live-generation revision match (a same-name recycle at a new revision is stale gen)
+        # A live worker-row generation match: the live worker inventory row's OWN ``revision``
+        # against the approval's pinned WORKER revision — a distinct authority from the lane
+        # lifecycle (Redmine #13806 recover-stale revision-authority split). Conflating the two
+        # under one ``--lane-revision`` left an installed binary unable to satisfy both this
+        # preflight gate and the close-boundary lane-lifecycle preservation fence with one value.
+        # A same-name recycle at a bumped row revision is a stale generation. Empty pin matches
+        # any present row revision (the row shape may not carry one).
         revision_raw = row.get("revision")
         row_revision = (
             _norm(revision_raw) if not isinstance(revision_raw, bool) else ""
         )
         generation_matches = bool(row_revision) and (
-            row_revision == _norm(request.lane_revision)
-            or _norm(request.lane_revision) == ""  # revision not carried in the row shape
+            row_revision == _norm(request.worker_revision)
+            or _norm(request.worker_revision) == ""  # revision not carried in the row shape
         )
         runtime_state = _row_runtime_state(row)
         not_productive = runtime_state != RUNTIME_BUSY

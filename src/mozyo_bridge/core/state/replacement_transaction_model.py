@@ -268,6 +268,87 @@ def transaction_phase_prerequisite_met(
     return True
 
 
+#: The transaction phases in which NO destructive participant effect can yet have run: the
+#: header is written / claimed / the non-self replacement has begun but — as long as every
+#: participant is still ``close_owed`` — nothing has been closed, launched, or verified, and
+#: the continuation drain (``draining_continuation`` / ``completed``) has not started. A
+#: transaction outside this set, or one whose participants have advanced past ``close_owed``,
+#: has already actuated (Redmine #13806 recover-stale convergence) and is an immutable fence.
+_ZERO_EFFECT_PHASES = frozenset(
+    {PHASE_PLANNED, PHASE_CLAIMED, PHASE_REPLACING_NONSELF}
+)
+
+
+def transaction_has_zero_actuation_effect(
+    record: "ReplacementTransactionRecord",
+) -> bool:
+    """Has this transaction provably run ZERO close / launch / send? (pure, fail-closed)
+
+    The safety proof a :meth:`...ReplacementTransactionStore.supersede_transaction` re-anchor
+    requires (Redmine #13806 recover-stale convergence): a stuck transaction may be corrected
+    to a fresh generation only while it has actuated nothing. That is exactly:
+
+    - the transaction phase is one of :data:`_ZERO_EFFECT_PHASES` (``planned`` / ``claimed`` /
+      ``replacing_nonself``) — never ``draining_continuation`` / ``completed`` (a redispatch
+      send may have fired) nor any self-close phase; AND
+    - **every** participant is still ``close_owed`` — none has been closed (``launch_owed``),
+      relaunched (``verify_owed``), or verified (``replaced``).
+
+    Both conditions are needed: a row can sit at ``replacing_nonself`` (a real value the
+    installed a10 residue holds) with every participant still ``close_owed`` — that is
+    zero-effect — whereas a ``replacing_nonself`` row whose one worker is already
+    ``launch_owed`` has closed the old slot and must never be re-anchored. Any unknown /
+    corrupt phase falls outside the closed set and returns ``False`` (fail closed).
+    """
+    if norm(record.phase) not in _ZERO_EFFECT_PHASES:
+        return False
+    return all(
+        norm(pin.phase) == PARTICIPANT_CLOSE_OWED for pin in record.participants
+    )
+
+
+def supersede_refusal_reason(
+    existing: "ReplacementTransactionRecord",
+    *,
+    new_action_generation: int,
+    decision: "DecisionPointer",
+    continuation: "ContinuationPointer",
+    new_participants: Sequence["ParticipantPin"],
+    now: str,
+) -> Optional[str]:
+    """The CAS refusal for a supersede re-anchor, or ``None`` to proceed. (pure, fail-closed)
+
+    The recover-stale convergence guards (Redmine #13806) as a pure decision so the store's
+    :meth:`...ReplacementTransactionStore.supersede_transaction` is a thin apply. Checked in
+    order, each an immutable fence that keeps a mis-bound residue from a WRONG re-anchor:
+
+    1. an ACTUATED or in-flight row — not :func:`transaction_has_zero_actuation_effect`, or a
+       still-live lease — is refused :data:`CAS_UNEXPECTED_STATE`. Once a close / launch / send
+       happened, or a different holder is live, the header is immutable, zero-write;
+    2. a row whose decision / continuation pointers OR participant-identity set diverges from
+       the request is not the **same exact action** — refused :data:`CAS_ACTION_MISMATCH`, so a
+       supersede corrects EVIDENCE only, never re-targets a different worker / gate / approval;
+    3. a new generation not **strictly greater** than the stored one is refused
+       :data:`CAS_GENERATION_MISMATCH` — a monotonic, owner-approved supersede only.
+
+    ``None`` means every guard passed and the header may be rewritten at the new generation with
+    the corrected (all-``close_owed``) manifest.
+    """
+    if not transaction_has_zero_actuation_effect(existing) or existing.lease_is_live(now):
+        return CAS_UNEXPECTED_STATE
+    stored_identities = frozenset(p.identity for p in existing.participants)
+    new_identities = frozenset(p.identity for p in new_participants)
+    if (
+        existing.decision != decision
+        or existing.continuation != continuation
+        or stored_identities != new_identities
+    ):
+        return CAS_ACTION_MISMATCH
+    if new_action_generation <= existing.action_generation:
+        return CAS_GENERATION_MISMATCH
+    return None
+
+
 def participant_actuation_phase_allowed(is_self: bool, transaction_phase: str) -> bool:
     """May a participant of this ``is_self`` kind be actuated in this phase? (pure)
 
@@ -751,6 +832,8 @@ __all__ = (
     "encode_participants",
     "participant_actuation_phase_allowed",
     "participant_transition_allowed",
+    "supersede_refusal_reason",
+    "transaction_has_zero_actuation_effect",
     "transaction_phase_prerequisite_met",
     "transaction_transition_allowed",
     "validate_participants",
