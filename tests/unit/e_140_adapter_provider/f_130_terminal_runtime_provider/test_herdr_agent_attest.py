@@ -23,6 +23,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     VERDICT_PRESENT,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (
+    _argv0_alias_binds_to_exec_target,
     _live_lister,
     cmd_herdr_agent_attest,
     perform_self_attestation,
@@ -261,12 +262,96 @@ class CmdAgentAttestTest(unittest.TestCase):
             execvp.assert_not_called()
 
 
+def _install_real_exe(directory: str, name: str) -> str:
+    """A real executable file at ``<directory>/<name>``, returning its realpath."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(path, 0o755)
+    return os.path.realpath(path)
+
+
+class Argv0AliasBindingTest(unittest.TestCase):
+    """The wrapper-side fail-closed alias->exec-target binding predicate (R3-F1).
+
+    The wrapper is a separate trust boundary from the resolver, so it re-verifies the
+    binding at exec time: the exec target must be an absolute realpath of its own and the
+    absolute alias must name that same file. Every other shape is rejected value-free.
+    """
+
+    def test_symlink_alias_to_realpath_target_binds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            alias = os.path.join(base, "claude")
+            os.symlink(real, alias)
+            self.assertTrue(_argv0_alias_binds_to_exec_target(alias, real))
+
+    def test_equal_absolute_realpath_binds(self) -> None:
+        # Unsymlinked provider: alias == exec-target realpath (byte-invariant form).
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "codex")
+            self.assertTrue(_argv0_alias_binds_to_exec_target(real, real))
+
+    def test_relative_alias_does_not_bind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            self.assertFalse(_argv0_alias_binds_to_exec_target("claude", real))
+            self.assertFalse(_argv0_alias_binds_to_exec_target("./claude", real))
+
+    def test_nonexistent_alias_does_not_bind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            self.assertFalse(
+                _argv0_alias_binds_to_exec_target(os.path.join(base, "missing"), real)
+            )
+
+    def test_unrelated_absolute_alias_does_not_bind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            other = _install_real_exe(base, "unrelated")
+            self.assertFalse(_argv0_alias_binds_to_exec_target(other, real))
+
+    def test_different_target_symlink_does_not_bind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            other_real = _install_real_exe(base, "other-real")
+            other_alias = os.path.join(base, "other-alias")
+            os.symlink(other_real, other_alias)
+            self.assertFalse(_argv0_alias_binds_to_exec_target(other_alias, real))
+
+    def test_non_realpath_exec_target_is_not_an_anchor(self) -> None:
+        # The exec target must be its OWN realpath; a symlink exec target is not a
+        # canonical resolver output and cannot anchor a binding even for an alias that
+        # resolves to the same underlying file.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            symlinked_target = os.path.join(base, "claude-symlink")
+            os.symlink(real, symlinked_target)
+            self.assertFalse(
+                _argv0_alias_binds_to_exec_target(symlinked_target, symlinked_target)
+            )
+
+    def test_relative_exec_target_is_not_an_anchor(self) -> None:
+        self.assertFalse(_argv0_alias_binds_to_exec_target("/abs/alias", "relative/exe"))
+
+
 class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
     """Redmine #14017: exec the realpath, present the trusted alias as argv[0].
 
     The exec target is always ``provider_argv[0]`` (the verified realpath); the alias,
     when the launch injected ``MOZYO_PROVIDER_ARGV0``, is applied as argv[0] DATA only —
     via ``os.execv`` (explicit path, no PATH search) so the alias itself is never run.
+    R3-F1: the wrapper re-verifies the alias->exec-target binding fail-closed at exec
+    time, so a set-but-unbound alias never reaches argv[0]; it dies typed/value-free
+    instead of launching (no silent realpath-argv[0] fallback).
     """
 
     def _args(self, provider_argv):
@@ -301,14 +386,19 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
             leftover = os.environ.get(MOZYO_PROVIDER_ARGV0_ENV)
         return execv, execvp, leftover
 
-    def test_absolute_alias_env_execs_realpath_with_alias_argv0(self) -> None:
-        execv, execvp, leftover = self._run(
-            ["--", "/opt/claude/cli", "--permission-mode", "auto"],
-            {MOZYO_PROVIDER_ARGV0_ENV: "/home/u/.local/bin/claude"},
-        )
-        execv.assert_called_once_with(
-            "/opt/claude/cli", ["/home/u/.local/bin/claude", "--permission-mode", "auto"]
-        )
+    def test_bound_symlink_alias_execs_realpath_with_alias_argv0(self) -> None:
+        # Positive: a REAL temp symlink alias that resolves TO the realpath exec target.
+        # The wrapper execs the realpath but presents the trusted alias as argv[0].
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)  # canonical: exec target is its own realpath
+            real = _install_real_exe(base, "claude-real")
+            alias = os.path.join(base, "claude")
+            os.symlink(real, alias)
+            execv, execvp, leftover = self._run(
+                ["--", real, "--permission-mode", "auto"],
+                {MOZYO_PROVIDER_ARGV0_ENV: alias},
+            )
+        execv.assert_called_once_with(real, [alias, "--permission-mode", "auto"])
         execvp.assert_not_called()
         self.assertIsNone(leftover)  # dropped from the provider's inherited env
 
@@ -319,13 +409,42 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
         execvp.assert_called_once_with("/opt/codex", ["/opt/codex", "-c", "x=1"])
         execv.assert_not_called()
 
-    def test_relative_alias_env_is_ignored(self) -> None:
-        # A non-absolute alias must never become argv[0]; fall back to execvp(realpath).
-        execv, execvp, _ = self._run(
-            ["--", "/opt/claude/cli"], {MOZYO_PROVIDER_ARGV0_ENV: "claude"}
+    def _assert_alias_fails_closed(self, provider_argv, alias) -> None:
+        # A set-but-unbound alias dies typed/value-free: NEITHER exec runs (no launch),
+        # and the value is dropped from the env even on the failure path.
+        execv, execvp, leftover = self._run(
+            provider_argv, {MOZYO_PROVIDER_ARGV0_ENV: alias}
         )
-        execvp.assert_called_once_with("/opt/claude/cli", ["/opt/claude/cli"])
         execv.assert_not_called()
+        execvp.assert_not_called()
+        self.assertIsNone(leftover)
+
+    def test_relative_alias_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            real = _install_real_exe(os.path.realpath(tmp), "claude-real")
+            self._assert_alias_fails_closed(["--", real], "claude")
+
+    def test_unrelated_absolute_alias_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            other = _install_real_exe(base, "unrelated")
+            self._assert_alias_fails_closed(["--", real], other)
+
+    def test_nonexistent_alias_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            self._assert_alias_fails_closed(["--", real], os.path.join(base, "missing"))
+
+    def test_different_target_symlink_alias_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            real = _install_real_exe(base, "claude-real")
+            other_real = _install_real_exe(base, "other-real")
+            other_alias = os.path.join(base, "other-alias")
+            os.symlink(other_real, other_alias)
+            self._assert_alias_fails_closed(["--", real], other_alias)
 
 
 if __name__ == "__main__":

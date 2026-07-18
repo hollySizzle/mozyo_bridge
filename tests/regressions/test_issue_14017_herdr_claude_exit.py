@@ -279,15 +279,18 @@ class Argv0WrapperExecTest(unittest.TestCase):
 
     def test_alias_env_execs_realpath_with_alias_argv0(self) -> None:
         # Claude: exec target = realpath, argv[0] = trusted alias. This is the residency
-        # fix — Claude sees its stable alias, not the symlink-collapsed realpath.
-        provider_argv = ["/opt/claude/cli", "--permission-mode", "auto"]
+        # fix — Claude sees its stable alias, not the symlink-collapsed realpath. The alias
+        # is a REAL temp symlink that resolves TO the realpath exec target, so the wrapper's
+        # fail-closed binding check (R3-F1) accepts it and never executes the alias itself.
         with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            alias, real = _symlinked_alias(base, "claude")
+            provider_argv = [real, "--permission-mode", "auto"]
             execv, execvp, leftover = self._drive(
-                provider_argv, alias="/home/u/.local/bin/claude", home=Path(tmp)
+                provider_argv, alias=alias, home=base
             )
         execv.assert_called_once_with(
-            "/opt/claude/cli",
-            ["/home/u/.local/bin/claude", "--permission-mode", "auto"],
+            real, [alias, "--permission-mode", "auto"]
         )
         execvp.assert_not_called()
         # The alias var is a wrapper instruction, dropped from the provider's env.
@@ -307,17 +310,45 @@ class Argv0WrapperExecTest(unittest.TestCase):
                 execvp.assert_called_once_with(provider_argv[0], provider_argv)
                 execv.assert_not_called()
 
-    def test_relative_alias_env_is_ignored_and_falls_back(self) -> None:
-        # Defensive: the resolver only ever emits an ABSOLUTE alias, but a non-absolute
-        # value must never become argv[0] — fall back to the byte-invariant execvp.
-        provider_argv = ["/opt/claude/cli", "--permission-mode", "auto"]
-        with tempfile.TemporaryDirectory() as tmp:
-            execv, execvp, leftover = self._drive(
-                provider_argv, alias="claude", home=Path(tmp)
-            )
+    def _assert_alias_fails_closed(self, provider_argv, alias, home) -> None:
+        # A set-but-unbound alias is a spoofed/drifted input: the wrapper dies
+        # typed/value-free (SystemExit from ``die``), launching NEITHER exec, and the
+        # value is dropped from the inherited env even on the failure path.
+        execv, execvp, leftover = self._drive(provider_argv, alias=alias, home=home)
         execv.assert_not_called()
-        execvp.assert_called_once_with(provider_argv[0], provider_argv)
+        execvp.assert_not_called()
         self.assertIsNone(leftover)
+
+    def test_relative_alias_env_fails_closed(self) -> None:
+        # A non-absolute alias must never become argv[0], and (R3-F1) must NOT silently
+        # fall back to a realpath-argv[0] launch — that would remask the residency bug.
+        with tempfile.TemporaryDirectory() as tmp:
+            real = _install_exe(Path(os.path.realpath(tmp)) / "real", "claude-real")
+            self._assert_alias_fails_closed(
+                [real, "--permission-mode", "auto"], "claude", Path(tmp)
+            )
+
+    def test_unrelated_absolute_alias_fails_closed(self) -> None:
+        # An existing but DIFFERENT-inode absolute alias is not a trusted binding.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            real = _install_exe(base / "real", "claude-real")
+            other = _install_exe(base / "real", "unrelated")
+            self._assert_alias_fails_closed([real], other, base)
+
+    def test_nonexistent_alias_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            real = _install_exe(base / "real", "claude-real")
+            self._assert_alias_fails_closed([real], str(base / "missing"), base)
+
+    def test_different_target_symlink_alias_fails_closed(self) -> None:
+        # A symlink alias resolving to a DIFFERENT real file than the exec target.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(os.path.realpath(tmp))
+            _alias_claude, real = _symlinked_alias(base, "claude")
+            other_alias, _other_real = _symlinked_alias(base, "codex")
+            self._assert_alias_fails_closed([real], other_alias, base)
 
 
 class PreExecListerHygieneTest(unittest.TestCase):
@@ -412,14 +443,24 @@ class AttestationRecordedBeforeExecTest(unittest.TestCase):
                 pass
 
     def test_attestation_recorded_present_on_both_exec_paths(self) -> None:
-        for label, alias in {"alias-claude": "/home/u/.local/bin/claude", "fallback": ""}.items():
-            with self.subTest(path=label), tempfile.TemporaryDirectory() as tmp:
-                home = Path(tmp)
-                self._drive(["/opt/claude/cli", "--permission-mode", "auto"], alias=alias, home=home)
-                record = HerdrIdentityAttestationStore(home=home).read(NAME)
-                self.assertIsNotNone(record)
-                self.assertEqual(record.verdict, VERDICT_PRESENT)
-                self.assertEqual(record.locator, "wY:p2")
+        # The alias path uses a REAL bound symlink so it reaches a CLEAN os.execv after the
+        # record write (the R3-F1 binding check passes); the fallback path has no alias and
+        # os.execvp's the realpath. Both must have recorded the attestation first.
+        with tempfile.TemporaryDirectory() as fixture:
+            base = Path(os.path.realpath(fixture))
+            alias, real = _symlinked_alias(base, "claude")
+            cases = {
+                "alias-claude": ([real, "--permission-mode", "auto"], alias),
+                "fallback": ([real, "--permission-mode", "auto"], ""),
+            }
+            for label, (provider_argv, alias_val) in cases.items():
+                with self.subTest(path=label), tempfile.TemporaryDirectory() as home_tmp:
+                    home = Path(home_tmp)
+                    self._drive(provider_argv, alias=alias_val, home=home)
+                    record = HerdrIdentityAttestationStore(home=home).read(NAME)
+                    self.assertIsNotNone(record)
+                    self.assertEqual(record.verdict, VERDICT_PRESENT)
+                    self.assertEqual(record.locator, "wY:p2")
 
 
 if __name__ == "__main__":

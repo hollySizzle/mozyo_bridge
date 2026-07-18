@@ -1732,18 +1732,65 @@ default topology) is deliberately NOT derived from the registry.
 ### Executable trust boundary (supersedes the bare-name argv[0])
 
 The launch chokepoints previously rendered a bare `claude` / `codex` as `argv[0]`,
-leaving provider identity to the exec-time `PATH`. They now render the **verified
-absolute realpath** resolved from the trusted environment (explicit env override →
-trusted `PATH`; unsafe `PATH`, relative override, non-executable, missing, or ambiguous
-all fail closed *before* a pane exists). A committed profile can never name the binary
-that runs (#13245 hostile-checkout boundary).
+leaving provider identity to the exec-time `PATH`. They now resolve a **verified absolute
+realpath** from the trusted environment (explicit env override → trusted `PATH`; unsafe
+`PATH`, relative override, non-executable, missing, or ambiguous all fail closed *before*
+a pane exists). A committed profile can never name the binary that runs (#13245
+hostile-checkout boundary).
 
 **Compatibility carve-out (Design Answer j#76725 Q1).** Trusted resolution and a
 byte-invariant built-in argv cannot both hold — re-emitting the bare name after
 resolving would reintroduce the TOCTOU / PATH-substitution hole. The trust boundary
 wins: byte-invariance is narrowed to **every argv token except `argv[0]`**, plus default
-topology, provider order, CLI output, and behavior. Tests pin the *injected* resolver's
-absolute `argv[0]` plus the argv suffix, never a host path literal.
+topology, provider order, CLI output, and behavior.
+
+**`exec_target` and provider-visible `argv[0]` are distinct outputs (Redmine #14017).**
+j#76725 Q1 collapsed `argv[0]` onto the exec-target realpath. Under Herdr that reproduced
+a provider-asymmetric startup exit: Claude's interactive TUI, exec'd with its
+symlink-collapsed realpath as `argv[0]`, exits immediately into `shell_residue`, while it
+stays resident when invoked as its stable trusted alias with the SAME realpath as the
+exec target (measured, j#81879). Executing the alias path directly would reopen the very
+TOCTOU the realpath pin closes, so the resolver emits **two** values instead of conflating
+them: `exec_target` (the verified realpath — the file actually `exec`'d, and always the
+trust boundary) and `argv0` (the positively-resolved trusted absolute alias — the exact
+trusted-`PATH` entry or absolute env override, whose realpath was verified to equal
+`exec_target`). The alias is `argv[0]` **data only** and is never itself executed. When
+the trusted alias is not a symlink the two are equal and the launch is byte-invariant with
+the pre-#14017 single-realpath form.
+
+**Only the wrapped launch decouples them; the wrapper re-verifies the binding fail-closed
+(R3-F1).** Only the wrapped managed launch (`herdr agent-attest`) can honor the split — it
+`os.execv`s `exec_target` while handing the process `argv[0]=argv0`. The alias travels
+out-of-band on a single `--env MOZYO_PROVIDER_ARGV0=<alias>` flag, emitted **only** when
+wrapping *and* the alias differs from the realpath. The wrapper is a **separate trust
+boundary** from the resolver, so it does not blindly trust the injected value: before the
+alias can reach `argv[0]` it re-establishes the resolver's binding at exec time — the exec
+target must be an absolute realpath of its own and the absolute alias must resolve to that
+same file. A set-but-unbound alias (an unrelated absolute, nonexistent, relative, or
+different-target-symlink value) **never becomes `argv[0]` and fails typed and value-free**
+(a `die`, leaking no path); it is never a silent successful launch, which would both
+re-trigger the provider exit and mask the violation from startup health.
+
+**Realpath-only unwrapped / old-wrapper fallback (honest, never weakened).** A launch that
+cannot decouple the two — an unwrapped direct exec, a tmux shell-command line, an
+unsymlinked provider, or an older wrapper predating this contract — keeps the realpath on
+**both** the exec target and `argv[0]`. It never weakens the trust boundary by execing an
+alias. Version skew is safe in both directions: an older wrapper simply ignores the new
+`--env` key (an unknown herdr env key is inherited, not an argparse error, so no launch
+dies), and a newer wrapper handed no key takes the realpath-on-both fallback. This is the
+one token j#76725 Q1 exempts from byte-invariance.
+
+**Startup health must not launder a fallback / binding failure into success.** The
+realpath-only fallback is honest, not a success signal: an unwrapped launch injects no
+attestation env and records no attestation, which the adopt / doctor read side treats as
+fail-closed (`attestation_unavailable`), and a provider that still exits (`shell_residue`)
+is separately non-success. A wrapper that refuses a set-but-unbound alias exits non-zero
+rather than launching. None of these non-success outcomes may be reported as a healthy
+launch.
+
+Tests pin the *injected* resolver's distinct `exec_target` realpath **and** its `argv0`
+alias (a real temporary symlink alias for the wrapped-decoupled path; an equal realpath for
+the unsymlinked / unwrapped fallback), plus the argv suffix, never a host path literal.
 
 ### Honest limit
 
