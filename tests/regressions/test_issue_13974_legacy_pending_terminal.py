@@ -38,6 +38,7 @@ from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer, LaneLifecycleKey
 from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore, supervisor_lease_path
 from mozyo_bridge.core.state.workflow_runtime_store import (
+    CALLBACK_INFLIGHT,
     CALLBACK_PENDING,
     CALLBACK_UNCERTAIN,
     WorkflowRuntimeStore,
@@ -59,10 +60,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_review_return import (
     BacklogDrainOutcome,
+    deliver_workspace_backlog,
     drain_review_return_backlog,
     owning_lane_binding,
     owning_lane_generation_reader,
     review_round_send_fence,
+    snapshot_restrict_issues,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
     BackendNeutralTargetResolver,
@@ -195,11 +198,12 @@ class LegacyPendingTerminalTest(unittest.TestCase):
             decision=DecisionPointer("redmine", ISSUE, journal), issue_id=ISSUE, now=NOW,
         )
 
-    def _legacy_row(self, *, req="10", journal="20", lane=LANE, wsid=WS, gen="1", payload=None):
+    def _legacy_row(self, *, req="10", journal="20", lane=LANE, wsid=WS, gen="1",
+                    issue=ISSUE, payload=None):
         """Enqueue a PRE-EXISTING pending review_return row shaped exactly like the a8-era #13933 row:
         a legacy payload carrying ONLY ``review_request_journal`` (no head / conclusion)."""
         key = CallbackOutboxKey(
-            source="redmine", issue=ISSUE, journal=journal, normalized_gate="review",
+            source="redmine", issue=issue, journal=journal, normalized_gate="review",
             callback_route=review_return_callback_route(lane), workspace_id=wsid,
         )
         self.outbox.enqueue(
@@ -208,6 +212,14 @@ class LegacyPendingTerminalTest(unittest.TestCase):
             target_lane=lane, target_receiver="codex", target_generation=gen, now=NOW,
         )
         return key
+
+    def _claim_to_inflight(self, wsid=WS):
+        """Claim the workspace's pending row into ``inflight`` (a processor crashed BEFORE the send edge:
+        ``send_attempted=0``, so recovery resets it to pending for a fresh claim + fence). ``claimed_at``
+        is ``NOW`` (well before real wall-clock now), so the claim lease is already expired = stale."""
+        claimed = self.outbox.claim_pending(limit=1, now=NOW, workspace_id=wsid)
+        self.assertEqual(len(claimed), 1)
+        return claimed[0].key
 
     def _return_rows(self, states, wsid=WS):
         return [
@@ -383,15 +395,94 @@ class LegacyPendingTerminalTest(unittest.TestCase):
         self.assertEqual(len(pending), 1)  # never terminal
         self.assertEqual([r.attempts for r in pending], [1])  # bounded-retry bumped attempts — the bug
 
+    # -- review R2 corrections: F1 inflight recovery ----------------------
+
+    def test_direct_drain_recovers_and_fences_stale_inflight(self) -> None:
+        # F1: a legacy row whose ONLY state is a stale ``inflight`` (a processor crashed BEFORE its send
+        # edge, claim lease long expired) is still drained — enumeration now includes inflight, and the
+        # per-issue deliver recovers it (-> pending) before claiming + fencing. Terminal, not stuck
+        # inflight forever. (A fresh, still-live inflight is left untouched by the outbox's own
+        # ``recover_inflight`` stale-lease guard, #13520 review F2 — inherited, not re-tested here.)
+        self._legacy_row()
+        self._claim_to_inflight()  # inflight, send_attempted=0, claimed at NOW (already stale)
+        self.assertEqual(len(self._return_rows([CALLBACK_INFLIGHT])), 1)
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])  # nothing pending — only the inflight
+        sender = _RecordingSender()
+        outcome = self._drain(_old_round_source(), sender)
+        self.assertEqual(sender.calls, [])
+        self.assertEqual(self._return_rows([CALLBACK_INFLIGHT]), [])  # no longer stuck inflight
+        self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
+        self.assertEqual(len(self._return_rows([CALLBACK_UNCERTAIN])), 1)  # recovered -> fenced -> terminal
+        self.assertGreaterEqual(outcome.recovered, 1)
+        self.assertEqual(outcome.fenced, 1)
+
+    # -- review R2 corrections: F2 workspace-wide --limit budget ----------
+
+    def test_limit_is_a_workspace_wide_budget_across_issues(self) -> None:
+        # F2: `--limit 1` must transition at most ONE row across the WHOLE workspace, never limit-per-issue
+        # (which could mutate/send up to 32 rows × N issues). Two hibernated legacy rows on distinct issues,
+        # limit=1 -> exactly one terminalizes, the other stays pending for a later pass.
+        self._legacy_row(issue=ISSUE, journal="20")
+        self._legacy_row(issue="13999", journal="21")
+        outcome = self._drain(_old_round_source(), _RecordingSender(), limit=1)
+        self.assertEqual(len(self._return_rows([CALLBACK_UNCERTAIN], wsid=WS)), 1)  # budget = 1 terminalized
+        self.assertEqual(len(self.outbox.read(states=[CALLBACK_PENDING])), 1)  # the other stays pending
+        self.assertEqual(outcome.fenced, 1)
+
+    # -- review R2 corrections: F3 single-issue snapshot scope ------------
+
+    def test_snapshot_restrict_issues_scopes_to_payload_issue(self) -> None:
+        # F3 unit: a MappingRedmineJournalSource snapshot is authoritative ONLY for its payload issue; a
+        # live (payload-less) provider is unrestricted.
+        self.assertEqual(snapshot_restrict_issues(_old_round_source()), frozenset({ISSUE}))
+        self.assertIsNone(snapshot_restrict_issues(_RaisingSource()))
+
+    def test_snapshot_source_never_terminalizes_a_foreign_issue(self) -> None:
+        # F3: `--redmine-json` provides a single-issue snapshot whose read_entries re-labels its journals
+        # to ANY requested id. `deliver_workspace_backlog` auto-scopes the drain to the snapshot's own
+        # issue, so a foreign issue's row is left UNTOUCHED (never terminalized on a foreign authority).
+        self._legacy_row(issue=ISSUE, journal="20")       # the snapshot's issue
+        self._legacy_row(issue="13999", journal="21")     # a foreign issue
+        outcome = deliver_workspace_backlog(
+            self.outbox, WS, source=_old_round_source(), sender=_RecordingSender(), home=self.home
+        )
+        self.assertEqual(outcome.fenced, 1)  # only the snapshot's own issue was drained
+        foreign = [r for r in self.outbox.read(states=[CALLBACK_PENDING]) if r.issue == "13999"]
+        self.assertEqual(len(foreign), 1)  # untouched
+        self.assertEqual([r.attempts for r in foreign], [0])
+
+    # -- review R2 corrections: F4 delivered roll-up ----------------------
+
+    def test_supervisor_report_counts_backlog_delivered(self) -> None:
+        # F4: a CURRENT-generation backlog row that the drain actually SENDS is a real side effect — the
+        # SupervisorReport must count it, not report delivered=0.
+        wsid = self._register_ws()
+        self._declare_owner(wsid=wsid)
+        source = _current_round_source()
+        owner = owning_lane_binding(wsid, ISSUE, RoleProviderBinding.default(), lifecycle_store=self.life)
+        candidates, _ = discover_review_returns(
+            source, ISSUE, owner, workspace_id=wsid, dispatch_anchor_journal=IR_JOURNAL
+        )
+        self.assertEqual(len(candidates), 1)
+        CallbackOutboxProcessor(self.outbox, source, workspace_id=wsid).ingest(candidates, now=NOW)
+        self.lease.acquire(wsid, "superF", now=NOW, ttl_seconds=600)
+        sender = _RecordingSender(outcome=SEND_DELIVERED)
+        report = self._backlog_supervisor(wsid=wsid, source=source, sender=sender, roster=())
+        result = report.run_once()
+        self.assertEqual(len(sender.calls), 1)  # a real backlog send happened
+        self.assertEqual(result.delivered, 1)  # F4: rolled into the report, not 0
+        self.assertEqual(result.backlog_fenced, 0)
+
     # -- CLI --deliver routing --------------------------------------------
 
     def test_cli_deliver_with_source_routes_to_the_fenced_drain(self) -> None:
-        # `workflow callbacks --deliver --poll` (a readable provider) routes to the fenced backlog drain,
-        # so the operator command CONVERGES a stale row instead of attempt-and-retrying it.
+        # `workflow callbacks --deliver --poll` (a readable provider) routes to the fenced backlog drain
+        # AND forwards the `--limit` workspace budget (F2), so the operator command CONVERGES a stale row.
         captured = {}
 
-        def fake_drain(outbox, workspace_id, *, source, sender, home=None):
+        def fake_drain(outbox, workspace_id, *, source, sender, home=None, limit=None):
             captured["workspace_id"] = workspace_id
+            captured["limit"] = limit
             return BacklogDrainOutcome(workspace_id=workspace_id, fenced=1)
 
         with mock.patch.object(rr, "deliver_workspace_backlog", fake_drain), \
@@ -399,9 +490,10 @@ class LegacyPendingTerminalTest(unittest.TestCase):
              mock.patch.object(cli, "_require_partition_workspace_id", lambda a: WS), \
              mock.patch.object(cli, "_callback_sender", lambda a: (lambda row: SEND_NOT_SENT)), \
              mock.patch.object(cli, "_outbox_from_args", lambda a: self.outbox):
-            rc = cli.cmd_workflow_callbacks(_cli_args(deliver=True, poll=True))
+            rc = cli.cmd_workflow_callbacks(_cli_args(deliver=True, poll=True, limit=1))
         self.assertEqual(rc, 0)
         self.assertEqual(captured.get("workspace_id"), WS)  # the drain was invoked with this partition
+        self.assertEqual(captured.get("limit"), 1)  # F2: --limit forwarded as the workspace budget
 
     def test_cli_deliver_without_source_stays_a_raw_drain(self) -> None:
         # Source-less `--deliver` is unchanged (a deterministic previous-generation judgement is impossible

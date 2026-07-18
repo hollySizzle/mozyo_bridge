@@ -22,6 +22,7 @@ composition root; this module owns only the review-return owning-lane authoritie
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -411,14 +412,16 @@ class BacklogDrainOutcome:
 
     ``fenced`` is the count of backlog rows a readable provider terminally fenced this drain (zero-send,
     ``mark_uncertain`` — retry 0, attempts unchanged); ``delivered`` is the count the fence let through
-    to the sender (a still-current row); ``transient_skipped`` is the count of issues left pending
-    because the provider was unreadable (retryable, never terminalized); ``lease_lost`` is True when a
-    takeover stopped the drain mid-sweep.
+    to the sender (a still-current row — a REAL side effect the report must not under-count, review
+    F4); ``recovered`` is the count of stale crashed ``inflight`` rows this drain reconciled (review F1);
+    ``transient_skipped`` is the count of issues left pending because the provider was unreadable
+    (retryable, never terminalized); ``lease_lost`` is True when a takeover stopped the drain mid-sweep.
     """
 
     workspace_id: str
     fenced: int = 0
     delivered: int = 0
+    recovered: int = 0
     transient_skipped: int = 0
     lease_lost: bool = False
 
@@ -427,6 +430,7 @@ class BacklogDrainOutcome:
             "workspace_id": self.workspace_id,
             "fenced": self.fenced,
             "delivered": self.delivered,
+            "recovered": self.recovered,
             "transient_skipped": self.transient_skipped,
             "lease_lost": self.lease_lost,
         }
@@ -442,6 +446,8 @@ def drain_review_return_backlog(
     route: str,
     lease_guard_fn: "Optional[Callable[[], bool]]" = None,
     skip_issues: "Optional[frozenset]" = None,
+    restrict_issues: "Optional[frozenset]" = None,
+    limit: "Optional[int]" = None,
     now: "Optional[str]" = None,
 ) -> BacklogDrainOutcome:
     """Terminally fence a workspace's PRE-EXISTING previous-generation / hibernated-owner review_return
@@ -456,6 +462,12 @@ def drain_review_return_backlog(
     instead of retrying forever. A legacy row whose payload carries no head / conclusion can never match
     the current review identity, so a readable provider always fences it terminally.
 
+    Crash recovery (review F1): the enumeration includes issues whose only row is a stale ``inflight``
+    (a processor that crashed mid-send, its claim lease long expired), because the per-issue
+    :meth:`CallbackOutboxProcessor.deliver` recovers stale inflight (-> pending) BEFORE it claims. A
+    FRESH inflight (a live concurrent claim) is never recovered (the outbox's ``stale_seconds`` guard),
+    so a genuinely-in-progress send is untouched.
+
     Transient-safe (correction 3, the deterministic-stale vs transient-unreadable split): each issue's
     identity + dispatch anchor is resolved behind ONE ``try`` over the live provider — a provider read
     that RAISES (``markers_from_source`` / the lifecycle owner read / the dispatch-anchor read) leaves
@@ -469,8 +481,14 @@ def drain_review_return_backlog(
     workspace's rows are never read or claimed. ``lease_guard_fn`` (the supervisor's holder renew) is
     re-checked before each issue's deliver so a takeover mid-drain stops before the next send.
     ``skip_issues`` are issues already drained this sweep (the active-issue pass), skipped here.
+
+    ``restrict_issues`` (review F3): when set, ONLY these issues are drained. A single-issue snapshot
+    provider (``--redmine-json``) re-labels its journals to whatever issue id it is asked for, so a
+    snapshot must be scoped to its own issue — every other issue stays untouched (never terminalized on a
+    foreign snapshot's authority). ``limit`` (review F2): a WORKSPACE-WIDE budget on the rows this drain
+    claims + transitions (``--deliver --limit N``); ``None`` applies the per-issue processor default.
     """
-    from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+    from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_INFLIGHT, CALLBACK_PENDING
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
         CallbackOutboxProcessor,
     )
@@ -482,25 +500,36 @@ def drain_review_return_backlog(
 
     wsid = str(workspace_id or "").strip()
     skip = frozenset(str(i or "").strip() for i in (skip_issues or ()))
-    fenced = delivered = transient = 0
-    # Foreign-partition-safe read: only THIS workspace's pending rows (an unreadable outbox drains
-    # nothing rather than raising). The processor claim below is also workspace-scoped.
+    restrict = (
+        frozenset(str(i or "").strip() for i in restrict_issues)
+        if restrict_issues is not None else None
+    )
+    fenced = delivered = recovered = transient = 0
+    remaining = limit  # None = unbounded (the per-issue processor default applies)
+    # Foreign-partition-safe read: only THIS workspace's own rows (an unreadable outbox drains nothing
+    # rather than raising). Include stale ``inflight`` (F1: a crashed-mid-send issue is enumerated so
+    # its per-issue deliver recovers it); the processor claim below is also workspace-scoped.
     try:
-        pending = [
-            r for r in outbox.read(states=[CALLBACK_PENDING])
+        own = [
+            r for r in outbox.read(states=[CALLBACK_PENDING, CALLBACK_INFLIGHT])
             if str(getattr(r, "workspace_id", "") or "").strip() == wsid
         ]
     except Exception:  # noqa: BLE001 - an unreadable outbox drains nothing (fail-open)
         return BacklogDrainOutcome(workspace_id=wsid)
     issues: list[str] = []
-    for r in pending:
+    for r in own:
         issue = str(getattr(r, "issue", "") or "").strip()
-        if issue and issue not in skip and issue not in issues:
-            issues.append(issue)
+        if not issue or issue in skip or issue in issues:
+            continue
+        if restrict is not None and issue not in restrict:
+            continue  # F3: a single-issue snapshot never touches another issue's rows
+        issues.append(issue)
     for issue in issues:
+        if remaining is not None and remaining <= 0:
+            break  # F2: the workspace-wide claim budget is exhausted
         if lease_guard_fn is not None and not lease_guard_fn():
             return BacklogDrainOutcome(
-                workspace_id=wsid, fenced=fenced, delivered=delivered,
+                workspace_id=wsid, fenced=fenced, delivered=delivered, recovered=recovered,
                 transient_skipped=transient, lease_lost=True,
             )
         try:
@@ -527,13 +556,36 @@ def drain_review_return_backlog(
             anchor, route, review_head, review_request, review_conclusion
         )
         report = CallbackOutboxProcessor(outbox, source, workspace_id=wsid).deliver(
-            sender, send_fence_fn=send_fence_fn, issue=issue, now=now
+            sender, send_fence_fn=send_fence_fn, issue=issue,
+            limit=(remaining if remaining is not None else 32), now=now,
         )
         fenced += len(report.fenced)
         delivered += len(report.delivered)
+        recovered += len(report.recovered)
+        if remaining is not None:
+            remaining -= len(report.fenced) + len(report.delivered)
     return BacklogDrainOutcome(
-        workspace_id=wsid, fenced=fenced, delivered=delivered, transient_skipped=transient
+        workspace_id=wsid, fenced=fenced, delivered=delivered, recovered=recovered,
+        transient_skipped=transient,
     )
+
+
+def snapshot_restrict_issues(source: object) -> "Optional[frozenset]":
+    """The issue set a snapshot provider is authoritative for, or ``None`` for a live provider (F3).
+
+    A :class:`...redmine_journal_source.MappingRedmineJournalSource` is a FROZEN single-issue
+    ``/issues/<id>.json`` snapshot whose ``read_entries(issue_id)`` re-labels its journals to ANY
+    requested issue id — so it must be scoped to its OWN payload issue, and the drain must leave every
+    other issue untouched. A live per-issue provider (``--poll``) returns ``None`` (drain the whole
+    partition). Fail-safe: an unreadable / issue-less snapshot yields an empty set (drain nothing) rather
+    than the whole partition, so a malformed snapshot never contaminates a foreign issue.
+    """
+    payload = getattr(source, "payload", None)
+    if not isinstance(payload, Mapping):
+        return None  # not a snapshot (a live per-issue provider) -> unrestricted
+    issue = payload.get("issue")
+    issue_id = str(issue.get("id", "")).strip() if isinstance(issue, Mapping) else ""
+    return frozenset({issue_id}) if issue_id else frozenset()
 
 
 def deliver_workspace_backlog(
@@ -543,13 +595,16 @@ def deliver_workspace_backlog(
     source: object,
     sender: "Callable[[CallbackOutboxRow], object]",
     home: object = None,
+    limit: "Optional[int]" = None,
 ) -> BacklogDrainOutcome:
     """Operator convenience: drain a workspace's review_return backlog over a readable provider (#13974 R2).
 
     Wires the home-scoped owning-lane lifecycle authority (the same read-only #13681/#13689 store the
     supervisor uses) and delegates to :func:`drain_review_return_backlog`, so ``workflow callbacks
     --deliver`` with ``--poll`` / ``--redmine-json`` converges a previous-generation / hibernated-owner
-    row to a terminal zero-send. Fenced on the default coordinator route (:data:`DEFAULT_CALLBACK_ROUTE`).
+    row to a terminal zero-send. ``limit`` is the CLI ``--limit`` workspace budget (F2). A single-issue
+    ``--redmine-json`` snapshot is auto-scoped to its own issue (:func:`snapshot_restrict_issues`, F3) so
+    it can never terminalize a foreign issue's row. Fenced on :data:`DEFAULT_CALLBACK_ROUTE`.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (  # noqa: E501
         default_lifecycle_store,
@@ -559,6 +614,7 @@ def deliver_workspace_backlog(
         outbox, workspace_id, source=source, sender=sender,
         lifecycle_store=default_lifecycle_store(home=home),
         route=DEFAULT_CALLBACK_ROUTE,
+        restrict_issues=snapshot_restrict_issues(source), limit=limit,
     )
 
 
@@ -577,5 +633,6 @@ __all__ = (
     "BacklogDrainOutcome",
     "drain_review_return_backlog",
     "deliver_workspace_backlog",
+    "snapshot_restrict_issues",
     "REVIEW_RETURN_OWNER_READ_ERROR",
 )
