@@ -9,6 +9,7 @@ lane metadata records; hints are advisory-only.
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -18,9 +19,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
     GATEWAY_SLOT_MISSING_HINT,
+    GATEWAY_SLOT_STALE_HINT,
     LANE_RECORD_MISSING_HINT,
     LANE_SLOTS_MISSING_HINT,
     WORKER_SLOT_MISSING_HINT,
+    WORKER_SLOT_STALE_HINT,
     probe_worktree_resolved,
     project_herdr_sublanes,
 )
@@ -35,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUBLANE_STATE_DETACHED,
     SUBLANE_STATE_GATEWAY_ONLY,
     SUBLANE_STATE_PAIR_SPLIT,
+    SUBLANE_STATE_WORKER_ONLY,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -45,6 +49,32 @@ def _row(ws, role, lane, locator, tab_id=None):
     row = {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
     if tab_id is not None:
         row["tab_id"] = tab_id
+    return row
+
+
+def _live_row(ws, role, lane, locator, tab_id=None):
+    """A row carrying a positive liveness signal (a detected provider agent).
+
+    A minimal ``_row`` (no ``agent`` / status field) also classifies live — the
+    legacy / minimal shape — but ``_live_row`` pins the *positive* signal so the
+    stale-slot tests contrast against an unambiguous live slot (Redmine #14063).
+    """
+    row = _row(ws, role, lane, locator, tab_id=tab_id)
+    row["agent"] = role
+    row["agent_status"] = "working"
+    return row
+
+
+def _stale_row(ws, role, lane, locator, tab_id=None):
+    """A #13518 shell-residue row: the durable name + locator survive but no agent.
+
+    ``agent`` present-but-blank is herdr's positive "this pane has no managed agent"
+    signal, exactly the reboot residue :func:`classify_named_slot` classifies
+    ``SLOT_STALE``. The locator still exists — the whole point of #14063 is that a
+    locator alone must not read the slot live.
+    """
+    row = _row(ws, role, lane, locator, tab_id=tab_id)
+    row["agent"] = ""
     return row
 
 
@@ -252,6 +282,150 @@ class ProjectHerdrSublanesTest(unittest.TestCase):
             resolve_lane_record={"wt_x": record}.get,
         )
         self.assertEqual(views[0].issue, "777")
+
+
+class StaleSlotLivenessProjectionTest(unittest.TestCase):
+    """Redmine #14063: a slot's LOCATOR existing is not proof of a live agent.
+
+    The fold must run each slot's row through the shared ``classify_named_slot``
+    (#13518) and count only a ``SLOT_LIVE`` slot toward live placement / ``active``.
+    A ``SLOT_STALE`` shell residue (durable name + locator survive, no managed agent)
+    must not populate ``gateway_pane`` / ``worker_pane`` and must surface a distinct
+    ``*_slot_stale`` hint — so a #13846 lane whose worker is reboot residue no longer
+    over-reports ``active``.
+    """
+
+    def _views(self, rows):
+        return project_herdr_sublanes(
+            rows, exclude_workspace_id="", resolve_repo_root=lambda ws: None
+        )
+
+    def test_both_slots_live_reads_active(self) -> None:
+        rows = [
+            _live_row("wsX", "codex", "issue_1_x", "w1:p1"),
+            _live_row("wsX", "claude", "issue_1_x", "w1:p2"),
+        ]
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+        self.assertEqual(view.gateway_pane, "w1:p1")
+        self.assertEqual(view.worker_pane, "w1:p2")
+        self.assertNotIn(GATEWAY_SLOT_STALE_HINT, view.stale_hints)
+        self.assertNotIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+
+    def test_live_plus_stale_worker_reads_one_sided_gateway_only(self) -> None:
+        # The measured #13846 incident: live gateway, shell-residue worker. Before
+        # #14063 this over-reported active; now the residue is excluded from placement.
+        rows = [
+            _live_row("wsX", "codex", "issue_13846_x", "w1:p1"),
+            _stale_row("wsX", "claude", "issue_13846_x", "w1:p2"),
+        ]
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_GATEWAY_ONLY)
+        self.assertEqual(view.gateway_pane, "w1:p1")
+        self.assertIsNone(view.worker_pane)
+        self.assertIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+        # A stale slot is NOT an absent slot — it keeps the distinct stale hint.
+        self.assertNotIn(WORKER_SLOT_MISSING_HINT, view.stale_hints)
+
+    def test_live_plus_stale_gateway_reads_worker_only(self) -> None:
+        rows = [
+            _stale_row("wsX", "codex", "issue_1_x", "w1:p1"),
+            _live_row("wsX", "claude", "issue_1_x", "w1:p2"),
+        ]
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_WORKER_ONLY)
+        self.assertIsNone(view.gateway_pane)
+        self.assertEqual(view.worker_pane, "w1:p2")
+        self.assertIn(GATEWAY_SLOT_STALE_HINT, view.stale_hints)
+        self.assertNotIn(GATEWAY_SLOT_MISSING_HINT, view.stale_hints)
+
+    def test_both_slots_stale_reads_detached_with_both_hints(self) -> None:
+        rows = [
+            _stale_row("wsX", "codex", "issue_1_x", "w1:p1"),
+            _stale_row("wsX", "claude", "issue_1_x", "w1:p2"),
+        ]
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_DETACHED)
+        self.assertIsNone(view.gateway_pane)
+        self.assertIsNone(view.worker_pane)
+        self.assertIn(GATEWAY_SLOT_STALE_HINT, view.stale_hints)
+        self.assertIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+
+    def test_status_unknown_no_detected_agent_is_stale(self) -> None:
+        # The other #13518 residue shape: no detected agent, present-but-unknown status.
+        rows = [
+            _live_row("wsX", "codex", "issue_1_x", "w1:p1"),
+            {
+                "name": encode_assigned_name("wsX", "claude", "issue_1_x"),
+                "pane_id": "w1:p2",
+                "agent_status": "unknown",
+            },
+        ]
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_GATEWAY_ONLY)
+        self.assertIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+
+    def test_detected_agent_overrides_unknown_status_stays_live(self) -> None:
+        # A briefly-unreadable status must not clobber a positively detected agent.
+        rows = [
+            _row("wsX", "codex", "issue_1_x", "w1:p1", tab_id="w1:t1"),
+            {
+                "name": encode_assigned_name("wsX", "claude", "issue_1_x"),
+                "pane_id": "w1:p2",
+                "tab_id": "w1:t1",
+                "agent": "claude",
+                "agent_status": "unknown",
+            },
+        ]
+        # Add a detected agent to the gateway too so neither slot reads stale.
+        rows[0]["agent"] = "codex"
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+        self.assertNotIn(GATEWAY_SLOT_STALE_HINT, view.stale_hints)
+        self.assertNotIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+
+    def test_legacy_minimal_row_without_signals_still_live(self) -> None:
+        # Backward compat (#13518 conservative direction): a row carrying NEITHER a
+        # detected-agent field NOR a status field adopts live exactly as before.
+        rows = [
+            _row("wsX", "codex", "issue_1_x", "w1:p1"),
+            _row("wsX", "claude", "issue_1_x", "w1:p2"),
+        ]
+        view = self._views(rows)[0]
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+        self.assertNotIn(GATEWAY_SLOT_STALE_HINT, view.stale_hints)
+        self.assertNotIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+
+    def test_stale_slot_does_not_regress_pair_split_for_live_pair(self) -> None:
+        # A genuinely live pair split across tabs still reads pair_split — the #14063
+        # liveness gate only removes stale slots, it never downgrades a live pair.
+        rows = [
+            _live_row("wsMain", "codex", "issue_1_x", "w19:p2", tab_id="w19:t5"),
+            _live_row("wsMain", "claude", "issue_1_x", "w19:pG", tab_id="w19:t6"),
+        ]
+        self.assertEqual(self._views(rows)[0].state, SUBLANE_STATE_PAIR_SPLIT)
+
+    def test_cli_json_payload_shows_detached_not_active_for_residue_lane(self) -> None:
+        # The `sublane list --json` read-model surface (Redmine #14063): a #13846 lane
+        # whose worker is shell residue must serialize as its true one-sided state with
+        # the stale hint, never as `active`.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            SublaneListOutcome,
+        )
+
+        rows = [
+            _live_row("wsX", "codex", "issue_13846_x", "w1:p1"),
+            _stale_row("wsX", "claude", "issue_13846_x", "w1:p2"),
+        ]
+        outcome = SublaneListOutcome(lanes=self._views(rows))
+        payload = json.loads(
+            json.dumps(outcome.as_payload(), ensure_ascii=False, sort_keys=True)
+        )
+        lane = payload["sublanes"][0]
+        self.assertNotEqual(lane["state"], SUBLANE_STATE_ACTIVE)
+        self.assertEqual(lane["state"], SUBLANE_STATE_GATEWAY_ONLY)
+        self.assertIsNone(lane["worker_pane"])
+        self.assertIn(WORKER_SLOT_STALE_HINT, lane["stale_hints"])
 
 
 class HerdrStaleHintsTest(unittest.TestCase):
@@ -762,6 +936,52 @@ class HerdrLaneViewForWorktreeTest(unittest.TestCase):
         self.assertEqual(view.worker_pane, "w2:p5")
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
         self.assertEqual(view.stale_hints, ())
+
+    def test_stale_worker_slot_excluded_and_hinted(self) -> None:
+        # Redmine #14063: the single-lane read-back must also exclude a #13518 shell
+        # residue — a live gateway + residue worker reads one-sided, not active.
+        record = LaneMetadataRecord(
+            lane_workspace_token=self._token,
+            repo_workspace_id="wsMain",
+            issue_id="13377",
+            lane_label="issue_13377_shared",
+            branch="issue_13377_shared",
+            lane_id="issue_13377_shared",
+        )
+        view = self._resolve(
+            segment="wsMain",
+            rows=[
+                _live_row("wsMain", "codex", "issue_13377_shared", "w2:p4"),
+                _stale_row("wsMain", "claude", "issue_13377_shared", "w2:p5"),
+            ],
+            records={self._token: record},
+        )
+        self.assertIsNotNone(view)
+        self.assertEqual(view.gateway_pane, "w2:p4")
+        self.assertIsNone(view.worker_pane)
+        self.assertEqual(view.state, SUBLANE_STATE_GATEWAY_ONLY)
+        self.assertIn(WORKER_SLOT_STALE_HINT, view.stale_hints)
+
+    def test_both_slots_stale_resolves_none(self) -> None:
+        # Both slots residue: no live slot at all — the helper's documented
+        # "neither managed slot is live" contract resolves None (Redmine #14063).
+        record = LaneMetadataRecord(
+            lane_workspace_token=self._token,
+            repo_workspace_id="wsMain",
+            issue_id="13377",
+            lane_label="issue_13377_shared",
+            branch="issue_13377_shared",
+            lane_id="issue_13377_shared",
+        )
+        view = self._resolve(
+            segment="wsMain",
+            rows=[
+                _stale_row("wsMain", "codex", "issue_13377_shared", "w2:p4"),
+                _stale_row("wsMain", "claude", "issue_13377_shared", "w2:p5"),
+            ],
+            records={self._token: record},
+        )
+        self.assertIsNone(view)
 
     def test_resolves_legacy_lane_via_token(self) -> None:
         record = LaneMetadataRecord(
