@@ -44,6 +44,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     V1ReplacementBindingFailure,
     launch_or_resume_v1_replacement,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
+    REASON_BLOCKED,
+    REASON_OK,
+    run_session_rollback,
+)
 from mozyo_bridge.core.state.replacement_preservation import (
     PreservationObservation,
     assess_preservation,
@@ -761,6 +766,56 @@ def _agent_list_rows(fake: FakeHerdr):
 
     out = fake.run(["herdr", "agent", "list"]).stdout
     return json.loads(out).get("agents", [])
+
+
+class _CloseResult:
+    def __init__(self, closed=(), failed=()):
+        self.closed = tuple(closed)
+        self.failed = tuple(failed)
+
+
+class _FakeBackedRollbackOps:
+    """The public startup-rollback rail's six ports, backed by a live ``FakeHerdr``.
+
+    ``close`` actually removes the pane from the fake, so the rail's post-close re-measure
+    reads a world the close produced (not one the test hand-wrote) — the same discipline the
+    #13948 rail tests use. Drives the REAL ``run_session_rollback`` FSM (inventory / runtime /
+    composer / obligation / identity checks + close), never the internals.
+    """
+
+    def __init__(self, fake, *, obligations=(), runtime=None, composers=None):
+        self.fake = fake
+        self._obligations = tuple(obligations)
+        self.runtime = runtime or {}
+        self.composers = composers or {}
+        self.close_calls: list = []
+
+    def agent_rows(self):
+        return _agent_list_rows(self.fake)
+
+    def runtime_state(self, locator):
+        return self.runtime.get(locator, "turn_ended")
+
+    def observe_composer(self, locator):
+        return self.composers.get(locator, (True, False))
+
+    def startup_blocker(self, provider, locator):
+        return ""
+
+    def open_obligations(self, workspace_id, assigned_names):
+        return self._obligations
+
+    def close(self, workspace_id, lane_id, targets):
+        self.close_calls.append(list(targets))
+        by_locator = {r["pane_id"]: r["name"] for r in _agent_list_rows(self.fake)}
+        closed = []
+        for role, locator in targets:
+            closed.append((role, locator))
+            name = by_locator.get(locator)
+            for pane, agent in list(self.fake._agents.items()):
+                if agent.name == name:
+                    del self.fake._agents[pane]
+        return _CloseResult(closed=closed, failed=())
 
 
 def _append_v1_lane(tmp: str, *, lane: str, issue: str):
@@ -1741,6 +1796,43 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             # No side binding at all for this action.
             self.assertEqual(_detect("act-never-reserved"), "")
 
+    def test_foreign_startup_unit_binding_is_not_surfaced(self):
+        # F1 (review j#82084): a side binding aligned to the current lane but whose stored
+        # startup id belongs to another unit must NOT lend that foreign startup id to a
+        # rollback aimed here. The resolver re-derives the id from the current unit + nonce
+        # (the authoritative bind-path join) and refuses the mismatch.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            request = PrepareBoundPairRequest(
+                issue=self.ISSUE, journal="80925", lane=self.LANE,
+                worktree=str(worktree), branch="main",
+            )
+            nonce = "foreign-unit-nonce"
+            managed = ("claude", "codex")
+            foreign_unit = StartupUnit("foreignws0000000000000000000000", "foreign_lane", managed)
+            foreign_sa = startup_action_id(foreign_unit, nonce)
+            HerdrIdentityReplacementBindingStore(home=home).reserve(
+                action_id="foreign-unit-act", assigned_name=gw_name, workspace_id=ws,
+                role="codex", lane_id=self.LANE, old_locator="w1:pPREV",
+                startup_nonce=nonce, startup_action_id=foreign_sa,
+            )
+            fence = StartupTransactionFence(home=home)
+            fence.reserve(foreign_unit, nonce)
+            fence.record_participant(
+                foreign_sa, Participant(role="codex", assigned_name=gw_name,
+                                        locator=gw_old, receipt="workspace=w1")
+            )
+            fence.set_phase(foreign_sa, PHASE_HEALTH_CHECK)
+            fence.set_phase(foreign_sa, PHASE_ROLLBACK_OWED)
+            ops = LiveBoundPairPreparationOps(repo_root=coord, env=env)
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                 mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                self.assertEqual(
+                    ops.rollback_owed_startup_action(request, action_id="foreign-unit-act"), ""
+                )
+
     def test_public_preflight_surfaces_rollback_command_with_startup_action_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
@@ -1861,16 +1953,51 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             self.assertNotEqual(outcome.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED)
             self.assertEqual(outcome.startup_rollback_action_id, "")
 
-    def test_full_chain_preflight_id_then_public_rollback_then_replay_binds(self):
-        # The threaded recovery chain (review j#82079 #2): seed the actual a14 partial -> the
-        # read-only detection hands out the exact startup id -> the public rollback rail's
-        # durable transition (mark_closed + completed_rolled_back, herdr_session_rollback.py
-        # lines 520/546) closes the fresh slot -> replaying the SAME prepare/replacement action
-        # relaunches and binds. No blind retry, no raw rollback, no old-slot re-close.
-        from mozyo_bridge.core.state.startup_transaction_fence import (
-            StartupTransactionFence as _Fence,
+    def _seamed_ops(self, coord, env, ws, gw_name, wk_name, gw_old, wk_old, worktree, *,
+                    worktree_clean=True, branch_matches=True, lifecycle_exact=True,
+                    revision=4, generation=1):
+        """A real ``LiveBoundPairPreparationOps`` with observe/approval seamed (external
+        inputs) but the REAL rollback detection. Returns (ops, expectation)."""
+        expectation = expectation_for(
+            issue=self.ISSUE, lane=self.LANE, revision=4, generation=1,
+            resolved_worktree=str(worktree), worktree_identity="wt_fc", branch="main",
+            slots=(
+                BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
+                          locator=gw_old, disposition=SLOT_HEALTHY),
+                BoundSlot(role="worker", provider="claude", assigned_name=wk_name,
+                          locator=wk_old, disposition=SLOT_RECOVER),
+            ),
+            discard_roles=("worker",),
+        )
+        blocked_obs = PreparationObservation(
+            workspace_id=ws, worktree_path=str(worktree), worktree_identity="wt_fc",
+            branch="main" if branch_matches else "other", revision=revision,
+            generation=generation, lifecycle_exact=lifecycle_exact, pins_empty=True,
+            pins_known=True, inventory_readable=True, worktree_readable=True,
+            worktree_clean=worktree_clean, branch_matches=branch_matches,
+            slots=(
+                BoundSlot(role="gateway", provider="codex", assigned_name=gw_name,
+                          locator=gw_old, disposition=SLOT_HEALTHY),
+                BoundSlot(role="worker", provider="claude", assigned_name=wk_name,
+                          locator=wk_old, disposition=SLOT_HEALTHY),
+            ),
+            discard_roles=(),
         )
 
+        class _SeamedPreflightOps(LiveBoundPairPreparationOps):
+            def observe(self_inner, req, *, action_id=""):
+                return blocked_obs
+
+            def approval_fields(self_inner, issue, journal):
+                return (expectation.marker_fields(),)
+
+        return _SeamedPreflightOps(repo_root=coord, env=env), expectation
+
+    def test_full_chain_public_prepare_then_public_rollback_then_public_replay(self):
+        # The threaded recovery chain THROUGH the public rails (review j#82084 F3): public
+        # prepare preflight surfaces the id -> public `run_session_rollback` preflight then
+        # execute (its own inventory/runtime/composer/obligation/identity checks + real close)
+        # -> replay the SAME action -> fresh bind. Reject cases stay zero-close.
         with tempfile.TemporaryDirectory() as tmp:
             home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
                 _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
@@ -1879,35 +2006,60 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
                 issue=self.ISSUE, journal="80925", lane=self.LANE,
                 worktree=str(worktree), branch="main",
             )
-            action = "prep-full-chain-act"
             old_locator = "w1:pPREV"
+            ops, expectation = self._seamed_ops(
+                coord, env, ws, gw_name, wk_name, gw_old, wk_old, worktree
+            )
             sa_id = self._seed_partial(
-                home, ws, gw_name, gw_old, action=action, old_locator=old_locator
+                home, ws, gw_name, gw_old, action=expectation.action_id, old_locator=old_locator
             )
 
-            ops = LiveBoundPairPreparationOps(repo_root=coord, env=env)
             with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
                  mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
-                # 1. Read-only preflight detection hands out the exact public rollback id.
+                # 1. Public prepare preflight surfaces the exact public rollback id.
+                outcome = run_bound_pair_preparation(request, execute=False, ops=ops)
                 self.assertEqual(
-                    ops.rollback_owed_startup_action(request, action_id=action), sa_id
+                    outcome.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED
                 )
+                surfaced_id = outcome.startup_rollback_action_id
+                self.assertEqual(surfaced_id, sa_id)
 
-                # 2. The public rollback rail's durable effect: the fresh slot is closed and
-                #    the startup transaction is terminal-rolled-back.
-                for pane, agent in list(fake._agents.items()):
-                    if agent.name == gw_name:
-                        del fake._agents[pane]
-                fence = _Fence(home=home)
-                fence.mark_closed(sa_id, "codex")
-                fence.set_phase(sa_id, PHASE_COMPLETED_ROLLED_BACK)
+                # 2a. Reject: a pending composer -> the public rail blocks, zero close.
+                reject_ops = _FakeBackedRollbackOps(fake, composers={gw_old: (True, True)})
+                reject = run_session_rollback(
+                    action_id=surfaced_id, ops=reject_ops, home=home, execute=True
+                )
+                self.assertEqual(reject.reason, REASON_BLOCKED)
+                self.assertFalse(reject_ops.close_calls)
+                self.assertIsNotNone(fake.agent_named(gw_name))  # still live
 
-                # 3. Replay the SAME action -> fresh relaunch + bind (never re-close gw_old).
+                # 2b. Public rollback: preflight (zero close) then execute (real close).
+                rb_ops = _FakeBackedRollbackOps(fake)
+                pre = run_session_rollback(
+                    action_id=surfaced_id, ops=rb_ops, home=home, execute=False
+                )
+                self.assertEqual(pre.state, "actionable")
+                self.assertFalse(rb_ops.close_calls)
+                done = run_session_rollback(
+                    action_id=surfaced_id, ops=rb_ops, home=home, execute=True
+                )
+                self.assertTrue(done.ok)
+                self.assertEqual(done.reason, REASON_OK)
+                self.assertIsNone(fake.agent_named(gw_name))  # the fresh slot was closed
+
+                # 3. Replay the SAME action -> fresh relaunch + bind.
                 HerdrSublaneActuatorOps(
                     repo_root=coord, lane_label=self.LANE, issue=self.ISSUE, journal="80925",
-                    env=env, runner=fake.run, replacement_action_id=action,
+                    env=env, runner=fake.run, replacement_action_id=expectation.action_id,
                     replacement_assigned_name=gw_name, replacement_old_locator=old_locator,
                 ).heal_lane_column(str(worktree), target_provider="codex")
+
+                # The same prepare action no longer offers a rollback (durable success now).
+                second = run_bound_pair_preparation(request, execute=False, ops=ops)
+                self.assertNotEqual(
+                    second.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED
+                )
+                self.assertEqual(second.startup_rollback_action_id, "")
 
             gw_live = fake.agent_named(gw_name)
             self.assertIsNotNone(gw_live)
@@ -1915,19 +2067,45 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             record = HerdrIdentityAttestationStore(home=home).read(gw_name)
             self.assertTrue(
                 replacement_action_is_bound(
-                    record, action_id=action, live_locator=gw_live["pane_id"],
+                    record, action_id=expectation.action_id, live_locator=gw_live["pane_id"],
                     expected_workspace_id=ws, expected_role="codex",
                     expected_lane=self.LANE, expected_assigned_name=gw_name,
                     expected_old_locator=old_locator, home=home,
                 )
             )
-            # The replay reached a NEW durable startup success, and the same id is no longer
-            # rollback-owed, so a second preflight no longer offers a rollback.
-            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
-                 mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
-                self.assertEqual(
-                    ops.rollback_owed_startup_action(request, action_id=action), ""
+
+    def test_dirty_or_raced_pair_never_surfaces_a_rollback_command(self):
+        # F2 negative: the public rollback surface must not bypass acceptance-3 safety. A
+        # dirty worktree / branch mismatch / lifecycle fault / revision race must yield no id
+        # and no command, even though the rollback-owed partial is genuinely present.
+        for label, kw in (
+            ("dirty", {"worktree_clean": False}),
+            ("branch", {"branch_matches": False}),
+            ("lifecycle", {"lifecycle_exact": False}),
+            ("revision_race", {"revision": 7}),
+        ):
+            with self.subTest(unsafe=label), tempfile.TemporaryDirectory() as tmp:
+                home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                    _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
                 )
+                request = PrepareBoundPairRequest(
+                    issue=self.ISSUE, journal="80925", lane=self.LANE,
+                    worktree=str(worktree), branch="main",
+                )
+                ops, expectation = self._seamed_ops(
+                    coord, env, ws, gw_name, wk_name, gw_old, wk_old, worktree, **kw
+                )
+                self._seed_partial(
+                    home, ws, gw_name, gw_old, action=expectation.action_id,
+                    old_locator="w1:pPREV",
+                )
+                with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False), \
+                     mock.patch.object(PRP, "list_herdr_agent_rows", lambda e: _agent_list_rows(fake)):
+                    outcome = run_bound_pair_preparation(request, execute=False, ops=ops)
+                self.assertNotEqual(
+                    outcome.resume_diagnostic, RESUME_STARTUP_ROLLBACK_REQUIRED, label
+                )
+                self.assertEqual(outcome.startup_rollback_action_id, "", label)
 
 
 if __name__ == "__main__":
