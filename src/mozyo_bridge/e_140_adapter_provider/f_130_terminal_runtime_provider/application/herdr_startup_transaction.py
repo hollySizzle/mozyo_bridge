@@ -90,8 +90,15 @@ class StartupTransaction:
             ),
         )
 
-    def settle(self, *, ok: bool, launched: bool) -> None:
+    def settle(self, *, owed: bool, launched: bool) -> None:
         """Close the run's books: success, or a debt only the rollback rail may clear.
+
+        ``owed`` is the run's OWN compensation debt — whether a slot THIS run freshly
+        launched failed to come up healthy (:attr:`SessionStartResult.owes_rollback`), NOT
+        the pair aggregate ``ok`` (Redmine #13933 R13, j#82038). The distinction is the fix:
+        a healthy fresh launch that merely adopted a non-green sibling owes nothing, so the
+        transaction completes instead of leaving a phantom rollback owed against a pane the
+        run never created — which is what stalled the v1 replacement bind at ``launch_owed``.
 
         ``launched`` is what makes the difference between a debt and a fact: a run that
         started nothing (all-adopt) has no side effect to compensate even when it reports
@@ -102,7 +109,7 @@ class StartupTransaction:
             return
         action_id = self._action.action_id
         self._fence.set_phase(action_id, PHASE_HEALTH_CHECK)
-        if ok:
+        if not owed:
             self._fence.set_phase(action_id, PHASE_SUCCESS_OWED)
             self._action = self._fence.set_phase(action_id, PHASE_COMPLETED_SUCCESS)
             return

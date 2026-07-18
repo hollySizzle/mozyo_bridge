@@ -22,6 +22,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     COMPENSATION_NOT_NEEDED,
+    COMPENSATION_ROLLBACK_OWED,
     DISPOSITION_ADOPTED,
     DISPOSITION_FRESH_LAUNCHED,
     DISPOSITION_PLANNED,
@@ -205,6 +206,24 @@ class SessionStartResult:
             # of a dry run is the plan itself.
             return True
         return bool(self.slots) and all(slot.healthy for slot in self.slots)
+
+    @property
+    def owes_rollback(self) -> bool:
+        """True iff a slot THIS run freshly launched did not come up healthy (a debt).
+
+        Deliberately narrower than ``not ok`` (Redmine #13933 R13, j#82038): an *adopted*
+        or read-only *surfaced* slot that is unhealthy makes the pair unusable (``ok`` is
+        False) but is NOT this run's compensation debt — the run never launched it, so there
+        is nothing for the explicit rollback rail to undo. Only a fresh launch can ever owe a
+        compensation (the ``compensation`` axis is set that way in :mod:`...startup_health`),
+        so the startup transaction settles its debt on THIS, not on the pair aggregate. The
+        old ``settle(ok=result.ok)`` over-owed: a healthy fresh target left a rollback owed
+        only because a non-green sibling it adopted dragged the aggregate false, which is the
+        v1 replacement bind that stalled at ``launch_owed`` in the installed a14 dogfood.
+        """
+        return any(
+            slot.compensation == COMPENSATION_ROLLBACK_OWED for slot in self.slots
+        )
 
     def as_payload(self) -> dict:
         return {
