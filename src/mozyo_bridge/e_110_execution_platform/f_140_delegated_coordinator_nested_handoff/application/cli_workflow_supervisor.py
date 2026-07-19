@@ -113,12 +113,16 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         f"workspaces_skipped: {report.workspaces_skipped}",
         f"events_supplied: {report.events_supplied}",
         f"delivered: {report.delivered}",
+        # Receipt truth (Redmine #13683 R2): claimed rows that did NOT wake the receiver (busy /
+        # uncertain / reconciled-away), held as retryable / uncertain receipts — surfaced alongside
+        # ``delivered`` so the projection never presents a non-wake as a delivery.
+        f"blocked: {report.blocked}",
     ]
     for w in report.workspaces:
         if w.lease_acquired:
             lines.append(
                 f"  ws {w.workspace_id}: supervised {len(w.supervised_issues)} issue(s), "
-                f"events={w.events_supplied} delivered={w.delivered}"
+                f"events={w.events_supplied} delivered={w.delivered} blocked={w.blocked}"
                 + (f" [{w.skipped_reason}]" if w.skipped_reason else "")
             )
         else:

@@ -90,7 +90,12 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import cycle
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
+        PatchEquivalentResolution,
+    )
 
 # -- terminal retire verdict vocabulary --------------------------------------
 
@@ -129,6 +134,13 @@ BOUND_RETIRE_DUPLICATE_INVENTORY = "duplicate_inventory"
 #: liveness* rather than on proof of absence.
 BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED = "expected_identity_unresolved"
 BOUND_RETIRE_HEAD_NOT_INTEGRATED = "head_not_integrated"
+#: The literal-ancestor probe reported the head un-integrated AND a supplied ``patch_equivalent``
+#: integration disposition (Redmine #14066) did not verify at action-time — the coordinator's
+#: recorded source/integration heads, commit map, stable patch-ids, or origin reachability did
+#: not match the recomputed git facts (or no disposition was readable). The pure fence's reason
+#: is carried in ``detail``. Distinct from :data:`BOUND_RETIRE_HEAD_NOT_INTEGRATED`, which is the
+#: literal-only failure with no disposition offered.
+BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED = "patch_equivalence_unverified"
 #: The caller's ``--worktree`` is not actually checked out on the caller's ``--branch`` (a
 #: mismatch, a detached HEAD, or an unresolvable checkout). The clean / integrated evidence
 #: would then describe a branch other than the worktree's real head, so the identity is
@@ -220,17 +232,25 @@ def run_hibernated_bound_retire(
     *,
     head_integrated: Optional[bool],
     worktree_branch: Optional[str],
+    patch_equivalent: Optional["PatchEquivalentResolution"] = None,
 ):
-    """Metadata-only terminalize a hibernated / released BOUND lane (Redmine #13845).
+    """Metadata-only terminalize a hibernated / released BOUND lane (Redmine #13845 / #14066).
 
     Returns a :class:`HibernatedBoundRetireVerdict`, or ``None`` when the repo is not on the
     herdr backend (this is a herdr lane-lifecycle operation, like the guarded close).
 
-    ``head_integrated`` is the command's read-only ancestry probe result (``--branch`` reachable
-    from ``--integration-branch``); ``None`` / ``False`` fails closed. ``worktree_branch`` is the
-    ``--worktree``'s ACTUAL checked-out branch (``git rev-parse --abbrev-ref HEAD``, ``None``
-    when unresolvable / detached): it must equal ``--branch``, so the clean + integrated
-    evidence describes the worktree's real head and not an unrelated branch name.
+    ``head_integrated`` is the command's read-only LITERAL-ancestry probe result (``--branch``
+    reachable from ``--integration-branch``); ``None`` / ``False`` fails the literal path.
+    ``patch_equivalent`` (Redmine #14066) is the action-time verdict for a coordinator-supplied
+    ``patch_equivalent`` integration disposition, measured by the CLI (recomputed patch-ids +
+    origin reachability vs the durable disposition): it is consulted ONLY when the literal probe
+    reported the head un-integrated, so a literal-ancestor green lane is byte-identical to
+    #13845. ``None`` means no disposition was supplied (the retire keeps its literal
+    ``head_not_integrated``); a non-admissible resolution fails closed with the fence reason.
+    ``worktree_branch`` is the ``--worktree``'s ACTUAL checked-out branch (``git rev-parse
+    --abbrev-ref HEAD``, ``None`` when unresolvable / detached): it must equal ``--branch``, so
+    the clean + integrated evidence describes the worktree's real head and not an unrelated
+    branch name.
 
     The command runs this only when its ``may_retire`` preflight already passed (issue closed,
     worktree clean, latest review admissible, callbacks drained, target identity known), so
@@ -351,18 +371,40 @@ def run_hibernated_bound_retire(
         )
     # Head-integration is an action-time invariant (Redmine #13845 origin-ancestry acceptance):
     # the retire preflight runs with merge_on_retire=False, so it does NOT check integration —
-    # this probe does. Unknown (probe could not answer) or non-ancestor fails closed.
+    # this probe does. Unknown (probe could not answer) or non-ancestor fails the LITERAL path.
     if head_integrated is not True:
-        return _blocked(
-            BOUND_RETIRE_HEAD_NOT_INTEGRATED,
-            detail=(
-                "--branch is not a verified ancestor of --integration-branch (unintegrated or "
-                "the ancestry probe could not answer); the lane's head must be integrated "
-                "before a terminal retire"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
+        # Redmine #14066: the literal ancestor probe failed. The only other admissible route is a
+        # coordinator ``patch_equivalent`` integration disposition — the review-approved commits
+        # were cherry-picked onto the integration branch (so --branch is no longer a literal
+        # ancestor), and the CLI re-read the durable disposition and recomputed the stable
+        # patch-ids / origin reachability action-time. Fail closed on absence (keep the
+        # byte-identical literal ``head_not_integrated``) or any refusal. A literal-ancestor green
+        # lane never reaches this branch, so #13845's literal path is unchanged.
+        if patch_equivalent is None:
+            return _blocked(
+                BOUND_RETIRE_HEAD_NOT_INTEGRATED,
+                detail=(
+                    "--branch is not a verified ancestor of --integration-branch (unintegrated or "
+                    "the ancestry probe could not answer); the lane's head must be integrated "
+                    "before a terminal retire"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        if not patch_equivalent.admissible:
+            return _blocked(
+                BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED,
+                detail=(
+                    "--branch is not a literal ancestor of --integration-branch and the supplied "
+                    "patch-equivalent integration disposition did not verify at action-time "
+                    f"({patch_equivalent.reason}): {patch_equivalent.detail}"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        # Admissible patch-equivalent integration: every mapped cherry-pick was proven
+        # patch-equivalent and origin-reachable against the recomputed git facts. Proceed exactly
+        # as the literal-ancestor path would.
     # The bound-worktree agreement axis (Redmine #13845), reusing the #13754 attestation rather
     # than restating it: prove the requested (issue, lane, --worktree) name ONE durable lane
     # unit against the fail-closed #13689 lifecycle store. This is what makes the surface a
@@ -748,6 +790,7 @@ __all__ = (
     "BOUND_RETIRE_DUPLICATE_INVENTORY",
     "BOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED",
     "BOUND_RETIRE_HEAD_NOT_INTEGRATED",
+    "BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED",
     "BOUND_RETIRE_WORKTREE_BRANCH_MISMATCH",
     "BOUND_RETIRE_LIFECYCLE_UNREADABLE",
     "BOUND_RETIRE_NOT_BOUND_STATE",

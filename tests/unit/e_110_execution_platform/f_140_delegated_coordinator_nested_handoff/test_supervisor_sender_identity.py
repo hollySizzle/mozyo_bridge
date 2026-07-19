@@ -27,9 +27,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
     HandoffDeliveryResult,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
-    background_transport_env,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
     AUTH_AMBIGUOUS_TARGET,
     AUTH_ANCHOR_MISMATCH,
@@ -40,7 +37,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AUTH_NO_LEASE,
     AUTH_NO_TARGET,
     AUTH_OK,
-    BACKGROUND_SERVICE_ORIGIN,
     DeliveryTarget,
     TargetResolution,
     authorize_background_delivery,
@@ -572,16 +568,10 @@ class ClaimLostDuringResolverTest(unittest.TestCase):
 
 
 class BackgroundTransportEnvTest(unittest.TestCase):
-    def test_env_scrubs_agent_identity_and_stamps_origin(self):
-        polluted = {"MOZYO_AGENT_ROLE": "codex", "MOZYO_LANE_ID": "foreign", "MOZYO_WORKSPACE_ID": "wsZ", "PATH": "/bin"}
-        with mock.patch.dict("os.environ", polluted, clear=True):
-            env = background_transport_env("wsA")
-        self.assertNotIn("MOZYO_AGENT_ROLE", env)
-        self.assertNotIn("MOZYO_LANE_ID", env)
-        self.assertEqual(env["MOZYO_WORKSPACE_ID"], "wsA")
-        self.assertEqual(env["MOZYO_DELIVERY_ORIGIN"], BACKGROUND_SERVICE_ORIGIN)
-        self.assertEqual(env["PATH"], "/bin")  # unrelated env preserved
-
+    # Redmine #14082: the background_service delivery no longer builds a scrubbed subprocess env (the
+    # dedicated in-process rail seam replaced the `handoff send` subprocess), so the former
+    # `background_transport_env` scrub helper is gone. The invariant that MATTERS remains: ambient env
+    # NEVER grants delivery authority — lease + claim do.
     def test_ambient_pollution_does_not_grant_authority(self):
         # Even with a polluted agent env, without a lease the delivery is zero-send: the authority is
         # lease + claim, NOT the env identity.

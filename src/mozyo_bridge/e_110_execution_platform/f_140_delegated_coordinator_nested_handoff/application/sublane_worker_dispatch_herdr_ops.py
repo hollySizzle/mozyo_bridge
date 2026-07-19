@@ -34,6 +34,49 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 )
 
 
+def _generation_binding_detail(
+    *,
+    current: bool,
+    worker_pin,
+    declared_slots_absent: bool,
+    declared_reason: str,
+    declared_identity_current: bool,
+    declared_attestation_current: bool,
+    live_generation_current: bool,
+    live_present: bool,
+    fresh_live_provider_consistent: bool = True,
+) -> str:
+    """A value-free token naming WHICH generation authority did not bind (Redmine #13846 R4).
+
+    The prior conflict reason ("... not bound to the current declared process generation") did
+    not say WHICH authority field failed, so a recurrence could not be diagnosed from the public
+    structured outcome (installed acceptance finding j#82030). This returns a token identifying
+    the failing sub-authority — a declared-pin identity mismatch, a live locator / runtime
+    revision divergence from the declared pin, a startup self-attestation not generation-bound,
+    a slot-less fresh row whose live provider disagrees (review F1) or whose live attestation is
+    not generation-bound, or an unresolvable declared-pin shape (carrying only the pair-resolution
+    reason token). Every token is a vocabulary label — no locator, provider VALUE, raw output, or
+    secret is exposed. Empty when the binding is current.
+    """
+    if current:
+        return ""
+    if worker_pin is not None:
+        if not declared_identity_current:
+            return "declared_worker_identity_mismatch"
+        if live_present and not live_generation_current:
+            return "live_locator_or_runtime_revision_diverged_from_declared_pin"
+        if not declared_attestation_current:
+            return "startup_self_attestation_not_generation_bound_to_declared_pin"
+        return "declared_generation_unbound"
+    if declared_slots_absent:
+        # Redmine #13846 R4 review F1: distinguish a wrong live provider from an unattested /
+        # stale slot so the operator sees the failing identity axis (a field label, not a value).
+        if not fresh_live_provider_consistent:
+            return "fresh_live_provider_mismatch"
+        return "fresh_startup_self_attestation_not_generation_bound"
+    return f"declared_slots_unresolved:{declared_reason}"
+
+
 @dataclass
 class HerdrWorkerDispatchOps:
     """Live herdr adapter composing the same-lane worker-forward primitives (#13357).
@@ -105,7 +148,10 @@ class HerdrWorkerDispatchOps:
             HerdrIdentityAttestationStore,
             evaluate_attestation,
         )
-        from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
+        from mozyo_bridge.core.state.lane_pin_role import (
+            PIN_PAIR_ABSENT,
+            read_declared_pin_pair,
+        )
         from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
         from mozyo_bridge.core.state.lane_lifecycle_model import (
             LaneLifecycleKey,
@@ -168,6 +214,15 @@ class HerdrWorkerDispatchOps:
         )
         declared_pair = read_declared_pin_pair(lifecycle) if lifecycle else None
         worker_pin = declared_pair.worker if declared_pair and declared_pair.ok else None
+        declared_reason = declared_pair.reason if declared_pair else PIN_PAIR_ABSENT
+        # A create-path lane (`sublane create --no-dispatch`) declares its owner row through
+        # `declare_active`, which writes NO declared-slot snapshot — a legitimate fresh
+        # generation-1 shape (Redmine #13846 R4, live evidence #14062 j#82028). ONLY a
+        # genuinely slot-less row (`PIN_PAIR_ABSENT`) may fall back to the startup
+        # self-attestation authority below; a positively suspicious declared shape (foreign /
+        # mixed / duplicate / incomplete / unreadable) is never proof of the current
+        # generation and stays fail-closed — "the row has pins" is not itself the proof.
+        declared_slots_absent = declared_reason == PIN_PAIR_ABSENT
         declared_identity_current = bool(
             worker_pin
             and norm(worker_pin.provider) == norm(provider)
@@ -200,14 +255,72 @@ class HerdrWorkerDispatchOps:
             except (TypeError, ValueError):
                 live_generation_current = False
             else:
-                live_generation_current = live_pin.match_key == worker_pin.match_key
+                # Redmine #13846: bind on the (role/provider/assigned_name/locator) identity,
+                # treating runtime_revision as supplementary evidence. A full match_key equality
+                # rejects a current fresh generation whose declared pin never observed a runtime
+                # version while the live `agent list` row surfaces one (locator still matches) —
+                # the false `worker_liveness_authority_conflict`. A same-name process re-launched
+                # at a newer revision (both observed, differ) or a locator drift still fails closed.
+                live_generation_current = worker_pin.binds_same_generation(live_pin)
 
-        # A live receiver must match the declaration's full process-generation pin.
-        # For an absent receiver, the stored self-attestation must match that pin; this
-        # proves which declared generation is absent without fabricating live presence.
-        generation_binding_current = (
-            (live_generation_current and declared_attestation_current)
-            if locator else declared_attestation_current
+        # The slot-less create-path generation authority (Redmine #13846 R4): with no declared
+        # worker pin, the live worker's startup self-attestation generation-bound to the LIVE
+        # locator is the herdr generation discriminant (`herdr-native-identity.md`: the
+        # discriminant is the live locator; the attestation store records no runtime version).
+        # ``joined`` (above) already proves the attestation is present, identity-matched
+        # (workspace/role/lane) and locator-current; the assigned_name is verified explicitly,
+        # exactly as the declared path does. A slot-less row whose live worker is absent,
+        # unattested, or stale (a drifted locator) has no such authority and fails closed.
+        #
+        # Redmine #13846 R4 review F1: the slot-less path must ALSO reject a wrong live provider,
+        # exactly as the declared path does through ``binds_same_generation`` (``live_pin.provider``).
+        # The live row surfaces the bound provider two ways — its ``provider`` field and its
+        # detected-agent field (``agent``, which on a live pane holds the provider id). A row whose
+        # surfaced provider / detected agent disagrees with the resolved worker provider is a
+        # foreign / mis-bound process even when the name and locator line up, so it is never this
+        # generation's worker (provider is an identity-authority field). An UNsurfaced field falls
+        # back to the name-encoded provider — the declared path's ``... or norm(provider)`` shape —
+        # never fabricating a match.
+        want_provider = norm(provider)
+        live_row_provider = norm(row.get("provider")) if row is not None else ""
+        live_detected_agent = norm(row.get("agent")) if row is not None else ""
+        fresh_live_provider_consistent = (
+            (not live_row_provider or live_row_provider == want_provider)
+            and (not live_detected_agent or live_detected_agent == want_provider)
+        )
+        fresh_attested_generation_current = bool(
+            declared_slots_absent
+            and row is not None
+            and locator
+            and joined.ok
+            and norm(getattr(attestation, "assigned_name", "")) == norm(assigned_name)
+            and fresh_live_provider_consistent
+        )
+
+        # The action-time process-generation binding, from whichever authority the
+        # declaration surface actually provided. A live receiver must match the declared pin's
+        # process generation; for an absent receiver on the declared path the stored
+        # self-attestation proves which declared generation is absent without fabricating live
+        # presence. A slot-less create binds on the live startup self-attestation. Every other
+        # shape (a suspicious declared set, or a slot-less row without a live attested worker)
+        # is not the current generation and fails closed.
+        if worker_pin is not None:
+            generation_binding_current = (
+                (live_generation_current and declared_attestation_current)
+                if locator else declared_attestation_current
+            )
+        else:
+            generation_binding_current = fresh_attested_generation_current
+        generation_binding_detail = _generation_binding_detail(
+            current=generation_binding_current,
+            worker_pin=worker_pin,
+            declared_slots_absent=declared_slots_absent,
+            declared_reason=declared_reason,
+            declared_identity_current=declared_identity_current,
+            declared_attestation_current=declared_attestation_current,
+            live_generation_current=live_generation_current,
+            live_present=bool(locator),
+            fresh_live_provider_consistent=fresh_live_provider_consistent,
         )
         lifecycle_action = norm(
             getattr(lifecycle, "replacement_action_id", "") if lifecycle else ""
@@ -252,6 +365,7 @@ class HerdrWorkerDispatchOps:
             locator_present=bool(locator),
             receiver_state=receiver_state,
             generation_binding_current=generation_binding_current,
+            generation_binding_detail=generation_binding_detail,
             terminal_absence_authoritative=terminal_absence,
             duplicate_or_uncertain_delivery=duplicate,
             workspace_id=scope or None,

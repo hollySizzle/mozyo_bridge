@@ -831,11 +831,28 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
                 getattr(args, "integration_branch", None) or "",
             )
             worktree_branch = ops.branch_for(worktree) if worktree else None
+            # Redmine #14066 review j#82298 F2: the literal-ancestor path must stay byte-identical
+            # to #13845 — NO file IO / git probe / Redmine read / exception surface added. So the
+            # patch-equivalent resolver is only imported AND called when the literal ancestry
+            # probe did NOT pass. When --branch is a literal ancestor (head_integrated is True) the
+            # resolver is never constructed and the retire runs exactly as before. On the
+            # non-literal path the resolver fresh-reads the exact Redmine integration journal
+            # (credential-gated authority) and recomputes patch-ids / origin reachability; ``None``
+            # means no integration journal was supplied (the retire keeps its literal
+            # ``head_not_integrated``), and every read / probe / fence failure is fail-closed.
+            patch_equivalent = None
+            if head_integrated is not True:
+                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
+                    resolve_patch_equivalent_integration,
+                )
+
+                patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
             bound_retire_result = run_hibernated_bound_retire(
                 args,
                 repo_root,
                 head_integrated=head_integrated,
                 worktree_branch=worktree_branch,
+                patch_equivalent=patch_equivalent,
             )
     elif getattr(args, "execute", False) and outcome.preflight.may_retire:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501

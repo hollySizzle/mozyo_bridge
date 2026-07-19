@@ -323,8 +323,9 @@ class ConfigSchemaVersionTest(unittest.TestCase):
 
         config = load_agent_provider_config()
         self.assertIn(config.version, SUPPORTED_SCHEMA_VERSIONS)
-        # The packaged artifact actually USES the v2 startup_blockers, so it must declare v2.
-        self.assertEqual(config.version, "2")
+        # The packaged artifact actually USES the v3 ghost_composer_signals (#14065 Phase 2)
+        # in addition to the v2 startup_blockers, so it must declare v3.
+        self.assertEqual(config.version, "3")
 
 
 class StartupBlockerSchemaTest(unittest.TestCase):

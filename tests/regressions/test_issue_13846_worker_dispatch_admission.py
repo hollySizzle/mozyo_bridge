@@ -11,6 +11,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATE_BLOCKED,
     DISPATCH_WORKER_DISPATCHED,
 )
+from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneLaneView,
 )
@@ -160,6 +161,89 @@ class AdmissionDecisionTests(unittest.TestCase):
                     _decision(**base, **changes).decision,
                     ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
                 )
+
+
+class GenerationBindingRuntimeRevisionTests(unittest.TestCase):
+    """#13846 root cause: a declared worker pin never observes a herdr runtime revision
+    (``sublane_adopt_declaration`` / ``sublane_hibernated_pin_repair`` leave it empty by
+    design — the generation discriminant is the live locator), while the live ``agent list``
+    row MAY surface one. A full ``match_key`` equality treated that asymmetry as a mismatch
+    and raised a false ``worker_liveness_authority_conflict`` on a perfectly current fresh
+    generation. ``binds_same_generation`` binds on the four identity fields and treats an
+    unobserved revision on either side as non-discriminant, while keeping a locator drift and
+    a both-observed revision mismatch fail-closed."""
+
+    def _declared(self, *, locator="w28:p75", runtime_revision=""):
+        return ProcessGenerationPin(
+            role="worker",
+            provider="claude",
+            assigned_name="mzb1_ws_claude_issueZ5F13846Z5Flane",
+            locator=locator,
+            runtime_revision=runtime_revision,
+        )
+
+    def test_declared_empty_live_nonempty_revision_is_same_generation(self):
+        # The exact #13846 false-conflict shape: declared empty vs live nonempty.
+        declared = self._declared(runtime_revision="")
+        live = self._declared(runtime_revision="cli-2.1.0")
+        self.assertTrue(declared.binds_same_generation(live))
+        # And the symmetric asymmetry (declared observed, live did not) also binds.
+        self.assertTrue(live.binds_same_generation(declared))
+
+    def test_both_unobserved_revisions_bind(self):
+        self.assertTrue(
+            self._declared(runtime_revision="").binds_same_generation(
+                self._declared(runtime_revision="")
+            )
+        )
+
+    def test_locator_drift_never_binds_even_with_matching_revision(self):
+        declared = self._declared(locator="w28:p75", runtime_revision="cli-2.1.0")
+        recycled = self._declared(locator="w28:p-new", runtime_revision="cli-2.1.0")
+        self.assertFalse(declared.binds_same_generation(recycled))
+
+    def test_both_observed_diverging_revisions_fail_closed(self):
+        # A same-name process re-launched at a newer runtime revision (both sides observed
+        # a version and the two differ) is a different pin — never bound.
+        declared = self._declared(runtime_revision="cli-1.0.0")
+        relaunched = self._declared(runtime_revision="cli-2.1.0")
+        self.assertFalse(declared.binds_same_generation(relaunched))
+
+    def test_both_observed_matching_revision_binds(self):
+        self.assertTrue(
+            self._declared(runtime_revision="cli-2.1.0").binds_same_generation(
+                self._declared(runtime_revision="cli-2.1.0")
+            )
+        )
+
+
+class GenerationBindingDetailReasonTests(unittest.TestCase):
+    """#13846 R4: a generation-binding conflict names WHICH authority field failed in the
+    public structured reason, so an installed recurrence (the j#82030 finding — the reason only
+    said "not bound to the current declared process generation") is diagnosable without exposing
+    a private locator / raw output / secret."""
+
+    def test_detail_token_surfaces_in_generation_conflict_reason(self):
+        result = _decision(
+            generation_binding_current=False,
+            generation_binding_detail="fresh_startup_self_attestation_not_generation_bound",
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertIn(
+            "fresh_startup_self_attestation_not_generation_bound", result.reason
+        )
+
+    def test_non_generation_conflict_never_borrows_the_generation_detail(self):
+        # A conflict raised by an EARLIER authority check (lifecycle) must not be annotated with
+        # the generation-binding detail — the suffix is scoped to the generation check.
+        result = _decision(lifecycle_current=False, generation_binding_detail="unused")
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertIn("lane lifecycle generation", result.reason)
+        self.assertNotIn("unused", result.reason)
 
 
 class ActionBoundaryTests(unittest.TestCase):

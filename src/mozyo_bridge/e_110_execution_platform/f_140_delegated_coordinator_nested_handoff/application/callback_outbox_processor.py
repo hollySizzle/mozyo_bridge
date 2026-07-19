@@ -53,6 +53,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_NOT_SENT,
     classify_callback_gate,
     normalize_send_result,
+    normalize_zero_send_reason,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     SOURCE_REDMINE,
@@ -66,6 +67,28 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: key needs a non-empty ``normalized_gate``. This sentinel keeps the row addressable /
 #: idempotent while marking it plainly as an unclassified dead-letter (never a real gate).
 UNCLASSIFIED_GATE = "unclassified"
+
+
+def _zero_send_detail(persist_reason: str) -> str:
+    """A secret-safe durable detail preserving WHY a claimed row zero-sent (Redmine #14082).
+
+    ``persist_reason`` is the sender's machine-readable outcome reason — an AUTHORIZATION token
+    (``no_target_resolved`` / ``generation_mismatch`` / ``no_workspace_lease`` …), a TRANSPORT
+    precondition token (``precondition_not_idle`` / ``target_unavailable`` …), or a round-fence
+    token. Threaded into the terminal ``mark_retry_or_dead`` / ``mark_uncertain`` detail so the first
+    known-not-sent reason SURVIVES to the dead-letter row instead of being flattened to the store's
+    default "retries exhausted; dead-lettered" — letting an operator tell an authorization zero-send
+    from a transport-precondition one at action time.
+
+    The reason is NORMALIZED through the closed :func:`...callback_delivery.normalize_zero_send_reason`
+    allowlist before it reaches the durable row (review j#82566 F2): a value that is not a known token
+    is replaced by a fixed ``unrecognized_zero_send_reason`` and the raw value is DROPPED — so the
+    durable diagnostic is secret-safe *by construction*, never carrying a path / credential / prose
+    that leaked into a reason string. A blank reason returns ``""`` so the store keeps its own default
+    detail (byte-identical to the pre-#14082 behaviour for bare-token senders that carry no reason).
+    """
+    reason = normalize_zero_send_reason(persist_reason)
+    return f"zero-send: {reason}" if reason else ""
 
 
 @dataclass(frozen=True)
@@ -476,11 +499,18 @@ class CallbackOutboxProcessor:
             if outcome == SEND_DELIVERED:
                 applied = self._outbox.mark_delivered(row.key, claim_token=token, now=now)
             elif outcome == SEND_NOT_SENT:
+                # Redmine #14082: persist the first known-not-sent reason so the retry/dead-letter row
+                # keeps WHY it zero-sent (authorization vs transport precondition), not just "retries
+                # exhausted". A blank reason falls back to the store's default detail (unchanged).
                 applied = self._outbox.mark_retry_or_dead(
-                    row.key, claim_token=token, now=now
+                    row.key, claim_token=token, now=now,
+                    detail=_zero_send_detail(send_result.persist_reason),
                 ) != CALLBACK_ABSENT
             else:
-                applied = self._outbox.mark_uncertain(row.key, claim_token=token, now=now)
+                applied = self._outbox.mark_uncertain(
+                    row.key, claim_token=token, now=now,
+                    detail=_zero_send_detail(send_result.persist_reason),
+                )
             # When the terminal mark applied, the persisted state is exactly what this delivery
             # intended; when it did not, read the state the reconciling processor actually left.
             resulting = self._outbox.state_of(row.key)

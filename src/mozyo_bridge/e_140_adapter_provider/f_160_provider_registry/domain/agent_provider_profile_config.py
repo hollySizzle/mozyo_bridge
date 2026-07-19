@@ -189,6 +189,7 @@ _PROFILE_ENTRY_KEYS: frozenset[str] = frozenset(
         "capabilities",
         "managed_flags",
         "startup_blockers",
+        "ghost_composer_signals",
     }
 )
 
@@ -205,6 +206,14 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     fold_startup_text,
 )
 
+# The ghost-composer render-signal schema (Redmine #14065 Phase 2) lives in its own
+# leaf module (module-health), imported back here and wired into the profile record.
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_ghost_composer_signal import (  # noqa: E501
+    ADMITTED_GHOST_COMPOSER_SIGNALS,
+    MAX_GHOST_COMPOSER_SIGNALS,
+    normalize_ghost_composer_signals,
+)
+
 
 _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
 
@@ -217,7 +226,7 @@ _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
 #: (the design gate j#77947 Q1 required version to be fail-closed validated, not merely
 #: non-empty). Adding a version here is the deliberate, reviewable act of teaching the
 #: loader a new shape.
-SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2"})
+SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2", "3"})
 
 #: Schema versions whose shape predates ``startup_blockers`` (Redmine #13760 review
 #: j#78529 finding 2). The field is the v2 addition, so a ``version: "1"`` artifact that
@@ -229,12 +238,20 @@ _VERSIONS_WITHOUT_STARTUP_BLOCKERS: frozenset[str] = frozenset({"1"})
 #: The version a profile is nominally on when it may carry startup_blockers (for messages).
 _STARTUP_BLOCKERS_MIN_VERSION = "2"
 
+#: Schema versions whose shape predates ``ghost_composer_signals`` (Redmine #14065
+#: Phase 2). The field is the v3 addition, so a ``version: "1"`` / ``"2"`` artifact that
+#: declares it is a shape/version drift and fails closed — the same lock-step contract
+#: the startup_blockers gate enforces. Explicit set (not ``<``) so ordering can't drift.
+_VERSIONS_WITHOUT_GHOST_SIGNALS: frozenset[str] = frozenset({"1", "2"})
+#: The version a profile is nominally on when it may carry ghost_composer_signals.
+_GHOST_SIGNALS_MIN_VERSION = "3"
+
 #: The version threaded to :meth:`AgentProviderProfile.from_record` when no config wrapper
 #: supplies one (a bare, context-free profile parse in a test). The newest supported
 #: version — a context-free parse is not artificially restricted; the artifact-level
 #: version gate is enforced by :meth:`AgentProviderProfileConfig.from_record`, which always
 #: passes the real declared version.
-_DEFAULT_PARSE_VERSION = "2"
+_DEFAULT_PARSE_VERSION = "3"
 
 #: Wheel-packaged resource (a sibling of the registry module) shipping the built-in
 #: profiles. Read via ``importlib.resources`` in :mod:`.agent_provider_profile` — a
@@ -395,6 +412,12 @@ class AgentProviderProfile:
     #: with none declared — which admits every send, exactly as before this field
     #: existed, so adding the field changes no provider that does not use it.
     startup_blockers: tuple[StartupBlocker, ...] = ()
+    #: Redmine #14065 Phase 2: the render ``style_provenance`` value(s) that identify
+    #: this provider's ghost idle composer (live-admitted set: ``("dim",)``). Empty for
+    #: a provider that declares none — which admits NO ghost signal, so a dim render is
+    #: preserved, never emptied. That absence is the fail-closed default (a provider not
+    #: using this field is unchanged).
+    ghost_composer_signals: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_id, str) or not self.provider_id.strip():
@@ -461,6 +484,31 @@ class AgentProviderProfile:
                 f"blocker id(s) {sorted(blocker_ids)}; a blocker id is the fixed token a "
                 f"zero-send outcome reports, so it must identify exactly one screen"
             )
+        # Redmine #14065 Phase 2: the FULL ghost-signal invariant lives here, in the
+        # single validator every construction path runs (the startup_blocker j#78481
+        # lesson) — so a directly-built profile cannot hold a signal outside the
+        # live-admitted closed set, whoever builds it.
+        seen_signals: set[str] = set()
+        for signal in self.ghost_composer_signals:
+            if signal not in ADMITTED_GHOST_COMPOSER_SIGNALS:
+                raise AgentProviderProfileError(
+                    f"agent provider profile {self.provider_id!r} ghost_composer_signals "
+                    f"entry {signal!r} is not an admitted ghost signal; allowed: "
+                    f"{sorted(ADMITTED_GHOST_COMPOSER_SIGNALS)} (only a live-admitted "
+                    f"render style may empty a composer; normal/mixed/unknown preserve)"
+                )
+            if signal in seen_signals:
+                raise AgentProviderProfileError(
+                    f"agent provider profile {self.provider_id!r} declares duplicate "
+                    f"ghost_composer_signals entry {signal!r}"
+                )
+            seen_signals.add(signal)
+        if len(self.ghost_composer_signals) > MAX_GHOST_COMPOSER_SIGNALS:
+            raise AgentProviderProfileError(
+                f"agent provider profile {self.provider_id!r} declares "
+                f"{len(self.ghost_composer_signals)} ghost_composer_signals; the bound is "
+                f"{MAX_GHOST_COMPOSER_SIGNALS}"
+            )
         concepts = {concept for concept, _ in self.managed_flags}
         has_permission_flag = ManagedFlagConcept.PERMISSION_MODE in concepts
         has_permission_cap = AgentCapability.MANAGED_PERMISSION_MODE in self.capabilities
@@ -500,6 +548,18 @@ class AgentProviderProfile:
     def has_capability(self, capability: AgentCapability) -> bool:
         """Whether the provider declares ``capability`` (mechanical, not authority)."""
         return capability in self.capabilities
+
+    def admits_ghost_signal(self, style_provenance: object) -> bool:
+        """Whether ``style_provenance`` is a declared ghost signal for this provider.
+
+        Redmine #14065 Phase 2 (fail-closed): ``False`` for a non-string, a value this
+        provider did not declare, or any provider that declares no signals — so a dim
+        render only ever admits an empty for a provider that explicitly declares it.
+        """
+        return (
+            isinstance(style_provenance, str)
+            and style_provenance in self.ghost_composer_signals
+        )
 
     @classmethod
     def from_record(
@@ -545,6 +605,17 @@ class AgentProviderProfile:
                 f"the fields the loader honors must not drift — bump the artifact to "
                 f"version {_STARTUP_BLOCKERS_MIN_VERSION!r} to use startup_blockers "
                 f"(Redmine #13760 j#78529)."
+            )
+        if (
+            "ghost_composer_signals" in record
+            and schema_version in _VERSIONS_WITHOUT_GHOST_SIGNALS
+        ):
+            raise AgentProviderProfileError(
+                f"agent provider profile {provider_id!r} declares 'ghost_composer_signals' "
+                f"but the config schema version is {schema_version!r}; that field was added "
+                f"in version {_GHOST_SIGNALS_MIN_VERSION!r}. Bump the artifact to version "
+                f"{_GHOST_SIGNALS_MIN_VERSION!r} to use ghost_composer_signals "
+                f"(Redmine #14065 Phase 2)."
             )
         missing = {"protocol", "executable"} - set(record)
         if missing:
@@ -623,6 +694,10 @@ class AgentProviderProfile:
             for entry in raw_blockers
         )
 
+        ghost_composer_signals = normalize_ghost_composer_signals(
+            record.get("ghost_composer_signals", []) or [], provider_id=provider_id
+        )
+
         return cls(
             provider_id=provider_id,
             protocol=protocol,
@@ -642,6 +717,7 @@ class AgentProviderProfile:
             capabilities=frozenset(capabilities),
             managed_flags=tuple(sorted(managed, key=lambda pair: pair[0].value)),
             startup_blockers=startup_blockers,
+            ghost_composer_signals=ghost_composer_signals,
         )
 
     def match_startup_blocker(self, content: object) -> Optional[StartupBlocker]:

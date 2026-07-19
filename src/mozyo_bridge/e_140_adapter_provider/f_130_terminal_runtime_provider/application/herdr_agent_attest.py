@@ -41,6 +41,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     classify_identity_env,
     record_identity_attestation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
+    MOZYO_PROVIDER_ARGV0_ENV,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
@@ -145,6 +148,27 @@ def _live_lister(env: Mapping[str, str]) -> Lister:
     :data:`_ATTEST_LIST_RETRIES` times so a herdr-registration lag right after start
     still resolves the agent's own row. Returns ``None`` on unresolved binary /
     repeated failure (the caller records an empty locator — fail-closed).
+
+    **Terminal-hygiene invariant (defensive; NOT the #14017 root cause).** This lister
+    runs *inside the herdr-spawned pane*, as the wrapper process about to exec the
+    interactive provider into that same pane. The ``agent list`` child is kept off the
+    pane's controlling terminal on **every** standard fd: ``capture_output`` already
+    pipes stdout/stderr, and ``stdin=subprocess.DEVNULL`` + ``start_new_session=True``
+    give the child no fd pointing at the pane PTY and no controlling-terminal
+    association — a query command needs neither. This keeps the pre-exec self-lookup
+    from perturbing the terminal the provider inherits and is byte-for-byte parity with
+    the unwrapped (pre-#13637) launch; it is retained as sound hygiene, provider-neutral.
+
+    History (Redmine #14017): R1 (commit 86fc24bc) hypothesised that this lister's
+    inherited controlling terminal WAS the provider-asymmetric ``shell_residue`` exit
+    and shipped this detach as the fix. Installed dogfood **refuted** that: Claude still
+    exited with the wrapper's lister fully detached (j#81858), and even with the whole
+    ``agent-attest`` wrapper removed (j#81867). The isolated root trigger is the
+    provider **argv[0]**: under Herdr, Claude's interactive TUI exits immediately when
+    invoked with its symlink-collapsed realpath as argv[0], and stays resident when
+    invoked with its trusted absolute alias (j#81879). The real correction is the
+    exec-target / argv[0] decoupling in :func:`cmd_herdr_agent_attest`; this detach is
+    kept only as harmless terminal hygiene, not as the fix.
     """
 
     def _list() -> Optional[Sequence[Mapping[str, object]]]:
@@ -161,6 +185,8 @@ def _live_lister(env: Mapping[str, str]) -> Lister:
                     text=True,
                     timeout=COMMAND_TIMEOUT_SECONDS,
                     env=dict(env),
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
             except (OSError, subprocess.SubprocessError):
                 continue
@@ -175,16 +201,77 @@ def _live_lister(env: Mapping[str, str]) -> Lister:
     return _list
 
 
+def _argv0_alias_binds_to_exec_target(argv0_alias: str, exec_target: str) -> bool:
+    """True iff ``argv0_alias`` is a trusted absolute alias of ``exec_target`` (#14017).
+
+    The wrapper is a **separate trust boundary** from the resolver: it re-establishes,
+    fail-closed at exec time, the exact binding the resolver made at resolve time
+    (``exec_target = realpath(alias)``, see ``agent_provider_executable`` R3-F1). Both
+    halves must hold:
+
+    - the ``exec_target`` (``provider_argv[0]``, the file actually ``exec``'d) is an
+      absolute, existing regular file already pinned to its **own realpath** — the
+      resolver's verified realpath, never a symlink an attacker could swing; and
+    - the ``argv0_alias``, resolved at THIS moment, names that **same file**.
+
+    An unrelated absolute, nonexistent, relative, or different-target-symlink alias
+    fails every one of those checks and returns ``False``; the caller then fails typed
+    and value-free instead of letting an unverified value reach the provider's argv[0]
+    (the one input that decides whether Claude stays resident or exits). Value-free by
+    construction: it returns only a boolean and neither returns nor raises any path.
+    """
+    if not (argv0_alias and os.path.isabs(argv0_alias)):
+        return False
+    if not (exec_target and os.path.isabs(exec_target)):
+        return False
+    # The exec target must be a real file already at its own realpath — the trust anchor
+    # the alias is checked against. A missing target or one that is itself a symlink is
+    # not a canonical resolver output and cannot anchor the binding.
+    if not os.path.isfile(exec_target) or os.path.realpath(exec_target) != exec_target:
+        return False
+    # The alias must be the SAME file as the exec target when resolved now. A nonexistent
+    # / unrelated / different-target alias never satisfies ``samefile`` (a missing path
+    # raises ``OSError`` -> not bound), so an unverified value can never become argv[0].
+    try:
+        return os.path.samefile(argv0_alias, exec_target)
+    except OSError:
+        return False
+
+
 def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
     """CLI entry: self-attest this agent's boot identity env, then exec the provider.
 
     Reached only as the wrapped managed launch argv
     (``... herdr agent-attest --assigned-name <NAME> --workspace-id <WS>
     --role <PROVIDER> --lane <LANE> -- <provider argv...>``). Writes the
-    self-attestation (best-effort) and then ``os.execvp``s the provider argv,
-    replacing this process — so the provider is the real herdr pane occupant and
-    inherits exactly the env this wrapper observed. A missing provider argv is the
-    only hard error (nothing to exec); every attestation step is non-blocking.
+    self-attestation (best-effort) and then ``exec``s the provider argv, replacing this
+    process — so the provider is the real herdr pane occupant and inherits exactly the
+    env this wrapper observed. A missing provider argv is the only hard error (nothing
+    to exec); every attestation step is non-blocking.
+
+    **Exec-target / argv[0] decoupling (Redmine #14017).** ``provider_argv[0]`` is the
+    provider's verified absolute exec-target realpath — the file that is run. When the
+    launch injected :data:`MOZYO_PROVIDER_ARGV0_ENV` (a provider whose trusted alias
+    differs from that realpath, e.g. Claude's stable ``~/.local/bin/claude`` symlink),
+    the provider is ``os.execv``'d at that realpath but handed ``argv[0]=<alias>`` — so
+    the exec target stays the trust-pinned realpath while Claude's interactive TUI sees
+    the stable alias it needs to stay resident instead of exiting into ``shell_residue``.
+    The alias is argv[0] DATA only and is never itself executed.
+
+    **Wrapper-side fail-closed re-verification (R3-F1).** This wrapper is a *separate
+    trust boundary* from the resolver, so it does not blindly trust the injected value:
+    before the alias can reach argv[0] it re-establishes the resolver's binding here, at
+    exec time, via :func:`_argv0_alias_binds_to_exec_target` — the exec target must be an
+    absolute realpath of its own and the absolute alias must name that same file. A
+    set-but-unbound alias (unrelated absolute, nonexistent, relative, or a symlink to a
+    different target) is a spoofed / drifted input; it never becomes argv[0] and fails
+    typed and value-free (``die``), never a silent successful launch that would re-trigger
+    the provider exit and mislead startup health. The var is dropped from the env the
+    provider inherits (before validation, so the value never lingers) so, apart from that
+    one argv[0] token, the provider's launch is byte-invariant. Without the var (a normal
+    / unsymlinked / Codex / older-wrapper launch) the provider is ``os.execvp``'d at
+    ``provider_argv[0]`` unchanged — the honest fallback that keeps the realpath on both
+    the exec target and argv[0] and never weakens the trust boundary by execing an alias.
     """
     provider_argv = list(getattr(args, "provider_argv", None) or [])
     # argparse REMAINDER keeps a leading ``--`` separator; drop it so argv[0] is the
@@ -210,7 +297,39 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         replacement_action_id=_norm(getattr(args, "replacement_action_id", "")),
         lister=_live_lister(env),
     )
-    os.execvp(provider_argv[0], provider_argv)
+    # Redmine #14017: the exec target is always provider_argv[0] (the verified realpath);
+    # the trusted argv[0] alias, if any, arrives out-of-band via MOZYO_PROVIDER_ARGV0. It
+    # is a wrapper instruction, not identity the provider should carry, so drop it from the
+    # inherited env (keeps the provider's env byte-invariant; only argv[0] differs). It is
+    # popped BEFORE it is validated so the value never lingers in the inherited env, even
+    # on the fail-closed path below.
+    exec_target = provider_argv[0]
+    argv0_alias = _norm(os.environ.pop(MOZYO_PROVIDER_ARGV0_ENV, ""))
+    if argv0_alias:
+        # A wrapped launch declared a trusted argv[0] alias. Re-verify the alias->exec-target
+        # binding fail-closed at THIS boundary (R3-F1): a set-but-unbound value (unrelated
+        # absolute, nonexistent, relative, or a symlink to a different target) is a spoofed /
+        # drifted input. It must never reach argv[0], and it must fail typed and value-free —
+        # NOT silently launch with the realpath argv[0], which would both re-trigger the
+        # provider exit this fix closes and hide the violation from startup health.
+        if not _argv0_alias_binds_to_exec_target(argv0_alias, exec_target):
+            from mozyo_bridge.shared.errors import die
+
+            die(
+                "MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to the "
+                "provider exec target (an absolute exec-target realpath named by an "
+                "absolute same-file alias); refusing to launch with an unverified argv[0]"
+            )
+            raise AssertionError("unreachable")
+        # Exec the verified realpath, but present the trusted alias as argv[0]. os.execv
+        # takes an explicit path, so PATH is never consulted and the alias is never run.
+        os.execv(exec_target, [argv0_alias, *provider_argv[1:]])
+        raise AssertionError("unreachable")  # pragma: no cover - execv replaces process
+    # No alias var — an unwrapped / unsymlinked / Codex launch, or an older wrapper that
+    # ignores the key (version skew). Keep the realpath on both the exec target and argv[0]:
+    # the honest, byte-invariant fallback that never weakens the trust boundary by execing
+    # an alias.
+    os.execvp(exec_target, provider_argv)
     raise AssertionError("unreachable")  # pragma: no cover - execvp replaces process
 
 

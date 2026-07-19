@@ -29,7 +29,12 @@ from typing import Callable, Optional
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
     DEFAULT_CALLBACK_ROUTE,
+    discover_lane_gateway_sends,
     discover_review_returns,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
+    is_lane_gateway_route,
+    make_lane_gateway_send_edge_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     OWNER_RESOLVED,
@@ -144,7 +149,12 @@ def owning_lane_generation_reader(
     wsid = str(workspace_id or "").strip()
 
     def _read(row: CallbackOutboxRow) -> str:
-        if not is_review_return_route(str(getattr(row, "callback_route", "") or "")):
+        route = str(getattr(row, "callback_route", "") or "")
+        # #13683 R2: the lane_gateway route (worker gate -> same-lane gateway) needs the SAME
+        # independent live-generation authority as review_return — read the owning lane's current
+        # revision so a supersession (owner switched) or a same-lane revision bump zero-sends the stale
+        # row at authorize_background_delivery. Any other route stays blank (Phase A fail-closed).
+        if not (is_review_return_route(route) or is_lane_gateway_route(route)):
             return ""
         issue = str(getattr(row, "issue", "") or "").strip()
         target_lane = str(getattr(row, "target_lane", "") or "").strip()
@@ -196,6 +206,10 @@ def review_round_send_fence(
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
         markers_from_source,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
+        gate_is_shadowed,
+        latest_review_journal,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
         decode_review_return_conclusion,
         decode_review_return_payload,
@@ -204,8 +218,32 @@ def review_round_send_fence(
     )
 
     def _fence(row: CallbackOutboxRow) -> str:
-        if not is_review_return_route(str(getattr(row, "callback_route", "") or "")):
-            return REVIEW_ROUND_CURRENT  # a non-return row is not fenced
+        route = str(getattr(row, "callback_route", "") or "")
+        if is_lane_gateway_route(route):
+            # #13683 R2 (review j#82382 F1): a worker gate that went pending BEFORE its review must
+            # terminally zero-send once the review lands — the generation-only send-edge fence let a
+            # reviewed row re-wake the gateway on a later backlog drain. Re-read the live markers at the
+            # send edge and shadow-check: a gate older than the latest review-side journal is terminal
+            # (the gateway already reviewed), a fresh / rework gate (newer than the last review) proceeds.
+            issue = str(getattr(row, "issue", "") or "").strip()
+            gate_journal = str(getattr(row, "journal", "") or "").strip()
+            if not issue or not gate_journal:
+                return REVIEW_ROUND_STALE  # no verifiable identity -> deterministic terminal
+            try:
+                source = source_fn()
+            except Exception:  # noqa: BLE001 - a transient unresolvable source -> retryable, not dropped
+                return REVIEW_ROUND_UNVERIFIABLE
+            if source is None:
+                return REVIEW_ROUND_UNVERIFIABLE
+            try:
+                markers = list(markers_from_source(source, issue))
+            except Exception:  # noqa: BLE001 - a transient unreadable source -> retryable, not dropped
+                return REVIEW_ROUND_UNVERIFIABLE
+            if gate_is_shadowed(gate_journal, latest_review_journal(markers, issue)):
+                return REVIEW_ROUND_STALE
+            return REVIEW_ROUND_CURRENT
+        if not is_review_return_route(route):
+            return REVIEW_ROUND_CURRENT  # a non-return / non-lane-gateway row is not fenced
         issue = str(getattr(row, "issue", "") or "").strip()
         review_journal = str(getattr(row, "journal", "") or "").strip()
         if not issue or not review_journal:
@@ -273,6 +311,42 @@ def discover_fenced_review_returns(
         return (), (REVIEW_RETURN_OWNER_READ_ERROR,)
 
 
+#: A lane_gateway discovery pass whose owning-lane binding read raised (fail-open per issue): the issue
+#: pass records this single refusal token and returns no candidate, never aborting the sweep.
+LANE_GATEWAY_OWNER_READ_ERROR = "lane_gateway_owner_binding_read_error"
+
+
+def discover_fenced_lane_gateway_sends(
+    owner_binding_fn: Callable[[str, str, object], OwningLaneBinding],
+    source: object,
+    *,
+    workspace_id: str,
+    issue: str,
+    binding: object,
+    fence_active: bool,
+    anchor: object,
+) -> "tuple[tuple, tuple[str, ...]]":
+    """Resolve the issue owner + discover generation-fenced lane_gateway candidates (Redmine #13683 R2).
+
+    Returns ``(candidates, refusal_reasons)``. The worker's ``implementation_done`` / ``review_request``
+    gates route to the issue's OWN owning-lane implementation_gateway (design answer j#82367), so this
+    resolves the same #13681/#13689 owning-lane binding the review_return path uses and threads the
+    current dispatch anchor (:func:`review_return_discovery_anchor`) so a gate predating the current lane
+    generation is refused at discovery (0-enqueue). The refusal reasons are surfaced for observability (a
+    fail-closed zero-send is not a silent drop). Fail-open per issue: an owner-read failure yields no
+    candidate + a single :data:`LANE_GATEWAY_OWNER_READ_ERROR` token, never aborting the issue pass.
+    """
+    try:
+        owner = owner_binding_fn(workspace_id, issue, binding)
+        candidates, plans = discover_lane_gateway_sends(
+            source, issue, owner, workspace_id=workspace_id,
+            dispatch_anchor_journal=review_return_discovery_anchor(fence_active, anchor),
+        )
+        return tuple(candidates), tuple(p.reason for p in plans if not p.emit)
+    except Exception:  # noqa: BLE001 - an owner-read failure never aborts the issue pass
+        return (), (LANE_GATEWAY_OWNER_READ_ERROR,)
+
+
 def review_return_discovery_anchor(fence_active: bool, anchor: object) -> "Optional[str]":
     """The dispatch anchor to thread into review_return discovery (Redmine #13974).
 
@@ -329,6 +403,10 @@ def build_supervisor_send_edge_fence(
         make_review_return_send_edge_fence(
             anchor, current_review_head, current_review_request, current_review_conclusion
         ),
+        # #13683 R2: also terminally fence a pre-existing / recovered lane_gateway backlog row whose
+        # worker gate predates the current dispatch anchor (a previous-generation gate on a restarted
+        # lane), each route-fence exempt on the others' rows so at most one fires per row.
+        make_lane_gateway_send_edge_fence(anchor),
     )
 
 
@@ -421,6 +499,11 @@ class BacklogDrainOutcome:
     workspace_id: str
     fenced: int = 0
     delivered: int = 0
+    #: Claimed backlog rows that reached the send edge but did NOT positively deliver (Redmine #13683
+    #: R2): a busy / ambiguous / unavailable receiver held as a retryable / uncertain receipt, or a
+    #: claim reconciled away mid-send. The receipt-truth counterpart of ``delivered`` — ``len(report.
+    #: delivered)`` includes these, so the drain must not count them as deliveries.
+    blocked: int = 0
     recovered: int = 0
     transient_skipped: int = 0
     lease_lost: bool = False
@@ -430,6 +513,7 @@ class BacklogDrainOutcome:
             "workspace_id": self.workspace_id,
             "fenced": self.fenced,
             "delivered": self.delivered,
+            "blocked": self.blocked,
             "recovered": self.recovered,
             "transient_skipped": self.transient_skipped,
             "lease_lost": self.lease_lost,
@@ -488,9 +572,16 @@ def drain_review_return_backlog(
     foreign snapshot's authority). ``limit`` (review F2): a WORKSPACE-WIDE budget on the rows this drain
     claims + transitions (``--deliver --limit N``); ``None`` applies the per-issue processor default.
     """
-    from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_INFLIGHT, CALLBACK_PENDING
+    from mozyo_bridge.core.state.workflow_runtime_store import (
+        CALLBACK_DELIVERED,
+        CALLBACK_INFLIGHT,
+        CALLBACK_PENDING,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
         CallbackOutboxProcessor,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+        partition_delivery_receipts,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
         current_review_generation_conclusion,
@@ -504,7 +595,7 @@ def drain_review_return_backlog(
         frozenset(str(i or "").strip() for i in restrict_issues)
         if restrict_issues is not None else None
     )
-    fenced = delivered = recovered = transient = 0
+    fenced = delivered = blocked = recovered = transient = 0
     remaining = limit  # None = unbounded (the per-issue processor default applies)
     # Foreign-partition-safe read: only THIS workspace's own rows (an unreadable outbox drains nothing
     # rather than raising). Include stale ``inflight`` (F1: a crashed-mid-send issue is enumerated so
@@ -529,8 +620,8 @@ def drain_review_return_backlog(
             break  # F2: the workspace-wide claim budget is exhausted
         if lease_guard_fn is not None and not lease_guard_fn():
             return BacklogDrainOutcome(
-                workspace_id=wsid, fenced=fenced, delivered=delivered, recovered=recovered,
-                transient_skipped=transient, lease_lost=True,
+                workspace_id=wsid, fenced=fenced, delivered=delivered, blocked=blocked,
+                recovered=recovered, transient_skipped=transient, lease_lost=True,
             )
         try:
             # ONE provider read is the transient gate: any read that RAISES leaves this issue's rows
@@ -560,13 +651,20 @@ def drain_review_return_backlog(
             limit=(remaining if remaining is not None else 32), now=now,
         )
         fenced += len(report.fenced)
-        delivered += len(report.delivered)
+        # Receipt truth (Redmine #13683 R2): count a real delivery ONLY when the row's durable state is
+        # CALLBACK_DELIVERED; a busy / uncertain / reconciled-away row in report.delivered is ``blocked``,
+        # never a delivery. The claim budget below still spends on every claimed row (fenced + attempted).
+        issue_delivered, issue_blocked = partition_delivery_receipts(
+            report.delivered, delivered_state=CALLBACK_DELIVERED
+        )
+        delivered += issue_delivered
+        blocked += issue_blocked
         recovered += len(report.recovered)
         if remaining is not None:
             remaining -= len(report.fenced) + len(report.delivered)
     return BacklogDrainOutcome(
-        workspace_id=wsid, fenced=fenced, delivered=delivered, recovered=recovered,
-        transient_skipped=transient,
+        workspace_id=wsid, fenced=fenced, delivered=delivered, blocked=blocked,
+        recovered=recovered, transient_skipped=transient,
     )
 
 
@@ -627,6 +725,8 @@ __all__ = (
     "resolve_current_review_identity",
     "build_supervisor_send_edge_fence",
     "discover_fenced_review_returns",
+    "discover_fenced_lane_gateway_sends",
+    "LANE_GATEWAY_OWNER_READ_ERROR",
     "resolve_lane_facts",
     "resolve_dispatch_anchor",
     "build_candidate_anchor_fn",

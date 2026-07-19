@@ -909,6 +909,32 @@ class PinRepairCommandTests(unittest.TestCase):
         self.assertEqual(after.lane_generation, before.lane_generation)
         self.assertEqual(after.process_release, before.process_release)
 
+    def test_action_time_composer_drift_before_write_is_zero_write(self) -> None:
+        """Redmine #14065 Phase 2 item 4: the pair settles green at the decision, then a
+        slot's composer drifts to pending (e.g. a ghost that is now real unsent input)
+        before the CAS. The action-time re-observation must fail the repair closed
+        zero-write — the repair rail otherwise had no composer re-read before its CAS."""
+
+        class _DriftOps(_FakeOps):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._calls = 0
+
+            def observe_composer(self, locator: str) -> tuple:
+                # The first pass (the decision) settles both slots; the second pass (the
+                # pre-CAS re-observation) reports pending — the drift.
+                self._calls += 1
+                return (True, True) if self._calls > 2 else (True, False)
+
+        self._seed()
+        before = self._rec()
+        result = self._run(_DriftOps(_live_pair(), attested=_attest_pair()))
+        self.assertNotEqual(result.state, REPAIR_REPAIRED)
+        self.assertFalse(result.repaired)
+        self.assertIn("action-time re-observation", result.detail)
+        self._assert_pins_unwritten()
+        self.assertEqual(self._rec().revision, before.revision)
+
     def test_pins_are_built_from_the_live_pair_not_a_name_or_cache(self) -> None:
         """Acceptance 1: the locators come from the live rows, never from the row/name."""
         self._seed()

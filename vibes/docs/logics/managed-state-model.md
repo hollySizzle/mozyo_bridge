@@ -334,7 +334,43 @@ Table naming:
       検証済み startup self-attestation の `observed_at` を保存する。observation surface を持つ
       richer 宣言経路は runtime_revision を供給してよく `match_key` に入る。current liveness では
       なく **観測 snapshot** であり、存在確認は毎回 live inventory を読む。既存 release/replacement
-      `ReleasePin` の後方互換 decode は維持。
+      `ReleasePin` の後方互換 decode は維持。★**action-time の current-liveness 世代照合**
+      (`ProcessGenerationPin.binds_same_generation`, #13846) は identity tuple
+      (`role/provider/assigned_name/locator`) を **strict 一致**で束ね、`runtime_revision` は
+      **どちらか一方が空なら非 discriminant**（declared は herdr runtime version 観測 surface が無く空、
+      live `agent list` row は供給しうる）として扱い、**両側が観測して差異があるときだけ** re-launch
+      された別世代として fail-closed する。full `match_key` 等価は「declared 空 vs live 非空」を mismatch と
+      誤読し、current な fresh generation を `worker_liveness_authority_conflict` で拒否していた
+      (#13846)。これは #13845 の「CAS を共有 predicate へ一般化しない (「空 or 一致」)」警告が対象とする
+      **row-shape CAS write** の共有述語一般化ではなく、上で optional evidence と定義済みの
+      `runtime_revision` を **read-time liveness 照合**で
+      その定義どおり非 identity として扱うだけであり、identity 4 field には空許容を持ち込まない。
+      ★★**action-time 世代 authority の 2 source** (#13846 R4、installed 実機証拠 #14062 j#82028):
+      worker dispatch admission の `generation_binding_current` は **どの宣言 surface が authority を
+      供給したか**で 2 経路を持つ。**(a) declared worker pin 経路** (adopt / hibernate-repair が
+      `declared_slots` を書いた row): 上記 `binds_same_generation` で live pin と束ね、かつ startup
+      self-attestation を declared locator に照合する (最強 — locator drift / both-observed revision
+      mismatch を fail-closed)。**(b) slot-less create 経路** (`sublane create --no-dispatch` は
+      `declare_active` を通り `declared_slots` を **一切書かない** — 正当な generation-1 shape): declared
+      worker pin が無いので generation authority は **live worker の startup self-attestation を LIVE
+      locator に generation-bound したもの** (herdr の世代 discriminant は live locator、attestation store
+      は runtime version を保存しない — `herdr-native-identity.md`) とし、assigned_name も明示照合する。
+      **live row の provider / detected agent (`agent` field) が resolved worker provider と一致する
+      ことも fail-closed 照合する** (#13846 R4 review F1): declared 経路の `binds_same_generation`
+      (`live_pin.provider`) が持つ provider 軸を slot-less 経路でも保ち、name+locator 一致でも
+      wrong-provider row を zero-send する (surface されない field は name-encoded provider に fallback)。
+      R3 の `binds_same_generation` は declared pin が存在する前提だったため経路 (b) では発火せず、空
+      snapshot が false `worker_liveness_authority_conflict` を生んで installed fresh E2E 全体を止めていた。
+      経路 (b) は **`PIN_PAIR_ABSENT` (真に slot-less な row) のみ**に適用し、positively suspicious な
+      declared shape (foreign / mixed / duplicate / incomplete / unreadable) と、live 側が absent /
+      unattested / stale (locator drift) な slot-less row は従来どおり fail-closed (「row に pin がある」
+      ことは current generation の証明にならない)。field 分類: **identity authority** =
+      role/provider/assigned_name/locator、**generation authority** = live locator に bound した startup
+      self-attestation (declared pin 存在時は locator-drift / both-observed-revision fail-closed を加える)、
+      **observation metadata** = runtime_revision (both-observed かつ差異のときのみ discriminant)。
+      conflict reason には **どの authority field が不一致か**の value-free token
+      (`_generation_binding_detail`、locator / raw output / secret を露出しない) を付す (#13846 R4、
+      finding j#82030)。
     - **common declaration service** (`LaneDeclarationStore.declare_lane`) が issue / project 双方を
       fail-closed に宣言する。exact duplicate は idempotent (#13809 live-adopt)、既存 owner conflict /
       別 issue-or-scope / 不読・ambiguous inventory は zero-write。bulk / implicit backfill は禁止。

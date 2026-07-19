@@ -218,6 +218,66 @@ def send_outcome_for_delivery(status: str, reason: str) -> str:
     return SEND_UNCERTAIN
 
 
+#: The fixed token an unrecognized zero-send reason normalizes to (Redmine #14082 review F2). A raw
+#: reason that is not a member of :data:`ZERO_SEND_REASON_ALLOWLIST` is REPLACED by this token — the
+#: raw value is dropped, never persisted — so a durable zero-send diagnostic can never carry a path,
+#: credential, or prose leaked into a reason string.
+UNRECOGNIZED_ZERO_SEND_REASON = "unrecognized_zero_send_reason"
+
+#: The closed allowlist of machine tokens a zero-send reason may carry into a durable diagnostic
+#: (Redmine #14082 review F2). Persisting a zero-send reason to the outbox row / dead-letter must be
+#: secret-safe *by construction*, not by convention: only these known tokens survive; anything else
+#: normalizes to :data:`UNRECOGNIZED_ZERO_SEND_REASON`. The set unions every closed vocabulary the
+#: background_service callback send can produce a reason from — the handoff outcome reasons here plus
+#: the background_service authorization / round-fence / transport-exception tokens defined in the
+#: application layer. Those application-layer tokens are enumerated as literals (a domain module must
+#: not import the application), and a drift-guard test asserts they still match their definitions
+#: (``FAIL_CLOSED_REASONS`` / ``ROUND_STALE`` / ``ROUND_UNVERIFIABLE``), so a renamed token is caught.
+ZERO_SEND_REASON_ALLOWLIST = frozenset(
+    _DELIVERED_SENT_REASONS
+    | _NOT_SENT_BLOCKED_REASONS
+    | {
+        # background_service authorization fail-closed reasons (domain
+        # ``background_service_delivery.FAIL_CLOSED_REASONS``; drift-guarded).
+        "no_workspace_lease",
+        "no_outbox_claim",
+        "foreign_workspace",
+        "no_target_resolved",
+        "ambiguous_target",
+        "anchor_mismatch",
+        "target_tuple_mismatch",
+        "generation_mismatch",
+        # action-time review-round fence dispositions (application
+        # ``background_service_sender.ROUND_STALE`` / ``ROUND_UNVERIFIABLE``; drift-guarded).
+        "review_round_stale",
+        "review_round_unverifiable",
+        # transport-side ambiguous / exception outcomes a callback send can carry to a zero-send.
+        "transport_error",
+        "inject_failed",
+        "turn_start_unconfirmed",
+        "marker_timeout",
+        "receiver_blocked",
+        "turn_start_absent",
+        "missing_sender_env",
+    }
+)
+
+
+def normalize_zero_send_reason(reason: str) -> str:
+    """Normalize a zero-send reason to a secret-safe closed token (Redmine #14082 review F2).
+
+    Returns ``reason`` unchanged when it is a known member of :data:`ZERO_SEND_REASON_ALLOWLIST`, a
+    blank string for a blank / ``None`` reason (the caller then keeps its own default detail), and
+    :data:`UNRECOGNIZED_ZERO_SEND_REASON` for anything else — the raw value is DROPPED, never returned.
+    This is the enforcement (not just the convention) that a durable zero-send diagnostic can never
+    carry a path / credential / prose that leaked into a reason string.
+    """
+    r = str(reason or "").strip()
+    if not r:
+        return ""
+    return r if r in ZERO_SEND_REASON_ALLOWLIST else UNRECOGNIZED_ZERO_SEND_REASON
+
+
 def normalize_gate_name(name: str) -> str:
     """Map a marker-facing gate name onto the runtime gate (``review_result`` -> ``review``).
 
@@ -344,6 +404,9 @@ __all__ = (
     "CallbackSendResult",
     "normalize_send_result",
     "send_outcome_for_delivery",
+    "UNRECOGNIZED_ZERO_SEND_REASON",
+    "ZERO_SEND_REASON_ALLOWLIST",
+    "normalize_zero_send_reason",
     "normalize_gate_name",
     "CallbackClassification",
     "classify_callback_gate",

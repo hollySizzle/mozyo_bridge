@@ -49,9 +49,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PreparationObservation,
     PrepareBoundPairRequest,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import (
-    ConvergeBoundPairRequest,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence_live import (
     LiveBoundPairConvergenceOps,
     _BoundPairActuatorPort,
@@ -60,7 +57,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _launch_detail,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (
-    LiveSublaneQuarantineOps,
     QuarantineRequest,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_composer_discard import (
@@ -96,100 +92,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     list_herdr_agent_rows,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
-    WorkflowProviderUnresolved,
     resolve_gateway_provider,
     resolve_worker_provider,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     _agent_locator,
-    _norm_lane as norm_lane,
-    decode_assigned_name,
 )
-
-
-def _action_closed_providers(slots: Sequence[BoundSlot]) -> tuple[str, ...]:
-    """Provider roles whose live absence is proven by this action's own immutable close.
-
-    ``close_proven`` is set only where the slot has no live row AND the transaction pinned by
-    the approved action id carries that participant past ``close_owed``.
-    """
-    return tuple(slot.provider for slot in slots if slot.close_proven)
-
-
-def _convergence_request(request: PrepareBoundPairRequest) -> ConvergeBoundPairRequest:
-    return ConvergeBoundPairRequest(
-        issue=request.issue,
-        journal=request.journal,
-        lane=request.lane,
-        worktree=request.worktree,
-        branch=request.branch,
-    )
-
-
-@dataclass
-class _SnapshotQuarantineOps(LiveSublaneQuarantineOps):
-    """Run the pending-composer classifier against one already-read inventory."""
-
-    snapshot_rows: Sequence[Mapping[str, object]] = ()
-    #: Provider roles whose live row is absent *because this immutable action closed it*
-    #: (Redmine #13933 j#80934).  Only a caller holding that transaction proof may set this.
-    action_closed_roles: tuple[str, ...] = ()
-
-    def _rows(self) -> Sequence[Mapping[str, object]]:
-        return self.snapshot_rows
-
-    def _pair_ok(
-        self,
-        rows: Sequence[Mapping[str, object]],
-        *,
-        workspace_id: str,
-        lane: str,
-    ) -> bool:
-        """Admit the sibling absence this action itself caused, and nothing else.
-
-        The inherited pair fence requires BOTH provider rows live and co-placed.  A
-        ``prepare-bound-pair`` run that closed one role and then failed to relaunch destroys
-        that premise with its own effect, so the still-owed role reads as
-        ``generation_mismatch`` and the transaction can never be replayed (j#80934).  The
-        absence is re-admitted only for a role whose close THIS transaction proves, and only
-        while that role stays absent — a reappeared or foreign sibling falls back to the
-        inherited fence, which is the authority for every live row.
-        """
-        if super()._pair_ok(rows, workspace_id=workspace_id, lane=lane):
-            return True
-        if not self.action_closed_roles:
-            return False
-        try:
-            providers = set(self._providers())
-        except WorkflowProviderUnresolved:
-            return False
-        closed = {norm(role) for role in self.action_closed_roles}
-        # A proper subset: a wholly action-closed pair has no live composer left to classify.
-        if not closed < providers:
-            return False
-        live: list[str] = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
-            if not decoded.ok or decoded.identity is None:
-                continue
-            identity = decoded.identity
-            if (
-                identity.workspace_id == workspace_id
-                and norm_lane(identity.lane_id) == norm_lane(lane)
-                and identity.role in providers
-            ):
-                live.append(identity.role)
-        # Every role this action closed must still be gone (a reappeared sibling is a live row
-        # the inherited fence owns), and every other role of the pair must still be live and
-        # unique.  Identity / revision / cwd of the classified row remain the caller's fences.
-        return (
-            len(live) == len(set(live))
-            and not (closed & set(live))
-            and (providers - closed) <= set(live)
-        )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_prepare_readonly_projection import (
+    SnapshotQuarantineOps as _SnapshotQuarantineOps,
+    action_closed_providers as _action_closed_providers,
+    convergence_request as _convergence_request,
+    resolve_rollback_owed_startup_action,
+)
 
 
 @dataclass
@@ -658,6 +573,27 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
             branch_matches=ok_branch and branch == request.branch,
             slots=tuple(slots),
             discard_roles=tuple(sorted(discard)),
+        )
+
+    def rollback_owed_startup_action(
+        self, request: PrepareBoundPairRequest, *, action_id: str
+    ) -> str:
+        """Delegate the a14 rollback-owed-partial detection to its read-only leaf.
+
+        The read-only preflight uses the returned inner startup ``--action-id`` to hand the
+        operator the exact public rollback command (Redmine #13933 R13 F1, review j#82079).
+        Resolving the workspace is this adapter's job; the cross-store conjunct check is
+        :func:`resolve_rollback_owed_startup_action`.
+        """
+        _wt, workspace, _identity = self._worktree(_convergence_request(request))
+        if not workspace:
+            return ""
+        return resolve_rollback_owed_startup_action(
+            repo_root=self.repo_root,
+            env=self.env,
+            workspace=workspace,
+            lane=request.lane,
+            action_id=action_id,
         )
 
     def observe(

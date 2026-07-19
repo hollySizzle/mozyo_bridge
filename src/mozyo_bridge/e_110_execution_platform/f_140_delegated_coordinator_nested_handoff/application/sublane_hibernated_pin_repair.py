@@ -202,6 +202,9 @@ def run_hibernated_pin_repair(
         REASON_PROVIDER_UNRESOLVED,
         REASON_WORKSPACE_UNRESOLVED,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
+        default_ghost_policy,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile import (  # noqa: E501
         LiveReconcileOps,
         observe_pair,
@@ -391,7 +394,11 @@ def run_hibernated_pin_repair(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    live_ops = ops if ops is not None else LiveReconcileOps(repo_root=repo_root)
+    live_ops = (
+        ops
+        if ops is not None
+        else LiveReconcileOps(repo_root=repo_root, ghost_policy=default_ghost_policy())
+    )
     try:
         rows = live_ops.agent_rows()
     except HerdrSessionStartError as exc:
@@ -526,6 +533,79 @@ def run_hibernated_pin_repair(
             lane_id=lane_label,
             executed=False,
             repaired=False,
+            pins=pin_payloads,
+        )
+    # Redmine #14065 Phase 2 item 4: re-observe the pair at action time, immediately
+    # before the CAS, through the SAME authority (the dim-ghost render gate rides in
+    # observe_composer). The repair rail otherwise had NO composer re-read between the
+    # decision and the CAS. Any drift — a slot that no longer settles green (e.g. a slot
+    # that was a dim ghost at decision time but now renders real input), a vanished /
+    # non-unique pair, or a pin set different from the decision-time one — fails the
+    # repair closed zero-write, mirroring the hibernate rail's pre-close re-verification.
+    try:
+        recheck = observe_pair(
+            live_ops.agent_rows(),
+            live_ops,
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            managed_pairs=managed_pairs,
+        )
+    except HerdrSessionStartError as exc:
+        return _blocked(
+            REASON_INVENTORY_UNREADABLE,
+            detail=(
+                f"action-time re-observation could not read the live inventory ({exc}); "
+                f"the repair fails closed zero-write"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            pins=pin_payloads,
+        )
+    recheck_verdict = decide_pair_reconcile(recheck)
+    if recheck_verdict.absent or recheck_verdict.state == STATE_BLOCKED:
+        return _blocked(
+            recheck_verdict.reason,
+            detail=(
+                "action-time re-observation changed: the live pair no longer settles green "
+                "just before the write (a slot drifted — e.g. a ghost composer is now real "
+                "unsent input); the repair fails closed zero-write"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            pins=pin_payloads,
+        )
+    try:
+        recheck_pins = encode_declared_slots(
+            validate_declared_slots(
+                tuple(
+                    ProcessGenerationPin(
+                        role=s.role,
+                        provider=s.provider,
+                        assigned_name=s.assigned_name,
+                        locator=s.locator,
+                        attested_at=s.attested_at,
+                    )
+                    for s in recheck.slots
+                )
+            )
+        )
+    except ProcessPinError as exc:
+        return _blocked(
+            REPAIR_STORE_ERROR,
+            detail=f"the re-observed live pair could not be encoded ({exc}); fail closed",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            pins=pin_payloads,
+        )
+    if recheck_pins != encoded_pins:
+        return _blocked(
+            REPAIR_PINS_DIVERGENT,
+            detail=(
+                "action-time re-observation changed: the live pair drifted from the "
+                "decision-time pair just before the write; the repair fails closed zero-write"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
             pins=pin_payloads,
         )
     repair_store = LanePinRepairStore()

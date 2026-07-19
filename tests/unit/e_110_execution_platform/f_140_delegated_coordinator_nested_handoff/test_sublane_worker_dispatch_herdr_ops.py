@@ -268,6 +268,77 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
         self.assertEqual(result.decision, ADMISSION_HEALTHY)
         self.assertEqual(result.facts.lane_generation, 7)
 
+    def test_fresh_generation_live_runtime_revision_is_healthy_not_conflict(self):
+        # Redmine #13846: the declared worker pin carries no runtime_revision (the fixture's
+        # declared_pins leave it empty, exactly as adopt/hibernate declarations do — the
+        # generation discriminant is the live locator), yet the live `agent list` row DOES
+        # surface a runtime_revision. A full match_key equality treated that asymmetry as a
+        # mismatch and raised a false `worker_liveness_authority_conflict`; binding on the
+        # (role/provider/assigned_name/locator) identity keeps this current fresh generation
+        # healthy while the locator still matches.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "runtime_revision": "cli-2.1.0",
+                }
+            ],
+            self._attestation(),
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertTrue(result.facts.generation_binding_current)
+
+    def test_live_runtime_revision_diverging_from_declared_is_conflict(self):
+        # Adversarial: when the declared pin DID observe a runtime revision and the live row
+        # surfaces a DIFFERENT one (a same-name process re-launched at a newer runtime), that
+        # is a distinct generation and must fail closed even though the locator matches.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        declared_pins = (
+            ProcessGenerationPin(
+                role="gateway",
+                provider="codex",
+                assigned_name=encode_assigned_name("ws", "codex", LANE_LABEL),
+                locator="w28:p74",
+            ),
+            ProcessGenerationPin(
+                role="worker",
+                provider="claude",
+                assigned_name=name,
+                locator="w28:p75",
+                runtime_revision="cli-1.0.0",
+            ),
+        )
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "runtime_revision": "cli-2.1.0",
+                }
+            ],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": declared_pins},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
     def test_locator_bearing_stale_row_is_authority_conflict(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
             encode_assigned_name,
@@ -318,32 +389,124 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
         )
 
-    def test_missing_or_incomplete_declared_pair_is_conflict(self):
+    def _fresh_row(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
             encode_assigned_name,
         )
 
-        name = encode_assigned_name("ws", "claude", LANE_LABEL)
-        row = {
-            "name": name,
+        return {
+            "name": encode_assigned_name("ws", "claude", LANE_LABEL),
             "pane_id": "w28:p75",
             "provider": "claude",
             "agent": "claude",
             "agent_status": "idle",
         }
-        incomplete = (
-            ProcessGenerationPin("worker", "claude", name, "w28:p75"),
+
+    def test_fresh_create_no_declared_slots_live_attested_is_healthy(self):
+        # Redmine #13846 R4 (live evidence #14062 j#82028): a fresh `sublane create
+        # --no-dispatch` lane declares its owner row through `declare_active`, which writes NO
+        # declared-slot snapshot (a legitimate generation-1 shape). The worker is live and its
+        # startup self-attestation is present + generation-bound to the LIVE locator. The R3
+        # `binds_same_generation` fix never fires (there is no declared pin), so before this
+        # correction the empty snapshot collapsed to a false `worker_liveness_authority_conflict`
+        # and blocked the whole installed fresh E2E. The slot-less generation authority is the
+        # startup self-attestation, so this fresh generation is HEALTHY.
+        result = self._observe(
+            [self._fresh_row()],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": ()},
         )
-        for pins in ((), incomplete):
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertTrue(result.facts.generation_binding_current)
+        self.assertEqual(result.facts.generation_binding_detail, "")
+
+    def test_fresh_create_no_slots_unattested_worker_stays_conflict(self):
+        # A slot-less create row without a present + generation-bound startup self-attestation
+        # has NO generation authority and must stay fail-closed. `attestation=None` (never ran /
+        # absent) and a stale attestation (recorded locator drifted from the live slot) are both
+        # unattested for this generation — zero-send, with the failing authority field surfaced.
+        stale = self._attestation()
+        stale.locator = "w28:p-old"
+        for attestation in (None, stale):
+            with self.subTest(attestation=attestation):
+                result = self._observe(
+                    [self._fresh_row()],
+                    attestation,
+                    lifecycle_overrides={"declared_pins": ()},
+                )
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
+                self.assertFalse(result.facts.generation_binding_current)
+                self.assertIn(
+                    "fresh_startup_self_attestation_not_generation_bound",
+                    result.reason,
+                )
+
+    def test_fresh_create_wrong_live_provider_stays_conflict(self):
+        # Redmine #13846 R4 review F1: a slot-less fresh row whose live `provider` / detected
+        # `agent` disagrees with the resolved worker provider is a foreign / mis-bound process
+        # even though the assigned name and locator line up and the startup attestation is
+        # present. The declared path rejects this via `binds_same_generation` (`live_pin.provider`);
+        # the slot-less path must fail closed on the same identity axis instead of promoting to
+        # healthy — the provider VALUE is never exposed, only the field-label detail token.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        # name still encodes the expected `claude` slot (so the row is name-matched), but the live
+        # row surfaces a foreign provider + detected agent. `agent=codex` keeps the slot LIVE
+        # (positive detection), so `slot_state` alone does not block it.
+        wrong_provider_row = {
+            "name": name,
+            "pane_id": "w28:p75",
+            "provider": "codex",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        result = self._observe(
+            [wrong_provider_row],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": ()},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertFalse(result.facts.generation_binding_current)
+        self.assertIn("fresh_live_provider_mismatch", result.reason)
+        self.assertNotIn("codex", result.reason)
+
+    def test_incomplete_or_foreign_declared_pair_stays_conflict(self):
+        # A positively suspicious declared shape is NEVER the slot-less fresh path: a half pair
+        # (worker without gateway -> incomplete) and a foreign pin role are ambiguous provenance
+        # and must fail closed even though the live worker is attested — "the row has pins" is
+        # not proof of the current generation, and the fresh fallback covers ONLY a genuinely
+        # empty (PIN_PAIR_ABSENT) snapshot.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        incomplete = (ProcessGenerationPin("worker", "claude", name, "w28:p75"),)
+        foreign = (
+            ProcessGenerationPin("someslot", "claude", name, "w28:p75"),
+            ProcessGenerationPin(
+                "otherslot", "codex", encode_assigned_name("ws", "codex", LANE_LABEL),
+                "w28:p74",
+            ),
+        )
+        for pins in (incomplete, foreign):
             with self.subTest(pins=pins):
                 result = self._observe(
-                    [row],
+                    [self._fresh_row()],
                     self._attestation(),
                     lifecycle_overrides={"declared_pins": pins},
                 )
                 self.assertEqual(
                     result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
                 )
+                self.assertIn("declared_slots_unresolved", result.reason)
 
     def test_terminal_absence_with_stale_anchor_or_action_is_conflict(self):
         attestation = self._attestation()

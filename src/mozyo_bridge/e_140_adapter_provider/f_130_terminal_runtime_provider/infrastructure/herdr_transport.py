@@ -60,9 +60,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from typing import Callable, Mapping, Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (
+    CURSOR_RELATION_ABSENT,
+    CURSOR_RELATION_COMPOSER,
+    CURSOR_RELATION_ELSEWHERE,
+    CURSOR_RELATION_UNKNOWN,
+    RENDER_REASON_AMBIGUOUS_RENDER,
+    RENDER_REASON_ANSI_ABSENT,
+    RENDER_REASON_ANSI_UNSUPPORTED,
+    RENDER_REASON_EMPTY_COMPOSER,
+    RENDER_REASON_INVALID_TARGET,
+    RENDER_REASON_NO_COMPOSER,
+    RENDER_REASON_OK,
+    RENDER_REASON_UNREADABLE,
+    STYLE_PROVENANCE_DIM,
+    STYLE_PROVENANCE_MIXED,
+    STYLE_PROVENANCE_NORMAL,
+    PaneRenderObservation,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     BINARY_SOURCE_ENV,
@@ -226,6 +245,56 @@ class HerdrCliTransport:
         content, truncated = _parse_read_payload(completed.stdout)
         return PaneReadResult.success(content, truncated=truncated)
 
+    def read_pane_render(
+        self,
+        target: str,
+        *,
+        source: str = DEFAULT_PANE_READ_SOURCE,
+        lines: Optional[int] = None,
+    ) -> PaneRenderObservation:
+        """Observe ``target``'s composer *style* via ``agent read --format ansi`` (#14065).
+
+        A herdr-provider capability — deliberately NOT on the core
+        :class:`TerminalTransportPort` (tmux has no composer-style surface). It is
+        *capability-negotiated*: the adapter asks the supported binary for an ANSI
+        render, and every way that can fail — an unsupported ``--format ansi`` /
+        ``--ansi`` flag, an absent ANSI stream, a composer-less or empty pane, an
+        unparseable render, a transport failure — resolves to a fail-closed
+        :class:`PaneRenderObservation` (``readable=False`` + a specific closed
+        reason), never a silent text fallback that fabricates a positive signal
+        (#14065 Design Answer j#82160 scope item 4).
+
+        The return value is fully redacted: only closed enums / bools leave this
+        method. The raw ANSI is consumed *inside* :func:`_parse_render_payload` and
+        never returned, logged, or surfaced (IR acceptance #3 / #4). The legacy
+        :meth:`read_pane` text contract is untouched — this is an additive sibling.
+        """
+        if not valid_target(target):
+            return PaneRenderObservation.failed(RENDER_REASON_INVALID_TARGET)
+        if not isinstance(source, str) or source not in PANE_READ_SOURCES:
+            return PaneRenderObservation.failed(RENDER_REASON_INVALID_TARGET)
+        argv = ["agent", "read", target, "--source", source, "--format", "ansi", "--ansi"]
+        if lines is not None:
+            if isinstance(lines, bool) or not isinstance(lines, int) or lines <= 0:
+                return PaneRenderObservation.failed(RENDER_REASON_INVALID_TARGET)
+            argv += ["--lines", str(lines)]
+        completed = self._invoke(argv)
+        if isinstance(completed, TransportResult):
+            # A fail-closed spawn / timeout / OS outcome: unreadable, preserve.
+            return PaneRenderObservation.failed(RENDER_REASON_UNREADABLE)
+        if completed.returncode != 0:
+            # A non-zero exit whose stderr carries an unknown-flag signature means
+            # the supported binary has no ANSI render surface (capability negotiation
+            # failed); anything else is a generic unreadable transport failure. Both
+            # are fail-closed / preserve — the distinction only sharpens the reason.
+            reason = (
+                RENDER_REASON_ANSI_UNSUPPORTED
+                if _looks_like_unknown_flag(completed.stderr)
+                else RENDER_REASON_UNREADABLE
+            )
+            return PaneRenderObservation.failed(reason)
+        return _parse_render_payload(completed.stdout)
+
     # -- internals ------------------------------------------------------------
 
     def _run_send(self, tail: list) -> TransportResult:
@@ -331,6 +400,277 @@ def _parse_read_payload(stdout: object) -> tuple:
         content = stdout
     truncated = bool(source.get("truncated", False))
     return content, truncated
+
+
+# -- composer-render (ANSI style) parsing (Redmine #14065) --------------------
+# Escape-sequence grammars. A full CSI is ESC '[' <parameter bytes> <intermediate
+# bytes 0x20-0x2F> <final byte 0x40-0x7E>. The parameter class spans the private
+# The ONLY escape a visible-buffer *style* snapshot legitimately needs: a standard
+# SGR — ``ESC[`` <numeric / ``;`` parameters> ``m`` — which changes intensity / colour
+# WITHOUT moving the cursor, erasing, scrolling, or otherwise mutating the screen.
+# EVERY other escape is rejected as ambiguous, not consumed: a non-SGR CSI (cursor
+# move ``ESC[H`` / erase ``ESC[2K`` / mode toggle), a private / extension CSI, an OSC
+# or charset sequence, and any malformed / unterminated escape all either mutate the
+# rendered buffer (whose effect this instrument does NOT emulate) or cannot be
+# reconstructed. Consuming such a sequence and then trusting the reassembled text
+# would launder a stale, erased, or displaced body into a positive style — exactly
+# the residual the R2 review caught (Redmine #14065 review j#82171 finding 2: a
+# ``CSI 2K`` erase after a dim prompt must NOT stay classified as ``dim``). So the
+# scanner recognises SGR alone and fails the whole render closed (``ambiguous_render``)
+# on the first escape that is not a standard SGR.
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# The composer prompt marker set + body, mirroring the e110 observer's
+# ``_PROMPT_RE`` (``sublane_quarantine``). Duplicated as a one-line provider-local
+# literal on purpose: the adapter (e140) must not import the consumer (e110), and
+# the render parsing is a provider mechanic. Kept in sync by the adversarial
+# regression fixtures, not by a cross-layer import.
+_RENDER_PROMPT_RE = re.compile(r"^\s*[›❯>]\s*(?P<body>.*)$")
+_PROMPT_MARKERS = "›❯>"
+
+# The closed set of SGR intensities this instrument reads as "dim" (a ghost
+# idle-placeholder candidate): SGR 2 (faint) and SGR 90 (bright-black / gray).
+# Everything else is "normal"; an explicit reset (0) or normal-intensity (22) /
+# default-or-standard foreground (39 / 30-37 / 38…) clears the respective dim
+# axis. A provider that draws placeholders with some other gray (e.g. an 8-bit
+# palette index) reads as ``normal`` here — the fail-SAFE direction, since phase 1
+# only measures and phase 2 requires a STABLE positive separation before acting.
+
+
+def _apply_sgr(params: str, faint: bool, dim_fg: bool) -> tuple[bool, bool]:
+    """Fold one SGR parameter list into the (faint, dim_fg) intensity state."""
+    codes = params.split(";") if params else [""]
+    idx = 0
+    while idx < len(codes):
+        raw = codes[idx]
+        code = raw if raw != "" else "0"
+        if code == "0":
+            faint = False
+            dim_fg = False
+        elif code == "2":
+            faint = True
+        elif code == "22":
+            faint = False
+        elif code == "90":
+            dim_fg = True
+        elif code == "39" or (code.isdigit() and 30 <= int(code) <= 37):
+            dim_fg = False
+        elif code == "38":
+            # Extended foreground (38;5;N or 38;2;R;G;B): a concrete fg colour, so
+            # it clears the bright-black gray-dim axis, and its own parameters are
+            # skipped so they can never be misread as intensity codes.
+            dim_fg = False
+            if idx + 1 < len(codes) and codes[idx + 1] == "5":
+                idx += 2
+            elif idx + 1 < len(codes) and codes[idx + 1] == "2":
+                idx += 4
+        idx += 1
+    return faint, dim_fg
+
+
+def _consume_escape(ansi: str, i: int) -> tuple:
+    """Consume the escape at ``i``: ``(end_index, kind, sgr_params)``.
+
+    ``kind`` is ``"sgr"`` (a standard intensity/colour SGR, with ``sgr_params``) or
+    ``"ambiguous"`` (anything else). Only a standard SGR is recognised; every other
+    escape — a non-SGR CSI (cursor / erase / mode), a private / extension CSI, an OSC
+    or charset sequence, or a malformed one — fails the whole render closed rather
+    than being consumed and its surrounding text trusted (Redmine #14065 review
+    j#82171 finding 2: a screen-mutating CSI must never launder a stale / erased body
+    into a positive style).
+    """
+    match = _SGR_RE.match(ansi, i)
+    if match:
+        return match.end(), "sgr", match.group(0)[2:-1]
+    return i + 1, "ambiguous", None
+
+
+def _scan_ansi_intensities(ansi: str) -> tuple:
+    """Reconstruct visible lines + an ambiguity flag from an ANSI stream.
+
+    Returns ``([[(char, is_dim), …], …], ambiguous)``. Walks the stream tracking
+    the SGR intensity state; every visible character is emitted with the intensity
+    in force when it was drawn, and every recognised escape (SGR or other control)
+    is consumed without emitting a character. The moment an escape cannot be
+    resolved into a complete recognised sequence, ``ambiguous`` is ``True`` and the
+    scan stops — the classifier fails the render closed rather than trusting a
+    partially-parsed screen. The raw text never leaves this module.
+    """
+    lines: list = []
+    current: list = []
+    faint = False
+    dim_fg = False
+    i = 0
+    n = len(ansi)
+    while i < n:
+        ch = ansi[i]
+        if ch == "\x1b":
+            end, kind, params = _consume_escape(ansi, i)
+            if kind == "ambiguous":
+                lines.append(current)
+                return lines, True
+            if kind == "sgr":
+                faint, dim_fg = _apply_sgr(params, faint, dim_fg)
+            i = end
+            continue
+        if ch == "\n":
+            lines.append(current)
+            current = []
+            i += 1
+            continue
+        if ch == "\r":
+            i += 1
+            continue
+        current.append((ch, faint or dim_fg))
+        i += 1
+    lines.append(current)
+    return lines, False
+
+
+def _prompt_body_cells(cells: list) -> list:
+    """The composer body cells after the leading whitespace + prompt marker + gap."""
+    i = 0
+    n = len(cells)
+    while i < n and cells[i][0].isspace():
+        i += 1
+    if i < n and cells[i][0] in _PROMPT_MARKERS:
+        i += 1
+    while i < n and cells[i][0].isspace():
+        i += 1
+    return cells[i:]
+
+
+def _classify_composer_style(ansi: str) -> tuple:
+    """Classify the last composer prompt body's style: ``(prompt_present, idx, prov, reason)``.
+
+    ``reason`` is :data:`RENDER_REASON_OK` with ``prov`` in ``{dim, normal, mixed}``
+    only when a composer prompt line with a non-empty body was found and classified;
+    otherwise ``prov`` is ``None`` and ``reason`` is the fail-closed cause
+    (``no_composer`` / ``empty_composer`` / ``ambiguous_render``).
+    """
+    lines, ambiguous = _scan_ansi_intensities(ansi)
+    if ambiguous:
+        return (False, -1, None, RENDER_REASON_AMBIGUOUS_RENDER)
+    prompt_idx = -1
+    prompt_cells: list = []
+    for idx, cells in enumerate(lines):
+        text = "".join(char for char, _dim in cells)
+        if _RENDER_PROMPT_RE.match(text):
+            prompt_idx = idx
+            prompt_cells = cells
+    if prompt_idx < 0:
+        return (False, -1, None, RENDER_REASON_NO_COMPOSER)
+    body = _prompt_body_cells(prompt_cells)
+    non_space = [(char, dim) for char, dim in body if not char.isspace()]
+    if not non_space:
+        return (True, prompt_idx, None, RENDER_REASON_EMPTY_COMPOSER)
+    intensities = {dim for _char, dim in non_space}
+    if intensities == {True}:
+        provenance = STYLE_PROVENANCE_DIM
+    elif intensities == {False}:
+        provenance = STYLE_PROVENANCE_NORMAL
+    else:
+        provenance = STYLE_PROVENANCE_MIXED
+    return (True, prompt_idx, provenance, RENDER_REASON_OK)
+
+
+def _cursor_relation(cursor: object, prompt_idx: int) -> str:
+    """Derive the closed cursor relation from a payload cursor vs the composer line."""
+    if cursor is None:
+        return CURSOR_RELATION_UNKNOWN
+    if cursor is False:
+        return CURSOR_RELATION_ABSENT
+    if not isinstance(cursor, Mapping):
+        return CURSOR_RELATION_UNKNOWN
+    row = cursor.get("row")
+    if isinstance(row, bool) or not isinstance(row, int):
+        return CURSOR_RELATION_UNKNOWN
+    return (
+        CURSOR_RELATION_COMPOSER if row == prompt_idx else CURSOR_RELATION_ELSEWHERE
+    )
+
+
+#: The rendered-string keys a read payload may carry, in preference order. Under
+#: ``--format ansi`` / ``--ansi`` the supported binary is expected to embed SGR
+#: escape sequences into the *same* rendered field (a dedicated ``ansi`` key is
+#: tried first, then the plain-text keys ``_parse_read_payload`` already reads).
+#: Capability negotiation is by *content*: the chosen field must actually contain
+#: an ANSI CSI escape (``ESC[``); a payload with no escape in any field means the
+#: ANSI capability was not exercised (``ansi_absent``), never a positive signal.
+_RENDER_TEXT_KEYS = ("ansi", "content", "text", "visible", "data")
+
+
+def _select_ansi_stream(source: Mapping) -> Optional[str]:
+    """The first candidate field carrying an ANSI escape, or ``None`` (no ANSI)."""
+    for key in _RENDER_TEXT_KEYS:
+        value = source.get(key)
+        if isinstance(value, str) and "\x1b[" in value:
+            return value
+    return None
+
+
+def _parse_render_payload(stdout: object) -> PaneRenderObservation:
+    """Extract a redacted :class:`PaneRenderObservation` from an ANSI ``agent read`` payload.
+
+    The rendered text is read from the live nested ``result.read`` object (the E11
+    schema shape) or the top-level mapping, choosing the first field
+    (:data:`_RENDER_TEXT_KEYS`) that actually carries an ANSI CSI escape. A payload
+    that parsed but carried no ANSI escape in any field is ``ansi_absent`` — the
+    ``--format ansi`` capability was not exercised (the flag was ignored or the
+    render is unstyled), so no style could be measured. The raw ANSI is classified
+    in place and discarded; only the closed observation is returned, so no body /
+    hash / length / excerpt / ANSI can escape.
+    """
+    if not isinstance(stdout, str):
+        return PaneRenderObservation.failed(RENDER_REASON_ANSI_ABSENT)
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return PaneRenderObservation.failed(RENDER_REASON_ANSI_ABSENT)
+    if not isinstance(payload, Mapping):
+        return PaneRenderObservation.failed(RENDER_REASON_ANSI_ABSENT)
+    source: Mapping = payload
+    result = payload.get("result")
+    if isinstance(result, Mapping):
+        read_obj = result.get("read")
+        if isinstance(read_obj, Mapping):
+            source = read_obj
+    ansi = _select_ansi_stream(source)
+    if ansi is None:
+        return PaneRenderObservation.failed(RENDER_REASON_ANSI_ABSENT)
+    prompt_present, prompt_idx, provenance, reason = _classify_composer_style(ansi)
+    if reason != RENDER_REASON_OK or provenance is None:
+        return PaneRenderObservation.failed(reason, prompt_present=prompt_present)
+    return PaneRenderObservation.classified(
+        provenance, cursor_relation=_cursor_relation(source.get("cursor"), prompt_idx)
+    )
+
+
+def _looks_like_unknown_flag(stderr: object) -> bool:
+    """Whether ``stderr`` reads as an unknown/unsupported-flag rejection (bounded).
+
+    Conservative: it takes an explicit "unknown / unrecognised / unexpected /
+    invalid / no such" signature AND a mention of a flag / option / argument (or of
+    ``format`` / ``ansi`` themselves). Used only to *sharpen* a fail-closed reason
+    (``ansi_unsupported`` vs ``unreadable``); both branches preserve, so a
+    misread never changes safety.
+    """
+    if not isinstance(stderr, str):
+        return False
+    low = stderr.lower()
+    signatures = (
+        "unknown",
+        "unrecognized",
+        "unrecognised",
+        "unexpected",
+        "invalid",
+        "no such",
+    )
+    mentions_flag = any(
+        token in low
+        for token in ("--format", "--ansi", "format", "ansi", "option", "argument", "flag")
+    )
+    return any(sig in low for sig in signatures) and mentions_flag
 
 
 def resolve_terminal_transport(

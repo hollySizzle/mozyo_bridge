@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
@@ -61,6 +61,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkflowProviderUnresolved,
     resolve_gateway_provider,
     resolve_worker_provider,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
+    apply_ghost_empty,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_ghost_composer_gate import (  # noqa: E501
+    GhostComposerRenderPolicy,
+    RenderGhostFacts,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
     AMBIGUOUS,
@@ -587,6 +594,10 @@ class LiveSublaneQuarantineOps:
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
     timeout: float = COMMAND_TIMEOUT_SECONDS
+    #: Redmine #14065 Phase 2: injected ghost render policy (``None`` = gate OFF /
+    #: byte-unchanged); ``render_facts_reader`` lets a hermetic test supply facts.
+    ghost_policy: Optional[GhostComposerRenderPolicy] = None
+    render_facts_reader: Optional[Callable[[str], RenderGhostFacts]] = None
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         return list_herdr_agent_rows(self.env)
@@ -737,9 +748,21 @@ class LiveSublaneQuarantineOps:
                 for record in records
             ):
                 correlated.append(marker)
+        # Redmine #14065 Phase 2: a dim ghost the provider declares empties the text
+        # pending candidate at action time; everything else (normal/mixed/unknown,
+        # unreadable, unresolved provider, missing observation, no injected policy)
+        # preserves. The render read runs only when the text observation reported pending.
+        effective_has_pending = apply_ghost_empty(
+            observation.has_pending,
+            policy=self.ghost_policy,
+            repo_root=self.repo_root,
+            env=self.env,
+            locator=_norm(request.locator),
+            facts_reader=self.render_facts_reader,
+        )
         signal = PendingComposerSignal(
             inventory_readable=observation.readable,
-            has_pending=observation.has_pending,
+            has_pending=effective_has_pending,
             agent_state=runtime_state,
             identity_attested=attestation.ok,
             generation_matches=generation_ok,

@@ -561,7 +561,10 @@ def run_hibernated_live_reconcile(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    live_ops = ops if ops is not None else LiveReconcileOps(repo_root=repo_root)
+    # Redmine #14065 Phase 2: inject the dim-ghost render policy (decision + pre-close re-observe).
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import default_ghost_policy  # noqa: E501
+
+    live_ops = ops if ops is not None else LiveReconcileOps(repo_root=repo_root, ghost_policy=default_ghost_policy())  # noqa: E501
     try:
         rows = live_ops.agent_rows()
     except HerdrSessionStartError as exc:

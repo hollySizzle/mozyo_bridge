@@ -29,6 +29,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding impo
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
     PHASE_COMPLETED_SUCCESS,
+    PHASE_ROLLBACK_OWED,
     StartupTransactionFence,
     StartupUnit,
     startup_action_id,
@@ -99,6 +100,12 @@ V1_BINDING_STARTUP_DEBT = "replacement_binding_startup_debt"
 V1_BINDING_LAUNCH_UNHEALTHY = "replacement_binding_launch_unhealthy"
 V1_BINDING_ATTESTATION_MISMATCH = "replacement_binding_attestation_mismatch"
 V1_BINDING_MAINTENANCE_BUSY = "replacement_binding_maintenance_busy"
+#: The exact fresh launch this action owns is durably rollback-owed (the installed a14
+#: partial, Redmine #13933 R13 item 3): even a now-live, attested slot is NOT bound or
+#: promoted to success, because the durable startup record distrusts that health. The
+#: operator runs the public startup rollback rail, then replays the same action to relaunch
+#: and bind. Distinct from the generic ``startup_debt`` so the reason is actionable.
+V1_BINDING_STARTUP_ROLLBACK_REQUIRED = "action_owned_startup_rollback_required"
 
 
 class V1ReplacementBindingFailure(RuntimeError):
@@ -161,6 +168,31 @@ def _binding_identity_matches(
     return intent.startup_action_id == expected_startup
 
 
+def _is_exact_normal_v1_row(
+    home: Path, intent: ReplacementActionBinding, live_locator: str
+) -> bool:
+    """True iff the live locator carries an exact, unbound normal-v1 attestation row.
+
+    The same join the success bind requires (locator-matched, workspace/role/lane exact, and
+    NOT already carrying a replacement binding). Used only to confirm the a14 rollback-owed
+    partial's slot is genuinely this action's clean fresh launch before naming it rollback
+    required; any unreadable / mismatched / already-bound row makes this False and the caller
+    falls through to the generic fail-closed debt.
+    """
+    try:
+        record = HerdrIdentityAttestationStore(home=home).read(intent.assigned_name)
+    except Exception:  # noqa: BLE001 - unreadable is not a match
+        return False
+    join = evaluate_attestation(
+        record,
+        live_locator=live_locator,
+        expected_workspace_id=intent.workspace_id,
+        expected_role=intent.role,
+        expected_lane=intent.lane_id,
+    )
+    return bool(join.ok) and record is not None and not record.replacement_action_id
+
+
 def _bind_startup_receipt(
     *,
     home: Path,
@@ -205,14 +237,38 @@ def _bind_startup_receipt(
             V1_BINDING_STARTUP_DEBT,
             "the startup transaction receipt is unreadable",
         )
-    if (
-        startup is None
-        or startup.phase != PHASE_COMPLETED_SUCCESS
-        or startup.action_id != intent.startup_action_id
-        or startup.unit.workspace_id != intent.workspace_id
-        or startup.unit.lane_id != intent.lane_id
-        or tuple(startup.unit.providers) != tuple(sorted(set(managed_pair)))
-    ):
+    unit_matches = (
+        startup is not None
+        and startup.action_id == intent.startup_action_id
+        and startup.unit.workspace_id == intent.workspace_id
+        and startup.unit.lane_id == intent.lane_id
+        and tuple(startup.unit.providers) == tuple(sorted(set(managed_pair)))
+    )
+    # The a14 partial (Redmine #13933 R13 item 3): an exact fresh launch THIS action owns
+    # that the durable startup record marks rollback-owed. Even if the slot now reads live +
+    # attested, the durable record distrusts that health, so it is never silently bound or
+    # promoted to success — it is projected as a typed, actionable reason so the operator runs
+    # the public rollback rail and then replays. Every conjunct must match (outer action,
+    # assigned name, and old locator are already validated by the caller; here: exact startup
+    # action + unit, an un-closed participant whose receipt sits at the exact live locator, and
+    # a clean normal-v1 attestation row). Any mismatch falls through to the generic debt below,
+    # which preserves the foreign / conflicting / not-yet-durable cases fail-closed.
+    if unit_matches and startup.phase == PHASE_ROLLBACK_OWED:
+        owed = startup.participant_for(intent.role)
+        if (
+            owed is not None
+            and not owed.closed
+            and owed.assigned_name == intent.assigned_name
+            and owed.locator == live_locator
+            and owed.receipt
+            and _is_exact_normal_v1_row(home, intent, live_locator)
+        ):
+            _stop(
+                V1_BINDING_STARTUP_ROLLBACK_REQUIRED,
+                "an exact fresh launch this action owns is durably rollback-owed; run the "
+                "public startup rollback rail, then replay the same action to relaunch and bind",
+            )
+    if not unit_matches or startup.phase != PHASE_COMPLETED_SUCCESS:
         _stop(
             V1_BINDING_STARTUP_DEBT,
             "the reserved launch has not reached exact durable startup success",
@@ -414,11 +470,17 @@ def launch_or_resume_v1_replacement(
             V1_BINDING_AUTHORITY_CONFLICT,
             "the startup result did not record one exact fresh replacement participant",
         )
-    if not result.ok:
-        # Carry the nested result so the caller can project the typed action id / per-role
-        # health / rollback debt and surface the explicit public rollback pointer for the
-        # SAME startup action (Redmine #13948 R3). ``result.action_id`` is exactly the
-        # startup-transaction id ``herdr session-rollback --action-id`` acts under.
+    # Gate on the EXACT target participant's own health, never the pair aggregate
+    # ``result.ok`` (Redmine #13933 R13, j#82038). A single-leg replacement launch adopts
+    # or surfaces the sibling it did not launch; an old-worker-pending sibling being
+    # non-green dragged the aggregate false and stalled a healthy fresh target's bind. The
+    # target's health is what this bind is responsible for: target non-green / missing
+    # receipt / name collision / foreign all still fail closed below and in the receipt bind.
+    # The stop carries the nested result so the caller can project the typed action id /
+    # per-role health / rollback debt and surface the explicit public rollback pointer for
+    # the SAME startup action (Redmine #13948 R3): ``result.action_id`` is exactly the
+    # startup-transaction id ``herdr session-rollback --action-id`` acts under.
+    if not launched[0].healthy:
         _stop(
             V1_BINDING_LAUNCH_UNHEALTHY,
             "the fresh replacement participant did not reach bounded startup health",

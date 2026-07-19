@@ -527,7 +527,13 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         transport = _CapturingTransport()
         supervisor = self._build_supervisor(wsid=wsid, source=advanced, transport=transport, anchor=ANCHOR)
         supervisor.run_once()
-        self.assertEqual(transport.calls, [])
+        # The drifted review_RETURN row is terminally fenced (never delivered). The fresh unshadowed
+        # review_request j130 (CUR_HEAD, after the last review) legitimately wakes the same-lane gateway
+        # via the #13683 R2 lane_gateway route — a separate, correct side effect, so scope this drift
+        # assertion to review_return-route calls only.
+        self.assertEqual(
+            [r for r, _target in transport.calls if is_review_return_route(r.callback_route)], []
+        )
         self.assertEqual(self._return_rows([CALLBACK_PENDING]), [])
         self.assertTrue(self._return_rows([CALLBACK_UNCERTAIN]))
 

@@ -193,11 +193,33 @@ def register_sublane_retire(
             "attests against the row's recorded canonical binding AND the durable row is "
             "hibernated + released + owns --issue AND the live inventory shows every expected "
             "managed slot absent AND no foreign / unexpected provider occupies the lane unit "
-            "AND --branch is integrated, moves it directly to the terminal "
+            "AND --branch is integrated (a literal ancestor of --integration-branch, OR a "
+            "coordinator patch_equivalent integration verified from the exact Redmine journal via "
+            "--integration-journal, Redmine #14066), moves it directly to the terminal "
             "`retired` disposition via a bounded CAS, preserving the row's declared pins and "
             "worktree identity. Launches / closes / resumes NO process; removes no worktree / "
             "branch. Mutually exclusive with --execute, --migrate-hibernated-legacy and "
             "--reconcile-hibernated-live (passing more than one is a zero-write error)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--integration-journal",
+        dest="integration_journal",
+        default=None,
+        help=(
+            "Redmine #14066: the Redmine journal id (on --issue) carrying the coordinator's "
+            "durable `patch_equivalent` integration disposition — a fenced "
+            "`mozyo-patch-equivalent-integration` JSON block {issue, lane, branch, "
+            "integration_branch, source_head, integration_head, origin_reachable, "
+            "commit_map:[{source,integration,patch_id}]}. Used ONLY with --retire-hibernated-bound "
+            "and ONLY when --branch is not a literal ancestor of --integration-branch: the retire "
+            "fresh-reads that EXACT journal over the credential-gated Redmine read (the durable "
+            "authority — never a caller-supplied file), RECOMPUTES the stable patch-ids and "
+            "origin reachability (against origin/<integration-branch>) from real git, and "
+            "terminalizes only when every mapped cherry-pick is proven patch-equivalent and the "
+            "recorded heads match the current branches. Unconfigured credentials / unreadable "
+            "Redmine / journal-not-found / missing / ambiguous / malformed / stale / mismatched "
+            "evidence all fail closed (zero-write). The literal-ancestor path ignores it entirely."
         ),
     )
     add_repo_option(sublane_retire)
