@@ -136,6 +136,7 @@ class ReplacementActuatorUseCase:
         preservation_policy: Callable[
             [PreservationObservation], PreservationVerdict
         ] = assess_preservation,
+        launch_authority: Optional[Callable[[ParticipantPin], bool]] = None,
     ) -> None:
         self._store = store
         self._port = port
@@ -147,6 +148,14 @@ class ReplacementActuatorUseCase:
         # a dirty / unrecorded worktree while still refusing to close a live-working or
         # wrong-identity slot (Redmine #13806 tranche D, j#79485 §4).
         self._preservation_policy = preservation_policy
+        # An OPTIONAL action-time authority probe re-joined by the launch step IMMEDIATELY before
+        # the (bounded-recovery) ``launch_action_bound`` effect (Redmine #13806 R3-F1, Review
+        # j#82731). ``None`` (the self-replacement default) leaves the launch unchanged. A
+        # post-close worker recovery injects one that re-verifies the exact live lane authority
+        # (lifecycle / worktree token / branch) + a lane free of any foreign live process, so the
+        # relaunch is fenced action-time and not by a stale admission-time snapshot. Returns
+        # ``True`` to permit the launch; ``False`` fails closed with zero launch (stay launch_owed).
+        self._launch_authority = launch_authority
 
     def run(
         self,
@@ -566,6 +575,18 @@ class ReplacementActuatorUseCase:
         if isinstance(fresh, ActuationResult):
             return fresh
         rec = fresh
+        # R3-F1 (Review j#82731) — an OPTIONAL action-time authority probe re-joined IMMEDIATELY
+        # before the launch effect (a post-close worker recovery injects one; self-replacement
+        # leaves it None). The lease re-auth above proves WE still hold the transaction; this
+        # proves the LANE authority (lifecycle / worktree token / branch) is still exact and the
+        # lane is free of any foreign live process, right now — not at a stale admission snapshot.
+        # A blocked probe is a fail-closed ZERO launch that stays launch_owed (a later re-run
+        # re-joins and resumes once authority is restored).
+        if self._launch_authority is not None and not self._launch_authority(pin):
+            return ActuationResult(
+                status=ACTUATION_PRESERVATION_BLOCKED, phase=rec.phase, revision=rec.revision,
+                stopped_on=pin.identity, detail="launch_authority_moved",
+            )
         if self._port.launch_action_bound(rec.action_id, pin) != LAUNCH_DONE:
             # Stay launch_owed (retryable): a later re-run relaunches, never re-closes.
             return ActuationResult(

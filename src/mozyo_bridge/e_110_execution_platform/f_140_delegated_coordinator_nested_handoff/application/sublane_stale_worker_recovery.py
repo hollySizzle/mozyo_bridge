@@ -120,6 +120,11 @@ REDISPATCH_LEASE_LOST = "lease_lost"
 REDISPATCH_GENERATION_MISMATCH = "generation_mismatch"
 REDISPATCH_NOT_FOUND = "not_found"
 REDISPATCH_CONTINUATION_UNREADABLE = "continuation_unreadable"
+#: The live lane authority (lifecycle / worktree token / branch) moved between the launch and the
+#: send — a fail-closed ZERO send re-joined action-time immediately before the transport (Redmine
+#: #13806 R3-F1, Review j#82731). The phase stays not-attempted so a later re-run re-joins and
+#: sends once authority is restored; never a blind send into a lane the approval no longer governs.
+REDISPATCH_AUTHORITY_MOVED = "authority_moved"
 
 
 def _utc_now() -> str:
@@ -285,50 +290,42 @@ class StaleWorkerRecoveryOps(Protocol):
         """
         ...
 
-    def lane_lifecycle_current(self, request: RecoveryRequest) -> bool:
-        """Does the LIVE lane lifecycle still match the approval's pinned generation? (read-only)
+    def resume_lane_authority(self, request: RecoveryRequest) -> bool:
+        """Is the lane's ambient authority EXACT and current, right now? (read-only, #13806 R3-F1)
 
-        The ambient lane authority a **post-close resume** must re-verify before it drives any
-        owed launch / send (Redmine #13806 post-close correction §3). A post-close replay re-runs
-        against a durable transaction whose close already committed, so it cannot rely on the
-        pinned old worker's identity (that slot is gone). This re-reads the LIVE lane lifecycle
-        ``(revision, generation)`` — old-slot-independent, and not confused by the fresh
-        relaunched slot — and returns ``True`` only when it still equals the approval's pinned
-        ``lane_revision`` / ``lane_generation``. A moved / newer lifecycle (the coordinator
-        re-owned or advanced the lane) or an unreadable / absent lifecycle returns ``False`` so
-        the resume stops with zero launch / send rather than relaunching into a lane the
-        approval no longer governs. Never mutates the #13810 owner row — it only compares.
+        The exact, old-slot-independent lane authority a **post-close resume** re-joins
+        **immediately before each owed effect** (the actuator's launch probe and the redispatch
+        send) — never a once-at-admission snapshot (Review j#82731 F1). A post-close replay's
+        durable transaction says the close committed, so this cannot trust the pinned old worker
+        (gone) or a stale earlier reading — it re-observes the live lane and returns ``True`` only
+        when EVERY axis holds (Review j#82731 F2 / Answer j#82708 block list):
+
+        - the LIVE lane lifecycle exists and its ``(revision, generation)`` equals the approval's
+          pinned ``lane_revision`` / ``lane_generation`` (a moved / newer lifecycle → ``False``);
+        - the lane's canonical ``worktree_identity`` token is non-empty AND equals the recovery
+          worktree's currently-derived token (a sibling / wrong worktree → ``False``);
+        - the recovery worktree resolves to a live git checkout on the lane's expected branch (an
+          unreadable worktree / a drifted branch → ``False``).
+
+        A **dirty (but readable)** worktree is byte-preserved and recovered, NOT a block (Answer
+        j#82708 Option A / tranche D contract) — dirtiness is not an authority axis. Fail-closed:
+        any unreadable / absent / mismatched axis returns ``False``. Never mutates the #13810
+        owner row — it only compares.
         """
         ...
 
-    def lane_worktree_readable(self, request: RecoveryRequest) -> bool:
-        """Is the lane's recovery worktree currently READABLE? (read-only, Redmine #13806 R3-F1)
+    def lane_free_of_live_process(self, request: RecoveryRequest) -> bool:
+        """Is the lane free of ANY foreign live process (busy OR idle)? (read-only, #13806 R3-F1)
 
-        The second ambient fence a **post-close resume** re-verifies before any owed launch /
-        send: byte preservation requires a *readable* worktree to relaunch the fresh worker into.
-        A post-close replay observes the old worker as absent (``identity_unknown``), so the entry
-        preflight's ``worktree_readable`` gate is short-circuited and never re-checked — this
-        re-reads the lane's worktree directly (old-slot-independent) and returns ``True`` only when
-        it resolves. Fail-closed: an unreadable worktree returns ``False`` so the resume stops zero
-        launch / send. A **dirty (but readable)** worktree is NOT unreadable — it is byte-preserved
-        and recovered, exactly as a fresh recovery does (the tranche D contract, IR j#79485 §4 /
-        ``assess_worker_recovery_preservation``); this fence is readability only, never a dirty
-        block.
-        """
-        ...
-
-    def lane_free_of_foreign_live(self, request: RecoveryRequest) -> bool:
-        """Is the lane free of a foreign PRODUCTIVE live process? (read-only, Redmine #13806 R3-F1)
-
-        The third ambient fence a **post-close resume** re-verifies (Design Consultation Answer
-        j#82708 block list): a *productive* live process (a busy provider / running tool-child)
-        occupying the lane's assigned name is foreign work the relaunch must never collide with.
-        Old-slot-independent: it scans for a productive live row at the lane's assigned name, not
-        the (absent) pinned old locator. The freshly relaunched recovery worker is IDLE (awaiting
-        its redispatch), not productive, so it never trips this fence — only genuine foreign work
-        does. An IDLE stale residue at the name is exactly what recover-stale recovers and is NOT
-        a foreign-live block. Returns ``True`` when the lane is free (safe to launch); ``False``
-        (fail-closed) when a productive live process is present or the inventory is unreadable.
+        The pre-**launch** liveness fence (Review j#82731 F2 / Answer j#82708 "foreign OR
+        productive live"). Re-joined immediately before the owed launch: at that point the old
+        worker is closed and the fresh worker is not yet launched, so ANY live process at the
+        lane's assigned name — busy OR idle — is foreign and the relaunch must never collide with
+        it. Returns ``True`` only when NO row at the assigned name is a live slot (a positive
+        shell-residue / terminal row — what recover-stale recovers — is not live and does not
+        fence). Old-slot-independent. Fail-closed: an unreadable inventory returns ``False``. This
+        is a pre-launch fence only; after the fresh worker is launched its own action-bound
+        attestation (not this scan) is what proves the live process at the name is ours.
         """
         ...
 
@@ -444,56 +441,14 @@ class StaleWorkerRecoveryUseCase:
         stored_worker = current.find_participant(worker_identity)
         if stored_worker is None or not worker_close_committed(stored_worker.phase):
             return None
-        # R3-F1 — re-verify the ambient lane authority before driving any owed launch / send.
-        # The durable transaction says the close committed, but the live lane lifecycle may have
-        # moved since (a coordinator re-owned / advanced the lane); relaunching a fresh worker
-        # into a lane the approval no longer governs is exactly what IR §3 (newer lifecycle ->
-        # zero-launch/zero-send) forbids. Each resume command re-checks it fresh (old-slot- and
-        # fresh-slot-independent), so it fences the launch AND the redispatch, never trusting the
-        # durable state alone. Fail-closed: an unreadable / absent / moved lifecycle stops here.
-        if not self._ops.lane_lifecycle_current(request):
-            return self._outcome(
-                request, verdict, status=RECOVERY_REFUSED, executed=True,
-                observation=observation, post_close_resume=True,
-                phase=current.phase, revision=current.revision,
-                detail=(
-                    "live lane lifecycle no longer matches the approved generation "
-                    "(moved / newer / unreadable); zero close / launch / send"
-                ),
-            )
-        # R3-F1 — the fresh worker relaunches into the lane's worktree, so byte preservation
-        # requires it to be READABLE. The entry preflight's worktree gate is short-circuited on a
-        # post-close absence (identity_unknown), so re-verify readability here, old-slot-
-        # independent. An UNREADABLE worktree fences the launch/send zero-effect (a dirty but
-        # readable worktree is byte-preserved and recovered, NOT blocked — the tranche D
-        # contract; this fence is readability only). A later re-run with a readable worktree
-        # resumes from the same durable owed state.
-        if not self._ops.lane_worktree_readable(request):
-            return self._outcome(
-                request, verdict, status=RECOVERY_REFUSED, executed=True,
-                observation=observation, post_close_resume=True,
-                phase=current.phase, revision=current.revision,
-                detail=(
-                    "lane recovery worktree is unreadable; byte preservation requires a "
-                    "readable worktree; zero close / launch / send"
-                ),
-            )
-        # R3-F1 (Design Consultation Answer j#82708) — a foreign PRODUCTIVE live process (a busy
-        # provider / running tool-child) occupying the lane's assigned name is live work the
-        # relaunch must never collide with. The entry preflight's not_productive gate is
-        # short-circuited on a post-close absence, so re-verify it here, old-slot-independent. The
-        # freshly relaunched recovery worker is idle (never productive), so this fences only
-        # genuine foreign work — an idle stale residue is what the recovery recovers, not a block.
-        if not self._ops.lane_free_of_foreign_live(request):
-            return self._outcome(
-                request, verdict, status=RECOVERY_REFUSED, executed=True,
-                observation=observation, post_close_resume=True,
-                phase=current.phase, revision=current.revision,
-                detail=(
-                    "a foreign productive live process occupies the lane; zero close / "
-                    "launch / send"
-                ),
-            )
+        # R3-F1 (Review j#82731) — the resume authority (live lane lifecycle + exact worktree
+        # token/branch + no foreign live process) is NOT snapshotted here at admission. A once-at-
+        # admission check is a stale snapshot: the lane could move between it and the effect. It is
+        # instead re-joined **action-time, immediately before each owed effect** — the launch
+        # (the actuator's ``launch_authority`` probe, injected in _execute) and the send
+        # (_redispatch, immediately before the transport). Admission only decides whether this is a
+        # resume at all (expected old-locator absence + a durable committed-close transaction for
+        # THIS exact approved recovery); the effect-bound fences decide whether it is safe to act.
         # §5 — the resume RE-approval anchor is a SEPARATE authority from the stored decision /
         # continuation anchor. A supplied ``resume_journal`` must be a complete Redmine pointer
         # (fail-closed, zero effect on a malformed one) and is recorded as the resume authority;
@@ -714,10 +669,20 @@ class StaleWorkerRecoveryUseCase:
             converged_supersede = True
 
         # 3. Drive the guarded close → launch → attest (tranche B actuator, byte-preserving).
+        # The actuator re-joins the exact live lane authority IMMEDIATELY before the (bounded-
+        # recovery) launch effect via ``launch_authority`` (Redmine #13806 R3-F1, Review j#82731):
+        # the lane lifecycle / worktree token / branch must be exact AND the lane free of any
+        # foreign live process, action-time — never a stale admission-time snapshot. Applies to a
+        # fresh recovery launch too (defence-in-depth); a legitimate one, having just closed the
+        # old slot under the pinned authority, passes.
         actuator = ReplacementActuatorUseCase(
             self._store, self._actuation_port, clock=self._clock,
             lease_ttl_seconds=self._ttl,
             preservation_policy=assess_worker_recovery_preservation,
+            launch_authority=lambda _pin: (
+                self._ops.resume_lane_authority(request)
+                and self._ops.lane_free_of_live_process(request)
+            ),
         )
         recov = actuator.drive_worker_recovery(
             key, holder=request.holder, expected_action_generation=gen,
@@ -744,7 +709,7 @@ class StaleWorkerRecoveryUseCase:
             )
 
         # 4. Fresh receiver attested — redispatch the ORIGINAL gate exactly once.
-        redis = self._redispatch(key, holder=request.holder, gen=gen)
+        redis = self._redispatch(key, request, holder=request.holder, gen=gen)
         final = self._store.get(key)
         status = (
             RECOVERY_COMPLETED
@@ -767,7 +732,7 @@ class StaleWorkerRecoveryUseCase:
 
     # -- redispatch leg (rides the tranche C drain discipline) ----------------
 
-    def _redispatch(self, key, *, holder, gen) -> str:
+    def _redispatch(self, key, request, *, holder, gen) -> str:
         """Redispatch the original durable gate exactly once (``replacing_nonself -> completed``).
 
         Reuses the tranche C drain's "record ``attempted`` (the phase move into
@@ -795,6 +760,15 @@ class StaleWorkerRecoveryUseCase:
             # attempted / uncertain and the gate is NOT confirmed — a send may be in flight.
             # Report uncertain; a later re-run re-checks the gate. Never blind-resend.
             return REDISPATCH_UNCERTAIN
+        # R3-F1 (Review j#82731) — re-join the exact live lane authority IMMEDIATELY before the
+        # send, action-time, BEFORE recording ``attempted``. A lane whose lifecycle / worktree
+        # token / branch moved since the launch must not receive the original gate — zero send,
+        # leaving the phase not-attempted so a later re-run re-joins and sends once authority is
+        # restored (never blind-sending into a lane the approval no longer governs). The lane-free-
+        # of-live fence is NOT applied here: the fresh worker is now live at the name by design;
+        # its own action-bound attestation (already confirmed) is what proves it is ours.
+        if not self._ops.resume_lane_authority(request):
+            return REDISPATCH_AUTHORITY_MOVED
         # not_attempted (phase replacing_nonself): record attempted (-> draining_continuation)
         # BEFORE the send, so a crash here resumes as uncertain rather than re-sending.
         attempt = self._store.transition_phase(
@@ -935,6 +909,7 @@ __all__ = (
     "REDISPATCH_GENERATION_MISMATCH",
     "REDISPATCH_NOT_FOUND",
     "REDISPATCH_CONTINUATION_UNREADABLE",
+    "REDISPATCH_AUTHORITY_MOVED",
     "RecoveryRequest",
     "RecoveryOutcome",
     "StaleWorkerRecoveryOps",

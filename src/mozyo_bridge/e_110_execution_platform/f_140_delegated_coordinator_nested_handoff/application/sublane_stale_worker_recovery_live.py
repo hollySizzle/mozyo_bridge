@@ -93,6 +93,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+    SLOT_LIVE,
     SLOT_STALE,
     classify_named_slot,
 )
@@ -509,16 +510,39 @@ class LiveStaleWorkerRecoveryOps:
         except Exception:  # noqa: BLE001 - unreadable worktree fails closed
             return False
 
-    def lane_lifecycle_current(self, request: RecoveryRequest) -> bool:
-        """Does the LIVE lane lifecycle still match the approval's pinned generation? (read-only)
+    @staticmethod
+    def _current_branch(path: str) -> str:
+        """The worktree's current branch name, or ``""`` (fail-closed). Read-only."""
+        import subprocess
 
-        The post-close resume re-verification (Redmine #13806 R3-F1): re-read the LIVE lane
-        lifecycle ``(revision, generation)`` for the approved lane and compare it — old-slot- and
-        fresh-slot-independent — to the approval's pinned ``lane_revision`` / ``lane_generation``.
-        Fail-closed: an unreadable / absent / moved lifecycle (or a request that carries no pinned
-        lane evidence — a destructive worker recovery always must, per R1-F2) returns ``False`` so
-        the resume stops before relaunching into a lane the approval no longer governs. Never
-        mutates the #13810 owner row — it only compares.
+        if not path or not Path(path).is_dir():
+            return ""
+        try:
+            result = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+                text=True, capture_output=True,
+            )
+        except OSError:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def resume_lane_authority(self, request: RecoveryRequest) -> bool:
+        """Is the lane's ambient authority EXACT and current, right now? (read-only, #13806 R3-F1)
+
+        Re-joins EVERY exact lane-authority axis (Review j#82731 F2 / Answer j#82708), old-slot-
+        independent, for the action-time launch / send fence:
+
+        - the LIVE lane lifecycle exists and its ``(revision, generation)`` equals the pinned
+          ``lane_revision`` / ``lane_generation``;
+        - the lifecycle's canonical ``worktree_identity`` token is non-empty AND equals the token
+          freshly derived from the recovery worktree (``derive_lane_workspace_token(repo_root)``) —
+          a sibling / wrong / moved worktree fails here;
+        - the recovery worktree resolves to a live git checkout AND its current branch equals the
+          lane's expected branch (the issue lane id IS its branch) — an unreadable worktree or a
+          drifted branch fails here.
+
+        Dirtiness is deliberately NOT an axis (Answer j#82708 Option A). Fail-closed: any absent /
+        mismatched axis returns ``False``.
         """
         pinned_rev = _norm(request.lane_revision)
         pinned_gen = _norm(request.lane_generation)
@@ -529,41 +553,48 @@ class LiveStaleWorkerRecoveryOps:
             LaneLifecycleKey,
             LaneLifecycleStore,
         )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
 
         try:
-            workspace_id = repo_scope_workspace_id(self.repo_root)
             record = LaneLifecycleStore(home=self.lifecycle_home).get(
-                LaneLifecycleKey(workspace_id, _norm_lane(request.lane))
+                LaneLifecycleKey(repo_scope_workspace_id(self.repo_root), _norm_lane(request.lane))
             )
         except (LaneLifecycleError, ValueError, OSError):
             return False
         if record is None:
             return False
-        return str(record.revision) == pinned_rev and str(record.lane_generation) == pinned_gen
-
-    def lane_worktree_readable(self, request: RecoveryRequest) -> bool:
-        """Is the lane's recovery worktree readable? (read-only, Redmine #13806 R3-F1)
-
-        The fresh worker relaunches into the recovery's target execution root (``repo_root``), so
-        byte preservation requires that worktree to be READABLE. Re-probed old-slot-independent on
-        a post-close resume (the absent old worker carries no row to read it from). Fail-closed: an
-        unresolvable worktree returns ``False``. Readability only — a dirty but readable worktree
-        is byte-preserved and recovered (the tranche D contract), never blocked here.
-        """
-        try:
-            return probe_worktree_resolved(str(self.repo_root)) is True
-        except Exception:  # noqa: BLE001 - an unreadable worktree fails closed
+        if str(record.revision) != pinned_rev or str(record.lane_generation) != pinned_gen:
             return False
+        # Exact worktree-token authority: the lane's canonical token must be present AND equal the
+        # token freshly derived from the recovery worktree (a wrong / sibling worktree differs).
+        pinned_token = _norm(record.worktree_identity)
+        if not pinned_token:
+            return False
+        try:
+            live_token = _norm(derive_lane_workspace_token(str(self.repo_root)))
+        except Exception:  # noqa: BLE001 - an underivable token fails closed
+            return False
+        if not live_token or live_token != pinned_token:
+            return False
+        # Readable worktree on the lane's expected branch (the issue lane id is the branch).
+        try:
+            if probe_worktree_resolved(str(self.repo_root)) is not True:
+                return False
+        except Exception:  # noqa: BLE001 - unreadable worktree fails closed
+            return False
+        return _norm_lane(self._current_branch(str(self.repo_root))) == _norm_lane(request.lane)
 
-    def lane_free_of_foreign_live(self, request: RecoveryRequest) -> bool:
-        """Is the lane free of a foreign PRODUCTIVE live process? (read-only, Redmine #13806 R3-F1)
+    def lane_free_of_live_process(self, request: RecoveryRequest) -> bool:
+        """Is the lane free of ANY foreign live process (busy OR idle)? (read-only, #13806 R3-F1)
 
-        Scan the live herdr inventory for a PRODUCTIVE (busy) row at the recovery's assigned name
-        (old-slot-independent — any row at the name, not the absent pinned old locator). The freshly
-        relaunched recovery worker is idle (awaiting redispatch), so a busy row at the name is
-        foreign work the relaunch must not collide with. Fail-closed: an unreadable inventory returns
-        ``False``. An idle stale residue at the name is NOT productive and does not fence the resume
-        (it is exactly what recover-stale recovers).
+        Scan the live herdr inventory for a LIVE slot at the recovery's assigned name (old-slot-
+        independent). A pre-launch fence: the old worker is closed and the fresh worker is not yet
+        launched, so ANY row at the name that classifies :data:`SLOT_LIVE` — busy OR idle — is a
+        foreign process the relaunch must not collide with. A positive shell-residue (:data:`SLOT_STALE`,
+        what recover-stale recovers) is not live and does not fence. Fail-closed: an unreadable
+        inventory returns ``False``.
         """
         try:
             rows = self._rows()
@@ -575,7 +606,7 @@ class LiveStaleWorkerRecoveryOps:
                 continue
             if _norm(row.get(AGENT_KEY_NAME)) != name:
                 continue
-            if _row_runtime_state(row) == RUNTIME_BUSY:
+            if classify_named_slot(row) == SLOT_LIVE:
                 return False
         return True
 

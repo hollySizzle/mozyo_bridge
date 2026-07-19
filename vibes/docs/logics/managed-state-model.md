@@ -851,14 +851,18 @@ observation に join し、次の typed decision を返す。
   absence（fresh-recovery preflight の `identity_unknown`）を **expected post-close state** として durable owed resume
   （launch → attest → 元 gate exactly-once redispatch）へ接続する。admission は **`identity_unknown`（expected old-locator
   absence）のみ**に閉じる: worktree unreadable/dirty・stale generation・productive・gateway/foreign 等の他 blocker は
-  old slot が resolve した real な current-state fence ゆえ resume で迂回せず block を維持する（R3-F1）。さらに **各 resume
-  command は owed launch/send の前に live lane lifecycle（revision, generation）・lane recovery worktree readability・
-  foreign productive-live 不在を再検証**（old-slot/fresh-slot 非依存、独立軸: readability / lifecycle / lease / liveness / identity）:
-  moved/newer/unreadable lifecycle・unreadable worktree・foreign productive live process（busy provider / running tool-child）は
-  zero close/launch/send で durable transaction を温存する（lease authority は actuator が effect 直前に再認証、foreign worker は
-  action-bound attestation も捕捉）。**dirty（but readable）worktree は byte 保存対象ゆえ block しない**（Design Consultation
-  Answer j#82708 Option A / tranche D contract, IR j#79485 §4 / `assess_worker_recovery_preservation`; 初回 close_owed と
-  retry launch_owed で同一 policy、launch failure timing で挙動を変えない）。durable transaction 不在 / `close_owed` 止まり / generation 相違は
+  old slot が resolve した real な current-state fence ゆえ resume で迂回せず block を維持する（R3-F1）。resume authority は
+  admission で snapshot せず、**各 owed effect の直前に action-time 再 join する**（Review j#82731 F1、`runtime-observability-boundary.md`
+  Action-Time Live Preflight Boundary）: (1) **launch 直前**は actuator の injected `launch_authority` が `resume_lane_authority`
+  （exact lane lifecycle rev/gen + canonical worktree token + expected branch）AND `lane_free_of_live_process`（assigned-name の
+  SLOT_LIVE 行=busy OR idle foreign を排除）を再 join、(2) **send 直前**は `_redispatch` が `resume_lane_authority` を再 join し、
+  attempted 記録前に stop（phase 非 attempted のまま→再 run で送達、blind send せず）。moved/newer lifecycle・wrong worktree
+  token・drifted branch・unreadable worktree・foreign live（busy/idle）は zero launch/send で durable transaction を温存
+  （lease は actuator が effect 直前に別途再認証、launch 後の自 fresh worker は action-bound attestation が正当性を証明）。
+  worktree readability は exact worktree-token authority の一部（単なる git-checkout 解決だけでは sibling/wrong worktree を通す）。
+  **dirty（but readable）worktree は byte 保存対象ゆえ authority 軸でない=block しない**（Design Consultation Answer j#82708
+  Option A / tranche D contract, IR j#79485 §4 / `assess_worker_recovery_preservation`; 初回 close_owed と retry launch_owed で
+  同一 policy、launch failure timing で挙動を変えない）。durable transaction 不在 / `close_owed` 止まり / generation 相違は
   resume と認めず block を維持する（新規 plan も blind launch もしない）。owner re-approval journal は
   stored decision/continuation anchor（同一 CAS identity を保つ `--journal`）と **別 pointer**（`--resume-journal`）で
   表し、same-action CAS と fresh durable approval を両立させる。

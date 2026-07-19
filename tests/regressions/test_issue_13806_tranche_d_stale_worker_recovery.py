@@ -160,26 +160,22 @@ class FakeRecoveryOps:
 
     def __init__(
         self, observation, *, send_result=DRAIN_SEND_OK, confirm_after_send=True,
-        already_landed=False, lane_lifecycle_current=True, lane_worktree_readable=True,
-        lane_free_of_foreign_live=True,
+        already_landed=False, resume_lane_authority=True, lane_free_of_live_process=True,
     ):
         self._observation = observation
         self.send_result = send_result
         self.confirm_after_send = confirm_after_send
         self.sends: list = []
         self._landed = already_landed
-        #: The live lane-lifecycle re-verification a post-close resume consults (R3-F1). Default
-        #: current; a test sets it False to simulate a moved / newer / unreadable lifecycle.
-        self._lane_lifecycle_current = lane_lifecycle_current
-        self.lifecycle_checks: list = []
-        #: The lane worktree readability re-verification a post-close resume consults (R3-F1).
-        #: Default readable; a test sets it False to simulate an unreadable worktree.
-        self._lane_worktree_readable = lane_worktree_readable
-        self.worktree_checks: list = []
-        #: The lane foreign-live re-verification a post-close resume consults (R3-F1). Default
-        #: free; a test sets it False to simulate a foreign productive live process.
-        self._lane_free_of_foreign_live = lane_free_of_foreign_live
-        self.foreign_live_checks: list = []
+        #: The exact action-time lane authority a resume re-joins immediately before each owed
+        #: effect (R3-F1). A bool (constant) or a list consumed per call (then default True) so a
+        #: test can make the authority move BETWEEN the launch and the send.
+        self._resume_lane_authority = resume_lane_authority
+        self.authority_checks: list = []
+        #: The pre-launch lane-free-of-live fence (R3-F1). Default free; a test sets it False to
+        #: simulate a foreign live process (busy OR idle) holding the lane's name.
+        self._lane_free_of_live_process = lane_free_of_live_process
+        self.free_of_live_checks: list = []
 
     def observe_target(self, request) -> RecoveryObservation:
         return self._observation
@@ -193,17 +189,16 @@ class FakeRecoveryOps:
     def gate_redispatched(self, continuation) -> bool:
         return self._landed
 
-    def lane_lifecycle_current(self, request) -> bool:
-        self.lifecycle_checks.append(request)
-        return self._lane_lifecycle_current
+    def resume_lane_authority(self, request) -> bool:
+        self.authority_checks.append(request)
+        v = self._resume_lane_authority
+        if isinstance(v, list):
+            return v.pop(0) if v else True
+        return v
 
-    def lane_worktree_readable(self, request) -> bool:
-        self.worktree_checks.append(request)
-        return self._lane_worktree_readable
-
-    def lane_free_of_foreign_live(self, request) -> bool:
-        self.foreign_live_checks.append(request)
-        return self._lane_free_of_foreign_live
+    def lane_free_of_live_process(self, request) -> bool:
+        self.free_of_live_checks.append(request)
+        return self._lane_free_of_live_process
 
 
 class _RecoveryCase(unittest.TestCase):
@@ -944,87 +939,85 @@ class PostCloseResumeTests(_RecoveryCase):
         self.assertEqual(self.port.launched, launched_before)
         self.assertEqual(ops.sends, [])
 
-    def test_newer_lane_lifecycle_blocks_admitted_resume_zero_launch_send(self):
-        # The expected old-locator absence IS admitted, but the live lane lifecycle has moved
-        # since the close committed (a coordinator re-owned / advanced the lane). Relaunching
-        # into a lane the approval no longer governs is exactly what IR §3 forbids — the resume
-        # re-verifies the lane authority before the owed launch/send and stops zero-effect.
+    def test_lane_authority_moved_blocks_launch_zero_effect(self):
+        # The expected old-locator absence IS admitted, but the exact lane authority (lifecycle /
+        # worktree token / branch) is moved when re-joined ACTION-TIME immediately before the
+        # launch — zero launch/send, the durable transaction preserved (Review j#82731 F1/F2).
         ops, _wk = self._committed_launch_owed()
         launched_before = list(self.port.launched)
         ops._observation = self._gone()  # identity_unknown => admitted
-        ops._lane_lifecycle_current = False  # but the lane lifecycle moved
+        ops._resume_lane_authority = False  # the lane authority moved
         outcome = self._use_case(ops).run(self._request(), execute=True)
-        self.assertEqual(outcome.status, RECOVERY_REFUSED)
-        self.assertTrue(outcome.post_close_resume)  # it WAS admitted, then re-verify blocked it
-        self.assertIn("lane lifecycle", outcome.detail)
-        self.assertTrue(ops.lifecycle_checks)  # the re-verification was consulted
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertIn("launch_authority_moved", outcome.detail)
+        self.assertTrue(ops.authority_checks)  # the authority was re-joined before the launch
         self.assertEqual(self.port.launched, launched_before)  # zero launch
         self.assertEqual(ops.sends, [])  # zero send
-        # the durable transaction is untouched — a later re-run (lifecycle restored) resumes
+        # a later re-run (authority restored) resumes from the same durable owed state
         self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
 
-    def test_admitted_resume_reverifies_lane_lifecycle_then_completes(self):
-        # The legitimate path: expected absence admitted, lane lifecycle still current — the
-        # resume re-verifies (consults the check) and completes.
+    def test_foreign_live_process_blocks_launch_zero_effect(self):
+        # Any foreign live process (busy OR idle) at the lane's name when re-joined immediately
+        # before the launch stops it zero-effect (Answer j#82708 "foreign OR productive live").
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()
+        ops._lane_free_of_live_process = False  # a foreign live process holds the name
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertIn("launch_authority_moved", outcome.detail)
+        self.assertTrue(ops.free_of_live_checks)  # the liveness fence was re-joined
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+
+    def test_authority_moves_between_launch_and_send_blocks_send_no_blind_send(self):
+        # THE effect-bound race (Review j#82731 F1): the authority is current at the launch but
+        # moves BEFORE the send. The launch/attest complete, but the send re-joins the authority
+        # action-time and stops zero-send, leaving the phase not-attempted so a later re-run (with
+        # authority restored) sends exactly once — never a blind send.
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        # authority: True for the launch probe, False for the send probe (moved in between).
+        ops._resume_lane_authority = [True, False]
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertTrue(first.post_close_resume)
+        # launched (the setup's failed attempt + this run's success) but...
+        self.assertEqual([i for _a, i in self.port.launched].count(_wk), 2)
+        self.assertEqual(ops.sends, [])  # ...NEVER sent (authority moved before the send)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)  # not-attempted, re-sendable
+        # authority restored (list drained -> default True); a re-run sends exactly once
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
+    def test_admitted_resume_reverifies_authority_effect_bound_then_completes(self):
+        # The legitimate path: expected absence admitted, authority exact and current at BOTH the
+        # launch and the send — the resume re-joins them action-time and completes.
         ops, _wk = self._committed_launch_owed()
         ops._observation = self._gone()
         outcome = self._use_case(ops).run(self._request(), execute=True)
         self.assertTrue(outcome.post_close_resume)
         self.assertEqual(outcome.status, RECOVERY_COMPLETED)
-        self.assertTrue(ops.lifecycle_checks)  # re-verified on the resume command
+        # authority re-joined both before the launch and before the send (>= 2 action-time checks)
+        self.assertGreaterEqual(len(ops.authority_checks), 2)
+        self.assertTrue(ops.free_of_live_checks)  # pre-launch liveness fence consulted
 
-    def test_unreadable_worktree_blocks_admitted_resume_zero_launch_send(self):
-        # The expected old-locator absence IS admitted and the lane lifecycle is current, but the
-        # recovery worktree is now UNREADABLE — byte preservation needs a readable worktree to
-        # relaunch into, so the resume re-verifies it before the owed launch/send and stops
-        # zero-effect (R3-F1), preserving the durable transaction for a later re-run.
-        ops, _wk = self._committed_launch_owed()
-        launched_before = list(self.port.launched)
-        ops._observation = self._gone()  # identity_unknown => admitted
-        ops._lane_worktree_readable = False  # but the worktree is unreadable
-        outcome = self._use_case(ops).run(self._request(), execute=True)
-        self.assertEqual(outcome.status, RECOVERY_REFUSED)
-        self.assertTrue(outcome.post_close_resume)  # admitted, then re-verify blocked it
-        self.assertIn("worktree is unreadable", outcome.detail)
-        self.assertTrue(ops.worktree_checks)  # the readability re-verification was consulted
-        self.assertEqual(self.port.launched, launched_before)  # zero launch
-        self.assertEqual(ops.sends, [])  # zero send
-        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)  # transaction intact
-
-    def test_foreign_productive_live_blocks_admitted_resume_zero_launch_send(self):
-        # A foreign PRODUCTIVE live process (a busy provider / running tool-child) occupies the
-        # lane — the relaunch must not collide with live work (Design Consultation Answer j#82708
-        # block list). The resume re-verifies it before the owed launch/send and stops
-        # zero-effect, preserving the transaction.
-        ops, _wk = self._committed_launch_owed()
-        launched_before = list(self.port.launched)
-        ops._observation = self._gone()  # identity_unknown => admitted
-        ops._lane_free_of_foreign_live = False  # a foreign productive process appeared
-        outcome = self._use_case(ops).run(self._request(), execute=True)
-        self.assertEqual(outcome.status, RECOVERY_REFUSED)
-        self.assertTrue(outcome.post_close_resume)
-        self.assertIn("foreign productive live process", outcome.detail)
-        self.assertTrue(ops.foreign_live_checks)
-        self.assertEqual(self.port.launched, launched_before)  # zero launch
-        self.assertEqual(ops.sends, [])  # zero send
-        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)  # transaction intact
-
-    def test_dirty_but_readable_worktree_resume_completes_byte_preserved(self):
-        # The tranche D byte-preservation contract holds on the resume too (Design Consultation
-        # Answer j#82708 Option A): a DIRTY (but readable) worktree is the un-durable-ized work the
-        # recovery exists to preserve — the readability fence passes (dirty != unreadable), no
-        # foreign-live is present, so the resume relaunches into it and completes, exactly as a
-        # fresh recovery does (test_stale_worker_with_dirty_unrecorded_worktree_closes_present_slot,
-        # the first-success path). Same conclusion for first-success AND retry-after-launch-failure
-        # — the launch-failure timing never changes the byte-preservation outcome. A dirty worktree
-        # is NEVER blocked by the post-close resume fence.
+    def test_dirty_but_readable_resume_completes_byte_preserved(self):
+        # The tranche D byte-preservation contract holds on the resume (Answer j#82708 Option A):
+        # a DIRTY (but readable) worktree is the un-durable-ized work the recovery preserves —
+        # dirtiness is not an authority axis, so with the lane authority exact and no foreign live
+        # process, the resume relaunches and completes, exactly as the first-success fresh-recovery
+        # path (test_stale_worker_with_dirty_unrecorded_worktree_closes_present_slot). The launch-
+        # failure timing never changes the byte-preservation outcome.
         ops, _wk = self._committed_launch_owed()
         ops._observation = self._gone()
-        ops._lane_worktree_readable = True  # dirty-but-readable is still readable
+        ops._resume_lane_authority = True  # dirtiness is not an axis => authority holds
         outcome = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(outcome.status, RECOVERY_COMPLETED)
-        self.assertTrue(ops.worktree_checks)
-        self.assertTrue(ops.foreign_live_checks)
 
     # -- §5 dual-anchor: resume re-approval is a separate authority from the CAS anchor ----
 

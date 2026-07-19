@@ -625,88 +625,132 @@ class LaunchArgvActionIdTest(unittest.TestCase):
         self.assertNotIn("--replacement-action-id", self._build(""))
 
 
-class LaneLifecycleCurrentTests(_LiveCase):
-    """R3-F1: the post-close resume re-verifies the LIVE lane lifecycle, old-slot-independent."""
+def _actual_branch():
+    import subprocess
 
-    def _declared_lane_home(self):
+    r = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True, capture_output=True,
+    )
+    return r.stdout.strip()
+
+
+def _root_token():
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        derive_lane_workspace_token,
+    )
+
+    return derive_lane_workspace_token(str(ROOT))
+
+
+class ResumeLaneAuthorityTests(_LiveCase):
+    """R3-F1 (Review j#82731 F2): the exact, effect-bound lane authority join.
+
+    Every axis is exact: lane lifecycle (rev/gen) + canonical worktree token + a readable worktree
+    on the lane's expected branch. ROOT (a real git checkout on its own branch) is the recovery
+    worktree, so the positive case pins the lane to ROOT's actual branch and token.
+    """
+
+    def _declared(self, *, lane, worktree_identity):
         from mozyo_bridge.core.state.lane_lifecycle import (
             LaneLifecycleKey,
             LaneLifecycleStore,
         )
 
         home = Path(tempfile.mkdtemp())
-        store = LaneLifecycleStore(home=home)
-        store.declare_active(
-            LaneLifecycleKey(WS, LANE),
+        LaneLifecycleStore(home=home).declare_active(
+            LaneLifecycleKey(WS, lane),
             decision=DecisionPointer(source="redmine", issue_id="13806", journal_id="79485"),
-            issue_id="13806",
+            issue_id="13806", worktree_identity=worktree_identity,
         )
-        # A freshly declared lane is revision 1 / generation 1.
-        return home
+        return home  # a freshly declared lane is revision 1 / generation 1
 
-    def _ops_with(self, home, **req):
+    def _ops(self, home, *, lane):
         return live.LiveStaleWorkerRecoveryOps(
-            repo_root=ROOT, request=_request(**req), lifecycle_home=home,
+            repo_root=ROOT, request=_request(lane=lane), lifecycle_home=home,
         )
 
-    def test_matching_lane_lifecycle_is_current(self):
-        home = self._declared_lane_home()
-        ops = self._ops_with(home, lane_revision="1", lane_generation="1")
-        self.assertTrue(ops.lane_lifecycle_current(_request(lane_revision="1", lane_generation="1")))
+    def _req(self, *, lane, rev="1", gen="1"):
+        return _request(lane=lane, lane_revision=rev, lane_generation=gen)
 
-    def test_moved_generation_is_not_current(self):
-        home = self._declared_lane_home()
-        ops = self._ops_with(home, lane_revision="1", lane_generation="1")
-        # The approval pinned generation 2, but the live lane is at generation 1 (moved/mismatch).
-        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="1", lane_generation="2")))
+    def test_exact_authority_all_axes_current_is_authorized(self):
+        branch = _actual_branch()
+        home = self._declared(lane=branch, worktree_identity=_root_token())
+        self.assertTrue(self._ops(home, lane=branch).resume_lane_authority(self._req(lane=branch)))
 
-    def test_moved_revision_is_not_current(self):
-        home = self._declared_lane_home()
-        ops = self._ops_with(home, lane_revision="9", lane_generation="1")
-        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="9", lane_generation="1")))
+    def test_moved_generation_is_not_authorized(self):
+        branch = _actual_branch()
+        home = self._declared(lane=branch, worktree_identity=_root_token())
+        self.assertFalse(
+            self._ops(home, lane=branch).resume_lane_authority(self._req(lane=branch, gen="2"))
+        )
 
-    def test_absent_lane_lifecycle_is_not_current(self):
-        # An empty (isolated) lifecycle store — the lane the approval pinned is not backed at all.
-        home = Path(tempfile.mkdtemp())
-        ops = self._ops_with(home, lane_revision="1", lane_generation="1")
-        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="1", lane_generation="1")))
+    def test_wrong_worktree_token_is_not_authorized(self):
+        # Lifecycle rev/gen + branch match, but the canonical worktree token is a SIBLING/wrong
+        # worktree's — a sibling checkout must not read as authorized (Review j#82731 F2).
+        branch = _actual_branch()
+        home = self._declared(lane=branch, worktree_identity="wt_deadbeefdeadbeef")
+        self.assertFalse(self._ops(home, lane=branch).resume_lane_authority(self._req(lane=branch)))
 
-    def test_missing_pinned_lane_evidence_is_not_current(self):
-        home = self._declared_lane_home()
-        ops = self._ops_with(home, lane_revision="", lane_generation="")
-        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="", lane_generation="")))
+    def test_empty_worktree_token_is_not_authorized(self):
+        branch = _actual_branch()
+        home = self._declared(lane=branch, worktree_identity="")
+        self.assertFalse(self._ops(home, lane=branch).resume_lane_authority(self._req(lane=branch)))
 
+    def test_branch_drift_is_not_authorized(self):
+        # Lifecycle + token match, but the lane's expected branch is NOT ROOT's actual branch — a
+        # drifted / wrong branch must not read as authorized (Review j#82731 F2).
+        other = "issue_13806_some_other_branch"
+        home = self._declared(lane=other, worktree_identity=_root_token())
+        self.assertFalse(self._ops(home, lane=other).resume_lane_authority(self._req(lane=other)))
 
-class LaneWorktreeReadableTests(_LiveCase):
-    """R3-F1: the post-close resume re-verifies the lane recovery worktree is readable."""
+    def test_absent_lifecycle_is_not_authorized(self):
+        home = Path(tempfile.mkdtemp())  # empty store
+        branch = _actual_branch()
+        self.assertFalse(self._ops(home, lane=branch).resume_lane_authority(self._req(lane=branch)))
 
-    def test_real_checkout_is_readable(self):
-        # ROOT is a real git checkout — the recovery worktree resolves.
-        ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
-        self.assertTrue(ops.lane_worktree_readable(_request()))
+    def test_missing_pinned_lane_evidence_is_not_authorized(self):
+        branch = _actual_branch()
+        home = self._declared(lane=branch, worktree_identity=_root_token())
+        self.assertFalse(
+            self._ops(home, lane=branch).resume_lane_authority(
+                _request(lane=branch, lane_revision="", lane_generation="")
+            )
+        )
 
-    def test_nonexistent_worktree_is_unreadable_fail_closed(self):
+    def test_nonexistent_worktree_is_not_authorized(self):
+        branch = _actual_branch()
+        home = self._declared(lane=branch, worktree_identity=_root_token())
         ops = live.LiveStaleWorkerRecoveryOps(
-            repo_root=Path("/nonexistent/mozyo_recovery_xyz"), request=_request(),
+            repo_root=Path("/nonexistent/mozyo_recovery_xyz"),
+            request=_request(lane=branch), lifecycle_home=home,
         )
-        self.assertFalse(ops.lane_worktree_readable(_request()))
+        self.assertFalse(ops.resume_lane_authority(self._req(lane=branch)))
 
 
-class LaneFreeOfForeignLiveTests(_LiveCase):
-    """R3-F1: the post-close resume re-verifies no foreign PRODUCTIVE process holds the lane."""
+class LaneFreeOfLiveProcessTests(_LiveCase):
+    """R3-F1 (Review j#82731 F2): a pre-launch fence blocking ANY live (busy OR idle) foreign row."""
 
     def test_empty_inventory_is_free(self):
-        self.assertTrue(self._ops([]).lane_free_of_foreign_live(_request()))
+        self.assertTrue(self._ops([]).lane_free_of_live_process(_request()))
 
-    def test_idle_stale_residue_at_name_is_free(self):
-        # An IDLE (unknown / not-busy) row at the name is stale residue — NOT a foreign-live block
-        # (it is exactly what recover-stale recovers).
-        self.assertTrue(self._ops([_row(status="unknown")]).lane_free_of_foreign_live(_request()))
+    def test_stale_shell_residue_at_name_is_free(self):
+        # A positive shell-residue (blank agent + unknown status = SLOT_STALE) is what recover-stale
+        # recovers — not a live process, so it does not fence the launch.
+        self.assertTrue(self._ops([_row(agent="", status="unknown")]).lane_free_of_live_process(_request()))
 
-    def test_productive_process_at_name_is_not_free(self):
-        # A BUSY (working) row at the assigned name is foreign live work — fail-closed.
+    def test_busy_process_at_name_is_not_free(self):
         self.assertFalse(
-            self._ops([_row(agent="claude", status="working")]).lane_free_of_foreign_live(_request())
+            self._ops([_row(agent="claude", status="working")]).lane_free_of_live_process(_request())
+        )
+
+    def test_idle_but_live_foreign_process_at_name_is_not_free(self):
+        # THE F2 gap: an IDLE but LIVE foreign row (a detected agent at a different locator) is
+        # SLOT_LIVE and must block — an idle foreign process is not a safe residue.
+        self.assertFalse(
+            self._ops([_row(agent="codex", status="idle", pane_id="w99:p99")]).lane_free_of_live_process(
+                _request()
+            )
         )
 
     def test_unreadable_inventory_is_not_free_fail_closed(self):
@@ -715,7 +759,7 @@ class LaneFreeOfForeignLiveTests(_LiveCase):
 
         live.list_herdr_agent_rows = boom
         ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
-        self.assertFalse(ops.lane_free_of_foreign_live(_request()))
+        self.assertFalse(ops.lane_free_of_live_process(_request()))
 
 
 if __name__ == "__main__":
