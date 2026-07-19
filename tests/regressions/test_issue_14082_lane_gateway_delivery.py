@@ -97,12 +97,31 @@ class _FakeTurnStartResult:
         self.outcome = outcome
 
 
-class _FakeRail:
-    """A turn-start rail stub recording (locator, text) and returning a chosen outcome."""
+# A benign readable composer that matches NO provider's declared startup_blockers -> admitted.
+_ADMITTED_PANE = "> \n(the composer is ready for input)"
+# The exact workspace-trust startup screen a fresh Claude renders (agent_provider_profiles.yaml
+# `workspace_trust_confirmation`) — a live, non-blank, ready-LOOKING pane with no composer.
+_TRUST_SCREEN_PANE = (
+    "Is this a project you created or one you trust?\n"
+    "Claude will be able to read, edit, and execute files here."
+)
 
-    def __init__(self, outcome=OUTCOME_STARTED):
+
+class _FakeRail:
+    """A turn-start rail stub: records reads + (locator, text) drives, returns a chosen outcome."""
+
+    def __init__(self, outcome=OUTCOME_STARTED, *, pane_content=_ADMITTED_PANE, read_error=False):
         self.outcome = outcome
+        self.pane_content = pane_content
+        self.read_error = read_error
         self.calls = []
+        self.reads = []
+
+    def read_visible_pane(self, locator):
+        self.reads.append(locator)
+        if self.read_error:
+            raise RuntimeError("visible-pane read failed")
+        return self.pane_content
 
     def drive_turn_start(self, locator, text, **kw):
         self.calls.append((locator, text))
@@ -206,6 +225,50 @@ class DedicatedBackgroundTransportTest(unittest.TestCase):
             )
         self.assertEqual(result.reason, "target_unavailable")
         self.assertEqual(rail.calls, [])  # never driven without a locator
+
+    # --- Redmine #14082 R2 (review j#82572): the #13760 pre-send startup admission gate ---
+
+    def test_startup_screen_is_zero_send_receiver_startup_required(self) -> None:
+        # A trust / first-run / login startup screen snapshots as idle-LOOKING but has no composer:
+        # the seam must classify the receiver's VISIBLE pane and REFUSE zero-send (never drive the
+        # rail into it), distinct from a busy precondition. Uses the real evaluator + real Claude
+        # provider profile (which declares the workspace-trust startup screen).
+        rail = _FakeRail(OUTCOME_STARTED, pane_content=_TRUST_SCREEN_PANE)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(
+                object(), self._target(receiver="claude")
+            )
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "receiver_startup_interaction_required")
+        self.assertEqual(rail.calls, [])  # the rail was NEVER driven — zero text, zero Enter
+        self.assertEqual(rail.reads, ["wGW:pGW"])  # the visible pane WAS classified
+
+    def test_unreadable_pane_is_zero_send_target_unavailable(self) -> None:
+        # An unreadable visible pane never decays to "startup clear": fail-closed zero-send, rail 0.
+        rail = _FakeRail(OUTCOME_STARTED, read_error=True)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(object(), self._target())
+        self.assertEqual(result.reason, "target_unavailable")
+        self.assertEqual(rail.calls, [])
+
+    def test_unknown_provider_is_zero_send_target_unavailable(self) -> None:
+        # A receiver that resolves to no registered provider profile fails closed (never assume it
+        # has no startup screen), rail 0.
+        rail = _FakeRail(OUTCOME_STARTED)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(
+                object(), self._target(receiver="not_a_provider")
+            )
+        self.assertEqual(result.reason, "target_unavailable")
+        self.assertEqual(rail.calls, [])
+
+    def test_admitted_readable_composer_drives_rail(self) -> None:
+        # A benign readable composer matching NO declared startup screen is admitted and driven once.
+        rail = _FakeRail(OUTCOME_STARTED, pane_content=_ADMITTED_PANE)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(object(), self._target())
+        self.assertEqual(result.status, "sent")
+        self.assertEqual(len(rail.calls), 1)  # driven exactly once, AFTER admission
 
 
 # ---------------------------------------------------------------------------

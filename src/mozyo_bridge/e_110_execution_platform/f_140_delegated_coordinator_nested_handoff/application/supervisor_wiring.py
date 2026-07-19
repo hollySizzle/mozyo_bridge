@@ -220,7 +220,11 @@ def default_background_transport(ws: SupervisedWorkspace):
 
     The rail is resolved once from the target workspace's repo-local ``terminal_transport`` config; an
     unreadable config / unsupported backend is a fail-closed ``target_unavailable`` (bounded retry),
-    never a raw-Herdr fallback. The rail is injectable for tests via ``resolve_turn_start_rail``.
+    never a raw-Herdr fallback. Immediately before driving the rail — mirroring the ``handoff send``
+    boundary — it runs the #13760 pre-send startup admission (a trust / first-run / login screen is a
+    zero-send ``receiver_startup_interaction_required``, an unreadable / unprofiled receiver a zero-send
+    ``target_unavailable``), so a blind Enter never lands on a startup screen. The rail is injectable
+    for tests via ``resolve_turn_start_rail``.
     """
     from pathlib import Path as _Path
 
@@ -237,6 +241,10 @@ def default_background_transport(ws: SupervisedWorkspace):
     )
     from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
         RepoLocalConfigError,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (
+        ADMISSION_BLOCKED,
+        evaluate_startup_admission,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (
         resolve_turn_start_rail,
@@ -277,6 +285,27 @@ def default_background_transport(ws: SupervisedWorkspace):
             locator = str(target.locator or "").strip()
             if not locator:
                 return HandoffDeliveryResult("blocked", "target_unavailable")
+            # Redmine #14082 R2 (review j#82572): run the #13760 pre-send startup admission — the SAME
+            # action-time hard gate the `handoff send` boundary runs before its first keystroke — so
+            # this dedicated seam closes the bypass inside itself rather than inheriting it. The rail's
+            # own precondition gate rejects a BUSY pane, but a trust / first-run / login startup screen
+            # snapshots as idle-LOOKING yet has no composer, so a blind Enter would accept its default
+            # and destroy an existing request. Classify the receiver's VISIBLE pane against the
+            # provider's declared startup screens through the rail's read-only borrow; a match →
+            # ``receiver_startup_interaction_required`` and an unreadable / unprofiled provider →
+            # ``target_unavailable`` — every non-admit is a ZERO-send refusal (the rail is NEVER driven),
+            # distinct from a busy precondition. Both reasons are deterministic pre-injection, so the
+            # bounded retry can never duplicate (re-refuse, or deliver once after an operator clears it).
+            admission = evaluate_startup_admission(
+                provider_id=receiver, read_visible=lambda: rail.read_visible_pane(locator)
+            )
+            if not admission.admitted:
+                reason = (
+                    "receiver_startup_interaction_required"
+                    if admission.outcome == ADMISSION_BLOCKED
+                    else "target_unavailable"
+                )
+                return HandoffDeliveryResult("blocked", reason)
             try:
                 result = rail.drive_turn_start(locator, f"{marker} {body}")
             except Exception:  # noqa: BLE001 - a rail blow-up mid-drive is fail-safe uncertain
