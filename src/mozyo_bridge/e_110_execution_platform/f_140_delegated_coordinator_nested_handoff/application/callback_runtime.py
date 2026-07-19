@@ -34,6 +34,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RedmineJournalSource,
     markers_from_source,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
+    LANE_GATEWAY_GATES,
+    LaneGatewaySendPlan,
+    plan_lane_gateway_sends,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     OwningLaneBinding,
     ReviewReturnPlan,
@@ -55,6 +60,7 @@ def discover_candidates(
     target_lane: str = "",
     target_receiver: str = "",
     target_generation: str = "",
+    exclude_gates: "frozenset[str] | tuple[str, ...]" = (),
 ) -> list[CallbackCandidate]:
     """Discover callback candidates from a source issue's structured gate markers (#13520 F1-R1).
 
@@ -66,9 +72,17 @@ def discover_candidates(
     downstream by the outbox UNIQUE fence (re-discovering the same gate enqueues no new row). A
     read failure propagates to the caller (the processor's ingest handles it fail-closed per
     candidate); an issue with no gate marker yields ``[]`` (nothing to deliver — never a guess).
+
+    ``exclude_gates`` (Redmine #13683 R2, design answer j#82367 B) drops markers whose gate kind is in
+    the set from the coordinator route — the worker-produced ``implementation_done`` / ``review_request``
+    gates are routed to the same-lane gateway via :func:`discover_lane_gateway_sends` instead, so
+    routing them to the coordinator too would be a forbidden double wake.
     """
+    excluded = frozenset(str(g or "").strip() for g in (exclude_gates or ()))
     candidates: list[CallbackCandidate] = []
     for marker in markers_from_source(source, issue):
+        if str(getattr(marker, "gate", "") or "").strip() in excluded:
+            continue
         candidates.append(
             CallbackCandidate(
                 issue=str(marker.issue).strip(),
@@ -136,6 +150,58 @@ def discover_review_returns(
                 payload=encode_review_return_payload(
                     plan.review_request_journal, plan.target_head, plan.conclusion
                 ),
+                workspace_id=str(workspace_id or "").strip(),
+                target_lane=plan.target_lane,
+                target_receiver=plan.target_receiver,
+                target_generation=plan.target_generation,
+            )
+        )
+    return candidates, plans
+
+
+def discover_lane_gateway_sends(
+    source: RedmineJournalSource,
+    issue: str,
+    owner: OwningLaneBinding,
+    *,
+    workspace_id: str = "",
+    dispatch_anchor_journal: Optional[str] = None,
+) -> tuple[list[CallbackCandidate], list[LaneGatewaySendPlan]]:
+    """Discover same-lane gateway wake candidates for a worker's gate markers (Redmine #13683 R2).
+
+    Reads the issue's structured markers and asks the pure
+    :func:`...domain.lane_gateway_route.plan_lane_gateway_sends` policy which ``implementation_done`` /
+    ``review_request`` gate should wake its OWN owning-lane implementation_gateway (the same-lane Codex
+    reviewer), given ``owner`` (the #13681/#13689 owning-lane binding + generation + gateway receiver the
+    caller resolved). Only an emitting plan becomes a :class:`CallbackCandidate` — carrying the distinct
+    ``lane_gateway:<lane>`` route (a separate idempotency key from the coordinator + review_return
+    callbacks) and the durable expected target tuple (lane / gateway receiver / owning-lane generation)
+    the background_service delivery authority binds the re-resolved live target + independently-read live
+    generation to.
+
+    ``dispatch_anchor_journal`` is the current owning lane+generation's dispatch anchor. When supplied
+    (the fenced production supervisor) a gate marker predating it is a previous-generation gate and is
+    refused (not enqueued); ``None`` leaves discovery unfenced; a supplied-but-unresolvable anchor
+    (``""``) fails closed. Returns ``(candidates, plans)``: the candidates to enqueue plus every plan
+    (incl. refusals) so the caller can surface why nothing was sent (observability). A read failure
+    propagates to the caller (handled fail-closed downstream); no worker gate yields no candidate.
+    """
+    markers = markers_from_source(source, issue)
+    plans = list(
+        plan_lane_gateway_sends(
+            markers, issue, owner, dispatch_anchor_journal=dispatch_anchor_journal
+        )
+    )
+    candidates: list[CallbackCandidate] = []
+    for plan in plans:
+        if not plan.emit:
+            continue
+        candidates.append(
+            CallbackCandidate(
+                issue=str(issue).strip(),
+                journal=str(plan.gate_journal).strip(),
+                callback_route=plan.callback_route,
+                notification_kind=plan.gate,
                 workspace_id=str(workspace_id or "").strip(),
                 target_lane=plan.target_lane,
                 target_receiver=plan.target_receiver,
@@ -215,6 +281,7 @@ __all__ = (
     "DEFAULT_CALLBACK_ROUTE",
     "discover_candidates",
     "discover_review_returns",
+    "discover_lane_gateway_sends",
     "run_once",
     "watch",
 )

@@ -308,6 +308,12 @@ class IssueSupervisionOutcome:
     #: generation, uncorrelated). Secret-safe reason tokens only (no pane id / path / credential), so
     #: an operator sees a fail-closed zero-send is a deliberate refusal, not a silent drop.
     review_return_refusals: tuple[str, ...] = ()
+    #: The fixed-vocabulary same-lane-gateway routing refusal reasons for this issue (Redmine #13683 R2):
+    #: why a worker's implementation_done / review_request was NOT routed to its owning-lane gateway
+    #: (no active owner, ambiguous, coordinator self-route, no gateway, blank / previous generation).
+    #: Secret-safe reason tokens only, so a fail-closed zero-send is an operator-visible deliberate
+    #: refusal (design answer j#82367), not a silent drop.
+    lane_gateway_refusals: tuple[str, ...] = ()
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -321,6 +327,7 @@ class IssueSupervisionOutcome:
             "historical_fenced": self.historical_fenced,
             "error": self.error,
             "review_return_refusals": list(self.review_return_refusals),
+            "lane_gateway_refusals": list(self.lane_gateway_refusals),
         }
 
 

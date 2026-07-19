@@ -29,7 +29,12 @@ from typing import Callable, Optional
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
     DEFAULT_CALLBACK_ROUTE,
+    discover_lane_gateway_sends,
     discover_review_returns,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
+    is_lane_gateway_route,
+    make_lane_gateway_send_edge_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     OWNER_RESOLVED,
@@ -144,7 +149,12 @@ def owning_lane_generation_reader(
     wsid = str(workspace_id or "").strip()
 
     def _read(row: CallbackOutboxRow) -> str:
-        if not is_review_return_route(str(getattr(row, "callback_route", "") or "")):
+        route = str(getattr(row, "callback_route", "") or "")
+        # #13683 R2: the lane_gateway route (worker gate -> same-lane gateway) needs the SAME
+        # independent live-generation authority as review_return — read the owning lane's current
+        # revision so a supersession (owner switched) or a same-lane revision bump zero-sends the stale
+        # row at authorize_background_delivery. Any other route stays blank (Phase A fail-closed).
+        if not (is_review_return_route(route) or is_lane_gateway_route(route)):
             return ""
         issue = str(getattr(row, "issue", "") or "").strip()
         target_lane = str(getattr(row, "target_lane", "") or "").strip()
@@ -273,6 +283,42 @@ def discover_fenced_review_returns(
         return (), (REVIEW_RETURN_OWNER_READ_ERROR,)
 
 
+#: A lane_gateway discovery pass whose owning-lane binding read raised (fail-open per issue): the issue
+#: pass records this single refusal token and returns no candidate, never aborting the sweep.
+LANE_GATEWAY_OWNER_READ_ERROR = "lane_gateway_owner_binding_read_error"
+
+
+def discover_fenced_lane_gateway_sends(
+    owner_binding_fn: Callable[[str, str, object], OwningLaneBinding],
+    source: object,
+    *,
+    workspace_id: str,
+    issue: str,
+    binding: object,
+    fence_active: bool,
+    anchor: object,
+) -> "tuple[tuple, tuple[str, ...]]":
+    """Resolve the issue owner + discover generation-fenced lane_gateway candidates (Redmine #13683 R2).
+
+    Returns ``(candidates, refusal_reasons)``. The worker's ``implementation_done`` / ``review_request``
+    gates route to the issue's OWN owning-lane implementation_gateway (design answer j#82367), so this
+    resolves the same #13681/#13689 owning-lane binding the review_return path uses and threads the
+    current dispatch anchor (:func:`review_return_discovery_anchor`) so a gate predating the current lane
+    generation is refused at discovery (0-enqueue). The refusal reasons are surfaced for observability (a
+    fail-closed zero-send is not a silent drop). Fail-open per issue: an owner-read failure yields no
+    candidate + a single :data:`LANE_GATEWAY_OWNER_READ_ERROR` token, never aborting the issue pass.
+    """
+    try:
+        owner = owner_binding_fn(workspace_id, issue, binding)
+        candidates, plans = discover_lane_gateway_sends(
+            source, issue, owner, workspace_id=workspace_id,
+            dispatch_anchor_journal=review_return_discovery_anchor(fence_active, anchor),
+        )
+        return tuple(candidates), tuple(p.reason for p in plans if not p.emit)
+    except Exception:  # noqa: BLE001 - an owner-read failure never aborts the issue pass
+        return (), (LANE_GATEWAY_OWNER_READ_ERROR,)
+
+
 def review_return_discovery_anchor(fence_active: bool, anchor: object) -> "Optional[str]":
     """The dispatch anchor to thread into review_return discovery (Redmine #13974).
 
@@ -329,6 +375,10 @@ def build_supervisor_send_edge_fence(
         make_review_return_send_edge_fence(
             anchor, current_review_head, current_review_request, current_review_conclusion
         ),
+        # #13683 R2: also terminally fence a pre-existing / recovered lane_gateway backlog row whose
+        # worker gate predates the current dispatch anchor (a previous-generation gate on a restarted
+        # lane), each route-fence exempt on the others' rows so at most one fires per row.
+        make_lane_gateway_send_edge_fence(anchor),
     )
 
 
@@ -647,6 +697,8 @@ __all__ = (
     "resolve_current_review_identity",
     "build_supervisor_send_edge_fence",
     "discover_fenced_review_returns",
+    "discover_fenced_lane_gateway_sends",
+    "LANE_GATEWAY_OWNER_READ_ERROR",
     "resolve_lane_facts",
     "resolve_dispatch_anchor",
     "build_candidate_anchor_fn",
