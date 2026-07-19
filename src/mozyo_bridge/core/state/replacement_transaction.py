@@ -45,7 +45,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_STALE_REVISION,
     CAS_UNEXPECTED_STATE,
     PARTICIPANT_PHASES,
+    PHASE_DRAINING_CONTINUATION,
     PHASE_PLANNED,
+    PHASE_REPLACING_NONSELF,
     TRANSACTION_PHASES,
     CasOutcome,
     ContinuationPointer,
@@ -63,6 +65,13 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     transaction_transition_allowed,
     validate_participants,
 )
+from mozyo_bridge.core.state.replacement_transaction_rows import (
+    _is_pristine_replan,
+    _locked_row,
+    _record,
+    _require_exact_generation,
+    _rollback,
+)
 from mozyo_bridge.core.state.replacement_transaction_schema import (
     COLUMNS as _COLUMNS,
     READONLY_COMPONENT_ABSENT,
@@ -77,116 +86,6 @@ from mozyo_bridge.core.state.replacement_transaction_schema import (
     readonly_component_status,
     replacement_transaction_path,
 )
-
-
-# -- row plumbing ------------------------------------------------------------
-
-
-def _record(row: Sequence[object]) -> ReplacementTransactionRecord:
-    return ReplacementTransactionRecord(
-        workspace_id=str(row[0]),
-        action_id=str(row[1]),
-        action_generation=int(row[2]),
-        phase=str(row[3]),
-        revision=int(row[4]),
-        decision_source=str(row[5] or ""),
-        decision_issue_id=str(row[6] or ""),
-        decision_journal=str(row[7] or ""),
-        continuation_source=str(row[8] or ""),
-        continuation_issue_id=str(row[9] or ""),
-        continuation_journal=str(row[10] or ""),
-        continuation_expected_gate=str(row[11] or ""),
-        continuation_next_action=str(row[12] or ""),
-        participants_manifest=str(row[13] or ""),
-        lease_holder=str(row[14] or ""),
-        lease_epoch=int(row[15]),
-        lease_expires_at=str(row[16] or ""),
-        created_at=str(row[17]),
-        updated_at=str(row[18]),
-    )
-
-
-def _locked_row(
-    conn: sqlite3.Connection, key: ReplacementTransactionKey
-) -> Optional[ReplacementTransactionRecord]:
-    """Read the row inside the already-open ``BEGIN IMMEDIATE`` write lock."""
-    row = conn.execute(
-        f"SELECT {_COLUMNS} FROM {_TABLE} WHERE workspace_id = ? AND action_id = ?",
-        key.as_row(),
-    ).fetchone()
-    return _record(row) if row is not None else None
-
-
-def _rollback(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ROLLBACK")
-    except sqlite3.DatabaseError:
-        pass
-
-
-def _require_exact_generation(value: object) -> int:
-    """Validate an effect's ``expected_action_generation`` as a positive exact int.
-
-    An authority token is never compared by Python numeric equality (Redmine #13806 R2-F2):
-    ``7 == 7.0`` and ``1 == True`` fold, so a ``float`` / ``bool`` / string generation token
-    would slip through a bare ``!=`` fence and be accepted as an approved exact generation.
-    This rejects any non-``int`` (``bool`` is an ``int`` subclass and is not a generation) or
-    non-positive value BEFORE any DB read/write, mirroring ``plan_transaction``'s
-    ``action_generation`` validation and the manifest / component-version bool-float
-    fail-closed discipline. Raising (not a zero-write outcome) is deliberate: a malformed
-    token is a caller type error, exactly as ``plan_transaction`` treats a malformed
-    ``action_generation`` — distinct from a well-formed but *stale* generation, which is the
-    :data:`CAS_GENERATION_MISMATCH` zero-write path.
-    """
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(
-            "expected_action_generation must be an exact integer, "
-            f"got {type(value).__name__}"
-        )
-    if value < 1:
-        raise ValueError("expected_action_generation is a positive counter (>= 1)")
-    return value
-
-
-def _is_pristine_replan(
-    existing: ReplacementTransactionRecord,
-    *,
-    action_generation: int,
-    decision: DecisionPointer,
-    continuation: ContinuationPointer,
-    participants_manifest: str,
-) -> bool:
-    """Is ``existing`` a *genuinely untouched* exact-header duplicate? (the idempotency test)
-
-    Idempotent no-op requires BOTH an exact header/manifest match AND a pristine row
-    (Redmine #13806 R1-F5): the row is still at :data:`PHASE_PLANNED`, at its initial
-    revision 1, and holds no lease (``lease_holder`` empty, ``lease_epoch`` 0). The manifest
-    match already asserts every participant is ``close_owed`` (a fresh plan's manifest is
-    all-``close_owed``); the pristine gate additionally excludes a row that has been
-    **claimed or phase-advanced** without moving a participant. Reporting an in-flight,
-    lease-held authority row as an ``applied`` re-plan would let a caller mistake a claimed
-    transaction for a fresh, untouched one — so anything short of pristine is
-    :data:`CAS_ALREADY_DECLARED`, never a silent success.
-    """
-    header_matches = (
-        existing.action_generation == action_generation
-        and existing.decision_source == decision.source
-        and existing.decision_issue_id == decision.issue_id
-        and existing.decision_journal == decision.journal_id
-        and existing.continuation_source == continuation.source
-        and existing.continuation_issue_id == continuation.issue_id
-        and existing.continuation_journal == continuation.journal_id
-        and existing.continuation_expected_gate == continuation.expected_gate
-        and existing.continuation_next_action == continuation.next_semantic_action
-        and existing.participants_manifest == participants_manifest
-    )
-    pristine = (
-        existing.phase == PHASE_PLANNED
-        and existing.revision == 1
-        and existing.lease_holder == ""
-        and existing.lease_epoch == 0
-    )
-    return header_matches and pristine
 
 
 # -- store -------------------------------------------------------------------
@@ -787,6 +686,87 @@ class ReplacementTransactionStore:
             _rollback(conn)
             raise ReplacementTransactionError(
                 f"replacement transaction phase move failed ({type(exc).__name__}); "
+                f"fail closed"
+            ) from exc
+        finally:
+            conn.close()
+
+    def release_drain_attempt(
+        self,
+        key: ReplacementTransactionKey,
+        *,
+        expected_revision: int,
+        expected_action_generation: int,
+        holder: str,
+        now: Optional[str] = None,
+    ) -> CasOutcome:
+        """Un-record a not-yet-sent drain attempt: ``draining_continuation -> replacing_nonself``.
+
+        The one deliberate, guarded *reverse* move (Redmine #13806 R3 Review j#82760 F1). The
+        continuation-drain records ``attempted`` (``-> draining_continuation``) BEFORE the send so
+        a crash mid-transport resumes as ``uncertain`` and never blind-resends. But when the caller
+        re-joins the live lane authority as the LAST check immediately before the transport and
+        finds it moved, it returns WITHOUT sending — the send provably did not happen. Leaving the
+        phase at ``draining_continuation`` would make a re-run mistake it for a send-in-flight and
+        stick at ``uncertain`` forever. This reverts the *proven zero-send* attempt back to
+        ``replacing_nonself`` (worker replaced, not-yet-dispatched) so a re-run re-attempts the
+        redispatch exactly once. It is NOT a general backward edge (``transition_phase`` keeps the
+        strict linear DAG): it applies ONLY from ``draining_continuation``, and only the caller
+        that has just proven zero-send calls it. Guarded on the exact revision + generation + live
+        lease holder; a wrong revision / generation / holder or any other phase is refused,
+        zero-write. A send that DID (or may have) gone out never calls this.
+        """
+        _require_exact_generation(expected_action_generation)
+        who = norm(holder)
+        stamp = now or _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _locked_row(conn, key)
+            if current is None:
+                conn.execute("ROLLBACK")
+                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
+            if current.action_generation != expected_action_generation:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=CAS_GENERATION_MISMATCH, revision=current.revision
+                )
+            if current.revision != expected_revision:
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=CAS_STALE_REVISION, revision=current.revision
+                )
+            if not who or current.lease_holder != who or not current.lease_is_live(stamp):
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=CAS_LEASE_NOT_HELD, revision=current.revision
+                )
+            if current.phase != PHASE_DRAINING_CONTINUATION:
+                # Only a not-yet-sent attempt is revertible; any other phase is a wrong-state
+                # caller (never revert a completed / never-attempted / self-flow phase).
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False, reason=CAS_UNEXPECTED_STATE, revision=current.revision
+                )
+            revision = current.revision + 1
+            conn.execute(
+                f"UPDATE {_TABLE} SET phase = ?, revision = ?, updated_at = ? "
+                "WHERE workspace_id = ? AND action_id = ? AND revision = ?",
+                (
+                    PHASE_REPLACING_NONSELF,
+                    revision,
+                    stamp,
+                    key.workspace_id,
+                    key.action_id,
+                    current.revision,
+                ),
+            )
+            conn.execute("COMMIT")
+            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
+        except sqlite3.DatabaseError as exc:
+            _rollback(conn)
+            raise ReplacementTransactionError(
+                f"replacement transaction drain-attempt release failed ({type(exc).__name__}); "
                 f"fail closed"
             ) from exc
         finally:

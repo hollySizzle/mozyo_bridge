@@ -760,15 +760,6 @@ class StaleWorkerRecoveryUseCase:
             # attempted / uncertain and the gate is NOT confirmed — a send may be in flight.
             # Report uncertain; a later re-run re-checks the gate. Never blind-resend.
             return REDISPATCH_UNCERTAIN
-        # R3-F1 (Review j#82731) — re-join the exact live lane authority IMMEDIATELY before the
-        # send, action-time, BEFORE recording ``attempted``. A lane whose lifecycle / worktree
-        # token / branch moved since the launch must not receive the original gate — zero send,
-        # leaving the phase not-attempted so a later re-run re-joins and sends once authority is
-        # restored (never blind-sending into a lane the approval no longer governs). The lane-free-
-        # of-live fence is NOT applied here: the fresh worker is now live at the name by design;
-        # its own action-bound attestation (already confirmed) is what proves it is ours.
-        if not self._ops.resume_lane_authority(request):
-            return REDISPATCH_AUTHORITY_MOVED
         # not_attempted (phase replacing_nonself): record attempted (-> draining_continuation)
         # BEFORE the send, so a crash here resumes as uncertain rather than re-sending.
         attempt = self._store.transition_phase(
@@ -789,6 +780,22 @@ class StaleWorkerRecoveryUseCase:
             or not fresh.lease_is_live(effect_now)
         ):
             return REDISPATCH_LEASE_LOST
+        # R3-F1 (Review j#82760) — re-join the exact live lane authority as the LAST external
+        # observation, AFTER the attempted CAS + lease re-auth and IMMEDIATELY before the
+        # transport (nothing runs between this check and the send). A last-mile lifecycle /
+        # worktree / branch move is independent of the transaction lease, so the lease re-auth
+        # above cannot catch it. On a move the send provably has NOT happened, so un-record the
+        # attempt (``draining_continuation -> replacing_nonself``) rather than leaving it mistaken
+        # for a send-in-flight: a re-run re-attempts the redispatch exactly once, never a blind
+        # send into a lane the approval no longer governs. The lane-free-of-live fence is NOT
+        # applied here (the fresh worker is now live at the name by design; its already-confirmed
+        # action-bound attestation is what proves it is ours).
+        if not self._ops.resume_lane_authority(request):
+            self._store.release_drain_attempt(
+                key, expected_revision=fresh.revision, expected_action_generation=gen,
+                holder=holder, now=self._clock(),
+            )
+            return REDISPATCH_AUTHORITY_MOVED
         if self._ops.redispatch_gate(continuation) != DRAIN_SEND_OK:
             # Send failed; the state stays attempted/draining_continuation. A re-run re-checks
             # the gate and only completes if it confirms — never a blind resend.

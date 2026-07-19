@@ -855,8 +855,11 @@ observation に join し、次の typed decision を返す。
   admission で snapshot せず、**各 owed effect の直前に action-time 再 join する**（Review j#82731 F1、`runtime-observability-boundary.md`
   Action-Time Live Preflight Boundary）: (1) **launch 直前**は actuator の injected `launch_authority` が `resume_lane_authority`
   （exact lane lifecycle rev/gen + canonical worktree token + expected branch）AND `lane_free_of_live_process`（assigned-name の
-  SLOT_LIVE 行=busy OR idle foreign を排除）を再 join、(2) **send 直前**は `_redispatch` が `resume_lane_authority` を再 join し、
-  attempted 記録前に stop（phase 非 attempted のまま→再 run で送達、blind send せず）。moved/newer lifecycle・wrong worktree
+  SLOT_LIVE 行=busy OR idle foreign を排除）を再 join、(2) **send 直前**は `_redispatch` が **attempted CAS + lease reauth の後・
+  transport 直前（最後の external observation）** に `resume_lane_authority` を再 join する（Review j#82760 F1: attempted の前だと
+  CAS/lease-read の間の last-mile authority race を lease check が捕捉できない）。send 直前 check が moved なら send は起きていない
+  ので `release_drain_attempt`（`draining_continuation → replacing_nonself` の唯一の guarded 逆遷移、linear DAG は不変）で attempted を
+  **un-record** し、re-run が exactly-once 送達できる（`draining_continuation`=send-in-flight 誤認で永久 uncertain にしない）。moved/newer lifecycle・wrong worktree
   token・drifted branch・unreadable worktree・foreign live（busy/idle）は zero launch/send で durable transaction を温存
   （lease は actuator が effect 直前に別途再認証、launch 後の自 fresh worker は action-bound attestation が正当性を証明）。
   worktree readability は exact worktree-token authority の一部（単なる git-checkout 解決だけでは sibling/wrong worktree を通す）。

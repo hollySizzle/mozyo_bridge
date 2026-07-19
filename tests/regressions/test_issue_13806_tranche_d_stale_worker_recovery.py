@@ -994,6 +994,38 @@ class PostCloseResumeTests(_RecoveryCase):
         self.assertEqual(second.status, RECOVERY_COMPLETED)
         self.assertEqual(len(ops.sends), 1)
 
+    def test_authority_moves_during_attempted_cas_before_transport_blocks_send(self):
+        # THE last-mile race (Review j#82760 F1): authority is current through the launch AND at
+        # the moment the redispatch records `attempted`, but moves DURING the attempted CAS —
+        # after it, before the transport. The send re-joins the authority as the LAST check
+        # immediately before the transport (after the CAS + lease re-auth), so it catches the
+        # move, sends nothing, and UN-RECORDS the attempt (draining_continuation ->
+        # replacing_nonself) so a re-run re-attempts exactly once — never stuck at uncertain.
+        ops, wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        # Hook the store's attempted-CAS (the -> draining_continuation move) to flip the live
+        # authority to moved, reproducing a lane change between the CAS and the transport.
+        orig = self.store.transition_phase
+
+        def flip(key, **kw):
+            out = orig(key, **kw)
+            if kw.get("target") == PHASE_DRAINING_CONTINUATION:
+                ops._resume_lane_authority = False
+            return out
+
+        self.store.transition_phase = flip
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertEqual(ops.sends, [])  # zero send — the last-mile check caught the move
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)  # attempt un-recorded, re-sendable
+        self.assertEqual([i for _a, i in self.port.launched].count(wk), 2)  # launched, not sent
+        # authority restored + hook removed; a re-run sends exactly once (never a blind resend)
+        self.store.transition_phase = orig
+        ops._resume_lane_authority = True
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
     def test_admitted_resume_reverifies_authority_effect_bound_then_completes(self):
         # The legitimate path: expected absence admitted, authority exact and current at BOTH the
         # launch and the send — the resume re-joins them action-time and completes.
