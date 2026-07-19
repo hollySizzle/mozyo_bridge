@@ -118,6 +118,36 @@ def _as_int(value: object) -> Optional[int]:
         return None
 
 
+def latest_review_journal(markers: Iterable[JournalMarker], issue: str) -> Optional[int]:
+    """The newest review-side (``review`` / ``review_result`` -> GATE_REVIEW) journal id on ``issue``.
+
+    ``None`` when the issue carries no numeric review-side marker. This is the shadowing authority a
+    worker gate is measured against: a worker gate older than it has already been reviewed by the
+    gateway (:func:`gate_is_shadowed`). Pure and duck-typed on ``marker.issue`` / ``.gate`` / ``.journal``.
+    """
+    issue_s = str(issue or "").strip()
+    review_journals = [
+        j
+        for m in markers
+        if str(getattr(m, "issue", "") or "").strip() == issue_s
+        and str(getattr(m, "gate", "") or "").strip() == GATE_REVIEW
+        for j in (_as_int(getattr(m, "journal", "")),)
+        if j is not None
+    ]
+    return max(review_journals) if review_journals else None
+
+
+def gate_is_shadowed(gate_journal: object, latest_review: Optional[int]) -> bool:
+    """Has the worker gate at ``gate_journal`` already been answered by a later review? (pure).
+
+    True iff a numeric ``latest_review`` exists and the numeric gate journal is strictly older than it —
+    the gateway already reviewed this work, so a (re-)wake would be spurious. A fresh unreviewed gate
+    (``latest_review is None``) and a re-work gate newer than the last review are NOT shadowed.
+    """
+    gj = _as_int(gate_journal)
+    return latest_review is not None and gj is not None and gj < latest_review
+
+
 @dataclass(frozen=True)
 class LaneGatewaySendPlan:
     """The pure plan for waking one worker gate's same-lane implementation_gateway.
@@ -157,7 +187,7 @@ def _plan_one(
     owner: OwningLaneBinding,
     *,
     dispatch_anchor_journal: Optional[str],
-    latest_review_journal: Optional[int],
+    latest_review: Optional[int],
 ) -> LaneGatewaySendPlan:
     gate = str(getattr(marker, "gate", "") or "").strip()
     journal = str(getattr(marker, "journal", "") or "").strip()
@@ -185,13 +215,10 @@ def _plan_one(
     # The shadowing fence (design answer j#82367 — no over-send / no duplicate wake): a worker gate
     # already answered by a LATER review-side gate on the issue means the gateway ALREADY reviewed this
     # work, so re-waking it would be spurious. A fresh unreviewed request (no later review) and a re-work
-    # request whose journal is newer than the last review are unshadowed and still send.
-    gate_journal_int = _as_int(journal)
-    if (
-        latest_review_journal is not None
-        and gate_journal_int is not None
-        and gate_journal_int < latest_review_journal
-    ):
+    # request whose journal is newer than the last review are unshadowed and still send. The SAME check
+    # runs action-time at the send edge (:func:`gate_is_shadowed` via ``review_round_send_fence``), so a
+    # row that went pending BEFORE the review still terminally zero-sends once the review lands (j#82382 F1).
+    if gate_is_shadowed(journal, latest_review):
         return LaneGatewaySendPlan(
             emit=False, reason=LANE_SHADOWED, gate_journal=journal, gate=gate
         )
@@ -241,14 +268,7 @@ def plan_lane_gateway_sends(
     ]
     # The latest review-side journal on the issue (``review`` / ``review_result`` both normalize to
     # GATE_REVIEW). A worker gate older than it has already been reviewed → shadowed (see ``_plan_one``).
-    review_journals = [
-        j
-        for m in marker_list
-        if str(getattr(m, "gate", "") or "").strip() == GATE_REVIEW
-        for j in (_as_int(getattr(m, "journal", "")),)
-        if j is not None
-    ]
-    latest_review_journal = max(review_journals) if review_journals else None
+    latest_review = latest_review_journal(marker_list, issue_s)
     plans: list[LaneGatewaySendPlan] = []
     for marker in marker_list:
         if str(getattr(marker, "gate", "") or "").strip() not in LANE_GATEWAY_GATES:
@@ -257,7 +277,7 @@ def plan_lane_gateway_sends(
             _plan_one(
                 marker, owner,
                 dispatch_anchor_journal=dispatch_anchor_journal,
-                latest_review_journal=latest_review_journal,
+                latest_review=latest_review,
             )
         )
     return plans
@@ -306,6 +326,8 @@ __all__ = (
     "LANE_REFUSAL_REASONS",
     "lane_gateway_route",
     "is_lane_gateway_route",
+    "latest_review_journal",
+    "gate_is_shadowed",
     "LaneGatewaySendPlan",
     "plan_lane_gateway_sends",
     "make_lane_gateway_send_edge_fence",

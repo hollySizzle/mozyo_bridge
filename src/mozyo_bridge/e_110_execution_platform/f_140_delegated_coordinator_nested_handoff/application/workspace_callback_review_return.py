@@ -206,6 +206,10 @@ def review_round_send_fence(
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
         markers_from_source,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
+        gate_is_shadowed,
+        latest_review_journal,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
         decode_review_return_conclusion,
         decode_review_return_payload,
@@ -214,8 +218,32 @@ def review_round_send_fence(
     )
 
     def _fence(row: CallbackOutboxRow) -> str:
-        if not is_review_return_route(str(getattr(row, "callback_route", "") or "")):
-            return REVIEW_ROUND_CURRENT  # a non-return row is not fenced
+        route = str(getattr(row, "callback_route", "") or "")
+        if is_lane_gateway_route(route):
+            # #13683 R2 (review j#82382 F1): a worker gate that went pending BEFORE its review must
+            # terminally zero-send once the review lands — the generation-only send-edge fence let a
+            # reviewed row re-wake the gateway on a later backlog drain. Re-read the live markers at the
+            # send edge and shadow-check: a gate older than the latest review-side journal is terminal
+            # (the gateway already reviewed), a fresh / rework gate (newer than the last review) proceeds.
+            issue = str(getattr(row, "issue", "") or "").strip()
+            gate_journal = str(getattr(row, "journal", "") or "").strip()
+            if not issue or not gate_journal:
+                return REVIEW_ROUND_STALE  # no verifiable identity -> deterministic terminal
+            try:
+                source = source_fn()
+            except Exception:  # noqa: BLE001 - a transient unresolvable source -> retryable, not dropped
+                return REVIEW_ROUND_UNVERIFIABLE
+            if source is None:
+                return REVIEW_ROUND_UNVERIFIABLE
+            try:
+                markers = list(markers_from_source(source, issue))
+            except Exception:  # noqa: BLE001 - a transient unreadable source -> retryable, not dropped
+                return REVIEW_ROUND_UNVERIFIABLE
+            if gate_is_shadowed(gate_journal, latest_review_journal(markers, issue)):
+                return REVIEW_ROUND_STALE
+            return REVIEW_ROUND_CURRENT
+        if not is_review_return_route(route):
+            return REVIEW_ROUND_CURRENT  # a non-return / non-lane-gateway row is not fenced
         issue = str(getattr(row, "issue", "") or "").strip()
         review_journal = str(getattr(row, "journal", "") or "").strip()
         if not issue or not review_journal:

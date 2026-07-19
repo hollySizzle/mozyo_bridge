@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # tests/regressions/<file> -> repo root
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
@@ -22,6 +22,14 @@ from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore
 from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_DELIVERED, WorkflowRuntimeStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (
     discover_lane_gateway_sends,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_review_return import (
+    review_round_send_fence,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+    REVIEW_ROUND_CURRENT,
+    REVIEW_ROUND_STALE,
+    REVIEW_ROUND_UNVERIFIABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (
     SupervisedWorkspace,
@@ -181,6 +189,58 @@ class LaneGatewaySendEdgeFenceTest(unittest.TestCase):
         fenced, reason = fence(self._Row(lane_gateway_route(LANE), "110"))
         self.assertTrue(fenced)
         self.assertIn("unresolvable", reason)
+
+
+class LaneGatewayActionTimeShadowFenceTest(unittest.TestCase):
+    """Send-edge shadow re-check (review j#82382 F1): a row pending BEFORE the review terminates once
+    the review lands, so a later backlog drain never re-wakes the gateway; a rework gate still sends."""
+
+    class _Row:
+        def __init__(self, journal):
+            self.callback_route = lane_gateway_route(LANE)
+            self.issue = ISSUE
+            self.journal = journal
+
+    def _reviewed_source(self):
+        # review_request j110 -> review_result j120 (the gateway already reviewed j110).
+        return MappingRedmineJournalSource(
+            payload={
+                "issue": {"id": ISSUE},
+                "journals": [
+                    {"id": "110", "notes": "[mozyo:workflow-event:gate=review_request:conclusion=pending]"},
+                    {"id": "120", "notes": "[mozyo:workflow-event:gate=review_result:conclusion=approved]"},
+                ],
+            }
+        )
+
+    def test_shadowed_row_is_terminal_at_send_edge(self) -> None:
+        fence = review_round_send_fence(self._reviewed_source)
+        self.assertEqual(fence(self._Row("110")), REVIEW_ROUND_STALE)
+
+    def test_rework_gate_newer_than_review_still_sends(self) -> None:
+        fence = review_round_send_fence(self._reviewed_source)
+        self.assertEqual(fence(self._Row("130")), REVIEW_ROUND_CURRENT)
+
+    def test_unreviewed_gate_sends(self) -> None:
+        source = MappingRedmineJournalSource(
+            payload={
+                "issue": {"id": ISSUE},
+                "journals": [
+                    {"id": "110", "notes": "[mozyo:workflow-event:gate=review_request:conclusion=pending]"}
+                ],
+            }
+        )
+        fence = review_round_send_fence(lambda: source)
+        self.assertEqual(fence(self._Row("110")), REVIEW_ROUND_CURRENT)
+
+    def test_unreadable_source_is_retryable_not_terminal(self) -> None:
+        fence = review_round_send_fence(lambda: None)
+        self.assertEqual(fence(self._Row("110")), REVIEW_ROUND_UNVERIFIABLE)
+
+    def test_blank_identity_is_terminal(self) -> None:
+        fence = review_round_send_fence(self._reviewed_source)
+        row = self._Row("")
+        self.assertEqual(fence(row), REVIEW_ROUND_STALE)
 
 
 class DiscoverLaneGatewaySendsTest(unittest.TestCase):
