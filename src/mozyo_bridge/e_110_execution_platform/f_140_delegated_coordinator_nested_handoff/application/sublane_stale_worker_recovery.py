@@ -31,12 +31,8 @@ lands the live wiring.
 
 from __future__ import annotations
 
-import argparse
-import json
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.core.state.replacement_preservation import (
@@ -53,6 +49,8 @@ from mozyo_bridge.core.state.replacement_transaction import (
 from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_GENERATION_MISMATCH,
     CAS_LEASE_NOT_HELD,
+    CAS_NOT_FOUND,
+    CAS_STALE_REVISION,
     ContinuationPointerError,
     DecisionPointerError,
     ParticipantPinError,
@@ -80,9 +78,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     RECOVER_ACTIONABLE,
+    RECOVER_BLOCK_UNKNOWN,
     RecoveryObservation,
     decide_recovery,
     stale_worker_recovery_action_id,
+    worker_close_committed,
 )
 
 # -- recovery / redispatch status vocabulary (closed) ---------------------------
@@ -122,6 +122,27 @@ REDISPATCH_LEASE_LOST = "lease_lost"
 REDISPATCH_GENERATION_MISMATCH = "generation_mismatch"
 REDISPATCH_NOT_FOUND = "not_found"
 REDISPATCH_CONTINUATION_UNREADABLE = "continuation_unreadable"
+#: The live lane authority (lifecycle / worktree token / branch) moved between the launch and the
+#: send — a fail-closed ZERO send re-joined action-time immediately before the transport (Redmine
+#: #13806 R3-F1, Review j#82731). The phase stays not-attempted so a later re-run re-joins and
+#: sends once authority is restored; never a blind send into a lane the approval no longer governs.
+REDISPATCH_AUTHORITY_MOVED = "authority_moved"
+#: A PROVEN zero-send attempt's revert CAS could not complete (the retry cap was exhausted by a
+#: pathological concurrent refusal, an unexpected concurrent phase, or an unexpected refusal
+#: reason) — Redmine #13806 R3 Review j#82782 F1. DISTINCT from :data:`REDISPATCH_UNCERTAIN`: this
+#: invocation definitively did NOT send (the authority moved before the transport), so it is a
+#: **concrete zero-send CAS-recovery failure**, never conflated with the "attempted, a send may be
+#: in flight" ``uncertain`` state. It never claims a re-sendable state it did not reach; recovery
+#: is by operator diagnosis / a later re-run once the pathological contention clears, never a blind
+#: resend (the send is proven zero, so no gate ever went out on this path).
+REDISPATCH_RELEASE_REFUSED = "release_refused"
+
+#: Bounded re-read + retry cap for un-recording a proven zero-send attempt whose revert CAS was
+#: refused by a concurrent write (Redmine #13806 R3 Progress blocker j#82768). A lease-held revert
+#: converges in one or two iterations once the racing write settles; the cap only backstops a
+#: pathological loop, and hitting it reports :data:`REDISPATCH_RELEASE_REFUSED` (never a false
+#: ``authority_moved`` and never the send-in-flight ``uncertain``).
+_UN_RECORD_RETRY_CAP = 8
 
 
 def _utc_now() -> str:
@@ -169,6 +190,16 @@ class RecoveryRequest:
     #: The durable gate the coordinator must find + the one semantic action to redispatch once.
     expected_gate: str = ""
     next_semantic_action: str = ""
+    #: The owner's durable RE-approval journal for a post-close resume — a SEPARATE authority
+    #: from :attr:`journal` (Redmine #13806 post-close correction §5). ``journal`` is the
+    #: transaction's immutable stored decision / continuation anchor (the same-action CAS
+    #: identity): a resume must present that ORIGINAL journal to match the durable row. A fresh
+    #: owner re-approval of the resume therefore cannot be forced through the same ``--journal``
+    #: without tripping the divergence / supersede fence — so this distinct pointer carries it.
+    #: When present it is validated as a complete Redmine pointer and recorded as the resume
+    #: authority; it never overwrites the stored decision / continuation anchor. Empty falls back
+    #: to the stored anchor (a same-journal resume), preserving the original single-anchor flow.
+    resume_journal: str = ""
 
     @property
     def holder(self) -> str:
@@ -202,6 +233,14 @@ class RecoveryOutcome:
     #: Whether this --execute re-anchored a stuck same-action transaction to a new generation
     #: before driving (the owner-approved supersede convergence). Diagnostic only.
     converged_supersede: bool = False
+    #: Whether this --execute was admitted as a POST-CLOSE resume (Redmine #13806 post-close
+    #: correction): the fresh-recovery preflight blocked (the closed old worker is expectedly
+    #: absent) but a durable transaction that already committed the close drove the owed launch /
+    #: attest / redispatch. Diagnostic — ``verdict`` still carries the honest preflight blocker.
+    post_close_resume: bool = False
+    #: The resume RE-approval journal that governed a post-close resume, when one was supplied
+    #: distinct from the stored anchor (§5). Empty for a fresh execute or a same-journal resume.
+    resume_authorization: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -230,6 +269,8 @@ class RecoveryOutcome:
             "observation": self.observation,
             "preservation_reasons": list(self.preservation_reasons),
             "converged_supersede": self.converged_supersede,
+            "post_close_resume": self.post_close_resume,
+            "resume_authorization": self.resume_authorization or None,
         }
 
 
@@ -267,6 +308,45 @@ class StaleWorkerRecoveryOps(Protocol):
         """
         ...
 
+    def resume_lane_authority(self, request: RecoveryRequest) -> bool:
+        """Is the lane's ambient authority EXACT and current, right now? (read-only, #13806 R3-F1)
+
+        The exact, old-slot-independent lane authority a **post-close resume** re-joins
+        **immediately before each owed effect** (the actuator's launch probe and the redispatch
+        send) — never a once-at-admission snapshot (Review j#82731 F1). A post-close replay's
+        durable transaction says the close committed, so this cannot trust the pinned old worker
+        (gone) or a stale earlier reading — it re-observes the live lane and returns ``True`` only
+        when EVERY axis holds (Review j#82731 F2 / Answer j#82708 block list):
+
+        - the LIVE lane lifecycle exists and its ``(revision, generation)`` equals the approval's
+          pinned ``lane_revision`` / ``lane_generation`` (a moved / newer lifecycle → ``False``);
+        - the lane's canonical ``worktree_identity`` token is non-empty AND equals the recovery
+          worktree's currently-derived token (a sibling / wrong worktree → ``False``);
+        - the recovery worktree resolves to a live git checkout on the lane's expected branch (an
+          unreadable worktree / a drifted branch → ``False``).
+
+        A **dirty (but readable)** worktree is byte-preserved and recovered, NOT a block (Answer
+        j#82708 Option A / tranche D contract) — dirtiness is not an authority axis. Fail-closed:
+        any unreadable / absent / mismatched axis returns ``False``. Never mutates the #13810
+        owner row — it only compares.
+        """
+        ...
+
+    def lane_free_of_live_process(self, request: RecoveryRequest) -> bool:
+        """Is the lane free of ANY foreign live process (busy OR idle)? (read-only, #13806 R3-F1)
+
+        The pre-**launch** liveness fence (Review j#82731 F2 / Answer j#82708 "foreign OR
+        productive live"). Re-joined immediately before the owed launch: at that point the old
+        worker is closed and the fresh worker is not yet launched, so ANY live process at the
+        lane's assigned name — busy OR idle — is foreign and the relaunch must never collide with
+        it. Returns ``True`` only when NO row at the assigned name is a live slot (a positive
+        shell-residue / terminal row — what recover-stale recovers — is not live and does not
+        fence). Old-slot-independent. Fail-closed: an unreadable inventory returns ``False``. This
+        is a pre-launch fence only; after the fresh worker is launched its own action-bound
+        attestation (not this scan) is what proves the live process at the name is ours.
+        """
+        ...
+
 
 class StaleWorkerRecoveryUseCase:
     """Read-only preflight + owner-approved atomic recovery of a stale sublane worker."""
@@ -298,12 +378,122 @@ class StaleWorkerRecoveryUseCase:
             )
         # --execute: the target must be exactly the stale worker the approval names.
         if verdict != RECOVER_ACTIONABLE:
+            # A POST-CLOSE resume (Redmine #13806 close-success → launch-failure → replay): the
+            # fresh-recovery preflight cannot resolve the pinned OLD worker because the recovery
+            # already CLOSED it — that absence is the expected post-close state, not a real
+            # blocker. Route the replay to the durable owed transaction ONLY when one that
+            # already committed this worker's close exists for THIS exact approved recovery;
+            # otherwise the block stands (a fresh unknown identity never plans / launches blind).
+            resumed = self._post_close_resume(request, verdict, observation)
+            if resumed is not None:
+                return resumed
             return self._outcome(
                 request, verdict, status=RECOVERY_REFUSED, executed=True,
                 observation=observation,
                 detail=f"target not actionable ({verdict}); zero close",
             )
         return self._execute(request, verdict, observation)
+
+    # -- post-close resume admission -----------------------------------------
+
+    def _post_close_resume(
+        self, request: RecoveryRequest, verdict: str, observation: RecoveryObservation
+    ) -> Optional[RecoveryOutcome]:
+        """Admit + drive a post-close replay, or ``None`` when it is not a resume.
+
+        Admission is closed to the ONE expected post-close signal — an ``identity_unknown``
+        preflight (the exact old worker was closed and its pinned locator no longer resolves)
+        — Redmine #13806 post-close correction R3-F1. Every OTHER blocker verdict means the old
+        worker DID resolve and a genuine current-state fence fired (an unreadable / dirty
+        worktree, a stale generation, a productive provider, a gateway / foreign slot, a wrong
+        issue-lane, a competing authority); that block is real and must stand — a resume never
+        bypasses it. It is then a *resume* — never a fresh plan, never a blind launch — ONLY
+        when a durable transaction for this EXACT approved recovery already committed the
+        worker's close (its participant is past ``close_owed``).
+
+        Before the replay is handed to :meth:`_execute`, the ambient lane authority the fresh
+        launch depends on is **re-verified** (R3-F1): the live lane lifecycle must still match
+        the approval's pinned generation. A moved / newer / unreadable lifecycle stops the
+        resume with zero launch / send rather than relaunching into a lane the approval no
+        longer governs (the lease authority is re-verified inside the actuator before every
+        effect; the worktree-readability fence is the ``identity_unknown``-only admission plus a
+        launch that fails closed on an unreadable worktree). Returns ``None`` (the caller's
+        block stands) for every non-resume case: a non-``identity_unknown`` block, no such
+        transaction, a different generation, or a participant still at ``close_owed``.
+        """
+        if norm(verdict) != RECOVER_BLOCK_UNKNOWN:
+            # Only the expected old-locator absence admits a resume. Any other blocker is a real
+            # current-state fence (worktree unreadable / stale generation / gateway / etc.) that
+            # the resume must not bypass (R3-F1). The caller's block stands.
+            return None
+        try:
+            expected_action = stale_worker_recovery_action_id(
+                lane_id=request.lane, role=request.role, provider=request.provider,
+                assigned_name=request.assigned_name, locator=request.locator,
+            )
+        except ValueError:
+            return None
+        if norm(request.action_id) != expected_action:
+            return None
+        try:
+            key = ReplacementTransactionKey(self._workspace_id, expected_action)
+        except ValueError:
+            return None
+        current = self._store.get(key)
+        if current is None:
+            return None
+        # The stored transaction must be THIS exact approved generation — a different generation
+        # is a foreign / superseding authority, never resumed past the block (the full pointer /
+        # evidence signature is re-verified inside _execute; the generation is the coarse gate
+        # that keeps a wrong-generation replay from being admitted as a resume at all).
+        if not isinstance(request.action_generation, int) or isinstance(
+            request.action_generation, bool
+        ) or current.action_generation != request.action_generation:
+            return None
+        # The pinned worker must already have committed its close (past close_owed). A
+        # close_owed / absent participant is a fresh recovery whose preflight block is real.
+        worker_identity = (
+            norm(request.lane), norm(request.role), norm(request.provider),
+            norm(request.assigned_name),
+        )
+        stored_worker = current.find_participant(worker_identity)
+        if stored_worker is None or not worker_close_committed(stored_worker.phase):
+            return None
+        # R3-F1 (Review j#82731) — the resume authority (live lane lifecycle + exact worktree
+        # token/branch + no foreign live process) is NOT snapshotted here at admission. A once-at-
+        # admission check is a stale snapshot: the lane could move between it and the effect. It is
+        # instead re-joined **action-time, immediately before each owed effect** — the launch
+        # (the actuator's ``launch_authority`` probe, injected in _execute) and the send
+        # (_redispatch, immediately before the transport). Admission only decides whether this is a
+        # resume at all (expected old-locator absence + a durable committed-close transaction for
+        # THIS exact approved recovery); the effect-bound fences decide whether it is safe to act.
+        # §5 — the resume RE-approval anchor is a SEPARATE authority from the stored decision /
+        # continuation anchor. A supplied ``resume_journal`` must be a complete Redmine pointer
+        # (fail-closed, zero effect on a malformed one) and is recorded as the resume authority;
+        # it NEVER overwrites the stored anchor, so the same-action CAS (matched on the original
+        # ``journal``) and a fresh durable re-approval coexist without tripping the divergence
+        # fence. An empty ``resume_journal`` is a same-journal resume (the original single anchor).
+        resume_authorization = ""
+        if norm(request.resume_journal):
+            try:
+                DecisionPointer(
+                    source="redmine", issue_id=norm(request.issue),
+                    journal_id=norm(request.resume_journal),
+                )
+            except DecisionPointerError:
+                return self._outcome(
+                    request, verdict, status=RECOVERY_REFUSED, executed=True,
+                    observation=observation, post_close_resume=True,
+                    detail=(
+                        "resume re-approval journal is not a complete Redmine pointer; "
+                        "zero close / launch / send"
+                    ),
+                )
+            resume_authorization = norm(request.resume_journal)
+        outcome = self._execute(request, verdict, observation)
+        return replace(
+            outcome, post_close_resume=True, resume_authorization=resume_authorization
+        )
 
     # -- execute -------------------------------------------------------------
 
@@ -497,10 +687,20 @@ class StaleWorkerRecoveryUseCase:
             converged_supersede = True
 
         # 3. Drive the guarded close → launch → attest (tranche B actuator, byte-preserving).
+        # The actuator re-joins the exact live lane authority IMMEDIATELY before the (bounded-
+        # recovery) launch effect via ``launch_authority`` (Redmine #13806 R3-F1, Review j#82731):
+        # the lane lifecycle / worktree token / branch must be exact AND the lane free of any
+        # foreign live process, action-time — never a stale admission-time snapshot. Applies to a
+        # fresh recovery launch too (defence-in-depth); a legitimate one, having just closed the
+        # old slot under the pinned authority, passes.
         actuator = ReplacementActuatorUseCase(
             self._store, self._actuation_port, clock=self._clock,
             lease_ttl_seconds=self._ttl,
             preservation_policy=assess_worker_recovery_preservation,
+            launch_authority=lambda _pin: (
+                self._ops.resume_lane_authority(request)
+                and self._ops.lane_free_of_live_process(request)
+            ),
         )
         recov = actuator.drive_worker_recovery(
             key, holder=request.holder, expected_action_generation=gen,
@@ -527,7 +727,7 @@ class StaleWorkerRecoveryUseCase:
             )
 
         # 4. Fresh receiver attested — redispatch the ORIGINAL gate exactly once.
-        redis = self._redispatch(key, holder=request.holder, gen=gen)
+        redis = self._redispatch(key, request, holder=request.holder, gen=gen)
         final = self._store.get(key)
         status = (
             RECOVERY_COMPLETED
@@ -550,7 +750,7 @@ class StaleWorkerRecoveryUseCase:
 
     # -- redispatch leg (rides the tranche C drain discipline) ----------------
 
-    def _redispatch(self, key, *, holder, gen) -> str:
+    def _redispatch(self, key, request, *, holder, gen) -> str:
         """Redispatch the original durable gate exactly once (``replacing_nonself -> completed``).
 
         Reuses the tranche C drain's "record ``attempted`` (the phase move into
@@ -598,6 +798,18 @@ class StaleWorkerRecoveryUseCase:
             or not fresh.lease_is_live(effect_now)
         ):
             return REDISPATCH_LEASE_LOST
+        # R3-F1 (Review j#82760) — re-join the exact live lane authority as the LAST external
+        # observation, AFTER the attempted CAS + lease re-auth and IMMEDIATELY before the
+        # transport (nothing runs between this check and the send). A last-mile lifecycle /
+        # worktree / branch move is independent of the transaction lease, so the lease re-auth
+        # above cannot catch it. On a move the send provably has NOT happened, so un-record the
+        # attempt (``draining_continuation -> replacing_nonself``) rather than leaving it mistaken
+        # for a send-in-flight: a re-run re-attempts the redispatch exactly once, never a blind
+        # send into a lane the approval no longer governs. The lane-free-of-live fence is NOT
+        # applied here (the fresh worker is now live at the name by design; its already-confirmed
+        # action-bound attestation is what proves it is ours).
+        if not self._ops.resume_lane_authority(request):
+            return self._un_record_attempt(key, holder=holder, gen=gen)
         if self._ops.redispatch_gate(continuation) != DRAIN_SEND_OK:
             # Send failed; the state stays attempted/draining_continuation. A re-run re-checks
             # the gate and only completes if it confirms — never a blind resend.
@@ -605,6 +817,65 @@ class StaleWorkerRecoveryUseCase:
         if not self._ops.gate_redispatched(continuation):
             return REDISPATCH_UNCERTAIN
         return self._finalize_confirmed(key, holder=holder, gen=gen)
+
+    def _un_record_attempt(self, key, *, holder, gen) -> str:
+        """Un-record a PROVEN zero-send attempt, handling the release CAS outcome (j#82768).
+
+        The lane authority moved immediately before the transport, so the redispatch did NOT
+        send. The attempt (``draining_continuation``) must be reverted to ``replacing_nonself`` so
+        a re-run re-attempts exactly once. The revert is a CAS that can be REFUSED — a concurrent
+        write raced the read that fed ``expected_revision`` — and its outcome must NEVER be
+        ignored (Progress blocker j#82768): a silently-refused revert leaves ``draining_continuation``,
+        which a re-run mistakes for a send-in-flight and gets stuck at ``uncertain`` forever.
+
+        So each attempt re-reads the CURRENT row and classifies it into a typed disposition:
+
+        - row gone / newer generation / lost lease -> a concrete typed blocker (never
+          ``authority_moved``, which would claim a re-sendable state that is not one);
+        - already ``replacing_nonself`` (a concurrent holder reverted, or it was never attempted)
+          -> ``authority_moved`` (re-sendable);
+        - ``completed`` (a concurrent holder dispatched + drained) -> ``confirmed``;
+        - still ``draining_continuation`` with the live lease at the current revision -> release
+          with THAT revision; a stale-revision refusal re-reads and retries (a lease-held revert
+          converges once the racing write settles). A bounded cap — and any unexpected concurrent
+          phase or refusal reason — reports :data:`REDISPATCH_RELEASE_REFUSED` (Review j#82782 F1):
+          a **distinct** zero-send CAS-recovery failure, never the send-in-flight ``uncertain`` and
+          never a false ``authority_moved``. The send is proven zero on this path, so recovery is
+          operator diagnosis / a later re-run, never a blind resend.
+        """
+        for _ in range(_UN_RECORD_RETRY_CAP):
+            rec = self._store.get(key)
+            if rec is None:
+                return REDISPATCH_NOT_FOUND
+            if rec.action_generation != gen:
+                return REDISPATCH_GENERATION_MISMATCH
+            if rec.phase == PHASE_REPLACING_NONSELF:
+                return REDISPATCH_AUTHORITY_MOVED  # re-sendable (reverted / never attempted)
+            if rec.phase == PHASE_COMPLETED:
+                return REDISPATCH_CONFIRMED  # a concurrent holder dispatched + drained
+            if rec.phase != PHASE_DRAINING_CONTINUATION:
+                # An unexpected concurrent phase (a self flow / mid-transition); never claim
+                # re-sendable — a distinct zero-send recovery failure, not send-in-flight uncertain.
+                return REDISPATCH_RELEASE_REFUSED
+            now = self._clock()
+            if rec.lease_holder != holder or not rec.lease_is_live(now):
+                return REDISPATCH_LEASE_LOST
+            out = self._store.release_drain_attempt(
+                key, expected_revision=rec.revision, expected_action_generation=gen,
+                holder=holder, now=now,
+            )
+            if out.applied:
+                return REDISPATCH_AUTHORITY_MOVED  # reverted -> re-sendable
+            if out.reason == CAS_GENERATION_MISMATCH:
+                return REDISPATCH_GENERATION_MISMATCH
+            if out.reason == CAS_LEASE_NOT_HELD:
+                return REDISPATCH_LEASE_LOST
+            if out.reason not in (CAS_STALE_REVISION, CAS_NOT_FOUND):
+                # An unexpected refusal reason — a distinct zero-send recovery failure, never a
+                # false re-sendable and never the send-in-flight uncertain.
+                return REDISPATCH_RELEASE_REFUSED
+            # CAS_STALE_REVISION / CAS_NOT_FOUND: a concurrent write moved the row — re-read + retry.
+        return REDISPATCH_RELEASE_REFUSED  # cap exhausted (a real lease-held revert converges quickly)
 
     def _finalize_confirmed(self, key, *, holder, gen) -> str:
         """Advance a gate-confirmed transaction to ``completed`` with ZERO send (idempotent).
@@ -681,6 +952,8 @@ class StaleWorkerRecoveryUseCase:
         detail: str = "",
         preservation_reasons: tuple[str, ...] = (),
         converged_supersede: bool = False,
+        post_close_resume: bool = False,
+        resume_authorization: str = "",
     ) -> RecoveryOutcome:
         return RecoveryOutcome(
             issue=norm(request.issue),
@@ -699,179 +972,9 @@ class StaleWorkerRecoveryUseCase:
             observation=observation.as_payload() if observation is not None else None,
             preservation_reasons=tuple(preservation_reasons),
             converged_supersede=converged_supersede,
+            post_close_resume=post_close_resume,
+            resume_authorization=norm(resume_authorization),
         )
-
-
-# -- CLI ------------------------------------------------------------------------
-
-#: The verdict a fail-closed construction error surfaces (a missing repo / workspace identity),
-#: so a broken invocation never silently reads as a clean preflight.
-SEAM_UNAVAILABLE_VERDICT = "recovery_seam_error"
-
-
-def format_recover_text(outcome: RecoveryOutcome) -> str:
-    lines = [
-        f"sublane recover-stale: {outcome.lane} / {outcome.role} (issue {outcome.issue})",
-        f"  verdict: {outcome.verdict}  status: {outcome.status}",
-        f"  executed: {outcome.executed}",
-    ]
-    if outcome.executed:
-        lines.append(
-            f"  recovery: {outcome.recovery_status or '-'}  "
-            f"redispatch: {outcome.redispatch_status or '-'}  "
-            f"closed_old: {outcome.closed_old_worker}"
-        )
-    if outcome.detail:
-        lines.append(f"  detail: {outcome.detail}")
-    return "\n".join(lines)
-
-
-def _run_live_recovery(
-    args: argparse.Namespace, request: RecoveryRequest, *, execute: bool
-) -> RecoveryOutcome:
-    """Construct the LIVE use case (real inventory + actuation + redispatch) and run it.
-
-    The live adapters are imported lazily to avoid an import cycle (they import this module for
-    the request / ops types). A construction error — a repo / workspace identity that cannot be
-    resolved — is a fail-closed typed outcome, never a fabricated preflight.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-        repo_scope_workspace_id,
-    )
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
-        LiveRecoveryActuatorPort,
-        LiveStaleWorkerRecoveryOps,
-    )
-
-    repo = getattr(args, "repo", None)
-    repo_root = Path(repo).expanduser() if repo else Path.cwd()
-    try:
-        workspace_id = repo_scope_workspace_id(repo_root)
-    except Exception:  # noqa: BLE001 - an unresolvable workspace identity fails closed
-        workspace_id = ""
-    if not norm(workspace_id):
-        return RecoveryOutcome(
-            issue=norm(request.issue), lane=norm(request.lane), role=norm(request.role),
-            verdict=SEAM_UNAVAILABLE_VERDICT, status=RECOVERY_REFUSED, executed=execute,
-            detail="could not resolve the repo workspace identity; zero process effect",
-        )
-    # The transaction key the use case will derive (best-effort; the use case re-derives and
-    # refuses on incomplete inputs before the port is ever exercised).
-    try:
-        action_id = stale_worker_recovery_action_id(
-            lane_id=request.lane, role=request.role, provider=request.provider,
-            assigned_name=request.assigned_name, locator=request.locator,
-        )
-        key = ReplacementTransactionKey(workspace_id, action_id)
-    except Exception:  # noqa: BLE001 - incomplete identity => the use case refuses downstream
-        key = ReplacementTransactionKey(workspace_id, "recover:pending")
-    store = ReplacementTransactionStore()
-    actuation_port = LiveRecoveryActuatorPort(
-        repo_root=repo_root, request=request, store=store, key=key,
-    )
-    ops = LiveStaleWorkerRecoveryOps(repo_root=repo_root, request=request)
-    use_case = StaleWorkerRecoveryUseCase(
-        store, actuation_port, ops, workspace_id=workspace_id,
-    )
-    return use_case.run(request, execute=execute)
-
-
-def cmd_sublane_recover_stale(args: argparse.Namespace) -> int:
-    request = RecoveryRequest(
-        issue=getattr(args, "issue", "") or "",
-        lane=getattr(args, "lane", "") or "",
-        role=getattr(args, "role", "") or "",
-        provider=getattr(args, "provider", "") or "",
-        assigned_name=getattr(args, "assigned_name", "") or "",
-        locator=getattr(args, "locator", "") or "",
-        journal=getattr(args, "journal", "") or "",
-        action_id=getattr(args, "action_id", "") or "",
-        action_generation=int(getattr(args, "action_generation", 0) or 0),
-        worker_revision=getattr(args, "worker_revision", "") or "",
-        lane_revision=getattr(args, "lane_revision", "") or "",
-        lane_generation=getattr(args, "lane_generation", "") or "",
-        expected_gate=getattr(args, "expected_gate", "") or "",
-        next_semantic_action=getattr(args, "next_semantic_action", "") or "",
-        supersede=bool(getattr(args, "supersede", False)),
-    )
-    execute = bool(getattr(args, "execute", False))
-    outcome = _run_live_recovery(args, request, execute=execute)
-    if bool(getattr(args, "json", False)):
-        print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_recover_text(outcome), file=sys.stdout)
-    # A staged-seam refusal is a non-zero exit so a caller never mistakes it for a completed
-    # recovery; a preflight (once wired) that merely reports a blocker is exit 0.
-    return 1 if outcome.is_blocked or outcome.verdict == SEAM_UNAVAILABLE_VERDICT else 0
-
-
-def register_sublane_recover_stale_parser(sublane_sub: Any) -> None:
-    parser = sublane_sub.add_parser(
-        "recover-stale",
-        help=(
-            "Redmine #13806: recover the exact stale standard-sublane worker of a lane whose "
-            "worker process vanished after a turn. Default is read-only preflight; --execute "
-            "requires a positive generation-bound owner approval and closes only that worker "
-            "(never the gateway / coordinator / a foreign slot), byte-preserving the worktree."
-        ),
-    )
-    for flag, dest, help_text in (
-        ("--issue", "issue", "Redmine issue id owning the lane"),
-        ("--lane", "lane", "Exact lane id/label of the stale worker"),
-        ("--role", "role", "Exact provider role of the worker"),
-        ("--provider", "provider", "Exact provider of the worker"),
-        ("--assigned-name", "assigned_name", "Exact managed assigned name"),
-        ("--locator", "locator", "Exact stale (old) process locator"),
-    ):
-        parser.add_argument(flag, dest=dest, required=True, help=help_text)
-    for flag, dest, help_text in (
-        ("--journal", "journal", "Positive owner approval journal id (--execute)"),
-        ("--action-id", "action_id", "Exact recover:<lane>:<role>:<provider>:<name>:<locator> id"),
-        (
-            "--worker-revision",
-            "worker_revision",
-            "Live worker inventory row revision pinned at approval (preflight generation gate; "
-            "distinct from the lane lifecycle revision)",
-        ),
-        (
-            "--lane-revision",
-            "lane_revision",
-            "Lane LIFECYCLE revision pinned at approval (close-boundary preservation fence)",
-        ),
-        (
-            "--lane-generation",
-            "lane_generation",
-            "Lane LIFECYCLE generation pinned at approval (close-boundary preservation fence)",
-        ),
-        ("--expected-gate", "expected_gate", "The durable gate the fresh worker must resume"),
-        (
-            "--next-semantic-action",
-            "next_semantic_action",
-            "The single semantic action to redispatch exactly once",
-        ),
-    ):
-        parser.add_argument(flag, dest=dest, default="", help=help_text)
-    parser.add_argument(
-        "--action-generation", dest="action_generation", type=int, default=0,
-        help="Immutable approved generation counter (>= 1) (--execute)",
-    )
-    parser.add_argument(
-        "--supersede", action="store_true",
-        help=(
-            "With a higher --action-generation, re-anchor a zero-effect stuck same-action "
-            "transaction to the corrected evidence (converges a mis-bound residue without raw "
-            "DB; refused once any close / launch / send happened)"
-        ),
-    )
-    parser.add_argument(
-        "--execute", action="store_true",
-        help="Apply owner-approved recovery; otherwise read-only preflight only",
-    )
-    from mozyo_bridge.application.cli_common import add_repo_option
-
-    add_repo_option(parser)
-    parser.add_argument("--json", action="store_true", help="Emit structured JSON")
-    parser.set_defaults(func=cmd_sublane_recover_stale)
 
 
 __all__ = (
@@ -886,13 +989,10 @@ __all__ = (
     "REDISPATCH_GENERATION_MISMATCH",
     "REDISPATCH_NOT_FOUND",
     "REDISPATCH_CONTINUATION_UNREADABLE",
+    "REDISPATCH_AUTHORITY_MOVED",
+    "REDISPATCH_RELEASE_REFUSED",
     "RecoveryRequest",
     "RecoveryOutcome",
     "StaleWorkerRecoveryOps",
     "StaleWorkerRecoveryUseCase",
-    "LIVE_RECOVERY_SEAM_INSTALLED",
-    "SEAM_UNAVAILABLE_VERDICT",
-    "cmd_sublane_recover_stale",
-    "format_recover_text",
-    "register_sublane_recover_stale_parser",
 )

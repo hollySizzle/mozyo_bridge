@@ -889,7 +889,31 @@ observation に join し、次の typed decision を返す。
 - `healthy`: 全 authority が一致し receiver が dispatch-admissible。送信直前の再観測も byte-equivalent な場合だけ 1 回 inject。
 - `stale_worker_recovery_required`: current lifecycle / decision anchor / declared worker generation / action authority が
   すべて current で、その generation の exact slot の terminal absence が positive に証明された場合だけ。
-  close/relaunch はせず、owner-governed #13806 recovery へ route する。
+  close/relaunch はせず、owner-governed #13806 recovery へ route する。★**post-close resume 入口**（#13806
+  close-success → launch-failure → replay 訂正, IR j#81810 / R3-F1）: recover-stale の `--execute` は、既に close を commit した
+  worker（participant が `close_owed` を越え `launch_owed` / `verify_owed` / `replaced`）を持つ durable transaction が
+  **その exact approved recovery（同 workspace+action_id+generation）に存在する場合だけ**、pinned old locator の
+  absence（fresh-recovery preflight の `identity_unknown`）を **expected post-close state** として durable owed resume
+  （launch → attest → 元 gate exactly-once redispatch）へ接続する。admission は **`identity_unknown`（expected old-locator
+  absence）のみ**に閉じる: worktree unreadable/dirty・stale generation・productive・gateway/foreign 等の他 blocker は
+  old slot が resolve した real な current-state fence ゆえ resume で迂回せず block を維持する（R3-F1）。resume authority は
+  admission で snapshot せず、**各 owed effect の直前に action-time 再 join する**（Review j#82731 F1、`runtime-observability-boundary.md`
+  Action-Time Live Preflight Boundary）: (1) **launch 直前**は actuator の injected `launch_authority` が `resume_lane_authority`
+  （exact lane lifecycle rev/gen + canonical worktree token + expected branch）AND `lane_free_of_live_process`（assigned-name の
+  SLOT_LIVE 行=busy OR idle foreign を排除）を再 join、(2) **send 直前**は `_redispatch` が **attempted CAS + lease reauth の後・
+  transport 直前（最後の external observation）** に `resume_lane_authority` を再 join する（Review j#82760 F1: attempted の前だと
+  CAS/lease-read の間の last-mile authority race を lease check が捕捉できない）。send 直前 check が moved なら send は起きていない
+  ので `release_drain_attempt`（`draining_continuation → replacing_nonself` の唯一の guarded 逆遷移、linear DAG は不変）で attempted を
+  **un-record** し、re-run が exactly-once 送達できる（`draining_continuation`=send-in-flight 誤認で永久 uncertain にしない）。★**release CAS の outcome は無視しない**（Progress blocker j#82768）: concurrent write で `expected_revision` が stale 化し revert が拒否され得るので、`_redispatch` は row を **再読して state 別 typed disposition** へ分岐する — exclusive lease 保持中は fresh revision で bounded retry すれば re-sendable（`replacing_nonself`）へ収束、収束不能な state は具体 typed blocker（`lease_lost`/`generation_mismatch`/`not_found`、concurrent 完了は `confirmed`）に落とし、**cap 超過 / unexpected phase / unexpected refusal reason は zero-send CAS-recovery failure 固有の distinct token `release_refused`**（Review j#82782 F1）に分離する（send-in-flight `uncertain` とは型で区別、send は当該 invocation で proven-zero、false `authority_moved` を作らない）。silent な `draining_continuation` 残置を作らない。moved/newer lifecycle・wrong worktree
+  token・drifted branch・unreadable worktree・foreign live（busy/idle）は zero launch/send で durable transaction を温存
+  （lease は actuator が effect 直前に別途再認証、launch 後の自 fresh worker は action-bound attestation が正当性を証明）。
+  worktree readability は exact worktree-token authority の一部（単なる git-checkout 解決だけでは sibling/wrong worktree を通す）。
+  **dirty（but readable）worktree は byte 保存対象ゆえ authority 軸でない=block しない**（Design Consultation Answer j#82708
+  Option A / tranche D contract, IR j#79485 §4 / `assess_worker_recovery_preservation`; 初回 close_owed と retry launch_owed で
+  同一 policy、launch failure timing で挙動を変えない）。durable transaction 不在 / `close_owed` 止まり / generation 相違は
+  resume と認めず block を維持する（新規 plan も blind launch もしない）。owner re-approval journal は
+  stored decision/continuation anchor（同一 CAS identity を保つ `--journal`）と **別 pointer**（`--resume-journal`）で
+  表し、same-action CAS と fresh durable approval を両立させる。
 - `worker_liveness_authority_conflict`: locator-bearing stale token、duplicate row、missing/ambiguous declared pin、declared
   locator/provider/name/runtime-revision drift、missing/foreign attestation、generation/action drift、busy/unknown receiver、
   既送達または送達不確実を含む。それらはすべて zero-send / zero-close / no auto retry。replacement action id が空の

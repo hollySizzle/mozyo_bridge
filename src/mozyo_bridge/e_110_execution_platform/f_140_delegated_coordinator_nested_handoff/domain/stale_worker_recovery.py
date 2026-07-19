@@ -23,7 +23,12 @@ gateway or foreign slot, a wrong issue-lane, and a stale generation.
 
 from __future__ import annotations
 
-from mozyo_bridge.core.state.replacement_transaction_model import norm
+from mozyo_bridge.core.state.replacement_transaction_model import (
+    PARTICIPANT_LAUNCH_OWED,
+    PARTICIPANT_REPLACED,
+    PARTICIPANT_VERIFY_OWED,
+    norm,
+)
 
 # -- recovery preflight verdict vocabulary (a closed set) -----------------------
 
@@ -191,6 +196,33 @@ def is_recovery_actionable(verdict: str) -> bool:
     return norm(verdict) == RECOVER_ACTIONABLE
 
 
+# -- post-close resume admission (Redmine #13806 post-close correction) ----------
+
+#: The participant owed phases that mean the old worker's exact-generation close ALREADY
+#: committed: everything past ``close_owed`` (``launch_owed`` / ``verify_owed`` / ``replaced``).
+#: Once a close has committed, a replay re-resolves the pinned OLD locator against a live
+#: inventory that no longer holds it — the fresh-recovery preflight legitimately reports
+#: ``identity_unknown``. That absence is the EXPECTED post-close state, not a real blocker.
+_POST_CLOSE_PARTICIPANT_PHASES = frozenset(
+    {PARTICIPANT_LAUNCH_OWED, PARTICIPANT_VERIFY_OWED, PARTICIPANT_REPLACED}
+)
+
+
+def worker_close_committed(participant_phase: str) -> bool:
+    """Has the recovery already committed the old worker's exact-generation close? (pure)
+
+    True for every owed phase past ``close_owed`` (``launch_owed`` / ``verify_owed`` /
+    ``replaced``). This is the pure gate that distinguishes a **post-close resume** — where the
+    durable transaction has already closed the exact old generation and the pinned old worker is
+    EXPECTED absent, so the owed launch / attest / redispatch drives the replay — from a fresh
+    recovery still at ``close_owed`` (nothing closed yet), whose preflight block is a real fence
+    and must stand (Redmine #13806 close-success → launch-failure → replay correction §1/§2).
+    A ``close_owed`` participant is never a post-close resume: routing one past the fresh-worker
+    preflight would let an ``identity_unknown`` observation plan a launch blind.
+    """
+    return norm(participant_phase) in _POST_CLOSE_PARTICIPANT_PHASES
+
+
 def stale_worker_recovery_action_id(
     *, lane_id: str, role: str, provider: str, assigned_name: str, locator: str
 ) -> str:
@@ -238,4 +270,5 @@ __all__ = (
     "decide_recovery",
     "is_recovery_actionable",
     "stale_worker_recovery_action_id",
+    "worker_close_committed",
 )

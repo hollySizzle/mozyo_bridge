@@ -453,6 +453,13 @@ class _FakeRecoveryOps:
     def gate_redispatched(self, continuation) -> bool:
         return self._landed
 
+    def resume_lane_authority(self, request) -> bool:
+        # The convergence tests drive fresh recoveries with the lane authority current.
+        return True
+
+    def lane_free_of_live_process(self, request) -> bool:
+        return True
+
 
 class _ConvergenceCase(unittest.TestCase):
     def setUp(self):

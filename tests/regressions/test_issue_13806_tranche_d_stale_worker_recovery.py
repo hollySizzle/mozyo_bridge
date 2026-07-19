@@ -40,9 +40,14 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionStore,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
+    CAS_LEASE_NOT_HELD,
+    CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
+    CasOutcome,
     PARTICIPANT_CLOSE_OWED,
     PARTICIPANT_LAUNCH_OWED,
     PARTICIPANT_REPLACED,
+    PARTICIPANT_VERIFY_OWED,
     PHASE_CLAIMED,
     PHASE_COMPLETED,
     PHASE_DRAINING_CONTINUATION,
@@ -62,7 +67,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECOVERY_PREFLIGHT,
     RECOVERY_REFUSED,
     RECOVERY_STOPPED,
+    REDISPATCH_AUTHORITY_MOVED,
     REDISPATCH_CONFIRMED,
+    REDISPATCH_LEASE_LOST,
+    REDISPATCH_RELEASE_REFUSED,
     REDISPATCH_UNCERTAIN,
     RecoveryRequest,
     StaleWorkerRecoveryOps,
@@ -94,6 +102,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RecoveryObservation,
     decide_recovery,
     stale_worker_recovery_action_id,
+    worker_close_committed,
 )
 
 GEN = 7
@@ -158,13 +167,22 @@ class FakeRecoveryOps:
 
     def __init__(
         self, observation, *, send_result=DRAIN_SEND_OK, confirm_after_send=True,
-        already_landed=False,
+        already_landed=False, resume_lane_authority=True, lane_free_of_live_process=True,
     ):
         self._observation = observation
         self.send_result = send_result
         self.confirm_after_send = confirm_after_send
         self.sends: list = []
         self._landed = already_landed
+        #: The exact action-time lane authority a resume re-joins immediately before each owed
+        #: effect (R3-F1). A bool (constant) or a list consumed per call (then default True) so a
+        #: test can make the authority move BETWEEN the launch and the send.
+        self._resume_lane_authority = resume_lane_authority
+        self.authority_checks: list = []
+        #: The pre-launch lane-free-of-live fence (R3-F1). Default free; a test sets it False to
+        #: simulate a foreign live process (busy OR idle) holding the lane's name.
+        self._lane_free_of_live_process = lane_free_of_live_process
+        self.free_of_live_checks: list = []
 
     def observe_target(self, request) -> RecoveryObservation:
         return self._observation
@@ -177,6 +195,17 @@ class FakeRecoveryOps:
 
     def gate_redispatched(self, continuation) -> bool:
         return self._landed
+
+    def resume_lane_authority(self, request) -> bool:
+        self.authority_checks.append(request)
+        v = self._resume_lane_authority
+        if isinstance(v, list):
+            return v.pop(0) if v else True
+        return v
+
+    def lane_free_of_live_process(self, request) -> bool:
+        self.free_of_live_checks.append(request)
+        return self._lane_free_of_live_process
 
 
 class _RecoveryCase(unittest.TestCase):
@@ -722,6 +751,463 @@ class PureDomainTests(unittest.TestCase):
         self.assertEqual(payload["verdict"], RECOVER_ACTIONABLE)
         self.assertEqual(payload["status"], RECOVERY_PREFLIGHT)
         self.assertIn("observation", payload)
+
+
+# -- post-close resume correction (Redmine #13806 close-success -> launch-failure -> replay) ----
+#
+# The installed dogfood (#13811 j#81809) broke exactly here: the recovery superseded the worker
+# to a fresh generation, closed the old worker (close=true), then the fresh launch failed
+# (effect_failed: launch). The public outcome said "re-run resumes", but the same immutable
+# replay re-resolved the pinned OLD locator against a live inventory that no longer held it, so
+# the entry preflight classified it identity_unknown and REFUSED "target not actionable" — never
+# reaching the durable transaction's launch_owed resume. These pins prove the replay now reaches
+# the resume and drives launch -> attest -> exactly-once redispatch, while every fail-closed fence
+# (no durable txn, a still-close_owed txn, a wrong generation, a malformed re-approval) still
+# stands (Implementation Request j#81810 §1-§5).
+
+
+class PostCloseResumeTests(_RecoveryCase):
+    def _gone(self):
+        """The post-close live inventory: the pinned OLD worker was closed and is now absent.
+
+        The old-locator-pinned observation resolves nothing (every positive fact defaults to the
+        unsafe side), so ``decide_recovery`` returns ``identity_unknown`` — exactly what the live
+        ops report once the recovery has closed the old slot (the fresh slot sits at a new
+        locator the pin does not name).
+        """
+        return RecoveryObservation()
+
+    def test_close_then_launch_failure_replay_after_old_worker_gone_resumes(self):
+        # THE central reproduction (j#81810): close committed, launch failed, then on replay the
+        # old worker is GONE (identity_unknown) — the resume must still reach launch_owed, not
+        # refuse.
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertIn("re-run resumes", first.detail)
+        self.assertTrue(first.closed_old_worker)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+        # The old worker is now gone; the launch now succeeds. The ACTUAL next command (item 4)
+        # observes identity_unknown yet must reach the durable launch_owed resume and complete.
+        ops._observation = self._gone()
+        self.port.launch_result.pop(wk_id)
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.verdict, RECOVER_BLOCK_UNKNOWN)  # honest preflight fact
+        self.assertTrue(second.post_close_resume)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertFalse(second.is_blocked)
+        self.assertEqual(self.port.closed.count(wk_id), 1)  # NEVER re-closed on the resume
+        # Every launch is action-bound (the failed first attempt + the resume's retry); a
+        # launch_owed resume re-launches, it never adopts blind and never re-closes.
+        self.assertEqual({a for a, _ in self.port.launched}, {ACTION_ID})
+        self.assertEqual(len(ops.sends), 1)  # redispatched exactly once
+        self.assertEqual(self._phase(), PHASE_COMPLETED)
+
+    def test_attestation_pending_replay_after_old_worker_gone_resumes(self):
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.attest[wk_id] = ATTEST_PENDING
+        ops = FakeRecoveryOps(_all_clear())
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_VERIFY_OWED)
+        # Old worker gone; the fresh slot now attests. The verify_owed resume completes.
+        ops._observation = self._gone()
+        self.port.attest[wk_id] = ATTEST_BOUND
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(second.post_close_resume)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(self.port.closed.count(wk_id), 1)
+
+    def test_redispatch_uncertain_replay_after_old_worker_gone_resumes_no_blind_resend(self):
+        # The worker is already replaced (draining_continuation); the send went out but is
+        # unconfirmed. On replay the old worker is gone — the resume must reach the redispatch
+        # idempotency fence, NOT refuse, and never blind-resend.
+        ops = FakeRecoveryOps(_all_clear(), confirm_after_send=False)
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertEqual(first.redispatch_status, REDISPATCH_UNCERTAIN)
+        self.assertEqual(self._phase(), PHASE_DRAINING_CONTINUATION)
+        self.assertEqual(len(ops.sends), 1)
+        ops._observation = self._gone()
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(second.post_close_resume)
+        self.assertEqual(second.redispatch_status, REDISPATCH_UNCERTAIN)
+        self.assertEqual(len(ops.sends), 1)  # no blind resend
+        # The gate lands out of band; a third replay (still worker-gone) confirms, no new send.
+        ops._landed = True
+        third = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(third.post_close_resume)
+        self.assertEqual(third.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
+    def test_completed_recovery_replay_after_old_worker_gone_is_idempotent(self):
+        ops = FakeRecoveryOps(_all_clear())
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_COMPLETED)
+        closed_after = list(self.port.closed)
+        sends_after = len(ops.sends)
+        ops._observation = self._gone()
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(second.post_close_resume)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(self.port.closed, closed_after)  # zero additional close
+        self.assertEqual(len(ops.sends), sends_after)  # zero additional send
+
+    # -- fail-closed fences that must NOT be weakened by the resume admission (§3) ----
+
+    def test_identity_unknown_with_no_durable_transaction_still_refuses_zero_close(self):
+        # A genuinely unknown identity with NO durable transaction is a fresh recovery whose
+        # block is real — never planned / launched blind as a "resume".
+        ops = FakeRecoveryOps(self._gone())
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertEqual(outcome.verdict, RECOVER_BLOCK_UNKNOWN)
+        self.assertFalse(outcome.post_close_resume)
+        self.assertEqual(self.port.closed, [])
+        self.assertIsNone(self.store.get(ReplacementTransactionKey(self.workspace_id, ACTION_ID)))
+
+    def test_close_owed_zero_effect_transaction_is_not_resumed_on_identity_unknown(self):
+        # A durable transaction exists but NOTHING was closed yet (participant close_owed). The
+        # old worker being absent is not a post-close state — the preflight block must stand and
+        # never launch on the unknown identity.
+        key = ReplacementTransactionKey(self.workspace_id, ACTION_ID)
+        self.store.plan_transaction(
+            key, action_generation=GEN,
+            decision=DecisionPointer(source="redmine", issue_id="13806", journal_id="79485"),
+            continuation=ContinuationPointer(
+                source="redmine", issue_id="13806", journal_id="79485",
+                expected_gate="implementation_request", next_semantic_action="dispatch_once",
+            ),
+            participants=[ParticipantPin(**WORKER, lane_revision="3", lane_generation="2")],
+        )
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_CLOSE_OWED)
+        ops = FakeRecoveryOps(self._gone())
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertFalse(outcome.post_close_resume)
+        self.assertEqual(self.port.closed, [])  # never launched / closed on the block
+
+    def test_wrong_generation_committed_transaction_is_not_admitted_as_resume(self):
+        # A committed-effect transaction exists at GEN, but the replay names a DIFFERENT
+        # generation — a foreign / superseding authority, never admitted past the block.
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+        closed_before = list(self.port.closed)
+        # replay at a different generation with the old worker gone
+        ops._observation = self._gone()
+        outcome = self._use_case(ops).run(
+            self._request(action_generation=GEN + 5), execute=True
+        )
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertFalse(outcome.post_close_resume)
+        self.assertEqual(self.port.closed, closed_before)  # zero additional effect
+
+    # -- R3-F1: admission is closed to expected old-locator absence; owed launch/send re-verify --
+
+    def _committed_launch_owed(self):
+        """Drive to a post-close ``launch_owed`` (close committed, launch failed once)."""
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+        self.port.launch_result.pop(wk_id)
+        return ops, wk_id
+
+    def test_worktree_unreadable_blocker_is_not_admitted_as_resume(self):
+        # A committed-close transaction exists, but the current observation RESOLVES the worker
+        # and reports the worktree unreadable (verdict dirty_state_unreadable). That is a real
+        # current-state fence — NOT the expected old-locator absence — so the resume must not
+        # bypass it (R3-F1): zero launch / send.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = _all_clear(worktree_readable=False)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertEqual(outcome.verdict, RECOVER_BLOCK_DIRTY_UNREADABLE)
+        self.assertFalse(outcome.post_close_resume)  # never admitted as a resume
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+
+    def test_stale_generation_blocker_is_not_admitted_as_resume(self):
+        # Likewise a resolved worker at a stale generation is a real fence, never bypassed.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = _all_clear(generation_matches=False)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertEqual(outcome.verdict, RECOVER_BLOCK_STALE_GENERATION)
+        self.assertFalse(outcome.post_close_resume)
+        self.assertEqual(self.port.launched, launched_before)
+        self.assertEqual(ops.sends, [])
+
+    def test_lane_authority_moved_blocks_launch_zero_effect(self):
+        # The expected old-locator absence IS admitted, but the exact lane authority (lifecycle /
+        # worktree token / branch) is moved when re-joined ACTION-TIME immediately before the
+        # launch — zero launch/send, the durable transaction preserved (Review j#82731 F1/F2).
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()  # identity_unknown => admitted
+        ops._resume_lane_authority = False  # the lane authority moved
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertIn("launch_authority_moved", outcome.detail)
+        self.assertTrue(ops.authority_checks)  # the authority was re-joined before the launch
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+        # a later re-run (authority restored) resumes from the same durable owed state
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+
+    def test_foreign_live_process_blocks_launch_zero_effect(self):
+        # Any foreign live process (busy OR idle) at the lane's name when re-joined immediately
+        # before the launch stops it zero-effect (Answer j#82708 "foreign OR productive live").
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()
+        ops._lane_free_of_live_process = False  # a foreign live process holds the name
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertIn("launch_authority_moved", outcome.detail)
+        self.assertTrue(ops.free_of_live_checks)  # the liveness fence was re-joined
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+
+    def test_authority_moves_between_launch_and_send_blocks_send_no_blind_send(self):
+        # THE effect-bound race (Review j#82731 F1): the authority is current at the launch but
+        # moves BEFORE the send. The launch/attest complete, but the send re-joins the authority
+        # action-time and stops zero-send, leaving the phase not-attempted so a later re-run (with
+        # authority restored) sends exactly once — never a blind send.
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        # authority: True for the launch probe, False for the send probe (moved in between).
+        ops._resume_lane_authority = [True, False]
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertTrue(first.post_close_resume)
+        # launched (the setup's failed attempt + this run's success) but...
+        self.assertEqual([i for _a, i in self.port.launched].count(_wk), 2)
+        self.assertEqual(ops.sends, [])  # ...NEVER sent (authority moved before the send)
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)  # not-attempted, re-sendable
+        # authority restored (list drained -> default True); a re-run sends exactly once
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
+    def test_authority_moves_during_attempted_cas_before_transport_blocks_send(self):
+        # THE last-mile race (Review j#82760 F1): authority is current through the launch AND at
+        # the moment the redispatch records `attempted`, but moves DURING the attempted CAS —
+        # after it, before the transport. The send re-joins the authority as the LAST check
+        # immediately before the transport (after the CAS + lease re-auth), so it catches the
+        # move, sends nothing, and UN-RECORDS the attempt (draining_continuation ->
+        # replacing_nonself) so a re-run re-attempts exactly once — never stuck at uncertain.
+        ops, wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        # Hook the store's attempted-CAS (the -> draining_continuation move) to flip the live
+        # authority to moved, reproducing a lane change between the CAS and the transport.
+        orig = self.store.transition_phase
+
+        def flip(key, **kw):
+            out = orig(key, **kw)
+            if kw.get("target") == PHASE_DRAINING_CONTINUATION:
+                ops._resume_lane_authority = False
+            return out
+
+        self.store.transition_phase = flip
+        first = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(first.status, RECOVERY_STOPPED)
+        self.assertEqual(ops.sends, [])  # zero send — the last-mile check caught the move
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)  # attempt un-recorded, re-sendable
+        self.assertEqual([i for _a, i in self.port.launched].count(wk), 2)  # launched, not sent
+        # authority restored + hook removed; a re-run sends exactly once (never a blind resend)
+        self.store.transition_phase = orig
+        ops._resume_lane_authority = True
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
+    def _to_authority_moved_release(self, release_impl):
+        """Drive a resume to the point of an authority-moved un-record, with a hooked release CAS.
+
+        Returns the outcome of a run where the launch succeeds, the authority moves before the
+        send, and ``release_drain_attempt`` is replaced by ``release_impl`` (to force refusals).
+        """
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        ops._resume_lane_authority = [True, False]  # current at launch, moved before the send
+        orig = self.store.release_drain_attempt
+        self.store.release_drain_attempt = release_impl(orig)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        return ops, outcome, orig
+
+    def test_release_cas_stale_revision_is_re_read_and_retried_not_ignored(self):
+        # Progress blocker j#82768: the revert CAS can be refused (a concurrent write raced the
+        # revision that fed expected_revision). The outcome must NOT be ignored — it is re-read and
+        # retried, converging to re-sendable (replacing_nonself), so a re-run sends exactly once.
+        calls = []
+
+        def release_impl(orig):
+            def flaky(key, **kw):
+                calls.append(1)
+                if len(calls) == 1:  # first attempt: a stale-revision refusal
+                    return CasOutcome(
+                        applied=False, reason=CAS_STALE_REVISION,
+                        revision=kw["expected_revision"] + 1,
+                    )
+                return orig(key, **kw)  # the re-read retry applies
+            return flaky
+
+        ops, outcome, orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_AUTHORITY_MOVED)
+        self.assertEqual(ops.sends, [])  # zero send
+        self.assertGreaterEqual(len(calls), 2)  # the refusal was re-read + retried, not ignored
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)  # reverted -> re-sendable
+        # a re-run (release restored, authority current) sends exactly once
+        self.store.release_drain_attempt = orig
+        ops._resume_lane_authority = True
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
+    def test_release_cas_lease_lost_is_typed_blocker_not_false_re_sendable(self):
+        # A revert refused because the lease was lost is a CONCRETE typed blocker (lease_lost) —
+        # never a false authority_moved that claims a re-sendable state it did not reach.
+        def release_impl(orig):
+            return lambda key, **kw: CasOutcome(
+                applied=False, reason=CAS_LEASE_NOT_HELD, revision=kw["expected_revision"],
+            )
+
+        _ops, outcome, _orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_LEASE_LOST)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+
+    def test_release_cas_persistently_refused_caps_to_distinct_release_refused(self):
+        # A pathologically persistent stale-revision refusal hits the bounded cap and reports the
+        # DISTINCT release_refused blocker (Review j#82782 F1) — a zero-send CAS-recovery failure,
+        # NEVER a false authority_moved AND NEVER conflated with the send-in-flight uncertain (the
+        # send is proven zero on this path).
+        def release_impl(orig):
+            return lambda key, **kw: CasOutcome(
+                applied=False, reason=CAS_STALE_REVISION, revision=kw["expected_revision"] + 1,
+            )
+
+        ops, outcome, _orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_RELEASE_REFUSED)
+        self.assertNotEqual(outcome.redispatch_status, REDISPATCH_UNCERTAIN)
+        self.assertNotEqual(outcome.redispatch_status, REDISPATCH_AUTHORITY_MOVED)
+        self.assertEqual(ops.sends, [])
+
+    def test_release_cas_unexpected_refusal_reason_is_release_refused(self):
+        # An unexpected refusal reason (neither stale/not-found retry nor lease/generation) is the
+        # same distinct release_refused blocker — never claimed re-sendable, never uncertain.
+        def release_impl(orig):
+            return lambda key, **kw: CasOutcome(
+                applied=False, reason=CAS_UNEXPECTED_STATE, revision=kw["expected_revision"],
+            )
+
+        _ops, outcome, _orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_RELEASE_REFUSED)
+        self.assertNotEqual(outcome.redispatch_status, REDISPATCH_UNCERTAIN)
+
+    def test_admitted_resume_reverifies_authority_effect_bound_then_completes(self):
+        # The legitimate path: expected absence admitted, authority exact and current at BOTH the
+        # launch and the send — the resume re-joins them action-time and completes.
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        # authority re-joined both before the launch and before the send (>= 2 action-time checks)
+        self.assertGreaterEqual(len(ops.authority_checks), 2)
+        self.assertTrue(ops.free_of_live_checks)  # pre-launch liveness fence consulted
+
+    def test_dirty_but_readable_resume_completes_byte_preserved(self):
+        # The tranche D byte-preservation contract holds on the resume (Answer j#82708 Option A):
+        # a DIRTY (but readable) worktree is the un-durable-ized work the recovery preserves —
+        # dirtiness is not an authority axis, so with the lane authority exact and no foreign live
+        # process, the resume relaunches and completes, exactly as the first-success fresh-recovery
+        # path (test_stale_worker_with_dirty_unrecorded_worktree_closes_present_slot). The launch-
+        # failure timing never changes the byte-preservation outcome.
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        ops._resume_lane_authority = True  # dirtiness is not an axis => authority holds
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+
+    # -- §5 dual-anchor: resume re-approval is a separate authority from the CAS anchor ----
+
+    def test_resume_with_distinct_reapproval_journal_completes_without_tripping_divergence(self):
+        # The stored decision/continuation anchor is journal 79485 (--journal). A post-close
+        # resume re-approved by a FRESH journal (--resume-journal 82649) must complete: the CAS
+        # anchor stays 79485 (matched via --journal), the fresh re-approval is recorded, and the
+        # divergence / supersede fence is NEVER tripped.
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+        ops._observation = self._gone()
+        self.port.launch_result.pop(wk_id)
+        second = self._use_case(ops).run(
+            self._request(resume_journal="82649"), execute=True
+        )
+        self.assertTrue(second.post_close_resume)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(second.resume_authorization, "82649")
+        self.assertNotIn("different recovery authority", second.detail)
+        # The stored immutable decision anchor is UNCHANGED (still the original 79485).
+        rec = self.store.get(ReplacementTransactionKey(self.workspace_id, ACTION_ID))
+        self.assertEqual(rec.decision.journal_id, "79485")
+        self.assertEqual(rec.continuation.journal_id, "79485")
+
+    def test_malformed_resume_journal_is_zero_close_launch_send(self):
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+        closed_before = list(self.port.closed)
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()
+        self.port.launch_result.pop(wk_id)
+        outcome = self._use_case(ops).run(
+            self._request(resume_journal="not-a-journal"), execute=True
+        )
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertTrue(outcome.post_close_resume)  # it WAS an admitted resume, refused on §5
+        self.assertEqual(self.port.closed, closed_before)  # zero close
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+
+    def test_same_journal_resume_records_no_distinct_reauthorization(self):
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        self._use_case(ops).run(self._request(), execute=True)
+        ops._observation = self._gone()
+        self.port.launch_result.pop(wk_id)
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertTrue(second.post_close_resume)
+        self.assertEqual(second.resume_authorization, "")  # same-journal resume
+
+
+class PostCloseResumePureTests(unittest.TestCase):
+    def test_worker_close_committed_is_true_only_past_close_owed(self):
+        self.assertFalse(worker_close_committed(PARTICIPANT_CLOSE_OWED))
+        self.assertTrue(worker_close_committed(PARTICIPANT_LAUNCH_OWED))
+        self.assertTrue(worker_close_committed(PARTICIPANT_VERIFY_OWED))
+        self.assertTrue(worker_close_committed(PARTICIPANT_REPLACED))
+        self.assertFalse(worker_close_committed(""))
+        self.assertFalse(worker_close_committed("nonsense"))
 
 
 if __name__ == "__main__":

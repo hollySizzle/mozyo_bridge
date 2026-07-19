@@ -138,6 +138,25 @@ class RecoverStaleCliTests(unittest.TestCase):
         self.assertFalse(parser.parse_args(BASE).supersede)
         self.assertTrue(parser.parse_args(BASE + ["--supersede"]).supersede)
 
+    def test_resume_journal_flag_parses_separately_from_journal(self):
+        # Redmine #13806 post-close correction §5: --resume-journal is a SEPARATE authority from
+        # --journal (the immutable stored decision/continuation anchor).
+        parser = build_parser(None)
+        self.assertEqual(parser.parse_args(BASE).resume_journal, "")
+        ns = parser.parse_args(BASE + ["--journal", "79485", "--resume-journal", "82649"])
+        self.assertEqual(ns.journal, "79485")
+        self.assertEqual(ns.resume_journal, "82649")
+
+    def test_payload_carries_post_close_resume_fields(self):
+        rc, text = self._run(BASE + ["--json"], rows=[_stale_row()])
+        payload = json.loads(text)
+        # A fresh preflight is never a post-close resume, but the fields are always present so a
+        # durable record / audit can read them without a shape guess.
+        self.assertIn("post_close_resume", payload)
+        self.assertFalse(payload["post_close_resume"])
+        self.assertIn("resume_authorization", payload)
+        self.assertIsNone(payload["resume_authorization"])
+
 
 if __name__ == "__main__":
     unittest.main()

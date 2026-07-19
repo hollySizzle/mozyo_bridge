@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     CAS_NOT_FOUND,
     CAS_PARTICIPANT_NOT_FOUND,
     CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
     ReplacementTransactionError,
     ReplacementTransactionStore,
     load_replacement_transactions,
@@ -687,6 +688,61 @@ class PhaseTransitionTests(_StoreCase):
                 self.key, expected_revision=2, expected_action_generation=GEN,
                 target="bogus", holder="H",
             )
+
+
+class ReleaseDrainAttemptTests(_StoreCase):
+    """Redmine #13806 R3 Review j#82760 F1: the guarded not-yet-sent drain-attempt revert."""
+
+    def setUp(self):
+        super().setUp()
+        # A no-self worker recovery: replacing_nonself -> draining_continuation shortcut, then
+        # the worker is replaced so the recovery sits ready to redispatch.
+        self._plan(participants=[_worker()])
+        self._claim(holder="H")
+        self._phase(PHASE_CLAIMED)
+        self._phase(PHASE_REPLACING_NONSELF)
+        self._replace_participant(_worker().identity)
+        self.assertTrue(self._phase(PHASE_DRAINING_CONTINUATION).applied)
+
+    def _release(self, holder="H", gen=GEN, rev=None):
+        if rev is None:
+            rev = self._rev()
+        return self.store.release_drain_attempt(
+            self.key, expected_revision=rev, expected_action_generation=gen, holder=holder,
+        )
+
+    def test_reverts_draining_continuation_to_replacing_nonself(self):
+        out = self._release()
+        self.assertTrue(out.applied)
+        self.assertEqual(self.store.get(self.key).phase, PHASE_REPLACING_NONSELF)
+
+    def test_requires_live_lease_holder(self):
+        out = self._release(holder="stranger")
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_LEASE_NOT_HELD)
+
+    def test_generation_mismatch_refused(self):
+        out = self._release(gen=GEN + 1)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_GENERATION_MISMATCH)
+
+    def test_stale_revision_refused(self):
+        out = self._release(rev=self._rev() + 5)
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_STALE_REVISION)
+
+    def test_only_from_draining_continuation(self):
+        # After one revert the phase is replacing_nonself; a second is a wrong-state caller.
+        self.assertTrue(self._release().applied)
+        out = self._release()
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+
+    def test_reverted_transaction_can_re_advance_to_draining_continuation(self):
+        # The revert is exact: the transaction is back at replacing_nonself (worker replaced) and
+        # can re-take the shortcut to draining_continuation (a re-run re-attempts the redispatch).
+        self.assertTrue(self._release().applied)
+        self.assertTrue(self._phase(PHASE_DRAINING_CONTINUATION).applied)
 
 
 class ParticipantTransitionTests(_StoreCase):

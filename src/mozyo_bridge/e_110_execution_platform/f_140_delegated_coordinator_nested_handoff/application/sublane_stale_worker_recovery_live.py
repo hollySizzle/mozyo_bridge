@@ -93,6 +93,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+    SLOT_LIVE,
     SLOT_STALE,
     classify_named_slot,
 )
@@ -389,6 +390,9 @@ class LiveStaleWorkerRecoveryOps:
     #: The startup-attestation store home the redispatch post-launch boundary reads (Redmine
     #: #13806 R2-F3). ``None`` = the real state home; tests inject an isolated one.
     attestation_home: Optional[Path] = None
+    #: The lane-lifecycle store home the post-close resume re-verification reads (Redmine #13806
+    #: R3-F1). ``None`` = the real state home; tests inject an isolated one.
+    lifecycle_home: Optional[Path] = None
 
     def _ledger(self) -> HerdrDeliveryLedger:
         return self.ledger if self.ledger is not None else HerdrDeliveryLedger()
@@ -505,6 +509,106 @@ class LiveStaleWorkerRecoveryOps:
             return probe_worktree_resolved(str(raw)) is True
         except Exception:  # noqa: BLE001 - unreadable worktree fails closed
             return False
+
+    @staticmethod
+    def _current_branch(path: str) -> str:
+        """The worktree's current branch name, or ``""`` (fail-closed). Read-only."""
+        import subprocess
+
+        if not path or not Path(path).is_dir():
+            return ""
+        try:
+            result = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+                text=True, capture_output=True,
+            )
+        except OSError:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def resume_lane_authority(self, request: RecoveryRequest) -> bool:
+        """Is the lane's ambient authority EXACT and current, right now? (read-only, #13806 R3-F1)
+
+        Re-joins EVERY exact lane-authority axis (Review j#82731 F2 / Answer j#82708), old-slot-
+        independent, for the action-time launch / send fence:
+
+        - the LIVE lane lifecycle exists and its ``(revision, generation)`` equals the pinned
+          ``lane_revision`` / ``lane_generation``;
+        - the lifecycle's canonical ``worktree_identity`` token is non-empty AND equals the token
+          freshly derived from the recovery worktree (``derive_lane_workspace_token(repo_root)``) —
+          a sibling / wrong / moved worktree fails here;
+        - the recovery worktree resolves to a live git checkout AND its current branch equals the
+          lane's expected branch (the issue lane id IS its branch) — an unreadable worktree or a
+          drifted branch fails here.
+
+        Dirtiness is deliberately NOT an axis (Answer j#82708 Option A). Fail-closed: any absent /
+        mismatched axis returns ``False``.
+        """
+        pinned_rev = _norm(request.lane_revision)
+        pinned_gen = _norm(request.lane_generation)
+        if not pinned_rev or not pinned_gen:
+            return False
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            LaneLifecycleError,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
+        try:
+            record = LaneLifecycleStore(home=self.lifecycle_home).get(
+                LaneLifecycleKey(repo_scope_workspace_id(self.repo_root), _norm_lane(request.lane))
+            )
+        except (LaneLifecycleError, ValueError, OSError):
+            return False
+        if record is None:
+            return False
+        if str(record.revision) != pinned_rev or str(record.lane_generation) != pinned_gen:
+            return False
+        # Exact worktree-token authority: the lane's canonical token must be present AND equal the
+        # token freshly derived from the recovery worktree (a wrong / sibling worktree differs).
+        pinned_token = _norm(record.worktree_identity)
+        if not pinned_token:
+            return False
+        try:
+            live_token = _norm(derive_lane_workspace_token(str(self.repo_root)))
+        except Exception:  # noqa: BLE001 - an underivable token fails closed
+            return False
+        if not live_token or live_token != pinned_token:
+            return False
+        # Readable worktree on the lane's expected branch (the issue lane id is the branch).
+        try:
+            if probe_worktree_resolved(str(self.repo_root)) is not True:
+                return False
+        except Exception:  # noqa: BLE001 - unreadable worktree fails closed
+            return False
+        return _norm_lane(self._current_branch(str(self.repo_root))) == _norm_lane(request.lane)
+
+    def lane_free_of_live_process(self, request: RecoveryRequest) -> bool:
+        """Is the lane free of ANY foreign live process (busy OR idle)? (read-only, #13806 R3-F1)
+
+        Scan the live herdr inventory for a LIVE slot at the recovery's assigned name (old-slot-
+        independent). A pre-launch fence: the old worker is closed and the fresh worker is not yet
+        launched, so ANY row at the name that classifies :data:`SLOT_LIVE` — busy OR idle — is a
+        foreign process the relaunch must not collide with. A positive shell-residue (:data:`SLOT_STALE`,
+        what recover-stale recovers) is not live and does not fence. Fail-closed: an unreadable
+        inventory returns ``False``.
+        """
+        try:
+            rows = self._rows()
+        except Exception:  # noqa: BLE001 - unreadable inventory fails closed
+            return False
+        name = _norm(request.assigned_name)
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if _norm(row.get(AGENT_KEY_NAME)) != name:
+                continue
+            if classify_named_slot(row) == SLOT_LIVE:
+                return False
+        return True
 
     # -- redispatch (high-level rail + REAL delivery-ledger oracle, Redmine #13806 R2-F3) ----
 
