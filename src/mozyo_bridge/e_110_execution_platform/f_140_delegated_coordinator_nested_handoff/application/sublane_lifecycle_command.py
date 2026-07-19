@@ -831,11 +831,23 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
                 getattr(args, "integration_branch", None) or "",
             )
             worktree_branch = ops.branch_for(worktree) if worktree else None
+            # Redmine #14066: when the literal ancestry probe does not pass, a coordinator
+            # ``patch_equivalent`` integration disposition (cherry-picked, review-approved
+            # commits) is the only other admissible route. Resolve it action-time — re-read the
+            # durable disposition and recompute the stable patch-ids / origin reachability vs the
+            # real git facts. ``None`` when no disposition is supplied (the retire keeps its
+            # literal ``head_not_integrated``); every read / probe / fence failure is fail-closed.
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
+                resolve_patch_equivalent_integration,
+            )
+
+            patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
             bound_retire_result = run_hibernated_bound_retire(
                 args,
                 repo_root,
                 head_integrated=head_integrated,
                 worktree_branch=worktree_branch,
+                patch_equivalent=patch_equivalent,
             )
     elif getattr(args, "execute", False) and outcome.preflight.may_retire:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501

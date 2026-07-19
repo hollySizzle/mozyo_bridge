@@ -193,11 +193,30 @@ def register_sublane_retire(
             "attests against the row's recorded canonical binding AND the durable row is "
             "hibernated + released + owns --issue AND the live inventory shows every expected "
             "managed slot absent AND no foreign / unexpected provider occupies the lane unit "
-            "AND --branch is integrated, moves it directly to the terminal "
+            "AND --branch is integrated (a literal ancestor of --integration-branch, OR a "
+            "coordinator patch_equivalent integration verified via --integration-disposition-json, "
+            "Redmine #14066), moves it directly to the terminal "
             "`retired` disposition via a bounded CAS, preserving the row's declared pins and "
             "worktree identity. Launches / closes / resumes NO process; removes no worktree / "
             "branch. Mutually exclusive with --execute, --migrate-hibernated-legacy and "
             "--reconcile-hibernated-live (passing more than one is a zero-write error)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--integration-disposition-json",
+        dest="integration_disposition_json",
+        default=None,
+        help=(
+            "Redmine #14066: path to the coordinator's durable `patch_equivalent` integration "
+            "disposition, captured from the exact integration journal "
+            "{issue, lane, branch, integration_branch, source_head, integration_head, origin_ref, "
+            "origin_reachable, journal_id, commit_map:[{source,integration,patch_id}]}. Used ONLY "
+            "with --retire-hibernated-bound and ONLY when --branch is not a literal ancestor of "
+            "--integration-branch: the retire re-reads the disposition and RECOMPUTES the stable "
+            "patch-ids + origin reachability from real git at action-time, terminalizing only when "
+            "every mapped cherry-pick is proven patch-equivalent and the recorded source/"
+            "integration heads match the current branches. Missing / malformed / stale / "
+            "mismatched evidence fails closed (zero-write). The literal-ancestor path ignores it."
         ),
     )
     add_repo_option(sublane_retire)
