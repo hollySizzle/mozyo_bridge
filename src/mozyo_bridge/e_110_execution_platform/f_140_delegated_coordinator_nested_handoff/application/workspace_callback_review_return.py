@@ -421,6 +421,11 @@ class BacklogDrainOutcome:
     workspace_id: str
     fenced: int = 0
     delivered: int = 0
+    #: Claimed backlog rows that reached the send edge but did NOT positively deliver (Redmine #13683
+    #: R2): a busy / ambiguous / unavailable receiver held as a retryable / uncertain receipt, or a
+    #: claim reconciled away mid-send. The receipt-truth counterpart of ``delivered`` — ``len(report.
+    #: delivered)`` includes these, so the drain must not count them as deliveries.
+    blocked: int = 0
     recovered: int = 0
     transient_skipped: int = 0
     lease_lost: bool = False
@@ -430,6 +435,7 @@ class BacklogDrainOutcome:
             "workspace_id": self.workspace_id,
             "fenced": self.fenced,
             "delivered": self.delivered,
+            "blocked": self.blocked,
             "recovered": self.recovered,
             "transient_skipped": self.transient_skipped,
             "lease_lost": self.lease_lost,
@@ -488,9 +494,16 @@ def drain_review_return_backlog(
     foreign snapshot's authority). ``limit`` (review F2): a WORKSPACE-WIDE budget on the rows this drain
     claims + transitions (``--deliver --limit N``); ``None`` applies the per-issue processor default.
     """
-    from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_INFLIGHT, CALLBACK_PENDING
+    from mozyo_bridge.core.state.workflow_runtime_store import (
+        CALLBACK_DELIVERED,
+        CALLBACK_INFLIGHT,
+        CALLBACK_PENDING,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
         CallbackOutboxProcessor,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+        partition_delivery_receipts,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
         current_review_generation_conclusion,
@@ -504,7 +517,7 @@ def drain_review_return_backlog(
         frozenset(str(i or "").strip() for i in restrict_issues)
         if restrict_issues is not None else None
     )
-    fenced = delivered = recovered = transient = 0
+    fenced = delivered = blocked = recovered = transient = 0
     remaining = limit  # None = unbounded (the per-issue processor default applies)
     # Foreign-partition-safe read: only THIS workspace's own rows (an unreadable outbox drains nothing
     # rather than raising). Include stale ``inflight`` (F1: a crashed-mid-send issue is enumerated so
@@ -529,8 +542,8 @@ def drain_review_return_backlog(
             break  # F2: the workspace-wide claim budget is exhausted
         if lease_guard_fn is not None and not lease_guard_fn():
             return BacklogDrainOutcome(
-                workspace_id=wsid, fenced=fenced, delivered=delivered, recovered=recovered,
-                transient_skipped=transient, lease_lost=True,
+                workspace_id=wsid, fenced=fenced, delivered=delivered, blocked=blocked,
+                recovered=recovered, transient_skipped=transient, lease_lost=True,
             )
         try:
             # ONE provider read is the transient gate: any read that RAISES leaves this issue's rows
@@ -560,13 +573,20 @@ def drain_review_return_backlog(
             limit=(remaining if remaining is not None else 32), now=now,
         )
         fenced += len(report.fenced)
-        delivered += len(report.delivered)
+        # Receipt truth (Redmine #13683 R2): count a real delivery ONLY when the row's durable state is
+        # CALLBACK_DELIVERED; a busy / uncertain / reconciled-away row in report.delivered is ``blocked``,
+        # never a delivery. The claim budget below still spends on every claimed row (fenced + attempted).
+        issue_delivered, issue_blocked = partition_delivery_receipts(
+            report.delivered, delivered_state=CALLBACK_DELIVERED
+        )
+        delivered += issue_delivered
+        blocked += issue_blocked
         recovered += len(report.recovered)
         if remaining is not None:
             remaining -= len(report.fenced) + len(report.delivered)
     return BacklogDrainOutcome(
-        workspace_id=wsid, fenced=fenced, delivered=delivered, recovered=recovered,
-        transient_skipped=transient,
+        workspace_id=wsid, fenced=fenced, delivered=delivered, blocked=blocked,
+        recovered=recovered, transient_skipped=transient,
     )
 
 

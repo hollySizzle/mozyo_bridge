@@ -209,6 +209,44 @@ def compose_send_edge_fences(*fences):
     return _fence
 
 
+def _receipt_state(item: object) -> str:
+    """Read a delivery outcome's ACTUAL persisted callback-outbox state (dict or object; pure)."""
+    if isinstance(item, dict):
+        return str(item.get("resulting_state", "") or "").strip()
+    return str(getattr(item, "resulting_state", "") or "").strip()
+
+
+def partition_delivery_receipts(
+    delivery_outcomes: Iterable[object], *, delivered_state: str
+) -> tuple[int, int]:
+    """Split a deliver pass's per-row outcomes into ``(delivered, blocked)`` by durable receipt.
+
+    ``delivery_outcomes`` is a ``DeliveryReport.delivered`` sequence — one entry per CLAIMED row that
+    reached the send edge (as a :class:`...callback_outbox_processor.DeliveryOutcome` object OR its
+    ``as_payload()`` dict). Crucially this list is NOT "the rows that were delivered": it carries every
+    claimed row's terminal outcome regardless of whether the receiver was woken. A row counts as
+    ``delivered`` ONLY when its **actual persisted** ``resulting_state`` is ``delivered_state`` (the
+    outbox ``CALLBACK_DELIVERED`` terminal — a positively-submitted send). Every other outcome — a
+    busy / ambiguous / unavailable receiver held as a retryable (``retry`` / re-``pending``) row, a
+    post-injection ``uncertain`` receipt, or a claim whose lease expired mid-send and was reconciled
+    away (``ownership_lost``) — is a NON-delivery counted as ``blocked``: a receipt held, not a wake.
+
+    This is the receipt-truth binding (Redmine #13683 R2): the supervisor's ``delivered`` projection
+    must equal actual receiver wakes, never the count of send *attempts*. Counting ``len(delivered)``
+    reported a busy-receiver zero-send as a delivery — the ``delivered`` counter diverging from the
+    receiver's durable state (installed a16 j#82329). Pure and duck-typed; returns ``(delivered,
+    blocked)`` with ``delivered + blocked == len(delivery_outcomes)``.
+    """
+    delivered = 0
+    blocked = 0
+    for item in delivery_outcomes or ():
+        if _receipt_state(item) == delivered_state:
+            delivered += 1
+        else:
+            blocked += 1
+    return delivered, blocked
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -252,6 +290,11 @@ class IssueSupervisionOutcome:
     issue: str
     events_supplied: int = 0
     delivered: int = 0
+    #: Claimed callback rows that reached the send edge but did NOT positively deliver (Redmine #13683
+    #: R2): a busy / ambiguous / unavailable receiver held as a retryable / uncertain receipt, or a
+    #: claim reconciled away mid-send. Counted separately so ``delivered`` equals actual receiver wakes
+    #: and a non-wake is operator-visible, never silently folded into the delivered count.
+    blocked: int = 0
     recovered: int = 0
     pending: int = 0
     dead_letter: int = 0
@@ -271,6 +314,7 @@ class IssueSupervisionOutcome:
             "issue": self.issue,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
+            "blocked": self.blocked,
             "recovered": self.recovered,
             "pending": self.pending,
             "dead_letter": self.dead_letter,
@@ -303,6 +347,10 @@ class WorkspaceSupervisionOutcome:
     #: was left pending because the provider was unreadable. All surfaced so no side effect is invisible.
     backlog_fenced: int = 0
     backlog_delivered: int = 0
+    #: Backlog-drain claimed rows that reached the send edge but did NOT positively deliver (Redmine
+    #: #13683 R2): the receipt-truth counterpart of ``backlog_delivered`` (busy / uncertain / reconciled
+    #: mid-send), rolled into the workspace ``blocked`` so a non-wake in the backlog drain is visible.
+    backlog_blocked: int = 0
     backlog_recovered: int = 0
     backlog_transient_skipped: int = 0
 
@@ -315,6 +363,12 @@ class WorkspaceSupervisionOutcome:
         # F4: a backlog-drain send is a real delivery — roll it in so the report never under-counts it.
         return sum(i.delivered for i in self.issues) + self.backlog_delivered
 
+    @property
+    def blocked(self) -> int:
+        # Receipt truth (Redmine #13683 R2): non-delivering claimed rows across the active-issue pass
+        # AND the backlog drain, so ``delivered`` never absorbs a send that did not wake the receiver.
+        return sum(i.blocked for i in self.issues) + self.backlog_blocked
+
     def as_payload(self) -> dict[str, object]:
         return {
             "workspace_id": self.workspace_id,
@@ -326,8 +380,10 @@ class WorkspaceSupervisionOutcome:
             "skipped_reason": self.skipped_reason,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
+            "blocked": self.blocked,
             "backlog_fenced": self.backlog_fenced,
             "backlog_delivered": self.backlog_delivered,
+            "backlog_blocked": self.backlog_blocked,
             "backlog_recovered": self.backlog_recovered,
             "backlog_transient_skipped": self.backlog_transient_skipped,
             "issues": [i.as_payload() for i in self.issues],
@@ -359,6 +415,10 @@ class SupervisorReport:
         return sum(w.delivered for w in self.workspaces)
 
     @property
+    def blocked(self) -> int:
+        return sum(w.blocked for w in self.workspaces)
+
+    @property
     def backlog_fenced(self) -> int:
         return sum(w.backlog_fenced for w in self.workspaces)
 
@@ -376,6 +436,7 @@ class SupervisorReport:
             "workspaces_skipped": self.workspaces_skipped,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
+            "blocked": self.blocked,
             "backlog_fenced": self.backlog_fenced,
             "backlog_recovered": self.backlog_recovered,
             "workspaces": [w.as_payload() for w in self.workspaces],
@@ -466,6 +527,7 @@ __all__ = (
     "fence_candidates_to_anchor",
     "make_send_edge_fence",
     "compose_send_edge_fences",
+    "partition_delivery_receipts",
     "IssueSelection",
     "select_supervised_issues",
     "IssueSupervisionOutcome",

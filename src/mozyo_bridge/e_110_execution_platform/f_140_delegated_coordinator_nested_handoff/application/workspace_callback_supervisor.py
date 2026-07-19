@@ -42,7 +42,7 @@ from mozyo_bridge.core.state.supervisor_lease import (
     SUPERVISOR_LEASE_TTL_SECONDS,
     SupervisorLeaseStore,
 )
-from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_INFLIGHT, CALLBACK_PENDING, WorkflowRuntimeStore  # noqa: E501
+from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_DELIVERED, CALLBACK_INFLIGHT, CALLBACK_PENDING, WorkflowRuntimeStore  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
@@ -88,6 +88,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     authoritative_workspace_by_issue,
     fence_candidates_to_anchor,
     partition_authoritative,
+    partition_delivery_receipts,
     select_supervised_issues,
 )
 
@@ -393,6 +394,7 @@ class WorkspaceCallbackSupervisor:
                 skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
                 backlog_fenced=backlog.fenced if backlog else 0,
                 backlog_delivered=backlog.delivered if backlog else 0,
+                backlog_blocked=backlog.blocked if backlog else 0,
                 backlog_recovered=backlog.recovered if backlog else 0,
                 backlog_transient_skipped=backlog.transient_skipped if backlog else 0,
             )
@@ -551,10 +553,19 @@ class WorkspaceCallbackSupervisor:
         sweep = report.get("sweep") or {}
         # Total fenced this pass: ingest-dropped candidates + send-edge fenced backlog rows.
         historical_fenced += len(deliver.get("fenced") or [])
+        # Receipt truth (Redmine #13683 R2): ``deliver["delivered"]`` is EVERY claimed row that reached
+        # the send edge, NOT the rows that positively delivered. Count a row as delivered ONLY when its
+        # durable ``resulting_state`` is CALLBACK_DELIVERED; a busy / ambiguous / unavailable receiver
+        # held as a retryable / uncertain receipt (or a claim reconciled away mid-send) is ``blocked``,
+        # so the ``delivered`` counter equals actual receiver wakes (installed a16 j#82329 divergence).
+        delivered_count, blocked_count = partition_delivery_receipts(
+            deliver.get("delivered") or [], delivered_state=CALLBACK_DELIVERED
+        )
         return IssueSupervisionOutcome(
             issue=issue,
             events_supplied=events_supplied,
-            delivered=len(deliver.get("delivered") or []),
+            delivered=delivered_count,
+            blocked=blocked_count,
             recovered=len(deliver.get("recovered") or []),
             pending=len(sweep.get("pending") or []),
             dead_letter=len(sweep.get("dead_letter") or []),
