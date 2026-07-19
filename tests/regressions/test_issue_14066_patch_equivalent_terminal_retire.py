@@ -127,6 +127,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CommitPatchMapping,
     PatchEquivalentDisposition,
     PatchEquivalentObservation,
+    disposition_from_block,
     disposition_from_mapping,
     evaluate_patch_equivalent_integrated,
     parse_integration_disposition_blocks,
@@ -433,13 +434,13 @@ class IntegrationDispositionBlockTests(unittest.TestCase):
         note = "coordinator prose\n\n" + render_integration_disposition_block(disp)
         blocks = parse_integration_disposition_blocks(note)
         self.assertEqual(len(blocks), 1)
-        self.assertEqual(disposition_from_mapping(blocks[0]), disp)
+        self.assertEqual(disposition_from_block(blocks[0]), disp)
 
     def test_no_block_is_empty(self) -> None:
         self.assertEqual(parse_integration_disposition_blocks("just prose"), ())
         self.assertEqual(parse_integration_disposition_blocks(""), ())
 
-    def test_two_blocks_are_both_returned_as_ambiguous(self) -> None:
+    def test_two_blocks_are_both_counted_as_ambiguous(self) -> None:
         disp = self._disposition()
         note = (
             render_integration_disposition_block(disp)
@@ -448,12 +449,55 @@ class IntegrationDispositionBlockTests(unittest.TestCase):
         )
         self.assertEqual(len(parse_integration_disposition_blocks(note)), 2)
 
-    def test_malformed_json_block_is_skipped(self) -> None:
-        note = "```mozyo-patch-equivalent-integration\n{not json\n```"
-        self.assertEqual(parse_integration_disposition_blocks(note), ())
+    def test_malformed_block_still_counts_as_a_raw_occurrence(self) -> None:
+        # review j#82301 F2: a malformed fence is NOT dropped — it is a raw block occurrence, so
+        # malformed + valid is TWO blocks (ambiguous), never silently the one valid block.
+        note = (
+            "```mozyo-patch-equivalent-integration\n{not json\n```\n\n"
+            + render_integration_disposition_block(self._disposition())
+        )
+        blocks = parse_integration_disposition_blocks(note)
+        self.assertEqual(len(blocks), 2)
+        self.assertIsNone(disposition_from_block(blocks[0]))  # the malformed one
 
-    def test_missing_commit_map_does_not_project(self) -> None:
+    def test_single_malformed_block_does_not_project(self) -> None:
+        note = "```mozyo-patch-equivalent-integration\n{not json\n```"
+        blocks = parse_integration_disposition_blocks(note)
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNone(disposition_from_block(blocks[0]))
+
+    def test_stringified_origin_reachable_is_not_coerced(self) -> None:
+        # review j#82301 F2: JSON string "false" must not read as truthy True — it is malformed.
+        body = json.dumps(
+            {
+                "issue": "13879",
+                "lane": "issue_13879_hibernated_pin_repair",
+                "branch": "issue_13879_hibernated_pin_repair",
+                "integration_branch": _INTEGRATION_BRANCH,
+                "source_head": "s" * 40,
+                "integration_head": "i" * 40,
+                "origin_reachable": "false",
+                "commit_map": [{"source": "a" * 40, "integration": "A" * 40, "patch_id": "p"}],
+            }
+        )
+        self.assertIsNone(disposition_from_block(body))
+
+    def test_missing_or_non_bool_fields_do_not_project(self) -> None:
         self.assertIsNone(disposition_from_mapping({"issue": "1"}))
+        # origin_reachable missing entirely
+        self.assertIsNone(
+            disposition_from_mapping(
+                {
+                    "issue": "1",
+                    "lane": "l",
+                    "branch": "b",
+                    "integration_branch": "i",
+                    "source_head": "s",
+                    "integration_head": "h",
+                    "commit_map": [],
+                }
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +593,15 @@ class _Scenario:
         _git("remote", "add", "origin", str(self.origin), cwd=self.primary)
         _git("fetch", "origin", cwd=self.primary)
         self.bound_token = derive_lane_workspace_token(str(self.lane_worktree.resolve()))
+
+    def drop_origin_branch(self) -> None:
+        """Delete the integration branch on the bare origin AFTER the fetch (review j#82301 F1).
+
+        The local ``refs/remotes/origin/<branch>`` tracking ref stays behind, so a check that
+        trusts the cached ref would still pass — but a fresh ``git ls-remote`` now sees the branch
+        gone. This is the reviewer's exact stale-cache reproduction.
+        """
+        _git("update-ref", "-d", f"refs/heads/{_INTEGRATION_BRANCH}", cwd=self.origin)
 
     def disposition(self, **over) -> PatchEquivalentDisposition:
         base = PatchEquivalentDisposition(
@@ -799,14 +852,36 @@ class PatchEquivalentResolverTests(unittest.TestCase):
             out.reason, {PE_INTEGRATION_COMMIT_UNREACHABLE, PE_PATCH_ID_UNRESOLVED}
         )
 
-    def test_origin_unreachable_fails_closed(self) -> None:
-        # origin has no integration ref, so origin/<integration-branch> is unreachable — the
-        # caller cannot substitute a local ref because the retire derives the origin ref itself.
+    def test_origin_unreachable_when_branch_absent_before_fetch(self) -> None:
+        # origin never had the integration ref: ls-remote sees nothing -> unreachable.
         s = self._scenario(origin_has_integration=False)
         _install_fake_journal(self, [s.entry()])
         out = resolve_patch_equivalent_integration(self._args(s), s.primary)
         self.assertFalse(out.admissible)
         self.assertEqual(out.reason, PE_ORIGIN_UNREACHABLE)
+
+    def test_stale_remote_tracking_ref_is_not_authority(self) -> None:
+        # review j#82301 F1: the branch is deleted on origin AFTER the fetch, so the cached
+        # refs/remotes/origin/<branch> ref survives locally. A fresh ls-remote must still see the
+        # branch gone and fail closed — the stale tracking ref is NOT origin authority.
+        s = self._scenario()
+        s.drop_origin_branch()
+        _install_fake_journal(self, [s.entry()])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
+        self.assertFalse(out.admissible)
+        self.assertEqual(out.reason, PE_ORIGIN_UNREACHABLE)
+
+    def test_malformed_plus_valid_block_is_ambiguous(self) -> None:
+        # review j#82301 F2: a malformed fence alongside a valid one is ambiguous, not the valid
+        # one silently winning.
+        s = self._scenario()
+        note = (
+            "```mozyo-patch-equivalent-integration\n{not json\n```\n\n" + s.journal_note()
+        )
+        _install_fake_journal(self, [_entry(_INTEGRATION_JOURNAL, note, s.issue)])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
+        self.assertFalse(out.admissible)
+        self.assertEqual(out.reason, PE_DISPOSITION_AMBIGUOUS)
 
     def test_unresolvable_integration_branch_probe_fails_closed(self) -> None:
         s = self._scenario()
@@ -1038,6 +1113,21 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
         verdict = self._verdict(payload)
         self.assertEqual(verdict["reason"], BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED)
         self.assertIn(PE_JOURNAL_NOT_FOUND, verdict["detail"])
+
+    def test_stale_remote_tracking_ref_fails_closed(self) -> None:
+        # review j#82301 F1 at the command boundary: origin branch dropped after fetch, cached
+        # tracking ref survives — the retire must fail closed on the fresh ls-remote.
+        issue, lane = _RESIDUAL_LANES[0]
+        s = self._scenario(issue, lane)
+        self._seed(s)
+        s.drop_origin_branch()
+        _install_fake_journal(self, [s.entry()])
+        code, payload = self._run(self._args(s))
+        self.assertEqual(code, 1)
+        verdict = self._verdict(payload)
+        self.assertEqual(verdict["reason"], BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED)
+        self.assertIn(PE_ORIGIN_UNREACHABLE, verdict["detail"])
+        self.assertEqual(self._disposition_of(lane), DISPOSITION_HIBERNATED)
 
     def test_wrong_lane_disposition_fails_closed(self) -> None:
         issue, lane = _RESIDUAL_LANES[0]

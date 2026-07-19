@@ -165,36 +165,62 @@ def render_integration_disposition_block(disposition: PatchEquivalentDisposition
     return f"```{INTEGRATION_DISPOSITION_FENCE}\n{body}\n```"
 
 
-def parse_integration_disposition_blocks(notes: str) -> tuple[dict, ...]:
-    """Every JSON object parsed from a fenced disposition block in ``notes`` (pure, in order).
+def parse_integration_disposition_blocks(notes: str) -> tuple[str, ...]:
+    """Every RAW fenced disposition block body in ``notes`` (pure, in order, unvalidated).
 
-    Scans for ```` ```mozyo-patch-equivalent-integration ```` fenced blocks and returns each
-    parsed JSON object. A block whose body is not a JSON object is skipped (a malformed block is
-    not a valid disposition); the count the caller sees therefore reflects only well-formed
-    blocks, so ``0`` means "no disposition present" and ``>=2`` means "ambiguous" — both
-    fail-closed conditions the application layer maps to zero-write. Prose is never inspected.
+    Scans for ```` ```mozyo-patch-equivalent-integration ```` fences and returns each block's raw
+    body **without parsing or validating it** (Redmine #14066 review j#82301 F2). The count MUST
+    reflect every fence occurrence — a malformed block is still a block — so ``0`` means "no
+    disposition present" and ``>=2`` means "ambiguous", and a malformed-plus-valid pair is
+    correctly ``2`` (ambiguous), never silently collapsed to the one valid block. The single-block
+    JSON parse + strict schema is :func:`disposition_from_block`. Prose is never inspected.
     """
     if not notes:
         return ()
-    found: list[dict] = []
-    for match in _DISPOSITION_BLOCK_RE.finditer(notes):
-        raw = match.group("body")
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            found.append(obj)
-    return tuple(found)
+    return tuple(match.group("body") for match in _DISPOSITION_BLOCK_RE.finditer(notes))
+
+
+def disposition_from_block(body: str) -> Optional[PatchEquivalentDisposition]:
+    """Parse ONE raw fenced block body into a disposition, strictly (pure). ``None`` on any fault.
+
+    The body must be a JSON **object**; a non-JSON / non-object body is malformed (``None``). The
+    object is then projected through the strict :func:`disposition_from_mapping`.
+    """
+    try:
+        raw = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return disposition_from_mapping(raw)
 
 
 def disposition_from_mapping(raw: Mapping[str, object]) -> Optional[PatchEquivalentDisposition]:
-    """Project a parsed disposition mapping onto :class:`PatchEquivalentDisposition` (pure).
+    """Project a parsed disposition mapping onto :class:`PatchEquivalentDisposition`, strictly (pure).
 
-    ``None`` when ``commit_map`` is absent / not a list / an entry is malformed (a broken durable
-    record is fail-closed, never coerced). Commit hashes are compared verbatim downstream, so the
-    coordinator must record canonical full hashes.
+    Every required field is TYPE-CHECKED, never coerced (Redmine #14066 review j#82301 F2): the six
+    identity / head fields must be non-empty strings; ``origin_reachable`` must be a JSON boolean
+    (so the string ``"false"`` is malformed, NOT a truthy ``True``); ``commit_map`` must be a list
+    of objects whose ``source`` / ``integration`` / ``patch_id`` are strings. Any violation returns
+    ``None`` (a broken durable record is fail-closed). Commit hashes are compared verbatim
+    downstream, so the coordinator must record canonical full hashes.
     """
+    for key in (
+        "issue",
+        "lane",
+        "branch",
+        "integration_branch",
+        "source_head",
+        "integration_head",
+    ):
+        value = raw.get(key)
+        if not isinstance(value, str) or not value:
+            return None
+    # A JSON boolean, never a coerced string / int. ``isinstance(True, int)`` holds in Python but
+    # ``isinstance("false", bool)`` / ``isinstance(1, bool)`` do not, so this rejects a stringified
+    # or numeric flag rather than reading it as truthy.
+    if not isinstance(raw.get("origin_reachable"), bool):
+        return None
     entries = raw.get("commit_map")
     if not isinstance(entries, list):
         return None
@@ -202,21 +228,22 @@ def disposition_from_mapping(raw: Mapping[str, object]) -> Optional[PatchEquival
     for entry in entries:
         if not isinstance(entry, Mapping):
             return None
+        src = entry.get("source")
+        integ = entry.get("integration")
+        pid = entry.get("patch_id")
+        if not all(isinstance(field_value, str) for field_value in (src, integ, pid)):
+            return None
         mappings.append(
-            CommitPatchMapping(
-                source_commit=str(entry.get("source", "")),
-                integration_commit=str(entry.get("integration", "")),
-                patch_id=str(entry.get("patch_id", "")),
-            )
+            CommitPatchMapping(source_commit=src, integration_commit=integ, patch_id=pid)
         )
     return PatchEquivalentDisposition(
-        issue=str(raw.get("issue", "")),
-        lane=str(raw.get("lane", "")),
-        branch=str(raw.get("branch", "")),
-        integration_branch=str(raw.get("integration_branch", "")),
-        source_head=str(raw.get("source_head", "")),
-        integration_head=str(raw.get("integration_head", "")),
-        origin_reachable=bool(raw.get("origin_reachable", False)),
+        issue=raw["issue"],
+        lane=raw["lane"],
+        branch=raw["branch"],
+        integration_branch=raw["integration_branch"],
+        source_head=raw["source_head"],
+        integration_head=raw["integration_head"],
+        origin_reachable=raw["origin_reachable"],
         commit_map=tuple(mappings),
     )
 
@@ -407,6 +434,7 @@ __all__ = (
     "AdmissionResult",
     "render_integration_disposition_block",
     "parse_integration_disposition_blocks",
+    "disposition_from_block",
     "disposition_from_mapping",
     "evaluate_patch_equivalent_integrated",
 )

@@ -9,9 +9,9 @@ durable integration journal; this resolver fetches the issue's journals, locates
 journal by its own Redmine record id (never a self-reported field — the dispatch-marker
 authority principle), parses the disposition block, **recomputes** the real git facts (current
 branch / integration heads, unintegrated-by-hash set, per-commit stable patch-ids,
-integration-commit reachability, and origin reachability against the DERIVED
-``origin/<integration_branch>`` ref so a caller cannot substitute a local ref), and consults the
-pure fence.
+integration-commit reachability, and origin reachability against a FRESH read-only remote
+observation of the canonical ``origin`` integration branch — ``git ls-remote``, not a cached
+tracking ref a caller could forge), and consults the pure fence.
 
 The #13845 bound terminal retire consults the returned :class:`PatchEquivalentResolution` ONLY
 when the literal-ancestor probe already reported the head un-integrated, so the literal path
@@ -26,8 +26,10 @@ Nothing here writes anything; every git call is read-only and the Redmine fetch 
 redirect-refusing GET.
 
 Boundary (Redmine #14066): read-only git probes (``rev-parse`` / ``rev-list`` / ``merge-base
---is-ancestor`` / ``show`` + ``patch-id``) + one credential-gated read-only Redmine journal
-fetch. No git fetch/push/ref mutation, no Redmine write, no process / worktree / branch actuation.
+--is-ancestor`` / ``show`` + ``patch-id`` / ``ls-remote``) + one credential-gated read-only
+Redmine journal fetch. ``ls-remote`` is a read-only remote query (no object download, no ref
+mutation); there is no ``git fetch``/push/ref mutation, no Redmine write, no process / worktree /
+branch actuation.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AdmissionResult,
     PatchEquivalentDisposition,
     PatchEquivalentObservation,
-    disposition_from_mapping,
+    disposition_from_block,
     evaluate_patch_equivalent_integrated,
     parse_integration_disposition_blocks,
 )
@@ -134,27 +136,33 @@ def read_integration_disposition(
             f"issue #{issue} carries no journal {target!r}; the named integration disposition "
             "journal does not exist, so the terminal retire fails closed",
         )
-    blocks: list[dict] = []
+    # RAW fence occurrences, counted before any JSON validation (review j#82301 F2): a malformed
+    # block still counts, so a malformed-plus-valid pair is ambiguous, never silently collapsed to
+    # the one valid block.
+    raw_blocks: list[str] = []
     for entry in matched:
-        blocks.extend(parse_integration_disposition_blocks(getattr(entry, "notes", "") or ""))
-    if not blocks:
+        raw_blocks.extend(
+            parse_integration_disposition_blocks(getattr(entry, "notes", "") or "")
+        )
+    if not raw_blocks:
         return None, _fail(
             PE_DISPOSITION_ABSENT,
             f"journal {target!r} carries no `mozyo-patch-equivalent-integration` disposition "
             "block; there is no structured integration disposition to verify",
         )
-    if len(blocks) > 1:
+    if len(raw_blocks) > 1:
         return None, _fail(
             PE_DISPOSITION_AMBIGUOUS,
-            f"journal {target!r} carries {len(blocks)} disposition blocks; an ambiguous durable "
-            "record cannot license a terminal retire",
+            f"journal {target!r} carries {len(raw_blocks)} disposition blocks; an ambiguous "
+            "durable record cannot license a terminal retire",
         )
-    disposition = disposition_from_mapping(blocks[0])
+    disposition = disposition_from_block(raw_blocks[0])
     if disposition is None:
         return None, _fail(
             PE_DISPOSITION_MALFORMED,
-            f"the disposition block in journal {target!r} is malformed (missing / non-list "
-            "commit_map or a bad entry); it cannot be verified",
+            f"the disposition block in journal {target!r} is malformed (not a JSON object, a "
+            "missing / non-list commit_map, a non-string field, or a non-boolean "
+            "origin_reachable); it cannot be verified",
         )
     return disposition, None
 
@@ -192,6 +200,29 @@ def _rev_list(repo_root: Path, base: str, tip: str) -> Optional[frozenset[str]]:
     if result is None or result.returncode != 0:
         return None
     return frozenset(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
+def _remote_head(repo_root: Path, remote: str, branch: str) -> Optional[str]:
+    """The CURRENT head SHA of ``<remote>/refs/heads/<branch>`` via a read-only remote query.
+
+    ``git ls-remote`` performs a read-only remote observation (no fetch, no object download, no
+    ref mutation) so the answer reflects the actual origin RIGHT NOW — not a cached
+    ``refs/remotes/origin/*`` tracking ref that a stale checkout or a local ``update-ref`` could
+    forge (Redmine #14066 review j#82301 F1). ``None`` when the remote is unreadable or the branch
+    is absent on the remote, so a missing / dropped integration branch fails closed.
+    """
+    if not remote or not branch:
+        return None
+    result = _run_git(repo_root, "ls-remote", "--heads", remote, branch)
+    if result is None or result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
+            sha = parts[0].strip()
+            if sha:
+                return sha
+    return None
 
 
 def _stable_patch_id(repo_root: Path, sha: str) -> str:
@@ -233,9 +264,10 @@ def probe_patch_equivalent_observation(
 ) -> Optional[PatchEquivalentObservation]:
     """Recompute the real git facts for the fence. ``None`` when the branch identities won't resolve.
 
-    Origin reachability is measured against the DERIVED ``origin/<integration_branch>`` remote
-    ref (``CANONICAL_REMOTE``), never a ref named by the disposition — a caller cannot substitute
-    a local ref (review j#82298 F1). All reads are read-only.
+    Origin reachability is measured against a FRESH read-only remote observation of the canonical
+    ``origin`` integration branch (``git ls-remote``), never a cached ``origin/<branch>``
+    tracking ref a caller could forge (review j#82301 F1): the integration head must be an ancestor
+    of the origin branch's CURRENT head. All reads are read-only (``ls-remote`` does not fetch).
     """
     actual_source_head = _rev_parse(repo_root, branch)
     actual_integration_head = _rev_parse(repo_root, integration_branch)
@@ -257,8 +289,13 @@ def probe_patch_equivalent_observation(
             patch_ids[integ] = _stable_patch_id(repo_root, integ)
         if integ:
             reachable[integ] = _is_ancestor(repo_root, integ, actual_integration_head)
-    origin_ref = f"{CANONICAL_REMOTE}/{integration_branch}"
-    origin_reachable = _is_ancestor(repo_root, actual_integration_head, origin_ref)
+    # The canonical origin branch's CURRENT head, observed action-time (not a cached tracking ref).
+    # The integration head is origin-reachable only if it is an ancestor of that live remote head;
+    # a missing remote branch (``None``) or an unresolvable / non-local remote head fails closed.
+    remote_head = _remote_head(repo_root, CANONICAL_REMOTE, integration_branch)
+    origin_reachable = bool(remote_head) and _is_ancestor(
+        repo_root, actual_integration_head, remote_head
+    )
     return PatchEquivalentObservation(
         actual_source_head=actual_source_head,
         actual_integration_head=actual_integration_head,
