@@ -23,15 +23,23 @@ candidate — and nothing else. It is deliberately fail-closed and content-free:
   (from e140), so this module holds no render-vocabulary literal to drift.
 
 Dependency direction: this is core (e110). It receives already-closed facts and an
-injected policy value; it never imports the e140 provider registry / render adapter
-(IR j#82181 item 2). The e140 side builds the policy (from the profile registry) and the
-facts (from the authority-resolved render read) and injects both.
+injected policy value; it never imports the e140 provider **registry / singleton**
+(IR j#82181 item 2). It does import the pure render-reason vocabulary constant
+(``RENDER_REASON_OK``) so the destructive-empty conjunction can enforce ``reason == "ok"``
+against the single source of truth rather than a duplicated literal (review j#82190 F1) —
+a leaf constant, not the registry or any adapter logic. The e140 side builds the policy
+(from the profile registry) and the facts (from the authority-resolved render read) and
+injects both.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Mapping
+
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (  # noqa: E501
+    RENDER_REASON_OK,
+)
 
 
 @dataclass(frozen=True)
@@ -114,16 +122,22 @@ def render_admits_empty(
 
     Fail-closed conjunction (IR j#82181 item 3): returns ``True`` ONLY when the text
     observation actually reported a pending composer AND the authority-resolved render
-    was observed, readable (which, by the render observation's invariant, means
-    ``reason == "ok"``), prompt-present, and its ``style_provenance`` is one the resolved
-    provider declares as a ghost signal. Any other combination — no text pending, no
-    observation, unreadable / ambiguous render, no prompt, an unadmitted provenance
-    (``normal`` / ``mixed`` / ``unknown``), or an unresolved provider — returns ``False``
-    (preserve).
+    was observed, readable, ``reason == "ok"``, prompt-present, and its
+    ``style_provenance`` is one the resolved provider declares as a ghost signal. The
+    ``reason == "ok"`` term is checked here EXPLICITLY, not inferred from ``readable``:
+    :class:`RenderGhostFacts` is a plain boundary type that does not enforce the render
+    observation's ``readable`` ⟺ ``reason == "ok"`` invariant, so a facts value with
+    ``readable=True`` but an ``ambiguous_render`` / ``unreadable`` / empty reason must NOT
+    admit an empty (Redmine #14065 Phase 2 review j#82190 F1). Any other combination — no
+    text pending, no observation, a non-ok reason, unreadable / no prompt, an unadmitted
+    provenance (``normal`` / ``mixed`` / ``unknown``), or an unresolved provider — returns
+    ``False`` (preserve).
     """
     if text_has_pending is not True:
         return False
-    if not facts.observed or not facts.readable or not facts.prompt_present:
+    if not facts.observed or not facts.readable or facts.reason != RENDER_REASON_OK:
+        return False
+    if not facts.prompt_present:
         return False
     return policy.admits(facts.provider_id, facts.style_provenance)
 

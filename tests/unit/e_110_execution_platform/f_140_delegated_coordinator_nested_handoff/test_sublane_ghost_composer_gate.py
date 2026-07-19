@@ -90,6 +90,19 @@ class RenderAdmitsEmptyMatrixTest(unittest.TestCase):
     def test_empty_policy_preserves(self) -> None:
         self.assertFalse(self._empties(policy=GhostComposerRenderPolicy.empty()))
 
+    def test_non_ok_reason_preserves_even_if_readable(self) -> None:
+        # Redmine #14065 Phase 2 review j#82190 F1: RenderGhostFacts does not enforce the
+        # readable <=> reason=="ok" invariant, so a dim/readable/prompt facts carrying a
+        # non-ok reason must NOT admit an empty — the gate checks reason explicitly.
+        for reason in ("ambiguous_render", "unreadable", "", "no_composer"):
+            self.assertFalse(
+                self._empties(facts=_facts(reason=reason)),
+                f"reason={reason!r} must preserve",
+            )
+
+    def test_ok_reason_still_empties(self) -> None:
+        self.assertTrue(self._empties(facts=_facts(reason="ok")))
+
     def test_provider_that_admits_only_dim_rejects_normal(self) -> None:
         self.assertFalse(_POLICY.admits("claude", "normal"))
         self.assertTrue(_POLICY.admits("claude", "dim"))
