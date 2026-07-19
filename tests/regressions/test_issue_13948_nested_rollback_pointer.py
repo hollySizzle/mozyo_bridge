@@ -4,15 +4,23 @@ R2 (j#81717) taught the embedded ``sublane create/start`` path to stop before di
 non-positive embedded ``session-start`` and to point at the SAME action's public rollback.
 R3 (j#81811) closes the *nested* leak: when ``prepare-bound-pair --execute`` converges a
 hibernated bound pair through the #13933 v1 replacement-binding adapter and the fresh
-participant does not reach bounded startup health, the inner
-:class:`SessionStartResult` carried the typed startup ``action_id`` / per-role health /
-rollback debt, but the outer public outcome collapsed it to a generic
-``replacement_binding_launch_unhealthy`` detail string with no actionable rollback pointer.
+participant does not reach bounded startup health, the inner :class:`SessionStartResult`
+carried the typed startup ``action_id`` / per-role health / rollback debt, but the outer
+public outcome collapsed it to a generic ``replacement_binding_launch_unhealthy`` detail
+string with no actionable rollback pointer.
 
-These regressions pin the R3 contract through the REAL wiring (review j#82682 F1): the
-production ``_BoundPairActuatorPort.launch_action_bound`` running under the REAL
-:class:`ReplacementActuatorUseCase`, and the REAL public :func:`run_session_rollback` rail —
-never a hand-injected ``PreparationDrive`` nor a hand-set fence phase.
+Review j#82700 (Finding 1, mutation-probed): the earlier regressions patched
+``heal_lane_column`` itself and hand-built the ``PreparationDrive``, so a broken production
+connection stayed green. :class:`RealDriveWiringTest` therefore drives the REAL
+``run_bound_pair_preparation(execute=True)`` over the REAL
+``LiveBoundPairPreparationOps.drive`` and the REAL ``ReplacementActuatorUseCase``, mocking
+ONLY the external boundaries (live herdr inventory, git, provider resolution, the
+attestation-store lock, and the actual process launch). Every production line under test —
+``heal_lane_column``'s v1 catch/projection, the port's ``launch_startup_health`` stash, the
+drive's ``startup=getattr(...)``, and the outcome's ``rollback_pointer`` — runs for real, and
+the action id from the PUBLIC pointer drives the REAL ``run_session_rollback`` rail.
+
+Contract (IR j#81811 Required correction 1-5):
 
 1. the nested unhealthy launch propagates the typed ``action_id`` / role health / rollback
    debt / explicit rollback pointer outward losslessly — no raw locator / detail / secret;
@@ -27,24 +35,21 @@ never a hand-injected ``PreparationDrive`` nor a hand-set fence phase.
 
 from __future__ import annotations
 
+import contextlib
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from mozyo_bridge.core.state.lane_lifecycle import DecisionPointer
-from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
-from mozyo_bridge.core.state.replacement_transaction import (
-    ContinuationPointer,
-    ParticipantPin,
-    ReplacementTransactionKey,
-    ReplacementTransactionStore,
-)
+import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops as herdr_ops  # noqa: E501
+import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard_live as compdisclive  # noqa: E501
+import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence_live as convlive  # noqa: E501
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     HerdrIdentityReplacementBindingStore,
 )
-from mozyo_bridge.core.state.replacement_preservation import assess_preservation
+from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
+from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_ROLLBACK_OWED,
     Participant,
@@ -52,30 +57,16 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     StartupUnit,
     startup_action_id,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
-    ReplacementActuatorUseCase,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
-    HerdrSublaneActuatorOps,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_startup_projection import (  # noqa: E501
     project_sublane_startup,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import (  # noqa: E501
-    PreparationDrive,
     PreparationObservation,
     PreparationOutcome,
     PrepareBoundPairRequest,
     _blocked,
     format_preparation_text,
     run_bound_pair_preparation,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import (  # noqa: E501
-    ConvergeBoundPairRequest,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence_live import (  # noqa: E501
-    _BoundPairActuatorPort,
-    _launch_detail,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_bound_pair_composer_discard import (  # noqa: E501
     BLOCK_REPLACEMENT_STOPPED,
@@ -92,16 +83,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
-    ACTUATION_EFFECT_FAILED,
-    ATTEST_BOUND,
     CLOSE_DONE,
     OLD_SLOT_PRESENT,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     SublaneStartupObservation,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
-    SublaneHealError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
     SLOT_ADOPTED,
@@ -128,25 +114,30 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     COMPENSATION_ROLLBACK_OWED,
     HEALTH_HEALTHY,
     HEALTH_PROVIDER_EXITED,
-    HEALTH_RECEIVER_UNREADABLE,
+)
+
+WS = "mzb1_workspace"
+LANE = "issue_13948_nested_rollback_pointer_r3"
+_MANAGED = ("codex", "claude")
+_REQ = PrepareBoundPairRequest(
+    issue="13948", journal="81811", lane=LANE, worktree="/tmp/wt-13948", branch=LANE
 )
 
 
-def _nested_result(*, action_id="startup_act_13948", owed=True, provider="claude",
-                   assigned="mzb1_workspace_claude_issue", locator="w2G:p3"):
+def _unhealthy_result(*, action_id, assigned, owed=True, locator="w2G:p3"):
     """A nested replacement launch: an adopted healthy sibling + a fresh, dead participant.
 
-    The fresh participant carries a private locator and a raw launch detail exactly so the
-    projection can be proven to strip them.
+    Carries a private locator + raw launch detail so the projection can be proven to strip
+    them; only the fresh claude slot owes a rollback (item 4).
     """
     return SessionStartResult(
-        workspace_id="mzb1_workspace",
-        lane_id="issue_13948_nested_rollback_pointer_r3",
+        workspace_id=WS,
+        lane_id=LANE,
         action_id=action_id,
         slots=[
             SlotResult(
                 provider="codex",
-                assigned_name="mzb1_workspace_codex_issue",
+                assigned_name=encode_assigned_name(WS, "codex", LANE),
                 outcome=SLOT_ADOPTED,
                 locator="private:codex:locator",
                 detail="RAW-LAUNCH-DETAIL",
@@ -154,7 +145,7 @@ def _nested_result(*, action_id="startup_act_13948", owed=True, provider="claude
                 compensation=COMPENSATION_NOT_NEEDED,
             ),
             SlotResult(
-                provider=provider,
+                provider="claude",
                 assigned_name=assigned,
                 outcome=SLOT_LAUNCHED,
                 locator=locator,
@@ -172,35 +163,32 @@ class NestedStartupProjectionTest(unittest.TestCase):
     """Item 4: only the fresh participant this action started ever owes a rollback."""
 
     def test_mixed_adopted_and_fresh_owes_only_the_fresh_rollback(self):
-        obs = project_sublane_startup(_nested_result())
+        obs = project_sublane_startup(
+            _unhealthy_result(action_id="a", assigned="mzb1_ws_claude")
+        )
         self.assertFalse(obs.ok)
         self.assertTrue(obs.rollback_owed)
-        self.assertEqual(obs.action_id, "startup_act_13948")
-        # The adopted sibling never carries a compensation; only the fresh, dead slot does.
+        self.assertEqual(obs.action_id, "a")
         self.assertEqual(obs.roles[0].disposition, "adopted")
         self.assertEqual(obs.roles[0].compensation, COMPENSATION_NOT_NEEDED)
         self.assertEqual(obs.roles[1].compensation, COMPENSATION_ROLLBACK_OWED)
 
     def test_projection_strips_the_backend_locator_and_raw_detail(self):
-        payload = str(project_sublane_startup(_nested_result()).as_payload())
+        payload = str(
+            project_sublane_startup(
+                _unhealthy_result(action_id="a", assigned="mzb1_ws_claude")
+            ).as_payload()
+        )
         self.assertNotIn("private:", payload)
         self.assertNotIn("RAW-LAUNCH-DETAIL", payload)
 
 
 class PreparationOutcomeRollbackPointerTest(unittest.TestCase):
-    """Items 1/2/4/5 at the public outcome surface, without any live machinery."""
-
-    _REQ = PrepareBoundPairRequest(
-        issue="13948",
-        journal="81811",
-        lane="issue_13948_nested_rollback_pointer_r3",
-        worktree="/tmp/wt-13948",
-        branch="issue_13948_nested_rollback_pointer_r3",
-    )
+    """Items 2/4/5 at the public outcome surface, without any live machinery."""
 
     def _blocked_outcome(self, obs: SublaneStartupObservation | None) -> PreparationOutcome:
         return _blocked(
-            self._REQ,
+            _REQ,
             BLOCK_REPLACEMENT_STOPPED,
             detail="launch:replacement_binding_launch_unhealthy",
             action_id="approval_action_7",
@@ -210,244 +198,51 @@ class PreparationOutcomeRollbackPointerTest(unittest.TestCase):
         )
 
     def test_pointer_names_the_startup_action_and_never_executes(self):
-        outcome = self._blocked_outcome(project_sublane_startup(_nested_result()))
+        obs = SublaneStartupObservation(
+            ok=False, action_id="startup_act_x", roles=(), rollback_owed=True
+        )
+        outcome = self._blocked_outcome(obs)
         self.assertEqual(
             outcome.rollback_pointer,
-            "mozyo-bridge herdr session-rollback --action-id startup_act_13948",
+            "mozyo-bridge herdr session-rollback --action-id startup_act_x",
         )
         self.assertNotIn("--execute", outcome.rollback_pointer)
         # The pointer targets the STARTUP action id, never the composer-approval action id.
         self.assertNotIn("approval_action_7", outcome.rollback_pointer)
 
-    def test_payload_carries_startup_and_pointer_without_leaking_raw_facts(self):
-        outcome = self._blocked_outcome(project_sublane_startup(_nested_result()))
-        payload = outcome.as_payload()
-        self.assertIn("startup", payload)
-        self.assertEqual(
-            payload["rollback_pointer"],
-            "mozyo-bridge herdr session-rollback --action-id startup_act_13948",
-        )
-        self.assertNotIn("private:", str(payload))
-        self.assertNotIn("RAW-LAUNCH-DETAIL", str(payload))
-
-    def test_text_surfaces_the_health_and_the_pointer(self):
-        text = format_preparation_text(
-            self._blocked_outcome(project_sublane_startup(_nested_result()))
-        )
-        self.assertIn("startup_action_id: startup_act_13948", text)
-        self.assertIn("startup_rollback_owed: true", text)
-        self.assertIn(
-            "rollback_pointer: mozyo-bridge herdr session-rollback "
-            "--action-id startup_act_13948",
-            text,
-        )
-
     def test_no_debt_owed_offers_no_pointer(self):
-        # An uncertain (unreadable-pane) launch that owes no rollback still blocks, but there
-        # is nothing this action may compensate, so no pointer is invented.
         obs = SublaneStartupObservation(
             ok=False, action_id="startup_act_x", roles=(), rollback_owed=False
         )
-        outcome = self._blocked_outcome(obs)
-        self.assertIsNone(outcome.rollback_pointer)
+        self.assertIsNone(self._blocked_outcome(obs).rollback_pointer)
 
     def test_action_id_loss_offers_no_pointer(self):
-        # Item 5 negative: a rollback-owed observation whose action id was lost cannot name a
-        # target, so the rail refuses to print a pointer that would roll back nothing.
         obs = SublaneStartupObservation(
             ok=False, action_id="", roles=(), rollback_owed=True
         )
         self.assertIsNone(self._blocked_outcome(obs).rollback_pointer)
 
     def test_a_non_startup_block_is_byte_for_byte_unchanged(self):
-        # Every other blocked outcome keeps its historical payload: the additive keys appear
-        # only when a nested startup failure was actually observed.
         payload = self._blocked_outcome(None).as_payload()
         self.assertNotIn("startup", payload)
         self.assertNotIn("rollback_pointer", payload)
 
 
-# --- The REAL actuator + REAL port wiring (review j#82682 Finding 1) -------------------
-
-_REQ = PrepareBoundPairRequest(
-    issue="13948",
-    journal="81811",
-    lane="issue_13948_nested_rollback_pointer_r3",
-    worktree="/tmp/wt-13948",
-    branch="issue_13948_nested_rollback_pointer_r3",
-)
+# --- The REAL LiveBoundPairPreparationOps.drive + REAL rollback rail (review j#82700) ---
 
 
-def _slot(role: str, disposition: str) -> BoundSlot:
-    provider = "codex" if role == "gateway" else "claude"
-    locator = "w1:p1" if role == "gateway" else "w1:p2"
-    return BoundSlot(role, provider, f"managed-{role}", locator, disposition)
-
-
-def _observation(**changes) -> PreparationObservation:
-    values = dict(
-        workspace_id="mzb1_workspace",
-        worktree_path=_REQ.worktree,
-        worktree_identity="wt_deadbeef",
-        branch=_REQ.branch,
-        revision=4,
-        generation=1,
-        lifecycle_exact=True,
-        pins_empty=True,
-        inventory_readable=True,
-        worktree_readable=True,
-        worktree_clean=True,
+def _observation() -> PreparationObservation:
+    return PreparationObservation(
+        workspace_id=WS, worktree_path=_REQ.worktree, worktree_identity="wt_test",
+        branch=LANE, revision=4, generation=1, lifecycle_exact=True, pins_empty=True,
+        inventory_readable=True, worktree_readable=True, worktree_clean=True,
         branch_matches=True,
         slots=(
-            _slot("gateway", SLOT_PRESERVE_PENDING),
-            _slot("worker", SLOT_RECOVER),
+            BoundSlot("gateway", "codex", "gw", "w1:p1", SLOT_RECOVER),
+            BoundSlot("worker", "claude", "wk", "w1:p2", SLOT_PRESERVE_PENDING),
         ),
-        discard_roles=("gateway",),
+        discard_roles=("worker",),
     )
-    values.update(changes)
-    return PreparationObservation(**values)
-
-
-class _FakeOps:
-    def __init__(self):
-        self.observation = _observation()
-        self.markers = ()
-        self.drive_result = PreparationDrive(True, "recovered")
-
-    def observe(self, request, *, action_id=""):
-        return self.observation
-
-    def approval_fields(self, issue, journal):
-        return self.markers
-
-    def drive(self, request, expectation, initial):
-        return self.drive_result
-
-
-class _RealLaunchPort:
-    """A port whose non-launch legs are stubbed, but whose ``launch_action_bound`` is the
-    production :meth:`_BoundPairActuatorPort.launch_action_bound` verbatim.
-
-    Driving THIS under the real actuator exercises the exact connection review j#82682 F1
-    flagged as bypassed: adapter → ``heal_lane_column`` catch site → ``launch_startup_health``.
-    """
-
-    def __init__(self, owner, request):
-        self.owner = owner
-        self.request = request
-        self.launch_failure_reason = ""
-        self.launch_startup_health = None
-
-    def observe_old_slot(self, pin):
-        return OLD_SLOT_PRESENT
-
-    def observe_preservation(self, pin):
-        return PreservationObservation(identity_matches=True, attestation_fresh=True)
-
-    def close_exact_generation(self, pin):
-        return CLOSE_DONE
-
-    def verify_attestation(self, action_id, pin):
-        return ATTEST_BOUND
-
-    def _fresh_authority(self, *, require_attested_roles=()):
-        return self
-
-    def launch_action_bound(self, action_id, pin):
-        # The REAL production method (constructs HerdrSublaneActuatorOps, calls
-        # heal_lane_column, catches SublaneHealError, projects/stashes launch_startup_health).
-        return _BoundPairActuatorPort.launch_action_bound(self, action_id, pin)
-
-
-class RealActuatorPortStashTest(unittest.TestCase):
-    """Item 1 wiring: adapter → heal catch → port stash → PreparationDrive → outcome."""
-
-    GEN = 1
-    FIXED = "2099-07-17T12:00:00+00:00"
-
-    def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
-        self.store = ReplacementTransactionStore(home=self.home)
-        self.key = ReplacementTransactionKey("mzb1_workspace", "prepare-bound-pair-abc")
-        self.pin = ParticipantPin(
-            lane_id=_REQ.lane, role="worker", provider="claude",
-            assigned_name="mzb1-wk", old_locator="w28:p3H",
-            lane_revision="4", lane_generation="1",
-        )
-        self.store.plan_transaction(
-            self.key,
-            action_generation=self.GEN,
-            decision=DecisionPointer(source="redmine", issue_id="13846", journal_id="80925"),
-            continuation=ContinuationPointer(
-                source="redmine", issue_id="13846", journal_id="80925",
-                expected_gate="bound_pair_composer_discard_approval",
-                next_semantic_action="converge_bound_pair",
-            ),
-            participants=[self.pin],
-        )
-        owner = SimpleNamespace(repo_root=self.home, env={})
-        request = ConvergeBoundPairRequest(
-            issue="13846", journal="80925", lane=_REQ.lane,
-            worktree=str(self.home), branch=_REQ.branch,
-        )
-        self.port = _RealLaunchPort(owner, request)
-
-    def _drive(self):
-        return ReplacementActuatorUseCase(
-            self.store, self.port, preservation_policy=assess_preservation,
-            clock=lambda: self.FIXED,
-        ).drive_worker_recovery(self.key, holder="H", expected_action_generation=self.GEN)
-
-    def test_nested_unhealthy_launch_flows_through_the_real_wiring_to_a_pointer(self):
-        obs = project_sublane_startup(_nested_result())  # REAL projection of a dead launch
-
-        def _fenced_heal(*_args, **_kwargs):
-            raise SublaneHealError(
-                "lane heal fenced (replacement_binding_launch_unhealthy)",
-                reason=V1_BINDING_LAUNCH_UNHEALTHY,
-                startup=obs,
-            )
-
-        with mock.patch.object(
-            HerdrSublaneActuatorOps, "heal_lane_column", autospec=True,
-            side_effect=_fenced_heal,
-        ):
-            result = self._drive()
-
-        # The real actuator surfaces the typed launch stop, and the real port stashed the
-        # nested observation at the heal catch site.
-        self.assertEqual(result.status, ACTUATION_EFFECT_FAILED)
-        self.assertEqual(result.detail, "launch")
-        self.assertIs(self.port.launch_startup_health, obs)
-        self.assertEqual(self.port.launch_failure_reason, V1_BINDING_LAUNCH_UNHEALTHY)
-        self.assertEqual(
-            _launch_detail(result, self.port),
-            "launch:replacement_binding_launch_unhealthy",
-        )
-
-        # The exact PreparationDrive `LiveBoundPairPreparationOps.drive` builds from this
-        # (result, port), fed through the public run, surfaces the pointer.
-        drive = PreparationDrive(
-            False, result.status, _launch_detail(result, self.port),
-            startup=getattr(self.port, "launch_startup_health", None),
-        )
-        ops = _FakeOps()
-        preflight = run_bound_pair_preparation(_REQ, execute=False, ops=ops)
-        [(channel, fields)] = marker_fields_in_note(preflight.approval_marker)
-        self.assertEqual(channel, "workflow-event")
-        ops.markers = (fields,)
-        ops.drive_result = drive
-        outcome = run_bound_pair_preparation(_REQ, execute=True, ops=ops)
-        self.assertEqual(outcome.state, STATE_BLOCKED)
-        self.assertEqual(outcome.reason, BLOCK_REPLACEMENT_STOPPED)
-        self.assertEqual(
-            outcome.rollback_pointer,
-            "mozyo-bridge herdr session-rollback --action-id startup_act_13948",
-        )
-        self.assertNotIn("--execute", outcome.rollback_pointer)
-
-
-# --- The v1 replacement-binding adapter over the REAL public rollback rail -------------
 
 
 class _CloseResult:
@@ -465,8 +260,6 @@ class _RollbackOps:
         self.close_calls = []
 
     def agent_rows(self):
-        if not self.inventory_readable:
-            raise RuntimeError("herdr agent list failed")
         return list(self.rows)
 
     def runtime_state(self, locator):
@@ -483,20 +276,178 @@ class _RollbackOps:
 
     def close(self, workspace_id, lane_id, targets):
         self.close_calls.append(list(targets))
-        closed = []
-        for role, locator in targets:
-            closed.append((role, locator))
+        for _role, locator in targets:
             self.rows = [r for r in self.rows if r.get("pane_id") != locator]
-        return _CloseResult(closed=closed)
+        return _CloseResult(closed=list(targets))
+
+
+class RealDriveWiringTest(unittest.TestCase):
+    """Item 1/2/4 end-to-end through the REAL drive, then the REAL public rollback rail.
+
+    The mocks are ONLY external boundaries (live herdr inventory, provider resolution, the
+    attestation-store lock/home, and the nested pane launch). The heal-catch projection, the
+    port ``launch_startup_health`` stash, the drive's ``startup=getattr(...)``, the outcome
+    ``rollback_pointer``, and ``run_session_rollback`` all execute for real, so a broken
+    production connection turns this red (review j#82700 F1).
+    """
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.obs = _observation()
+        self.unit = StartupUnit(WS, LANE, _MANAGED)
+        self.nonce = "n1"
+        self.action_id = startup_action_id(self.unit, self.nonce)
+        self.assigned = encode_assigned_name(WS, "claude", LANE)
+        self.fresh_locator = "w2G:p3"
+        # A REAL rollback-owed startup transaction the public pointer will target — exactly
+        # the durable debt the real nested launch would have recorded.
+        self.fence = StartupTransactionFence(home=self.home)
+        action = self.fence.reserve(self.unit, self.nonce)
+        self.fence.record_participant(
+            action.action_id,
+            Participant(
+                role="claude", assigned_name=self.assigned,
+                locator=self.fresh_locator, receipt="workspace=w2G",
+            ),
+        )
+        self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+
+    def _real_ops(self):
+        outer = self
+
+        class _Ops(compdisclive.LiveBoundPairPreparationOps):
+            # Only the three pure external reads are overridden; drive/actuator/heal are real.
+            def observe(self, request, *, action_id=""):
+                return outer.obs
+
+            def approval_fields(self, issue, journal):
+                return self._markers
+
+            def _composer_discardable(self, request, *, role, provider, assigned_name,
+                                      locator, rows=None, action_closed_roles=()):
+                return True
+
+        ops = _Ops(
+            repo_root=self.home, env={},
+            transaction_store=ReplacementTransactionStore(home=self.home),
+        )
+        ops._markers = ()
+        # The exact structured owner approval the read-only preflight mints for this pair.
+        preflight = run_bound_pair_preparation(_REQ, execute=False, ops=ops)
+        ops._markers = tuple(f for _c, f in marker_fields_in_note(preflight.approval_marker))
+        return ops
+
+    @contextlib.contextmanager
+    def _mocked_external_boundaries(self):
+        _test = self
+
+        @contextlib.contextmanager
+        def _nolock(*a, **k):
+            yield
+
+        def _fenced_nested_launch(**_kwargs):
+            # The nested pane launch came up dead: fail closed carrying the raw result, exactly
+            # as the real `session-start` -> v1 adapter would (this is the ONLY seam a live
+            # herdr backend would own). heal_lane_column's REAL catch projects it downstream.
+            raise V1ReplacementBindingFailure(
+                "fenced", "nested unhealthy",
+                startup_result=_unhealthy_result(
+                    action_id=self.action_id, assigned=self.assigned,
+                    locator=self.fresh_locator,
+                ),
+            )
+
+        not_preserved = PreservationObservation(
+            dirty_diff=False, running_process=False, pending_approval=False,
+            identity_matches=True, attestation_fresh=True,
+        )
+        port = compdisclive._ComposerDiscardActuatorPort
+        with contextlib.ExitStack() as stack:
+            for target, name, value in [
+                (compdisclive, "list_herdr_agent_rows", lambda env: []),
+                (convlive, "list_herdr_agent_rows", lambda env: []),
+                (herdr_ops, "evaluate_heal_runtime_fence",
+                 lambda *a, **k: SimpleNamespace(ok=True, reason="", detail="")),
+                (herdr_ops, "selected_attestation_store_is_v1", lambda home: True),
+                (herdr_ops, "attestation_store_lock", _nolock),
+                (herdr_ops, "mozyo_bridge_home", lambda: self.home),
+                (herdr_ops, "launch_or_resume_v1_replacement", _fenced_nested_launch),
+            ]:
+                stack.enter_context(mock.patch.object(target, name, value))
+            for cls, name, value in [
+                (herdr_ops.HerdrSublaneActuatorOps, "_live_rows", lambda self: []),
+                (herdr_ops.HerdrSublaneActuatorOps, "_launch_providers",
+                 lambda self: _MANAGED),
+                (herdr_ops.HerdrSublaneActuatorOps, "_resolve_lane_slots",
+                 lambda self, wt, rows, managed=None: (
+                     WS, LANE, {"codex": ("", ""), "claude": ("", "")})),
+                (port, "observe_old_slot", lambda self, pin: OLD_SLOT_PRESENT),
+                (port, "observe_preservation", lambda self, pin: not_preserved),
+                (port, "close_exact_generation", lambda self, pin: CLOSE_DONE),
+                (port, "_fresh_authority",
+                 lambda port_self, *, require_attested_roles=(): _test.obs),
+            ]:
+                stack.enter_context(mock.patch.object(cls, name, value))
+            yield
+
+    def test_nested_failure_surfaces_pointer_and_the_real_rail_discharges_it(self):
+        ops = self._real_ops()
+        with self._mocked_external_boundaries():
+            outcome = run_bound_pair_preparation(_REQ, execute=True, ops=ops)
+
+        # (1) the public outcome surfaces the SAME startup action's typed pointer, projected
+        # through the real heal catch / port stash / drive getattr — no raw fact leaks.
+        self.assertEqual(outcome.state, STATE_BLOCKED)
+        self.assertEqual(outcome.reason, BLOCK_REPLACEMENT_STOPPED)
+        self.assertEqual(
+            outcome.rollback_pointer,
+            f"mozyo-bridge herdr session-rollback --action-id {self.action_id}",
+        )
+        self.assertNotIn("--execute", outcome.rollback_pointer)
+        payload = outcome.as_payload()
+        self.assertTrue(payload["startup"]["rollback_owed"])
+        self.assertNotIn("private:", str(payload))
+        self.assertNotIn("RAW-LAUNCH-DETAIL", str(payload))
+        self.assertIn(
+            f"rollback_pointer: mozyo-bridge herdr session-rollback --action-id {self.action_id}",
+            format_preparation_text(outcome),
+        )
+
+        # (2) the action id taken FROM the public pointer drives the REAL rollback rail:
+        # read-only preflight closes nothing; execute discharges the debt.
+        action_id = outcome.rollback_pointer.split("--action-id ", 1)[1]
+        rows = [{
+            "name": self.assigned, "pane_id": self.fresh_locator,
+            "agent": "claude", "agent_status": "idle",
+        }]
+        preflight = run_session_rollback(
+            action_id=action_id, ops=_RollbackOps(rows),
+            fence=StartupTransactionFence(home=self.home), execute=False,
+        )
+        self.assertEqual(preflight.reason, REASON_PREFLIGHT)
+        self.assertFalse(preflight.executed)
+
+        exec_ops = _RollbackOps(rows)
+        discharged = run_session_rollback(
+            action_id=action_id, ops=exec_ops,
+            fence=StartupTransactionFence(home=self.home), execute=True,
+        )
+        self.assertEqual(discharged.reason, REASON_OK)
+        self.assertTrue(exec_ops.close_calls)
+
+
+# --- The v1 replacement-binding adapter over the REAL public rollback rail -------------
 
 
 class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
-    """Items 1/3/5 over the adapter AND the REAL public rollback rail (review j#82682 F1)."""
+    """Items 3/5 over the REAL binding adapter AND the REAL public rollback rail.
 
-    WORKSPACE = "mzb1_workspace"
-    LANE = "issue_13948_nested_rollback_pointer_r3"
-    PROVIDER = "claude"
-    MANAGED_PAIR = ("codex", "claude")
+    Complementary to :class:`RealDriveWiringTest`: here ``launch_or_resume_v1_replacement``
+    runs unpatched (real binding-store reserve / fence interplay), so the rolled-back
+    reservation replay and the startup-debt terminal cannot be faked. Only the nested pane
+    launch is a fake, and it records the fence exactly as the real ``session-start`` would.
+    """
+
     OLD_LOCATOR = "w1:p9"
     FRESH_LOCATOR = "w2G:p3"
 
@@ -505,8 +456,8 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
         self.action_id = "replacement_action_13948"
-        self.assigned = encode_assigned_name(self.WORKSPACE, self.PROVIDER, self.LANE)
-        self.unit = StartupUnit(self.WORKSPACE, self.LANE, self.MANAGED_PAIR)
+        self.assigned = encode_assigned_name(WS, "claude", LANE)
+        self.unit = StartupUnit(WS, LANE, _MANAGED)
         self.launch_calls = []
 
     def _unhealthy_launch(self, nonce, startup_fence):
@@ -517,28 +468,20 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
         startup_fence.record_participant(
             action.action_id,
             Participant(
-                role=self.PROVIDER, assigned_name=self.assigned,
+                role="claude", assigned_name=self.assigned,
                 locator=self.FRESH_LOCATOR, receipt="workspace=w2G",
             ),
         )
         startup_fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
-        return _nested_result(
-            action_id=action.action_id, provider=self.PROVIDER,
-            assigned=self.assigned, locator=self.FRESH_LOCATOR,
+        return _unhealthy_result(
+            action_id=action.action_id, assigned=self.assigned, locator=self.FRESH_LOCATOR,
         )
 
     def _launch_or_resume(self, launch):
         launch_or_resume_v1_replacement(
-            home=self.home,
-            action_id=self.action_id,
-            assigned_name=self.assigned,
-            old_locator=self.OLD_LOCATOR,
-            target_provider=self.PROVIDER,
-            workspace_id=self.WORKSPACE,
-            lane_id=self.LANE,
-            managed_pair=self.MANAGED_PAIR,
-            rows=(),
-            existing={self.PROVIDER: ("", "")},
+            home=self.home, action_id=self.action_id, assigned_name=self.assigned,
+            old_locator=self.OLD_LOCATOR, target_provider="claude", workspace_id=WS,
+            lane_id=LANE, managed_pair=_MANAGED, rows=(), existing={"claude": ("", "")},
             launch=launch,
         )
 
@@ -550,43 +493,33 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
     def _rollback_rows(self):
         return [{
             "name": self.assigned, "pane_id": self.FRESH_LOCATOR,
-            "agent": self.PROVIDER, "agent_status": "idle",
+            "agent": "claude", "agent_status": "idle",
         }]
 
-    def test_unhealthy_launch_then_public_rollback_then_replay_converges(self):
-        # (1) nested failure: the adapter fails closed and carries the nested result.
+    def test_public_rollback_then_replay_converges_to_a_new_action_id(self):
+        # (1) nested failure carries the nested result out of the real adapter.
         with self.assertRaises(V1ReplacementBindingFailure) as caught:
             self._launch_or_resume(self._unhealthy_launch)
         self.assertEqual(caught.exception.reason, V1_BINDING_LAUNCH_UNHEALTHY)
-        self.assertIsNotNone(caught.exception.startup_result)
-        obs = project_sublane_startup(caught.exception.startup_result)
-        self.assertTrue(obs.rollback_owed)
         first_action = self._intent().startup_action_id
-        self.assertEqual(obs.action_id, first_action)
-        pointer = (
-            "mozyo-bridge herdr session-rollback --action-id " + first_action
+        self.assertEqual(
+            project_sublane_startup(caught.exception.startup_result).action_id, first_action
         )
 
+        # (2) the REAL public rollback rail discharges the debt (never a manual set_phase).
         fence = StartupTransactionFence(home=self.home)
-
-        # (2) read-only preflight of the pointer's action id closes nothing.
-        preflight = run_session_rollback(
+        pre = run_session_rollback(
             action_id=first_action, ops=_RollbackOps(self._rollback_rows()),
             fence=fence, execute=False,
         )
-        self.assertEqual(preflight.reason, REASON_PREFLIGHT)
-        self.assertFalse(preflight.executed)
-
-        # (3) execute the public rollback rail — the ONLY thing that discharges the debt.
-        exec_ops = _RollbackOps(self._rollback_rows())
-        discharged = run_session_rollback(
-            action_id=first_action, ops=exec_ops, fence=fence, execute=True,
+        self.assertEqual(pre.reason, REASON_PREFLIGHT)
+        done = run_session_rollback(
+            action_id=first_action, ops=_RollbackOps(self._rollback_rows()),
+            fence=fence, execute=True,
         )
-        self.assertEqual(discharged.reason, REASON_OK)
-        self.assertTrue(exec_ops.close_calls)
-        self.assertTrue(pointer)  # the pointer the operator followed
+        self.assertEqual(done.reason, REASON_OK)
 
-        # (4) replay: the SAME binding recognises the rolled-back reservation and relaunches
+        # (3) replay: the SAME binding recognises the rolled-back reservation and relaunches
         # under a NEW startup action id (convergence, not a startup-debt dead end).
         self.launch_calls.clear()
         with self.assertRaises(V1ReplacementBindingFailure) as replay:
