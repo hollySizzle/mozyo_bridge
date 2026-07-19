@@ -422,11 +422,12 @@ rules:
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
   - .github/workflows/**
+  - scripts/disposable_ubuntu_smoke.py
   - pyproject.toml
   - .github/ISSUE_TEMPLATE/**
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/rules/release-distribution.md と @vibes/docs/logics/release-flow.md と @vibes/docs/logics/release-helper-contract.md
-    と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
+    と @vibes/docs/logics/tiered-ci-gate-policy.md と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

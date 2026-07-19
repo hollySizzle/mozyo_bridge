@@ -1868,6 +1868,7 @@ file_conventions:
     patterns:
       - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
       - .github/workflows/**
+      - scripts/disposable_ubuntu_smoke.py
       - pyproject.toml
       - .github/ISSUE_TEMPLATE/**
     severity: block
@@ -1875,6 +1876,7 @@ file_conventions:
       - rule-release-distribution
       - logic-release-flow
       - logic-release-helper-contract
+      - logic-tiered-ci-gate-policy
       - skill-release-reference
 
   - id: fc-pre-commit-hook-script

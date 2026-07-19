@@ -185,6 +185,44 @@ jobs:
           /tmp/pypi-smoke-venv/bin/mozyo-bridge --help > /dev/null
           /tmp/pypi-smoke-venv/bin/mozyo --help > /dev/null
 
+      - name: Disposable Ubuntu container smoke (built artifact, pre-publish)
+        # Redmine #14100 (parent #14098): black-box the SAME built wheel on a
+        # pinned, non-root, fresh-HOME Ubuntu container with NO source checkout
+        # mounted, BEFORE the artifact can be published. Runs after `Build
+        # package` + venv fresh-install smoke and before `Upload built
+        # distributions`, keeping the job order build -> smoke -> upload; only
+        # the separate `publish` job carries OIDC.
+        #
+        # Complements — does not duplicate — the venv fresh-install smoke above:
+        # this crosses an OS boundary (pinned Ubuntu LTS), runs as a NON-root
+        # user in a FRESH HOME with the repo checkout absent, and drives the
+        # real user harness (rules / scaffold / docs / doctor runtime), not just
+        # `--version` / `--help`. Blocking authority is the image DIGEST (the
+        # script refuses a floating tag in blocking mode). The expected version
+        # is the stripped release tag, which `verify` already proved equals the
+        # 2-file version mirror. No credentials are injected into the container.
+        env:
+          # Pinned Ubuntu 24.04 digest = blocking authority. Kept in lockstep
+          # with vibes/docs/logics/tiered-ci-gate-policy.md
+          # (## Disposable Ubuntu container smoke); refresh both together.
+          DISPOSABLE_UBUNTU_IMAGE: "ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${TAG_NAME#v}"
+          python scripts/disposable_ubuntu_smoke.py \
+            --artifact-dir dist \
+            --expected-version "$EXPECTED_VERSION" \
+            --image "$DISPOSABLE_UBUNTU_IMAGE" \
+            --json-summary container-smoke-summary.json
+          {
+            echo "### Disposable Ubuntu container smoke (blocking)"
+            echo ""
+            echo '```json'
+            cat container-smoke-summary.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Production release summary
         if: always()
         env:

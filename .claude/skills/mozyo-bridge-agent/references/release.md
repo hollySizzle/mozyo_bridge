@@ -143,6 +143,30 @@ pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args 
 - `rules install`、per-preset の scaffold、`scaffold status`、`doctor --target` が、fresh な TestPyPI / PyPI install 経路から動作することを確認する。
 - production PyPI distribution は内部 beta distribution と分離されており、明示的な production release の要求または承認を要する。
 
+## 使い捨て Ubuntu container smoke (#14100)
+
+venv fresh-install smoke に加えて、`testpypi.yml` / `publish.yml` の build job は
+`Upload built distributions` の前に **使い捨て pinned Ubuntu container** で同一 wheel を
+black-box する (`scripts/disposable_ubuntu_smoke.py`)。venv smoke が build runner 上で
+runner user として `--version` / `--help` を確認するのに対し、container smoke は非root
+user・fresh HOME・source checkout 不在・pinned Ubuntu LTS 上で実 user harness
+(`rules install/status`、fresh target への `scaffold apply/status`、`docs validate/resolve`、
+read-only `doctor runtime`) を横断し、artifact-only mount の wheel byte が installed
+provenance と expected version に一致することを機械照合する。
+
+- blocking authority は **image DIGEST**。default `blocking` mode は digest pin
+  (`ubuntu@sha256:<64-hex>`) を必須とし floating tag を拒否する。advisory な `canary`
+  mode は floating tag を許すが blocking gate には接続しない。
+- release path (TestPyPI acceptance / production prepublish) の gate のみで、quick
+  issue-branch lane (`test.yml`) には接続しない。
+- credential は image / container env / summary へ入れない。summary は image ref/digest・
+  wheel sha256・expected/observed version・runtime user/uid・fresh HOME・source-mount
+  不在・surface 結果・duration を secret-safe な JSON で出す。
+- maintainer は本 smoke を ad-hoc でも回せる:
+  `python scripts/disposable_ubuntu_smoke.py --artifact-dir <dist> --expected-version <X.Y.Z> --image ubuntu@sha256:<digest>`。
+- 契約と digest pin authority の正本: `vibes/docs/logics/tiered-ci-gate-policy.md`
+  (`## Disposable Ubuntu container smoke`)。
+
 ## Trusted Publishing
 
 TestPyPI の pending publisher:

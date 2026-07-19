@@ -80,6 +80,15 @@ completion criteria for beta and production distribution live here.
 - Order the internal-beta steps as #13528 (TestPyPI publish) then #13527 (exact
   install QA); the install QA runs against the published exact version, not a
   floating `main` install.
+- Before the built wheel is uploaded, the build job also runs the disposable
+  Ubuntu container smoke (`scripts/disposable_ubuntu_smoke.py`, Redmine #14100):
+  the SAME wheel bytes are black-boxed on a DIGEST-pinned, non-root, fresh-HOME
+  Ubuntu container with no source checkout mounted, exercising the real user
+  harness (rules / scaffold / docs / doctor). The image digest is the blocking
+  authority (a floating tag is refused in blocking mode). This is a blocking
+  release-path gate only; it is never added to the quick issue-branch lane. See
+  `vibes/docs/logics/tiered-ci-gate-policy.md` -> `Disposable Ubuntu container
+  smoke`.
 
 ## Production Distribution
 
@@ -91,3 +100,7 @@ completion criteria for beta and production distribution live here.
   GitHub Release.
 - Production PyPI publish must use GitHub Actions Trusted Publishing, not local
   token upload, unless a separate emergency procedure is explicitly approved.
+- The production build job runs the same disposable Ubuntu container smoke on
+  the built wheel before upload, with the release tag's stripped version as the
+  expected version. It runs in the `build` job, which carries no `id-token`, so
+  the OIDC boundary (publish-only) is preserved.

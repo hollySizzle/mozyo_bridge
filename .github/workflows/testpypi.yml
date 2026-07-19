@@ -386,6 +386,44 @@ jobs:
           /tmp/testpypi-smoke-venv/bin/mozyo-bridge --help > /dev/null
           /tmp/testpypi-smoke-venv/bin/mozyo --help > /dev/null
 
+      - name: Disposable Ubuntu container smoke (built artifact, pre-publish)
+        # Redmine #14100 (parent #14098): black-box the SAME built wheel on a
+        # pinned, non-root, fresh-HOME Ubuntu container with NO source checkout
+        # mounted, BEFORE the artifact can be uploaded/published. This runs
+        # after `Build package` and after the venv fresh-install smoke, and
+        # before `Upload built distributions`, so the job order stays
+        # build -> smoke -> upload (publish is a separate OIDC-only job).
+        #
+        # It complements — does not duplicate — the venv fresh-install smoke
+        # above: that smoke installs into a venv on the BUILD RUNNER as the
+        # runner user; this one crosses an OS boundary (pinned Ubuntu LTS), runs
+        # as a NON-root user in a FRESH HOME with the repo checkout absent, and
+        # drives the real user harness (rules install/status, scaffold
+        # apply/status, docs validate/resolve, doctor runtime) rather than only
+        # `--version` / `--help`. Blocking authority is the image DIGEST: the
+        # script refuses a floating tag in blocking mode, so a moving image can
+        # never be the gate. No credentials are injected into the container.
+        env:
+          # Pinned Ubuntu 24.04 digest = blocking authority. Kept in lockstep
+          # with vibes/docs/logics/tiered-ci-gate-policy.md
+          # (## Disposable Ubuntu container smoke); refresh both together.
+          DISPOSABLE_UBUNTU_IMAGE: "ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+          RESOLVED_VERSION: ${{ steps.resolve_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/disposable_ubuntu_smoke.py \
+            --artifact-dir dist \
+            --expected-version "$RESOLVED_VERSION" \
+            --image "$DISPOSABLE_UBUNTU_IMAGE" \
+            --json-summary container-smoke-summary.json
+          {
+            echo "### Disposable Ubuntu container smoke (blocking)"
+            echo ""
+            echo '```json'
+            cat container-smoke-summary.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload built distributions
         uses: actions/upload-artifact@v4
         with:
