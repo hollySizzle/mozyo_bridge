@@ -260,11 +260,25 @@ def default_background_transport(ws: SupervisedWorkspace):
 
     class _HandoffBackgroundTransport:
         def deliver(self, row, target) -> "HandoffDeliveryResult":  # noqa: F821
+            # Redmine #14082: pin the exact stable target slot on the herdr rail. On the herdr backend
+            # an explicit `--target <locator>` is NOT the route authority (only a `%N` tmux pane is), so
+            # the pre-authorized locator alone is dropped and `--to <receiver>` re-derives the lane from
+            # the (scrubbed / default) sender lane — the coordinator/default misroute. Passing the
+            # re-resolved target's OWN lane as `--target-lane` makes the route resolve the exact
+            # `(workspace_id, lane, receiver)` slot (tier-1 explicit), never a sender-lane re-derivation.
+            # The `background_service` origin env (background_transport_env) admits this as a sanctioned
+            # system actor without a fake agent identity. The live locator is passed only as the
+            # like-for-like target, never promoted to sole authority.
+            target_lane = str(getattr(target, "lane", "") or "").strip()
             argv = [
                 "mozyo-bridge", "handoff", "send",
                 "--to", str(target.receiver or "codex"),
                 "--target", str(target.locator),  # the re-resolved explicit locator, never a label
                 "--target-repo", canonical,
+            ]
+            if target_lane:
+                argv += ["--target-lane", target_lane]
+            argv += [
                 "--source", "redmine",
                 "--issue", str(target.issue),
                 "--journal", str(target.journal),

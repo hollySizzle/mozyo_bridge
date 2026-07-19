@@ -57,6 +57,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REVIEW_ROUND_STALE,
     REVIEW_ROUND_UNVERIFIABLE,
     REVIEW_ROUND_DISPOSITIONS,
+    SEND_DELIVERED,
     SEND_NOT_SENT,
     SEND_UNCERTAIN,
     send_outcome_for_delivery,
@@ -284,8 +285,19 @@ class BackgroundServiceCallbackSender:
         except Exception:  # noqa: BLE001 - a transport blow-up mid-send is uncertain (no blind retry)
             return CallbackSendResult(SEND_UNCERTAIN, persist_reason="transport_error")
         outcome = send_outcome_for_delivery(result.status, result.reason)
+        # Redmine #14082: preserve the TRANSPORT precondition reason as the persisted zero-send reason
+        # when the send did not positively deliver. The authorization fail-closed paths above already
+        # carry their reason (``decision.reason``); here the transport's own outcome reason (a
+        # deterministic pre-injection ``precondition_not_idle`` / ``target_unavailable``, or an
+        # ambiguous post-injection token) is the first known-not-sent cause. Carrying it lets the
+        # durable row (and the dead-letter) distinguish an AUTHORIZATION zero-send from a TRANSPORT
+        # precondition zero-send, instead of both flattening to "retries exhausted". A delivered row
+        # keeps the transport's own best-effort receipt evidence unchanged.
+        persist_reason = result.persist_reason
+        if outcome != SEND_DELIVERED and not str(persist_reason or "").strip():
+            persist_reason = str(result.reason or "").strip()
         return CallbackSendResult(
-            outcome, persist_ok=result.persist_ok, persist_reason=result.persist_reason
+            outcome, persist_ok=result.persist_ok, persist_reason=persist_reason
         )
 
     def _round_disposition(self, row: CallbackOutboxRow) -> str:

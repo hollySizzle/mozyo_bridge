@@ -56,6 +56,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     MOZYO_WORKSPACE_ID_ENV,
     REASON_MISSING_SENDER_ENV,
+    REASON_SYSTEM_ACTOR_MISSING_LANE,
     RECEIVER_COORDINATOR,
     resolve_sender_identity,
 )
@@ -272,8 +273,25 @@ def resolve_herdr_send_target(
         if legacy_token and env_ws == legacy_token:
             anchor_ws = legacy_token
 
-    sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+    # Redmine #14082: a sanctioned background-service delivery (origin-stamped, agent identity
+    # scrubbed) is admitted as a system actor ONLY when it pins an explicit ``--target-lane``, so the
+    # route resolves the exact stable slot (tier-1) instead of a sender-lane re-derivation. Thread the
+    # target lane in so the domain can enforce that requirement (an agent send ignores it).
+    sender_res = resolve_sender_identity(
+        os.environ,
+        anchor_workspace_id=anchor_ws,
+        background_service_target_lane=target_lane,
+    )
     if not sender_res.ok or sender_res.identity is None:
+        if sender_res.reason == REASON_SYSTEM_ACTOR_MISSING_LANE:
+            # Redmine #14082: a background-service system actor was admitted by its origin stamp but
+            # supplied no explicit `--target-lane`, so the exact stable slot cannot be pinned. Name the
+            # concrete cause (not the generic "unattested sender") so the wiring gap is unambiguous.
+            raise HerdrSendEntryError(
+                "herdr backend selected for a background_service delivery, but no explicit "
+                f"--target-lane was supplied to pin the stable target slot ({sender_res.detail}).",
+                reason=sender_res.reason,
+            )
         # Redmine #13397 finding 2 (design consultation answer j#73755, Option B):
         # a herdr send needs an attested launch-time lane-sender identity
         # (`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`), which an
