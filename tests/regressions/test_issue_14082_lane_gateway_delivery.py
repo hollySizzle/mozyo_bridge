@@ -1,49 +1,35 @@
 """Redmine #14082: background-service same-lane gateway callback delivery correction.
 
-The a18 live-dogfood failure (j#82511 / j#82517): a fresh ``lane_gateway:<lane>`` worker gate
-resolved route / lane / receiver / generation / workspace correctly, yet delivered 0 — 3 attempts
-all ``send_attempted=false`` known-not-sent, dead-lettered, coordinator direct wake 0. Two root
-causes, independently verified from source and reproduced live (j#82530 / j#82537):
+The a18 live-dogfood failure (j#82511 / j#82517): a fresh ``lane_gateway:<lane>`` worker gate resolved
+route / lane / receiver / generation / workspace correctly, yet delivered 0 — 3 attempts all
+``send_attempted=false`` known-not-sent, dead-lettered, coordinator direct wake 0. Root causes verified
+from source (j#82530 / j#82537) and corrected under the coordinator design constraint j#82553 (Model A'
+= a SEPARATE outbox-delivery authority, NOT a loosened agent identity) after review j#82566:
 
-- **F1 (explicit target authority)** — on the herdr backend an explicit ``--target <locator>`` is NOT
-  the route authority (only a ``%N`` tmux pane is); the background transport passed the re-resolved
-  gateway locator but NO ``--target-lane``, so ``--to codex`` re-derived the lane from the (scrubbed /
-  default) sender lane and landed on the coordinator/default pane.
-- **F2 (system-actor sender identity)** — the background daemon scrubs the agent identity env, so the
-  ``handoff send`` subprocess failed closed with ``missing_sender_env`` (emitted ``target_unavailable``)
-  before it ever resolved a target.
-- **F4 (diagnostics)** — the terminal outbox row dropped the first known-not-sent reason, flattening
-  every dead-letter to "retries exhausted" so an authorization zero-send and a transport-precondition
-  zero-send were indistinguishable.
-
-The fix (design constraint j#82537 — no fake agent identity, no live-locator-as-sole-authority):
-
-1. the transport pins the exact stable slot with ``--target-lane <target.lane>`` (tier-1 explicit);
-2. a sanctioned ``background_service`` system-actor sender identity is admitted (origin-stamped +
-   explicit target-lane) without a fake ``claude`` / ``codex`` identity — an env-less shell still
-   fails closed;
-3. the first zero-send reason is persisted secret-safe to the durable row, distinguishing an
-   authorization zero-send from a transport-precondition one.
+- **F1** — the background transport shelled out to the agent ``mozyo-bridge handoff send`` entry, whose
+  herdr target resolution needs an attested agent sender identity (missing in the scrubbed daemon env ->
+  ``missing_sender_env`` -> ``target_unavailable``) and re-derives the target lane (coordinator misroute).
+  Corrected: a DEDICATED in-process ``background_service`` delivery seam drives the sanctioned turn-start
+  rail to the ALREADY-resolved explicit locator — no agent sender identity, no ``handoff send`` entry, no
+  target re-derivation, no env-only authorization. The authority (lease + claim + stable tuple + live
+  route/generation) is enforced by ``BackgroundServiceCallbackSender`` BEFORE the transport is called.
+- **F2** — the durable zero-send reason was persisted raw. Corrected: normalized through a closed
+  allowlist; an unrecognized value is dropped to a fixed token (secret-safe by construction).
+- **F4** — the first zero-send reason is persisted to the durable row, distinguishing an authorization
+  zero-send from a transport-precondition one, surviving to the dead-letter.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import stat
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.core.state.callback_outbox import (
     CallbackOutbox,
     CallbackOutboxKey,
@@ -54,13 +40,13 @@ from mozyo_bridge.core.state.workflow_runtime_store import (
     CALLBACK_DEAD_LETTER,
     CALLBACK_PENDING,
 )
-from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.background_service_sender import (
+    ROUND_STALE,
+    ROUND_UNVERIFIABLE,
     BackendNeutralTargetResolver,
     BackgroundServiceCallbackSender,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
-    CallbackCandidate,
     CallbackOutboxProcessor,
     _zero_send_detail,
 )
@@ -74,268 +60,156 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
     AUTH_GENERATION_MISMATCH,
     AUTH_NO_TARGET,
-    BACKGROUND_SERVICE_ORIGIN,
+    FAIL_CLOSED_REASONS,
     DeliveryTarget,
     TargetResolution,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
+    UNRECOGNIZED_ZERO_SEND_REASON,
+    ZERO_SEND_REASON_ALLOWLIST,
     CallbackSendResult,
     SEND_DELIVERED,
     SEND_NOT_SENT,
     SEND_UNCERTAIN,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
-    HerdrSendEntryError,
-    resolve_herdr_send_target,
+    normalize_zero_send_reason,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-    AGENT_PROVIDERS,
-    DELIVERY_ORIGIN_BACKGROUND_SERVICE,
-    REASON_ENV_ANCHOR_WORKSPACE_MISMATCH,
-    REASON_MISSING_ANCHOR,
     REASON_MISSING_SENDER_ENV,
-    REASON_SYSTEM_ACTOR_MISSING_LANE,
-    SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE,
     resolve_sender_identity,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
+    OUTCOME_PRECONDITION_NOT_IDLE,
+    OUTCOME_STARTED,
 )
 
 NOW = "2026-07-19T00:00:00+00:00"
 SUBLANE = "issue_14082_lane_gateway_delivery_r1"
 
+_RAIL_MOD = "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start"
+_CONFIG_MOD = "mozyo_bridge.application.repo_local_config_loader"
+
+
+class _FakeTurnStartResult:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+
+class _FakeRail:
+    """A turn-start rail stub recording (locator, text) and returning a chosen outcome."""
+
+    def __init__(self, outcome=OUTCOME_STARTED):
+        self.outcome = outcome
+        self.calls = []
+
+    def drive_turn_start(self, locator, text, **kw):
+        self.calls.append((locator, text))
+        return _FakeTurnStartResult(self.outcome)
+
+
+class _StubConfig:
+    terminal_transport = object()  # non-None so the transport proceeds to resolve the rail
+
+
+def _patched_rail(rail):
+    """Patch the transport's lazily-imported rail + config resolution to inject ``rail``."""
+    return (
+        mock.patch(f"{_RAIL_MOD}.resolve_turn_start_rail", return_value=rail),
+        mock.patch(f"{_CONFIG_MOD}.load_repo_local_config", return_value=_StubConfig()),
+    )
+
+
+class _RailCtx:
+    """Context manager applying both rail patches for a fake rail."""
+
+    def __init__(self, rail):
+        self._patches = _patched_rail(rail)
+
+    def __enter__(self):
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self._patches:
+            p.stop()
+        return False
+
 
 # ---------------------------------------------------------------------------
-# F2 — the sanctioned background_service system-actor sender identity (pure).
+# F1 — resolve_sender_identity is agent-only again (the loosening is reverted).
 # ---------------------------------------------------------------------------
-class SystemActorSenderIdentityTest(unittest.TestCase):
-    """resolve_sender_identity admits a sanctioned background_service system actor, fail-closed."""
+class ResolveSenderIdentityAgentOnlyTest(unittest.TestCase):
+    """The background_service origin no longer admits a system actor through the agent send entry."""
 
-    def _env(self, **over) -> dict:
-        env = {
-            "MOZYO_WORKSPACE_ID": "wsA",
-            "MOZYO_DELIVERY_ORIGIN": DELIVERY_ORIGIN_BACKGROUND_SERVICE,
-        }
-        env.update(over)
-        return env
-
-    def test_admits_system_actor_without_agent_role(self) -> None:
-        # Origin-stamped + explicit target-lane + workspace==anchor: admitted with the sentinel role,
-        # NO MOZYO_AGENT_ROLE present (scrubbed by design).
-        res = resolve_sender_identity(
-            self._env(), anchor_workspace_id="wsA", background_service_target_lane=SUBLANE
-        )
-        self.assertTrue(res.ok)
-        self.assertIsNotNone(res.identity)
-        self.assertEqual(res.identity.role, SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE)
-        self.assertEqual(res.identity.workspace_id, "wsA")
-
-    def test_missing_target_lane_fails_closed(self) -> None:
-        # No explicit --target-lane: the exact stable slot cannot be pinned, so admission is refused
-        # (never a sender-lane re-derivation -> the coordinator/default misroute this Bug fixes).
-        res = resolve_sender_identity(
-            self._env(), anchor_workspace_id="wsA", background_service_target_lane=None
-        )
-        self.assertFalse(res.ok)
-        self.assertEqual(res.reason, REASON_SYSTEM_ACTOR_MISSING_LANE)
-
-    def test_blank_target_lane_fails_closed(self) -> None:
-        res = resolve_sender_identity(
-            self._env(), anchor_workspace_id="wsA", background_service_target_lane="   "
-        )
-        self.assertEqual(res.reason, REASON_SYSTEM_ACTOR_MISSING_LANE)
-
-    def test_missing_workspace_fails_closed(self) -> None:
-        res = resolve_sender_identity(
-            self._env(MOZYO_WORKSPACE_ID=""),
-            anchor_workspace_id="wsA",
-            background_service_target_lane=SUBLANE,
-        )
-        self.assertEqual(res.reason, REASON_MISSING_SENDER_ENV)
-
-    def test_workspace_anchor_mismatch_fails_closed(self) -> None:
-        # The env<->anchor workspace attestation is unchanged for a system actor: a leaked env var
-        # cannot mint an identity for another workspace.
-        res = resolve_sender_identity(
-            self._env(), anchor_workspace_id="wsOTHER", background_service_target_lane=SUBLANE
-        )
-        self.assertEqual(res.reason, REASON_ENV_ANCHOR_WORKSPACE_MISMATCH)
-
-    def test_missing_anchor_fails_closed(self) -> None:
-        res = resolve_sender_identity(
-            self._env(), anchor_workspace_id=None, background_service_target_lane=SUBLANE
-        )
-        self.assertEqual(res.reason, REASON_MISSING_ANCHOR)
-
-    def test_env_less_operator_shell_still_fails_closed(self) -> None:
-        # No origin stamp AND no agent role (an env-less operator shell): the system-actor branch is
-        # NOT taken, so the agent path fails closed exactly as before — the exception is never widened.
-        res = resolve_sender_identity(
-            {}, anchor_workspace_id="wsA", background_service_target_lane=SUBLANE
-        )
+    def test_background_service_origin_is_not_admitted_by_sender_identity(self) -> None:
+        # An env stamped background_service but WITHOUT an agent role must NOT be admitted: the
+        # dedicated delivery seam never goes through resolve_sender_identity, so the agent entry stays
+        # agent-only (design constraint j#82553 — no loosened agent vocabulary, no env-only auth).
+        env = {"MOZYO_WORKSPACE_ID": "wsA", "MOZYO_DELIVERY_ORIGIN": "background_service"}
+        res = resolve_sender_identity(env, anchor_workspace_id="wsA")
         self.assertFalse(res.ok)
         self.assertEqual(res.reason, REASON_MISSING_SENDER_ENV)
 
-    def test_sentinel_role_is_not_an_agent_provider(self) -> None:
-        # The system-actor role must never be a launchable agent provider: it is admitted ONLY through
-        # the origin-stamped branch, never by an ordinary MOZYO_AGENT_ROLE send.
-        self.assertNotIn(SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE, AGENT_PROVIDERS)
-
-    def test_origin_literal_does_not_drift_from_background_service_origin(self) -> None:
-        # The terminal-runtime local literal mirrors the execution-platform origin token; a drift guard
-        # (the two live in different bounded contexts to avoid an import cycle).
-        self.assertEqual(DELIVERY_ORIGIN_BACKGROUND_SERVICE, BACKGROUND_SERVICE_ORIGIN)
+    def test_agent_send_still_requires_agent_role(self) -> None:
+        res = resolve_sender_identity({}, anchor_workspace_id="wsA")
+        self.assertEqual(res.reason, REASON_MISSING_SENDER_ENV)
 
 
 # ---------------------------------------------------------------------------
-# F2 end-to-end — resolve_herdr_send_target admits the system actor and pins the exact slot.
+# F1 — the dedicated in-process background_service delivery seam.
 # ---------------------------------------------------------------------------
-class _HerdrCtx:
-    """A prepared herdr workspace (config + anchor + fake binary/runner), mirroring the send-entry harness."""
-
-    def __init__(self, tmp, *, rows):
-        self.repo = Path(tmp) / "repo"
-        self.repo.mkdir()
-        self.home = Path(tmp) / "home"
-        self.home.mkdir()
-        (self.repo / ".mozyo-bridge").mkdir()
-        (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
-            "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
-        )
-        register_workspace(self.repo, home=self.home)
-        self.workspace_id = read_anchor(self.repo)["workspace_id"]
-        self.rows = rows(self.workspace_id)
-        binpath = Path(tmp) / "fake-herdr"
-        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        self.binpath = binpath
-
-    def run(self, argv, capture_output=None, text=None, timeout=None, **kw):
-        if list(argv[:1]) == ["git"]:
-            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="not a git repo")
-        if list(argv[1:]) == ["agent", "list"]:
-            return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps({"agents": self.rows}), stderr=""
-            )
-        raise AssertionError(f"unexpected call: {argv!r}")
-
-    def background_service_env(self) -> dict:
-        # The scrubbed background-service env: workspace + origin stamp, NO agent role / lane.
-        return {
-            "MOZYO_HERDR_BINARY": str(self.binpath),
-            "MOZYO_BRIDGE_HOME": str(self.home),
-            "MOZYO_WORKSPACE_ID": self.workspace_id,
-            "MOZYO_DELIVERY_ORIGIN": DELIVERY_ORIGIN_BACKGROUND_SERVICE,
-        }
-
-
-class SystemActorHerdrRouteTest(unittest.TestCase):
-    """The origin-stamped, lane-less background actor resolves the EXACT sublane gateway, not coordinator."""
-
-    def _rows(self, ws):
-        # The sublane codex gateway AND the coordinator's default-lane codex both live: a sender-lane
-        # re-derivation would land on the coordinator; the explicit target-lane must pin the sublane.
-        return [
-            {"name": encode_assigned_name(ws, "codex", SUBLANE), "pane_id": "wGW:pGW"},
-            {"name": encode_assigned_name(ws, "codex", "default"), "pane_id": "wCO:pCO"},
-        ]
-
-    def test_resolves_sublane_gateway_not_coordinator(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctx = _HerdrCtx(tmp, rows=self._rows)
-            with patch("subprocess.run", ctx.run), patch.dict(
-                os.environ, ctx.background_service_env(), clear=True
-            ):
-                pane = resolve_herdr_send_target(
-                    repo_root=repo_root_from_args(_ns(ctx.repo)),
-                    target="wGW:pGW",  # the re-resolved explicit locator (NOT the sole authority)
-                    target_repo="auto",
-                    target_lane=SUBLANE,
-                    receiver="codex",
-                )
-        # The exact sublane gateway slot — never the default-lane coordinator.
-        self.assertEqual(pane["id"], "wGW:pGW")
-        self.assertEqual(pane["lane_id"], SUBLANE)
-        self.assertNotEqual(pane["id"], "wCO:pCO")
-
-    def test_background_actor_without_target_lane_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ctx = _HerdrCtx(tmp, rows=self._rows)
-            with patch("subprocess.run", ctx.run), patch.dict(
-                os.environ, ctx.background_service_env(), clear=True
-            ):
-                with self.assertRaises(HerdrSendEntryError) as c:
-                    resolve_herdr_send_target(
-                        repo_root=repo_root_from_args(_ns(ctx.repo)),
-                        target="wGW:pGW",
-                        target_repo="auto",
-                        target_lane=None,
-                        receiver="codex",
-                    )
-        self.assertEqual(c.exception.reason, REASON_SYSTEM_ACTOR_MISSING_LANE)
-
-
-def _ns(repo):
-    ns = argparse.Namespace()
-    ns.repo = str(repo)
-    return ns
-
-
-# ---------------------------------------------------------------------------
-# F1 — the background transport pins the exact slot with --target-lane.
-# ---------------------------------------------------------------------------
-class BackgroundTransportArgvTest(unittest.TestCase):
-    """default_background_transport emits an argv that pins the stable slot (--target-lane + receiver)."""
+class DedicatedBackgroundTransportTest(unittest.TestCase):
+    """default_background_transport drives the turn-start rail to the resolved locator (no handoff send)."""
 
     def _ws(self):
         return SupervisedWorkspace(workspace_id="wsA", canonical_path="/tmp/repoA")
 
-    def _target(self, *, lane=SUBLANE, receiver="codex", locator="%GW"):
+    def _target(self, *, lane=SUBLANE, receiver="codex", locator="wGW:pGW"):
         return DeliveryTarget(
             workspace_id="wsA", lane=lane, receiver=receiver, issue="14079",
             journal="82511", generation="1", locator=locator,
         )
 
-    def _deliver_capture(self, target, *, stdout='{"status": "sent", "reason": "ok"}'):
-        transport = default_background_transport(self._ws())
-        calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(list(argv))
-            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
-
-        with patch("subprocess.run", fake_run):
-            result = transport.deliver(object(), target)
-        return calls, result
-
-    def test_argv_pins_target_lane_and_receiver(self) -> None:
-        calls, result = self._deliver_capture(self._target())
-        self.assertEqual(len(calls), 1)  # exactly-once
-        argv = calls[0]
-        self.assertIn("--target-lane", argv)
-        self.assertEqual(argv[argv.index("--target-lane") + 1], SUBLANE)
-        self.assertEqual(argv[argv.index("--to") + 1], "codex")
-        self.assertEqual(argv[argv.index("--target") + 1], "%GW")
-        self.assertEqual(argv[argv.index("--mode") + 1], "standard")
+    def test_drives_rail_to_resolved_locator_with_reply_marker(self) -> None:
+        rail = _FakeRail(OUTCOME_STARTED)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(object(), self._target())
         self.assertEqual(result.status, "sent")
         self.assertEqual(result.reason, "ok")
+        self.assertEqual(len(rail.calls), 1)  # exactly-once
+        locator, text = rail.calls[0]
+        self.assertEqual(locator, "wGW:pGW")  # the exact resolved locator, never re-derived
+        # The reply landing marker is built from the row's durable anchor + receiver.
+        self.assertIn("[mozyo:handoff:source=redmine:issue=14079:journal=82511:kind=reply:to=codex]", text)
 
-    def test_lane_gateway_never_targets_default_coordinator_lane(self) -> None:
-        # coordinator 0-wake: a lane_gateway target pins the SUBLANE, never the "default" coordinator lane.
-        calls, _ = self._deliver_capture(self._target(lane=SUBLANE))
-        argv = calls[0]
-        self.assertEqual(argv[argv.index("--target-lane") + 1], SUBLANE)
-        self.assertNotEqual(argv[argv.index("--target-lane") + 1], "default")
+    def test_busy_target_maps_to_precondition_not_idle(self) -> None:
+        rail = _FakeRail(OUTCOME_PRECONDITION_NOT_IDLE)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(object(), self._target())
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "precondition_not_idle")
 
-    def test_blank_lane_omits_target_lane_flag(self) -> None:
-        # A target with no lane (defensive) omits the flag rather than passing an empty one.
-        calls, _ = self._deliver_capture(self._target(lane=""))
-        self.assertNotIn("--target-lane", calls[0])
+    def test_unresolvable_rail_is_target_unavailable(self) -> None:
+        with _RailCtx(None):  # rail resolves to None (config/backend unresolved)
+            result = default_background_transport(self._ws()).deliver(object(), self._target())
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "target_unavailable")
+
+    def test_blank_locator_is_target_unavailable(self) -> None:
+        rail = _FakeRail(OUTCOME_STARTED)
+        with _RailCtx(rail):
+            result = default_background_transport(self._ws()).deliver(
+                object(), self._target(locator="")
+            )
+        self.assertEqual(result.reason, "target_unavailable")
+        self.assertEqual(rail.calls, [])  # never driven without a locator
 
 
 # ---------------------------------------------------------------------------
-# F1 + F4 — the REAL sender + REAL resolver + REAL transport delivery path.
+# F1 + F4 — the REAL sender + REAL resolver + REAL transport (rail injected).
 # ---------------------------------------------------------------------------
 class ProductionDeliveryPathTest(unittest.TestCase):
     """The composed production path: idle gateway delivers exactly-once; busy is a bounded zero-send."""
@@ -358,95 +232,81 @@ class ProductionDeliveryPathTest(unittest.TestCase):
         )
         return outbox, outbox.claim_pending(now=NOW, workspace_id="wsA")[0]
 
-    def _resolver(self):
+    def _resolver(self, *, live_generation="1"):
         # A live herdr inventory carrying the sublane codex gateway; the live generation authority
-        # returns "1" so the correlated row is deliverable (the a18 fresh generation-1 case).
-        rows = [{"name": encode_assigned_name("wsA", "codex", SUBLANE), "pane_id": "%GW"}]
+        # returns the row's generation so the correlated row is deliverable (the a18 fresh gen-1 case).
+        rows = [{"name": encode_assigned_name("wsA", "codex", SUBLANE), "pane_id": "wGW:pGW"}]
         return BackendNeutralTargetResolver(
             workspace_id="wsA", inventory=lambda: (rows, "herdr"),
-            live_generation_fn=lambda row: "1",
+            live_generation_fn=lambda row: live_generation,
         )
 
-    def _sender(self, transport, outbox):
+    def _sender(self, resolver, outbox):
+        transport = default_background_transport(
+            SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "repoA"))
+        )
         return BackgroundServiceCallbackSender(
-            workspace_id="wsA", holder="superX", lease_store=self.lease_store,
-            target_resolver=self._resolver(), transport=transport, outbox=outbox, now_fn=lambda: NOW,
-        )
-
-    def test_idle_gateway_delivers_exactly_once_with_target_lane(self) -> None:
-        outbox, row = self._lane_gateway_row()
-        transport = default_background_transport(
-            SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "repoA"))
-        )
-        calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(list(argv))
-            return subprocess.CompletedProcess(
-                argv, 0, stdout='{"status": "sent", "reason": "ok"}', stderr=""
-            )
-
-        with patch("subprocess.run", fake_run):
-            result = self._sender(transport, outbox)(row)
-        self.assertEqual(result.outcome, SEND_DELIVERED)
-        self.assertEqual(len(calls), 1)  # exactly-once real send
-        argv = calls[0]
-        self.assertEqual(argv[argv.index("--target-lane") + 1], SUBLANE)
-        self.assertEqual(argv[argv.index("--to") + 1], "codex")
-
-    def test_busy_gateway_is_bounded_zero_send_with_reason_persisted(self) -> None:
-        # A busy receiver -> precondition_not_idle (pre-injection). Zero-send, retryable (no
-        # self-amplification), and the reason is propagated for the durable diagnostic surface.
-        outbox, row = self._lane_gateway_row()
-        transport = default_background_transport(
-            SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "repoA"))
-        )
-
-        def fake_run(argv, **kw):
-            return subprocess.CompletedProcess(
-                argv, 1, stdout='{"status": "blocked", "reason": "precondition_not_idle"}', stderr=""
-            )
-
-        with patch("subprocess.run", fake_run):
-            result = self._sender(transport, outbox)(row)
-        self.assertEqual(result.outcome, SEND_NOT_SENT)  # retryable, NOT uncertain (no blind retry)
-        self.assertEqual(result.persist_reason, "precondition_not_idle")
-
-    def test_generation_mismatch_is_transport_zero(self) -> None:
-        # The row's expected generation ("1") vs a LIVE generation that bumped ("2") -> authorization
-        # zero-send, the transport is NEVER invoked (pre-injection), reason preserved.
-        outbox, row = self._lane_gateway_row()
-        calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(list(argv))
-            return subprocess.CompletedProcess(argv, 0, stdout='{"status":"sent","reason":"ok"}', stderr="")
-
-        resolver = BackendNeutralTargetResolver(
-            workspace_id="wsA",
-            inventory=lambda: ([{"name": encode_assigned_name("wsA", "codex", SUBLANE), "pane_id": "%GW"}], "herdr"),
-            live_generation_fn=lambda row: "2",  # supersession bump
-        )
-        transport = default_background_transport(
-            SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "repoA"))
-        )
-        sender = BackgroundServiceCallbackSender(
             workspace_id="wsA", holder="superX", lease_store=self.lease_store,
             target_resolver=resolver, transport=transport, outbox=outbox, now_fn=lambda: NOW,
         )
-        with patch("subprocess.run", fake_run):
-            result = sender(row)
+
+    def test_idle_gateway_delivers_exactly_once_to_resolved_locator(self) -> None:
+        outbox, row = self._lane_gateway_row()
+        rail = _FakeRail(OUTCOME_STARTED)
+        with _RailCtx(rail):
+            result = self._sender(self._resolver(), outbox)(row)
+        self.assertEqual(result.outcome, SEND_DELIVERED)
+        self.assertEqual(len(rail.calls), 1)  # exactly-once real send
+        self.assertEqual(rail.calls[0][0], "wGW:pGW")  # the resolved sublane gateway, never coordinator
+
+    def test_busy_gateway_is_bounded_zero_send_with_reason_persisted(self) -> None:
+        outbox, row = self._lane_gateway_row()
+        rail = _FakeRail(OUTCOME_PRECONDITION_NOT_IDLE)
+        with _RailCtx(rail):
+            result = self._sender(self._resolver(), outbox)(row)
+        self.assertEqual(result.outcome, SEND_NOT_SENT)  # retryable, NOT uncertain (no blind retry)
+        self.assertEqual(result.persist_reason, "precondition_not_idle")
+
+    def test_generation_mismatch_never_drives_rail(self) -> None:
+        outbox, row = self._lane_gateway_row()
+        rail = _FakeRail(OUTCOME_STARTED)
+        with _RailCtx(rail):
+            result = self._sender(self._resolver(live_generation="2"), outbox)(row)  # supersession bump
         self.assertEqual(result.outcome, SEND_NOT_SENT)
         self.assertEqual(result.persist_reason, AUTH_GENERATION_MISMATCH)
-        self.assertEqual(calls, [])  # transport never invoked
+        self.assertEqual(rail.calls, [])  # transport never invoked (pre-injection authorization zero-send)
 
 
 # ---------------------------------------------------------------------------
-# F4 — the first zero-send reason survives to the durable row / dead-letter.
+# F2 — zero-send reason normalization is a closed, secret-safe allowlist.
+# ---------------------------------------------------------------------------
+class ZeroSendReasonAllowlistTest(unittest.TestCase):
+    def test_known_reason_passes_through(self) -> None:
+        self.assertEqual(normalize_zero_send_reason("precondition_not_idle"), "precondition_not_idle")
+        self.assertEqual(normalize_zero_send_reason(AUTH_NO_TARGET), AUTH_NO_TARGET)
+
+    def test_blank_reason_is_empty(self) -> None:
+        self.assertEqual(normalize_zero_send_reason(""), "")
+        self.assertEqual(normalize_zero_send_reason(None), "")
+
+    def test_unrecognized_reason_is_dropped_to_fixed_token(self) -> None:
+        # A path / credential / prose that leaked into a reason must NOT survive: the raw value is
+        # dropped and replaced by the fixed token.
+        for hostile in ("/Users/secret/token.pem", "api_key=abc123", "some free prose reason"):
+            self.assertEqual(normalize_zero_send_reason(hostile), UNRECOGNIZED_ZERO_SEND_REASON)
+
+    def test_allowlist_covers_authorization_and_round_fence_vocabularies(self) -> None:
+        # Drift guard: every background_service authorization reason + the round-fence tokens are in the
+        # allowlist, so a renamed token is caught here instead of silently normalizing to unrecognized.
+        self.assertTrue(FAIL_CLOSED_REASONS <= ZERO_SEND_REASON_ALLOWLIST)
+        self.assertIn(ROUND_STALE, ZERO_SEND_REASON_ALLOWLIST)
+        self.assertIn(ROUND_UNVERIFIABLE, ZERO_SEND_REASON_ALLOWLIST)
+
+
+# ---------------------------------------------------------------------------
+# F4 + F2 — the first zero-send reason survives to the durable row, secret-safe.
 # ---------------------------------------------------------------------------
 class ZeroSendReasonPersistenceTest(unittest.TestCase):
-    """CallbackOutboxProcessor.deliver persists the sender's first known-not-sent reason to the row."""
-
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.store_path = self.dir / "workflow-runtime.sqlite"
@@ -468,49 +328,44 @@ class ZeroSendReasonPersistenceTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         return rows[0]
 
-    def test_authorization_reason_survives_to_dead_letter(self) -> None:
+    def _deliver_with_reason(self, reason):
         key = self._claimed_row(max_attempts=1)
         proc = CallbackOutboxProcessor(self.outbox, _NullSource(), workspace_id="wsA")
+        proc.deliver(
+            lambda row: CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=reason),
+            now=NOW, issue="14079",
+        )
+        return self._row_detail(key)
 
-        def sender(row):
-            return CallbackSendResult(SEND_NOT_SENT, persist_ok=False, persist_reason=AUTH_NO_TARGET)
-
-        proc.deliver(sender, now=NOW, issue="14079")
-        row = self._row_detail(key)
-        self.assertEqual(row.state, CALLBACK_DEAD_LETTER)  # 1 attempt exhausted
+    def test_authorization_reason_survives_to_dead_letter(self) -> None:
+        row = self._deliver_with_reason(AUTH_NO_TARGET)
+        self.assertEqual(row.state, CALLBACK_DEAD_LETTER)
         self.assertIn(AUTH_NO_TARGET, row.detail)  # NOT flattened to "retries exhausted"
 
     def test_transport_precondition_reason_is_distinguishable(self) -> None:
-        key = self._claimed_row(max_attempts=1)
-        proc = CallbackOutboxProcessor(self.outbox, _NullSource(), workspace_id="wsA")
-
-        def sender(row):
-            return CallbackSendResult(
-                SEND_NOT_SENT, persist_ok=False, persist_reason="precondition_not_idle"
-            )
-
-        proc.deliver(sender, now=NOW, issue="14079")
-        row = self._row_detail(key)
-        self.assertEqual(row.state, CALLBACK_DEAD_LETTER)
+        row = self._deliver_with_reason("precondition_not_idle")
         self.assertIn("precondition_not_idle", row.detail)
-        # An operator can tell this transport-precondition zero-send from an authorization one.
-        self.assertNotIn(AUTH_NO_TARGET, row.detail)
+        self.assertNotIn(AUTH_NO_TARGET, row.detail)  # distinct from an authorization zero-send
+
+    def test_hostile_reason_is_not_persisted_raw(self) -> None:
+        hostile = "/Users/alice/.ssh/id_rsa"
+        row = self._deliver_with_reason(hostile)
+        self.assertEqual(row.state, CALLBACK_DEAD_LETTER)
+        self.assertNotIn(hostile, row.detail)  # the raw path is dropped
+        self.assertIn(UNRECOGNIZED_ZERO_SEND_REASON, row.detail)
 
     def test_blank_reason_keeps_store_default_detail(self) -> None:
-        # A bare-token sender that carries no reason -> the store keeps its own default (byte-identical
-        # pre-#14082 behaviour). _zero_send_detail("") is empty, so no "zero-send:" prefix is written.
         self.assertEqual(_zero_send_detail(""), "")
         self.assertEqual(_zero_send_detail(None), "")
         key = self._claimed_row(max_attempts=1)
         proc = CallbackOutboxProcessor(self.outbox, _NullSource(), workspace_id="wsA")
         proc.deliver(lambda row: SEND_NOT_SENT, now=NOW, issue="14079")
         row = self._row_detail(key)
-        self.assertEqual(row.state, CALLBACK_DEAD_LETTER)
         self.assertNotIn("zero-send:", row.detail)
 
 
 class SenderReasonPropagationTest(unittest.TestCase):
-    """BackgroundServiceCallbackSender carries the transport's precondition reason to persist_reason."""
+    """BackgroundServiceCallbackSender carries a normalized transport reason to persist_reason."""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -532,31 +387,30 @@ class SenderReasonPropagationTest(unittest.TestCase):
             target_resolver=_FixedResolver(
                 DeliveryTarget(
                     workspace_id="wsA", lane=SUBLANE, receiver="codex", issue="14079",
-                    journal="82511", generation="1", locator="%GW",
+                    journal="82511", generation="1", locator="wGW:pGW",
                 )
             ),
             transport=transport, now_fn=lambda: NOW,
         )
 
-    def test_transport_blocked_reason_becomes_persist_reason(self) -> None:
-        transport = _FixedTransport(HandoffDeliveryResult("blocked", "precondition_not_idle"))
-        result = self._sender(transport)(self._row())
+    def test_transport_precondition_reason_becomes_persist_reason(self) -> None:
+        result = self._sender(_FixedTransport(HandoffDeliveryResult("blocked", "precondition_not_idle")))(self._row())
         self.assertEqual(result.outcome, SEND_NOT_SENT)
         self.assertEqual(result.persist_reason, "precondition_not_idle")
 
-    def test_delivered_keeps_receipt_evidence_not_outcome_reason(self) -> None:
-        transport = _FixedTransport(
-            HandoffDeliveryResult("sent", "ok", persist_ok=True, persist_reason="ok")
-        )
-        result = self._sender(transport)(self._row())
+    def test_hostile_transport_reason_is_normalized(self) -> None:
+        result = self._sender(_FixedTransport(HandoffDeliveryResult("blocked", "/etc/shadow")))(self._row())
+        # An unrecognized transport reason maps to SEND_UNCERTAIN (not a known NOT_SENT reason) and its
+        # persist_reason is the fixed token, never the raw path.
+        self.assertEqual(result.outcome, SEND_UNCERTAIN)
+        self.assertEqual(result.persist_reason, UNRECOGNIZED_ZERO_SEND_REASON)
+
+    def test_delivered_keeps_receipt_evidence(self) -> None:
+        result = self._sender(
+            _FixedTransport(HandoffDeliveryResult("sent", "ok", persist_ok=True, persist_reason="ok"))
+        )(self._row())
         self.assertEqual(result.outcome, SEND_DELIVERED)
         self.assertEqual(result.persist_reason, "ok")
-
-    def test_uncertain_transport_reason_preserved(self) -> None:
-        transport = _FixedTransport(HandoffDeliveryResult("blocked", "turn_start_unconfirmed"))
-        result = self._sender(transport)(self._row())
-        self.assertEqual(result.outcome, SEND_UNCERTAIN)
-        self.assertEqual(result.persist_reason, "turn_start_unconfirmed")
 
 
 class _NullSource:

@@ -42,18 +42,6 @@ class SupervisedWorkspace:
     canonical_path: str
 
 
-#: The launch-time lane-identity env a background supervisor must NOT inherit (Redmine #13683
-#: R2-F3). A supervisor is not a lane agent, so carrying another lane's role / lane / workspace id
-#: into a target workspace's send would misroute on a foreign identity (or, in a login service,
-#: present a stale identity). These are scrubbed from the send env and only ``MOZYO_WORKSPACE_ID``
-#: is re-set to the target workspace — so a herdr send that needs an attested lane-sender identity
-#: fails **closed** (``missing_sender_env``) rather than misrouting on a stale ambient identity. The
-#: sanctioned background system-actor sender-identity contract (a supervisor is not a claude/codex
-#: lane provider, so :func:`...herdr_target_resolution.resolve_sender_identity` has no slot for it)
-#: is a design-consultation seam, not resolved by ambient env.
-_SCRUBBED_LANE_IDENTITY_ENV = ("MOZYO_AGENT_ROLE", "MOZYO_LANE_ID", "MOZYO_WORKSPACE_ID")
-
-
 def default_workspaces(*, home: Optional[Path] = None) -> list[SupervisedWorkspace]:
     """Enumerate the home workspace registry into supervised-workspace projections."""
     from mozyo_bridge.core.state.workspace_registry import list_workspaces
@@ -141,27 +129,6 @@ def default_redmine_source(
         return None
 
 
-def background_transport_env(workspace_id: str) -> dict:
-    """The deterministic env for a background-service delivery subprocess (design answer j#77216).
-
-    Model A' delivers as a ``background_service`` origin, NOT an agent: the inherited lane identity
-    (``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID`` / ``MOZYO_WORKSPACE_ID``) is scrubbed so no foreign
-    lane identity carries over (boundary 1), the target workspace id is pinned, and the delivery
-    origin is stamped ``MOZYO_DELIVERY_ORIGIN=background_service`` so the transport is separated from
-    an agent send (boundary 5). The lease + claim authority (not this env) gates the delivery.
-    """
-    import os
-
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery import (
-        BACKGROUND_SERVICE_ORIGIN,
-    )
-
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_LANE_IDENTITY_ENV}
-    env["MOZYO_WORKSPACE_ID"] = str(workspace_id or "")
-    env["MOZYO_DELIVERY_ORIGIN"] = BACKGROUND_SERVICE_ORIGIN
-    return env
-
-
 def workspace_live_inventory(ws: SupervisedWorkspace) -> "tuple[list, str]":
     """Best-effort ``(raw_inventory, backend)`` for this workspace (the live-inventory seam, R5-F1).
 
@@ -237,67 +204,87 @@ def default_target_resolver(ws: SupervisedWorkspace, *, lifecycle_store: object 
 
 
 def default_background_transport(ws: SupervisedWorkspace):
-    """Build the production background-service delivery transport for a workspace (boundary 5).
+    """Build the production background-service delivery transport for a workspace (Redmine #14082 R2).
 
-    Shares the handoff rail's outcome vocabulary but under a **separated origin class**: it fires
-    ``mozyo-bridge handoff send`` to the **re-resolved explicit target** (never a role label) from
-    the target workspace's canonical root, with the scrubbed background-service env
-    (:func:`background_transport_env`). Delivery safety is the lease + claim authority (verified by
-    the sender before this transport is ever called) + the outbox one-send fence, not this env. The
-    subprocess runner is injectable (tests inject a fake; the live wire is the Phase B dogfood).
+    A **dedicated** ``background_service`` delivery seam (design constraint j#82553 / Model A' #13683
+    j#77216): it delivers to the **already-resolved explicit live locator** the sender re-matched from
+    the row's stable target tuple, by driving the sanctioned turn-start rail directly — it does NOT go
+    through the agent ``mozyo-bridge handoff send`` entry, ``resolve_sender_identity``, or any target
+    re-derivation, and never presents a fake agent identity or an env-only authorization. It shares
+    only the handoff **outcome vocabulary** (via :func:`...turn_start_observation.project_herdr_turn_start`),
+    under a separated origin class + entry seam. The delivery authority is the supervisor lease + the
+    same-workspace outbox claim + the persisted stable tuple + the action-time live route/generation
+    re-check — all enforced by :class:`...background_service_sender.BackgroundServiceCallbackSender`
+    BEFORE this transport is ever called; the stable lane pin is the resolver matching the exact
+    ``(workspace_id, lane, receiver)`` slot, so the locator is never promoted to sole authority.
+
+    The rail is resolved once from the target workspace's repo-local ``terminal_transport`` config; an
+    unreadable config / unsupported backend is a fail-closed ``target_unavailable`` (bounded retry),
+    never a raw-Herdr fallback. The rail is injectable for tests via ``resolve_turn_start_rail``.
     """
-    import subprocess
+    from pathlib import Path as _Path
 
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
-        _parse_outcome,
+    from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+    from mozyo_bridge.application.turn_start_observation import project_herdr_turn_start
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+        AnchorError,
+        build_marker,
+        build_notification_body,
+        normalize_anchor,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
         HandoffDeliveryResult,
     )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+        RepoLocalConfigError,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (
+        resolve_turn_start_rail,
+    )
 
     canonical = str(ws.canonical_path)
-    env = background_transport_env(ws.workspace_id)
 
-    class _HandoffBackgroundTransport:
+    def _resolve_rail():
+        # The turn-start rail for the target workspace's terminal backend, or None (fail-closed).
+        try:
+            config = load_repo_local_config(_Path(canonical)).terminal_transport
+        except RepoLocalConfigError:
+            return None
+        return resolve_turn_start_rail(config)
+
+    class _BackgroundServiceRailTransport:
         def deliver(self, row, target) -> "HandoffDeliveryResult":  # noqa: F821
-            # Redmine #14082: pin the exact stable target slot on the herdr rail. On the herdr backend
-            # an explicit `--target <locator>` is NOT the route authority (only a `%N` tmux pane is), so
-            # the pre-authorized locator alone is dropped and `--to <receiver>` re-derives the lane from
-            # the (scrubbed / default) sender lane — the coordinator/default misroute. Passing the
-            # re-resolved target's OWN lane as `--target-lane` makes the route resolve the exact
-            # `(workspace_id, lane, receiver)` slot (tier-1 explicit), never a sender-lane re-derivation.
-            # The `background_service` origin env (background_transport_env) admits this as a sanctioned
-            # system actor without a fake agent identity. The live locator is passed only as the
-            # like-for-like target, never promoted to sole authority.
-            target_lane = str(getattr(target, "lane", "") or "").strip()
-            argv = [
-                "mozyo-bridge", "handoff", "send",
-                "--to", str(target.receiver or "codex"),
-                "--target", str(target.locator),  # the re-resolved explicit locator, never a label
-                "--target-repo", canonical,
-            ]
-            if target_lane:
-                argv += ["--target-lane", target_lane]
-            argv += [
-                "--source", "redmine",
-                "--issue", str(target.issue),
-                "--journal", str(target.journal),
-                "--kind", "reply",
-                "--mode", "standard",
-                "--record-format", "json",
-            ]
+            # Build the reply landing marker + body from the row's durable anchor (the SAME domain
+            # builders `handoff send` uses), then drive the turn-start rail to the resolved explicit
+            # locator — no target re-derivation, no agent sender identity.
             try:
-                proc = subprocess.run(  # noqa: S603 - fixed argv, no shell; sanctioned handoff CLI
-                    argv, capture_output=True, text=True, check=False, cwd=canonical or None, env=env
+                anchor = normalize_anchor(
+                    "redmine", issue=str(target.issue), journal=str(target.journal)
                 )
-            except Exception:  # noqa: BLE001 - a runner blow-up is fail-safe uncertain
+                receiver = str(target.receiver or "codex")
+                marker = build_marker(anchor, "reply", receiver)
+                body = build_notification_body(anchor, "reply", None, receiver)
+            except AnchorError:
+                return HandoffDeliveryResult("blocked", "invalid_anchor")
+            except Exception:  # noqa: BLE001 - a body-build failure is a deterministic pre-send refusal
+                return HandoffDeliveryResult("blocked", "invalid_args")
+            try:
+                rail = _resolve_rail()
+            except Exception:  # noqa: BLE001 - an unresolvable rail is fail-closed (bounded retry)
+                return HandoffDeliveryResult("blocked", "target_unavailable")
+            if rail is None:
+                return HandoffDeliveryResult("blocked", "target_unavailable")
+            locator = str(target.locator or "").strip()
+            if not locator:
+                return HandoffDeliveryResult("blocked", "target_unavailable")
+            try:
+                result = rail.drive_turn_start(locator, f"{marker} {body}")
+            except Exception:  # noqa: BLE001 - a rail blow-up mid-drive is fail-safe uncertain
                 return HandoffDeliveryResult("blocked", "inject_failed")
-            parsed = _parse_outcome(proc.stdout or "")
-            if parsed is not None:
-                return HandoffDeliveryResult(parsed[0], parsed[1])
-            return HandoffDeliveryResult("blocked", "turn_start_unconfirmed")
+            status, reason = project_herdr_turn_start(result)
+            return HandoffDeliveryResult(status, reason)
 
-    return _HandoffBackgroundTransport()
+    return _BackgroundServiceRailTransport()
 
 
 def default_binding(ws: SupervisedWorkspace) -> object:
@@ -319,7 +306,6 @@ __all__ = (
     "default_roster",
     "default_authoritative_map",
     "default_redmine_source",
-    "background_transport_env",
     "workspace_live_inventory",
     "default_lifecycle_store",
     "default_target_resolver",

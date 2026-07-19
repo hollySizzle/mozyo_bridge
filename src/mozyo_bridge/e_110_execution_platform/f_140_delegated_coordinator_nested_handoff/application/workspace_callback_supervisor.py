@@ -74,7 +74,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_wiring import (
     SupervisedWorkspace,
-    background_transport_env,
     default_authoritative_map,
     default_background_transport,
     default_binding,
@@ -137,8 +136,8 @@ ISSUE_PASS_ERROR = "issue_pass_error"
 ISSUE_LEASE_LOST = "lease_lost_before_send"
 # ``REVIEW_RETURN_OWNER_READ_ERROR`` (#13684 R1-F3) / ``LANE_GATEWAY_OWNER_READ_ERROR`` (#13683 R2) now
 # live in the sibling leaf; imported above and re-exported via ``__all__`` for a stable import surface.
-# ``SupervisedWorkspace``, ``_SCRUBBED_LANE_IDENTITY_ENV``, and the ``default_*`` production wiring live
-# in the ``supervisor_wiring`` sibling leaf (extracted R2 for module-health); imported + re-exported here.
+# ``SupervisedWorkspace`` and the ``default_*`` production wiring live in the ``supervisor_wiring``
+# sibling leaf (extracted R2 for module-health); imported + re-exported here.
 
 
 class WorkspaceCallbackSupervisor:
@@ -774,7 +773,6 @@ __all__ = (
     "coordinator_target_tuple",
     "owning_lane_binding",
     "owning_lane_generation_reader",
-    "background_transport_env",
     "default_binding",
     "build_supervisor",
 )

@@ -60,6 +60,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_DELIVERED,
     SEND_NOT_SENT,
     SEND_UNCERTAIN,
+    normalize_zero_send_reason,
     send_outcome_for_delivery,
 )
 
@@ -291,11 +292,13 @@ class BackgroundServiceCallbackSender:
         # deterministic pre-injection ``precondition_not_idle`` / ``target_unavailable``, or an
         # ambiguous post-injection token) is the first known-not-sent cause. Carrying it lets the
         # durable row (and the dead-letter) distinguish an AUTHORIZATION zero-send from a TRANSPORT
-        # precondition zero-send, instead of both flattening to "retries exhausted". A delivered row
+        # precondition zero-send, instead of both flattening to "retries exhausted". The transport
+        # reason is an external string, so it is normalized to the secret-safe closed allowlist (review
+        # F2): an unrecognized value is replaced by a fixed token, never persisted raw. A delivered row
         # keeps the transport's own best-effort receipt evidence unchanged.
         persist_reason = result.persist_reason
         if outcome != SEND_DELIVERED and not str(persist_reason or "").strip():
-            persist_reason = str(result.reason or "").strip()
+            persist_reason = normalize_zero_send_reason(result.reason)
         return CallbackSendResult(
             outcome, persist_ok=result.persist_ok, persist_reason=persist_reason
         )

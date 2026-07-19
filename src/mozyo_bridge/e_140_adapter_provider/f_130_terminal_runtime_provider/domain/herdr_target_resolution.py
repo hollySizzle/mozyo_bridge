@@ -61,17 +61,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 MOZYO_WORKSPACE_ID_ENV: str = "MOZYO_WORKSPACE_ID"
 MOZYO_AGENT_ROLE_ENV: str = "MOZYO_AGENT_ROLE"
 MOZYO_LANE_ID_ENV: str = "MOZYO_LANE_ID"
-#: The delivery-origin env stamp a sanctioned background-service delivery carries (Redmine #14082).
-#: The workspace callback supervisor scrubs the agent identity env (``MOZYO_AGENT_ROLE`` /
-#: ``MOZYO_LANE_ID``) and stamps this so its pre-authorized (lease + claim + stable route + live
-#: inventory + generation) callback delivery is admitted as a NON-agent **system actor** without
-#: presenting a fake ``claude`` / ``codex`` lane identity. Mirrors the value of
-#: ``...f_140_delegated_coordinator_nested_handoff.domain.background_service_delivery.BACKGROUND_SERVICE_ORIGIN``
-#: — kept a local literal here to avoid an e_140 -> e_110 import (the supervisor already imports the
-#: terminal-runtime domain, so the reverse would cycle); a drift-guard test asserts the two agree.
-MOZYO_DELIVERY_ORIGIN_ENV: str = "MOZYO_DELIVERY_ORIGIN"
-#: The sanctioned system-actor delivery origin token (see :data:`MOZYO_DELIVERY_ORIGIN_ENV`).
-DELIVERY_ORIGIN_BACKGROUND_SERVICE: str = "background_service"
 
 # ---------------------------------------------------------------------------
 # Provider / receiver vocabulary. The mzb1 "role" field is a runtime *provider*
@@ -82,15 +71,6 @@ DELIVERY_ORIGIN_BACKGROUND_SERVICE: str = "background_service"
 PROVIDER_CLAUDE: str = "claude"
 PROVIDER_CODEX: str = "codex"
 RECEIVER_COORDINATOR: str = "coordinator"
-
-#: The sender-identity role a sanctioned background-service **system actor** carries (Redmine
-#: #14082). DELIBERATELY not a member of :data:`AGENT_PROVIDERS` (a background service is not a
-#: ``claude`` / ``codex`` lane agent), so it is admitted ONLY through the origin-stamped system-actor
-#: branch of :func:`resolve_sender_identity` — never by an ordinary env-role send. It scopes nothing
-#: on its own: the target lane is pinned by an explicit ``--target-lane`` (tier-1 in
-#: :func:`derive_target_lane`) and the workspace by the same env<->anchor attestation an agent sender
-#: passes, so promoting a live locator alone to authority is never required (design constraint j#82537).
-SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE: str = "background_service"
 
 #: The provider tokens a launched agent (and thus a mzb1 identity slot) may carry,
 #: derived from the agent provider profile registry (Redmine #13441) rather than a
@@ -108,12 +88,6 @@ REASON_MISSING_SENDER_ENV: str = "missing_sender_env"
 REASON_INVALID_SENDER_ROLE: str = "invalid_sender_role"
 REASON_MISSING_ANCHOR: str = "missing_anchor"
 REASON_ENV_ANCHOR_WORKSPACE_MISMATCH: str = "env_anchor_workspace_mismatch"
-#: A sanctioned background-service system-actor delivery did not pin an explicit target lane
-#: (Redmine #14082). The system actor carries no sender lane (scrubbed by design), so it MUST supply
-#: an explicit ``--target-lane`` for the route to resolve the exact stable slot (tier-1); without it
-#: the send would fall back to a sender-lane re-derivation — the coordinator/default misroute this Bug
-#: fixes — so it fails closed instead.
-REASON_SYSTEM_ACTOR_MISSING_LANE: str = "system_actor_missing_target_lane"
 # -- target resolution --
 REASON_UNKNOWN_RECEIVER: str = "unknown_receiver"
 REASON_COORDINATOR_BINDING_UNRESOLVED: str = "coordinator_binding_unresolved"
@@ -127,7 +101,6 @@ SENDER_IDENTITY_FAILURE_REASONS: frozenset[str] = frozenset(
         REASON_INVALID_SENDER_ROLE,
         REASON_MISSING_ANCHOR,
         REASON_ENV_ANCHOR_WORKSPACE_MISMATCH,
-        REASON_SYSTEM_ACTOR_MISSING_LANE,
     }
 )
 
@@ -202,7 +175,6 @@ def resolve_sender_identity(
     *,
     anchor_workspace_id: Optional[str],
     snapshot: Optional[AgentProviderRuntimeSnapshot] = None,
-    background_service_target_lane: Optional[str] = None,
 ) -> SenderIdentityResolution:
     """Resolve the sender's identity from launch env + the repo anchor (fail-closed).
 
@@ -217,53 +189,10 @@ def resolve_sender_identity(
     - env workspace id != anchor workspace id ->
       :data:`REASON_ENV_ANCHOR_WORKSPACE_MISMATCH` (a checkout must not mint a name
       for another workspace via a leaked env var).
-
-    Sanctioned background-service system actor (Redmine #14082): when ``env`` carries
-    :data:`MOZYO_DELIVERY_ORIGIN_ENV` == :data:`DELIVERY_ORIGIN_BACKGROUND_SERVICE`, the sender is a
-    pre-authorized (lease + claim + stable route + generation) workspace-callback-supervisor delivery,
-    NOT an agent. It is admitted WITHOUT a ``claude`` / ``codex`` :data:`MOZYO_AGENT_ROLE` (scrubbed by
-    design), carrying the sentinel :data:`SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE` role — but every other
-    attestation is unchanged: ``MOZYO_WORKSPACE_ID`` is required and must equal the repo anchor
-    workspace (:data:`REASON_ENV_ANCHOR_WORKSPACE_MISMATCH`), and it MUST pin an explicit target lane
-    (``background_service_target_lane``), else :data:`REASON_SYSTEM_ACTOR_MISSING_LANE` — so the route
-    resolves the exact stable slot (tier-1), never a sender-lane re-derivation (the coordinator/default
-    misroute this Bug fixes). An env-less operator shell carries no origin stamp and still fails closed
-    on the agent path below; no fake agent identity is minted (design constraint j#82537).
     """
     workspace_id = _norm(env.get(MOZYO_WORKSPACE_ID_ENV))
     role = _norm(env.get(MOZYO_AGENT_ROLE_ENV))
     lane_id = _norm(env.get(MOZYO_LANE_ID_ENV)) or DEFAULT_LANE
-    if _norm(env.get(MOZYO_DELIVERY_ORIGIN_ENV)) == DELIVERY_ORIGIN_BACKGROUND_SERVICE:
-        if not workspace_id:
-            return SenderIdentityResolution.failure(
-                REASON_MISSING_SENDER_ENV,
-                f"{MOZYO_WORKSPACE_ID_ENV} must be set for a "
-                f"{DELIVERY_ORIGIN_BACKGROUND_SERVICE} sender",
-            )
-        if not _norm(background_service_target_lane):
-            return SenderIdentityResolution.failure(
-                REASON_SYSTEM_ACTOR_MISSING_LANE,
-                "a background_service delivery must pin an explicit --target-lane so the route "
-                "resolves the exact stable slot, never a sender-lane re-derivation",
-            )
-        anchor_ws = _norm(anchor_workspace_id)
-        if not anchor_ws:
-            return SenderIdentityResolution.failure(
-                REASON_MISSING_ANCHOR,
-                "repo anchor has no workspace_id; run `mozyo-bridge workspace register`",
-            )
-        if workspace_id != anchor_ws:
-            return SenderIdentityResolution.failure(
-                REASON_ENV_ANCHOR_WORKSPACE_MISMATCH,
-                f"sender env workspace {workspace_id!r} != anchor workspace {anchor_ws!r}",
-            )
-        return SenderIdentityResolution.success(
-            SenderIdentity(
-                workspace_id=workspace_id,
-                role=SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE,
-                lane_id=lane_id,
-            )
-        )
     if not workspace_id or not role:
         return SenderIdentityResolution.failure(
             REASON_MISSING_SENDER_ENV,
@@ -617,8 +546,6 @@ __all__ = (
     "LaneDerivation",
     "derive_target_lane",
     "MOZYO_AGENT_ROLE_ENV",
-    "MOZYO_DELIVERY_ORIGIN_ENV",
-    "DELIVERY_ORIGIN_BACKGROUND_SERVICE",
     "MOZYO_LANE_ID_ENV",
     "MOZYO_WORKSPACE_ID_ENV",
     "PROVIDER_CLAUDE",
@@ -631,10 +558,8 @@ __all__ = (
     "REASON_MISSING_SENDER_ENV",
     "REASON_MULTIPLE_MATCHES",
     "REASON_NO_MATCH",
-    "REASON_SYSTEM_ACTOR_MISSING_LANE",
     "REASON_UNKNOWN_RECEIVER",
     "RECEIVER_COORDINATOR",
-    "SYSTEM_ACTOR_ROLE_BACKGROUND_SERVICE",
     "SENDER_IDENTITY_FAILURE_REASONS",
     "TARGET_RESOLUTION_FAILURE_REASONS",
     "HerdrAgentDiscoveryPort",
