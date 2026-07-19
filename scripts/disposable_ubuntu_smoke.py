@@ -69,7 +69,13 @@ EXPECTED_STEPS = (
     "docs_validate",
     "docs_resolve",
     "doctor_runtime",
+    "mount_isolation",
 )
+
+# Distribution-file suffixes allowed in an artifact-only directory. Anything
+# else (a source tree, a .py file, a .git checkout) means /artifacts could leak
+# source into the container, so it is refused host-side.
+_DIST_SUFFIXES = (".whl", ".tar.gz")
 
 
 class SmokeError(RuntimeError):
@@ -104,6 +110,68 @@ def resolve_wheel(artifact_dir: Path, expected_version: str) -> Path:
             f"multiple wheels for version {expected_version!r} in {artifact_dir}: {names}"
         )
     return matches[0]
+
+
+def verify_artifact_dir_is_artifact_only(artifact_dir: Path) -> list[str]:
+    """Fail closed unless ``artifact_dir`` holds ONLY distribution files.
+
+    The directory is bind-mounted read-only at ``/artifacts`` and is the sole
+    install source, so it must not carry a source checkout. A subdirectory
+    (``src/``, ``.git/``), a ``pyproject.toml``, or any non-distribution file
+    would let the container see source rather than only the built artifact;
+    every such entry is refused. Returns the sorted distribution filenames.
+    This is the host-side half of the source-absence assertion (the container
+    observes ``/proc/self/mountinfo`` as the other half) — neither relies on a
+    self-reported constant.
+    """
+    if not artifact_dir.is_dir():
+        raise SmokeError(f"artifact dir is not a directory: {artifact_dir}")
+    dists: list[str] = []
+    offenders: list[str] = []
+    for entry in sorted(artifact_dir.iterdir()):
+        if entry.is_dir():
+            offenders.append(entry.name + "/")
+        elif entry.name.endswith(_DIST_SUFFIXES):
+            dists.append(entry.name)
+        else:
+            offenders.append(entry.name)
+    if offenders:
+        raise SmokeError(
+            f"artifact dir {artifact_dir} is not artifact-only; non-distribution "
+            f"entries present (source could leak into /artifacts): {', '.join(offenders)}"
+        )
+    if not dists:
+        raise SmokeError(f"artifact dir {artifact_dir} contains no distribution files")
+    return dists
+
+
+def verify_command_mounts_artifact_only(command: list[str], artifact_dir: Path) -> None:
+    """Fail closed unless the docker argv mounts EXACTLY the artifact dir ro.
+
+    Reads the ``-v`` / ``--volume`` occurrences out of the assembled argv and
+    requires the single mount ``<artifact_dir>:/artifacts:ro`` — nothing else,
+    and no source tree. This makes "no source mount" a verified property of the
+    actual command that will run, not a comment; a regression that added a
+    source bind mount to ``build_docker_command`` would trip here.
+    """
+    mounts: list[str] = []
+    index = 0
+    while index < len(command):
+        token = command[index]
+        if token in ("-v", "--volume"):
+            if index + 1 < len(command):
+                mounts.append(command[index + 1])
+            index += 2
+            continue
+        if token.startswith("--volume="):
+            mounts.append(token[len("--volume="):])
+        index += 1
+    expected = f"{artifact_dir.resolve()}:/artifacts:ro"
+    if mounts != [expected]:
+        raise SmokeError(
+            f"docker mounts must be exactly ['{expected}'] (artifact-only, read-only); "
+            f"got {mounts}"
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -275,9 +343,42 @@ if active.get("version") is None:
 PYCHECK
 step doctor_runtime
 
-python3 - "$RUNTIME_USER" "$RUNTIME_UID" "$HOME" "$OBS_VERSION" "$OBS_VERSION_MOZYO" "$PKG_PATH" "$PRESET" <<'PYFACTS'
+# Mount isolation: OBSERVE (not assume) that no host source checkout is bind-
+# mounted into the container. Read /proc/self/mountinfo, drop the container's
+# own system mounts (/, /proc*, /sys*, /dev*, the /etc/{hostname,hosts,
+# resolv.conf} files) and the one expected read-only artifact mount, then fail
+# CLOSED if any other host mount remains. This turns "no source is mounted" from
+# a hardcoded fact into a runtime observation, so a future mount-wiring
+# regression is caught here instead of passing on a self-reported constant.
+EXTRA_MOUNTS="$(python3 <<'PYMOUNT'
+SYSTEM_PREFIXES = ("/proc", "/sys", "/dev")
+SYSTEM_EXACT = {"/", "/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
+ALLOWED = {"/artifacts"}
+extra = []
+with open("/proc/self/mountinfo", encoding="utf-8") as fh:
+    for line in fh:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        mount_point = parts[4]
+        if mount_point in SYSTEM_EXACT or mount_point in ALLOWED:
+            continue
+        if any(mount_point == p or mount_point.startswith(p + "/") for p in SYSTEM_PREFIXES):
+            continue
+        extra.append(mount_point)
+print(",".join(sorted(set(extra))))
+PYMOUNT
+)"
+if [ -n "$EXTRA_MOUNTS" ]; then
+  echo "FAIL: unexpected host mount(s) present (possible source checkout): $EXTRA_MOUNTS" >&2
+  exit 3
+fi
+step mount_isolation
+
+python3 - "$RUNTIME_USER" "$RUNTIME_UID" "$HOME" "$OBS_VERSION" "$OBS_VERSION_MOZYO" "$PKG_PATH" "$PRESET" "$EXTRA_MOUNTS" <<'PYFACTS'
 import json, sys
-(user, uid, home, ver, ver_mozyo, pkg, preset) = sys.argv[1:8]
+(user, uid, home, ver, ver_mozyo, pkg, preset, extra_mounts_csv) = sys.argv[1:9]
+extra_mounts = [m for m in extra_mounts_csv.split(",") if m]
 facts = {
     "harness_user": user,
     "harness_uid": int(uid),
@@ -286,7 +387,9 @@ facts = {
     "observed_version_mozyo": ver_mozyo,
     "package_path": pkg,
     "preset": preset,
-    "source_mount_present": False,
+    # OBSERVED from /proc/self/mountinfo above (empty extra mounts => absent).
+    "source_mount_present": bool(extra_mounts),
+    "extra_mounts": extra_mounts,
 }
 print("MOZYO_SMOKE_FACTS=" + json.dumps(facts, sort_keys=True))
 PYFACTS
@@ -334,18 +437,30 @@ def build_summary(
     resolved_digest: str | None,
     duration_seconds: float,
     container_exit: int,
+    mounts_host_verified: bool = False,
 ) -> dict:
     """Assemble the machine-readable, secret-safe smoke summary."""
     facts = parsed.get("facts")
     steps = parsed.get("steps", [])
     missing = [name for name in EXPECTED_STEPS if name not in steps]
+    # Source-absence is verified at BOTH layers: host-side (argv + artifact-dir
+    # boundary, `mounts_host_verified`) and container-side (the observed
+    # `mount_isolation` surface + the observed `source_mount_present` fact). The
+    # verdict requires both, so neither a self-reported constant nor a single
+    # regressing layer can pass it.
+    source_mount_absent_verified = bool(
+        mounts_host_verified
+        and "mount_isolation" in steps
+        and facts
+        and facts.get("source_mount_present") is False
+    )
     provenance_ok = bool(
         facts
         and facts.get("observed_version_mozyo_bridge") == expected_version
         and facts.get("observed_version_mozyo") == expected_version
         and isinstance(facts.get("harness_uid"), int)
         and facts.get("harness_uid") != 0
-        and facts.get("source_mount_present") is False
+        and source_mount_absent_verified
     )
     ok = container_exit == 0 and not missing and provenance_ok
     return {
@@ -366,6 +481,9 @@ def build_summary(
             "harness_user": facts.get("harness_user") if facts else None,
             "fresh_home": facts.get("harness_home") if facts else None,
             "source_checkout_mounted": facts.get("source_mount_present") if facts else None,
+            "source_mount_absent_verified": source_mount_absent_verified,
+            "mounts_host_verified": bool(mounts_host_verified),
+            "extra_mounts": (facts.get("extra_mounts") if facts else None),
             "package_path": facts.get("package_path") if facts else None,
         },
         "preset": preset,
@@ -400,6 +518,9 @@ def run_smoke(args: argparse.Namespace) -> dict:
     artifact_dir = Path(args.artifact_dir)
     validate_image(args.image, args.mode)
     wheel = resolve_wheel(artifact_dir, args.expected_version)
+    # Host-side source-absence assertion #1: the mounted directory must hold
+    # only distribution files (no source tree can leak through /artifacts).
+    verify_artifact_dir_is_artifact_only(artifact_dir)
     wheel_sha = sha256_file(wheel)
 
     command = build_docker_command(
@@ -410,6 +531,9 @@ def run_smoke(args: argparse.Namespace) -> dict:
         expected_version=args.expected_version,
         preset=args.preset,
     )
+    # Host-side source-absence assertion #2: the actual argv must mount exactly
+    # the artifact dir read-only and nothing else.
+    verify_command_mounts_artifact_only(command, artifact_dir)
     program = _container_program()
 
     # ``perf_counter`` is monotonic and side-effect-free (no wall-clock / RNG).
@@ -445,6 +569,7 @@ def run_smoke(args: argparse.Namespace) -> dict:
         resolved_digest=resolved_digest,
         duration_seconds=duration,
         container_exit=completed.returncode,
+        mounts_host_verified=True,
     )
 
 

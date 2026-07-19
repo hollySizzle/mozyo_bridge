@@ -41,6 +41,7 @@ def _facts(**overrides):
         "package_path": "/home/smoke/venv/lib/python3.12/site-packages/mozyo_bridge",
         "preset": "redmine-governed",
         "source_mount_present": False,
+        "extra_mounts": [],
     }
     base.update(overrides)
     return base
@@ -85,6 +86,82 @@ class ResolveWheelTests(unittest.TestCase):
     def test_missing_dir_fails_closed(self):
         with self.assertRaises(mod.SmokeError):
             mod.resolve_wheel(Path("/no/such/dir/for/smoke"), "1.2.3")
+
+
+class ArtifactDirIsArtifactOnlyTests(unittest.TestCase):
+    def test_wheel_and_sdist_are_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "mozyo_bridge-1.2.3-py3-none-any.whl").write_bytes(b"x")
+            (root / "mozyo_bridge-1.2.3.tar.gz").write_bytes(b"y")
+            self.assertEqual(
+                mod.verify_artifact_dir_is_artifact_only(root),
+                ["mozyo_bridge-1.2.3-py3-none-any.whl", "mozyo_bridge-1.2.3.tar.gz"],
+            )
+
+    def test_source_subdir_fails_closed(self):
+        # A src/ tree in the mounted dir could leak source into /artifacts.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "mozyo_bridge-1.2.3-py3-none-any.whl").write_bytes(b"x")
+            (root / "src").mkdir()
+            with self.assertRaises(mod.SmokeError):
+                mod.verify_artifact_dir_is_artifact_only(root)
+
+    def test_loose_source_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "mozyo_bridge-1.2.3-py3-none-any.whl").write_bytes(b"x")
+            (root / "pyproject.toml").write_bytes(b"[project]")
+            with self.assertRaises(mod.SmokeError):
+                mod.verify_artifact_dir_is_artifact_only(root)
+
+    def test_empty_dir_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(mod.SmokeError):
+                mod.verify_artifact_dir_is_artifact_only(Path(d))
+
+
+class CommandMountsArtifactOnlyTests(unittest.TestCase):
+    def test_exact_single_ro_mount_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cmd = mod.build_docker_command(
+                docker_bin="docker",
+                image=_DIGEST,
+                artifact_dir=root,
+                wheel_name="w.whl",
+                expected_version="1.2.3",
+                preset="none",
+            )
+            mod.verify_command_mounts_artifact_only(cmd, root)  # no raise
+
+    def test_extra_source_mount_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cmd = mod.build_docker_command(
+                docker_bin="docker",
+                image=_DIGEST,
+                artifact_dir=root,
+                wheel_name="w.whl",
+                expected_version="1.2.3",
+                preset="none",
+            )
+            # Simulate a regression that bind-mounts the repo source tree.
+            cmd = cmd[:-4] + ["-v", "/repo/src:/src:ro"] + cmd[-4:]
+            with self.assertRaises(mod.SmokeError):
+                mod.verify_command_mounts_artifact_only(cmd, root)
+
+    def test_writable_artifact_mount_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cmd = [
+                "docker", "run", "--rm", "-i",
+                "-v", f"{root.resolve()}:/artifacts",  # missing :ro
+                _DIGEST, "bash",
+            ]
+            with self.assertRaises(mod.SmokeError):
+                mod.verify_command_mounts_artifact_only(cmd, root)
 
 
 class ValidateImageTests(unittest.TestCase):
@@ -163,6 +240,15 @@ class ContainerProgramTests(unittest.TestCase):
         self.assertIn("doctor runtime --json", program)
         self.assertIn("source surface", program)
 
+    def test_program_observes_mount_isolation(self):
+        program = mod._container_program()
+        # Source absence is OBSERVED from mountinfo and fails closed, not a
+        # hardcoded fact.
+        self.assertIn("/proc/self/mountinfo", program)
+        self.assertIn("step mount_isolation", program)
+        self.assertIn("unexpected host mount", program)
+        self.assertNotIn('"source_mount_present": False', program)
+
 
 class ParseOutputTests(unittest.TestCase):
     def test_extracts_steps_and_facts(self):
@@ -202,6 +288,7 @@ class BuildSummaryTests(unittest.TestCase):
             resolved_digest=_DIGEST,
             duration_seconds=1.2345,
             container_exit=0,
+            mounts_host_verified=True,
         )
         defaults.update(kw)
         return mod.build_summary(**defaults)
@@ -211,8 +298,22 @@ class BuildSummaryTests(unittest.TestCase):
         self.assertTrue(summary["ok"])
         self.assertTrue(summary["provenance_ok"])
         self.assertTrue(summary["runtime"]["non_root"])
+        self.assertTrue(summary["runtime"]["source_mount_absent_verified"])
         self.assertEqual(summary["surfaces"]["missing"], [])
         self.assertEqual(summary["artifact"]["sha256"], "deadbeef")
+
+    def test_host_unverified_mounts_fail(self):
+        # Even with a clean container fact, no host-side mount verification
+        # means source-absence is not proven -> not ok.
+        summary = self._summary(mounts_host_verified=False)
+        self.assertFalse(summary["runtime"]["source_mount_absent_verified"])
+        self.assertFalse(summary["ok"])
+
+    def test_missing_mount_isolation_surface_fails(self):
+        steps = [s for s in _all_steps() if s != "mount_isolation"]
+        summary = self._summary(parsed={"steps": steps, "facts": _facts()})
+        self.assertFalse(summary["runtime"]["source_mount_absent_verified"])
+        self.assertFalse(summary["ok"])
 
     def test_missing_surface_fails(self):
         parsed = {"steps": _all_steps()[:-1], "facts": _facts()}

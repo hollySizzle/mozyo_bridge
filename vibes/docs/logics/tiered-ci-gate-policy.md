@@ -151,7 +151,12 @@ build job 内で走り `id-token` を持たないため、#13601 の OIDC 境界
   ではない: container は root で OS provision (apt python3/venv) した後 **非root user
   へ drop** し、その user (`id -u != 0`)・fresh `HOME`・venv 配下の package path・
   両 console script の `--version == expected` を機械照合する。repo checkout は
-  container に一切現れない。
+  container に一切現れない。**source 不在は 2 層で検証する** (#14100 review j#82881
+  F1): host 側で docker argv の mount 集合が `artifact_dir:/artifacts:ro` ちょうど 1 件
+  である事と artifact-only directory 境界 (distribution file のみ) を fail-closed 検証し、
+  container 側で `/proc/self/mountinfo` を観測して `/artifacts` と system mount 以外の
+  host mount が無い事を `mount_isolation` surface として観測 (自己申告の固定値でなく
+  観測値)。両層が揃って初めて `source_mount_absent_verified` が真となり verdict を通す。
 - **既存 venv fresh-install smoke との差分 (重複でなく追加価値)**: venv smoke は build
   runner 上で runner user として `--version` / `--help` を叩くだけ。container smoke は
   (1) OS 境界 (pinned Ubuntu LTS)、(2) 非root user + fresh HOME、(3) source checkout 不在、
