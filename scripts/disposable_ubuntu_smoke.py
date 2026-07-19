@@ -145,27 +145,96 @@ def verify_artifact_dir_is_artifact_only(artifact_dir: Path) -> list[str]:
     return dists
 
 
+# Every docker flag that can introduce a mount / filesystem into the container.
+# ``-v`` / ``--volume`` / ``--mount`` are normalized and compared to the one
+# expected bind; ``--tmpfs`` / ``--volumes-from`` are never emitted by this tool,
+# so their mere presence is a regression and fails closed. Both the separate
+# (``--mount X``) and inline (``--mount=X``) spellings are covered so an
+# equivalent syntax cannot smuggle a source tree past the check
+# (Redmine #14100 review j#82888).
+_MOUNT_VALUE_FLAGS = ("-v", "--volume", "--mount")
+_OTHER_MOUNT_FLAGS = ("--tmpfs", "--volumes-from")
+
+
+def _normalize_mount_spec(value: str) -> str:
+    """Return a canonical ``src:dst[:ro]`` string for one mount value.
+
+    Accepts both the ``-v`` short form (``src:dst[:opts]``) and the ``--mount``
+    key=value form (``type=bind,source=..,target=..,readonly``). A ``--mount``
+    whose type is not ``bind`` normalizes to a ``type:<t>`` sentinel so it can
+    never equal the expected bind spec (and is therefore rejected).
+    """
+    if "=" in value and ("," in value or value.split("=", 1)[0] in {
+        "type", "source", "src", "destination", "dst", "target", "readonly", "ro"
+    }):
+        # --mount key=value[,key=value...] form.
+        fields: dict[str, str] = {}
+        flags: set[str] = set()
+        for part in value.split(","):
+            if "=" in part:
+                key, _, val = part.partition("=")
+                fields[key.strip()] = val.strip()
+            else:
+                flags.add(part.strip())
+        mount_type = fields.get("type", "volume")
+        if mount_type != "bind":
+            return f"type:{mount_type}"
+        src = fields.get("source", fields.get("src", ""))
+        dst = fields.get("target", fields.get("destination", fields.get("dst", "")))
+        read_only = (
+            "readonly" in flags
+            or "ro" in flags
+            or fields.get("readonly", "").lower() in {"", "true", "1"}
+            and "readonly" in fields
+        )
+        return f"{src}:{dst}:ro" if read_only else f"{src}:{dst}"
+    # -v / --volume short form: already src:dst[:opts].
+    return value
+
+
 def verify_command_mounts_artifact_only(command: list[str], artifact_dir: Path) -> None:
     """Fail closed unless the docker argv mounts EXACTLY the artifact dir ro.
 
-    Reads the ``-v`` / ``--volume`` occurrences out of the assembled argv and
-    requires the single mount ``<artifact_dir>:/artifacts:ro`` — nothing else,
-    and no source tree. This makes "no source mount" a verified property of the
-    actual command that will run, not a comment; a regression that added a
-    source bind mount to ``build_docker_command`` would trip here.
+    Collects EVERY mount-introducing flag from the assembled argv — ``-v`` /
+    ``--volume`` / ``--mount`` in both separate and ``=`` spellings, plus
+    ``--tmpfs`` / ``--volumes-from`` — normalizes them, and requires the single
+    normalized mount ``<artifact_dir>:/artifacts:ro`` and nothing else. This
+    makes "no source mount" a verified property of the actual command in every
+    equivalent syntax, so a regression that bind-mounted a source tree via
+    ``--mount`` (even under a ``/dev`` / ``/proc`` / ``/sys`` target) trips here
+    before the container starts (Redmine #14100 review j#82888).
     """
     mounts: list[str] = []
+    offenders: list[str] = []
     index = 0
     while index < len(command):
         token = command[index]
-        if token in ("-v", "--volume"):
+        if token in _MOUNT_VALUE_FLAGS:
             if index + 1 < len(command):
-                mounts.append(command[index + 1])
+                mounts.append(_normalize_mount_spec(command[index + 1]))
+            else:
+                offenders.append(token)  # dangling mount flag, no value
             index += 2
             continue
-        if token.startswith("--volume="):
-            mounts.append(token[len("--volume="):])
+        matched_value = False
+        for flag in _MOUNT_VALUE_FLAGS:
+            if token.startswith(flag + "="):
+                mounts.append(_normalize_mount_spec(token[len(flag) + 1:]))
+                matched_value = True
+                break
+        if matched_value:
+            index += 1
+            continue
+        if token in _OTHER_MOUNT_FLAGS or any(
+            token.startswith(flag + "=") for flag in _OTHER_MOUNT_FLAGS
+        ):
+            offenders.append(token)
         index += 1
+    if offenders:
+        raise SmokeError(
+            f"docker command carries unexpected mount flag(s) {offenders}; "
+            "only a single read-only artifact bind mount is allowed"
+        )
     expected = f"{artifact_dir.resolve()}:/artifacts:ro"
     if mounts != [expected]:
         raise SmokeError(
@@ -344,28 +413,42 @@ PYCHECK
 step doctor_runtime
 
 # Mount isolation: OBSERVE (not assume) that no host source checkout is bind-
-# mounted into the container. Read /proc/self/mountinfo, drop the container's
-# own system mounts (/, /proc*, /sys*, /dev*, the /etc/{hostname,hosts,
-# resolv.conf} files) and the one expected read-only artifact mount, then fail
-# CLOSED if any other host mount remains. This turns "no source is mounted" from
-# a hardcoded fact into a runtime observation, so a future mount-wiring
-# regression is caught here instead of passing on a self-reported constant.
+# mounted into the container. Read /proc/self/mountinfo and flag any mount whose
+# FILESYSTEM TYPE is a real (non-pseudo) filesystem — i.e. host content — unless
+# it is one of the tiny allowed set (/ overlay root, the expected /artifacts
+# bind, and the /etc/{resolv.conf,hostname,hosts} bind files docker injects). A
+# real filesystem mounted anywhere — including UNDER /dev, /proc or /sys — is
+# extra host content and fails CLOSED. Keying on fstype (not a path prefix)
+# closes the bypass where a bind mount targeted at e.g. /dev/src evaded a naive
+# /dev prefix allow (Redmine #14100 review j#82888). Pseudo filesystems (proc,
+# sysfs, cgroup, tmpfs, devpts, ...) are the container's own plumbing and are
+# allowed; a source checkout's backing fs (ext4/xfs/overlay/9p/virtiofs/...) is
+# never in that set, so it is always caught.
 EXTRA_MOUNTS="$(python3 <<'PYMOUNT'
-SYSTEM_PREFIXES = ("/proc", "/sys", "/dev")
-SYSTEM_EXACT = {"/", "/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
-ALLOWED = {"/artifacts"}
+PSEUDO_FSTYPES = {
+    "proc", "sysfs", "cgroup", "cgroup2", "tmpfs", "devpts", "mqueue", "bpf",
+    "tracefs", "debugfs", "securityfs", "pstore", "hugetlbfs", "devtmpfs",
+    "ramfs", "fusectl", "configfs", "binfmt_misc", "autofs", "nsfs", "efivarfs",
+}
+ALLOWED_EXACT = {"/", "/artifacts", "/etc/resolv.conf", "/etc/hostname", "/etc/hosts"}
 extra = []
 with open("/proc/self/mountinfo", encoding="utf-8") as fh:
     for line in fh:
         parts = line.split()
-        if len(parts) < 5:
+        try:
+            sep = parts.index("-")
+        except ValueError:
+            continue
+        if len(parts) < 5 or sep + 1 >= len(parts):
             continue
         mount_point = parts[4]
-        if mount_point in SYSTEM_EXACT or mount_point in ALLOWED:
+        fstype = parts[sep + 1]
+        if mount_point in ALLOWED_EXACT:
             continue
-        if any(mount_point == p or mount_point.startswith(p + "/") for p in SYSTEM_PREFIXES):
+        if fstype in PSEUDO_FSTYPES:
             continue
-        extra.append(mount_point)
+        # A non-pseudo filesystem at an unexpected mount point == host content.
+        extra.append(f"{mount_point}({fstype})")
 print(",".join(sorted(set(extra))))
 PYMOUNT
 )"

@@ -163,6 +163,77 @@ class CommandMountsArtifactOnlyTests(unittest.TestCase):
             with self.assertRaises(mod.SmokeError):
                 mod.verify_command_mounts_artifact_only(cmd, root)
 
+    def _base_cmd(self, root):
+        return mod.build_docker_command(
+            docker_bin="docker",
+            image=_DIGEST,
+            artifact_dir=root,
+            wheel_name="w.whl",
+            expected_version="1.2.3",
+            preset="none",
+        )
+
+    def test_mount_flag_source_injection_fails_closed(self):
+        # A --mount bind targeting /dev/src (the review j#82888 bypass) must be
+        # rejected host-side, in both the separate and inline spellings.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for injection in (
+                ["--mount", "type=bind,source=/repo,target=/dev/src,readonly"],
+                ["--mount=type=bind,source=/repo,target=/src,readonly"],
+            ):
+                cmd = self._base_cmd(root)
+                cmd = cmd[:-4] + injection + cmd[-4:]
+                with self.assertRaises(mod.SmokeError):
+                    mod.verify_command_mounts_artifact_only(cmd, root)
+
+    def test_tmpfs_and_volumes_from_fail_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for injection in (
+                ["--tmpfs", "/scratch"],
+                ["--tmpfs=/scratch"],
+                ["--volumes-from", "other"],
+                ["--volumes-from=other"],
+            ):
+                cmd = self._base_cmd(root)
+                cmd = cmd[:-4] + injection + cmd[-4:]
+                with self.assertRaises(mod.SmokeError):
+                    mod.verify_command_mounts_artifact_only(cmd, root)
+
+    def test_mount_form_artifact_equivalent_is_accepted(self):
+        # The SAME artifact bind expressed as --mount normalizes to the expected
+        # spec and is accepted (equivalent-syntax awareness, not blanket reject).
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cmd = [
+                "docker", "run", "--rm", "-i",
+                "--mount", f"type=bind,source={root.resolve()},target=/artifacts,readonly",
+                _DIGEST, "bash",
+            ]
+            mod.verify_command_mounts_artifact_only(cmd, root)  # no raise
+
+
+class NormalizeMountSpecTests(unittest.TestCase):
+    def test_short_form_passthrough(self):
+        self.assertEqual(mod._normalize_mount_spec("/a:/b:ro"), "/a:/b:ro")
+
+    def test_mount_bind_readonly(self):
+        self.assertEqual(
+            mod._normalize_mount_spec("type=bind,source=/a,target=/b,readonly"),
+            "/a:/b:ro",
+        )
+
+    def test_mount_bind_rw(self):
+        self.assertEqual(
+            mod._normalize_mount_spec("type=bind,source=/a,target=/b"),
+            "/a:/b",
+        )
+
+    def test_mount_nonbind_type_cannot_equal_bind(self):
+        spec = mod._normalize_mount_spec("type=volume,source=v,target=/b")
+        self.assertTrue(spec.startswith("type:"))
+
 
 class ValidateImageTests(unittest.TestCase):
     def test_blocking_requires_digest(self):
@@ -248,6 +319,9 @@ class ContainerProgramTests(unittest.TestCase):
         self.assertIn("step mount_isolation", program)
         self.assertIn("unexpected host mount", program)
         self.assertNotIn('"source_mount_present": False', program)
+        # Keys on filesystem TYPE, not a path prefix, so a real fs mounted under
+        # /dev, /proc or /sys is still flagged (review j#82888 bypass).
+        self.assertIn("PSEUDO_FSTYPES", program)
 
 
 class ParseOutputTests(unittest.TestCase):
