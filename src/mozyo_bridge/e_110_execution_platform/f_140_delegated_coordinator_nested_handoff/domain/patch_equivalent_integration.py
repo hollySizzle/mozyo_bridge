@@ -79,6 +79,16 @@ _DISPOSITION_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+#: A canonical full commit hash: 40 hex (sha1) or 64 hex (sha256), lowercase. Heads and commit-map
+#: identities MUST be full hashes so the git probe cannot resolve a short SHA / branch name /
+#: symbolic ref to a different object (Redmine #14066 review j#82305 F2). ``git`` emits lowercase
+#: hex, so a mixed-case or abbreviated value is not a value this surface recorded.
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _is_full_sha(value: object) -> bool:
+    return isinstance(value, str) and bool(_FULL_SHA_RE.match(value))
+
 # --- Closed-vocabulary admission reasons -----------------------------------
 PE_OK = "ok"
 PE_ISSUE_MISMATCH = "disposition_issue_mismatch"
@@ -89,6 +99,12 @@ PE_SOURCE_HEAD_STALE = "source_head_stale"
 PE_INTEGRATION_HEAD_STALE = "integration_head_stale"
 PE_EMPTY_MAP = "empty_commit_map"
 PE_COMMIT_MAP_INCOMPLETE = "commit_map_does_not_cover_head"
+#: The commit map is not one-to-one — two source commits map onto the SAME integration commit
+#: (Redmine #14066 review j#82305 F1). A cherry-pick integration produces one distinct
+#: integration commit per source commit, so a reused integration commit means a source commit has
+#: no distinct patch-equivalent twin (its diff was never actually applied on the integration
+#: branch), and the histories are not patch-equivalent even though every pair's patch-id matches.
+PE_INTEGRATION_COMMIT_REUSED = "integration_commit_reused"
 PE_INTEGRATION_COMMIT_UNREACHABLE = "integration_commit_unreachable"
 PE_PATCH_ID_UNRESOLVED = "patch_id_unresolved"
 PE_PATCH_ID_MISMATCH = "patch_id_mismatch"
@@ -180,14 +196,30 @@ def parse_integration_disposition_blocks(notes: str) -> tuple[str, ...]:
     return tuple(match.group("body") for match in _DISPOSITION_BLOCK_RE.finditer(notes))
 
 
+def _reject_duplicate_keys(pairs: list) -> dict:
+    """``object_pairs_hook`` that raises on a duplicate key at ANY object level (review j#82305 F2).
+
+    Python's default ``json.loads`` silently takes the last value for a duplicate key, so a
+    disposition carrying ``{"origin_reachable": false, "origin_reachable": true}`` would read as
+    ``True``. Raising here makes such an ambiguous object malformed instead.
+    """
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON key {key!r} in the disposition object")
+        seen[key] = value
+    return seen
+
+
 def disposition_from_block(body: str) -> Optional[PatchEquivalentDisposition]:
     """Parse ONE raw fenced block body into a disposition, strictly (pure). ``None`` on any fault.
 
-    The body must be a JSON **object**; a non-JSON / non-object body is malformed (``None``). The
-    object is then projected through the strict :func:`disposition_from_mapping`.
+    The body must be a JSON **object** with no duplicate keys at any level (a duplicate key is
+    ambiguous, so it is malformed); a non-JSON / non-object body is malformed too. The object is
+    then projected through the strict :func:`disposition_from_mapping`.
     """
     try:
-        raw = json.loads(body)
+        raw = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except ValueError:
         return None
     if not isinstance(raw, dict):
@@ -198,24 +230,22 @@ def disposition_from_block(body: str) -> Optional[PatchEquivalentDisposition]:
 def disposition_from_mapping(raw: Mapping[str, object]) -> Optional[PatchEquivalentDisposition]:
     """Project a parsed disposition mapping onto :class:`PatchEquivalentDisposition`, strictly (pure).
 
-    Every required field is TYPE-CHECKED, never coerced (Redmine #14066 review j#82301 F2): the six
-    identity / head fields must be non-empty strings; ``origin_reachable`` must be a JSON boolean
-    (so the string ``"false"`` is malformed, NOT a truthy ``True``); ``commit_map`` must be a list
-    of objects whose ``source`` / ``integration`` / ``patch_id`` are strings. Any violation returns
-    ``None`` (a broken durable record is fail-closed). Commit hashes are compared verbatim
-    downstream, so the coordinator must record canonical full hashes.
+    Every required field is TYPE-CHECKED, never coerced (Redmine #14066 review j#82301 F2 / j#82305
+    F2): the four name fields (issue / lane / branch / integration_branch) must be non-empty
+    strings; ``source_head`` / ``integration_head`` and each commit-map ``source`` / ``integration``
+    must be CANONICAL FULL commit hashes (40/64 hex) so the git probe cannot resolve a short SHA /
+    branch name / symbolic ref to a different object; ``origin_reachable`` must be a JSON boolean
+    (so the string ``"false"`` is malformed, NOT a truthy ``True``); each ``patch_id`` must be a
+    non-empty string. Any violation returns ``None`` (a broken durable record is fail-closed).
     """
-    for key in (
-        "issue",
-        "lane",
-        "branch",
-        "integration_branch",
-        "source_head",
-        "integration_head",
-    ):
+    for key in ("issue", "lane", "branch", "integration_branch"):
         value = raw.get(key)
         if not isinstance(value, str) or not value:
             return None
+    # Heads must be canonical full commit hashes (never a short SHA / branch name the git probe
+    # could resolve to a different commit — review j#82305 F2).
+    if not _is_full_sha(raw.get("source_head")) or not _is_full_sha(raw.get("integration_head")):
+        return None
     # A JSON boolean, never a coerced string / int. ``isinstance(True, int)`` holds in Python but
     # ``isinstance("false", bool)`` / ``isinstance(1, bool)`` do not, so this rejects a stringified
     # or numeric flag rather than reading it as truthy.
@@ -231,7 +261,10 @@ def disposition_from_mapping(raw: Mapping[str, object]) -> Optional[PatchEquival
         src = entry.get("source")
         integ = entry.get("integration")
         pid = entry.get("patch_id")
-        if not all(isinstance(field_value, str) for field_value in (src, integ, pid)):
+        # source / integration are full commit hashes; patch_id is a non-empty string.
+        if not _is_full_sha(src) or not _is_full_sha(integ):
+            return None
+        if not isinstance(pid, str) or not pid:
             return None
         mappings.append(
             CommitPatchMapping(source_commit=src, integration_commit=integ, patch_id=pid)
@@ -356,6 +389,20 @@ def evaluate_patch_equivalent_integrated(
             PE_COMMIT_MAP_INCOMPLETE,
             "the disposition commit map lists a source commit more than once; it is ambiguous",
         )
+    # The map must be ONE-TO-ONE (review j#82305 F1): a cherry-pick integration produces one
+    # distinct integration commit per source commit. Two sources mapped onto the SAME integration
+    # commit means a source commit has no distinct patch-equivalent twin — its diff was never
+    # actually applied on the integration branch — so the histories are not patch-equivalent even
+    # though every pair's patch-id matches (e.g. lane `add x; revert x; add x` mapped onto
+    # integration `add x; revert x` by reusing the single `add x` commit).
+    mapped_integrations = [m.integration_commit.strip() for m in disposition.commit_map]
+    if len(mapped_integrations) != len(set(mapped_integrations)):
+        return _refuse(
+            PE_INTEGRATION_COMMIT_REUSED,
+            "the disposition commit map reuses an integration commit for more than one source "
+            "commit; a patch-equivalent cherry-pick is one-to-one, so a reused integration commit "
+            "means a source commit's diff is not distinctly present on the integration branch",
+        )
     unintegrated = frozenset(c.strip() for c in observation.unintegrated_source_commits)
     if mapped_source_set != unintegrated:
         missing = sorted(unintegrated - mapped_source_set)
@@ -423,6 +470,7 @@ __all__ = (
     "PE_INTEGRATION_HEAD_STALE",
     "PE_EMPTY_MAP",
     "PE_COMMIT_MAP_INCOMPLETE",
+    "PE_INTEGRATION_COMMIT_REUSED",
     "PE_INTEGRATION_COMMIT_UNREACHABLE",
     "PE_PATCH_ID_UNRESOLVED",
     "PE_PATCH_ID_MISMATCH",

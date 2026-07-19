@@ -117,6 +117,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PE_INTEGRATION_BRANCH_MISMATCH,
     PE_INTEGRATION_COMMIT_UNREACHABLE,
     PE_INTEGRATION_HEAD_STALE,
+    PE_INTEGRATION_COMMIT_REUSED,
     PE_ISSUE_MISMATCH,
     PE_LANE_MISMATCH,
     PE_OK,
@@ -363,6 +364,23 @@ class PatchEquivalentFenceMatrix(unittest.TestCase):
         )
         self.assertEqual(out.reason, PE_COMMIT_MAP_INCOMPLETE)
 
+    def test_reused_integration_commit_refused(self) -> None:
+        # review j#82305 F1: two sources mapped onto the SAME integration commit is not one-to-one.
+        out = self._eval(
+            self._disposition(
+                commit_map=(
+                    CommitPatchMapping("a" * 40, "A" * 40, "pid_a"),
+                    CommitPatchMapping("b" * 40, "A" * 40, "pid_a"),
+                )
+            ),
+            self._observation(
+                unintegrated_source_commits=frozenset({"a" * 40, "b" * 40}),
+                integration_commit_reachable={"A" * 40: True},
+                patch_ids={"a" * 40: "pid_a", "b" * 40: "pid_a", "A" * 40: "pid_a"},
+            ),
+        )
+        self.assertEqual(out.reason, PE_INTEGRATION_COMMIT_REUSED)
+
     def test_unreachable_integration_commit_refused(self) -> None:
         out = self._eval(
             self._disposition(),
@@ -423,10 +441,10 @@ class IntegrationDispositionBlockTests(unittest.TestCase):
             lane="issue_13879_hibernated_pin_repair",
             branch="issue_13879_hibernated_pin_repair",
             integration_branch=_INTEGRATION_BRANCH,
-            source_head="s" * 40,
-            integration_head="i" * 40,
+            source_head="a" * 40,
+            integration_head="b" * 40,
             origin_reachable=True,
-            commit_map=(CommitPatchMapping("a" * 40, "A" * 40, "pid_a"),),
+            commit_map=(CommitPatchMapping("c" * 40, "d" * 40, "pid_a"),),
         )
 
     def test_render_parse_round_trip(self) -> None:
@@ -466,38 +484,64 @@ class IntegrationDispositionBlockTests(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         self.assertIsNone(disposition_from_block(blocks[0]))
 
+    def _valid_dict(self, **over) -> dict:
+        base = {
+            "issue": "13879",
+            "lane": "issue_13879_hibernated_pin_repair",
+            "branch": "issue_13879_hibernated_pin_repair",
+            "integration_branch": _INTEGRATION_BRANCH,
+            "source_head": "a" * 40,
+            "integration_head": "b" * 40,
+            "origin_reachable": True,
+            "commit_map": [{"source": "c" * 40, "integration": "d" * 40, "patch_id": "p"}],
+        }
+        base.update(over)
+        return base
+
     def test_stringified_origin_reachable_is_not_coerced(self) -> None:
         # review j#82301 F2: JSON string "false" must not read as truthy True — it is malformed.
-        body = json.dumps(
-            {
-                "issue": "13879",
-                "lane": "issue_13879_hibernated_pin_repair",
-                "branch": "issue_13879_hibernated_pin_repair",
-                "integration_branch": _INTEGRATION_BRANCH,
-                "source_head": "s" * 40,
-                "integration_head": "i" * 40,
-                "origin_reachable": "false",
-                "commit_map": [{"source": "a" * 40, "integration": "A" * 40, "patch_id": "p"}],
-            }
+        self.assertIsNone(
+            disposition_from_block(json.dumps(self._valid_dict(origin_reachable="false")))
+        )
+
+    def test_duplicate_json_key_is_malformed(self) -> None:
+        # review j#82305 F2: a duplicate object key is ambiguous (default json takes last-wins),
+        # so `origin_reachable` declared twice must be malformed, not silently the last value.
+        body = (
+            "{\"issue\": \"13879\", \"lane\": \"issue_13879_hibernated_pin_repair\", "
+            "\"branch\": \"issue_13879_hibernated_pin_repair\", \"integration_branch\": "
+            f"\"{_INTEGRATION_BRANCH}\", \"source_head\": \"{'a' * 40}\", \"integration_head\": "
+            f"\"{'b' * 40}\", \"origin_reachable\": false, \"origin_reachable\": true, "
+            f"\"commit_map\": [{{\"source\": \"{'c' * 40}\", \"integration\": \"{'d' * 40}\", "
+            "\"patch_id\": \"p\"}]}"
         )
         self.assertIsNone(disposition_from_block(body))
 
-    def test_missing_or_non_bool_fields_do_not_project(self) -> None:
-        self.assertIsNone(disposition_from_mapping({"issue": "1"}))
-        # origin_reachable missing entirely
+    def test_non_canonical_commit_identity_is_malformed(self) -> None:
+        # review j#82305 F2: short SHAs / branch names must not be accepted as commit identity.
         self.assertIsNone(
-            disposition_from_mapping(
-                {
-                    "issue": "1",
-                    "lane": "l",
-                    "branch": "b",
-                    "integration_branch": "i",
-                    "source_head": "s",
-                    "integration_head": "h",
-                    "commit_map": [],
-                }
+            disposition_from_block(json.dumps(self._valid_dict(integration_head="abc1234")))
+        )
+        self.assertIsNone(
+            disposition_from_block(
+                json.dumps(
+                    self._valid_dict(
+                        commit_map=[
+                            {"source": "c" * 40, "integration": _INTEGRATION_BRANCH, "patch_id": "p"}
+                        ]
+                    )
+                )
             )
         )
+        self.assertIsNone(
+            disposition_from_block(json.dumps(self._valid_dict(source_head="A" * 40)))
+        )  # uppercase is not git's lowercase hex
+
+    def test_missing_or_non_bool_fields_do_not_project(self) -> None:
+        self.assertIsNone(disposition_from_mapping({"issue": "1"}))
+        raw = self._valid_dict()
+        del raw["origin_reachable"]
+        self.assertIsNone(disposition_from_mapping(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -701,10 +745,10 @@ class ReadIntegrationDispositionTests(unittest.TestCase):
             lane=self.LANE,
             branch=self.LANE,
             integration_branch=_INTEGRATION_BRANCH,
-            source_head="s" * 40,
-            integration_head="i" * 40,
+            source_head="a" * 40,
+            integration_head="b" * 40,
             origin_reachable=True,
-            commit_map=(CommitPatchMapping("a" * 40, "A" * 40, "pid_a"),),
+            commit_map=(CommitPatchMapping("c" * 40, "d" * 40, "pid_a"),),
         )
 
     def _note(self, disp=None) -> str:
@@ -891,6 +935,77 @@ class PatchEquivalentResolverTests(unittest.TestCase):
         out = resolve_patch_equivalent_integration(args, s.primary)
         self.assertFalse(out.admissible)
         self.assertEqual(out.reason, PE_PROBE_UNRESOLVED)
+
+    def test_reused_integration_commit_with_nonequivalent_tree_refused(self) -> None:
+        # review j#82305 F1, real git: lane `add x; delete x; add x` vs integration `add x;
+        # delete x`. Mapping source 1 & 3 onto the single integration `add x` commit makes every
+        # pair's patch-id match, but the final trees differ (lane has x, integration does not).
+        # The one-to-one check must refuse it.
+        primary = self.tmp / "reuse"
+        _init_herdr_repo(primary)
+        lane = "issue_13846_reuse"
+        wt = self.tmp / "reuse_wt"
+        _git("worktree", "add", "-b", lane, str(wt), "main", cwd=primary)
+        for msg, write in (
+            ("add x", True),
+            ("delete x", False),
+            ("add x again", True),
+        ):
+            if write:
+                (wt / "x.txt").write_text("content X\n", encoding="utf-8")
+            else:
+                (wt / "x.txt").unlink()
+            _git("add", "-A", cwd=wt)
+            _git("commit", "-m", msg, cwd=wt)
+        c1, c2, c3 = (
+            _rev_parse(wt, f"{lane}~2"),
+            _rev_parse(wt, f"{lane}~1"),
+            _rev_parse(wt, lane),
+        )
+        _git("branch", _INTEGRATION_BRANCH, "main", cwd=primary)
+        _git("checkout", _INTEGRATION_BRANCH, cwd=primary)
+        (primary / "sb.txt").write_text("sb\n", encoding="utf-8")
+        _git("add", "-A", cwd=primary)
+        _git("commit", "-m", "staging base", cwd=primary)
+        _git("cherry-pick", c1, cwd=primary)
+        i1 = _rev_parse(primary, "HEAD")
+        _git("cherry-pick", c2, cwd=primary)
+        i2 = _rev_parse(primary, "HEAD")
+        _git("checkout", "main", cwd=primary)
+        # The trees really are non-equivalent (the exploit's whole point).
+        self.assertEqual(_git("ls-tree", lane, "x.txt", cwd=wt, capture=True).stdout.strip() != "", True)
+        self.assertEqual(
+            _git("ls-tree", _INTEGRATION_BRANCH, "x.txt", cwd=primary, capture=True).stdout.strip(),
+            "",
+        )
+        disp = PatchEquivalentDisposition(
+            issue="13846",
+            lane=lane,
+            branch=lane,
+            integration_branch=_INTEGRATION_BRANCH,
+            source_head=_rev_parse(wt, lane),
+            integration_head=_rev_parse(primary, _INTEGRATION_BRANCH),
+            origin_reachable=True,
+            commit_map=(
+                CommitPatchMapping(c1, i1, _patch_id(primary, c1)),
+                CommitPatchMapping(c2, i2, _patch_id(primary, c2)),
+                CommitPatchMapping(c3, i1, _patch_id(primary, c3)),  # reuse i1
+            ),
+        )
+        _install_fake_journal(
+            self, [_entry(_INTEGRATION_JOURNAL, render_integration_disposition_block(disp), "13846")]
+        )
+        args = argparse.Namespace(
+            repo=str(primary),
+            issue="13846",
+            lane_label=lane,
+            branch=lane,
+            integration_branch=_INTEGRATION_BRANCH,
+            integration_journal=_INTEGRATION_JOURNAL,
+        )
+        out = resolve_patch_equivalent_integration(args, primary)
+        self.assertFalse(out.admissible)
+        self.assertEqual(out.reason, PE_INTEGRATION_COMMIT_REUSED)
 
     def test_probe_observation_recomputes_matching_patch_ids(self) -> None:
         s = self._scenario()
