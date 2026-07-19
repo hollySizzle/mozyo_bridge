@@ -320,12 +320,17 @@ class ComposerRenderView:
     backend_selected: bool
     target: str = ""
     observation: Optional[PaneRenderObservation] = None
+    #: The authority-resolved provider id (the managed row's identity role, e.g.
+    #: ``claude`` / ``codex``) for ``target``, or ``""`` when the target did not
+    #: authority-resolve. A provider id is an identity token, never pane body.
+    provider: str = ""
 
     def to_record(self) -> dict:
         """A JSON-serializable, fully-redacted dict (the diagnostic ``--json`` shape)."""
         return {
             "backend_selected": self.backend_selected,
             "target": self.target,
+            "provider": self.provider,
             "observation": (
                 self.observation.to_record() if self.observation is not None else None
             ),
@@ -391,12 +396,14 @@ def read_composer_render(
     # the transport is never touched.
     if inventory is None:
         inventory = read_herdr_inventory(repo_root, env=source_env)
-    if _resolve_authority_target(inventory, target) is None:
+    resolved = _resolve_authority_target(inventory, target)
+    if resolved is None:
         return ComposerRenderView(
             backend_selected=True,
             target=target,
             observation=PaneRenderObservation.failed(RENDER_REASON_UNKNOWN_PROVIDER),
         )
+    provider = resolved.role
     if transport is None:
         try:
             from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
@@ -408,17 +415,19 @@ def read_composer_render(
             return ComposerRenderView(
                 backend_selected=True,
                 target=target,
+                provider=provider,
                 observation=PaneRenderObservation.failed(RENDER_REASON_UNREADABLE),
             )
     if transport is None:  # defensive: herdr_enabled implies non-None
         return ComposerRenderView(
             backend_selected=True,
             target=target,
+            provider=provider,
             observation=PaneRenderObservation.failed(RENDER_REASON_UNREADABLE),
         )
     observation = transport.read_pane_render(target)
     return ComposerRenderView(
-        backend_selected=True, target=target, observation=observation
+        backend_selected=True, target=target, provider=provider, observation=observation
     )
 
 

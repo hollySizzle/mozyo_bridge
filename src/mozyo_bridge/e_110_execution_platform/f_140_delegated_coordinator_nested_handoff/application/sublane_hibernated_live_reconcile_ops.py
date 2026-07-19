@@ -14,7 +14,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_ghost_composer_gate import (  # noqa: E501
+    GhostComposerRenderPolicy,
+    RenderGhostFacts,
+)
 
 
 @dataclass
@@ -29,6 +34,12 @@ class LiveReconcileOps:
 
     repo_root: Path
     env: Optional[Mapping[str, str]] = None
+    #: Redmine #14065 Phase 2: injected ghost-composer render policy. ``None`` (default)
+    #: keeps the render gate OFF — a text pending composer is preserved exactly as before
+    #: — so this rail is byte-unchanged unless a caller opts in.
+    ghost_policy: Optional[GhostComposerRenderPolicy] = None
+    #: Optional facts reader for hermetic tests; ``None`` uses the authority-resolved read.
+    render_facts_reader: Optional[Callable[[str], RenderGhostFacts]] = None
 
     def _environ(self) -> Mapping[str, str]:
         return self.env if self.env is not None else os.environ
@@ -83,7 +94,21 @@ class LiveReconcileOps:
             if not read.ok:
                 return (False, None)
             observation = observe_composer_text(read.content)
-            return (observation.readable, observation.has_pending)
+            # Redmine #14065 Phase 2: a dim ghost the provider declares empties the text
+            # candidate at action time; everything else preserves (see apply_ghost_empty).
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
+                apply_ghost_empty,
+            )
+
+            has_pending = apply_ghost_empty(
+                observation.has_pending,
+                policy=self.ghost_policy,
+                repo_root=self.repo_root,
+                env=self._environ(),
+                locator=locator,
+                facts_reader=self.render_facts_reader,
+            )
+            return (observation.readable, has_pending)
         except Exception:  # noqa: BLE001 - a failed composer read is fail-soft to unreadable
             return (False, None)
 

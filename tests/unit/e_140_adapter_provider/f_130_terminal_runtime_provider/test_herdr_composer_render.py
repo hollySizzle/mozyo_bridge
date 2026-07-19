@@ -324,7 +324,9 @@ class FakeRenderTransport:
 _SEG = "8d7b664ffb6f4cb3bda7f20e3406a7af"
 
 
-def _managed_inventory(target: str, *, locator: str = "w1:p2") -> HerdrInventoryView:
+def _managed_inventory(
+    target: str, *, locator: str = "w1:p2", role: str = "claude"
+) -> HerdrInventoryView:
     """An inventory whose managed row (in this repo's segment) resolves ``target``."""
     return HerdrInventoryView(
         backend_selected=True,
@@ -332,7 +334,11 @@ def _managed_inventory(target: str, *, locator: str = "w1:p2") -> HerdrInventory
         workspace_segment=_SEG,
         agents=(
             HerdrObservedAgent(
-                name=target, managed=True, workspace_id=_SEG, locator=locator
+                name=target,
+                managed=True,
+                workspace_id=_SEG,
+                role=role,
+                locator=locator,
             ),
         ),
     )
@@ -454,6 +460,23 @@ class ReadComposerRenderModelTest(unittest.TestCase):
         self.assertTrue(view.backend_selected)
         self.assertEqual([], transport.targets)  # never reached the transport
         self.assertEqual(RENDER_REASON_INVALID_TARGET, view.observation.reason)
+
+    def test_view_carries_authority_resolved_provider(self) -> None:
+        # Redmine #14065 Phase 2: the view exposes the managed row's provider (its
+        # identity role) so the e110 ghost gate can apply the per-provider policy.
+        transport = FakeRenderTransport(
+            PaneRenderObservation.classified(STYLE_PROVENANCE_DIM)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            view = read_composer_render(
+                _herdr_repo(tmp),
+                "poc_claude",
+                env={},
+                transport=transport,
+                inventory=_managed_inventory("poc_claude", role="claude"),
+            )
+        self.assertEqual("claude", view.provider)
+        self.assertEqual("claude", view.to_record()["provider"])
 
     def test_view_record_is_fully_redacted(self) -> None:
         transport = FakeRenderTransport(

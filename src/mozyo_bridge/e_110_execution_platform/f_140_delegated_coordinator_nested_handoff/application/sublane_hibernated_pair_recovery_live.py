@@ -130,8 +130,19 @@ class LiveHibernatedPairRecoveryOps:
         return list_herdr_agent_rows(self.env)
 
     def _quarantine(self) -> LiveSublaneQuarantineOps:
+        # Redmine #14065 Phase 2: inject the dim-ghost render policy so the converge /
+        # recover slot-recovery decision (and its action-time re-observation) empties a
+        # provider ghost idle placeholder while preserving real unsent input.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
+            default_ghost_policy,
+        )
+
         return LiveSublaneQuarantineOps(
-            repo_root=self.repo_root, env=self.env, runner=self.runner, timeout=self.timeout,
+            repo_root=self.repo_root,
+            env=self.env,
+            runner=self.runner,
+            timeout=self.timeout,
+            ghost_policy=default_ghost_policy(),
         )
 
     def _quarantine_request(self, *, role: str, assigned_name: str, locator: str, action_id: str) -> QuarantineRequest:

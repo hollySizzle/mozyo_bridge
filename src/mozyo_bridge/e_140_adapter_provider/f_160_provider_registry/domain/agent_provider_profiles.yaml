@@ -31,14 +31,17 @@
 # code; declaring an unknown `protocol` here fails closed rather than mis-driving
 # the pane.
 
-# schema version "2" adds the optional `startup_blockers` block (#13760). "1" (the
-# #13441 shape) still loads — the field is optional and backward-compatible — but an
-# unknown version fails closed (`SUPPORTED_SCHEMA_VERSIONS`, #13760 review j#78481 F2).
-version: "2"
+# schema version "3" adds the optional `ghost_composer_signals` block (#14065 Phase 2):
+# the render style_provenance value(s) that identify a provider's ghost idle composer
+# (live-admitted set: `dim`, j#82180). "2" added `startup_blockers` (#13760); "1" is the
+# #13441 shape. Older shapes still load (each new field is optional and version-gated),
+# but an unknown version fails closed (`SUPPORTED_SCHEMA_VERSIONS`).
+version: "3"
 source: >-
   Redmine #13441 journal #76725 (Coordinator Design Answer, Increment 1);
   startup_blockers added by #13760 journal #77947 (Design Answer) with the schema
-  hardened per #13760 journal #78481 (Review Result).
+  hardened per #13760 journal #78481 (Review Result); ghost_composer_signals added by
+  #14065 Phase 2 (live admission j#82180, dim-only).
 
 profiles:
   claude:
@@ -102,6 +105,16 @@ profiles:
         all_of:
           - "Select login method"
           - "Claude account with subscription"
+    # Ghost idle-composer render signal (#14065 Phase 2, live admission j#82180). A fresh
+    # managed Claude worker's idle composer renders a provider placeholder (a ghost hint)
+    # that is byte-identical, as text, to real unsent input — so the text-only observer
+    # (#14064) could not tell them apart and preserved the pending composer, blocking the
+    # #13846 drain. The render style DOES separate them: the ghost placeholder renders
+    # `dim`, real typed input renders `normal`. Observed `dim` 3/3 across 3 repetitions on
+    # the held ghost pair (j#82180), separated from the exact-same-text `normal` input.
+    # Only `dim` may empty a pending composer; normal / mixed / unknown always preserve.
+    ghost_composer_signals:
+      - dim
 
   codex:
     protocol: interactive_cli_tui
@@ -119,6 +132,12 @@ profiles:
       # identity is re-expressed as `-c` overrides at launch (#13614).
       - tool_shell_env_overrides
     managed_flags: {}
+    # Ghost idle-composer render signal (#14065 Phase 2, live admission j#82180). A held
+    # Codex ghost gateway rendered `dim` 3/3 on the #14064 held ghost pair, matching the
+    # cross-provider result, so Codex declares the same admitted signal. (Note: a Codex
+    # gateway carrying REAL content renders `normal` — that is real input, never emptied.)
+    ghost_composer_signals:
+      - dim
     # No `startup_blockers`: the #13760 pre-send admission gate is provider-neutral and
     # reads this data, so an absent list means "no startup screen is DECLARED for this
     # provider" — every send is admitted exactly as before. That is a statement about the
