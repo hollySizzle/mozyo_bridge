@@ -706,9 +706,15 @@ class HerdrSublaneActuatorOps:
                         )
                         used_v1_binding = True
             except V1ReplacementBindingFailure as exc:
+                # Project the nested unhealthy launch into the locator-free startup observation
+                # HERE (raw result never leaves this catch site); surfaces the pointer (#13948 R3).
+                startup = (
+                    project_sublane_startup(exc.startup_result)
+                    if exc.startup_result is not None else None
+                )
                 raise SublaneHealError(
                     f"lane heal fenced ({exc.reason}): {exc.detail}",
-                    reason=exc.reason,
+                    reason=exc.reason, startup=startup,
                 ) from exc
             except AttestationStoreLockBusy as exc:
                 raise SublaneHealError(

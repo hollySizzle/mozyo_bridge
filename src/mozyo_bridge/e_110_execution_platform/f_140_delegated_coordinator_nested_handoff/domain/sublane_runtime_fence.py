@@ -37,11 +37,16 @@ from a runtime whose source and installed fingerprints agree — Redmine #13524)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     _norm,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - type hint only; avoids any import cycle
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+        SublaneStartupObservation,
+    )
 
 #: The placement-contract capability token a runtime advertises when it ships the
 #: Redmine #13411 lane=tab same-tab pair placement + heal contract (the surviving
@@ -205,11 +210,25 @@ class SublaneHealError(RuntimeError):
     It additionally carries a stable, credential/path-free ``reason`` token so a
     single-participant convergence launch surfaces WHY the launcher fenced in its public
     outcome instead of a bare ``effect_failed / launch`` (Redmine #13933 R11 j#81429 #2).
+
+    ``startup`` is the locator-free :class:`SublaneStartupObservation` projected from a
+    nested unhealthy replacement launch (Redmine #13948 R3): the SAME startup action id,
+    per-role health, and rollback debt, so the public prepare-bound-pair outcome can point
+    the operator at ``herdr session-rollback --action-id <id>`` for the exact action that
+    did not come up. It is ``None`` for a heal fence that has no nested startup result
+    (preflight / postcondition / non-v1 launch), which never owes a replacement rollback.
     """
 
-    def __init__(self, message: str, *, reason: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        startup: "SublaneStartupObservation | None" = None,
+    ):
         super().__init__(message)
         self.reason = reason
+        self.startup = startup
 
 
 def enforce_heal_postcondition(

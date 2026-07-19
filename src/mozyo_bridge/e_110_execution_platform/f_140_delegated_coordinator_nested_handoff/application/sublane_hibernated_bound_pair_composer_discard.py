@@ -47,6 +47,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SLOT_PRESERVE_PENDING,
     SLOT_RECOVER,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    SublaneStartupObservation,
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,10 @@ class PreparationDrive:
     ok: bool
     status: str
     detail: str = ""
+    #: The locator-free startup observation of a nested unhealthy replacement launch
+    #: (Redmine #13948 R3): typed action id / per-role health / rollback debt for the SAME
+    #: startup action, so the blocked outcome can point at its explicit public rollback.
+    startup: SublaneStartupObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -104,13 +111,37 @@ class PreparationOutcome:
     resuming: bool = False
     #: Why the preflight did or did not adopt this pair's in-flight action (#13933 j#81046).
     resume_diagnostic: str = ""
+    #: The locator-free startup observation of a nested unhealthy replacement launch
+    #: (Redmine #13948 R3). Non-``None`` only on a ``replacement_binding_launch_unhealthy``
+    #: block; it never carries a locator, pane content, or secret — only fixed health
+    #: tokens and the SAME startup action id.
+    startup: SublaneStartupObservation | None = None
 
     @property
     def is_blocked(self) -> bool:
         return self.state == STATE_BLOCKED
 
+    @property
+    def rollback_pointer(self) -> str | None:
+        """The single public rollback command for the nested startup action, or ``None``.
+
+        Mirrors the embedded-startup gate (Redmine #13948 R2
+        :func:`...sublane_actuator_gates.startup_health_admission`): a pointer is offered
+        only when the SAME action owns a fresh participant that owes rollback and its typed
+        action id is known. It NEVER carries ``--execute`` — a launch closes nothing; the
+        operator discharges the debt explicitly (Answer j#80991). Adopted / foreign / newer
+        / productive slots never owe a rollback, so this stays ``None`` for them (item 4).
+        """
+        startup = self.startup
+        if startup is not None and startup.rollback_owed and startup.action_id:
+            return (
+                "mozyo-bridge herdr session-rollback "
+                f"--action-id {startup.action_id}"
+            )
+        return None
+
     def as_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "issue": self.request.issue,
             "journal": self.request.journal,
             "lane": self.request.lane,
@@ -132,6 +163,12 @@ class PreparationOutcome:
             "resumed": False,
             "sent": False,
         }
+        # Additive keys only when a nested startup failure was observed, so the historical
+        # payload stays byte-identical for every other outcome (Redmine #13948 R3).
+        if self.startup is not None:
+            payload["startup"] = self.startup.as_payload()
+            payload["rollback_pointer"] = self.rollback_pointer
+        return payload
 
 
 @runtime_checkable
@@ -159,6 +196,7 @@ def _blocked(
     executed: bool = False,
     replacement_status: str = "",
     resume_diagnostic: str = "",
+    startup: SublaneStartupObservation | None = None,
 ) -> PreparationOutcome:
     return PreparationOutcome(
         request=request,
@@ -171,6 +209,7 @@ def _blocked(
         executed=executed,
         replacement_status=replacement_status,
         resume_diagnostic=resume_diagnostic,
+        startup=startup,
     )
 
 
@@ -379,6 +418,10 @@ def run_bound_pair_preparation(
             request, reason, detail=drive.detail, action_id=approved.action_id,
             slots=initial.slots, discard_roles=approved.discard_roles, executed=True,
             replacement_status=drive.status,
+            # Carry the nested startup action's typed health + rollback pointer outward
+            # losslessly, so a `replacement_binding_launch_unhealthy` stop is actionable
+            # instead of a generic detail string (Redmine #13948 R3).
+            startup=drive.startup,
         )
     return PreparationOutcome(
         request=request,
@@ -407,6 +450,17 @@ def format_preparation_text(outcome: PreparationOutcome) -> str:
         lines.append(f"  approval_marker: {outcome.approval_marker}")
     if outcome.discard_roles:
         lines.append(f"  discard_roles: {roles_token(outcome.discard_roles)}")
+    # A nested unhealthy replacement launch surfaces the SAME startup action's per-role
+    # health and its single explicit rollback pointer (Redmine #13948 R3). The pointer is
+    # read-only guidance: it never carries `--execute`; the operator discharges the debt.
+    if outcome.startup is not None:
+        lines.append(f"  startup_action_id: {outcome.startup.action_id or '-'}")
+        lines.append(f"  startup_health: {outcome.startup.health_summary()}")
+        lines.append(
+            f"  startup_rollback_owed: {str(outcome.startup.rollback_owed).lower()}"
+        )
+    if outcome.rollback_pointer:
+        lines.append(f"  rollback_pointer: {outcome.rollback_pointer}")
     return "\n".join(lines)
 
 

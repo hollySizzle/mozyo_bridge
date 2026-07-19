@@ -990,6 +990,7 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
                 False,
                 result.status,
                 _launch_detail(result, port),
+                startup=getattr(port, "launch_startup_health", None),  # #13948 R3
             )
         if not self._finish(key, expectation, holder, port):
             return PreparationDrive(False, "completion_stopped", "transaction completion CAS stopped")
