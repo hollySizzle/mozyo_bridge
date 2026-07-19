@@ -109,16 +109,34 @@ V1_BINDING_STARTUP_ROLLBACK_REQUIRED = "action_owned_startup_rollback_required"
 
 
 class V1ReplacementBindingFailure(RuntimeError):
-    """A stable fail-closed reason from the v1 replacement binding adapter."""
+    """A stable fail-closed reason from the v1 replacement binding adapter.
 
-    def __init__(self, reason: str, detail: str):
+    ``startup_result`` carries the nested :class:`SessionStartResult` of an *unhealthy fresh
+    launch* so the execution-platform caller can project a locator-free startup observation
+    (typed action id / per-role health / rollback debt) and surface the explicit public
+    rollback pointer, without this adapter layer ever importing the execution platform
+    (Redmine #13948 R3). It is populated only for :data:`V1_BINDING_LAUNCH_UNHEALTHY`; the
+    raw result never leaves this process un-projected — the sole caller
+    (:meth:`HerdrSublaneActuatorOps.heal_lane_column`) projects it at the catch site.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        detail: str,
+        *,
+        startup_result: "SessionStartResult | None" = None,
+    ):
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
+        self.startup_result = startup_result
 
 
-def _stop(reason: str, detail: str) -> None:
-    raise V1ReplacementBindingFailure(reason, detail)
+def _stop(
+    reason: str, detail: str, *, startup_result: "SessionStartResult | None" = None
+) -> None:
+    raise V1ReplacementBindingFailure(reason, detail, startup_result=startup_result)
 
 
 def _binding_identity_matches(
@@ -458,10 +476,15 @@ def launch_or_resume_v1_replacement(
     # non-green dragged the aggregate false and stalled a healthy fresh target's bind. The
     # target's health is what this bind is responsible for: target non-green / missing
     # receipt / name collision / foreign all still fail closed below and in the receipt bind.
+    # The stop carries the nested result so the caller can project the typed action id /
+    # per-role health / rollback debt and surface the explicit public rollback pointer for
+    # the SAME startup action (Redmine #13948 R3): ``result.action_id`` is exactly the
+    # startup-transaction id ``herdr session-rollback --action-id`` acts under.
     if not launched[0].healthy:
         _stop(
             V1_BINDING_LAUNCH_UNHEALTHY,
             "the fresh replacement participant did not reach bounded startup health",
+            startup_result=result,
         )
     _bind_startup_receipt(
         home=home,

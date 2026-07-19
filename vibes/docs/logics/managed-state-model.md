@@ -790,6 +790,15 @@ Table naming:
         `startup_health_unconfirmed` として post-append inventory read-back / pair attestation / readiness / dispatch の前で
         zero-send にし、同 action の public rollback command を pointer として示すだけで auto rollback / auto close しない。
         `None` は startup result を持たない legacy non-Herdr adapter の互換値に限り、Herdr 成功の代用にしない。
+        **nested caller** (`sublane prepare-bound-pair --execute` の #13933 v1 replacement-binding 収束、#13948 R3) も同契約に従う:
+        fresh replacement participant が bounded startup health に達しないと v1 adapter は `replacement_binding_launch_unhealthy` で
+        fail-closed し、その **inner `SessionStartResult`** を catch site (`heal_lane_column`) で locator-free な startup observation
+        (同一 startup `action_id` / role health / rollback debt) へ projection して outer の public `prepare-bound-pair` outcome まで
+        **losslessly** 伝播する。outcome は同 action の pointer `mozyo-bridge herdr session-rollback --action-id <id>` (`--execute` なし)
+        を示すだけで auto rollback / auto close しない。raw locator / launch detail / secret は outer へ出さない。public rollback 完了後、
+        同 replacement action binding は rolled-back reservation を正に認識し、次の explicit replay で fresh pair launch へ収束する
+        (rolled-back でない replay は startup debt で fail-closed のまま)。rollback debt は **fresh_launched participant** に限り、
+        adopted / surfaced sibling は zero-close (pointer も出さない)。
         adopted / foreign / newer / identity drift / duplicate / obligation-present / busy / unreadable は zero-close。
         composer は 3 値を保つ: 捨てられるのは **transaction 自身が生んだ startup UI** (認識済み provider startup blocker で、
         誰も打鍵していないもの) だけで、LLM / operator が投入した composer body は **owner approval の有無に関わらず preserve**

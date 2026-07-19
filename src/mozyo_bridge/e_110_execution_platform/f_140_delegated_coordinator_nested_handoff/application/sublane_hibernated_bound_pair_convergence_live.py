@@ -328,14 +328,21 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
             ).heal_lane_column(self.request.worktree, target_provider=norm(pin.provider))
         except SublaneHealError as exc:
             self.launch_failure_reason = norm(exc.reason) or "launch_error"
+            # A nested unhealthy replacement launch carries the locator-free startup
+            # observation of the SAME startup action; stash it so the public outcome can
+            # surface its typed health + explicit rollback pointer (Redmine #13948 R3).
+            self.launch_startup_health = exc.startup
             return LAUNCH_ERROR
         except SublaneLauncherIncompatibleError as exc:
             self.launch_failure_reason = norm(exc.reason) or "launcher_incompatible"
+            self.launch_startup_health = None
             return LAUNCH_ERROR
         except Exception:  # noqa: BLE001 - any other relaunch failure is a fixed launch error
             self.launch_failure_reason = "launch_error"
+            self.launch_startup_health = None
             return LAUNCH_ERROR
         self.launch_failure_reason = ""
+        self.launch_startup_health = None
         return LAUNCH_DONE
 
     def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
