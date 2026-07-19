@@ -12,13 +12,16 @@ hibernated / released lane can never reach the terminal ``retired`` disposition
 (``head_not_integrated``). The live residual: #13846 (two rows) and #13879 (one row).
 
 This pure domain supplies the action-time fence the application layer consults. It never runs
-git, never reads a file, and never guesses: the application layer reads the coordinator's
-durable integration disposition (the exact Redmine journal's structured block, captured to a
-JSON observation) into :class:`PatchEquivalentDisposition`, **recomputes** the real git facts
-(the current branch / integration heads, the unintegrated commit set, per-commit stable
-patch-ids, origin reachability) into :class:`PatchEquivalentObservation`, and asks
-:func:`evaluate_patch_equivalent_integrated` whether the two agree. The verdict is
-``admissible`` only when every axis holds, each with a closed-vocabulary reason on refusal.
+git, never reads a file or the network, and never guesses: the application layer reads the
+coordinator's durable integration disposition **from the exact Redmine journal note**
+(credential-gated live fetch — :func:`parse_integration_disposition_blocks` extracts the
+structured block, :func:`disposition_from_mapping` projects it) into
+:class:`PatchEquivalentDisposition`, **recomputes** the real git facts (the current branch /
+integration heads, the unintegrated commit set, per-commit stable patch-ids, origin
+reachability against the canonical ``origin/<integration_branch>`` ref) into
+:class:`PatchEquivalentObservation`, and asks :func:`evaluate_patch_equivalent_integrated`
+whether the two agree. The verdict is ``admissible`` only when every axis holds, each with a
+closed-vocabulary reason on refusal.
 
 The bar is **positive, recomputed proof of patch-equivalence, never a coordinator assertion**.
 The disposition's role is to (a) name which integration branch / head the coordinator
@@ -45,8 +48,10 @@ then cross-checked against a value the application layer measured from real git:
   the integration commit must be non-empty, equal to each other, and equal to the disposition's
   recorded patch-id (a coordinator record that disagrees with the recomputed diff is refused:
   :data:`PE_PATCH_ID_UNRESOLVED` / :data:`PE_PATCH_ID_MISMATCH`);
-- **origin reachability** — the integration head must be observed reachable from the recorded
-  origin integration ref, and the disposition must assert it (:data:`PE_ORIGIN_UNREACHABLE`).
+- **origin reachability** — the integration head must be observed reachable from the canonical
+  ``origin/<integration_branch>`` remote ref (derived by the application layer, never named by
+  the disposition, so a caller cannot substitute a local ref), and the disposition must assert
+  it (:data:`PE_ORIGIN_UNREACHABLE`).
 
 Missing / ambiguous / stale / mismatched evidence, an unreadable disposition, or a git probe
 that could not answer all resolve to a refusal (the application layer maps an unreadable /
@@ -57,8 +62,22 @@ Boundary (Redmine #14066): pure. No IO, no subprocess, no file read. Synthetic u
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
+
+#: The fenced-code info string the coordinator's integration journal note carries the structured
+#: ``patch_equivalent`` disposition under. The note is authored on Redmine and read back at
+#: action-time by the credential-gated live journal source (never a caller-supplied local file),
+#: so the JSON inside this fence is the durable authority. One journal note carries at most one
+#: such block; more than one is ``ambiguous`` and fails closed upstream.
+INTEGRATION_DISPOSITION_FENCE = "mozyo-patch-equivalent-integration"
+
+_DISPOSITION_BLOCK_RE = re.compile(
+    r"```" + re.escape(INTEGRATION_DISPOSITION_FENCE) + r"[ \t]*\r?\n(?P<body>.*?)```",
+    re.DOTALL,
+)
 
 # --- Closed-vocabulary admission reasons -----------------------------------
 PE_OK = "ok"
@@ -96,13 +115,16 @@ class CommitPatchMapping:
 class PatchEquivalentDisposition:
     """The coordinator's structured ``patch_equivalent`` integration disposition (claimed).
 
-    Read by the application layer from the exact Redmine integration journal (captured to a
-    durable JSON observation). Every field is a CLAIM the fence cross-checks against a value
-    recomputed from real git; nothing here is trusted on its own.
+    Read by the application layer from the EXACT Redmine integration journal note (the
+    credential-gated action-time fresh read — never a caller-supplied local file). Every field
+    is a CLAIM the fence cross-checks against a value recomputed from real git; nothing here is
+    trusted on its own.
 
-    ``origin_ref`` is the remote-tracking ref the integration head is claimed reachable from
-    (e.g. ``origin/int_13472_session_continuity``); ``origin_reachable`` is the coordinator's
-    assertion, which the fence requires AND independently re-observes.
+    ``origin_reachable`` is the coordinator's assertion that the integration head reached the
+    canonical remote integration branch. The fence requires it AND the application layer
+    independently re-observes reachability against the derived ``origin/<integration_branch>``
+    ref — the disposition never names the ref, so a caller cannot substitute an arbitrary local
+    ref (Redmine #14066 review j#82298 F1).
     """
 
     issue: str
@@ -111,10 +133,92 @@ class PatchEquivalentDisposition:
     integration_branch: str
     source_head: str
     integration_head: str
-    origin_ref: str
     origin_reachable: bool
     commit_map: tuple[CommitPatchMapping, ...] = ()
-    journal_id: str = ""
+
+
+def render_integration_disposition_block(disposition: PatchEquivalentDisposition) -> str:
+    """Render the canonical fenced disposition block a coordinator embeds in the journal note.
+
+    The producer inverse of :func:`parse_integration_disposition_blocks`: the coordinator posts
+    the returned fenced block inside the durable Redmine integration journal, and the action-time
+    retire reads it back as authority. Pure; round-trips through the parser to the same mapping.
+    """
+    payload = {
+        "issue": disposition.issue,
+        "lane": disposition.lane,
+        "branch": disposition.branch,
+        "integration_branch": disposition.integration_branch,
+        "source_head": disposition.source_head,
+        "integration_head": disposition.integration_head,
+        "origin_reachable": disposition.origin_reachable,
+        "commit_map": [
+            {
+                "source": m.source_commit,
+                "integration": m.integration_commit,
+                "patch_id": m.patch_id,
+            }
+            for m in disposition.commit_map
+        ],
+    }
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+    return f"```{INTEGRATION_DISPOSITION_FENCE}\n{body}\n```"
+
+
+def parse_integration_disposition_blocks(notes: str) -> tuple[dict, ...]:
+    """Every JSON object parsed from a fenced disposition block in ``notes`` (pure, in order).
+
+    Scans for ```` ```mozyo-patch-equivalent-integration ```` fenced blocks and returns each
+    parsed JSON object. A block whose body is not a JSON object is skipped (a malformed block is
+    not a valid disposition); the count the caller sees therefore reflects only well-formed
+    blocks, so ``0`` means "no disposition present" and ``>=2`` means "ambiguous" — both
+    fail-closed conditions the application layer maps to zero-write. Prose is never inspected.
+    """
+    if not notes:
+        return ()
+    found: list[dict] = []
+    for match in _DISPOSITION_BLOCK_RE.finditer(notes):
+        raw = match.group("body")
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            found.append(obj)
+    return tuple(found)
+
+
+def disposition_from_mapping(raw: Mapping[str, object]) -> Optional[PatchEquivalentDisposition]:
+    """Project a parsed disposition mapping onto :class:`PatchEquivalentDisposition` (pure).
+
+    ``None`` when ``commit_map`` is absent / not a list / an entry is malformed (a broken durable
+    record is fail-closed, never coerced). Commit hashes are compared verbatim downstream, so the
+    coordinator must record canonical full hashes.
+    """
+    entries = raw.get("commit_map")
+    if not isinstance(entries, list):
+        return None
+    mappings: list[CommitPatchMapping] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            return None
+        mappings.append(
+            CommitPatchMapping(
+                source_commit=str(entry.get("source", "")),
+                integration_commit=str(entry.get("integration", "")),
+                patch_id=str(entry.get("patch_id", "")),
+            )
+        )
+    return PatchEquivalentDisposition(
+        issue=str(raw.get("issue", "")),
+        lane=str(raw.get("lane", "")),
+        branch=str(raw.get("branch", "")),
+        integration_branch=str(raw.get("integration_branch", "")),
+        source_head=str(raw.get("source_head", "")),
+        integration_head=str(raw.get("integration_head", "")),
+        origin_reachable=bool(raw.get("origin_reachable", False)),
+        commit_map=tuple(mappings),
+    )
 
 
 @dataclass(frozen=True)
@@ -268,10 +372,11 @@ def evaluate_patch_equivalent_integrated(
     if not disposition.origin_reachable or not observation.integration_head_origin_reachable:
         return _refuse(
             PE_ORIGIN_UNREACHABLE,
-            "the integration head is not durably reachable from the recorded origin ref "
-            f"({disposition.origin_ref!r}; disposition asserts={disposition.origin_reachable}, "
-            f"observed={observation.integration_head_origin_reachable}); a terminal retire "
-            "requires an origin-reachable integration",
+            "the integration head is not durably reachable from the canonical remote "
+            f"origin/{disposition.integration_branch} ref (disposition asserts="
+            f"{disposition.origin_reachable}, observed="
+            f"{observation.integration_head_origin_reachable}); a terminal retire requires an "
+            "origin-reachable integration",
         )
     return AdmissionResult(
         True,
@@ -295,9 +400,13 @@ __all__ = (
     "PE_PATCH_ID_UNRESOLVED",
     "PE_PATCH_ID_MISMATCH",
     "PE_ORIGIN_UNREACHABLE",
+    "INTEGRATION_DISPOSITION_FENCE",
     "CommitPatchMapping",
     "PatchEquivalentDisposition",
     "PatchEquivalentObservation",
     "AdmissionResult",
+    "render_integration_disposition_block",
+    "parse_integration_disposition_blocks",
+    "disposition_from_mapping",
     "evaluate_patch_equivalent_integrated",
 )

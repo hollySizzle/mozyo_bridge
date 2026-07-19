@@ -1,58 +1,81 @@
 """Action-time resolver for a ``patch_equivalent`` integration disposition (Redmine #14066).
 
-The application half of the #14066 fence: it reads the coordinator's durable integration
-disposition (the exact Redmine integration journal's structured ``patch_equivalent`` block,
-captured to a JSON observation — the same "coordinator-produced durable observation, MEASURED at
-action-time" shape the #13518 ``--review-generation-json`` review fence already uses),
-**recomputes** the real git facts (current branch / integration heads, the unintegrated-by-hash
-commit set, per-commit stable patch-ids, integration-commit reachability, origin reachability),
-and consults the pure :func:`...patch_equivalent_integration.evaluate_patch_equivalent_integrated`
-fence. It returns a fail-closed :class:`PatchEquivalentResolution` the #13845 bound terminal
-retire consults ONLY when the literal-ancestor probe already reported the head un-integrated —
-so the literal path stays byte-identical and this never widens it, only adds the cherry-picked
-alternative.
+The application half of the #14066 fence. The AUTHORITY is the exact Redmine integration
+journal, read fresh at action-time through the credential-gated
+:class:`...live_redmine_journal_source.LiveRedmineJournalSource` (Redmine #14066 review j#82298
+F1): a caller-supplied local file is never trusted. The coordinator embeds the structured
+``patch_equivalent`` disposition as a fenced ``mozyo-patch-equivalent-integration`` block in the
+durable integration journal; this resolver fetches the issue's journals, locates the EXACT
+journal by its own Redmine record id (never a self-reported field — the dispatch-marker
+authority principle), parses the disposition block, **recomputes** the real git facts (current
+branch / integration heads, unintegrated-by-hash set, per-commit stable patch-ids,
+integration-commit reachability, and origin reachability against the DERIVED
+``origin/<integration_branch>`` ref so a caller cannot substitute a local ref), and consults the
+pure fence.
 
-Fail-closed everywhere: an unsupplied disposition returns ``None`` (the retire keeps its literal
-``head_not_integrated``); an unreadable / malformed disposition, an unresolvable git ref, or any
-disagreement between the claim and the recomputed facts returns a non-admissible resolution with
-a closed-vocabulary reason. Nothing here writes anything; every git call is read-only.
+The #13845 bound terminal retire consults the returned :class:`PatchEquivalentResolution` ONLY
+when the literal-ancestor probe already reported the head un-integrated, so the literal path
+never even constructs this resolver (Redmine #14066 review j#82298 F2 — the guard lives in the
+command handler).
 
-Boundary (Redmine #14066): read-only git probes only (``rev-parse`` / ``rev-list`` /
-``merge-base --is-ancestor`` / ``show`` + ``patch-id``). No fetch, no push, no ref mutation, no
-process / worktree / branch actuation.
+Fail-closed everywhere: an unsupplied integration journal returns ``None`` (the retire keeps its
+literal ``head_not_integrated``); unconfigured / missing credentials, an unreadable Redmine, a
+journal not found, an absent / ambiguous / malformed disposition block, an unresolvable git ref,
+or any fence refusal returns a non-admissible resolution with a closed-vocabulary reason.
+Nothing here writes anything; every git call is read-only and the Redmine fetch is a read-only,
+redirect-refusing GET.
+
+Boundary (Redmine #14066): read-only git probes (``rev-parse`` / ``rev-list`` / ``merge-base
+--is-ancestor`` / ``show`` + ``patch-id``) + one credential-gated read-only Redmine journal
+fetch. No git fetch/push/ref mutation, no Redmine write, no process / worktree / branch actuation.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+    LiveRedmineJournalError,
+    LiveRedmineJournalSource,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.patch_equivalent_integration import (  # noqa: E501
     AdmissionResult,
-    CommitPatchMapping,
     PatchEquivalentDisposition,
     PatchEquivalentObservation,
+    disposition_from_mapping,
     evaluate_patch_equivalent_integrated,
+    parse_integration_disposition_blocks,
 )
 
+#: The canonical remote whose ``<remote>/<integration_branch>`` ref the integration head's origin
+#: reachability is bound to. The disposition never names the ref (a caller could otherwise point
+#: it at a local branch), so the retire derives it — review j#82298 F1.
+CANONICAL_REMOTE = "origin"
+
 #: Application-layer fail-closed reasons (distinct from the pure fence's evidence-vs-facts
-#: reasons): the durable disposition itself could not be read, or the git probe could not
+#: reasons): the durable authority could not be reached / located, or the git probe could not
 #: resolve the branch identities it needs to measure equivalence at all.
-PE_EVIDENCE_UNREADABLE = "integration_disposition_unreadable"
+PE_REDMINE_UNCONFIGURED = "redmine_credentials_unconfigured"
+PE_REDMINE_UNREADABLE = "redmine_journal_unreadable"
+PE_JOURNAL_NOT_FOUND = "integration_journal_not_found"
+PE_DISPOSITION_ABSENT = "integration_disposition_absent"
+PE_DISPOSITION_AMBIGUOUS = "integration_disposition_ambiguous"
+PE_DISPOSITION_MALFORMED = "integration_disposition_malformed"
 PE_PROBE_UNRESOLVED = "integration_probe_unresolved"
 
 
 @dataclass(frozen=True)
 class PatchEquivalentResolution:
-    """The fail-closed action-time verdict for a supplied patch-equivalent disposition.
+    """The fail-closed action-time verdict for a supplied integration journal.
 
-    ``admissible`` is true only when the disposition was readable, the git facts resolved, and
-    the pure fence proved every axis. Every other outcome is ``admissible=False`` with a
-    closed-vocabulary ``reason`` (the pure fence's, or an application-layer one) and a ``detail``.
+    ``admissible`` is true only when the exact Redmine journal was read, its disposition block
+    parsed, the git facts resolved, and the pure fence proved every axis. Every other outcome is
+    ``admissible=False`` with a closed-vocabulary ``reason`` (the pure fence's, or an
+    application-layer one) and a ``detail``.
     """
 
     admissible: bool
@@ -63,59 +86,77 @@ class PatchEquivalentResolution:
         return {"admissible": self.admissible, "reason": self.reason, "detail": self.detail}
 
 
-def load_patch_equivalent_disposition(
-    path: str,
-) -> Optional[PatchEquivalentDisposition]:
-    """Read the coordinator's durable integration disposition JSON. ``None`` on any read error.
+def _fail(reason: str, detail: str) -> PatchEquivalentResolution:
+    return PatchEquivalentResolution(admissible=False, reason=reason, detail=detail)
 
-    The JSON mirrors the exact Redmine integration journal's structured ``patch_equivalent``
-    block::
 
-        {
-          "issue": "13846", "lane": "issue_13846_...", "branch": "issue_13846_...",
-          "integration_branch": "int_13472_session_continuity",
-          "source_head": "<40-hex>", "integration_head": "<40-hex>",
-          "origin_ref": "origin/int_13472_session_continuity", "origin_reachable": true,
-          "journal_id": "82xxx",
-          "commit_map": [{"source": "<40-hex>", "integration": "<40-hex>", "patch_id": "<hex>"}]
-        }
+def read_integration_disposition(
+    issue: str, integration_journal: str
+) -> tuple[Optional[PatchEquivalentDisposition], Optional[PatchEquivalentResolution]]:
+    """Fresh-read the EXACT Redmine integration journal and parse its disposition block.
 
-    A missing file, malformed JSON, a non-object root, or a malformed ``commit_map`` entry
-    returns ``None`` (the caller fails closed with :data:`PE_EVIDENCE_UNREADABLE`). Commit hashes
-    are compared verbatim downstream, so they must be canonical full hashes.
+    Returns ``(disposition, None)`` on success, or ``(None, resolution)`` with a fail-closed
+    resolution. The Redmine read is credential-gated via
+    :meth:`LiveRedmineJournalSource.from_environment` (env / home-scoped credentials only — a
+    repo-local file can never supply the key), so missing credentials fail closed
+    (:data:`PE_REDMINE_UNCONFIGURED`) and an unreadable Redmine fails closed
+    (:data:`PE_REDMINE_UNREADABLE`). The journal is located by its OWN Redmine record id
+    (``entry.journal_id``), never a self-reported field. A journal absent
+    (:data:`PE_JOURNAL_NOT_FOUND`), carrying no disposition block
+    (:data:`PE_DISPOSITION_ABSENT`), carrying more than one (:data:`PE_DISPOSITION_AMBIGUOUS`),
+    or one that will not project (:data:`PE_DISPOSITION_MALFORMED`) each fails closed.
     """
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    entries = raw.get("commit_map")
-    if not isinstance(entries, list):
-        return None
-    mappings: list[CommitPatchMapping] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            return None
-        mappings.append(
-            CommitPatchMapping(
-                source_commit=str(entry.get("source", "")),
-                integration_commit=str(entry.get("integration", "")),
-                patch_id=str(entry.get("patch_id", "")),
-            )
+        source = LiveRedmineJournalSource.from_environment()
+    except LiveRedmineJournalError as exc:
+        return None, _fail(
+            PE_REDMINE_UNCONFIGURED,
+            f"the Redmine credentials are unconfigured ({exc}); the exact integration journal "
+            "cannot be re-read, so the terminal retire fails closed",
         )
-    return PatchEquivalentDisposition(
-        issue=str(raw.get("issue", "")),
-        lane=str(raw.get("lane", "")),
-        branch=str(raw.get("branch", "")),
-        integration_branch=str(raw.get("integration_branch", "")),
-        source_head=str(raw.get("source_head", "")),
-        integration_head=str(raw.get("integration_head", "")),
-        origin_ref=str(raw.get("origin_ref", "")),
-        origin_reachable=bool(raw.get("origin_reachable", False)),
-        commit_map=tuple(mappings),
-        journal_id=str(raw.get("journal_id", "")),
-    )
+    try:
+        entries = source.read_entries(issue)
+    except LiveRedmineJournalError as exc:
+        return None, _fail(
+            PE_REDMINE_UNREADABLE,
+            f"the Redmine integration journal could not be read ({exc}); the terminal retire "
+            "fails closed",
+        )
+    target = integration_journal.strip()
+    matched = [
+        entry
+        for entry in entries
+        if str(getattr(entry, "journal_id", "") or "").strip() == target
+    ]
+    if not matched:
+        return None, _fail(
+            PE_JOURNAL_NOT_FOUND,
+            f"issue #{issue} carries no journal {target!r}; the named integration disposition "
+            "journal does not exist, so the terminal retire fails closed",
+        )
+    blocks: list[dict] = []
+    for entry in matched:
+        blocks.extend(parse_integration_disposition_blocks(getattr(entry, "notes", "") or ""))
+    if not blocks:
+        return None, _fail(
+            PE_DISPOSITION_ABSENT,
+            f"journal {target!r} carries no `mozyo-patch-equivalent-integration` disposition "
+            "block; there is no structured integration disposition to verify",
+        )
+    if len(blocks) > 1:
+        return None, _fail(
+            PE_DISPOSITION_AMBIGUOUS,
+            f"journal {target!r} carries {len(blocks)} disposition blocks; an ambiguous durable "
+            "record cannot license a terminal retire",
+        )
+    disposition = disposition_from_mapping(blocks[0])
+    if disposition is None:
+        return None, _fail(
+            PE_DISPOSITION_MALFORMED,
+            f"the disposition block in journal {target!r} is malformed (missing / non-list "
+            "commit_map or a bad entry); it cannot be verified",
+        )
+    return disposition, None
 
 
 def _run_git(repo_root: Path, *args: str) -> Optional[subprocess.CompletedProcess]:
@@ -142,9 +183,7 @@ def _rev_parse(repo_root: Path, ref: str) -> Optional[str]:
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     if not ancestor or not descendant:
         return False
-    result = _run_git(
-        repo_root, "merge-base", "--is-ancestor", ancestor, descendant
-    )
+    result = _run_git(repo_root, "merge-base", "--is-ancestor", ancestor, descendant)
     return result is not None and result.returncode == 0
 
 
@@ -186,13 +225,17 @@ def _stable_patch_id(repo_root: Path, sha: str) -> str:
 
 
 def probe_patch_equivalent_observation(
-    repo_root: Path, disposition: PatchEquivalentDisposition, *, branch: str, integration_branch: str
+    repo_root: Path,
+    disposition: PatchEquivalentDisposition,
+    *,
+    branch: str,
+    integration_branch: str,
 ) -> Optional[PatchEquivalentObservation]:
     """Recompute the real git facts for the fence. ``None`` when the branch identities won't resolve.
 
-    Reads the current heads, the unintegrated-by-hash commit set, per-commit stable patch-ids for
-    every mapped commit, each mapped integration commit's reachability from the integration head,
-    and the integration head's reachability from the disposition's origin ref. All read-only.
+    Origin reachability is measured against the DERIVED ``origin/<integration_branch>`` remote
+    ref (``CANONICAL_REMOTE``), never a ref named by the disposition — a caller cannot substitute
+    a local ref (review j#82298 F1). All reads are read-only.
     """
     actual_source_head = _rev_parse(repo_root, branch)
     actual_integration_head = _rev_parse(repo_root, integration_branch)
@@ -213,12 +256,9 @@ def probe_patch_equivalent_observation(
         if integ and integ not in patch_ids:
             patch_ids[integ] = _stable_patch_id(repo_root, integ)
         if integ:
-            reachable[integ] = _is_ancestor(
-                repo_root, integ, actual_integration_head
-            )
-    origin_reachable = _is_ancestor(
-        repo_root, actual_integration_head, disposition.origin_ref
-    )
+            reachable[integ] = _is_ancestor(repo_root, integ, actual_integration_head)
+    origin_ref = f"{CANONICAL_REMOTE}/{integration_branch}"
+    origin_reachable = _is_ancestor(repo_root, actual_integration_head, origin_ref)
     return PatchEquivalentObservation(
         actual_source_head=actual_source_head,
         actual_integration_head=actual_integration_head,
@@ -232,45 +272,41 @@ def probe_patch_equivalent_observation(
 def resolve_patch_equivalent_integration(
     args: argparse.Namespace, repo_root: Path
 ) -> Optional[PatchEquivalentResolution]:
-    """Resolve the supplied patch-equivalent disposition action-time. ``None`` when unsupplied.
+    """Resolve the named integration journal action-time. ``None`` when unsupplied.
 
-    Reads ``--integration-disposition-json``; ``None`` (unsupplied) leaves the retire on its
-    literal-ancestor path. An unreadable / malformed disposition, an unresolvable git identity,
-    or a fence refusal returns a non-admissible :class:`PatchEquivalentResolution` (fail-closed).
+    Reads ``--integration-journal``; ``None`` (unsupplied) leaves the retire on its literal
+    -ancestor path. Otherwise it fresh-reads the EXACT Redmine journal as authority
+    (credential-gated), recomputes the git facts, and consults the pure fence. Every read /
+    probe / fence failure returns a non-admissible :class:`PatchEquivalentResolution`.
     """
-    path = (getattr(args, "integration_disposition_json", None) or "").strip()
-    if not path:
+    integration_journal = (getattr(args, "integration_journal", None) or "").strip()
+    if not integration_journal:
         return None
-    disposition = load_patch_equivalent_disposition(path)
-    if disposition is None:
-        return PatchEquivalentResolution(
-            admissible=False,
-            reason=PE_EVIDENCE_UNREADABLE,
-            detail=(
-                "the --integration-disposition-json evidence is missing / unreadable / "
-                "malformed; the coordinator's durable patch-equivalent integration disposition "
-                "cannot be re-read, so the terminal retire fails closed"
-            ),
+    issue = (getattr(args, "issue", "") or "").strip()
+    if not issue:
+        return _fail(
+            PE_JOURNAL_NOT_FOUND,
+            "no --issue to locate the integration journal against; fail closed",
         )
+    disposition, failure = read_integration_disposition(issue, integration_journal)
+    if failure is not None:
+        return failure
     branch = (getattr(args, "branch", "") or "").strip()
     integration_branch = (getattr(args, "integration_branch", "") or "").strip()
     observation = probe_patch_equivalent_observation(
         repo_root, disposition, branch=branch, integration_branch=integration_branch
     )
     if observation is None:
-        return PatchEquivalentResolution(
-            admissible=False,
-            reason=PE_PROBE_UNRESOLVED,
-            detail=(
-                "the git probe could not resolve --branch / --integration-branch heads or the "
-                "unintegrated commit set; patch-equivalence cannot be measured, so the terminal "
-                "retire fails closed"
-            ),
+        return _fail(
+            PE_PROBE_UNRESOLVED,
+            "the git probe could not resolve --branch / --integration-branch heads or the "
+            "unintegrated commit set; patch-equivalence cannot be measured, so the terminal "
+            "retire fails closed",
         )
     verdict: AdmissionResult = evaluate_patch_equivalent_integrated(
         disposition,
         observation,
-        issue=(getattr(args, "issue", "") or "").strip(),
+        issue=issue,
         lane=(getattr(args, "lane_label", "") or "").strip(),
         branch=branch,
         integration_branch=integration_branch,
@@ -281,10 +317,16 @@ def resolve_patch_equivalent_integration(
 
 
 __all__ = (
-    "PE_EVIDENCE_UNREADABLE",
+    "CANONICAL_REMOTE",
+    "PE_REDMINE_UNCONFIGURED",
+    "PE_REDMINE_UNREADABLE",
+    "PE_JOURNAL_NOT_FOUND",
+    "PE_DISPOSITION_ABSENT",
+    "PE_DISPOSITION_AMBIGUOUS",
+    "PE_DISPOSITION_MALFORMED",
     "PE_PROBE_UNRESOLVED",
     "PatchEquivalentResolution",
-    "load_patch_equivalent_disposition",
+    "read_integration_disposition",
     "probe_patch_equivalent_observation",
     "resolve_patch_equivalent_integration",
 )

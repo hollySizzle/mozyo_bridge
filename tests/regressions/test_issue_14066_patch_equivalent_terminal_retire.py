@@ -11,36 +11,44 @@ branch (the cherry-picks carry different commit hashes), so ``merge-base --is-an
 ``retired`` disposition (``head_not_integrated``). The live residual: #13846 (two rows) and
 #13879 (one row) — all resident process 0, issue closed, Review / CI / installed acceptance done.
 
-Passing a fake integration branch to dodge the literal probe is forbidden. Instead the retire
-re-reads the coordinator's structured integration disposition (source head, integration head,
-commit map, stable patch-id, origin reachability) from the exact journal at action-time and
-RECOMPUTES the git facts, terminalizing only when the recomputed patch-ids prove every mapped
-cherry-pick equivalent, the recorded heads match the current branches, and the integration head
-is origin-reachable. Missing / ambiguous / stale / mismatched evidence, an unreadable
-disposition, a live / foreign slot: all zero-write.
+The AUTHORITY is the EXACT Redmine integration journal, read fresh at action-time through the
+credential-gated live journal source (review j#82298 F1): the coordinator embeds the structured
+disposition as a ``mozyo-patch-equivalent-integration`` fenced block in the durable journal, and
+the retire re-reads that exact journal, RECOMPUTES the git facts (stable patch-ids, origin
+reachability against the derived ``origin/<integration_branch>`` ref), and terminalizes only when
+the recomputed patch-ids prove every mapped cherry-pick equivalent, the recorded heads match the
+current branches, and the integration head is origin-reachable. A caller-supplied local file is
+never the authority; passing a fake integration branch or an arbitrary local ref does not work.
 
-Three layers are pinned, all synthetic (isolated ``MOZYO_BRIDGE_HOME``, a fake herdr inventory,
-real local git repos with real cherry-picks, never the shared ``$HOME/.mozyo_bridge`` and never
-a live pane / process / route mutation, never a network / origin push by the tool):
+The literal-ancestor path is byte-identical to #13845: when ``--branch`` is a literal ancestor
+the retire never even constructs the patch-equivalent resolver (review j#82298 F2), so no file
+IO / git probe / Redmine read / exception surface is added to that path.
+
+Layers, all synthetic (isolated ``MOZYO_BRIDGE_HOME``, a fake herdr inventory, a fake injected
+Redmine journal source — never a real network / credential, real local git repos with real
+cherry-picks, never a live pane / process / route mutation, never a git push/fetch by the tool):
 
 1. the pure fence (:func:`evaluate_patch_equivalent_integrated`) — the claim-vs-recomputed-facts
    matrix, every refusal axis;
-2. the action-time resolver (:func:`resolve_patch_equivalent_integration`) over real cherry-picked
-   git — the green proof, a stale head, a tampered patch-id, an unreachable origin, an unreadable
-   disposition; and
-3. the command boundary (``sublane retire --retire-hibernated-bound
-   --integration-disposition-json``) over the three residual-lane journal shapes — positive
-   (terminalizes), negative (tampered evidence fails closed), and replay (idempotent no-op),
-   plus non-regression of the literal ``head_not_integrated`` when no disposition is supplied.
+2. the disposition journal block (render / parse / project) — round-trip, ambiguous, malformed;
+3. the credential-gated exact-journal read (:func:`read_integration_disposition`) — unconfigured
+   / unreadable / not-found / absent / ambiguous / malformed all zero-write;
+4. the action-time resolver over real cherry-picked git — green, stale head, tampered patch-id,
+   fabricated integration commit, origin-unreachable (bound to origin/<branch>); and
+5. the command boundary over the three residual-lane journal shapes — positive / negative /
+   replay, the literal ``head_not_integrated`` non-regression when no journal is supplied, and
+   the F2 non-regression that a literal-ancestor green lane never calls the resolver.
 
 Boundary (Redmine #14066): no process launch / close / resume, no worktree / branch removal, no
-raw Herdr / tmux, no origin/main, no production / tag / publish, no push / fetch by the tool.
+raw Herdr / tmux, no origin/main, no production / tag / publish, no git push/fetch or Redmine
+write by the tool.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -63,7 +71,6 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     LaneLifecycleKey,
     LaneLifecycleStore,
     RELEASE_RELEASED,
-    RELEASE_REQUESTED,
     ReleasePin,
     DecisionPointer,
 )
@@ -75,6 +82,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     sublane_herdr_projection,
     sublane_herdr_retire,
     sublane_lifecycle_command,
+    sublane_patch_equivalent_integration as spe,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E402,E501
+    LiveRedmineJournalError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E402,E501
     HerdrRetireCloseResult,
@@ -88,10 +99,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BOUND_RETIRE_RETIRED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E402,E501
-    PE_EVIDENCE_UNREADABLE,
+    PE_DISPOSITION_ABSENT,
+    PE_DISPOSITION_AMBIGUOUS,
+    PE_DISPOSITION_MALFORMED,
+    PE_JOURNAL_NOT_FOUND,
     PE_PROBE_UNRESOLVED,
-    load_patch_equivalent_disposition,
+    PE_REDMINE_UNCONFIGURED,
+    PE_REDMINE_UNREADABLE,
     probe_patch_equivalent_observation,
+    read_integration_disposition,
     resolve_patch_equivalent_integration,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.patch_equivalent_integration import (  # noqa: E402,E501
@@ -111,7 +127,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CommitPatchMapping,
     PatchEquivalentDisposition,
     PatchEquivalentObservation,
+    disposition_from_mapping,
     evaluate_patch_equivalent_integrated,
+    parse_integration_disposition_blocks,
+    render_integration_disposition_block,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E402,E501
+    RedmineJournalEntry,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
     derive_lane_workspace_token,
@@ -120,7 +142,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 _WORKSPACE_ID = "b3d17ac95e6f4802"
 _INTEGRATION_BRANCH = "int_13472_session_continuity"
-_ORIGIN_REF = f"origin/{_INTEGRATION_BRANCH}"
+_INTEGRATION_JOURNAL = "82290"
 
 
 def _git(*args: str, cwd: Path, capture: bool = False):
@@ -157,6 +179,66 @@ def _patch_id(cwd: Path, sha: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# A fake, injectable Redmine journal source (no network, no credentials).
+# ---------------------------------------------------------------------------
+
+
+class _FakeJournalSource:
+    """Stand-in for ``LiveRedmineJournalSource`` installed on the app module for a test.
+
+    ``from_environment`` raises when ``configured`` is False (the unconfigured-credentials fail
+    -closed shape); ``read_entries`` raises when ``read_error`` is set (the unreadable-Redmine
+    shape). Otherwise it returns the pre-built entries — exactly the port ``read_integration_
+    disposition`` consumes, so no real network / credential is ever touched.
+    """
+
+    entries: list = []
+    configured: bool = True
+    read_error: bool = False
+    reads: list = []
+
+    @classmethod
+    def from_environment(cls):
+        if not cls.configured:
+            raise LiveRedmineJournalError("live Redmine poll is unconfigured (test)")
+        return cls()
+
+    def read_entries(self, issue_id):
+        type(self).reads.append(str(issue_id))
+        if type(self).read_error:
+            raise LiveRedmineJournalError("redmine transport failed (test)")
+        return list(type(self).entries)
+
+
+def _install_fake_journal(
+    test: unittest.TestCase,
+    entries: list | None = None,
+    *,
+    configured: bool = True,
+    read_error: bool = False,
+) -> None:
+    """Install a fresh fake journal source on the app module for the duration of ``test``."""
+    fake = type(
+        "FakeJournalSource",
+        (_FakeJournalSource,),
+        {
+            "entries": list(entries or []),
+            "configured": configured,
+            "read_error": read_error,
+            "reads": [],
+        },
+    )
+    real = spe.LiveRedmineJournalSource
+    spe.LiveRedmineJournalSource = fake
+    test.addCleanup(lambda: setattr(spe, "LiveRedmineJournalSource", real))
+    test._fake_journal = fake
+
+
+def _entry(journal_id: str, notes: str, issue: str) -> RedmineJournalEntry:
+    return RedmineJournalEntry(issue_id=issue, journal_id=journal_id, notes=notes)
+
+
+# ---------------------------------------------------------------------------
 # 1. The pure fence matrix (no git, no IO).
 # ---------------------------------------------------------------------------
 
@@ -176,13 +258,11 @@ class PatchEquivalentFenceMatrix(unittest.TestCase):
             integration_branch=_INTEGRATION_BRANCH,
             source_head="s" * 40,
             integration_head="i" * 40,
-            origin_ref=_ORIGIN_REF,
             origin_reachable=True,
             commit_map=(
                 CommitPatchMapping("a" * 40, "A" * 40, "pid_a"),
                 CommitPatchMapping("b" * 40, "B" * 40, "pid_b"),
             ),
-            journal_id="82064",
         )
         base.update(over)
         return PatchEquivalentDisposition(**base)
@@ -255,7 +335,6 @@ class PatchEquivalentFenceMatrix(unittest.TestCase):
         self.assertEqual(out.reason, PE_EMPTY_MAP)
 
     def test_map_missing_a_branch_commit_refused(self) -> None:
-        # The branch carries an unintegrated commit the map does not mention.
         out = self._eval(
             self._disposition(),
             self._observation(
@@ -298,8 +377,6 @@ class PatchEquivalentFenceMatrix(unittest.TestCase):
         self.assertEqual(out.reason, PE_PATCH_ID_UNRESOLVED)
 
     def test_patch_id_mismatch_refused(self) -> None:
-        # Recomputed source patch-id disagrees with the recomputed integration patch-id: the
-        # cherry-pick is not actually patch-equivalent.
         pids = {
             "a" * 40: "pid_a",
             "b" * 40: "pid_b",
@@ -310,8 +387,6 @@ class PatchEquivalentFenceMatrix(unittest.TestCase):
         self.assertEqual(out.reason, PE_PATCH_ID_MISMATCH)
 
     def test_disposition_patch_id_disagreeing_with_recompute_refused(self) -> None:
-        # The recomputed source == integration, but the coordinator's RECORDED patch-id differs:
-        # a stale / wrong durable record must not license the retire.
         out = self._eval(
             self._disposition(
                 commit_map=(
@@ -336,7 +411,53 @@ class PatchEquivalentFenceMatrix(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Shared real-git scenario builder for the resolver + command layers.
+# 2. The disposition journal block (render / parse / project).
+# ---------------------------------------------------------------------------
+
+
+class IntegrationDispositionBlockTests(unittest.TestCase):
+    def _disposition(self) -> PatchEquivalentDisposition:
+        return PatchEquivalentDisposition(
+            issue="13879",
+            lane="issue_13879_hibernated_pin_repair",
+            branch="issue_13879_hibernated_pin_repair",
+            integration_branch=_INTEGRATION_BRANCH,
+            source_head="s" * 40,
+            integration_head="i" * 40,
+            origin_reachable=True,
+            commit_map=(CommitPatchMapping("a" * 40, "A" * 40, "pid_a"),),
+        )
+
+    def test_render_parse_round_trip(self) -> None:
+        disp = self._disposition()
+        note = "coordinator prose\n\n" + render_integration_disposition_block(disp)
+        blocks = parse_integration_disposition_blocks(note)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(disposition_from_mapping(blocks[0]), disp)
+
+    def test_no_block_is_empty(self) -> None:
+        self.assertEqual(parse_integration_disposition_blocks("just prose"), ())
+        self.assertEqual(parse_integration_disposition_blocks(""), ())
+
+    def test_two_blocks_are_both_returned_as_ambiguous(self) -> None:
+        disp = self._disposition()
+        note = (
+            render_integration_disposition_block(disp)
+            + "\n\n"
+            + render_integration_disposition_block(disp)
+        )
+        self.assertEqual(len(parse_integration_disposition_blocks(note)), 2)
+
+    def test_malformed_json_block_is_skipped(self) -> None:
+        note = "```mozyo-patch-equivalent-integration\n{not json\n```"
+        self.assertEqual(parse_integration_disposition_blocks(note), ())
+
+    def test_missing_commit_map_does_not_project(self) -> None:
+        self.assertIsNone(disposition_from_mapping({"issue": "1"}))
+
+
+# ---------------------------------------------------------------------------
+# Shared real-git scenario builder.
 # ---------------------------------------------------------------------------
 
 
@@ -372,12 +493,24 @@ class _Scenario:
     """A real repo whose lane branch was patch-equivalent-integrated by cherry-pick.
 
     ``lane`` branch (checked out in ``lane_worktree``) carries ``n_commits`` commits ahead of
-    main; ``integration_branch`` cherry-picks each (different hashes, identical diffs); a bare
-    ``origin`` clone makes the integration head origin-reachable. Nothing is pushed by the tool
-    — the origin is scaffolded by ``git clone --bare`` in the test.
+    main; ``integration_branch`` first takes a DIVERGENT staging-base commit (so the cherry-picks
+    land on a different parent and get different hashes — otherwise cherry-picking onto main
+    reproduces the identical SHAs and the lane is a literal ancestor, not a patch-equivalent one),
+    then cherry-picks each lane commit (same diff -> same stable patch-id). A bare ``origin``
+    clone makes the integration head origin-reachable; ``origin_has_integration=False`` removes
+    the integration ref from origin so the origin-reachability axis fails. Nothing is pushed by
+    the tool — the origin is scaffolded by ``git clone --bare`` in the test.
     """
 
-    def __init__(self, tmp: Path, lane: str, issue: str, *, n_commits: int = 2) -> None:
+    def __init__(
+        self,
+        tmp: Path,
+        lane: str,
+        issue: str,
+        *,
+        n_commits: int = 2,
+        origin_has_integration: bool = True,
+    ) -> None:
         self.primary = tmp / "primary"
         _init_herdr_repo(self.primary)
         self.lane = lane
@@ -387,19 +520,15 @@ class _Scenario:
             "worktree", "add", "-b", lane, str(self.lane_worktree), "main",
             cwd=self.primary,
         )
-        # Lane commits (ahead of main by hash) — NOT a literal ancestor of the integration branch.
         self.source_commits: list[str] = []
         for i in range(n_commits):
-            f = self.lane_worktree / f"lane_{i}.txt"
-            f.write_text(f"lane change {i}\n", encoding="utf-8")
+            (self.lane_worktree / f"lane_{i}.txt").write_text(
+                f"lane change {i}\n", encoding="utf-8"
+            )
             _git("add", "-A", cwd=self.lane_worktree)
             _git("commit", "-m", f"{lane} c{i}", cwd=self.lane_worktree)
             self.source_commits.append(_rev_parse(self.lane_worktree, "HEAD"))
         self.source_head = _rev_parse(self.lane_worktree, lane)
-        # Integration branch: a DIVERGENT staging base (so the cherry-picks land on a different
-        # parent and get different commit hashes — otherwise cherry-picking onto main reproduces
-        # the identical SHAs and the lane is a literal ancestor, not a patch-equivalent one), then
-        # cherry-pick every lane commit (same diff -> same stable patch-id, new hash).
         _git("branch", _INTEGRATION_BRANCH, "main", cwd=self.primary)
         _git("checkout", _INTEGRATION_BRANCH, cwd=self.primary)
         (self.primary / "staging_base.txt").write_text("staging base\n", encoding="utf-8")
@@ -411,40 +540,40 @@ class _Scenario:
             self.integration_commits.append(_rev_parse(self.primary, "HEAD"))
         self.integration_head = _rev_parse(self.primary, _INTEGRATION_BRANCH)
         _git("checkout", "main", cwd=self.primary)
-        # Origin: a bare clone carrying the integration branch (scaffold only, no tool push).
         self.origin = tmp / "origin.git"
         _git("clone", "--bare", str(self.primary), str(self.origin), cwd=tmp)
+        if not origin_has_integration:
+            _git(
+                "update-ref", "-d", f"refs/heads/{_INTEGRATION_BRANCH}", cwd=self.origin
+            )
         _git("remote", "add", "origin", str(self.origin), cwd=self.primary)
         _git("fetch", "origin", cwd=self.primary)
         self.bound_token = derive_lane_workspace_token(str(self.lane_worktree.resolve()))
 
-    def commit_map(self) -> list[dict]:
-        rows = []
-        for src, integ in zip(self.source_commits, self.integration_commits):
-            rows.append(
-                {
-                    "source": src,
-                    "integration": integ,
-                    "patch_id": _patch_id(self.primary, src),
-                }
-            )
-        return rows
+    def disposition(self, **over) -> PatchEquivalentDisposition:
+        base = PatchEquivalentDisposition(
+            issue=self.issue,
+            lane=self.lane,
+            branch=self.lane,
+            integration_branch=_INTEGRATION_BRANCH,
+            source_head=self.source_head,
+            integration_head=self.integration_head,
+            origin_reachable=True,
+            commit_map=tuple(
+                CommitPatchMapping(src, integ, _patch_id(self.primary, src))
+                for src, integ in zip(self.source_commits, self.integration_commits)
+            ),
+        )
+        return dataclasses.replace(base, **over) if over else base
 
-    def disposition_dict(self, **over) -> dict:
-        d = {
-            "issue": self.issue,
-            "lane": self.lane,
-            "branch": self.lane,
-            "integration_branch": _INTEGRATION_BRANCH,
-            "source_head": self.source_head,
-            "integration_head": self.integration_head,
-            "origin_ref": _ORIGIN_REF,
-            "origin_reachable": True,
-            "journal_id": "82000",
-            "commit_map": self.commit_map(),
-        }
-        d.update(over)
-        return d
+    def journal_note(self, disposition: PatchEquivalentDisposition | None = None) -> str:
+        disp = disposition if disposition is not None else self.disposition()
+        return "## Integration disposition: patch_equivalent\n\n" + (
+            render_integration_disposition_block(disp)
+        )
+
+    def entry(self, disposition: PatchEquivalentDisposition | None = None) -> RedmineJournalEntry:
+        return _entry(_INTEGRATION_JOURNAL, self.journal_note(disposition), self.issue)
 
 
 def _pins(lane: str) -> tuple[ProcessGenerationPin, ...]:
@@ -465,7 +594,7 @@ def _pins(lane: str) -> tuple[ProcessGenerationPin, ...]:
 
 
 def _seed_hibernated_released_bound(
-    key: LaneLifecycleKey, issue: str, worktree_identity: str, *, released: bool = True
+    key: LaneLifecycleKey, issue: str, worktree_identity: str
 ) -> None:
     from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_ACTIVE
 
@@ -498,8 +627,6 @@ def _seed_hibernated_released_bound(
             ReleasePin("worker", "claude-mzb1", "w28:p3T"),
         ],
     )
-    if not released:
-        return
     rec = lifecycle.get(key)
     lifecycle.record_release_outcome(
         key, action_id="rel-1", expected_revision=rec.revision, target=RELEASE_RELEASED
@@ -507,133 +634,207 @@ def _seed_hibernated_released_bound(
 
 
 # ---------------------------------------------------------------------------
-# 2. The action-time resolver over real cherry-picked git.
+# 3. The credential-gated exact-journal read (authority).
+# ---------------------------------------------------------------------------
+
+
+class ReadIntegrationDispositionTests(unittest.TestCase):
+    ISSUE = "13846"
+    LANE = "issue_13846_fresh_generation_binding"
+
+    def _disp(self) -> PatchEquivalentDisposition:
+        return PatchEquivalentDisposition(
+            issue=self.ISSUE,
+            lane=self.LANE,
+            branch=self.LANE,
+            integration_branch=_INTEGRATION_BRANCH,
+            source_head="s" * 40,
+            integration_head="i" * 40,
+            origin_reachable=True,
+            commit_map=(CommitPatchMapping("a" * 40, "A" * 40, "pid_a"),),
+        )
+
+    def _note(self, disp=None) -> str:
+        return render_integration_disposition_block(disp or self._disp())
+
+    def test_unconfigured_credentials_fail_closed(self) -> None:
+        _install_fake_journal(self, [], configured=False)
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(disp)
+        self.assertEqual(failure.reason, PE_REDMINE_UNCONFIGURED)
+
+    def test_unreadable_redmine_fails_closed(self) -> None:
+        _install_fake_journal(self, [], read_error=True)
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(disp)
+        self.assertEqual(failure.reason, PE_REDMINE_UNREADABLE)
+
+    def test_journal_not_found_fails_closed(self) -> None:
+        _install_fake_journal(
+            self, [_entry("99999", self._note(), self.ISSUE)]
+        )
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(disp)
+        self.assertEqual(failure.reason, PE_JOURNAL_NOT_FOUND)
+
+    def test_absent_block_fails_closed(self) -> None:
+        _install_fake_journal(
+            self, [_entry(_INTEGRATION_JOURNAL, "just prose, no block", self.ISSUE)]
+        )
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(disp)
+        self.assertEqual(failure.reason, PE_DISPOSITION_ABSENT)
+
+    def test_ambiguous_blocks_fail_closed(self) -> None:
+        note = self._note() + "\n\n" + self._note()
+        _install_fake_journal(self, [_entry(_INTEGRATION_JOURNAL, note, self.ISSUE)])
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(disp)
+        self.assertEqual(failure.reason, PE_DISPOSITION_AMBIGUOUS)
+
+    def test_malformed_block_fails_closed(self) -> None:
+        note = "```mozyo-patch-equivalent-integration\n{\"issue\": \"x\"}\n```"
+        _install_fake_journal(self, [_entry(_INTEGRATION_JOURNAL, note, self.ISSUE)])
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(disp)
+        self.assertEqual(failure.reason, PE_DISPOSITION_MALFORMED)
+
+    def test_exact_journal_disposition_is_read(self) -> None:
+        want = self._disp()
+        _install_fake_journal(
+            self,
+            [
+                _entry("82000", "unrelated", self.ISSUE),
+                _entry(_INTEGRATION_JOURNAL, self._note(want), self.ISSUE),
+            ],
+        )
+        disp, failure = read_integration_disposition(self.ISSUE, _INTEGRATION_JOURNAL)
+        self.assertIsNone(failure)
+        self.assertEqual(disp, want)
+        self.assertEqual(self._fake_journal.reads, [self.ISSUE])
+
+
+# ---------------------------------------------------------------------------
+# 4. The action-time resolver over real cherry-picked git.
 # ---------------------------------------------------------------------------
 
 
 class PatchEquivalentResolverTests(unittest.TestCase):
-    """``resolve_patch_equivalent_integration`` / probe over real git."""
-
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        self.s = _Scenario(self.tmp, "issue_13879_hibernated_pin_repair", "13879")
 
-    def _write(self, name: str, payload: dict) -> str:
-        p = self.tmp / name
-        p.write_text(json.dumps(payload), encoding="utf-8")
-        return str(p)
+    def _scenario(self, **kw) -> _Scenario:
+        return _Scenario(self.tmp, "issue_13879_hibernated_pin_repair", "13879", **kw)
 
-    def _args(self, path) -> argparse.Namespace:
+    def _args(self, s: _Scenario, journal=_INTEGRATION_JOURNAL) -> argparse.Namespace:
         return argparse.Namespace(
-            repo=str(self.s.primary),
-            issue=self.s.issue,
-            lane_label=self.s.lane,
-            branch=self.s.lane,
+            repo=str(s.primary),
+            issue=s.issue,
+            lane_label=s.lane,
+            branch=s.lane,
             integration_branch=_INTEGRATION_BRANCH,
-            integration_disposition_json=path,
+            integration_journal=journal,
         )
 
     def test_green_cherry_pick_disposition_is_admissible(self) -> None:
-        path = self._write("disp.json", self.s.disposition_dict())
-        out = resolve_patch_equivalent_integration(self._args(path), self.s.primary)
+        s = self._scenario()
+        _install_fake_journal(self, [s.entry()])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
         self.assertTrue(out.admissible, msg=out.detail)
         self.assertEqual(out.reason, PE_OK)
 
     def test_literal_ancestor_not_required_here(self) -> None:
-        # Sanity: the lane branch really is NOT a literal ancestor of the integration branch,
-        # so this path is the only route to an integrated verdict.
+        s = self._scenario()
         rc = subprocess.run(
-            ["git", "-C", str(self.s.primary), "merge-base", "--is-ancestor",
-             self.s.lane, _INTEGRATION_BRANCH],
+            ["git", "-C", str(s.primary), "merge-base", "--is-ancestor",
+             s.lane, _INTEGRATION_BRANCH],
         ).returncode
         self.assertNotEqual(rc, 0)
 
-    def test_no_disposition_returns_none(self) -> None:
-        args = self._args(None)
-        self.assertIsNone(resolve_patch_equivalent_integration(args, self.s.primary))
-
-    def test_unreadable_disposition_fails_closed(self) -> None:
-        out = resolve_patch_equivalent_integration(
-            self._args(str(self.tmp / "nope.json")), self.s.primary
+    def test_no_journal_returns_none(self) -> None:
+        s = self._scenario()
+        _install_fake_journal(self, [s.entry()])
+        self.assertIsNone(
+            resolve_patch_equivalent_integration(self._args(s, journal=None), s.primary)
         )
-        self.assertFalse(out.admissible)
-        self.assertEqual(out.reason, PE_EVIDENCE_UNREADABLE)
-
-    def test_malformed_json_fails_closed(self) -> None:
-        p = self.tmp / "bad.json"
-        p.write_text("{not json", encoding="utf-8")
-        out = resolve_patch_equivalent_integration(
-            self._args(str(p)), self.s.primary
-        )
-        self.assertEqual(out.reason, PE_EVIDENCE_UNREADABLE)
 
     def test_stale_source_head_fails_closed(self) -> None:
-        path = self._write("disp.json", self.s.disposition_dict(source_head="d" * 40))
-        out = resolve_patch_equivalent_integration(self._args(path), self.s.primary)
+        s = self._scenario()
+        _install_fake_journal(self, [s.entry(s.disposition(source_head="d" * 40))])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
         self.assertFalse(out.admissible)
         self.assertEqual(out.reason, PE_SOURCE_HEAD_STALE)
 
     def test_tampered_patch_id_fails_closed(self) -> None:
-        d = self.s.disposition_dict()
-        d["commit_map"][0]["patch_id"] = "deadbeef" * 5
-        path = self._write("disp.json", d)
-        out = resolve_patch_equivalent_integration(self._args(path), self.s.primary)
+        s = self._scenario()
+        disp = s.disposition()
+        tampered = dataclasses.replace(
+            disp,
+            commit_map=(
+                dataclasses.replace(disp.commit_map[0], patch_id="deadbeef" * 5),
+            )
+            + disp.commit_map[1:],
+        )
+        _install_fake_journal(self, [s.entry(tampered)])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
         self.assertFalse(out.admissible)
         self.assertEqual(out.reason, PE_PATCH_ID_MISMATCH)
 
     def test_fabricated_integration_commit_fails_closed(self) -> None:
-        # A disposition naming an integration commit that is not on the integration branch
-        # (the "fake integration branch" dodge the ticket forbids) is refused.
-        d = self.s.disposition_dict()
-        d["commit_map"][0]["integration"] = "f" * 40
-        path = self._write("disp.json", d)
-        out = resolve_patch_equivalent_integration(self._args(path), self.s.primary)
+        s = self._scenario()
+        disp = s.disposition()
+        fabricated = dataclasses.replace(
+            disp,
+            commit_map=(
+                dataclasses.replace(disp.commit_map[0], integration_commit="f" * 40),
+            )
+            + disp.commit_map[1:],
+        )
+        _install_fake_journal(self, [s.entry(fabricated)])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
         self.assertFalse(out.admissible)
         self.assertIn(
             out.reason, {PE_INTEGRATION_COMMIT_UNREACHABLE, PE_PATCH_ID_UNRESOLVED}
         )
 
-    def test_unresolvable_integration_branch_probe_fails_closed(self) -> None:
-        args = self._args(self._write("disp.json", self.s.disposition_dict()))
-        args.integration_branch = "no_such_branch"
-        out = resolve_patch_equivalent_integration(args, self.s.primary)
-        self.assertFalse(out.admissible)
-        self.assertEqual(out.reason, PE_PROBE_UNRESOLVED)
-
     def test_origin_unreachable_fails_closed(self) -> None:
-        # Point the disposition's origin ref at a ref the integration head is not reachable from.
-        path = self._write(
-            "disp.json", self.s.disposition_dict(origin_ref="origin/main")
-        )
-        out = resolve_patch_equivalent_integration(self._args(path), self.s.primary)
+        # origin has no integration ref, so origin/<integration-branch> is unreachable — the
+        # caller cannot substitute a local ref because the retire derives the origin ref itself.
+        s = self._scenario(origin_has_integration=False)
+        _install_fake_journal(self, [s.entry()])
+        out = resolve_patch_equivalent_integration(self._args(s), s.primary)
         self.assertFalse(out.admissible)
         self.assertEqual(out.reason, PE_ORIGIN_UNREACHABLE)
 
+    def test_unresolvable_integration_branch_probe_fails_closed(self) -> None:
+        s = self._scenario()
+        _install_fake_journal(self, [s.entry()])
+        args = self._args(s)
+        args.integration_branch = "no_such_branch"
+        out = resolve_patch_equivalent_integration(args, s.primary)
+        self.assertFalse(out.admissible)
+        self.assertEqual(out.reason, PE_PROBE_UNRESOLVED)
+
     def test_probe_observation_recomputes_matching_patch_ids(self) -> None:
-        disp = load_patch_equivalent_disposition(
-            self._write("disp.json", self.s.disposition_dict())
-        )
+        s = self._scenario()
         obs = probe_patch_equivalent_observation(
-            self.s.primary, disp, branch=self.s.lane, integration_branch=_INTEGRATION_BRANCH
+            s.primary, s.disposition(), branch=s.lane, integration_branch=_INTEGRATION_BRANCH
         )
-        self.assertEqual(obs.actual_source_head, self.s.source_head)
-        self.assertEqual(obs.actual_integration_head, self.s.integration_head)
-        self.assertEqual(
-            obs.unintegrated_source_commits, frozenset(self.s.source_commits)
-        )
-        for src, integ in zip(self.s.source_commits, self.s.integration_commits):
+        self.assertEqual(obs.actual_source_head, s.source_head)
+        self.assertEqual(obs.actual_integration_head, s.integration_head)
+        self.assertEqual(obs.unintegrated_source_commits, frozenset(s.source_commits))
+        for src, integ in zip(s.source_commits, s.integration_commits):
             self.assertTrue(obs.patch_ids[src])
             self.assertEqual(obs.patch_ids[src], obs.patch_ids[integ])
+        self.assertTrue(obs.integration_head_origin_reachable)
 
 
 # ---------------------------------------------------------------------------
-# 3. The command boundary over the three residual-lane journal shapes.
+# 5. The command boundary over the three residual-lane journal shapes.
 # ---------------------------------------------------------------------------
 
-#: The live #14066 residual rows (issue, lane label): #13846 two rows, #13879 one row. The lane
-#: labels are the representative journal shape the retire terminalizes via patch-equivalence.
 _RESIDUAL_LANES = (
     ("13846", "issue_13846_fresh_generation_binding"),
     ("13846", "issue_13846_worker_dispatch_admission"),
@@ -642,7 +843,7 @@ _RESIDUAL_LANES = (
 
 
 class PatchEquivalentCommandBoundary(unittest.TestCase):
-    """``sublane retire --retire-hibernated-bound --integration-disposition-json`` end to end."""
+    """``sublane retire --retire-hibernated-bound --integration-journal`` end to end."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -653,8 +854,6 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
         self._prev_home = os.environ.get("MOZYO_BRIDGE_HOME")
         os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
 
-        # A fake herdr inventory: the coordinator's default-lane pair only (no lane slot), so
-        # every lane unit measures ZERO live managed slots — the #13845 live-zero shape.
         self.rows: list[dict] = [
             {"name": encode_assigned_name(_WORKSPACE_ID, "codex", ""), "pane_id": "w28:p1"},
             {"name": encode_assigned_name(_WORKSPACE_ID, "claude", ""), "pane_id": "w28:p2"},
@@ -691,16 +890,11 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
 
         self.addCleanup(_restore)
 
-    def _scenario(self, issue: str, lane: str) -> _Scenario:
-        return _Scenario(self.tmp / f"sc_{lane}", lane, issue)
-
-    def _write(self, root: Path, payload: dict) -> str:
-        p = root / "disposition.json"
-        p.write_text(json.dumps(payload), encoding="utf-8")
-        return str(p)
+    def _scenario(self, issue: str, lane: str, **kw) -> _Scenario:
+        return _Scenario(self.tmp / f"sc_{lane}", lane, issue, **kw)
 
     def _args(
-        self, s: _Scenario, *, disposition_path, integration_branch=_INTEGRATION_BRANCH
+        self, s: _Scenario, *, journal=_INTEGRATION_JOURNAL, integration_branch=_INTEGRATION_BRANCH
     ) -> argparse.Namespace:
         return argparse.Namespace(
             repo=str(s.primary),
@@ -722,7 +916,7 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
             target_identity_known=True,
             latest_generation_admissible=True,
             review_generation_json=None,
-            integration_disposition_json=disposition_path,
+            integration_journal=journal,
         )
 
     def _run(self, args) -> tuple[int, dict]:
@@ -731,13 +925,17 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
             code = sublane_lifecycle_command.cmd_sublane_retire(args)
         return code, json.loads(buffer.getvalue())
 
-    def _disposition(self, payload) -> dict:
+    def _verdict(self, payload) -> dict:
         return payload.get("hibernated_bound_retire", {})
 
     def _seed(self, s: _Scenario) -> None:
         _seed_hibernated_released_bound(
             LaneLifecycleKey(_WORKSPACE_ID, s.lane), s.issue, s.bound_token
         )
+
+    def _disposition_of(self, lane: str) -> str:
+        rec = LaneLifecycleStore().get(LaneLifecycleKey(_WORKSPACE_ID, lane))
+        return "" if rec is None else rec.lane_disposition
 
     # -- the three residual-lane journal shapes ---------------------------
 
@@ -746,133 +944,142 @@ class PatchEquivalentCommandBoundary(unittest.TestCase):
             with self.subTest(lane=lane):
                 s = self._scenario(issue, lane)
                 self._seed(s)
-                path = self._write(s.primary, s.disposition_dict())
-                code, payload = self._run(self._args(s, disposition_path=path))
+                _install_fake_journal(self, [s.entry()])
+                code, payload = self._run(self._args(s))
                 self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
-                self.assertEqual(
-                    self._disposition(payload)["state"], BOUND_RETIRE_RETIRED
-                )
+                self.assertEqual(self._verdict(payload)["state"], BOUND_RETIRE_RETIRED)
                 self.assertTrue(payload["retire_ok"])
-                rec = LaneLifecycleStore().get(LaneLifecycleKey(_WORKSPACE_ID, lane))
-                self.assertEqual(rec.lane_disposition, DISPOSITION_RETIRED)
-                # Metadata only: the guarded close was never reached.
+                self.assertEqual(self._disposition_of(lane), DISPOSITION_RETIRED)
                 self.assertEqual(self.executed_closes, [])
 
     def test_residual_lane_replay_is_verified_noop(self) -> None:
         issue, lane = _RESIDUAL_LANES[0]
         s = self._scenario(issue, lane)
         self._seed(s)
-        path = self._write(s.primary, s.disposition_dict())
-        self.assertEqual(self._run(self._args(s, disposition_path=path))[0], 0)
-        code, payload = self._run(self._args(s, disposition_path=path))
+        _install_fake_journal(self, [s.entry()])
+        self.assertEqual(self._run(self._args(s))[0], 0)
+        code, payload = self._run(self._args(s))
         self.assertEqual(code, 0)
-        self.assertEqual(
-            self._disposition(payload)["state"], BOUND_RETIRE_ALREADY_RETIRED
-        )
+        self.assertEqual(self._verdict(payload)["state"], BOUND_RETIRE_ALREADY_RETIRED)
         self.assertEqual(self.executed_closes, [])
 
     def test_residual_lane_replay_with_relaunched_pair_fails_closed(self) -> None:
-        # The #13841 j#79150 F2 invariant, carried into #14066: a persisted `retired` never
-        # reports success while a pair is live again.
         issue, lane = _RESIDUAL_LANES[1]
         s = self._scenario(issue, lane)
         self._seed(s)
-        path = self._write(s.primary, s.disposition_dict())
-        self.assertEqual(self._run(self._args(s, disposition_path=path))[0], 0)
+        _install_fake_journal(self, [s.entry()])
+        self.assertEqual(self._run(self._args(s))[0], 0)
         self.rows.extend(
             [
                 {"name": encode_assigned_name(_WORKSPACE_ID, "codex", lane), "pane_id": "w9:pA"},
                 {"name": encode_assigned_name(_WORKSPACE_ID, "claude", lane), "pane_id": "w9:pB"},
             ]
         )
-        code, payload = self._run(self._args(s, disposition_path=path))
+        code, payload = self._run(self._args(s))
         self.assertEqual(code, 1)
-        self.assertEqual(
-            self._disposition(payload)["reason"], BOUND_RETIRE_LIVE_PAIR_PRESENT
-        )
+        self.assertEqual(self._verdict(payload)["reason"], BOUND_RETIRE_LIVE_PAIR_PRESENT)
         self.assertFalse(payload["retire_ok"])
 
-    # -- non-regression: no disposition keeps the literal head_not_integrated
+    # -- non-regression: no journal keeps the literal head_not_integrated -
 
-    def test_no_disposition_keeps_literal_head_not_integrated(self) -> None:
+    def test_no_journal_keeps_literal_head_not_integrated(self) -> None:
         issue, lane = _RESIDUAL_LANES[2]
         s = self._scenario(issue, lane)
         self._seed(s)
-        code, payload = self._run(self._args(s, disposition_path=None))
+        _install_fake_journal(self, [s.entry()])
+        code, payload = self._run(self._args(s, journal=None))
         self.assertEqual(code, 1)
         self.assertEqual(
-            self._disposition(payload)["reason"], BOUND_RETIRE_HEAD_NOT_INTEGRATED
+            self._verdict(payload)["reason"], BOUND_RETIRE_HEAD_NOT_INTEGRATED
         )
-        rec = LaneLifecycleStore().get(LaneLifecycleKey(_WORKSPACE_ID, lane))
-        self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(self._disposition_of(lane), DISPOSITION_HIBERNATED)
 
-    # -- negative: tampered / stale / malformed evidence fails closed -----
+    # -- negative: authority failures fail closed -------------------------
 
-    def test_tampered_patch_id_disposition_fails_closed(self) -> None:
+    def test_tampered_patch_id_fails_closed(self) -> None:
         issue, lane = _RESIDUAL_LANES[0]
         s = self._scenario(issue, lane)
         self._seed(s)
-        d = s.disposition_dict()
-        d["commit_map"][0]["patch_id"] = "cafebabe" * 5
-        path = self._write(s.primary, d)
-        code, payload = self._run(self._args(s, disposition_path=path))
+        disp = s.disposition()
+        tampered = dataclasses.replace(
+            disp,
+            commit_map=(dataclasses.replace(disp.commit_map[0], patch_id="cafebabe" * 5),)
+            + disp.commit_map[1:],
+        )
+        _install_fake_journal(self, [s.entry(tampered)])
+        code, payload = self._run(self._args(s))
         self.assertEqual(code, 1)
-        verdict = self._disposition(payload)
+        verdict = self._verdict(payload)
         self.assertEqual(verdict["state"], BOUND_RETIRE_BLOCKED)
         self.assertEqual(verdict["reason"], BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED)
         self.assertIn(PE_PATCH_ID_MISMATCH, verdict["detail"])
-        rec = LaneLifecycleStore().get(LaneLifecycleKey(_WORKSPACE_ID, lane))
-        self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(self._disposition_of(lane), DISPOSITION_HIBERNATED)
         self.assertEqual(self.executed_closes, [])
 
-    def test_stale_integration_head_disposition_fails_closed(self) -> None:
+    def test_unconfigured_credentials_fail_closed(self) -> None:
         issue, lane = _RESIDUAL_LANES[0]
         s = self._scenario(issue, lane)
         self._seed(s)
-        path = self._write(s.primary, s.disposition_dict(integration_head="a" * 40))
-        code, payload = self._run(self._args(s, disposition_path=path))
+        _install_fake_journal(self, [s.entry()], configured=False)
+        code, payload = self._run(self._args(s))
         self.assertEqual(code, 1)
-        verdict = self._disposition(payload)
+        verdict = self._verdict(payload)
         self.assertEqual(verdict["reason"], BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED)
-        self.assertIn(PE_INTEGRATION_HEAD_STALE, verdict["detail"])
+        self.assertIn(PE_REDMINE_UNCONFIGURED, verdict["detail"])
+        self.assertEqual(self._disposition_of(lane), DISPOSITION_HIBERNATED)
 
-    def test_malformed_disposition_fails_closed(self) -> None:
+    def test_journal_not_found_fails_closed(self) -> None:
         issue, lane = _RESIDUAL_LANES[0]
         s = self._scenario(issue, lane)
         self._seed(s)
-        p = s.primary / "disposition.json"
-        p.write_text("{ broken", encoding="utf-8")
-        code, payload = self._run(self._args(s, disposition_path=str(p)))
+        _install_fake_journal(self, [s.entry()])  # entry lives at _INTEGRATION_JOURNAL
+        code, payload = self._run(self._args(s, journal="70000"))
         self.assertEqual(code, 1)
-        verdict = self._disposition(payload)
+        verdict = self._verdict(payload)
         self.assertEqual(verdict["reason"], BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED)
-        self.assertIn(PE_EVIDENCE_UNREADABLE, verdict["detail"])
+        self.assertIn(PE_JOURNAL_NOT_FOUND, verdict["detail"])
 
     def test_wrong_lane_disposition_fails_closed(self) -> None:
-        # A disposition captured for another lane must never license this one.
         issue, lane = _RESIDUAL_LANES[0]
         s = self._scenario(issue, lane)
         self._seed(s)
-        path = self._write(s.primary, s.disposition_dict(lane="issue_99999_foreign"))
-        code, payload = self._run(self._args(s, disposition_path=path))
+        _install_fake_journal(
+            self, [s.entry(s.disposition(lane="issue_99999_foreign"))]
+        )
+        code, payload = self._run(self._args(s))
         self.assertEqual(code, 1)
         self.assertEqual(
-            self._disposition(payload)["reason"],
-            BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED,
+            self._verdict(payload)["reason"], BOUND_RETIRE_PATCH_EQUIVALENCE_UNVERIFIED
         )
 
-    def test_literal_ancestor_ignores_disposition(self) -> None:
-        # When --branch IS a literal ancestor of --integration-branch, the literal path wins and
-        # the disposition is not even consulted (byte-identical #13845). Point --integration-branch
-        # at the lane branch itself (a trivial literal ancestor) with a bogus disposition present.
+    # -- F2: literal-ancestor green never constructs the resolver ---------
+
+    def test_literal_ancestor_green_never_calls_the_resolver(self) -> None:
+        """Review j#82298 F2: a literal-ancestor lane must not touch the patch-equivalent path.
+
+        Point --integration-branch at the lane branch itself (a trivial literal ancestor) and
+        replace the resolver with a landmine: if the command constructs it on the literal path,
+        the mine fires. The retire must terminalize via the literal path alone.
+        """
         issue, lane = _RESIDUAL_LANES[0]
         s = self._scenario(issue, lane)
         self._seed(s)
-        bogus = self._write(s.primary, {"garbage": True})
-        args = self._args(s, disposition_path=bogus, integration_branch=lane)
+
+        def _landmine(*a, **k):
+            raise AssertionError("resolver called on the literal-ancestor path")
+
+        real = spe.resolve_patch_equivalent_integration
+        spe.resolve_patch_equivalent_integration = _landmine
+        self.addCleanup(
+            lambda: setattr(spe, "resolve_patch_equivalent_integration", real)
+        )
+        # Also make the Redmine source a landmine: the literal path must never read Redmine.
+        _install_fake_journal(self, [], read_error=True)
+        args = self._args(s, integration_branch=lane, journal=_INTEGRATION_JOURNAL)
         code, payload = self._run(args)
         self.assertEqual(code, 0, msg=json.dumps(payload, indent=2))
-        self.assertEqual(self._disposition(payload)["state"], BOUND_RETIRE_RETIRED)
+        self.assertEqual(self._verdict(payload)["state"], BOUND_RETIRE_RETIRED)
+        self.assertEqual(self._fake_journal.reads, [])  # Redmine never read
 
 
 if __name__ == "__main__":  # pragma: no cover
