@@ -190,9 +190,10 @@ class SendEdgeFenceResumedLaneTest(unittest.TestCase):
     """The send-edge fence exempts the resumed-lane current-gate row on an unresolvable anchor."""
 
     class _Row:
-        def __init__(self, journal, route=None):
+        def __init__(self, journal, route=None, normalized_gate="review_request"):
             self.callback_route = route or lane_gateway_route(LANE)
             self.journal = journal
+            self.normalized_gate = normalized_gate
 
     def test_current_request_row_exempt_under_unresolvable_anchor(self) -> None:
         fence = make_lane_gateway_send_edge_fence("", current_request_journal="82690")
@@ -203,6 +204,23 @@ class SendEdgeFenceResumedLaneTest(unittest.TestCase):
         fenced, reason = fence(self._Row("82600"))
         self.assertTrue(fenced)
         self.assertIn("unresolvable", reason)
+
+    def test_same_journal_implementation_done_row_stays_fenced(self) -> None:
+        # Review j#82729 F1: the exemption conjoins the gate kind. A same-journal implementation_done
+        # row (a combined Impl Done / Review Request journal, or a pre-existing backlog row) must stay
+        # fenced — matching on journal alone would wrongly exempt a gate discovery 0-sends.
+        fence = make_lane_gateway_send_edge_fence("", current_request_journal="82690")
+        exempt = fence(self._Row("82690", normalized_gate="review_request"))
+        fenced, reason = fence(self._Row("82690", normalized_gate="implementation_done"))
+        self.assertEqual(exempt, (False, ""))  # the review_request row is exempt
+        self.assertTrue(fenced)  # the implementation_done row on the SAME journal is NOT
+        self.assertIn("unresolvable", reason)
+
+    def test_blank_gate_row_stays_fenced(self) -> None:
+        # A row with no resolvable gate identity cannot be confirmed as the current review_request.
+        fence = make_lane_gateway_send_edge_fence("", current_request_journal="82690")
+        fenced, _ = fence(self._Row("82690", normalized_gate=""))
+        self.assertTrue(fenced)
 
     def test_exemption_only_applies_under_unresolvable_anchor(self) -> None:
         # With a RESOLVABLE anchor the strict older-than-anchor fence stands; the current-request

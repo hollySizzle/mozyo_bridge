@@ -393,12 +393,16 @@ def make_lane_gateway_send_edge_fence(anchor: object, current_request_journal: o
     marker, so ``anchor`` is unresolvable even though the lane's latest full-head Review Request IS the
     current gate. When the caller supplies ``current_request_journal`` (the durable journal id of that
     current full-head ``review_request`` — :func:`current_review_request_journal`), a row whose journal
-    equals it is the current gate and is NEVER fenced by the unresolvable anchor — mirroring the
-    discovery-side rescue so a resumed-lane current row is not terminally dropped at the send edge. The
-    exemption applies ONLY under an unresolvable anchor (the resumed-lane case); a RESOLVABLE anchor
-    keeps the strict older-than-anchor fence. ``current_request_journal`` is a journal id, never a SHA /
-    locator, so the fence stays secret-safe. Pure and duck-typed on ``row.callback_route`` /
-    ``row.journal``.
+    equals it AND whose ``normalized_gate`` is the ``review_request`` gate is the current gate and is
+    NEVER fenced by the unresolvable anchor — mirroring the discovery-side rescue so a resumed-lane
+    current row is not terminally dropped at the send edge. The gate-kind conjunction is required (review
+    j#82729 F1): the discovery rescue (:func:`_current_generation_rescue`) rescues ONLY a review_request
+    gate, so a same-journal ``implementation_done`` row (a combined Impl Done / Review Request gate
+    journal, or a pre-existing backlog row) must stay fenced here too — matching on journal alone would
+    wrongly exempt an implementation_done row that discovery 0-sends. The exemption applies ONLY under an
+    unresolvable anchor (the resumed-lane case); a RESOLVABLE anchor keeps the strict older-than-anchor
+    fence. ``current_request_journal`` is a journal id, never a SHA / locator, so the fence stays
+    secret-safe. Pure and duck-typed on ``row.callback_route`` / ``row.journal`` / ``row.normalized_gate``.
     """
     anchor_int = _as_int(anchor)
     current_request = str(current_request_journal or "").strip()
@@ -410,9 +414,17 @@ def make_lane_gateway_send_edge_fence(anchor: object, current_request_journal: o
         journal = _as_int(row_journal)
         if anchor_int is not None and journal is not None and journal >= anchor_int:
             return (False, "")
-        # #14094: under an unresolvable anchor, the current full-head review_request row is the current
-        # decision anchor for a RESUMED lane — never fenced by the missing IR anchor.
-        if anchor_int is None and current_request and row_journal == current_request:
+        # #14094 (review j#82729 F1): under an unresolvable anchor, the current full-head review_request
+        # row is the current decision anchor for a RESUMED lane — never fenced by the missing IR anchor.
+        # The exemption conjoins the gate kind so it mirrors the discovery rescue (review_request only):
+        # a same-journal implementation_done row stays fenced, never wrongly exempted on a journal match.
+        row_gate = str(getattr(row, "normalized_gate", "") or "").strip()
+        if (
+            anchor_int is None
+            and current_request
+            and row_journal == current_request
+            and row_gate == GATE_REVIEW_REQUEST
+        ):
             return (False, "")
         reason = (
             "fenced: dispatch anchor unresolvable"
