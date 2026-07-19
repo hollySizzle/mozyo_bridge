@@ -49,6 +49,8 @@ from mozyo_bridge.core.state.replacement_transaction import (
 from mozyo_bridge.core.state.replacement_transaction_model import (
     CAS_GENERATION_MISMATCH,
     CAS_LEASE_NOT_HELD,
+    CAS_NOT_FOUND,
+    CAS_STALE_REVISION,
     ContinuationPointerError,
     DecisionPointerError,
     ParticipantPinError,
@@ -125,6 +127,12 @@ REDISPATCH_CONTINUATION_UNREADABLE = "continuation_unreadable"
 #: #13806 R3-F1, Review j#82731). The phase stays not-attempted so a later re-run re-joins and
 #: sends once authority is restored; never a blind send into a lane the approval no longer governs.
 REDISPATCH_AUTHORITY_MOVED = "authority_moved"
+
+#: Bounded re-read + retry cap for un-recording a proven zero-send attempt whose revert CAS was
+#: refused by a concurrent write (Redmine #13806 R3 Progress blocker j#82768). A lease-held revert
+#: converges in one or two iterations once the racing write settles; the cap only backstops a
+#: pathological loop, and hitting it reports ``uncertain`` (never a false ``authority_moved``).
+_UN_RECORD_RETRY_CAP = 8
 
 
 def _utc_now() -> str:
@@ -791,11 +799,7 @@ class StaleWorkerRecoveryUseCase:
         # applied here (the fresh worker is now live at the name by design; its already-confirmed
         # action-bound attestation is what proves it is ours).
         if not self._ops.resume_lane_authority(request):
-            self._store.release_drain_attempt(
-                key, expected_revision=fresh.revision, expected_action_generation=gen,
-                holder=holder, now=self._clock(),
-            )
-            return REDISPATCH_AUTHORITY_MOVED
+            return self._un_record_attempt(key, holder=holder, gen=gen)
         if self._ops.redispatch_gate(continuation) != DRAIN_SEND_OK:
             # Send failed; the state stays attempted/draining_continuation. A re-run re-checks
             # the gate and only completes if it confirms — never a blind resend.
@@ -803,6 +807,61 @@ class StaleWorkerRecoveryUseCase:
         if not self._ops.gate_redispatched(continuation):
             return REDISPATCH_UNCERTAIN
         return self._finalize_confirmed(key, holder=holder, gen=gen)
+
+    def _un_record_attempt(self, key, *, holder, gen) -> str:
+        """Un-record a PROVEN zero-send attempt, handling the release CAS outcome (j#82768).
+
+        The lane authority moved immediately before the transport, so the redispatch did NOT
+        send. The attempt (``draining_continuation``) must be reverted to ``replacing_nonself`` so
+        a re-run re-attempts exactly once. The revert is a CAS that can be REFUSED — a concurrent
+        write raced the read that fed ``expected_revision`` — and its outcome must NEVER be
+        ignored (Progress blocker j#82768): a silently-refused revert leaves ``draining_continuation``,
+        which a re-run mistakes for a send-in-flight and gets stuck at ``uncertain`` forever.
+
+        So each attempt re-reads the CURRENT row and classifies it into a typed disposition:
+
+        - row gone / newer generation / lost lease -> a concrete typed blocker (never
+          ``authority_moved``, which would claim a re-sendable state that is not one);
+        - already ``replacing_nonself`` (a concurrent holder reverted, or it was never attempted)
+          -> ``authority_moved`` (re-sendable);
+        - ``completed`` (a concurrent holder dispatched + drained) -> ``confirmed``;
+        - still ``draining_continuation`` with the live lease at the current revision -> release
+          with THAT revision; a stale-revision refusal re-reads and retries (a lease-held revert
+          converges once the racing write settles). A bounded cap backstops a pathological loop
+          with ``uncertain`` (never a false ``authority_moved``).
+        """
+        for _ in range(_UN_RECORD_RETRY_CAP):
+            rec = self._store.get(key)
+            if rec is None:
+                return REDISPATCH_NOT_FOUND
+            if rec.action_generation != gen:
+                return REDISPATCH_GENERATION_MISMATCH
+            if rec.phase == PHASE_REPLACING_NONSELF:
+                return REDISPATCH_AUTHORITY_MOVED  # re-sendable (reverted / never attempted)
+            if rec.phase == PHASE_COMPLETED:
+                return REDISPATCH_CONFIRMED  # a concurrent holder dispatched + drained
+            if rec.phase != PHASE_DRAINING_CONTINUATION:
+                # An unexpected concurrent phase (a self flow / mid-transition); never claim
+                # re-sendable — report uncertain so a re-run re-reads and re-classifies.
+                return REDISPATCH_UNCERTAIN
+            now = self._clock()
+            if rec.lease_holder != holder or not rec.lease_is_live(now):
+                return REDISPATCH_LEASE_LOST
+            out = self._store.release_drain_attempt(
+                key, expected_revision=rec.revision, expected_action_generation=gen,
+                holder=holder, now=now,
+            )
+            if out.applied:
+                return REDISPATCH_AUTHORITY_MOVED  # reverted -> re-sendable
+            if out.reason == CAS_GENERATION_MISMATCH:
+                return REDISPATCH_GENERATION_MISMATCH
+            if out.reason == CAS_LEASE_NOT_HELD:
+                return REDISPATCH_LEASE_LOST
+            if out.reason not in (CAS_STALE_REVISION, CAS_NOT_FOUND):
+                # An unexpected refusal reason — never claim re-sendable; a re-run re-reads.
+                return REDISPATCH_UNCERTAIN
+            # CAS_STALE_REVISION / CAS_NOT_FOUND: a concurrent write moved the row — re-read + retry.
+        return REDISPATCH_UNCERTAIN  # runaway backstop (a real lease-held revert converges quickly)
 
     def _finalize_confirmed(self, key, *, holder, gen) -> str:
         """Advance a gate-confirmed transaction to ``completed`` with ZERO send (idempotent).

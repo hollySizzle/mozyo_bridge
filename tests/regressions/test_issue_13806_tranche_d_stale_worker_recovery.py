@@ -40,6 +40,9 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionStore,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
+    CAS_LEASE_NOT_HELD,
+    CAS_STALE_REVISION,
+    CasOutcome,
     PARTICIPANT_CLOSE_OWED,
     PARTICIPANT_LAUNCH_OWED,
     PARTICIPANT_REPLACED,
@@ -63,7 +66,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECOVERY_PREFLIGHT,
     RECOVERY_REFUSED,
     RECOVERY_STOPPED,
+    REDISPATCH_AUTHORITY_MOVED,
     REDISPATCH_CONFIRMED,
+    REDISPATCH_LEASE_LOST,
     REDISPATCH_UNCERTAIN,
     RecoveryRequest,
     StaleWorkerRecoveryOps,
@@ -1025,6 +1030,76 @@ class PostCloseResumeTests(_RecoveryCase):
         second = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(second.status, RECOVERY_COMPLETED)
         self.assertEqual(len(ops.sends), 1)
+
+    def _to_authority_moved_release(self, release_impl):
+        """Drive a resume to the point of an authority-moved un-record, with a hooked release CAS.
+
+        Returns the outcome of a run where the launch succeeds, the authority moves before the
+        send, and ``release_drain_attempt`` is replaced by ``release_impl`` (to force refusals).
+        """
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        ops._resume_lane_authority = [True, False]  # current at launch, moved before the send
+        orig = self.store.release_drain_attempt
+        self.store.release_drain_attempt = release_impl(orig)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        return ops, outcome, orig
+
+    def test_release_cas_stale_revision_is_re_read_and_retried_not_ignored(self):
+        # Progress blocker j#82768: the revert CAS can be refused (a concurrent write raced the
+        # revision that fed expected_revision). The outcome must NOT be ignored — it is re-read and
+        # retried, converging to re-sendable (replacing_nonself), so a re-run sends exactly once.
+        calls = []
+
+        def release_impl(orig):
+            def flaky(key, **kw):
+                calls.append(1)
+                if len(calls) == 1:  # first attempt: a stale-revision refusal
+                    return CasOutcome(
+                        applied=False, reason=CAS_STALE_REVISION,
+                        revision=kw["expected_revision"] + 1,
+                    )
+                return orig(key, **kw)  # the re-read retry applies
+            return flaky
+
+        ops, outcome, orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_AUTHORITY_MOVED)
+        self.assertEqual(ops.sends, [])  # zero send
+        self.assertGreaterEqual(len(calls), 2)  # the refusal was re-read + retried, not ignored
+        self.assertEqual(self._phase(), PHASE_REPLACING_NONSELF)  # reverted -> re-sendable
+        # a re-run (release restored, authority current) sends exactly once
+        self.store.release_drain_attempt = orig
+        ops._resume_lane_authority = True
+        second = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(second.status, RECOVERY_COMPLETED)
+        self.assertEqual(len(ops.sends), 1)
+
+    def test_release_cas_lease_lost_is_typed_blocker_not_false_re_sendable(self):
+        # A revert refused because the lease was lost is a CONCRETE typed blocker (lease_lost) —
+        # never a false authority_moved that claims a re-sendable state it did not reach.
+        def release_impl(orig):
+            return lambda key, **kw: CasOutcome(
+                applied=False, reason=CAS_LEASE_NOT_HELD, revision=kw["expected_revision"],
+            )
+
+        _ops, outcome, _orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_LEASE_LOST)
+        self.assertEqual(outcome.status, RECOVERY_STOPPED)
+
+    def test_release_cas_persistently_refused_caps_to_uncertain_never_false_re_sendable(self):
+        # A pathologically persistent stale-revision refusal hits the bounded cap and reports
+        # uncertain — NEVER a false authority_moved (which would claim the attempt was un-recorded
+        # when it was not).
+        def release_impl(orig):
+            return lambda key, **kw: CasOutcome(
+                applied=False, reason=CAS_STALE_REVISION, revision=kw["expected_revision"] + 1,
+            )
+
+        ops, outcome, _orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_UNCERTAIN)
+        self.assertNotEqual(outcome.redispatch_status, REDISPATCH_AUTHORITY_MOVED)
+        self.assertEqual(ops.sends, [])
 
     def test_admitted_resume_reverifies_authority_effect_bound_then_completes(self):
         # The legitimate path: expected absence admitted, authority exact and current at BOTH the
