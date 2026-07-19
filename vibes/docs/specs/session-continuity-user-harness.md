@@ -50,6 +50,35 @@ release chain を引き継ぐ bundle は、local verification だけで「releas
 - package version decision、version bump、build、artifact inspection、TestPyPI publish、TestPyPI exact-version install、installed CLI E2E の各 gate。
 - owner 承認の対象と除外。TestPyPI 承認を production PyPI / GitHub Releaseへ拡張解釈しない。
 
+### Installed environment evidence
+
+公開候補・公開済み artifact を source checkout の外で検証する session を引き継ぐ場合、package の正しさと実行環境の正しさを collapse しない。transition bundle / journal は少なくとも次を独立して記録する。
+
+```yaml
+installed_environment_evidence:
+  artifact:
+    source: workflow_artifact | testpypi | pypi
+    exact_version: <version>
+    source_sha: <origin-reachable commit>
+    local_substitution: false
+  environment:
+    image_ref: <public image tag or digest>
+    reproducibility: pinned_digest | floating_canary
+    runtime_user: non_root | root
+    home_state: fresh | persistent
+    source_checkout_mount: absent | present
+  verification:
+    surfaces: []
+    result: passed | failed | blocked | not_run
+    external_live_scope: excluded | separately_verified
+```
+
+- blocking gate は再現可能な pinned image digest と exact artifact authority を使う。floating image tag は OS drift canary として別 verdict にし、blocking gate の証拠へ読み替えない。
+- published index install を要求する acceptance で local wheel / editable install / source mount を代替証拠にしない。workflow artifact の pre-publish smoke は別の artifact source として明示する。
+- container 内の command smoke は real agent TUI、tmux / terminal transport、外部 ticket service の live E2E を自動的に保証しない。実施していない面は `external_live_scope: excluded` として残す。
+- image、repository、journalへ credentialを格納しない。外部 serviceを検証する場合はsecret injectionとその値を記録せず、別gateで結果だけを残す。
+- failureを観測しただけで既知 product defectと断定しない。exact artifact / image / command / expected / actualを再現し、Bugへ切り出した durable anchorを記録する。
+
 ### Routable lane state の区別
 
 lane を bundle / journal に記す場合、「target lane label」を live で routable な herdr lane と同一視しない。次の 3 state を **独立して** 記録し、collapse しない (Redmine #13543)。
