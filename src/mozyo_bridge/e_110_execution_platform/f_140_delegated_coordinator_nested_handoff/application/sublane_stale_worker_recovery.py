@@ -301,6 +301,37 @@ class StaleWorkerRecoveryOps(Protocol):
         """
         ...
 
+    def lane_worktree_readable(self, request: RecoveryRequest) -> bool:
+        """Is the lane's recovery worktree currently READABLE? (read-only, Redmine #13806 R3-F1)
+
+        The second ambient fence a **post-close resume** re-verifies before any owed launch /
+        send: byte preservation requires a *readable* worktree to relaunch the fresh worker into.
+        A post-close replay observes the old worker as absent (``identity_unknown``), so the entry
+        preflight's ``worktree_readable`` gate is short-circuited and never re-checked — this
+        re-reads the lane's worktree directly (old-slot-independent) and returns ``True`` only when
+        it resolves. Fail-closed: an unreadable worktree returns ``False`` so the resume stops zero
+        launch / send. A **dirty (but readable)** worktree is NOT unreadable — it is byte-preserved
+        and recovered, exactly as a fresh recovery does (the tranche D contract, IR j#79485 §4 /
+        ``assess_worker_recovery_preservation``); this fence is readability only, never a dirty
+        block.
+        """
+        ...
+
+    def lane_free_of_foreign_live(self, request: RecoveryRequest) -> bool:
+        """Is the lane free of a foreign PRODUCTIVE live process? (read-only, Redmine #13806 R3-F1)
+
+        The third ambient fence a **post-close resume** re-verifies (Design Consultation Answer
+        j#82708 block list): a *productive* live process (a busy provider / running tool-child)
+        occupying the lane's assigned name is foreign work the relaunch must never collide with.
+        Old-slot-independent: it scans for a productive live row at the lane's assigned name, not
+        the (absent) pinned old locator. The freshly relaunched recovery worker is IDLE (awaiting
+        its redispatch), not productive, so it never trips this fence — only genuine foreign work
+        does. An IDLE stale residue at the name is exactly what recover-stale recovers and is NOT
+        a foreign-live block. Returns ``True`` when the lane is free (safe to launch); ``False``
+        (fail-closed) when a productive live process is present or the inventory is unreadable.
+        """
+        ...
+
 
 class StaleWorkerRecoveryUseCase:
     """Read-only preflight + owner-approved atomic recovery of a stale sublane worker."""
@@ -428,6 +459,39 @@ class StaleWorkerRecoveryUseCase:
                 detail=(
                     "live lane lifecycle no longer matches the approved generation "
                     "(moved / newer / unreadable); zero close / launch / send"
+                ),
+            )
+        # R3-F1 — the fresh worker relaunches into the lane's worktree, so byte preservation
+        # requires it to be READABLE. The entry preflight's worktree gate is short-circuited on a
+        # post-close absence (identity_unknown), so re-verify readability here, old-slot-
+        # independent. An UNREADABLE worktree fences the launch/send zero-effect (a dirty but
+        # readable worktree is byte-preserved and recovered, NOT blocked — the tranche D
+        # contract; this fence is readability only). A later re-run with a readable worktree
+        # resumes from the same durable owed state.
+        if not self._ops.lane_worktree_readable(request):
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation, post_close_resume=True,
+                phase=current.phase, revision=current.revision,
+                detail=(
+                    "lane recovery worktree is unreadable; byte preservation requires a "
+                    "readable worktree; zero close / launch / send"
+                ),
+            )
+        # R3-F1 (Design Consultation Answer j#82708) — a foreign PRODUCTIVE live process (a busy
+        # provider / running tool-child) occupying the lane's assigned name is live work the
+        # relaunch must never collide with. The entry preflight's not_productive gate is
+        # short-circuited on a post-close absence, so re-verify it here, old-slot-independent. The
+        # freshly relaunched recovery worker is idle (never productive), so this fences only
+        # genuine foreign work — an idle stale residue is what the recovery recovers, not a block.
+        if not self._ops.lane_free_of_foreign_live(request):
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation, post_close_resume=True,
+                phase=current.phase, revision=current.revision,
+                detail=(
+                    "a foreign productive live process occupies the lane; zero close / "
+                    "launch / send"
                 ),
             )
         # §5 — the resume RE-approval anchor is a SEPARATE authority from the stored decision /

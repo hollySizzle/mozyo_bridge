@@ -852,9 +852,13 @@ observation に join し、次の typed decision を返す。
   （launch → attest → 元 gate exactly-once redispatch）へ接続する。admission は **`identity_unknown`（expected old-locator
   absence）のみ**に閉じる: worktree unreadable/dirty・stale generation・productive・gateway/foreign 等の他 blocker は
   old slot が resolve した real な current-state fence ゆえ resume で迂回せず block を維持する（R3-F1）。さらに **各 resume
-  command は owed launch/send の前に live lane lifecycle（revision, generation）を pin と再照合**（old-slot/fresh-slot 非依存）:
-  moved/newer/unreadable lifecycle は zero close/launch/send（lease authority は actuator が effect 直前に再認証、worktree は
-  admission + unreadable launch の fail-closed が担保）。durable transaction 不在 / `close_owed` 止まり / generation 相違は
+  command は owed launch/send の前に live lane lifecycle（revision, generation）・lane recovery worktree readability・
+  foreign productive-live 不在を再検証**（old-slot/fresh-slot 非依存、独立軸: readability / lifecycle / lease / liveness / identity）:
+  moved/newer/unreadable lifecycle・unreadable worktree・foreign productive live process（busy provider / running tool-child）は
+  zero close/launch/send で durable transaction を温存する（lease authority は actuator が effect 直前に再認証、foreign worker は
+  action-bound attestation も捕捉）。**dirty（but readable）worktree は byte 保存対象ゆえ block しない**（Design Consultation
+  Answer j#82708 Option A / tranche D contract, IR j#79485 §4 / `assess_worker_recovery_preservation`; 初回 close_owed と
+  retry launch_owed で同一 policy、launch failure timing で挙動を変えない）。durable transaction 不在 / `close_owed` 止まり / generation 相違は
   resume と認めず block を維持する（新規 plan も blind launch もしない）。owner re-approval journal は
   stored decision/continuation anchor（同一 CAS identity を保つ `--journal`）と **別 pointer**（`--resume-journal`）で
   表し、same-action CAS と fresh durable approval を両立させる。

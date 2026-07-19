@@ -541,6 +541,44 @@ class LiveStaleWorkerRecoveryOps:
             return False
         return str(record.revision) == pinned_rev and str(record.lane_generation) == pinned_gen
 
+    def lane_worktree_readable(self, request: RecoveryRequest) -> bool:
+        """Is the lane's recovery worktree readable? (read-only, Redmine #13806 R3-F1)
+
+        The fresh worker relaunches into the recovery's target execution root (``repo_root``), so
+        byte preservation requires that worktree to be READABLE. Re-probed old-slot-independent on
+        a post-close resume (the absent old worker carries no row to read it from). Fail-closed: an
+        unresolvable worktree returns ``False``. Readability only — a dirty but readable worktree
+        is byte-preserved and recovered (the tranche D contract), never blocked here.
+        """
+        try:
+            return probe_worktree_resolved(str(self.repo_root)) is True
+        except Exception:  # noqa: BLE001 - an unreadable worktree fails closed
+            return False
+
+    def lane_free_of_foreign_live(self, request: RecoveryRequest) -> bool:
+        """Is the lane free of a foreign PRODUCTIVE live process? (read-only, Redmine #13806 R3-F1)
+
+        Scan the live herdr inventory for a PRODUCTIVE (busy) row at the recovery's assigned name
+        (old-slot-independent — any row at the name, not the absent pinned old locator). The freshly
+        relaunched recovery worker is idle (awaiting redispatch), so a busy row at the name is
+        foreign work the relaunch must not collide with. Fail-closed: an unreadable inventory returns
+        ``False``. An idle stale residue at the name is NOT productive and does not fence the resume
+        (it is exactly what recover-stale recovers).
+        """
+        try:
+            rows = self._rows()
+        except Exception:  # noqa: BLE001 - unreadable inventory fails closed
+            return False
+        name = _norm(request.assigned_name)
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if _norm(row.get(AGENT_KEY_NAME)) != name:
+                continue
+            if _row_runtime_state(row) == RUNTIME_BUSY:
+                return False
+        return True
+
     # -- redispatch (high-level rail + REAL delivery-ledger oracle, Redmine #13806 R2-F3) ----
 
     def redispatch_gate(self, continuation: ContinuationPointer) -> str:

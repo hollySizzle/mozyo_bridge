@@ -677,5 +677,46 @@ class LaneLifecycleCurrentTests(_LiveCase):
         self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="", lane_generation="")))
 
 
+class LaneWorktreeReadableTests(_LiveCase):
+    """R3-F1: the post-close resume re-verifies the lane recovery worktree is readable."""
+
+    def test_real_checkout_is_readable(self):
+        # ROOT is a real git checkout — the recovery worktree resolves.
+        ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
+        self.assertTrue(ops.lane_worktree_readable(_request()))
+
+    def test_nonexistent_worktree_is_unreadable_fail_closed(self):
+        ops = live.LiveStaleWorkerRecoveryOps(
+            repo_root=Path("/nonexistent/mozyo_recovery_xyz"), request=_request(),
+        )
+        self.assertFalse(ops.lane_worktree_readable(_request()))
+
+
+class LaneFreeOfForeignLiveTests(_LiveCase):
+    """R3-F1: the post-close resume re-verifies no foreign PRODUCTIVE process holds the lane."""
+
+    def test_empty_inventory_is_free(self):
+        self.assertTrue(self._ops([]).lane_free_of_foreign_live(_request()))
+
+    def test_idle_stale_residue_at_name_is_free(self):
+        # An IDLE (unknown / not-busy) row at the name is stale residue — NOT a foreign-live block
+        # (it is exactly what recover-stale recovers).
+        self.assertTrue(self._ops([_row(status="unknown")]).lane_free_of_foreign_live(_request()))
+
+    def test_productive_process_at_name_is_not_free(self):
+        # A BUSY (working) row at the assigned name is foreign live work — fail-closed.
+        self.assertFalse(
+            self._ops([_row(agent="claude", status="working")]).lane_free_of_foreign_live(_request())
+        )
+
+    def test_unreadable_inventory_is_not_free_fail_closed(self):
+        def boom(env):
+            raise RuntimeError("herdr down")
+
+        live.list_herdr_agent_rows = boom
+        ops = live.LiveStaleWorkerRecoveryOps(repo_root=ROOT, request=_request())
+        self.assertFalse(ops.lane_free_of_foreign_live(_request()))
+
+
 if __name__ == "__main__":
     unittest.main()

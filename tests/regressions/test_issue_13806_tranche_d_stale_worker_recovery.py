@@ -160,7 +160,8 @@ class FakeRecoveryOps:
 
     def __init__(
         self, observation, *, send_result=DRAIN_SEND_OK, confirm_after_send=True,
-        already_landed=False, lane_lifecycle_current=True,
+        already_landed=False, lane_lifecycle_current=True, lane_worktree_readable=True,
+        lane_free_of_foreign_live=True,
     ):
         self._observation = observation
         self.send_result = send_result
@@ -171,6 +172,14 @@ class FakeRecoveryOps:
         #: current; a test sets it False to simulate a moved / newer / unreadable lifecycle.
         self._lane_lifecycle_current = lane_lifecycle_current
         self.lifecycle_checks: list = []
+        #: The lane worktree readability re-verification a post-close resume consults (R3-F1).
+        #: Default readable; a test sets it False to simulate an unreadable worktree.
+        self._lane_worktree_readable = lane_worktree_readable
+        self.worktree_checks: list = []
+        #: The lane foreign-live re-verification a post-close resume consults (R3-F1). Default
+        #: free; a test sets it False to simulate a foreign productive live process.
+        self._lane_free_of_foreign_live = lane_free_of_foreign_live
+        self.foreign_live_checks: list = []
 
     def observe_target(self, request) -> RecoveryObservation:
         return self._observation
@@ -187,6 +196,14 @@ class FakeRecoveryOps:
     def lane_lifecycle_current(self, request) -> bool:
         self.lifecycle_checks.append(request)
         return self._lane_lifecycle_current
+
+    def lane_worktree_readable(self, request) -> bool:
+        self.worktree_checks.append(request)
+        return self._lane_worktree_readable
+
+    def lane_free_of_foreign_live(self, request) -> bool:
+        self.foreign_live_checks.append(request)
+        return self._lane_free_of_foreign_live
 
 
 class _RecoveryCase(unittest.TestCase):
@@ -955,6 +972,59 @@ class PostCloseResumeTests(_RecoveryCase):
         self.assertTrue(outcome.post_close_resume)
         self.assertEqual(outcome.status, RECOVERY_COMPLETED)
         self.assertTrue(ops.lifecycle_checks)  # re-verified on the resume command
+
+    def test_unreadable_worktree_blocks_admitted_resume_zero_launch_send(self):
+        # The expected old-locator absence IS admitted and the lane lifecycle is current, but the
+        # recovery worktree is now UNREADABLE — byte preservation needs a readable worktree to
+        # relaunch into, so the resume re-verifies it before the owed launch/send and stops
+        # zero-effect (R3-F1), preserving the durable transaction for a later re-run.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()  # identity_unknown => admitted
+        ops._lane_worktree_readable = False  # but the worktree is unreadable
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertTrue(outcome.post_close_resume)  # admitted, then re-verify blocked it
+        self.assertIn("worktree is unreadable", outcome.detail)
+        self.assertTrue(ops.worktree_checks)  # the readability re-verification was consulted
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)  # transaction intact
+
+    def test_foreign_productive_live_blocks_admitted_resume_zero_launch_send(self):
+        # A foreign PRODUCTIVE live process (a busy provider / running tool-child) occupies the
+        # lane — the relaunch must not collide with live work (Design Consultation Answer j#82708
+        # block list). The resume re-verifies it before the owed launch/send and stops
+        # zero-effect, preserving the transaction.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()  # identity_unknown => admitted
+        ops._lane_free_of_foreign_live = False  # a foreign productive process appeared
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertIn("foreign productive live process", outcome.detail)
+        self.assertTrue(ops.foreign_live_checks)
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)  # transaction intact
+
+    def test_dirty_but_readable_worktree_resume_completes_byte_preserved(self):
+        # The tranche D byte-preservation contract holds on the resume too (Design Consultation
+        # Answer j#82708 Option A): a DIRTY (but readable) worktree is the un-durable-ized work the
+        # recovery exists to preserve — the readability fence passes (dirty != unreadable), no
+        # foreign-live is present, so the resume relaunches into it and completes, exactly as a
+        # fresh recovery does (test_stale_worker_with_dirty_unrecorded_worktree_closes_present_slot,
+        # the first-success path). Same conclusion for first-success AND retry-after-launch-failure
+        # — the launch-failure timing never changes the byte-preservation outcome. A dirty worktree
+        # is NEVER blocked by the post-close resume fence.
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        ops._lane_worktree_readable = True  # dirty-but-readable is still readable
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        self.assertTrue(ops.worktree_checks)
+        self.assertTrue(ops.foreign_live_checks)
 
     # -- §5 dual-anchor: resume re-approval is a separate authority from the CAS anchor ----
 
