@@ -41,6 +41,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
     LANE_AMBIGUOUS_OWNER,
     LANE_BLANK_GENERATION,
+    LANE_CURRENT_HEAD_UNCONFIRMED,
     LANE_NO_GATEWAY,
     LANE_NO_OWNER,
     LANE_PREVIOUS_GENERATION,
@@ -134,11 +135,16 @@ class PlanLaneGatewaySendsTest(unittest.TestCase):
         )
         self.assertEqual(plan.reason, LANE_PREVIOUS_GENERATION)
 
-    def test_unresolvable_anchor_fails_closed(self) -> None:
+    def test_unresolvable_anchor_head_less_request_fails_closed(self) -> None:
+        # Redmine #14094: an unresolvable anchor (a RESUMED lane with no fresh dispatch marker) no
+        # longer blanket-fences as previous-generation. A head-LESS latest review_request looks current
+        # (it IS the latest request) but its head is not a confirmable full head, so it fails closed
+        # with the distinct current-head-unconfirmed diagnostic (still emit=False).
         plan = self._only(
             plan_lane_gateway_sends([_req("110")], ISSUE, _owner(), dispatch_anchor_journal="")
         )
-        self.assertEqual(plan.reason, LANE_PREVIOUS_GENERATION)
+        self.assertFalse(plan.emit)
+        self.assertEqual(plan.reason, LANE_CURRENT_HEAD_UNCONFIRMED)
 
     def test_current_generation_gate_emits_under_anchor(self) -> None:
         plan = self._only(

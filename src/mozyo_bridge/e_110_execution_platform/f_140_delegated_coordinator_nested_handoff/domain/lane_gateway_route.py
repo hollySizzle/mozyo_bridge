@@ -35,6 +35,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OWNER_AMBIGUOUS,
     OWNER_RESOLVED,
     OwningLaneBinding,
+    current_review_generation_head,
+    is_full_commit_head,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     GATE_IMPLEMENTATION_DONE,
@@ -68,6 +70,14 @@ LANE_BLANK_GENERATION = "blank_owning_generation"  # the owning lane carries no 
 #: supervisor); a supplied-but-unresolvable anchor also lands here (fail-closed — a generation we cannot
 #: pin never authorizes a send).
 LANE_PREVIOUS_GENERATION = "previous_generation_gate"
+#: The gate is the issue's LATEST ``review_request`` (it LOOKS like the current gate) but its
+#: ``target_head`` is not a confirmable full commit head — missing / malformed / ambiguous (Redmine
+#: #14094). Distinct from :data:`LANE_PREVIOUS_GENERATION` (a genuine historical fence: an older
+#: superseded request or a non-review_request gate) so a refusal diagnostic separates "current-head
+#: rejected" from "historical fence" (secret-safe: names neither the SHA nor a locator). A fail-closed
+#: zero-send — a current generation we cannot pin by a unique full head never authorizes a send, and a
+#: prose SHA is never guessed to complete it.
+LANE_CURRENT_HEAD_UNCONFIRMED = "current_head_unconfirmed"
 #: The worker gate has already been answered by a later review-side gate (``review`` / ``review_result``)
 #: on the issue — the gateway ALREADY reviewed this work, so re-waking it to "please review" would be a
 #: spurious duplicate wake (design answer j#82367: no over-send / no duplicate wake). A worker gate wakes
@@ -86,6 +96,7 @@ LANE_REFUSAL_REASONS = frozenset(
         LANE_NO_GATEWAY,
         LANE_BLANK_GENERATION,
         LANE_PREVIOUS_GENERATION,
+        LANE_CURRENT_HEAD_UNCONFIRMED,
         LANE_SHADOWED,
     }
 )
@@ -148,6 +159,75 @@ def gate_is_shadowed(gate_journal: object, latest_review: Optional[int]) -> bool
     return latest_review is not None and gj is not None and gj < latest_review
 
 
+def latest_review_request_journal(markers: Iterable[JournalMarker], issue: str) -> Optional[int]:
+    """The newest ``review_request`` marker journal id on ``issue``, or ``None`` (pure; Redmine #14094).
+
+    Redmine journal ids are monotonic, so the greatest id is the most recent review round's request.
+    ``None`` when the issue carries no numeric ``review_request`` marker. Duck-typed on
+    ``marker.issue`` / ``.gate`` / ``.journal``.
+    """
+    issue_s = str(issue or "").strip()
+    request_journals = [
+        j
+        for m in markers
+        if str(getattr(m, "issue", "") or "").strip() == issue_s
+        and str(getattr(m, "gate", "") or "").strip() == GATE_REVIEW_REQUEST
+        for j in (_as_int(getattr(m, "journal", "")),)
+        if j is not None
+    ]
+    return max(request_journals) if request_journals else None
+
+
+def current_review_request_journal(markers: Iterable[JournalMarker], issue: str) -> str:
+    """The journal id of the CURRENT review generation's full-head ``review_request``, or ``""`` (#14094).
+
+    The "current decision anchor" for a RESUMED correction lane whose fresh generation carries no new
+    ``implementation_request`` marker (so the IR dispatch anchor is unresolvable): the current gate is
+    then pinned by the issue's latest ``review_request`` itself, but ONLY when its ``target_head`` is a
+    confirmable full commit head that equals the current review generation head
+    (:func:`...review_return_route.current_review_generation_head` — blank on a missing / malformed /
+    ambiguous head). ``""`` when there is no ``review_request`` marker, or the latest one's head is not a
+    confirmable full head (fail-closed — never a prose SHA guess). The value is a durable journal id (no
+    SHA / locator), so it is secret-safe to thread into the send-edge fence.
+    """
+    marker_list = list(markers)
+    latest = latest_review_request_journal(marker_list, issue)
+    if latest is None:
+        return ""
+    if not is_full_commit_head(current_review_generation_head(marker_list, issue)):
+        return ""
+    return str(latest)
+
+
+def _current_generation_rescue(
+    marker: JournalMarker, marker_list: "list[JournalMarker]", issue: str, gate: str
+) -> Optional[str]:
+    """Classify a worker gate under an UNRESOLVABLE dispatch anchor (pure; Redmine #14094).
+
+    A RESUMED correction lane opens a fresh generation WITHOUT a new ``implementation_request`` marker,
+    so its IR dispatch anchor is unresolvable (``""``) even though the lane's latest full-head Review
+    Request IS the current gate. The current decision anchor is then the ``review_request`` itself, not
+    the IR marker. Returns ``None`` (the current gate — emit) ONLY for the issue's current review
+    generation request (:func:`current_review_request_journal`). Every other gate stays fail-closed with
+    a diagnostic that DISTINGUISHES a historical fence (:data:`LANE_PREVIOUS_GENERATION` — a
+    non-review_request gate, or an older superseded request) from a "looks current but unconfirmable
+    head" refusal (:data:`LANE_CURRENT_HEAD_UNCONFIRMED` — the latest request but its head is missing /
+    malformed / ambiguous). Never guesses a prose SHA.
+    """
+    if gate != GATE_REVIEW_REQUEST:
+        return LANE_PREVIOUS_GENERATION  # only a review_request is pinned by the review generation head
+    gate_journal = _as_int(getattr(marker, "journal", ""))
+    latest_rr = latest_review_request_journal(marker_list, issue)
+    if latest_rr is None or gate_journal is None or gate_journal < latest_rr:
+        return LANE_PREVIOUS_GENERATION  # superseded by a newer review_request -> historical fence
+    # This IS the issue's latest review_request. It is the current gate only when its full head is the
+    # confirmed current review generation head; a missing / malformed / ambiguous head looks current but
+    # cannot be pinned (a distinct diagnostic from a historical fence).
+    if not current_review_request_journal(marker_list, issue):
+        return LANE_CURRENT_HEAD_UNCONFIRMED
+    return None  # the current full-head review_request -> the current gate
+
+
 @dataclass(frozen=True)
 class LaneGatewaySendPlan:
     """The pure plan for waking one worker gate's same-lane implementation_gateway.
@@ -186,6 +266,8 @@ def _plan_one(
     marker: JournalMarker,
     owner: OwningLaneBinding,
     *,
+    marker_list: "list[JournalMarker]",
+    issue: str,
     dispatch_anchor_journal: Optional[str],
     latest_review: Optional[int],
 ) -> LaneGatewaySendPlan:
@@ -222,13 +304,26 @@ def _plan_one(
         return LaneGatewaySendPlan(
             emit=False, reason=LANE_SHADOWED, gate_journal=journal, gate=gate
         )
-    # The generation fence (design answer j#82367): a worker gate on a journal OLDER than the current
-    # owning lane+generation's dispatch anchor is a previous-generation gate on a restarted lane, and a
-    # supplied-but-unresolvable anchor (``""``) is fail-closed — a generation we cannot pin never sends.
+    # The generation fence (design answer j#82367 + Redmine #14094): a worker gate on a journal OLDER
+    # than the current owning lane+generation's dispatch anchor is a previous-generation gate on a
+    # restarted lane. Redmine #14094: a RESUMED correction lane opens a fresh generation WITHOUT a new
+    # implementation_request marker, so its IR dispatch anchor is UNRESOLVABLE (``""``) even though the
+    # lane's latest full-head Review Request IS the current gate. So a supplied-but-unresolvable anchor
+    # no longer blanket-fences: the current gate is instead selected by the latest full-head
+    # review_request (:func:`_current_generation_rescue`). A RESOLVABLE anchor keeps the original fence
+    # (an older gate is previous-generation); an unresolvable anchor fails closed for every gate EXCEPT
+    # the confirmed current review generation request (previous / malformed-or-missing head /
+    # implementation_done all stay 0-send, with a diagnostic that separates the two refusal kinds).
     if dispatch_anchor_journal is not None:
         anchor = _as_int(dispatch_anchor_journal)
         gate_journal = _as_int(journal)
-        if anchor is None or gate_journal is None or gate_journal < anchor:
+        if anchor is None:
+            rescue_reason = _current_generation_rescue(marker, marker_list, issue, gate)
+            if rescue_reason is not None:
+                return LaneGatewaySendPlan(
+                    emit=False, reason=rescue_reason, gate_journal=journal, gate=gate
+                )
+        elif gate_journal is None or gate_journal < anchor:
             return LaneGatewaySendPlan(
                 emit=False, reason=LANE_PREVIOUS_GENERATION, gate_journal=journal, gate=gate
             )
@@ -276,6 +371,7 @@ def plan_lane_gateway_sends(
         plans.append(
             _plan_one(
                 marker, owner,
+                marker_list=marker_list, issue=issue_s,
                 dispatch_anchor_journal=dispatch_anchor_journal,
                 latest_review=latest_review,
             )
@@ -283,24 +379,40 @@ def plan_lane_gateway_sends(
     return plans
 
 
-def make_lane_gateway_send_edge_fence(anchor: object):
-    """Build a per-row send-edge fence for PRE-EXISTING ``lane_gateway`` backlog rows (j#82367).
+def make_lane_gateway_send_edge_fence(anchor: object, current_request_journal: object = ""):
+    """Build a per-row send-edge fence for PRE-EXISTING ``lane_gateway`` backlog rows (j#82367; #14094).
 
     Returns ``send_fence_fn(row) -> (fence, reason)``. A row is fenced when it is a ``lane_gateway:``
     route AND its journal is older than ``anchor`` (a previous-generation gate), or ``anchor`` is
     unresolvable (``None`` / blank / non-numeric — fail-closed). Non-``lane_gateway`` rows are exempt
     (they carry their own route's fence). This stops a pre-existing pending / recovered-then-reclaimed
     worker-gate row from waking a new generation's gateway — the ingest-side plan fence only stops newly
-    discovered markers. The reason token is secret-safe. Pure and duck-typed on ``row.callback_route`` /
+    discovered markers.
+
+    Redmine #14094: a RESUMED correction lane's fresh generation carries no new implementation_request
+    marker, so ``anchor`` is unresolvable even though the lane's latest full-head Review Request IS the
+    current gate. When the caller supplies ``current_request_journal`` (the durable journal id of that
+    current full-head ``review_request`` — :func:`current_review_request_journal`), a row whose journal
+    equals it is the current gate and is NEVER fenced by the unresolvable anchor — mirroring the
+    discovery-side rescue so a resumed-lane current row is not terminally dropped at the send edge. The
+    exemption applies ONLY under an unresolvable anchor (the resumed-lane case); a RESOLVABLE anchor
+    keeps the strict older-than-anchor fence. ``current_request_journal`` is a journal id, never a SHA /
+    locator, so the fence stays secret-safe. Pure and duck-typed on ``row.callback_route`` /
     ``row.journal``.
     """
     anchor_int = _as_int(anchor)
+    current_request = str(current_request_journal or "").strip()
 
     def _fence(row) -> tuple[bool, str]:
         if not is_lane_gateway_route(str(getattr(row, "callback_route", "") or "")):
             return (False, "")  # another route: own fence, exempt
-        journal = _as_int(getattr(row, "journal", ""))
+        row_journal = str(getattr(row, "journal", "") or "").strip()
+        journal = _as_int(row_journal)
         if anchor_int is not None and journal is not None and journal >= anchor_int:
+            return (False, "")
+        # #14094: under an unresolvable anchor, the current full-head review_request row is the current
+        # decision anchor for a RESUMED lane — never fenced by the missing IR anchor.
+        if anchor_int is None and current_request and row_journal == current_request:
             return (False, "")
         reason = (
             "fenced: dispatch anchor unresolvable"
@@ -322,11 +434,14 @@ __all__ = (
     "LANE_NO_GATEWAY",
     "LANE_BLANK_GENERATION",
     "LANE_PREVIOUS_GENERATION",
+    "LANE_CURRENT_HEAD_UNCONFIRMED",
     "LANE_SHADOWED",
     "LANE_REFUSAL_REASONS",
     "lane_gateway_route",
     "is_lane_gateway_route",
     "latest_review_journal",
+    "latest_review_request_journal",
+    "current_review_request_journal",
     "gate_is_shadowed",
     "LaneGatewaySendPlan",
     "plan_lane_gateway_sends",

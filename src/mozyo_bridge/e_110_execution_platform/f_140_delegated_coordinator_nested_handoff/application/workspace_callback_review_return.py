@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     discover_review_returns,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_gateway_route import (
+    current_review_request_journal,
     is_lane_gateway_route,
     make_lane_gateway_send_edge_fence,
 )
@@ -383,12 +384,30 @@ def resolve_current_review_identity(source: object, issue: str) -> "tuple[str, s
     )
 
 
+def resolve_current_request_journal(source: object, issue: str) -> str:
+    """The current review generation's full-head ``review_request`` journal id from ``issue`` (#14094).
+
+    The send-edge exemption authority for a RESUMED correction lane: the durable journal id of the
+    latest ``review_request`` whose full head is the confirmed current review generation head
+    (:func:`...lane_gateway_route.current_review_request_journal`). Fail-safe: an unreadable source, or a
+    missing / malformed / ambiguous head, yields ``""`` so the send-edge fence keeps its strict
+    unresolvable-anchor behavior (never a prose SHA guess). A journal id — never a SHA / locator.
+    """
+    if source is None:
+        return ""
+    try:
+        markers = list(markers_from_source(source, str(issue).strip()))
+    except Exception:  # noqa: BLE001 - an unreadable source is a fail-closed blank identity
+        return ""
+    return current_review_request_journal(markers, str(issue).strip())
+
+
 def build_supervisor_send_edge_fence(
     anchor: object, coordinator_route: str,
     current_review_head: object = None, current_review_request: object = None,
-    current_review_conclusion: object = None,
+    current_review_conclusion: object = None, current_request_journal: object = "",
 ) -> "Callable[[CallbackOutboxRow], tuple[bool, str]]":
-    """Compose the supervisor's per-row send-edge fence (Redmine #13974).
+    """Compose the supervisor's per-row send-edge fence (Redmine #13974; #14094).
 
     One ``send_fence_fn`` that terminally fences BOTH a historical coordinator row
     (:func:`...workspace_supervisor.make_send_edge_fence`) and a previous-generation / head- / req- /
@@ -397,16 +416,22 @@ def build_supervisor_send_edge_fence(
     ``conclusion`` (j#81506)) in the same deliver pass, each exempt on the other's rows. The deliver
     pass marks a fenced row terminally uncertain (zero-send, no retry), so a pre-existing misbound
     backlog row converges instead of retrying forever.
+
+    Redmine #14094: ``current_request_journal`` is the durable journal id of the issue's current
+    full-head ``review_request`` (blank when none is confirmable). It exempts a RESUMED-lane current-gate
+    ``lane_gateway`` row from the unresolvable-anchor fence at the send edge, mirroring the discovery-side
+    rescue so a resumed correction lane's current Review Request row is not terminally dropped.
     """
     return compose_send_edge_fences(
         make_send_edge_fence(anchor, coordinator_route),
         make_review_return_send_edge_fence(
             anchor, current_review_head, current_review_request, current_review_conclusion
         ),
-        # #13683 R2: also terminally fence a pre-existing / recovered lane_gateway backlog row whose
-        # worker gate predates the current dispatch anchor (a previous-generation gate on a restarted
-        # lane), each route-fence exempt on the others' rows so at most one fires per row.
-        make_lane_gateway_send_edge_fence(anchor),
+        # #13683 R2 / #14094: also terminally fence a pre-existing / recovered lane_gateway backlog row
+        # whose worker gate predates the current dispatch anchor (a previous-generation gate on a
+        # restarted lane), EXCEPT the current full-head review_request row (a resumed lane's current
+        # gate), each route-fence exempt on the others' rows so at most one fires per row.
+        make_lane_gateway_send_edge_fence(anchor, current_request_journal),
     )
 
 
@@ -640,11 +665,14 @@ def drain_review_return_backlog(
             review_head = current_review_generation_head(markers, issue)
             review_request = current_review_generation_request(markers, issue)
             review_conclusion = current_review_generation_conclusion(markers, issue)
+            # #14094: the current full-head review_request journal exempts a resumed-lane current-gate
+            # lane_gateway row from the unresolvable-anchor fence at the send edge.
+            current_request_journal = current_review_request_journal(markers, issue)
         except Exception:  # noqa: BLE001 - a transiently-unreadable provider -> retryable, never terminal
             transient += 1
             continue
         send_fence_fn = build_supervisor_send_edge_fence(
-            anchor, route, review_head, review_request, review_conclusion
+            anchor, route, review_head, review_request, review_conclusion, current_request_journal
         )
         report = CallbackOutboxProcessor(outbox, source, workspace_id=wsid).deliver(
             sender, send_fence_fn=send_fence_fn, issue=issue,
@@ -723,6 +751,7 @@ __all__ = (
     "review_round_send_fence",
     "review_return_discovery_anchor",
     "resolve_current_review_identity",
+    "resolve_current_request_journal",
     "build_supervisor_send_edge_fence",
     "discover_fenced_review_returns",
     "discover_fenced_lane_gateway_sends",

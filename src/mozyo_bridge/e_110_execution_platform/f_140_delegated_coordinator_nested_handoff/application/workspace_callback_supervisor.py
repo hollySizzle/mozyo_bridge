@@ -67,6 +67,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     drain_review_return_backlog,
     owning_lane_binding,
     owning_lane_generation_reader,
+    resolve_current_request_journal,
     resolve_current_review_identity,
     resolve_dispatch_anchor,
     resolve_lane_facts,
@@ -476,8 +477,12 @@ class WorkspaceCallbackSupervisor:
                     review_head, review_request, review_conclusion = resolve_current_review_identity(
                         source, issue
                     )
+                    # #14094: the current full-head review_request journal exempts a RESUMED-lane
+                    # current-gate lane_gateway row from the unresolvable-anchor send-edge fence.
+                    current_request_journal = resolve_current_request_journal(source, issue)
                     send_fence_fn = build_supervisor_send_edge_fence(
-                        anchor, self._route, review_head, review_request, review_conclusion
+                        anchor, self._route, review_head, review_request, review_conclusion,
+                        current_request_journal,
                     )
                 # #13684/#13974: reserve the correlated review_result return to the issue's owning-lane
                 # Codex gateway, generation-fenced. The sibling helper resolves the owning-lane binding,
