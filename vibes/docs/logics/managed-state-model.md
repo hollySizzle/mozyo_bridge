@@ -845,12 +845,17 @@ observation に join し、次の typed decision を返す。
 - `stale_worker_recovery_required`: current lifecycle / decision anchor / declared worker generation / action authority が
   すべて current で、その generation の exact slot の terminal absence が positive に証明された場合だけ。
   close/relaunch はせず、owner-governed #13806 recovery へ route する。★**post-close resume 入口**（#13806
-  close-success → launch-failure → replay 訂正, IR j#81810）: recover-stale の `--execute` は、既に close を commit した
+  close-success → launch-failure → replay 訂正, IR j#81810 / R3-F1）: recover-stale の `--execute` は、既に close を commit した
   worker（participant が `close_owed` を越え `launch_owed` / `verify_owed` / `replaced`）を持つ durable transaction が
   **その exact approved recovery（同 workspace+action_id+generation）に存在する場合だけ**、pinned old locator の
   absence（fresh-recovery preflight の `identity_unknown`）を **expected post-close state** として durable owed resume
-  （launch → attest → 元 gate exactly-once redispatch）へ接続する。durable transaction 不在 / `close_owed` 止まり /
-  generation 相違は resume と認めず block を維持する（新規 plan も blind launch もしない）。owner re-approval journal は
+  （launch → attest → 元 gate exactly-once redispatch）へ接続する。admission は **`identity_unknown`（expected old-locator
+  absence）のみ**に閉じる: worktree unreadable/dirty・stale generation・productive・gateway/foreign 等の他 blocker は
+  old slot が resolve した real な current-state fence ゆえ resume で迂回せず block を維持する（R3-F1）。さらに **各 resume
+  command は owed launch/send の前に live lane lifecycle（revision, generation）を pin と再照合**（old-slot/fresh-slot 非依存）:
+  moved/newer/unreadable lifecycle は zero close/launch/send（lease authority は actuator が effect 直前に再認証、worktree は
+  admission + unreadable launch の fail-closed が担保）。durable transaction 不在 / `close_owed` 止まり / generation 相違は
+  resume と認めず block を維持する（新規 plan も blind launch もしない）。owner re-approval journal は
   stored decision/continuation anchor（同一 CAS identity を保つ `--journal`）と **別 pointer**（`--resume-journal`）で
   表し、same-action CAS と fresh durable approval を両立させる。
 - `worker_liveness_authority_conflict`: locator-bearing stale token、duplicate row、missing/ambiguous declared pin、declared

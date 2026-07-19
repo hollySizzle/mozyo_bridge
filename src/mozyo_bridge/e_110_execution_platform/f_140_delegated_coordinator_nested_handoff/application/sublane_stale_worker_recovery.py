@@ -76,6 +76,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     RECOVER_ACTIONABLE,
+    RECOVER_BLOCK_UNKNOWN,
     RecoveryObservation,
     decide_recovery,
     stale_worker_recovery_action_id,
@@ -284,6 +285,22 @@ class StaleWorkerRecoveryOps(Protocol):
         """
         ...
 
+    def lane_lifecycle_current(self, request: RecoveryRequest) -> bool:
+        """Does the LIVE lane lifecycle still match the approval's pinned generation? (read-only)
+
+        The ambient lane authority a **post-close resume** must re-verify before it drives any
+        owed launch / send (Redmine #13806 post-close correction §3). A post-close replay re-runs
+        against a durable transaction whose close already committed, so it cannot rely on the
+        pinned old worker's identity (that slot is gone). This re-reads the LIVE lane lifecycle
+        ``(revision, generation)`` — old-slot-independent, and not confused by the fresh
+        relaunched slot — and returns ``True`` only when it still equals the approval's pinned
+        ``lane_revision`` / ``lane_generation``. A moved / newer lifecycle (the coordinator
+        re-owned or advanced the lane) or an unreadable / absent lifecycle returns ``False`` so
+        the resume stops with zero launch / send rather than relaunching into a lane the
+        approval no longer governs. Never mutates the #13810 owner row — it only compares.
+        """
+        ...
+
 
 class StaleWorkerRecoveryUseCase:
     """Read-only preflight + owner-approved atomic recovery of a stale sublane worker."""
@@ -338,17 +355,31 @@ class StaleWorkerRecoveryUseCase:
     ) -> Optional[RecoveryOutcome]:
         """Admit + drive a post-close replay, or ``None`` when it is not a resume.
 
-        The fresh-recovery preflight blocked (typically ``identity_unknown``: the exact old
-        worker was closed and is gone). This is a *resume* — never a fresh plan, never a blind
-        launch — ONLY when a durable transaction for this EXACT approved recovery already
-        committed the worker's close (its participant is past ``close_owed``). In that case the
-        replay is handed to :meth:`_execute`, which re-verifies the full signature (decision /
-        continuation / action generation / participant identity / old locator / lane lifecycle)
-        and idempotently resumes the owed launch → attest → original-gate redispatch. Returns
-        ``None`` (the caller's block stands) for every other case: no such transaction, a
-        different generation, or a participant still at ``close_owed`` (nothing was closed, so a
-        genuine preflight fence is real and a launch must never proceed on an unknown identity).
+        Admission is closed to the ONE expected post-close signal — an ``identity_unknown``
+        preflight (the exact old worker was closed and its pinned locator no longer resolves)
+        — Redmine #13806 post-close correction R3-F1. Every OTHER blocker verdict means the old
+        worker DID resolve and a genuine current-state fence fired (an unreadable / dirty
+        worktree, a stale generation, a productive provider, a gateway / foreign slot, a wrong
+        issue-lane, a competing authority); that block is real and must stand — a resume never
+        bypasses it. It is then a *resume* — never a fresh plan, never a blind launch — ONLY
+        when a durable transaction for this EXACT approved recovery already committed the
+        worker's close (its participant is past ``close_owed``).
+
+        Before the replay is handed to :meth:`_execute`, the ambient lane authority the fresh
+        launch depends on is **re-verified** (R3-F1): the live lane lifecycle must still match
+        the approval's pinned generation. A moved / newer / unreadable lifecycle stops the
+        resume with zero launch / send rather than relaunching into a lane the approval no
+        longer governs (the lease authority is re-verified inside the actuator before every
+        effect; the worktree-readability fence is the ``identity_unknown``-only admission plus a
+        launch that fails closed on an unreadable worktree). Returns ``None`` (the caller's
+        block stands) for every non-resume case: a non-``identity_unknown`` block, no such
+        transaction, a different generation, or a participant still at ``close_owed``.
         """
+        if norm(verdict) != RECOVER_BLOCK_UNKNOWN:
+            # Only the expected old-locator absence admits a resume. Any other blocker is a real
+            # current-state fence (worktree unreadable / stale generation / gateway / etc.) that
+            # the resume must not bypass (R3-F1). The caller's block stands.
+            return None
         try:
             expected_action = stale_worker_recovery_action_id(
                 lane_id=request.lane, role=request.role, provider=request.provider,
@@ -382,6 +413,23 @@ class StaleWorkerRecoveryUseCase:
         stored_worker = current.find_participant(worker_identity)
         if stored_worker is None or not worker_close_committed(stored_worker.phase):
             return None
+        # R3-F1 — re-verify the ambient lane authority before driving any owed launch / send.
+        # The durable transaction says the close committed, but the live lane lifecycle may have
+        # moved since (a coordinator re-owned / advanced the lane); relaunching a fresh worker
+        # into a lane the approval no longer governs is exactly what IR §3 (newer lifecycle ->
+        # zero-launch/zero-send) forbids. Each resume command re-checks it fresh (old-slot- and
+        # fresh-slot-independent), so it fences the launch AND the redispatch, never trusting the
+        # durable state alone. Fail-closed: an unreadable / absent / moved lifecycle stops here.
+        if not self._ops.lane_lifecycle_current(request):
+            return self._outcome(
+                request, verdict, status=RECOVERY_REFUSED, executed=True,
+                observation=observation, post_close_resume=True,
+                phase=current.phase, revision=current.revision,
+                detail=(
+                    "live lane lifecycle no longer matches the approved generation "
+                    "(moved / newer / unreadable); zero close / launch / send"
+                ),
+            )
         # §5 — the resume RE-approval anchor is a SEPARATE authority from the stored decision /
         # continuation anchor. A supplied ``resume_journal`` must be a complete Redmine pointer
         # (fail-closed, zero effect on a malformed one) and is recorded as the resume authority;

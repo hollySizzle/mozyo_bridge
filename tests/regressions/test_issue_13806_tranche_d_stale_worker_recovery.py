@@ -160,13 +160,17 @@ class FakeRecoveryOps:
 
     def __init__(
         self, observation, *, send_result=DRAIN_SEND_OK, confirm_after_send=True,
-        already_landed=False,
+        already_landed=False, lane_lifecycle_current=True,
     ):
         self._observation = observation
         self.send_result = send_result
         self.confirm_after_send = confirm_after_send
         self.sends: list = []
         self._landed = already_landed
+        #: The live lane-lifecycle re-verification a post-close resume consults (R3-F1). Default
+        #: current; a test sets it False to simulate a moved / newer / unreadable lifecycle.
+        self._lane_lifecycle_current = lane_lifecycle_current
+        self.lifecycle_checks: list = []
 
     def observe_target(self, request) -> RecoveryObservation:
         return self._observation
@@ -179,6 +183,10 @@ class FakeRecoveryOps:
 
     def gate_redispatched(self, continuation) -> bool:
         return self._landed
+
+    def lane_lifecycle_current(self, request) -> bool:
+        self.lifecycle_checks.append(request)
+        return self._lane_lifecycle_current
 
 
 class _RecoveryCase(unittest.TestCase):
@@ -879,6 +887,74 @@ class PostCloseResumeTests(_RecoveryCase):
         self.assertEqual(outcome.status, RECOVERY_REFUSED)
         self.assertFalse(outcome.post_close_resume)
         self.assertEqual(self.port.closed, closed_before)  # zero additional effect
+
+    # -- R3-F1: admission is closed to expected old-locator absence; owed launch/send re-verify --
+
+    def _committed_launch_owed(self):
+        """Drive to a post-close ``launch_owed`` (close committed, launch failed once)."""
+        wk_id = (WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"])
+        self.port.launch_result[wk_id] = LAUNCH_ERROR
+        ops = FakeRecoveryOps(_all_clear())
+        self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+        self.port.launch_result.pop(wk_id)
+        return ops, wk_id
+
+    def test_worktree_unreadable_blocker_is_not_admitted_as_resume(self):
+        # A committed-close transaction exists, but the current observation RESOLVES the worker
+        # and reports the worktree unreadable (verdict dirty_state_unreadable). That is a real
+        # current-state fence — NOT the expected old-locator absence — so the resume must not
+        # bypass it (R3-F1): zero launch / send.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = _all_clear(worktree_readable=False)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertEqual(outcome.verdict, RECOVER_BLOCK_DIRTY_UNREADABLE)
+        self.assertFalse(outcome.post_close_resume)  # never admitted as a resume
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+
+    def test_stale_generation_blocker_is_not_admitted_as_resume(self):
+        # Likewise a resolved worker at a stale generation is a real fence, never bypassed.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = _all_clear(generation_matches=False)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertEqual(outcome.verdict, RECOVER_BLOCK_STALE_GENERATION)
+        self.assertFalse(outcome.post_close_resume)
+        self.assertEqual(self.port.launched, launched_before)
+        self.assertEqual(ops.sends, [])
+
+    def test_newer_lane_lifecycle_blocks_admitted_resume_zero_launch_send(self):
+        # The expected old-locator absence IS admitted, but the live lane lifecycle has moved
+        # since the close committed (a coordinator re-owned / advanced the lane). Relaunching
+        # into a lane the approval no longer governs is exactly what IR §3 forbids — the resume
+        # re-verifies the lane authority before the owed launch/send and stops zero-effect.
+        ops, _wk = self._committed_launch_owed()
+        launched_before = list(self.port.launched)
+        ops._observation = self._gone()  # identity_unknown => admitted
+        ops._lane_lifecycle_current = False  # but the lane lifecycle moved
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertTrue(outcome.post_close_resume)  # it WAS admitted, then re-verify blocked it
+        self.assertIn("lane lifecycle", outcome.detail)
+        self.assertTrue(ops.lifecycle_checks)  # the re-verification was consulted
+        self.assertEqual(self.port.launched, launched_before)  # zero launch
+        self.assertEqual(ops.sends, [])  # zero send
+        # the durable transaction is untouched — a later re-run (lifecycle restored) resumes
+        self.assertEqual(self._worker_pin_phase(), PARTICIPANT_LAUNCH_OWED)
+
+    def test_admitted_resume_reverifies_lane_lifecycle_then_completes(self):
+        # The legitimate path: expected absence admitted, lane lifecycle still current — the
+        # resume re-verifies (consults the check) and completes.
+        ops, _wk = self._committed_launch_owed()
+        ops._observation = self._gone()
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(outcome.post_close_resume)
+        self.assertEqual(outcome.status, RECOVERY_COMPLETED)
+        self.assertTrue(ops.lifecycle_checks)  # re-verified on the resume command
 
     # -- §5 dual-anchor: resume re-approval is a separate authority from the CAS anchor ----
 

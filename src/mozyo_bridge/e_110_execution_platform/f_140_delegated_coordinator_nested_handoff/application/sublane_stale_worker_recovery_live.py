@@ -389,6 +389,9 @@ class LiveStaleWorkerRecoveryOps:
     #: The startup-attestation store home the redispatch post-launch boundary reads (Redmine
     #: #13806 R2-F3). ``None`` = the real state home; tests inject an isolated one.
     attestation_home: Optional[Path] = None
+    #: The lane-lifecycle store home the post-close resume re-verification reads (Redmine #13806
+    #: R3-F1). ``None`` = the real state home; tests inject an isolated one.
+    lifecycle_home: Optional[Path] = None
 
     def _ledger(self) -> HerdrDeliveryLedger:
         return self.ledger if self.ledger is not None else HerdrDeliveryLedger()
@@ -505,6 +508,38 @@ class LiveStaleWorkerRecoveryOps:
             return probe_worktree_resolved(str(raw)) is True
         except Exception:  # noqa: BLE001 - unreadable worktree fails closed
             return False
+
+    def lane_lifecycle_current(self, request: RecoveryRequest) -> bool:
+        """Does the LIVE lane lifecycle still match the approval's pinned generation? (read-only)
+
+        The post-close resume re-verification (Redmine #13806 R3-F1): re-read the LIVE lane
+        lifecycle ``(revision, generation)`` for the approved lane and compare it — old-slot- and
+        fresh-slot-independent — to the approval's pinned ``lane_revision`` / ``lane_generation``.
+        Fail-closed: an unreadable / absent / moved lifecycle (or a request that carries no pinned
+        lane evidence — a destructive worker recovery always must, per R1-F2) returns ``False`` so
+        the resume stops before relaunching into a lane the approval no longer governs. Never
+        mutates the #13810 owner row — it only compares.
+        """
+        pinned_rev = _norm(request.lane_revision)
+        pinned_gen = _norm(request.lane_generation)
+        if not pinned_rev or not pinned_gen:
+            return False
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            LaneLifecycleError,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        try:
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+            record = LaneLifecycleStore(home=self.lifecycle_home).get(
+                LaneLifecycleKey(workspace_id, _norm_lane(request.lane))
+            )
+        except (LaneLifecycleError, ValueError, OSError):
+            return False
+        if record is None:
+            return False
+        return str(record.revision) == pinned_rev and str(record.lane_generation) == pinned_gen
 
     # -- redispatch (high-level rail + REAL delivery-ledger oracle, Redmine #13806 R2-F3) ----
 

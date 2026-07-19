@@ -625,5 +625,57 @@ class LaunchArgvActionIdTest(unittest.TestCase):
         self.assertNotIn("--replacement-action-id", self._build(""))
 
 
+class LaneLifecycleCurrentTests(_LiveCase):
+    """R3-F1: the post-close resume re-verifies the LIVE lane lifecycle, old-slot-independent."""
+
+    def _declared_lane_home(self):
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        home = Path(tempfile.mkdtemp())
+        store = LaneLifecycleStore(home=home)
+        store.declare_active(
+            LaneLifecycleKey(WS, LANE),
+            decision=DecisionPointer(source="redmine", issue_id="13806", journal_id="79485"),
+            issue_id="13806",
+        )
+        # A freshly declared lane is revision 1 / generation 1.
+        return home
+
+    def _ops_with(self, home, **req):
+        return live.LiveStaleWorkerRecoveryOps(
+            repo_root=ROOT, request=_request(**req), lifecycle_home=home,
+        )
+
+    def test_matching_lane_lifecycle_is_current(self):
+        home = self._declared_lane_home()
+        ops = self._ops_with(home, lane_revision="1", lane_generation="1")
+        self.assertTrue(ops.lane_lifecycle_current(_request(lane_revision="1", lane_generation="1")))
+
+    def test_moved_generation_is_not_current(self):
+        home = self._declared_lane_home()
+        ops = self._ops_with(home, lane_revision="1", lane_generation="1")
+        # The approval pinned generation 2, but the live lane is at generation 1 (moved/mismatch).
+        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="1", lane_generation="2")))
+
+    def test_moved_revision_is_not_current(self):
+        home = self._declared_lane_home()
+        ops = self._ops_with(home, lane_revision="9", lane_generation="1")
+        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="9", lane_generation="1")))
+
+    def test_absent_lane_lifecycle_is_not_current(self):
+        # An empty (isolated) lifecycle store — the lane the approval pinned is not backed at all.
+        home = Path(tempfile.mkdtemp())
+        ops = self._ops_with(home, lane_revision="1", lane_generation="1")
+        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="1", lane_generation="1")))
+
+    def test_missing_pinned_lane_evidence_is_not_current(self):
+        home = self._declared_lane_home()
+        ops = self._ops_with(home, lane_revision="", lane_generation="")
+        self.assertFalse(ops.lane_lifecycle_current(_request(lane_revision="", lane_generation="")))
+
+
 if __name__ == "__main__":
     unittest.main()
