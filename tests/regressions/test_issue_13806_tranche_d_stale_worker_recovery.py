@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     CAS_LEASE_NOT_HELD,
     CAS_STALE_REVISION,
+    CAS_UNEXPECTED_STATE,
     CasOutcome,
     PARTICIPANT_CLOSE_OWED,
     PARTICIPANT_LAUNCH_OWED,
@@ -69,6 +70,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_AUTHORITY_MOVED,
     REDISPATCH_CONFIRMED,
     REDISPATCH_LEASE_LOST,
+    REDISPATCH_RELEASE_REFUSED,
     REDISPATCH_UNCERTAIN,
     RecoveryRequest,
     StaleWorkerRecoveryOps,
@@ -1087,19 +1089,33 @@ class PostCloseResumeTests(_RecoveryCase):
         self.assertEqual(outcome.redispatch_status, REDISPATCH_LEASE_LOST)
         self.assertEqual(outcome.status, RECOVERY_STOPPED)
 
-    def test_release_cas_persistently_refused_caps_to_uncertain_never_false_re_sendable(self):
-        # A pathologically persistent stale-revision refusal hits the bounded cap and reports
-        # uncertain — NEVER a false authority_moved (which would claim the attempt was un-recorded
-        # when it was not).
+    def test_release_cas_persistently_refused_caps_to_distinct_release_refused(self):
+        # A pathologically persistent stale-revision refusal hits the bounded cap and reports the
+        # DISTINCT release_refused blocker (Review j#82782 F1) — a zero-send CAS-recovery failure,
+        # NEVER a false authority_moved AND NEVER conflated with the send-in-flight uncertain (the
+        # send is proven zero on this path).
         def release_impl(orig):
             return lambda key, **kw: CasOutcome(
                 applied=False, reason=CAS_STALE_REVISION, revision=kw["expected_revision"] + 1,
             )
 
         ops, outcome, _orig = self._to_authority_moved_release(release_impl)
-        self.assertEqual(outcome.redispatch_status, REDISPATCH_UNCERTAIN)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_RELEASE_REFUSED)
+        self.assertNotEqual(outcome.redispatch_status, REDISPATCH_UNCERTAIN)
         self.assertNotEqual(outcome.redispatch_status, REDISPATCH_AUTHORITY_MOVED)
         self.assertEqual(ops.sends, [])
+
+    def test_release_cas_unexpected_refusal_reason_is_release_refused(self):
+        # An unexpected refusal reason (neither stale/not-found retry nor lease/generation) is the
+        # same distinct release_refused blocker — never claimed re-sendable, never uncertain.
+        def release_impl(orig):
+            return lambda key, **kw: CasOutcome(
+                applied=False, reason=CAS_UNEXPECTED_STATE, revision=kw["expected_revision"],
+            )
+
+        _ops, outcome, _orig = self._to_authority_moved_release(release_impl)
+        self.assertEqual(outcome.redispatch_status, REDISPATCH_RELEASE_REFUSED)
+        self.assertNotEqual(outcome.redispatch_status, REDISPATCH_UNCERTAIN)
 
     def test_admitted_resume_reverifies_authority_effect_bound_then_completes(self):
         # The legitimate path: expected absence admitted, authority exact and current at BOTH the

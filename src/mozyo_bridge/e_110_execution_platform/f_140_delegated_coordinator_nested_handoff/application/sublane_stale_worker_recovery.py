@@ -127,11 +127,21 @@ REDISPATCH_CONTINUATION_UNREADABLE = "continuation_unreadable"
 #: #13806 R3-F1, Review j#82731). The phase stays not-attempted so a later re-run re-joins and
 #: sends once authority is restored; never a blind send into a lane the approval no longer governs.
 REDISPATCH_AUTHORITY_MOVED = "authority_moved"
+#: A PROVEN zero-send attempt's revert CAS could not complete (the retry cap was exhausted by a
+#: pathological concurrent refusal, an unexpected concurrent phase, or an unexpected refusal
+#: reason) — Redmine #13806 R3 Review j#82782 F1. DISTINCT from :data:`REDISPATCH_UNCERTAIN`: this
+#: invocation definitively did NOT send (the authority moved before the transport), so it is a
+#: **concrete zero-send CAS-recovery failure**, never conflated with the "attempted, a send may be
+#: in flight" ``uncertain`` state. It never claims a re-sendable state it did not reach; recovery
+#: is by operator diagnosis / a later re-run once the pathological contention clears, never a blind
+#: resend (the send is proven zero, so no gate ever went out on this path).
+REDISPATCH_RELEASE_REFUSED = "release_refused"
 
 #: Bounded re-read + retry cap for un-recording a proven zero-send attempt whose revert CAS was
 #: refused by a concurrent write (Redmine #13806 R3 Progress blocker j#82768). A lease-held revert
 #: converges in one or two iterations once the racing write settles; the cap only backstops a
-#: pathological loop, and hitting it reports ``uncertain`` (never a false ``authority_moved``).
+#: pathological loop, and hitting it reports :data:`REDISPATCH_RELEASE_REFUSED` (never a false
+#: ``authority_moved`` and never the send-in-flight ``uncertain``).
 _UN_RECORD_RETRY_CAP = 8
 
 
@@ -827,8 +837,11 @@ class StaleWorkerRecoveryUseCase:
         - ``completed`` (a concurrent holder dispatched + drained) -> ``confirmed``;
         - still ``draining_continuation`` with the live lease at the current revision -> release
           with THAT revision; a stale-revision refusal re-reads and retries (a lease-held revert
-          converges once the racing write settles). A bounded cap backstops a pathological loop
-          with ``uncertain`` (never a false ``authority_moved``).
+          converges once the racing write settles). A bounded cap — and any unexpected concurrent
+          phase or refusal reason — reports :data:`REDISPATCH_RELEASE_REFUSED` (Review j#82782 F1):
+          a **distinct** zero-send CAS-recovery failure, never the send-in-flight ``uncertain`` and
+          never a false ``authority_moved``. The send is proven zero on this path, so recovery is
+          operator diagnosis / a later re-run, never a blind resend.
         """
         for _ in range(_UN_RECORD_RETRY_CAP):
             rec = self._store.get(key)
@@ -842,8 +855,8 @@ class StaleWorkerRecoveryUseCase:
                 return REDISPATCH_CONFIRMED  # a concurrent holder dispatched + drained
             if rec.phase != PHASE_DRAINING_CONTINUATION:
                 # An unexpected concurrent phase (a self flow / mid-transition); never claim
-                # re-sendable — report uncertain so a re-run re-reads and re-classifies.
-                return REDISPATCH_UNCERTAIN
+                # re-sendable — a distinct zero-send recovery failure, not send-in-flight uncertain.
+                return REDISPATCH_RELEASE_REFUSED
             now = self._clock()
             if rec.lease_holder != holder or not rec.lease_is_live(now):
                 return REDISPATCH_LEASE_LOST
@@ -858,10 +871,11 @@ class StaleWorkerRecoveryUseCase:
             if out.reason == CAS_LEASE_NOT_HELD:
                 return REDISPATCH_LEASE_LOST
             if out.reason not in (CAS_STALE_REVISION, CAS_NOT_FOUND):
-                # An unexpected refusal reason — never claim re-sendable; a re-run re-reads.
-                return REDISPATCH_UNCERTAIN
+                # An unexpected refusal reason — a distinct zero-send recovery failure, never a
+                # false re-sendable and never the send-in-flight uncertain.
+                return REDISPATCH_RELEASE_REFUSED
             # CAS_STALE_REVISION / CAS_NOT_FOUND: a concurrent write moved the row — re-read + retry.
-        return REDISPATCH_UNCERTAIN  # runaway backstop (a real lease-held revert converges quickly)
+        return REDISPATCH_RELEASE_REFUSED  # cap exhausted (a real lease-held revert converges quickly)
 
     def _finalize_confirmed(self, key, *, holder, gen) -> str:
         """Advance a gate-confirmed transaction to ``completed`` with ZERO send (idempotent).
@@ -976,6 +990,7 @@ __all__ = (
     "REDISPATCH_NOT_FOUND",
     "REDISPATCH_CONTINUATION_UNREADABLE",
     "REDISPATCH_AUTHORITY_MOVED",
+    "REDISPATCH_RELEASE_REFUSED",
     "RecoveryRequest",
     "RecoveryOutcome",
     "StaleWorkerRecoveryOps",
