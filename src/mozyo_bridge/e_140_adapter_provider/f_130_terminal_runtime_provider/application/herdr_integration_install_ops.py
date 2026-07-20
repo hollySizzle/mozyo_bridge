@@ -46,7 +46,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_CONFIG_DIRNAME,
     REASON_CONFIG_DIR_MISSING,
     REASON_HERDR_ERROR,
+    REASON_HERDR_UNRESOLVED,
     REASON_PARTIAL_FAILURE,
+    REASON_ROLLBACK_INCOMPLETE,
     REASON_UNPINNED_REMOTE,
     REASON_UNSAFE_CONFIG_PATH,
     AgentInstallOutcome,
@@ -142,14 +144,19 @@ def _backup_dir(root: Path) -> "dict[str, bytes]":
     return backup
 
 
-def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -> None:
-    """Restore ``root``'s non-credential files to their pre-apply state.
+def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -> bool:
+    """Restore ``root``'s non-credential files to their pre-apply state, and **verify** it.
 
     Removes any non-credential file herdr added (present now, absent in ``before``),
     then rewrites every backed-up file's original bytes (restoring changed / removed
     files). Credential files are never touched (they are absent from both the backup
     and the snapshot). Best-effort per file: a rollback IO error on one file does not
-    abort the rest — the outcome records that the agent was rolled back.
+    abort the rest — but the restoration is then **re-snapshotted and compared to the
+    pre-apply snapshot**, and the boolean it returns is ``True`` only when the dir's
+    non-credential content is byte-identical to how it was found. A swallowed
+    remove/restore error (a read-only file, a permission loss) that leaves residue
+    therefore makes this return ``False`` (Redmine #13249 review j#83613 finding 1),
+    so a caller can never claim ``home left as found`` on an unproven rollback.
     """
     before_paths = before.paths
     for rel, abspath in list(_iter_files(root)):
@@ -165,6 +172,8 @@ def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -
             target.write_bytes(data)
         except OSError:
             pass
+    # Prove the restoration: the post-rollback snapshot must match the pre-apply one.
+    return _snapshot_dir(root) == before
 
 
 # --- gating (read-only) ------------------------------------------------------
@@ -175,9 +184,24 @@ def _config_dir(home: Path, agent: str) -> Path:
 
 
 def _gate_agent(
-    agent: str, home: Path, *, pinned: bool, pin_detail: str, herdr_argv: "tuple[str, ...]"
+    agent: str,
+    home: Path,
+    *,
+    pinned: bool,
+    pin_detail: str,
+    binary: Optional[str],
+    binary_detail: str,
 ) -> AgentInstallPlan:
-    """Run the read-only gates for one agent and return its plan."""
+    """Run the read-only gates for one agent and return its plan.
+
+    A plan promises an apply *could* run for a ready agent, so the trusted herdr
+    binary must resolve for the plan to be ready — an unresolvable binary gates the
+    plan closed (``herdr_unresolved``) rather than being demoted to a cosmetic
+    ``detail`` while the plan still reports ``ok`` (Redmine #13249 review j#83613
+    finding 2). The security / filesystem gates (pinned posture, dir present, safe
+    path) are reported first so their more actionable reason surfaces; the binary
+    gate is the last precondition before ``ready``.
+    """
     config_dir = _config_dir(home, agent)
     display = str(config_dir)
     if not pinned:
@@ -210,11 +234,20 @@ def _gate_agent(
             detail=f"config path {display} resolves outside home or is not a "
             f"directory (symlink / traversal); refusing to touch it",
         )
+    if binary is None:
+        return AgentInstallPlan(
+            agent=agent,
+            config_dir=display,
+            ready=False,
+            reason=REASON_HERDR_UNRESOLVED,
+            detail=f"herdr binary unresolved from the trusted environment: "
+            f"{binary_detail}",
+        )
     return AgentInstallPlan(
         agent=agent,
         config_dir=display,
         ready=True,
-        herdr_argv=herdr_argv,
+        herdr_argv=_herdr_argv(binary, agent),
     )
 
 
@@ -260,14 +293,19 @@ def plan_install(inputs: InstallInputs) -> InstallReport:
     """Read-only plan: gate every agent, mutate nothing (byte-invariant)."""
     agents = inputs.agents
     pinned, pin_mode, pin_detail = _pin_state(inputs)
-    # A display binary token for the planned argv; resolution failures are surfaced
-    # as the plan detail rather than aborting the read-only plan.
+    # The trusted herdr binary is a plan precondition: an unresolvable binary gates
+    # every agent closed (finding 2), so a plan never reports ok for a target no
+    # apply could touch.
     binary, binary_detail = _resolve_binary(inputs)
     plans: "list[AgentInstallPlan]" = []
     for agent in agents:
-        argv = _herdr_argv(binary or "herdr", agent)
         plan = _gate_agent(
-            agent, inputs.home, pinned=pinned, pin_detail=pin_detail, herdr_argv=argv
+            agent,
+            inputs.home,
+            pinned=pinned,
+            pin_detail=pin_detail,
+            binary=binary,
+            binary_detail=binary_detail,
         )
         plans.append(plan)
     ok = bool(plans) and all(p.ready for p in plans)
@@ -328,26 +366,40 @@ def _run_apply_transaction(
         backup = _backup_dir(config_dir)
         ok, detail = _invoke_herdr(runner, binary, agent, env)
         if not ok:
-            # Roll back this agent's partial write, then every prior agent.
-            _rollback_dir(config_dir, backup, before)
+            # Roll back this agent's partial write (verified), then every prior agent.
+            restored = _rollback_dir(config_dir, backup, before)
+            if restored:
+                failed_reason, failed_detail, rolled = REASON_HERDR_ERROR, detail, True
+            else:
+                failed_reason = REASON_ROLLBACK_INCOMPLETE
+                failed_detail = (
+                    f"herdr install failed ({detail}) AND rollback left residue in "
+                    f"{config_dir}; home NOT restored"
+                )
+                rolled = False
             outcomes.append(
                 AgentInstallOutcome(
                     agent=agent,
                     config_dir=str(config_dir),
                     ok=False,
-                    reason=REASON_HERDR_ERROR,
-                    detail=detail,
-                    rolled_back=True,
+                    reason=failed_reason,
+                    detail=failed_detail,
+                    rolled_back=rolled,
                 )
             )
-            reverted = _rollback_applied(applied, outcomes)
-            note = (
-                f"herdr install failed for {agent}; rolled back {reverted} — home "
-                f"left as found"
-                if reverted
-                else f"herdr install failed for {agent}; rolled back its partial "
-                f"write — home left as found"
-            )
+            reverted, all_restored = _rollback_applied(applied, outcomes)
+            all_restored = all_restored and restored
+            reverted_desc = ", ".join(reverted) if reverted else "its partial write"
+            if all_restored:
+                note = (
+                    f"herdr install failed for {agent}; rolled back {reverted_desc} — "
+                    f"home left as found"
+                )
+            else:
+                note = (
+                    f"herdr install failed for {agent}; rollback INCOMPLETE — residue "
+                    f"remains, home NOT fully restored (verify the config dirs)"
+                )
             return InstallReport(
                 applied=True,
                 ok=False,
@@ -401,26 +453,45 @@ def _invoke_herdr(
 def _rollback_applied(
     applied: "list[tuple[str, Path, dict, DirSnapshot]]",
     outcomes: "list[AgentInstallOutcome]",
-) -> "list[str]":
-    """Roll back every already-applied agent; mark its outcome rolled_back."""
+) -> "tuple[list[str], bool]":
+    """Roll back every already-applied agent **with verification**.
+
+    Returns ``(reverted_agents, all_restored)``. Each agent's rollback is verified by
+    :func:`_rollback_dir`; when a restoration cannot be proven, that agent's outcome
+    is marked ``rollback_incomplete`` / ``rolled_back=False`` (never a false
+    ``partial_failure`` / ``rolled_back=True``) and ``all_restored`` is ``False`` so
+    the report never claims ``home left as found`` on unproven restoration (Redmine
+    #13249 review j#83613 finding 1).
+    """
     reverted: "list[str]" = []
+    all_restored = True
     by_agent = {o.agent: i for i, o in enumerate(outcomes)}
     for agent, config_dir, backup, before in applied:
-        _rollback_dir(config_dir, backup, before)
+        restored = _rollback_dir(config_dir, backup, before)
         reverted.append(agent)
+        all_restored = all_restored and restored
         idx = by_agent.get(agent)
         if idx is not None:
             prev = outcomes[idx]
+            if restored:
+                reason = REASON_PARTIAL_FAILURE
+                detail = "rolled back because another agent failed the transaction"
+            else:
+                reason = REASON_ROLLBACK_INCOMPLETE
+                detail = (
+                    f"rollback left residue in {config_dir}; home NOT restored for "
+                    f"this agent"
+                )
             outcomes[idx] = AgentInstallOutcome(
                 agent=prev.agent,
                 config_dir=prev.config_dir,
                 ok=False,
-                reason=REASON_PARTIAL_FAILURE,
-                detail="rolled back because another agent failed the transaction",
+                reason=reason,
+                detail=detail,
                 diff=prev.diff,
-                rolled_back=True,
+                rolled_back=restored,
             )
-    return reverted
+    return reverted, all_restored
 
 
 def _bounded(text: object, *, limit: int = 200) -> str:

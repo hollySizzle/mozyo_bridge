@@ -41,7 +41,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_CODEX,
     REASON_CONFIG_DIR_MISSING,
     REASON_HERDR_ERROR,
+    REASON_HERDR_UNRESOLVED,
     REASON_PARTIAL_FAILURE,
+    REASON_ROLLBACK_INCOMPLETE,
     REASON_UNPINNED_REMOTE,
     REASON_UNSAFE_CONFIG_PATH,
     DirSnapshot,
@@ -293,6 +295,38 @@ class FakeHerdrIntegration:
         return subprocess.CompletedProcess(list(argv), 0, stdout="installed", stderr="")
 
 
+class _ResidueLockingFake:
+    """A fake herdr that leaves un-rollback-able residue (drives finding-1 verification).
+
+    For a ``fail_for`` agent it writes ``hooks/partial.tmp`` then chmods ``hooks`` to
+    ``0o500`` so the installer's rollback ``unlink`` fails and residue remains. For a
+    ``lock_agent`` it installs the hook successfully then locks ``hooks`` too, so that
+    agent's later transactional rollback (triggered by another agent's failure) also
+    cannot restore.
+    """
+
+    def __init__(self, *, fail_for="", lock_agent=None):
+        self.fail_for = frozenset(fail_for) if fail_for else frozenset()
+        self.lock_agent = lock_agent
+        self.calls: "list[list[str]]" = []
+
+    def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **_):
+        self.calls.append(list(argv))
+        agent = argv[3]
+        home = Path((env or {}).get("HOME", ""))
+        config_dir = home / (".claude" if agent == AGENT_CLAUDE else ".codex")
+        hooks = config_dir / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        if agent in self.fail_for:
+            (hooks / "partial.tmp").write_text("partial", encoding="utf-8")
+            hooks.chmod(0o500)  # rollback unlink will fail → residue remains
+            return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="boom")
+        (config_dir / _HOOK_REL).write_text(_HOOK_BODY, encoding="utf-8")
+        if agent == self.lock_agent:
+            hooks.chmod(0o500)  # this agent's later rollback will fail too
+        return subprocess.CompletedProcess(list(argv), 0, stdout="installed", stderr="")
+
+
 class InstallOpsTest(unittest.TestCase):
     def setUp(self) -> None:
         import tempfile
@@ -436,6 +470,78 @@ class InstallOpsTest(unittest.TestCase):
         self.assertEqual(report.outcomes[0].reason, REASON_HERDR_ERROR)
         self.assertTrue(report.outcomes[0].rolled_back)
         self.assertEqual(before, self._dir_state())
+
+    def test_plan_binary_unresolved_is_gated_zero_mutation(self) -> None:
+        # Review j#83613 finding 2: an unresolvable herdr binary must gate the plan
+        # closed (not report ok=true), and still mutate nothing.
+        before = self._dir_state()
+        inputs = InstallInputs(
+            home=self.home,
+            agents=(AGENT_CLAUDE,),
+            herdr_config=self.herdr_config,
+            env={"PATH": ""},  # no MOZYO_HERDR_BINARY, empty PATH → unresolvable
+        )
+        report = plan_install(inputs)
+        self.assertFalse(report.ok)
+        self.assertEqual(report.plans[0].reason, REASON_HERDR_UNRESOLVED)
+        self.assertEqual(before, self._dir_state())
+
+    def test_apply_binary_unresolved_refused(self) -> None:
+        fake = FakeHerdrIntegration()
+        report = apply_install(
+            InstallInputs(
+                home=self.home,
+                agents=(AGENT_CLAUDE,),
+                herdr_config=self.herdr_config,
+                env={"PATH": ""},
+                runner=fake.run,
+            )
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(fake.calls, [])
+
+    def test_apply_rollback_failure_reports_incomplete(self) -> None:
+        # Review j#83613 finding 1: if rollback cannot restore the dir (residue
+        # remains), the outcome must be rollback_incomplete / rolled_back=False, and
+        # the report must NOT claim "home left as found".
+        self.addCleanup(self._restore_perms)
+        fake = _ResidueLockingFake(fail_for=frozenset({AGENT_CLAUDE}))
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.reason, REASON_ROLLBACK_INCOMPLETE)
+        self.assertFalse(outcome.rolled_back)
+        self.assertIn("INCOMPLETE", report.detail)
+        # the residue herdr wrote is really still there (rollback could not remove it)
+        self.assertTrue((self.home / ".claude" / "hooks" / "partial.tmp").exists())
+
+    def test_apply_partial_failure_rollback_failure_marks_prior_incomplete(self) -> None:
+        # claude installs, codex fails; if claude's rollback cannot restore, its
+        # outcome is rollback_incomplete (not a false partial_failure/rolled_back).
+        self.addCleanup(self._restore_perms)
+        # Seed a claude file that will be changed by the fake then locked against restore.
+        fake = _ResidueLockingFake(
+            fail_for=frozenset({AGENT_CODEX}), lock_agent=AGENT_CLAUDE
+        )
+        report = apply_install(
+            self._inputs(agents=(AGENT_CLAUDE, AGENT_CODEX), runner=fake.run)
+        )
+        self.assertFalse(report.ok)
+        by_agent = {o.agent: o for o in report.outcomes}
+        self.assertEqual(by_agent[AGENT_CLAUDE].reason, REASON_ROLLBACK_INCOMPLETE)
+        self.assertFalse(by_agent[AGENT_CLAUDE].rolled_back)
+        self.assertIn("INCOMPLETE", report.detail)
+
+    def _restore_perms(self) -> None:
+        import stat as _stat
+
+        for dirpath, dirs, files in os.walk(self.home):
+            for name in dirs + files:
+                p = Path(dirpath) / name
+                try:
+                    p.chmod(p.stat().st_mode | _stat.S_IRWXU)
+                except OSError:
+                    pass
 
     def test_apply_never_touches_credentials(self) -> None:
         # Seed a credential-shaped file; it must survive apply AND rollback untouched.

@@ -76,6 +76,16 @@ REASON_UNSAFE_CONFIG_PATH = "unsafe_config_path"
 REASON_UNPINNED_REMOTE = "unpinned_remote"
 #: herdr was invoked but reported a non-zero exit / spawn failure for an agent.
 REASON_HERDR_ERROR = "herdr_error"
+#: The trusted herdr binary could not be resolved (env / trusted PATH). Because a
+#: plan promises that an apply *could* run, an unresolvable binary gates the plan
+#: closed — a plan can never report ``ok`` for a target no apply could touch
+#: (Redmine #13249 review j#83613 finding 2).
+REASON_HERDR_UNRESOLVED = "herdr_unresolved"
+#: A rollback did not fully restore the dir: a remove/restore raised, or the
+#: post-rollback snapshot still differs from the pre-apply snapshot (residue
+#: remains). The installer must never claim ``home left as found`` / ``rolled_back``
+#: when restoration could not be *proven* (Redmine #13249 review j#83613 finding 1).
+REASON_ROLLBACK_INCOMPLETE = "rollback_incomplete"
 #: Apply was requested for several agents and at least one failed after another had
 #: already been mutated — the whole operation is reported failed and rolled back.
 REASON_PARTIAL_FAILURE = "partial_failure"
@@ -91,6 +101,8 @@ INSTALL_FAILURE_REASONS: frozenset[str] = frozenset(
         REASON_UNSAFE_CONFIG_PATH,
         REASON_UNPINNED_REMOTE,
         REASON_HERDR_ERROR,
+        REASON_HERDR_UNRESOLVED,
+        REASON_ROLLBACK_INCOMPLETE,
         REASON_PARTIAL_FAILURE,
         REASON_NOT_OPTED_IN,
     }
@@ -341,8 +353,10 @@ __all__ = (
     "INTEGRATION_AGENTS",
     "REASON_CONFIG_DIR_MISSING",
     "REASON_HERDR_ERROR",
+    "REASON_HERDR_UNRESOLVED",
     "REASON_NOT_OPTED_IN",
     "REASON_PARTIAL_FAILURE",
+    "REASON_ROLLBACK_INCOMPLETE",
     "REASON_UNKNOWN_AGENT",
     "REASON_UNPINNED_REMOTE",
     "REASON_UNSAFE_CONFIG_PATH",
