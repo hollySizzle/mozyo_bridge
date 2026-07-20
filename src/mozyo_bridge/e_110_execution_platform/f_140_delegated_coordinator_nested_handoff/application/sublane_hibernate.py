@@ -47,14 +47,15 @@ the hibernate. Resume back to ``active`` is the sibling ``sublane resume`` (neve
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    IdentityAttestationRecord,
+)
+from mozyo_bridge.core.state.lane_binding import record_matches_binding
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -64,6 +65,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessPinError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
     HerdrRetireClosePlan,
@@ -72,6 +74,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
     ReleaseOutcome,
+    declared_generation_attested,
+    declared_generation_exactly_live,
     drive_process_release,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -93,6 +97,23 @@ BLOCK_PENDING_PROMPT = "pending_composer_input"
 BLOCK_WORKING = "work_in_flight"
 BLOCK_UNRECORDED_BOUNDARY = "dirty_worktree_without_boundary_journal"
 BLOCK_INVENTORY_UNREADABLE = "inventory_unreadable"
+# Project-gateway action-time fences (Redmine #13811; design #13780 j#78386 §1-3). Each
+# gates ONLY a project-gateway lane (a lane bound by `project_scope`, not `issue_id`); an
+# issue-owned lane leaves all three satisfied, so its path is byte-identical.
+#: The live inventory does not carry the lane's EXACT declared generation — a recycled /
+#: renamed / provider-rebound / undeclared-role / ambiguous live slot. Releasing from the
+#: current live rows would close a newer generation than the one declared (§1-3 "exact pair
+#: pins" / "newer generation -> zero-actuation"); fail closed instead.
+BLOCK_PROJECT_GENERATION_MISMATCH = "project_generation_mismatch"
+#: A live managed slot lacks an action-time, generation-matched startup self-attestation
+#: (missing / stale locator-drift / conflict / unreadable). §2 requires re-reading the
+#: startup attestation at action time; an unattested live target is zero-actuation.
+BLOCK_PROJECT_UNATTESTED = "project_slot_unattested"
+#: The approval's asserted `lane_generation` does not equal the row's current generation —
+#: a stale approval from a superseded incarnation (a retire + `open_next_generation` bumps
+#: it, §1 "generation を混ぜない"). A stale approval never re-binds to the current
+#: generation; the operator must assert the approved generation and it must still hold.
+BLOCK_STALE_ACTION_GENERATION = "stale_action_generation"
 # Early-hibernate (Redmine #13967 item 1) unpushed fence: an early-hibernate basis
 # presupposes the commits are integrated to staging, so an early-hibernate attempt whose
 # commits are not pushed / origin-reachable fails closed (unlike a dependency park, which
@@ -302,6 +323,13 @@ class HibernatePreflight:
     lane_idle: bool
     boundary_ok: bool
     inventory_readable: bool = True
+    #: Project-gateway action-time fences (Redmine #13811). Each defaults ``True`` so an
+    #: issue-owned lane (which never sets them) is unchanged; only a project-gateway lane
+    #: with a matched binding evaluates them against its declared generation / attestation /
+    #: approved generation.
+    project_generation_matched: bool = True
+    project_attestation_ok: bool = True
+    action_generation_current: bool = True
     assertions: HibernateAssertions = field(default_factory=HibernateAssertions)
 
     @property
@@ -313,6 +341,9 @@ class HibernatePreflight:
             and self.lane_idle
             and self.boundary_ok
             and self.inventory_readable
+            and self.project_generation_matched
+            and self.project_attestation_ok
+            and self.action_generation_current
         )
 
     @property
@@ -351,6 +382,14 @@ class HibernatePreflight:
             reasons.append(BLOCK_UNRECORDED_BOUNDARY)
         if not self.inventory_readable:
             reasons.append(BLOCK_INVENTORY_UNREADABLE)
+        # Project-gateway action-time fences (Redmine #13811): each names itself so the
+        # operator sees exactly which exact-generation guard blocked the release.
+        if not self.action_generation_current:
+            reasons.append(BLOCK_STALE_ACTION_GENERATION)
+        if not self.project_generation_matched:
+            reasons.append(BLOCK_PROJECT_GENERATION_MISMATCH)
+        if not self.project_attestation_ok:
+            reasons.append(BLOCK_PROJECT_UNATTESTED)
         return tuple(reasons)
 
     def as_payload(self) -> dict[str, Any]:
@@ -363,6 +402,9 @@ class HibernatePreflight:
             "lane_idle": self.lane_idle,
             "boundary_ok": self.boundary_ok,
             "inventory_readable": self.inventory_readable,
+            "project_generation_matched": self.project_generation_matched,
+            "project_attestation_ok": self.project_attestation_ok,
+            "action_generation_current": self.action_generation_current,
             "blocked_reasons": list(self.blocked_reasons),
         }
 
@@ -375,6 +417,7 @@ class HibernateOutcome:
     preflight: HibernatePreflight
     issue: str
     lane: str
+    project_scope: str = ""
     already_hibernated: bool = False
     redrive_blocked: bool = False
     transition: Optional[CasOutcome] = None
@@ -400,6 +443,7 @@ class HibernateOutcome:
             "executed": self.executed,
             "issue": self.issue,
             "lane": self.lane,
+            "project_scope": self.project_scope,
             "already_hibernated": self.already_hibernated,
             "redrive_blocked": self.redrive_blocked,
             "is_blocked": self.is_blocked,
@@ -427,6 +471,10 @@ class SublaneHibernateOps(Protocol):
     def workspace_id(self) -> str: ...
 
     def read_inventory(self) -> tuple[Sequence[Mapping[str, object]], bool]: ...
+
+    def read_attestation(
+        self, assigned_name: str
+    ) -> Optional[IdentityAttestationRecord]: ...
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult: ...
 
@@ -467,6 +515,25 @@ class LiveSublaneHibernateOps:
         except Exception:  # noqa: BLE001 — inventory unreadable -> fail closed (NOT empty)
             return (), False
 
+    def read_attestation(
+        self, assigned_name: str
+    ) -> Optional[IdentityAttestationRecord]:
+        """Read a slot's #13637 startup self-attestation for the action-time gate.
+
+        Read-only over the shared attestation store, fail-open to ``None`` (absent /
+        unreadable): the project-gateway attestation gate then fails CLOSED on a ``None``
+        (an un-attestable live slot is never released, Redmine #13811 / #13882), so a cache
+        loss never falsely attests a slot.
+        """
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+        )
+
+        try:
+            return HerdrIdentityAttestationStore().read(assigned_name)
+        except Exception:  # noqa: BLE001 — unreadable attestation -> None -> gate fails closed
+            return None
+
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult:
         return execute_herdr_retire_close(
             plan, env=self.env, runner=self.runner, timeout=self.timeout
@@ -484,6 +551,19 @@ class HibernateRequest:
     lane: str
     journal: str
     assertions: HibernateAssertions
+    #: A project-gateway lane's canonical full project scope (Redmine #13811). When
+    #: non-empty the lane is identified by its ``project_gateway`` owner binding (scope +
+    #: empty issue), not by ``issue`` — which then names only the durable decision anchor the
+    #: ``--journal`` is filed on, exactly as for an issue lane. Empty for an issue lane (the
+    #: byte-identical pre-#13811 issue-owned path).
+    project_scope: str = ""
+    #: The approved expected ``lane_generation`` the operator asserts from the durable
+    #: Redmine approval (Redmine #13811 R1 F1 item 3; design j#78386 §1-2 stale-approval
+    #: fence). For a project-gateway lane it MUST be supplied and MUST equal the row's
+    #: current generation, so an approval from a superseded incarnation (retire +
+    #: ``open_next_generation`` bumps the generation) cannot re-bind to the current one.
+    #: Ignored for an issue lane.
+    expected_lane_generation: str = ""
 
 
 @dataclass
@@ -506,9 +586,14 @@ class SublaneHibernateUseCase:
     def run(self, request: HibernateRequest, *, execute: bool) -> HibernateOutcome:
         issue = _norm(request.issue)
         lane = _norm(request.lane)
+        project_scope = _norm(request.project_scope)
         workspace_id = _norm(self.ops.workspace_id())
 
         # A malformed identity / anchor can address nothing — fail closed before any read.
+        # The decision anchor is required (and issue-addressable) for BOTH binding kinds: a
+        # project-gateway lane owns a scope, but the journal that authorizes this hibernate
+        # is still filed on a real issue (R2-F1). ``project_scope`` selects WHICH lane the
+        # anchor may act on; it never replaces the anchor.
         decision = self._decision(request)
         if not issue or not lane or not workspace_id or decision is None:
             preflight = HibernatePreflight(
@@ -524,6 +609,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 detail="incomplete hibernate identity or decision anchor",
             )
 
@@ -545,6 +631,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 detail="lifecycle store unreadable; fail closed",
             )
 
@@ -552,6 +639,31 @@ class SublaneHibernateUseCase:
         # unreadable inventory is never folded to "empty"; the same snapshot is reused for
         # the release close so nothing is re-read between the gate and the actuation.
         rows, inventory_readable = self.ops.read_inventory()
+
+        # Project-gateway action-time exact-generation fences (Redmine #13811; design #13780
+        # j#78386 §1-2). The release closes the lane's CURRENT live slots, so before any
+        # mutation a project-gateway lane must prove (a) the operator's approved generation
+        # still equals the row's current generation — no stale approval re-binds to a newer
+        # incarnation; (b) those live slots ARE its exact declared generation — no recycled /
+        # renamed / provider-rebound / ambiguous slot is closed from a stale declaration; and
+        # (c) every live target carries an action-time, generation-matched startup
+        # attestation. An issue-owned lane (empty ``project_scope``) skips all three: they
+        # stay ``True`` and the issue path is byte-identical. Only evaluated on a readable
+        # inventory that this exact project lane owns; a corrupt declared snapshot fails
+        # closed (never coerced to "matched").
+        (
+            action_generation_current,
+            project_generation_matched,
+            project_attestation_ok,
+        ) = self._project_gates(
+            rec,
+            rows,
+            project_scope=project_scope,
+            workspace_id=workspace_id,
+            lane=lane,
+            inventory_readable=inventory_readable,
+            expected_lane_generation=_norm(request.expected_lane_generation),
+        )
 
         # Idempotent resume: the lane is already hibernated. Skip the commit (its CAS
         # guard would refuse anyway) and re-drive the release, which is itself idempotent
@@ -563,11 +675,19 @@ class SublaneHibernateUseCase:
         already_hibernated = (
             rec is not None
             and rec.lane_disposition == DISPOSITION_HIBERNATED
-            and rec.issue_id == issue
+            and record_matches_binding(rec, issue_id=issue, project_scope=project_scope)
         )
         if already_hibernated:
+            # The redrive also honors the project exact-generation / attestation / approval
+            # gates: a partial release is resumed only while the lane's live slots are still
+            # its declared, attested generation and the approval still names it — never
+            # re-pinning a slot recycled between the partial close and the resume.
             redrive_ok = (
-                inventory_readable and request.assertions.preservation_satisfied
+                inventory_readable
+                and request.assertions.preservation_satisfied
+                and action_generation_current
+                and project_generation_matched
+                and project_attestation_ok
             )
             release = None
             if execute and redrive_ok:
@@ -579,6 +699,9 @@ class SublaneHibernateUseCase:
                 lane_idle=request.assertions.lane_idle,
                 boundary_ok=request.assertions.boundary_ok,
                 inventory_readable=inventory_readable,
+                project_generation_matched=project_generation_matched,
+                project_attestation_ok=project_attestation_ok,
+                action_generation_current=action_generation_current,
                 assertions=request.assertions,
             )
             return HibernateOutcome(
@@ -586,6 +709,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 already_hibernated=True,
                 redrive_blocked=execute and not redrive_ok,
                 release=release,
@@ -600,7 +724,7 @@ class SublaneHibernateUseCase:
         original_identity_known = (
             rec is not None
             and rec.lane_disposition == DISPOSITION_ACTIVE
-            and rec.issue_id == issue
+            and record_matches_binding(rec, issue_id=issue, project_scope=project_scope)
         )
         preflight = HibernatePreflight(
             original_identity_known=original_identity_known,
@@ -609,6 +733,9 @@ class SublaneHibernateUseCase:
             lane_idle=request.assertions.lane_idle,
             boundary_ok=request.assertions.boundary_ok,
             inventory_readable=inventory_readable,
+            project_generation_matched=project_generation_matched,
+            project_attestation_ok=project_attestation_ok,
+            action_generation_current=action_generation_current,
             assertions=request.assertions,
         )
         if not preflight.may_hibernate or not execute:
@@ -617,6 +744,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 detail=(
                     "preflight only (no --execute)"
                     if preflight.may_hibernate
@@ -645,6 +773,7 @@ class SublaneHibernateUseCase:
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
+                project_scope=project_scope,
                 transition=transition,
                 detail=f"hibernate commit refused ({transition.reason})",
             )
@@ -655,9 +784,67 @@ class SublaneHibernateUseCase:
             preflight=preflight,
             issue=issue,
             lane=lane,
+            project_scope=project_scope,
             transition=transition,
             release=release,
             detail="lane hibernated; managed processes released",
+        )
+
+    def _project_gates(
+        self,
+        rec: Optional[Any],
+        rows: Sequence[Mapping[str, object]],
+        *,
+        project_scope: str,
+        workspace_id: str,
+        lane: str,
+        inventory_readable: bool,
+        expected_lane_generation: str,
+    ) -> tuple[bool, bool, bool]:
+        """The three project-gateway action-time gates (Redmine #13811; j#78386 §1-2).
+
+        Returns ``(action_generation_current, project_generation_matched,
+        project_attestation_ok)``. All three are ``True`` for an issue-owned lane (empty
+        ``project_scope``) or when the row is not the project lane the caller names / the
+        inventory is unreadable — so the issue path is byte-identical and the project gates
+        never *add* a spurious block on top of an identity / readability block that already
+        fires. Evaluated only when ``project_scope`` is set AND the row's binding matches it
+        AND the inventory is readable:
+
+        - **action_generation_current** (§1 stale-approval fence): the operator's asserted
+          approved ``lane_generation`` must be non-empty AND equal the row's current
+          generation. A missing assertion or a superseded incarnation fails closed.
+        - **project_generation_matched** (§1-2 exact-generation): the live inventory carries
+          the exact declared generation (:func:`declared_generation_exactly_live`). A
+          corrupt declared snapshot (:class:`ProcessPinError`) fails closed.
+        - **project_attestation_ok** (§2): every live target carries an action-time,
+          generation-matched startup attestation (:func:`declared_generation_attested`).
+        """
+        if not project_scope:
+            return True, True, True
+        if not inventory_readable or not record_matches_binding(
+            rec, project_scope=project_scope
+        ):
+            # A non-matching / unreadable case already blocks on identity / readability; the
+            # project gates stay satisfied so they do not double-report.
+            return True, True, True
+        assert rec is not None  # record_matches_binding is False for None
+        action_generation_current = bool(expected_lane_generation) and (
+            str(rec.lane_generation) == expected_lane_generation
+        )
+        try:
+            project_generation_matched = declared_generation_exactly_live(
+                rec.declared_pins, rows, workspace_id=workspace_id, lane_id=lane
+            )
+        except ProcessPinError:
+            project_generation_matched = False
+        project_attestation_ok = declared_generation_attested(
+            rows, workspace_id, lane, self.ops.read_attestation
+        )
+        return (
+            action_generation_current,
+            project_generation_matched,
+            project_attestation_ok,
         )
 
     def _drive_release(
@@ -686,185 +873,18 @@ class SublaneHibernateUseCase:
         )
 
 
-# ---------------------------------------------------------------------------
-# Text rendering + thin CLI handler.
-# ---------------------------------------------------------------------------
-
-
-def format_hibernate_text(outcome: HibernateOutcome) -> str:
-    lines = [
-        f"sublane hibernate: {outcome.lane} (issue {outcome.issue})",
-        f"  may_hibernate: {outcome.preflight.may_hibernate} executed: {outcome.executed}",
-    ]
-    if outcome.already_hibernated:
-        lines.append("  lane already hibernated (idempotent resume)")
-    if outcome.is_blocked:
-        lines.append(
-            "  -> fail-closed blocked: " + ", ".join(outcome.preflight.blocked_reasons)
-        )
-        if outcome.transition is not None and not outcome.transition.applied:
-            lines.append(f"  commit refused: {outcome.transition.reason}")
-        return "\n".join(lines)
-    if outcome.transition is not None:
-        lines.append(
-            f"  commit: applied={outcome.transition.applied} "
-            f"reason={outcome.transition.reason}"
-        )
-    if outcome.release is not None:
-        rel = outcome.release
-        lines.append(f"  release: {rel.process_release} ({rel.detail})")
-        for role, locator in rel.closed:
-            lines.append(f"    - closed {role} {locator}")
-        for role, locator, detail in rel.failed:
-            lines.append(f"    ! close failed {role} {locator}: {detail}")
-    if not outcome.executed and outcome.preflight.may_hibernate:
-        lines.append("  (preflight only; re-run with --execute to hibernate the lane)")
-    return "\n".join(lines)
-
-
-def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
-    repo = getattr(args, "repo", None)
-    repo_root = Path(repo).expanduser() if repo else Path.cwd()
-    request = HibernateRequest(
-        issue=getattr(args, "issue", "") or "",
-        lane=getattr(args, "lane", "") or "",
-        journal=getattr(args, "journal", "") or "",
-        assertions=HibernateAssertions(
-            explicitly_parked=bool(getattr(args, "explicitly_parked", False)),
-            callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
-            no_review_pending=bool(getattr(args, "no_review_pending", False)),
-            no_owner_approval_pending=bool(
-                getattr(args, "no_owner_approval_pending", False)
-            ),
-            no_integration_pending=bool(getattr(args, "no_integration_pending", False)),
-            no_pending_prompt=bool(getattr(args, "no_pending_prompt", False)),
-            not_working=bool(getattr(args, "not_working", False)),
-            worktree_clean=bool(getattr(args, "worktree_clean", False)),
-            boundary_recorded=bool(getattr(args, "boundary_recorded", False)),
-            review_approved=bool(getattr(args, "review_approved", False)),
-            staging_integrated=bool(getattr(args, "staging_integrated", False)),
-            required_ci_green=bool(getattr(args, "required_ci_green", False)),
-            dogfood_delegated=bool(getattr(args, "dogfood_delegated", False)),
-            commits_pushed=bool(getattr(args, "commits_pushed", False)),
-        ),
-    )
-    json_mode = bool(getattr(args, "json", False))
-    ops = LiveSublaneHibernateOps(repo_root=repo_root, env=dict(os.environ))
-    use_case = SublaneHibernateUseCase(ops=ops, store=LaneLifecycleStore())
-    outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
-    if json_mode:
-        print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_hibernate_text(outcome), file=sys.stdout)
-    return 1 if outcome.is_blocked else 0
-
-
-def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
-    """Register ``sublane hibernate`` outside the at-ceiling core CLI module.
-
-    Mirrors the sibling ``register_sublane_resume_parser`` placement (the core CLI module
-    is at the module-health ceiling), keeping the hibernate parser next to its use case
-    (Redmine #13967). Includes the early-hibernate park-basis flags (item 1).
-    """
-    from mozyo_bridge.application.cli_common import add_repo_option
-
-    sublane_hibernate = sublane_sub.add_parser(
-        "hibernate",
-        help=(
-            "Redmine #13682: release an OPEN lane's managed gateway/worker processes "
-            "while preserving its worktree / branch / unpublished commits / lane metadata "
-            "/ durable callback route (tombstone-free — never closes the issue, removes a "
-            "worktree, or deletes a branch). Fail-closed preflight (lane actively owns the "
-            "issue; an affirmative park basis — dependency park or early hibernate; no "
-            "callback/review/integration due (owner approval is required only for a "
-            "dependency park, not early hibernate); no pending composer; no work in "
-            "flight; a dirty worktree needs a boundary journal). Not an idle-timeout kill. "
-            "Default is preflight only; --execute performs the hibernate. Exits non-zero "
-            "when blocked. Resume with `sublane resume`."
-        ),
-    )
-    sublane_hibernate.add_argument(
-        "--issue", required=True, help="Redmine issue id the lane owns (stays open)"
-    )
-    sublane_hibernate.add_argument(
-        "--lane",
-        required=True,
-        help="Lane label to hibernate (e.g. issue_<id>_<slug>)",
-    )
-    sublane_hibernate.add_argument(
-        "--journal",
-        required=True,
-        help="Redmine journal id that authorizes the hibernate (durable anchor)",
-    )
-    # Durable-record invariants the operator asserts from the Redmine record (each
-    # defaults to unsatisfied so an omitted flag fails closed).
-    for _opt, _dest, _help in (
-        ("--explicitly-parked", "explicitly_parked",
-         "The issue is open and explicitly parked/blocked (dependency park basis)."),
-        ("--callbacks-drained", "callbacks_drained",
-         "The lane owes no outstanding coordinator callback."),
-        ("--no-review-pending", "no_review_pending",
-         "The lane has no review awaiting a result."),
-        ("--no-owner-approval-pending", "no_owner_approval_pending",
-         "The lane has no owner close approval pending. Required for a dependency park; "
-         "NOT required for early hibernate (owner approval stays on the coordinator path)."),
-        ("--no-integration-pending", "no_integration_pending",
-         "The lane has no integration disposition pending."),
-        ("--no-pending-prompt", "no_pending_prompt",
-         "The lane has no composer input pending."),
-        ("--not-working", "not_working", "The lane has no work in flight."),
-        ("--worktree-clean", "worktree_clean",
-         "The lane's worktree has no uncommitted diff (no boundary journal needed)."),
-        ("--boundary-recorded", "boundary_recorded",
-         "A boundary journal capturing the dirty worktree's diff / resume next-action "
-         "is recorded (required when the worktree is not clean)."),
-        # Early-hibernate park basis (Redmine #13967 item 1): the alternative to
-        # --explicitly-parked for a review-approved + staging-integrated feature lane
-        # whose dogfood execution/evidence is delegated to the dedicated release issue
-        # (close authority stays with the coordinator). All five must hold to qualify
-        # (each defaults unsatisfied -> fail closed).
-        ("--review-approved", "review_approved",
-         "Early hibernate: the same-lane Review Gate is approved with no open findings."),
-        ("--staging-integrated", "staging_integrated",
-         "Early hibernate: the coordinator staging integration is recorded (merged / "
-         "patch-equivalent to the staging branch)."),
-        ("--required-ci-green", "required_ci_green",
-         "Early hibernate: the required CI for the integrated commits is green."),
-        ("--dogfood-delegated", "dogfood_delegated",
-         "Early hibernate: TestPyPI / installed dogfood execution/evidence is delegated to "
-         "the dedicated release issue via a durable park/delegation record (close authority "
-         "and owner close approval stay with the coordinator, not delegated)."),
-        ("--commits-pushed", "commits_pushed",
-         "Early hibernate: the lane's commits are pushed / origin-reachable (unpushed "
-         "fails closed — an early hibernate presupposes integrated work)."),
-    ):
-        sublane_hibernate.add_argument(
-            _opt, dest=_dest, action="store_true", help=_help
-        )
-    sublane_hibernate.add_argument(
-        "--execute",
-        dest="execute",
-        action="store_true",
-        help=(
-            "Perform the hibernate: CAS the disposition (active->hibernated) and release "
-            "the lane's managed processes. Without it this is preflight only (no mutation)."
-        ),
-    )
-    add_repo_option(sublane_hibernate)
-    sublane_hibernate.add_argument(
-        "--json", action="store_true", help="Emit structured JSON output"
-    )
-    sublane_hibernate.set_defaults(func=cmd_sublane_hibernate)
-
-
 __all__ = (
     "BLOCK_CALLBACK_DEBT",
     "BLOCK_INTEGRATION_PENDING",
+    "BLOCK_INVENTORY_UNREADABLE",
     "BLOCK_NOT_PARKED",
     "BLOCK_ORIGINAL_IDENTITY",
     "BLOCK_OWNER_PENDING",
     "BLOCK_PENDING_PROMPT",
+    "BLOCK_PROJECT_GENERATION_MISMATCH",
+    "BLOCK_PROJECT_UNATTESTED",
     "BLOCK_REVIEW_PENDING",
+    "BLOCK_STALE_ACTION_GENERATION",
     "BLOCK_UNRECORDED_BOUNDARY",
     "BLOCK_UNPUSHED_COMMITS",
     "BLOCK_WORKING",
@@ -878,7 +898,4 @@ __all__ = (
     "LiveSublaneHibernateOps",
     "SublaneHibernateOps",
     "SublaneHibernateUseCase",
-    "cmd_sublane_hibernate",
-    "format_hibernate_text",
-    "register_sublane_hibernate_parser",
 )
