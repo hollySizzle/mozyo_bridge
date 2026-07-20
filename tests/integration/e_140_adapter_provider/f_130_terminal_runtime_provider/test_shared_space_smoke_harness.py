@@ -73,13 +73,21 @@ class _HarnessFixture:
         self.env = _make_env(tmp / "bin")
         self.fake = FakeHerdr(read_text="$ ready\n> ")
         self.tmp = tmp
-        self._ctx = isolated_smoke_home(self.isolated, operator_home=self.operator)
+        # Control the operator home the LEGITIMATE way (review j#83935 F1): set the
+        # ambient MOZYO_BRIDGE_HOME to the temp fixture, so `isolated_smoke_home`
+        # captures it as the operator home from the source of truth (no caller arg).
+        self._env_patch = patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": str(self.operator)}, clear=False
+        )
+        self._env_patch.start()
+        self._ctx = isolated_smoke_home(self.isolated)
         self.capability = self._ctx.__enter__()
         self.home = self.capability.isolated_home
         return self
 
     def __exit__(self, *exc):
         self._ctx.__exit__(*exc)
+        self._env_patch.stop()
         self._tmp.cleanup()
         return False
 
@@ -190,7 +198,7 @@ class SharedSpaceSmokeIntegrationTests(unittest.TestCase):
 
 
 class IsolationBindingTests(unittest.TestCase):
-    """F1: actuation is bound to a VERIFIED isolation capability (review j#83905 F1)."""
+    """F1: the operator home is the ambient source of truth, never a caller arg (j#83935)."""
 
     def test_harness_requires_a_capability(self) -> None:
         # The harness cannot be constructed without an IsolationCapability, so the
@@ -204,26 +212,50 @@ class IsolationBindingTests(unittest.TestCase):
                 )
 
     def test_hand_built_capability_is_refused(self) -> None:
-        # A capability can only be minted by isolated_smoke_home (token-guarded); a
-        # forged one (naming the operator home as "isolated") is refused at construction.
+        # A capability can only be minted by isolated_smoke_home (token-guarded).
         with tempfile.TemporaryDirectory() as tmp:
-            operator = Path(tmp) / "operator"
             with self.assertRaises(SmokeIsolationError):
-                IsolationCapability(operator, Path(tmp) / "other")
+                IsolationCapability(Path(tmp) / "a", Path(tmp) / "b")
 
-    def test_operator_home_as_both_cannot_mint_and_writes_nothing(self) -> None:
-        # review j#83905 F1 counterexample: the operator home passed as BOTH ambient and
-        # the smoke home. isolated_smoke_home re-runs prove_smoke_isolation, so a
-        # capability is never minted (same home) — no harness, no actuation, no write.
+    def test_capability_is_immutable(self) -> None:
+        # review j#83935 F1: the "unforgeable" claim is backed by immutability — a
+        # frozen dataclass whose fields cannot be reassigned.
         with tempfile.TemporaryDirectory() as tmp:
             operator = Path(tmp) / "operator"
             operator.mkdir()
+            isolated = Path(tmp) / "isolated"
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
+                with isolated_smoke_home(isolated) as capability:
+                    with self.assertRaises(Exception):
+                        capability.isolated_home = operator  # type: ignore[misc]
+
+    def test_ab_override_hole_is_closed(self) -> None:
+        # review j#83935 F1 counterexample: the ambient MOZYO_BRIDGE_HOME is the REAL
+        # operator home A; a caller tries to isolate INTO A while naming a fake distinct
+        # B as the operator. There is no `operator_home` param any more, so the operator
+        # home is ALWAYS the ambient A — isolating into A fails closed (A == A), with no
+        # write to A. (The A/B override that R3 left open cannot even be expressed.)
+        import inspect
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_harness import (  # noqa: E501
+            isolated_smoke_home as _mint,
+        )
+
+        self.assertNotIn(
+            "operator_home", inspect.signature(_mint).parameters,
+            "isolated_smoke_home must not expose a caller-supplied operator_home",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            operator_A = Path(tmp) / "operator_A"
+            operator_A.mkdir()
+            fake_B = Path(tmp) / "fake_B"  # a caller can no longer pass this anywhere
+            fake_B.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator_A)}, clear=False):
+                # Isolating INTO the ambient operator home A is refused (A == captured A).
                 with self.assertRaises(SmokeIsolationError):
-                    with isolated_smoke_home(operator, operator_home=operator):
-                        self.fail("must not mint a capability for operator==smoke home")
+                    with isolated_smoke_home(operator_A):
+                        self.fail("must not mint a capability isolating into the ambient home")
             self.assertEqual(
-                list(operator.rglob("*")), [], "operator home must be untouched"
+                list(operator_A.rglob("*")), [], "the real operator home must be untouched"
             )
 
     def test_ambient_drift_fails_closed_with_zero_write(self) -> None:
@@ -237,10 +269,9 @@ class IsolationBindingTests(unittest.TestCase):
             env = _make_env(Path(tmp) / "bin")
             repo = Path(tmp) / "proj"
             repo.mkdir()
-            # Mint a real capability, then leave the context so ambient reverts.
-            with isolated_smoke_home(isolated, operator_home=operator) as capability:
-                pass
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
+                with isolated_smoke_home(isolated) as capability:
+                    pass  # mint a real capability, then let the context restore ambient
                 harness = SharedSpaceSmokeHarness(
                     capability=capability, runner=FakeHerdr().run, env=env
                 )
@@ -369,10 +400,10 @@ class PreflightSurfaceTests(unittest.TestCase):
             operator.mkdir()
             env = _make_env(Path(tmp) / "bin")
             fake = FakeHerdr()
-            report = smoke_shared_space_preflight(
-                Path(tmp) / "smoke", runner=fake.run, env=env, projects=3,
-                operator_home=operator,
-            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
+                report = smoke_shared_space_preflight(
+                    Path(tmp) / "smoke", runner=fake.run, env=env, projects=3,
+                )
             self.assertTrue(report["isolated_home_ok"])
             self.assertTrue(report["clean_slate_ok"])
             self.assertEqual(report["mode"], "shared_space")
@@ -387,11 +418,11 @@ class PreflightSurfaceTests(unittest.TestCase):
             env = _make_env(Path(tmp) / "bin")
             fake = FakeHerdr()
             fake.run(["herdr", "workspace", "create", "--label", "coordinators"])
-            with self.assertRaises(SharedSpaceSmokeError):
-                smoke_shared_space_preflight(
-                    Path(tmp) / "smoke", runner=fake.run, env=env,
-                    operator_home=operator,
-                )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
+                with self.assertRaises(SharedSpaceSmokeError):
+                    smoke_shared_space_preflight(
+                        Path(tmp) / "smoke", runner=fake.run, env=env,
+                    )
 
 
 if __name__ == "__main__":

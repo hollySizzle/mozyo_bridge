@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _SRC = Path(__file__).resolve().parents[4] / "src"
 if str(_SRC) not in sys.path:
@@ -88,27 +89,32 @@ class IsolatedSmokeHomeTests(unittest.TestCase):
     """The isolation context manager writes the facade file and restores the env."""
 
     def test_writes_placement_file_and_restores_env(self) -> None:
-        prior = os.environ.get("MOZYO_BRIDGE_HOME")
         with tempfile.TemporaryDirectory() as tmp:
             operator = Path(tmp) / "real"
             operator.mkdir()
             isolated = Path(tmp) / "smoke"
-            with isolated_smoke_home(isolated, operator_home=operator) as capability:
-                # Yields a verified IsolationCapability (review j#83905 F1), not a bare path.
-                self.assertEqual(capability.operator_home, operator.resolve())
-                home = capability.isolated_home
-                text = coordinator_placement_path(home).read_text(encoding="utf-8")
-                self.assertIn("shared_space", text)
-                self.assertEqual(os.environ["MOZYO_BRIDGE_HOME"], str(home))
-            self.assertEqual(os.environ.get("MOZYO_BRIDGE_HOME"), prior)
+            # The operator home is the AMBIENT home (source of truth), not a caller arg
+            # (review j#83935 F1): a test controls it by setting MOZYO_BRIDGE_HOME.
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
+                with isolated_smoke_home(isolated) as capability:
+                    self.assertEqual(capability.operator_home, operator.resolve())
+                    home = capability.isolated_home
+                    text = coordinator_placement_path(home).read_text(encoding="utf-8")
+                    self.assertIn("shared_space", text)
+                    self.assertEqual(os.environ["MOZYO_BRIDGE_HOME"], str(home))
+                # Restored to the ambient operator home on exit.
+                self.assertEqual(os.environ.get("MOZYO_BRIDGE_HOME"), str(operator))
 
-    def test_bad_home_fails_closed_before_writing(self) -> None:
+    def test_isolating_into_the_ambient_home_fails_closed(self) -> None:
+        # review j#83935 F1: isolating into the ambient (operator) home is refused —
+        # there is no caller arg to name a fake distinct operator home.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             home.mkdir()
-            with self.assertRaises(SmokeIsolationError):
-                with isolated_smoke_home(home, operator_home=home):
-                    self.fail("must not enter the body when isolation is unprovable")
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(SmokeIsolationError):
+                    with isolated_smoke_home(home):
+                        self.fail("must not enter the body when isolation is unprovable")
 
 
 class RecordingHerdrRunnerTests(unittest.TestCase):

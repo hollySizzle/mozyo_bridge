@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Optional, Sequence
 
@@ -158,43 +158,42 @@ def prove_smoke_isolation(isolated_home: Path, *, operator_home: Path) -> Path:
 _ISOLATION_CAPABILITY_TOKEN = object()
 
 
+@dataclass(frozen=True)
 class IsolationCapability:
     """Proof that an isolated smoke home was established distinct from the operator home.
 
-    The R2 fix (:meth:`SharedSpaceSmokeHarness._assert_isolation_bound`) only proved the
-    ambient home *agreed* with ``self.home`` — value agreement, not isolation authority.
-    A caller who never used :func:`isolated_smoke_home` and passed the REAL operator home
-    as BOTH the ambient ``MOZYO_BRIDGE_HOME`` and the harness ``home`` slipped through,
-    because the two agreed (review j#83905 F1). This capability closes that: it is minted
-    ONLY by :func:`isolated_smoke_home`, AFTER :func:`prove_smoke_isolation` has proven the
-    isolated home is distinct from (and un-nested with) the REAL operator home captured
-    before the ``MOZYO_BRIDGE_HOME`` override. It carries that operator home so the
-    harness can RE-prove isolation at actuation time rather than trust a bare value.
+    Minted ONLY by :func:`isolated_smoke_home`, AFTER :func:`prove_smoke_isolation` has
+    proven the isolated home is distinct from (and un-nested with) the operator home the
+    mint captured from the **source of truth** — the effective ``mozyo_bridge_home()``
+    BEFORE the ``MOZYO_BRIDGE_HOME`` override — NOT from any caller argument (review
+    j#83935 F1). It carries that operator home so the harness can RE-prove isolation at
+    actuation time rather than trust a bare value.
 
-    Construction requires the module-private mint token, so a hand-built capability
-    (the only way to forge one) is refused. The harness requires an ``IsolationCapability``
-    to construct, so the "never used the context manager" misuse cannot even build a
-    harness — the public use-case is the safety authority, not caller discipline.
+    Two constraints back the guarantee (nothing more is claimed): it is **immutable**
+    (a frozen dataclass — its fields cannot be reassigned) and its construction requires
+    the module-private mint token (a hand-built capability is refused). Because
+    :func:`isolated_smoke_home` never accepts a caller-supplied proof target, there is no
+    supported public path for a normal caller to name the operator home as "isolated" —
+    the earlier ``operator_home`` override that allowed exactly that (review j#83935 F1)
+    is removed. The harness requires an ``IsolationCapability`` to construct, so the
+    "never used the context manager" misuse cannot even build a harness — the public
+    use-case is the safety authority, not caller discipline.
     """
 
-    __slots__ = ("isolated_home", "operator_home")
+    isolated_home: Path
+    operator_home: Path
+    _mint_token: InitVar[object] = None
 
-    def __init__(
-        self, isolated_home: Path, operator_home: Path, *, _mint_token: object = None
-    ) -> None:
+    def __post_init__(self, _mint_token: object) -> None:
         if _mint_token is not _ISOLATION_CAPABILITY_TOKEN:
             raise SmokeIsolationError(
                 "IsolationCapability must be minted by isolated_smoke_home(); refuse a "
                 "hand-built capability (Redmine #14187 Acceptance 1/5; review j#83905 F1)"
             )
-        self.isolated_home = Path(isolated_home).expanduser().resolve()
-        self.operator_home = Path(operator_home).expanduser().resolve()
 
 
 @contextmanager
-def isolated_smoke_home(
-    isolated_home: Path, *, operator_home: Optional[Path] = None
-) -> Iterator[IsolationCapability]:
+def isolated_smoke_home(isolated_home: Path) -> Iterator[IsolationCapability]:
     """Establish the isolated operator home for a smoke run (fail-closed, restoring).
 
     Proves isolation (:func:`prove_smoke_isolation`) BEFORE touching anything, then
@@ -203,21 +202,26 @@ def isolated_smoke_home(
     registry / store) resolves the isolated home — never the operator's. Writes the
     operator placement file (``mode: shared_space``) into the isolated home so the
     shared path is exercised through the real semantic facade, not a hardcoded mode.
-    Restores the prior ``MOZYO_BRIDGE_HOME`` on exit. ``operator_home`` defaults to
-    the currently-resolved home (captured before the override) so the distinctness
-    guard is measured against the real operator home.
+    Restores the prior ``MOZYO_BRIDGE_HOME`` on exit.
 
-    Yields an :class:`IsolationCapability` (review j#83905 F1) — the verified proof the
-    harness requires to construct, carrying the operator home the isolation was proven
-    against so the harness can re-prove it at actuation time. The value is unforgeable
-    (mint-token-guarded), so a caller cannot bypass the isolation authority.
+    The operator home the isolation is proven against is ALWAYS the effective
+    ``mozyo_bridge_home()`` captured BEFORE the override — the source of truth — never a
+    caller argument (review j#83935 F1: a public ``operator_home`` override let a caller
+    name a fake distinct home and mint the REAL operator home as "isolated"). A hermetic
+    test controls the operator home the only legitimate way: by setting the ambient
+    ``MOZYO_BRIDGE_HOME`` to its temp fixture before calling this — that IS the authority,
+    not a substitution of it.
+
+    Yields an :class:`IsolationCapability` — the verified, immutable, mint-token-guarded
+    proof the harness requires to construct.
     """
     import os
 
     prior = os.environ.get("MOZYO_BRIDGE_HOME")
-    # Capture the real operator home BEFORE any override so the guard measures the
-    # right thing (a caller may pass it explicitly for a fully hermetic test).
-    operator = Path(operator_home) if operator_home is not None else mozyo_bridge_home()
+    # The operator home is the effective home BEFORE the override — the source of truth,
+    # not a caller argument (review j#83935 F1). A test sets ambient MOZYO_BRIDGE_HOME to
+    # its fixture to control this; production reads the operator's real home.
+    operator = mozyo_bridge_home()
     isolated = prove_smoke_isolation(isolated_home, operator_home=operator)
     capability = IsolationCapability(
         isolated, operator, _mint_token=_ISOLATION_CAPABILITY_TOKEN
@@ -677,21 +681,21 @@ def smoke_shared_space_preflight(
     runner,
     env: Mapping[str, str],
     projects: int = 2,
-    operator_home: Optional[Path] = None,
 ) -> dict:
     """Prove a shared-space smoke can run here safely; return a redaction-safe report.
 
     The read-only surface the CLI exposes and the #14185 live driver calls first: it
     establishes the isolated home (:func:`isolated_smoke_home`, which fails closed
-    unless the home is provably distinct from the operator's), then runs the herdr
-    clean-slate cleanup-authority gate (:meth:`SharedSpaceSmokeHarness.preflight_clean_slate`,
-    a read-only ``workspace list``). It **actuates no agent** — the live coordinator
-    launch is the #14185 driver's isolated-instance job. Returns counts / bools /
-    closed tokens only (no home path, no env value), so the report can be summarised
-    into a durable Redmine journal.
+    unless the home is provably distinct from the operator's — the operator home is the
+    ambient ``mozyo_bridge_home()``, never a caller argument, review j#83935 F1), then
+    runs the herdr clean-slate cleanup-authority gate
+    (:meth:`SharedSpaceSmokeHarness.preflight_clean_slate`, a read-only ``workspace
+    list``). It **actuates no agent** — the live coordinator launch is the #14185
+    driver's isolated-instance job. Returns counts / bools / closed tokens only (no home
+    path, no env value), so the report can be summarised into a durable Redmine journal.
     """
     count = max(2, int(projects))
-    with isolated_smoke_home(isolated_home, operator_home=operator_home) as capability:
+    with isolated_smoke_home(isolated_home) as capability:
         harness = SharedSpaceSmokeHarness(capability=capability, runner=runner, env=env)
         harness.preflight_clean_slate()
     return {
