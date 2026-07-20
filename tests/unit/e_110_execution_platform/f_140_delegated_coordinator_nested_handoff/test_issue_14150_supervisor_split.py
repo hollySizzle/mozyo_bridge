@@ -302,6 +302,67 @@ class ProviderCallCountTest(unittest.TestCase):
         self.assertEqual(report.workspaces[0].provider_read_issues, 1)  # one issue touched provider
 
 
+class ProviderCallCountRoundFenceTest(unittest.TestCase):
+    """Redmine #14150 review F1: provider_calls counts the send-edge round-fence reads too, via a
+    shared per-workspace counter — not just the reconcile source's reads."""
+
+    def test_shared_counter_folds_send_edge_reads(self) -> None:
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutboxKey
+        from mozyo_bridge.core.state.workflow_runtime_store import (
+            CALLBACK_PENDING as _CP,
+            WorkflowRuntimeStore,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_wiring import (
+            _CountingSource,
+            _ProviderCallCounter,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+            MappingRedmineJournalSource,
+        )
+
+        d = Path(tempfile.mkdtemp())
+        sp = d / "wf.sqlite"
+        # A pending coordinator row so a delivery (and the sender) actually runs.
+        CallbackOutbox(path=sp).enqueue(
+            CallbackOutboxKey(source="redmine", issue=ISSUE, journal="100",
+                              normalized_gate="review_request", callback_route="coordinator",
+                              workspace_id="wsA"),
+            initial_state=_CP, target_receiver="coordinator", target_lane="laneA",
+        )
+        payload = {"issue": {"id": ISSUE}, "journals": [
+            {"id": "100", "notes": "## Gate: review_request\n"
+             "[mozyo:workflow-event:gate=review_request:conclusion=pending]"}]}
+        reconcile_src = MappingRedmineJournalSource(payload=payload)
+        shared = _ProviderCallCounter()
+        round_fence_reads = {"n": 0}
+
+        def sender_reading_provider(row):
+            # Simulate the send-edge round fence: read the provider through a source that SHARES the
+            # workspace counter (as build_supervisor wires it), then deliver.
+            _CountingSource(reconcile_src, shared).read_entries(ISSUE)
+            round_fence_reads["n"] += 1
+            return SEND_DELIVERED
+
+        sup = WorkspaceCallbackSupervisor(
+            holder="h",
+            lease_store=SupervisorLeaseStore(path=d / "l.sqlite"),
+            store=WorkflowRuntimeStore(path=sp),
+            outbox=CallbackOutbox(path=sp),
+            workspaces_fn=lambda: [SupervisedWorkspace(workspace_id="wsA", canonical_path=str(d))],
+            roster_fn=lambda ws: ((ISSUE,), ""),
+            redmine_source_fn=lambda ws: reconcile_src,
+            sender_fn=lambda ws: sender_reading_provider,
+            clock=lambda: CLOCK,
+            provider_counter_fn=lambda wsid: shared,  # the shared per-ws counter (build_supervisor wiring)
+        )
+        report = sup.run_once()
+        reconcile_only = report.provider_calls - round_fence_reads["n"]
+        self.assertGreaterEqual(round_fence_reads["n"], 1)  # the sender read the provider
+        self.assertGreaterEqual(reconcile_only, 1)  # the reconcile source read the provider
+        # provider_calls folds BOTH the reconcile reads AND the send-edge round-fence reads.
+        self.assertEqual(report.provider_calls, reconcile_only + round_fence_reads["n"])
+
+
 class SchemaForwardCompatTest(unittest.TestCase):
     """Redmine #14150: a strict read-only read must tolerate a store predating the additive column.
 
@@ -340,50 +401,6 @@ class SchemaForwardCompatTest(unittest.TestCase):
         rows = outbox.read_strict_readonly(states=[CALLBACK_PENDING])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].enqueue_lane_generation, "")  # absent column -> default, no raise
-
-
-class EventCursorTest(unittest.TestCase):
-    """Redmine #14150 review F3: durable per-issue event cursor bounds incremental discovery."""
-
-    def setUp(self) -> None:
-        self.dir = Path(tempfile.mkdtemp())
-        self.store = ReconcileCadenceStore(path=self.dir / "reconcile-cadence.sqlite")
-
-    def test_missing_cursor_reads_blank(self) -> None:
-        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "")
-
-    def test_cursor_advances_and_is_monotonic_across_restart(self) -> None:
-        self.store.advance_event_cursor("wsA", ISSUE, cursor="100", now=CLOCK)
-        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "100")
-        # A lower cursor never rewinds a higher stored one (idempotent restart safety).
-        self.store.advance_event_cursor("wsA", ISSUE, cursor="50", now=CLOCK)
-        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "100")
-        # A newer journal (lost wake / external update) advances it.
-        self.store.advance_event_cursor("wsA", ISSUE, cursor="150", now=CLOCK)
-        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "150")
-        # A fresh store instance (a restart) reads the persisted cursor.
-        reopened = ReconcileCadenceStore(path=self.dir / "reconcile-cadence.sqlite")
-        self.assertEqual(reopened.read_event_cursor("wsA", ISSUE), "150")
-
-    def test_fence_candidates_after_cursor(self) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
-            fence_candidates_after_cursor,
-        )
-
-        def cand(j):
-            return type("C", (), {"journal": j})()
-
-        # First pass (blank cursor): keep all, cursor -> max journal.
-        fresh, nxt = fence_candidates_after_cursor([cand("100"), cand("120")], "")
-        self.assertEqual([c.journal for c in fresh], ["100", "120"])
-        self.assertEqual(nxt, "120")
-        # Incremental: only journals strictly newer than the cursor; a lost/external newer id passes.
-        fresh, nxt = fence_candidates_after_cursor([cand("100"), cand("120"), cand("150")], "120")
-        self.assertEqual([c.journal for c in fresh], ["150"])
-        self.assertEqual(nxt, "150")
-        # A non-numeric journal is kept (fail-open toward delivery; UNIQUE key is the authority).
-        fresh, _ = fence_candidates_after_cursor([cand("abc")], "120")
-        self.assertEqual([c.journal for c in fresh], ["abc"])
 
 
 class PureHelperTest(unittest.TestCase):

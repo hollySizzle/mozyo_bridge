@@ -45,28 +45,46 @@ class _NullSource:
 _NULL_SOURCE = _NullSource()
 
 
-class _CountingSource:
-    """Wrap a Redmine source and count every ``read_entries`` (Redmine #14150 review F2).
+class _ProviderCallCounter:
+    """A mutable ticket-provider read counter SHARED across every source a workspace pass builds.
 
-    Each ``read_entries`` is one fresh ticket-provider fetch (``LiveRedmineJournalSource`` issues a new
-    HTTP request per call, by contract), so a per-issue reconcile firing supply + discovery +
-    dispatch-anchor + review-identity + review_return / lane_gateway discovery reads makes MANY provider
-    calls. This wrapper counts the ACTUAL transport invocations through the reconcile source (the
-    dominant provider-read path — supply / discover / fences / reconcile leg / own-workspace backlog
-    drain, which shares this same source), so ``SupervisorReport.provider_calls`` reports the real HTTP
-    fetch count rather than "issues that touched the provider" (which under-counted 1/issue). Send-edge
-    round-fence reads use a SEPARATELY-constructed source (a different delivery-path concern, bounded by
-    the number of review rows actually delivered) and are not folded into this count.
+    Redmine #14150 review F1: ``read_entries`` is one fresh provider fetch (``LiveRedmineJournalSource``
+    issues a new HTTP request per call). A workspace pass reads the provider through MORE than the
+    reconcile source — the send-edge review-round fence builds its OWN source and re-reads the journal
+    at delivery time. Sharing ONE counter across all those sources makes ``provider_calls`` the ACTUAL
+    whole-pass provider call count (supply + discovery + dispatch-anchor + review-identity + review_return
+    / lane_gateway discovery + send-edge round-fence + own-workspace backlog), not just the reconcile
+    source's reads.
     """
 
-    __slots__ = ("_inner", "count")
+    __slots__ = ("n",)
 
-    def __init__(self, inner: object) -> None:
+    def __init__(self) -> None:
+        self.n = 0
+
+
+class _CountingSource:
+    """Wrap a Redmine source and increment a SHARED counter on every ``read_entries`` (Redmine #14150).
+
+    All sources a workspace pass constructs (the reconcile source AND the send-edge round-fence source)
+    wrap the SAME :class:`_ProviderCallCounter`, so the count reflects every real transport invocation
+    across the whole pass, not the per-issue boolean (which under-counted 1/issue) nor the reconcile
+    source alone (which missed the send-edge round-fence reads — review F1). ``count`` mirrors the
+    shared counter for callers that read a single wrapper directly.
+    """
+
+    __slots__ = ("_inner", "_counter")
+
+    def __init__(self, inner: object, counter: Optional["_ProviderCallCounter"] = None) -> None:
         self._inner = inner
-        self.count = 0
+        self._counter = counter if counter is not None else _ProviderCallCounter()
+
+    @property
+    def count(self) -> int:
+        return self._counter.n
 
     def read_entries(self, issue_id: object = None):
-        self.count += 1
+        self._counter.n += 1
         return self._inner.read_entries(issue_id)
 
     def __getattr__(self, name: str):  # delegate any other source attribute unchanged

@@ -341,35 +341,6 @@ def select_drain_issues(pending_rows: Iterable[object], workspace_id: str) -> tu
     return tuple(issues)
 
 
-def fence_candidates_after_cursor(candidates, cursor):
-    """Bound candidate DISCOVERY to events newer than the durable event cursor (Redmine #14150 F3; pure).
-
-    ``cursor`` is the highest source journal id already folded for the issue (blank / non-numeric ->
-    first pass, keep everything). Returns ``(fresh, next_cursor)``: ``fresh`` is the candidates on a
-    journal strictly newer than ``cursor`` (an incremental read after the stored cursor); a candidate
-    with a non-numeric journal is kept (fail-open toward delivery — the generation fence + outbox
-    UNIQUE key remain the correctness authority, not the cursor). ``next_cursor`` is the max of
-    ``cursor`` and every candidate journal seen this pass, as a string, so the caller advances the
-    durable cursor past all discovered events on a successful pass. Order-preserving. Because a newer
-    gate always has a higher journal id, an over-advance never drops a future gate — the cursor only
-    filters re-discovery of already-folded events.
-    """
-    cur = _as_journal_int(cursor)
-    fresh: list = []
-    max_seen = cur
-    for candidate in candidates:
-        journal = _as_journal_int(getattr(candidate, "journal", ""))
-        if journal is None:
-            fresh.append(candidate)  # non-numeric journal: cannot cursor-filter -> keep (fail-open)
-            continue
-        if max_seen is None or journal > max_seen:
-            max_seen = journal
-        if cur is None or journal > cur:
-            fresh.append(candidate)
-    next_cursor = str(max_seen) if max_seen is not None else str(cursor or "")
-    return tuple(fresh), next_cursor
-
-
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -826,7 +797,6 @@ __all__ = (
     "partition_delivery_receipts",
     "is_locally_attestable_route",
     "select_drain_issues",
-    "fence_candidates_after_cursor",
     "reconcile_backoff_seconds",
     "should_reconcile_source",
     "IssueSelection",

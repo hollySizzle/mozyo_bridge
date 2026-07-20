@@ -79,6 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_wiring import (
     _CountingSource,
     _NULL_SOURCE,
+    _ProviderCallCounter,
     SupervisedWorkspace,
     default_authoritative_map,
     default_background_transport,
@@ -112,7 +113,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IssueSupervisionOutcome,
     SupervisorReport,
     WorkspaceSupervisionOutcome,
-    fence_candidates_after_cursor,
     fence_candidates_to_anchor,
     partition_authoritative,
     partition_delivery_receipts,
@@ -171,8 +171,7 @@ class WorkspaceCallbackSupervisor:
         ] = None,
         reconcile_due_fn: Optional[Callable[[str], bool]] = None,
         reconcile_mark_fn: Optional[Callable[[str, bool], None]] = None,
-        event_cursor_read_fn: Optional[Callable[[str, str], str]] = None,
-        event_cursor_advance_fn: Optional[Callable[[str, str, str], None]] = None,
+        provider_counter_fn: Optional[Callable[[str], "_ProviderCallCounter"]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -233,13 +232,12 @@ class WorkspaceCallbackSupervisor:
         # due-check failure fails toward reconciling (never silently suppresses the provider fallback).
         self._reconcile_due_fn = reconcile_due_fn
         self._reconcile_mark_fn = reconcile_mark_fn
-        # Redmine #14150 review F3: the durable per-(workspace, issue) event cursor. When wired, the
-        # bounded reconciliation reads only candidates NEWER than the stored cursor (incremental
-        # discovery after the stored cursor) and advances it only on a successful issue pass — a lost
-        # wake / external update (a newer journal) is still discovered because it has a higher id.
-        # Optional (default None -> no cursor filter -> pre-#14150-F3 full discovery, unit-fake safe).
-        self._event_cursor_read_fn = event_cursor_read_fn
-        self._event_cursor_advance_fn = event_cursor_advance_fn
+        # Redmine #14150 review F1: the shared per-workspace provider-call counter resolver. When wired,
+        # the reconcile source AND the sender's send-edge round-fence source share the SAME counter, so
+        # ``provider_calls`` is the ACTUAL whole-pass provider read count (incl. round-fence reads), not
+        # the reconcile source alone. Optional (default None -> a fresh per-pass counter that only the
+        # main reconcile source increments, the unit-fake path).
+        self._provider_counter_fn = provider_counter_fn
 
     # -- public entrypoint -------------------------------------------------
 
@@ -408,9 +406,17 @@ class WorkspaceCallbackSupervisor:
                         skipped_reason=SKIP_LEASE_LOST if drain_lease_lost else "",
                     )
             raw_source = self._redmine_source_fn(ws)
-            # Redmine #14150 review F2: count actual provider reads (read_entries = one HTTP fetch)
-            # through the reconcile source, which the per-issue supervise AND the backlog drain share.
-            source = _CountingSource(raw_source) if raw_source is not None else None
+            # Redmine #14150 review F1/F2: count the ACTUAL provider reads (read_entries = one HTTP
+            # fetch). The shared per-workspace counter (when wired) is also used by the sender's
+            # send-edge round-fence source, so the count spans the whole pass — reconcile discovery +
+            # fences + backlog + send-edge round-fence — not the reconcile source alone. Reset per pass.
+            counter = (
+                self._provider_counter_fn(wsid)
+                if self._provider_counter_fn is not None
+                else _ProviderCallCounter()
+            )
+            counter.n = 0
+            source = _CountingSource(raw_source, counter) if raw_source is not None else None
             sender = self._sender_fn(ws)
             binding = self._binding_fn(ws) if self._binding_fn is not None else None
             issue_outcomes: list[IssueSupervisionOutcome] = []
@@ -473,7 +479,7 @@ class WorkspaceCallbackSupervisor:
                 non_authoritative_issues=non_authoritative,
                 issues=tuple(issue_outcomes),
                 skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
-                provider_calls=source.count if source is not None else 0,
+                provider_calls=counter.n,
                 backlog_fenced=backlog.fenced if backlog else 0,
                 backlog_delivered=backlog.delivered if backlog else 0,
                 backlog_blocked=backlog.blocked if backlog else 0,
@@ -538,7 +544,6 @@ class WorkspaceCallbackSupervisor:
         review_return_refusals: tuple[str, ...] = ()
         lane_gateway_refusals: tuple[str, ...] = ()
         anchor: Optional[str] = None
-        next_event_cursor: Optional[str] = None
         try:
             if source is not None:
                 events_supplied = self._supply_events(issue, source, binding)
@@ -623,29 +628,12 @@ class WorkspaceCallbackSupervisor:
                         fence_active=self._candidate_fence_fn is not None, anchor=anchor,
                     )
                     candidates = candidates + tuple(lane_candidates)
-                # Redmine #14150 review F3: bound candidate DISCOVERY to events newer than the durable
-                # per-issue event cursor (incremental read after the stored cursor). Applied ONLY to the
-                # candidates that get ingested — the fences above already read the FULL journal, so a
-                # historical dispatch anchor / review identity is unaffected. ``next_event_cursor`` is
-                # advanced (below) only on a successful pass; a newer gate keeps a higher journal id, so
-                # a lost wake / external update is still discovered.
-                if self._event_cursor_read_fn is not None:
-                    try:
-                        prior_cursor = str(
-                            self._event_cursor_read_fn(workspace_id, issue) or ""
-                        )
-                    except Exception:  # noqa: BLE001 - an unreadable cursor falls back to full discovery
-                        prior_cursor = ""
-                    candidates, next_event_cursor = fence_candidates_after_cursor(
-                        candidates, prior_cursor
-                    )
             else:
                 error = ISSUE_SOURCE_UNREADABLE
         except Exception:  # noqa: BLE001 - a source read failure degrades this issue, never the sweep
             error = ISSUE_SOURCE_UNREADABLE
             candidates = ()
             send_fence_fn = None
-            next_event_cursor = None
 
         # R2-F1 transient-source guard: fence active but source read failed -> the current dispatch
         # anchor could not be resolved. Skip delivery entirely rather than deliver un-fenced
@@ -719,18 +707,6 @@ class WorkspaceCallbackSupervisor:
         delivered_count, blocked_count = partition_delivery_receipts(
             deliver.get("delivered") or [], delivered_state=CALLBACK_DELIVERED
         )
-        # Redmine #14150 review F3: advance the durable event cursor ONLY now — a successful pass that
-        # read the source and ran the outbox delivery. A read failure returned earlier (transient guard /
-        # except) without advancing, so a transient outage re-reads the same events next pass.
-        if (
-            self._event_cursor_advance_fn is not None
-            and next_event_cursor
-            and not error
-        ):
-            try:
-                self._event_cursor_advance_fn(workspace_id, issue, next_event_cursor)
-            except Exception:  # noqa: BLE001 - a cursor write never breaks the sweep (efficiency filter)
-                pass
         return IssueSupervisionOutcome(
             issue=issue,
             events_supplied=events_supplied,
@@ -839,6 +815,15 @@ def build_supervisor(
     # delivery (via default_target_resolver's live_generation_fn) — the two-sided fence correction 1.
     lifecycle_store = default_lifecycle_store(home=home)
 
+    # Redmine #14150 review F1: one shared provider-call counter per workspace — the reconcile source
+    # (wrapped in the supervisor) AND the send-edge round-fence source (wrapped below) increment the
+    # SAME counter, so ``provider_calls`` is the ACTUAL whole-pass provider read count. The supervisor
+    # resets it at each workspace pass start.
+    _ws_provider_counters: dict[str, _ProviderCallCounter] = {}
+
+    def _counter_for(workspace_id: str) -> _ProviderCallCounter:
+        return _ws_provider_counters.setdefault(str(workspace_id), _ProviderCallCounter())
+
     def _sender_fn(ws: SupervisedWorkspace):
         # Model A' (design answer j#77216): the supervisor delivers as a background_service
         # authority — lease + claim gated (claim re-verified against the outbox, R3-F4), target
@@ -854,7 +839,13 @@ def build_supervisor(
             outbox=outbox,
             # R1-F1: re-verify the review round at the send edge against the live Redmine markers.
             # home-scoped so the daemon reads credentials from the pinned mozyo home (j#79092 R2-F1).
-            round_fence_fn=review_round_send_fence(lambda: default_redmine_source(ws, home=home)),
+            # #14150 review F1: the round-fence source shares the workspace provider-call counter, so
+            # its send-edge journal re-reads are folded into ``provider_calls``.
+            round_fence_fn=review_round_send_fence(
+                lambda: _CountingSource(
+                    default_redmine_source(ws, home=home), _counter_for(ws.workspace_id)
+                )
+            ),
         )
 
     def _drain_sender_fn(ws: SupervisedWorkspace):
@@ -941,14 +932,6 @@ def build_supervisor(
     def _reconcile_mark_fn(workspace_id: str, produced_new: bool) -> None:
         cadence_store.mark(workspace_id, now=_utc_now_iso(), produced=produced_new)
 
-    def _event_cursor_read_fn(workspace_id: str, issue: str) -> str:
-        return cadence_store.read_event_cursor(workspace_id, issue)
-
-    def _event_cursor_advance_fn(workspace_id: str, issue: str, cursor: str) -> None:
-        cadence_store.advance_event_cursor(
-            workspace_id, issue, cursor=cursor, now=_utc_now_iso()
-        )
-
     return WorkspaceCallbackSupervisor(
         holder=holder,
         lease_store=lease_store,
@@ -971,8 +954,7 @@ def build_supervisor(
         drain_sender_fn=_drain_sender_fn,
         reconcile_due_fn=_reconcile_due_fn,
         reconcile_mark_fn=_reconcile_mark_fn,
-        event_cursor_read_fn=_event_cursor_read_fn,
-        event_cursor_advance_fn=_event_cursor_advance_fn,
+        provider_counter_fn=lambda wsid: _counter_for(wsid),
     )
 
 

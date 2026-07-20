@@ -33,26 +33,6 @@ CREATE TABLE IF NOT EXISTS reconcile_watermark (
 )
 """
 
-#: The durable per-(workspace, issue) event cursor (Redmine #14150 review F3): the highest source
-#: journal id already folded into the outbox for that issue. Bounds candidate DISCOVERY to events
-#: newer than the cursor (an incremental read after the stored cursor); the cursor advances only on a
-#: successful reconcile of the issue and never on a read failure, so a transient outage re-reads. The
-#: correctness authority remains the outbox UNIQUE key + the generation fence, not the cursor — the
-#: cursor is an efficiency filter, so an over-advance can never mis-deliver (a newer gate always has a
-#: higher journal id and is still discovered). NOTE: Redmine's issue-detail endpoint has no
-#: server-side journal `since` filter, so this bounds discovery / ingest processing, not the per-issue
-#: HTTP fetch; a fetch-level reduction (the issues.json `updated_since` list endpoint) is a follow-up.
-_EVENT_CURSOR_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS reconcile_event_cursor (
-    workspace_id TEXT NOT NULL,
-    issue        TEXT NOT NULL,
-    cursor       TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (workspace_id, issue)
-)
-"""
-
-
 def reconcile_cadence_path(home: Optional[Path] = None) -> Path:
     """Resolve the ``reconcile-cadence.sqlite`` path under the mozyo-bridge home."""
     return (home or mozyo_bridge_home()) / RECONCILE_CADENCE_FILENAME
@@ -78,7 +58,6 @@ class ReconcileCadenceStore:
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.execute("PRAGMA busy_timeout = 2000")
         conn.execute(_TABLE_SQL)
-        conn.execute(_EVENT_CURSOR_TABLE_SQL)
         return conn
 
     def read(self, workspace_id: str) -> ReconcileWatermark:
@@ -140,77 +119,6 @@ class ReconcileCadenceStore:
                 "last_reconciled_at=excluded.last_reconciled_at, empty_passes=excluded.empty_passes, "
                 "updated_at=excluded.updated_at",
                 (wsid, stamp, empties, stamp),
-            )
-            conn.execute("COMMIT")
-        except sqlite3.DatabaseError:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.DatabaseError:
-                pass
-        finally:
-            conn.close()
-
-
-    def read_event_cursor(self, workspace_id: str, issue: str) -> str:
-        """Return the durable event cursor for (workspace, issue), or '' if never reconciled (#14150 F3)."""
-        wsid = str(workspace_id or "").strip()
-        iss = str(issue or "").strip()
-        if not wsid or not iss or not self.path.exists():
-            return ""
-        try:
-            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
-        except sqlite3.DatabaseError:
-            return ""
-        try:
-            has = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='reconcile_event_cursor'"
-            ).fetchone()
-            if has is None:
-                return ""
-            row = conn.execute(
-                "SELECT cursor FROM reconcile_event_cursor WHERE workspace_id=? AND issue=?",
-                (wsid, iss),
-            ).fetchone()
-        except sqlite3.DatabaseError:
-            return ""
-        finally:
-            conn.close()
-        return str(row[0]) if row is not None else ""
-
-    def advance_event_cursor(self, workspace_id: str, issue: str, *, cursor: str, now: str) -> None:
-        """Advance the durable event cursor for (workspace, issue) (#14150 F3; caller advances on success).
-
-        Monotonic: a lower / blank ``cursor`` never rewinds a higher stored one (numeric compare;
-        non-numeric falls back to keeping the stored value). A write failure is swallowed — the cursor is
-        an efficiency filter, so a lost advance only re-reads next pass (never a mis-delivery).
-        """
-        wsid = str(workspace_id or "").strip()
-        iss = str(issue or "").strip()
-        proposed = str(cursor or "").strip()
-        if not wsid or not iss or not proposed:
-            return
-        try:
-            conn = self._connect()
-        except sqlite3.DatabaseError:
-            return
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            prev = conn.execute(
-                "SELECT cursor FROM reconcile_event_cursor WHERE workspace_id=? AND issue=?",
-                (wsid, iss),
-            ).fetchone()
-            keep = proposed
-            if prev is not None:
-                try:
-                    if int(str(prev[0])) >= int(proposed):
-                        keep = str(prev[0])  # never rewind a higher stored cursor
-                except (TypeError, ValueError):
-                    keep = proposed
-            conn.execute(
-                "INSERT INTO reconcile_event_cursor (workspace_id, issue, cursor, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(workspace_id, issue) DO UPDATE SET "
-                "cursor=excluded.cursor, updated_at=excluded.updated_at",
-                (wsid, iss, keep, str(now or "")),
             )
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
