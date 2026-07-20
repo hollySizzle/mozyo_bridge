@@ -97,6 +97,12 @@ ADOPT_DECL_INCOMPLETE_PAIR = "incomplete_live_pair"
 ADOPT_DECL_DUPLICATE_CANDIDATES = "duplicate_live_candidates"
 ADOPT_DECL_STALE_SLOT = "stale_named_slot"
 ADOPT_DECL_AMBIGUOUS_LOCATORS = "ambiguous_locators"
+#: The candidate resolved by its assigned NAME's provider token, but the LIVE row surfaces a
+#: detected provider (``provider`` / ``agent`` field) that disagrees — a foreign / wrong
+#: provider process squatting on the expected name. The name alone is never enough authority
+#: to adopt it as the expected provider (Redmine #13811 T2 R2 F1; ``managed-state-model.md``
+#: "live surfaced provider / detected-agent が resolved provider と一致"): zero-write.
+ADOPT_DECL_PROVIDER_MISMATCH = "provider_mismatch"
 ADOPT_DECL_UNATTESTED = "unattested_slot"
 ADOPT_DECL_BAD_TOKEN = "unresolvable_worktree_token"
 ADOPT_DECL_BAD_ANCHOR = "unusable_decision_anchor"
@@ -139,6 +145,7 @@ ADOPT_DECL_OWNER_UNBOUND = frozenset(
         ADOPT_DECL_DUPLICATE_CANDIDATES,
         ADOPT_DECL_STALE_SLOT,
         ADOPT_DECL_AMBIGUOUS_LOCATORS,
+        ADOPT_DECL_PROVIDER_MISMATCH,
         ADOPT_DECL_UNATTESTED,
         ADOPT_DECL_BAD_TOKEN,
         ADOPT_DECL_BAD_ANCHOR,
@@ -160,6 +167,7 @@ ADOPT_DECL_ZERO_WRITE = frozenset(
         ADOPT_DECL_DUPLICATE_CANDIDATES,
         ADOPT_DECL_STALE_SLOT,
         ADOPT_DECL_AMBIGUOUS_LOCATORS,
+        ADOPT_DECL_PROVIDER_MISMATCH,
         ADOPT_DECL_UNATTESTED,
         ADOPT_DECL_BAD_TOKEN,
         ADOPT_DECL_BAD_ANCHOR,
@@ -230,6 +238,21 @@ def _resolve_attested_slot(
     if classify_named_slot(row) != SLOT_LIVE:
         # A locator-bearing stale shell residue is never adopted.
         return (None, ADOPT_DECL_STALE_SLOT)
+    # The candidate was resolved by its assigned NAME's provider token; but the live row also
+    # surfaces its detected provider two ways — its ``provider`` field and its detected-agent
+    # field (``agent``, which on a live pane holds the provider id, #13846). If EITHER is
+    # surfaced and disagrees with the expected provider, a foreign / wrong-provider process is
+    # squatting on the expected name — never adopted as this provider (Redmine #13811 T2 R2
+    # F1; ``managed-state-model.md`` "live surfaced provider / detected-agent が resolved
+    # provider と一致"). Only an UNsurfaced (legacy / minimal) row falls back to the
+    # name-encoded provider.
+    want_provider = _norm(provider)
+    live_row_provider = _norm(row.get("provider"))
+    live_detected_agent = _norm(row.get("agent"))
+    if (live_row_provider and live_row_provider != want_provider) or (
+        live_detected_agent and live_detected_agent != want_provider
+    ):
+        return (None, ADOPT_DECL_PROVIDER_MISMATCH)
     assigned_name = _norm(row.get(AGENT_KEY_NAME))
     locator = _norm(_agent_locator(row))
     if not assigned_name or not locator:
@@ -260,6 +283,52 @@ def _resolve_attested_slot(
     except ProcessPinError:
         return (None, ADOPT_DECL_INCOMPLETE_PAIR)
     return (pin, "")
+
+
+def resolve_declared_pins(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+    providers: tuple[str, str],
+    attestation_store,
+) -> tuple[Optional[list[ProcessGenerationPin]], str]:
+    """Resolve the ``(gateway, worker)`` provider pair into typed declared pins (fail-closed).
+
+    The single fail-closed slot-resolution the issue-lane adopt (:func:`declare_adopted_owner_row`)
+    and the project-gateway create/adopt (:func:`declare_project_gateway_owner_row`) share, so
+    the raw-multiplicity / liveness / startup-attestation gate is authored ONCE (Redmine #13811
+    T2; #13780 j#78405 "共通 declaration helper でissue/project binding双方をfail-closedに扱い、
+    重複実装しない"). Each provider resolves to EXACTLY ONE live, attested slot via
+    :func:`_resolve_attested_slot`; two slots on one locator is an ambiguous / recycled target.
+
+    Returns ``(pins, "")`` when both slots resolve, or ``(None, reason)`` with a zero-write
+    outcome token on the first fail-closed condition. The pin ``role`` names the canonical SLOT
+    (``gateway`` / ``worker``, #13920), independent of ``provider`` — a swapped binding still
+    pins the gateway slot as ``gateway``.
+    """
+    gateway_provider, worker_provider = providers
+    pins: list[ProcessGenerationPin] = []
+    seen_locators: set[str] = set()
+    for provider, role in (
+        (gateway_provider, PIN_ROLE_GATEWAY),
+        (worker_provider, PIN_ROLE_WORKER),
+    ):
+        pin, reason = _resolve_attested_slot(
+            rows=rows,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            provider=provider,
+            role=role,
+            attestation_store=attestation_store,
+        )
+        if pin is None:
+            return (None, reason)
+        if pin.locator in seen_locators:
+            return (None, ADOPT_DECL_AMBIGUOUS_LOCATORS)
+        seen_locators.add(pin.locator)
+        pins.append(pin)
+    return (pins, "")
 
 
 def declare_adopted_owner_row(
@@ -315,31 +384,15 @@ def declare_adopted_owner_row(
             attestation_store = attestation_store_factory()
         else:
             attestation_store = HerdrIdentityAttestationStore(home=attestation_home)
-        gateway_provider, worker_provider = providers
-        pins: list[ProcessGenerationPin] = []
-        seen_locators: set[str] = set()
-        # The pin ``role`` names the SLOT, in the canonical vocabulary the recover-pair /
-        # repair-pins consumers read (Redmine #13920). It is deliberately independent of
-        # ``provider``: under a swapped binding the gateway slot is still ``gateway``.
-        for provider, role in (
-            (gateway_provider, PIN_ROLE_GATEWAY),
-            (worker_provider, PIN_ROLE_WORKER),
-        ):
-            pin, reason = _resolve_attested_slot(
-                rows=rows,
-                workspace_id=workspace,
-                lane_id=lane,
-                provider=provider,
-                role=role,
-                attestation_store=attestation_store,
-            )
-            if pin is None:
-                return reason
-            if pin.locator in seen_locators:
-                # Two slots on one locator is an ambiguous / recycled target.
-                return ADOPT_DECL_AMBIGUOUS_LOCATORS
-            seen_locators.add(pin.locator)
-            pins.append(pin)
+        pins, reason = resolve_declared_pins(
+            rows,
+            workspace_id=workspace,
+            lane_id=lane,
+            providers=providers,
+            attestation_store=attestation_store,
+        )
+        if pins is None:
+            return reason
 
         if worktree_token is None:
             return ADOPT_DECL_BAD_TOKEN

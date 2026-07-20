@@ -64,6 +64,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
     register_sublane_hibernate_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_project_gateway_declare import (  # noqa: E501
+    register_sublane_declare_project_gateway_parser,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (
     register_sublane_resume_parser,
 )
@@ -794,6 +797,7 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     sublane_supersede.set_defaults(func=cmd_sublane_supersede)
 
     register_sublane_hibernate_parser(sublane_sub)
+    register_sublane_declare_project_gateway_parser(sublane_sub)
     register_sublane_resume_parser(sublane_sub)
     register_sublane_quarantine_parser(sublane_sub)
     register_sublane_recover_stale_parser(sublane_sub)
