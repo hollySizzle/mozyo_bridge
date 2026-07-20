@@ -380,6 +380,27 @@ class ParseWorkspaceListTest(unittest.TestCase):
         self.assertIsNone(_parse_workspace_list('{"result": {"type": "other"}}'))
         self.assertIsNone(_parse_workspace_list("42"))
 
+    def test_duplicate_workspace_id_fails_closed_order_independent(self) -> None:
+        # Redmine #14139 R2 review j#83425 F1: a repeated workspace_id is an identity
+        # conflict — the label authority must not depend on iteration order, so the
+        # whole payload is unreadable (None) BOTH ways round, never last-wins.
+        import json
+
+        fwd = json.dumps(
+            {"workspaces": [
+                {"workspace_id": "w5", "label": "coordinators"},
+                {"workspace_id": "w5", "label": ""},
+            ]}
+        )
+        rev = json.dumps(
+            {"workspaces": [
+                {"workspace_id": "w5", "label": ""},
+                {"workspace_id": "w5", "label": "coordinators"},
+            ]}
+        )
+        self.assertIsNone(_parse_workspace_list(fwd))
+        self.assertIsNone(_parse_workspace_list(rev))
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -253,10 +253,15 @@ def _parse_workspace_list(stdout: object) -> Optional[dict]:
     entry contributes ``workspace_id -> label`` (a missing / non-string label is the
     empty string — present but unlabelled, so it never matches the shared label);
     an entry with no ``workspace_id`` is skipped. An EMPTY list is a valid readable
-    result (no workspaces) and yields ``{}``. Returns ``None`` — "labels
-    unreadable", which the resolver treats as fail-closed — only when the payload is
-    not JSON or exposes no recognisable workspace container, never a guess. Never
-    raises.
+    result (no workspaces) and yields ``{}``.
+
+    Returns ``None`` — "labels unreadable", which the resolver treats as
+    fail-closed — when the payload is not JSON, exposes no recognisable workspace
+    container, **or repeats a ``workspace_id``** (a herdr identity that appears
+    twice in one snapshot is an identity conflict: keeping the last-seen label would
+    make the whole label authority order-dependent — R2 review j#83425 F1 / Design
+    Answer j#83385 Decision 1 "identity conflict は typed fail-closed"). Never a
+    guess; never raises.
     """
     payload = stdout
     if isinstance(stdout, str):
@@ -274,6 +279,11 @@ def _parse_workspace_list(stdout: object) -> Optional[dict]:
         workspace_id = _norm(entry.get("workspace_id"))
         if not workspace_id:
             continue
+        if workspace_id in labels:
+            # A duplicate herdr workspace identity in one snapshot: the label
+            # authority must not depend on which row we saw last. Fail closed on the
+            # whole payload rather than pick a winner.
+            return None
         raw_label = entry.get("label")
         labels[workspace_id] = raw_label.strip() if isinstance(raw_label, str) else ""
     return labels

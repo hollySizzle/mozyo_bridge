@@ -1865,6 +1865,37 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [], "must adopt, not create")
         self.assertEqual(result.herdr_workspace_id, "w5")
 
+    def test_shared_space_adopt_appends_without_relayout(self) -> None:
+        # Redmine #14139 F2 / Design Answer j#83385 Decision 2: adopting an existing
+        # labelled shared space APPENDS this project's column and NEVER reorders /
+        # moves / swaps the existing columns (no live relayout). Existing foreign
+        # panes are neither closed nor moved.
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(existing_rows=foreign)
+        herdr.workspace_labels = {"w5": "coordinators"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "w5")
+        self.assertEqual(herdr.workspace_creates, [])
+        # Tail-append: this project's pair launches INTO the adopted space w5.
+        self.assertTrue(herdr.start_argvs, "the new coordinator pair must launch")
+        for start in herdr.start_argvs:
+            self.assertIn("w5", start, msg=f"launch must target adopted w5: {start}")
+        # No live relayout: never a pane move / swap / reorder, and the existing
+        # foreign panes are never closed.
+        reorder_verbs = {("pane", "move"), ("pane", "swap"), ("agent", "move")}
+        for call in herdr.calls:
+            self.assertNotIn(tuple(call[:2]), reorder_verbs, msg=f"unexpected relayout: {call}")
+        closed_tokens = {tok for call in herdr.pane_closes for tok in call}
+        self.assertNotIn("w5:p1", closed_tokens)
+        self.assertNotIn("w5:p2", closed_tokens)
+
     def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
         # Redmine #14139: an unknown mode string fails closed at the pure entry point,
         # before any herdr actuation (mirrors the unknown-provider guard).

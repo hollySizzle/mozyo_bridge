@@ -521,14 +521,22 @@ byte-invariant を保つ。
 
 Herdr の public launch API は既存 workspace 内への任意 insert / reorder target を持たない (`agent start` に
 pane-target flag 無し)。したがって**独立 launch を跨ぐ厳密な左右順は保証しない** (R1 review j#83383 F2 /
-Design Answer j#83385 Decision 2)。契約:
+Design Answer j#83385 Decision 2 / premise 訂正 j#83433)。
 
-- fresh shared space に複数 project を batch で作る場合は **stable project key 順に append** する。
-- 既存 column は現在順を保持し、**自動 reorder / live relayout しない**。
-- 単独 project launch は **末尾 append**。global strict order は別の live-relayout US。
+現行 architecture では coordinator launch (`herdr_launch_command.prepare` の bare `mozyo` / `herdr_session_start_cli`)
+は **単一 project の coordinator pair を 1 回だけ** 起動する。複数 project を一括生成する batch seam は存在しない。
+したがって **current-scope の acceptance** は次の realizable invariant である (j#83433):
 
-resolver の判断は inventory の row 順に依存しない (集合演算 + sorted で deterministic)。厳密左右順を望む
-operator の live 再配置は live-relayout runbook (#13648) の領分であり、本 mode は
+- 単独 project の coordinator launch は backend の既存列 **末尾へ append** する。
+- 既存 column の順序を変更せず、**live reorder / relayout を行わない** (既存 pane を move / swap / close しない)。
+- resolver の adopt / create / fail-closed 判断は **inventory row の iteration 順に依存しない** (集合演算 + sorted)。
+- **duplicate workspace identity** は label 一致 / 不一致に関わらず fail-closed し、**順序を反転しても同一 verdict** となる
+  (`_parse_workspace_list` は重複 `workspace_id` を検出したら `None` へ倒す)。
+
+**将来 invariant (現行 R3 は未実装)**: 複数 project を一括生成する実在 batch seam を追加する場合、その seam は
+stable project key 順に append する。これは今回、未使用 helper や架空 batch path を追加する根拠にはしない。
+
+厳密左右順を望む operator の live 再配置は live-relayout runbook (#13648) の領分であり、本 mode は
 **deterministic append order であって arbitrary live reorder ではない**。
 
 ### Launch-time only (適用条件)
