@@ -21,7 +21,10 @@ Fail-closed: an un-attested sender identity, an unavailable herdr binary / inven
 or a receiver that does not resolve to a single live agent raises
 :class:`HerdrSendEntryError`; the caller emits a structured ``blocked`` /
 ``target_unavailable`` outcome and ``die``s — never a silent tmux fallback, never a send
-to a guessed target.
+to a guessed target. One case projects differently (Redmine #13884): an explicit
+``--target`` that names a different agent than the resolved route raises
+:class:`HerdrExplicitTargetMismatchError` and projects onto ``blocked`` / ``invalid_args``
+(an inconsistent argument, not an unavailable window) — still a zero-send.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+    AGENT_PROVIDERS,
     MOZYO_WORKSPACE_ID_ENV,
     REASON_MISSING_SENDER_ENV,
     RECEIVER_COORDINATOR,
@@ -75,6 +79,32 @@ class HerdrSendEntryError(ValueError):
     def __init__(self, message: str, *, reason: Optional[str] = None):
         super().__init__(message)
         self.reason = reason
+
+
+#: The existing delivery-outcome reason a herdr explicit-target mismatch projects onto
+#: (Redmine #13884 review j#83307 F1/F2). NOT a new fail-closed token: the herdr resolution
+#: vocabulary stays the #13302 ledger set (``vibes/docs/specs/herdr-native-identity.md``
+#: §3.1). ``invalid_args`` (an inconsistent ``--target`` argument, not an unavailable window)
+#: is the pre-existing ``DeliveryOutcome`` reason whose ``next_action`` ("supply the required
+#: arguments") is consistent with the cause; the full ``--target-lane`` retry guidance rides
+#: the die message. ``orchestrate_handoff`` reads this off ``exc.reason`` and surfaces it
+#: instead of the generic ``target_unavailable`` (which would tell the operator to start a
+#: window — contradicting the cause).
+EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON: str = "invalid_args"
+
+
+class HerdrExplicitTargetMismatchError(HerdrSendEntryError):
+    """An explicit ``--target`` named a different agent than the resolved route (#13884).
+
+    A discriminable :class:`HerdrSendEntryError` subclass carrying the pre-existing
+    :data:`EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON` (``invalid_args``) as its ``reason`` — no
+    new fail-closed token is minted (herdr-native-identity.md §3.1). The locator is never
+    promoted to a routing authority (#13305); this only refuses when the named target and
+    the resolved target disagree, and it stays a zero-send (``target=None``, no injection).
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, reason=EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON)
 
 
 def _terminal_transport_config_for_root(
@@ -342,9 +372,10 @@ def resolve_herdr_send_target(
     # / the `binds_receiver` process gate) is unchanged — the coordinator IS a codex, so the
     # role the route resolves (coordinator provider) matches the `--to codex` binding, and
     # `--to` public choices stay `claude|codex` (this is an internal, semantic translation).
+    norm_target = _norm(target)
     route_receiver = (
         RECEIVER_COORDINATOR
-        if _norm(target) == RECEIVER_COORDINATOR
+        if norm_target == RECEIVER_COORDINATOR
         else receiver
     )
     if cross_workspace:
@@ -380,6 +411,40 @@ def resolve_herdr_send_target(
         )
     identity = resolution.identity
     assert identity is not None  # success guarantees an identity
+    # Redmine #13884 (repro anchors #13882 j#79958 / #13883 j#79959): an explicit concrete
+    # `--target` (a live herdr locator / assigned name — NOT the `coordinator` pseudo-target,
+    # NOT a bare provider token) asserts WHICH agent the send must reach. The #13305 route
+    # authority resolves the target from `--to` + `--target-lane` + `--target-repo` and
+    # treats the locator as transient cache, never the routing key — correct by design (a
+    # locator is not stable identity), and the exact reason a lane-pinned worker dispatch
+    # (#13485/#13488) passes `--target <worker-locator>` alongside `--target-lane <lane>`
+    # yet still resolves the stable slot. The defect was the SILENT drop: a `--target` that
+    # named a DIFFERENT agent than the derived route (a coordinator's cross-lane
+    # `--target <lane-gateway-locator>` with no `--target-lane`, which derived the sender's
+    # OWN default lane and resolved the coordinator's own pane) was dropped, the send landed
+    # on that wrong agent, and it reported a false-positive `sent` (a sender echo). Cross-check
+    # the explicit target against the resolved identity: a `--target` that agrees with the
+    # derived route (same live locator or same durable assigned name) passes through unchanged
+    # (resolve-to-exact); a MISMATCH raises :class:`HerdrExplicitTargetMismatchError`, which the
+    # `orchestrate_handoff` herdr branch projects onto a zero-send `blocked` / `invalid_args`
+    # outcome (`target=None`, no injection — an inconsistent `--target` argument, not an
+    # unavailable window; see EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON), never a coordinator /
+    # sender-lane fallback. The locator stays evidence, never the authority — the pin
+    # (`--target-lane`), not the locator, is what resolves the intended target; this guard only
+    # refuses to send when the named target and the resolved target disagree.
+    if norm_target and norm_target != RECEIVER_COORDINATOR and norm_target not in AGENT_PROVIDERS:
+        if norm_target not in (_norm(resolution.locator), _norm(resolution.assigned_name)):
+            raise HerdrExplicitTargetMismatchError(
+                f"herdr send named an explicit --target {target!r} but the route authority "
+                f"resolved a different agent (live locator {resolution.locator!r}, name "
+                f"{resolution.assigned_name!r}) from --to={receiver!r} + --target-lane="
+                f"{(_norm(explicit_lane) or None)!r} + --target-repo (lane basis "
+                f"{resolution.lane_basis!r}). The named target and the derived route "
+                "disagree; refusing to send to the derived target, which would echo the "
+                "send onto the sender's own lane and report a false-positive `sent` "
+                "(Redmine #13884). Pin the intended lane with --target-lane <lane> (or use "
+                "--target coordinator) so the route authority resolves the target you named."
+            )
     # The synthesized target record's `cwd` is the TARGET agent's repo root (the tmux path
     # reads the target pane's own cwd). Three shapes (#13331 / #13377 j#73640 finding 1):
     #
@@ -431,6 +496,8 @@ def resolve_herdr_send_target(
 
 __all__ = (
     "HerdrSendEntryError",
+    "HerdrExplicitTargetMismatchError",
+    "EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON",
     "explicit_tmux_pane_target",
     "herdr_backend_selected",
     "herdr_effective_backend_selected",

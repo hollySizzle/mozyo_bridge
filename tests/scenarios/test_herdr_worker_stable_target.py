@@ -40,7 +40,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -266,22 +268,63 @@ class StableWorkerTargetScenario(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp_ctx.cleanup()
 
-    def test_unpinned_dispatch_false_positive_acks_on_the_wrong_lane(self) -> None:
-        # Bug #13486: with no `--target-lane`, the herdr rail derives the sender's
-        # (default) lane and resolves the coordinator's own default-lane claude — the
-        # send delivery-ACKs (exit 0) on that WRONG agent while the real LANE worker is
-        # never touched (idle). This is the ACK↔turn-start divergence (#13483).
+    @staticmethod
+    def _delivery_json(*streams: str) -> dict:
+        """Parse the CLI's structured delivery-record JSON out of the captured output.
+
+        `DeliveryOutcome.to_json` emits a single-line sorted-keys object; find the line
+        that parses as a dict carrying `status` (the delivery record) and return it.
+        """
+        for stream in streams:
+            for line in stream.splitlines():
+                line = line.strip()
+                if not (line.startswith("{") and '"status"' in line):
+                    continue
+                for candidate in re.findall(r"\{.*\}", line):
+                    try:
+                        parsed = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(parsed, dict) and "status" in parsed:
+                        return parsed
+        raise AssertionError(f"no delivery-record JSON found in output; streams={streams!r}")
+
+    def test_unpinned_dispatch_with_explicit_target_now_fails_closed(self) -> None:
+        # Bug #13486 was: with no `--target-lane`, the herdr rail derives the sender's
+        # (default) lane and resolves the coordinator's own default-lane claude, and the
+        # unpinned dispatch — which still passes the worker's own `--target <locator>` —
+        # delivery-ACKed (exit 0) on that WRONG agent while the real LANE worker stayed idle
+        # (the ACK↔turn-start divergence #13483). #13488 worked around it by pinning the
+        # lane; Redmine #13884 fixes it at the RAIL: the explicit `--target <worker-locator>`
+        # (in LANE) now MISMATCHES the derived route (the default-lane peer), so the rail
+        # fails closed instead of false-positive-ACKing on the wrong agent.
         rc, out, err = self.world.drive_unpinned()
-        self.assertEqual(rc, 0, msg=f"the misrouted send still ACKs\nout={out}\nerr={err}")
-        # The delivery landed on the default-lane peer, NOT the target sublane worker.
-        self.assertTrue(
+        self.assertNotEqual(
+            rc, 0, msg=f"the unpinned mismatch must fail closed, not ACK\nout={out}\nerr={err}"
+        )
+        # Review j#83307 F1: assert the CLI delivery-record JSON directly — the mismatch
+        # projects onto the existing `invalid_args` reason (NOT `target_unavailable`, whose
+        # "start the window and retry" next_action contradicts the cause; NOT a new token,
+        # per herdr-native-identity.md §3.1), with `target=null` and a next_action that owns
+        # the argument fix rather than a window restart.
+        record = self._delivery_json(err, out)
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["reason"], "invalid_args")
+        self.assertIsNone(record["target"])
+        self.assertNotEqual(record["reason"], "target_unavailable")
+        self.assertIn("arguments", record["next_action"])
+        # The full mismatch cause + the safe `--target-lane` retry ride the die message.
+        self.assertIn("--target-lane", err)
+        # Zero-send: neither the (wrong) default-lane peer nor the LANE worker is touched.
+        self.assertEqual(
             self.world.injections_to(self.world.default_locator),
-            msg=f"expected the misroute onto the default-lane claude; calls={self.world.fake.calls}",
+            [],
+            msg=f"the misroute onto the default-lane claude must be refused; calls={self.world.fake.calls}",
         )
         self.assertEqual(
             self.world.injections_to(self.world.worker_locator),
             [],
-            msg="the real lane worker must have received nothing (idle) — the bug",
+            msg="nothing is sent anywhere on a fail-closed mismatch (zero-send)",
         )
 
     def test_pinned_dispatch_resolves_the_stable_lane_worker(self) -> None:

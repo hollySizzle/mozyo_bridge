@@ -33,6 +33,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    HerdrExplicitTargetMismatchError,
     HerdrSendEntryError,
     explicit_tmux_pane_target,
     herdr_backend_selected,
@@ -533,6 +534,136 @@ class CoordinatorPseudoTargetHerdrSendTest(unittest.TestCase):
             )
             with self.assertRaises(HerdrSendEntryError):
                 self._resolve(ctx, self._args(ctx, target="coordinator", to="codex"))
+
+
+class ExplicitTargetMismatchHerdrSendTest(unittest.TestCase):
+    """Redmine #13884 (repro anchors #13882 j#79958 / #13883 j#79959): a coordinator's
+    explicit ``--target <lane-gateway locator>`` on the herdr rail used to be silently
+    dropped, so routing fell back to ``--to`` + the sender's OWN (default) lane and resolved
+    to the coordinator's own pane — a sender echo with a false-positive ``sent``.
+
+    The fix is a consistency check, not a blanket reject: the #13305 route authority still
+    resolves by ``--to`` + ``--target-lane`` + ``--target-repo`` (the locator is transient
+    cache, never the routing key — the same reason a lane-pinned worker dispatch passes
+    ``--target <worker-locator>`` alongside ``--target-lane`` and still resolves the stable
+    slot). After resolution the rail cross-checks the explicit target against the resolved
+    identity: a target that AGREES with the derived route passes through (resolve-to-exact);
+    a MISMATCH raises :class:`HerdrExplicitTargetMismatchError` (a discriminable
+    :class:`HerdrSendEntryError` subclass — NOT a new fail-closed reason token; the herdr
+    resolution vocabulary stays the #13302 ledger set per herdr-native-identity.md §3.1),
+    which the send branch projects onto a zero-send ``blocked`` / ``invalid_args`` outcome.
+    The fixture is the exact reported shape — a coordinator + TWO lane gateways in one shared
+    workspace. The CLI delivery-JSON contract for the mismatch is pinned end-to-end in
+    ``tests/scenarios/test_herdr_worker_stable_target.py``.
+    """
+
+    #: coordinator (codex, default lane) + two lane gateways (codex) in the SAME shared
+    #: project workspace; each carries a distinct live locator.
+    COORDINATOR_LOCATOR = "wC:pC"
+    GATEWAY_A_LOCATOR = "wA:pA"
+    GATEWAY_B_LOCATOR = "wB:pB"
+    LANE_A = "issue_13882_attestation_store_compat"
+    LANE_B = "issue_13883_testpypi_source_ref_preflight"
+
+    def _rows(self, ws):
+        return [
+            {"name": encode_assigned_name(ws, "codex", "default"), "pane_id": self.COORDINATOR_LOCATOR},
+            {"name": encode_assigned_name(ws, "codex", self.LANE_A), "pane_id": self.GATEWAY_A_LOCATOR},
+            {"name": encode_assigned_name(ws, "codex", self.LANE_B), "pane_id": self.GATEWAY_B_LOCATOR},
+        ]
+
+    @staticmethod
+    def _args(ctx, *, target=None, target_lane=None, to="codex"):
+        ns = argparse.Namespace()
+        ns.repo = str(ctx.repo)
+        ns.to = to
+        ns.target = target
+        ns.target_lane = target_lane
+        return ns
+
+    def _ctx(self, tmp):
+        # Sender = the parent coordinator (codex, default lane), divergent from the gateways.
+        return _Ctx(tmp, sender_role="codex", sender_lane="default", rows=self._rows)
+
+    def _resolve(self, ctx, args):
+        with patch("subprocess.run", ctx.run), patch.dict(
+            os.environ, ctx.env(), clear=True
+        ):
+            return _resolve_from_args(args, receiver=args.to)
+
+    def test_explicit_gateway_a_locator_without_lane_mismatch_fails_closed(self) -> None:
+        # The exact #13882 j#79958 repro: coordinator passes the lane-A gateway's live
+        # locator as --target but no --target-lane. The route authority derives the sender's
+        # own default lane and resolves the coordinator's OWN pane — a MISMATCH with the
+        # named target, so the rail fails closed (the raise is the proof of no sender echo /
+        # no false-positive sent; the send branch converts it to a zero-send blocked outcome).
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(tmp)
+            with self.assertRaises(HerdrExplicitTargetMismatchError) as c:
+                self._resolve(ctx, self._args(ctx, target=self.GATEWAY_A_LOCATOR, to="codex"))
+        msg = str(c.exception)
+        # The refusal names the derived (wrong) target, the sender-echo cause, and the
+        # sanctioned selector so the coordinator can re-issue correctly.
+        self.assertIn(self.COORDINATOR_LOCATOR, msg)  # the derived (wrong) agent, surfaced
+        self.assertIn("--target-lane", msg)
+        self.assertIn("false-positive", msg)
+
+    def test_explicit_gateway_b_locator_without_lane_mismatch_fails_closed(self) -> None:
+        # The second gateway (#13883 j#79959) — same behavior, proving it is not a single
+        # lane-specific state (the ticket reproduced across two targets).
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(tmp)
+            with self.assertRaises(HerdrExplicitTargetMismatchError):
+                self._resolve(ctx, self._args(ctx, target=self.GATEWAY_B_LOCATOR, to="codex"))
+
+    def test_session_window_style_target_mismatch_fails_closed(self) -> None:
+        # A ``session:window`` string names no live herdr agent, so it can never agree with
+        # the resolved locator/name — it fails closed rather than silently routing to the
+        # sender's own lane.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(tmp)
+            with self.assertRaises(HerdrExplicitTargetMismatchError):
+                self._resolve(ctx, self._args(ctx, target="cockpit:codex", to="codex"))
+
+    def test_explicit_target_consistent_with_target_lane_resolves_exact(self) -> None:
+        # Resolve-to-exact: --target <gateway-A locator> PAIRED with --target-lane LANE_A.
+        # The pin (not the locator) resolves the stable slot, the resolved locator equals the
+        # named --target, so the consistency check passes and the send lands on gateway A —
+        # the #13485/#13488 lane-pinned-dispatch shape, unaffected by the new guard.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(tmp)
+            pane = self._resolve(
+                ctx,
+                self._args(ctx, target=self.GATEWAY_A_LOCATOR, target_lane=self.LANE_A, to="codex"),
+            )
+        self.assertEqual(pane["id"], self.GATEWAY_A_LOCATOR)
+        self.assertEqual(pane["lane_id"], self.LANE_A)
+        self.assertNotEqual(pane["id"], self.COORDINATOR_LOCATOR)
+
+    def test_target_lane_selector_resolves_exact_gateway(self) -> None:
+        # The sanctioned explicit selector alone (no --target): --target-lane resolves to the
+        # intended gateway EXACTLY, never the coordinator's own default-lane pane. No explicit
+        # --target means no consistency check to run.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(tmp)
+            pane_a = self._resolve(ctx, self._args(ctx, target_lane=self.LANE_A, to="codex"))
+            pane_b = self._resolve(ctx, self._args(ctx, target_lane=self.LANE_B, to="codex"))
+        self.assertEqual(pane_a["id"], self.GATEWAY_A_LOCATOR)
+        self.assertEqual(pane_a["lane_id"], self.LANE_A)
+        self.assertEqual(pane_b["id"], self.GATEWAY_B_LOCATOR)
+        self.assertEqual(pane_b["lane_id"], self.LANE_B)
+        self.assertNotEqual(pane_a["id"], self.COORDINATOR_LOCATOR)
+        self.assertNotEqual(pane_b["id"], self.COORDINATOR_LOCATOR)
+
+    def test_coordinator_pseudo_target_still_routes_default_lane(self) -> None:
+        # Regression guard: the `coordinator` pseudo-target is still honored (the new
+        # consistency check excludes it — it is a route-string, not a locator). A sublane
+        # sender addressing `coordinator` resolves the workspace default-lane parent.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane=self.LANE_A, rows=self._rows)
+            pane = self._resolve(ctx, self._args(ctx, target="coordinator", to="codex"))
+        self.assertEqual(pane["id"], self.COORDINATOR_LOCATOR)
+        self.assertEqual(pane["lane_id"], "default")
 
 
 if __name__ == "__main__":  # pragma: no cover
