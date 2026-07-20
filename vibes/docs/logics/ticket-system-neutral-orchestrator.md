@@ -55,8 +55,9 @@ architecture_status:
 | coordinator-forward fence | Herdr上の同じforward generationの重複実行を拒否する | `mozyo-bridge workflow forward-fence`はstore lifecycle用。通常reserveは`mozyo-bridge workflow step`内部 |
 
 従って図中で単に「admission」「dispatch」「generation fence」とは書かない。どのauthority、
-identity、公開commandを指すかを同じ行に置く。なお「三次元図」は採用しない。PlantUMLの`box`で
-責務層を奥行きの代わりに表現し、矢印の前後関係とside effectの有無を優先する。
+identity、公開commandを指すかをaction IDで直下のcommand ledgerへ接続する。なお「三次元図」は
+採用しない。主図は一枚のPlantUML swimlane activityとし、人間が読むactionにはguidanceとIDだけを
+表示する。実command、side effect、現行／目標境界は同じIDを持つledgerで追跡する。
 
 ## 対象外
 
@@ -145,183 +146,150 @@ webhookやpush通知は処理を早めるための最適化であり、必須契
 副作用の実行権限は、永続gate、Git・artifactの証拠、実行時fence、操作直前の生存確認を、
 command境界ですべて照合した結果だけから得る。どれか一層だけでは許可しない。
 
-## 現行0.12.2のcommand-to-authority対応
+## 一枚で読む標準フロー
 
-CLI helpをflagの正本とすることと、設計書からcommand名を省くことは別である。各工程は、次の
-公開surfaceまたは「現行公開commandなし」へ必ず接続する。
+主図は「誰が次に何を判断・実行するか」だけを示す。command全文を図へ詰めず、各actionの
+`[Axx]`を直下のcommand ledgerへ接続する。PlantUML procedure `$guidance`はIDと表示形式を
+一箇所で固定するための描画関数であり、runtime実装の関数ではない。
 
-| 工程 | 実行者 | 現行0.12.2のcommand / 操作 | side effectとauthority | target gap |
-| --- | --- | --- | --- | --- |
-| 関連docs解決 | coordinator / agent | `mozyo-bridge docs resolve <paths...> --repo .` | read-only。catalogから読むべき正本を解決する | なし |
-| 次の安全な一手 | coordinator / gateway | `mozyo-bridge workflow step --dry-run --json`で確認、`mozyo-bridge workflow step`で許可済みroutingを一手実行 | dry-runはread-only。通常実行は安全なtransportを一手だけactuateし得る | 入力は現行Redmine binding |
-| lane admission | coordinator | `mozyo-bridge workflow admission` / `mozyo-bridge workflow lane-admission` / `mozyo-bridge workflow dispatch-plan` | advisory / read-only。ticketへ判断を自動追記しない | provider-neutral candidate sourceは未実装 |
-| admission / dispatch判断の永続化 | coordinator | `mozyo-bridge workflow admission --journal`等で本文を生成後、provider UI / API / MCPで記録 | `--journal`はrenderのみ。現行のprovider-neutral writer commandはない | `DurableWorkRecordPort.append_event`はtarget-only |
-| managed lane作成・初期dispatch | coordinator | `mozyo-bridge sublane create --issue <id> --lane-label <label> --branch <branch> --worktree <path> --journal <j> --execute` | worktree・managed process・IR handoffを変更する | 現行はRedmine issue / journal anchor |
-| IR記録・worker送信 | gateway / coordinator | `mozyo-bridge workflow dispatch-ir --issue <id> --lane <lane> --generation <n> ... --execute` | Redmine IR journal write + exact worker send | provider-neutral writer未実装 |
-| same-lane worker送信 | gateway | `mozyo-bridge sublane dispatch-worker --issue <id> --lane-label <label> --journal <j> --execute` | exact same-lane workerへ一回送信しACKを記録 | 現行はRedmine anchor |
-| 実装・commit・push | worker | Git / test command。全体を代行する`mozyo-bridge` commandなし | Git・CIがcommit / test authority | 自動実装は非目標 |
-| gate記録 | worker / coordinator | `mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate <kind> ...` | marker-bearing Redmine journal write。未記録はnon-zero | provider-neutral append未実装 |
-| callback再照合・配送 | supervisor | `mozyo-bridge workflow supervisor --run-once --json`、bounded pumpは`--watch` | durable event供給、runtime fold、outbox delivery。`--run-once`はloss recovery経路 | ticket provider sourceは現行Redmine |
-| callback低レベル処理 | supervisor / operator | `mozyo-bridge workflow callbacks --sweep` / `--ingest` / `--deliver` / `--run-once` | `sweep`はread-only、`deliver` / `run-once`はsendをactuate | 通常はsupervisorを標準入口とする |
-| review状態の確認 | coordinator / reviewer | `mozyo-bridge workflow glance --json`、`mozyo-bridge workflow resume --json`、`mozyo-bridge workflow step --dry-run --json` | read-only projection / next-action解決 | review判断そのものは人間・reviewer authority |
-| Review Result記録 | reviewer | changes requested: `mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate review_result --target-head <sha> --review-request-journal <j> --review-decision changes_requested`; approvalは加えて`--review-generation-json <path> --consumer-id <id>` | review-generation fenceを通ったmarker-bearing Redmine journal write | provider-neutral writer未実装 |
-| Git統合・CI gate | coordinator | Git / CI操作。全体を代行する`mozyo-bridge` commandなし | exact approved commitとCIがauthority | `mozyo-bridge workflow step`へ統合判断を自動昇格させない |
-| owner承認 | owner / coordinator | provider UI / API / MCP。owner承認を代行する`mozyo-bridge` commandなし | ownerがdurable gateを記録する。実行時stateは承認にならない | provider-neutral append未実装 |
-| close | coordinator | provider UI / API / MCP。issue closeを一括実行するprovider-neutral `mozyo-bridge` commandなし | review・owner approval・commit evidence確認後だけclose | target port導入後もowner authorityは不変 |
-| process解放・退役 | coordinator | open laneは`mozyo-bridge sublane hibernate ... --execute`、close後は`mozyo-bridge sublane retire ... --execute` | managed process / lifecycleを変更する。remote branchは削除しない | なし |
+薄緑の2列は同じ`managed_sublane` execution boundaryを共有する。Gatewayはlane境界でdurable
+anchorとroute identityを検証し、Implementer / Workerだけが実装差分を作る。黄色のReviewer /
+AuditorはCoordinatorと別の論理roleであり、同じproviderを使う場合でもImplementerのself-reviewへ
+統合しない。lane列はprovider brandではなく責務を表す。
+
+```plantuml
+@startuml ticket_system_neutral_orchestrator_guidance
+title Ticket-system-neutral orchestrator: role / sublane / gate guidance
+
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #F8FBFD
+  BorderColor #365A6C
+  DiamondBackgroundColor #FFF4CC
+  DiamondBorderColor #8A6D1D
+}
+
+!procedure $guidance($id, $label)
+:<b>[$id]</b>\n$label;
+!endprocedure
+
+' 空actionを作らずlane順と同一sublaneの色を固定する。
+|#F4ECF7|Owner|
+|#EAF2F8|Coordinator|
+|#FFF4CC|Reviewer / Auditor|
+|#E8F8F5|Managed Sublane\nGateway|
+|#E8F8F5|Managed Sublane\nImplementer / Worker|
+
+|#F4ECF7|Owner|
+start
+$guidance("A01", "依頼とdurable pointerを提示")
+
+|#EAF2F8|Coordinator|
+$guidance("A02", "関連正本を解決")
+$guidance("A03", "安全な次actionとlane admissionを判定")
+
+if (実装対象?) then (yes)
+  $guidance("A04", "dispatch判断をdurable recordへ記録")
+  $guidance("A05", "managed sublaneを作成 / adopt")
+
+  |#E8F8F5|Managed Sublane\nGateway|
+  $guidance("A06", "durable IRを同一sublaneのImplementerへ配送")
+
+  repeat
+    |#E8F8F5|Managed Sublane\nImplementer / Worker|
+    $guidance("A07", "実装・検証・issue branch push")
+    $guidance("A08", "Implementation Done / Review Requestを記録")
+
+    |#EAF2F8|Coordinator|
+    $guidance("A09", "callbackを再照合しreview対象を提示")
+
+    |#FFF4CC|Reviewer / Auditor|
+    $guidance("A10", "head・diff・evidenceを独立review")
+    if (要修正?) then (yes)
+      $guidance("A11", "changes requestedを記録")
+
+      |#EAF2F8|Coordinator|
+      $guidance("A12", "owning generationへ修正callbackを配送")
+
+      |#E8F8F5|Managed Sublane\nGateway|
+      $guidance("A13", "同一sublaneのImplementerへ修正を配送")
+    endif
+  repeat while (要修正?) is (yes) not (approved)
+
+  |#FFF4CC|Reviewer / Auditor|
+  $guidance("A14", "approved Review Resultを記録")
+
+  |#EAF2F8|Coordinator|
+  $guidance("A15", "承認済みexact headを統合")
+else (no)
+  $guidance("A04N", "coordinator-owned actionを実行 / 記録")
+endif
+
+|#EAF2F8|Coordinator|
+if (owner close approvalが必要?) then (yes)
+  $guidance("A16", "owner waiting gateを記録")
+  if (early hibernate preflightを満たす?) then (yes)
+    $guidance("A16H", "open sublaneをhibernate")
+  endif
+
+  |#F4ECF7|Owner|
+  $guidance("A17", "承認可否をdurable recordへ記録")
+  if (承認済み?) then (yes)
+  else (no / pending)
+    stop
+  endif
+endif
+
+|#EAF2F8|Coordinator|
+$guidance("A18", "Close Gateを確認しissueをclose")
+$guidance("A19", "closed sublaneをretire")
+stop
+@enduml
+```
+
+## Action ID command ledger（現行0.12.2）
+
+CLI helpをflagの正本とすることと、設計書からcommand名を省くことは別である。主図の全actionは
+このledgerで、現行公開surfaceまたは「現行公開commandなし」へ必ず接続する。複数commandは
+`<br>`で分け、図の人間向けguidanceへ逆流させない。
+
+| ID | action / 責務 | 現行command / 操作 | side effect・authority・境界 |
+| --- | --- | --- | --- |
+| `A01` | Owner: 依頼とdurable pointer | provider UI / API / MCP（`mozyo-bridge` commandなし） | `external-authority`。pane通知はpointerであり正本ではない |
+| `A02` | Coordinator: 関連docs解決 | `mozyo-bridge docs resolve <paths...> --repo .` | `current-public`、read-only。catalogから読むべき正本を解決 |
+| `A03` | Coordinator: next action / lane admission | `mozyo-bridge workflow step --dry-run --json`<br>`mozyo-bridge workflow admission` / `workflow lane-admission` / `workflow dispatch-plan` | `current-public`、read-only / advisory。ticketは変更しない |
+| `A04` | Coordinator: dispatch decisionを永続化 | `mozyo-bridge workflow admission --journal`等で本文をrender<br>provider UI / API / MCPで記録 | renderはread-only。provider書込みは`external-authority`。provider-neutral writerなし |
+| `A04N` | Coordinator: coordinator-owned action | `mozyo-bridge workflow step`で許可済みの一手、またはprovider / Git操作 | action固有authorityを再照合。全種類を代行する単一commandなし |
+| `A05` | Coordinator: managed sublane作成 / adopt | `mozyo-bridge sublane create --issue <id> --lane-label <label> --branch <branch> --worktree <path> --base-ref origin/main --journal <j> --execute` | worktree、lane generation、Gateway / Worker pair、初期handoffを変更 |
+| `A06` | Gateway: durable IRをsame-lane dispatch | marker記録＋送信: `mozyo-bridge workflow dispatch-ir --issue <id> --lane <lane> --generation <n> --body-file <path> --target <worker> --target-repo <repo> --gateway-callback-target <gateway> --role-profile implementation_worker --execute`<br>既存IR anchorのforward: `mozyo-bridge sublane dispatch-worker --issue <id> --lane-label <label> --journal <j> --execute` | Gatewayがlane境界を所有。現行はRedmine anchor。`A05`が既存anchorを初期dispatch済みなら重複送信しない |
+| `A07` | Implementer / Worker: 実装・test・issue branch push | Git / test command（全体を代行する`mozyo-bridge` commandなし） | Git・CIが差分、commit、test evidenceのauthority。Implementerだけが実装diffを作る |
+| `A08` | Implementer / Worker: gate記録 | `mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate implementation_done ...`<br>`mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate review_request --target-head <sha> ...` | marker-bearing Redmine journal write。未記録はnon-zero。provider-neutral appendなし |
+| `A09` | Coordinator: callback再照合・review提示 | `mozyo-bridge workflow supervisor --run-once --json`<br>`mozyo-bridge workflow glance --json` / `workflow resume --json` / `workflow step --dry-run --json`<br>`mozyo-bridge handoff send --to codex --source redmine --issue <id> --journal <review-request-j> --kind review_request --target <reviewer> --target-repo <repo>` | supervisorはevent供給、fold、outbox配送。projectionはread-only。review通知はdurable requestへのpointerであり判断ではない |
+| `A10` | Reviewer / Auditor: 独立review | Git / CI / durable Review Requestを読む（review判断を代行する`mozyo-bridge` commandなし） | `external-authority`。ReviewerはImplementerと別role。projectionは判断材料であって承認ではない |
+| `A11` | Reviewer / Auditor: changes requested記録 | `mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate review_result --target-head <sha> --review-request-journal <j> --review-decision changes_requested` | exact head / request journal付きresult。non-approvalなのでapproval generation leaseは取らない |
+| `A12` | Coordinator: correction callback再照合・配送 | `mozyo-bridge workflow supervisor --run-once --json` | review resultをfoldし、owning lane generationへfenceしたcallbackを配送 |
+| `A13` | Gateway: same-lane Implementerへ修正配送 | `mozyo-bridge handoff send --to claude --source redmine --issue <id> --journal <j> --kind review_result --role-profile implementation_worker` | same-lane標準handoff。Coordinatorから別laneのWorkerへ直接送信しない |
+| `A14` | Reviewer / Auditor: approval記録 | `mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate review_result --review-decision approval --target-head <sha> --review-request-journal <j> --review-generation-json <path> --consumer-id <id>` | review-generation fence通過後だけmarker-bearing approvalを記録 |
+| `A15` | Coordinator: integration disposition | Git / CI操作（`mozyo-bridge` integration commandなし） | approved exact headだけを標準`ff-only`で統合し、remote到達性を記録 |
+| `A16` | Coordinator: owner waiting | `mozyo-bridge workflow callbacks --emit-gate --issue <id> --gate owner_close_approval_waiting ...` | owner actionが必要なdurable gateを先に記録。Review Resultと同じjournalへ畳まない |
+| `A16H` | Coordinator: eligibleなopen sublaneをhibernate | `mozyo-bridge sublane hibernate --issue <id> --lane <label> --journal <j> <measured-preflight-flags> --execute` | `--review-approved --staging-integrated --required-ci-green --dogfood-delegated --commits-pushed`等、CLI helpが要求する実測basisを省略しない。hibernateはclose / approvalではない |
+| `A17` | Owner: owner close approval | provider UI / API / MCP（owner判断を代行する`mozyo-bridge` commandなし） | `external-authority`。未承認・不明はfail-closedでopenのまま停止 |
+| `A18` | Coordinator: Close Gate / issue close | provider UI / API / MCP（provider-neutral `mozyo-bridge` close commandなし） | review、owner approval、commit evidenceを再確認後だけclose |
+| `A19` | Coordinator: closed sublane退役 | `mozyo-bridge sublane retire --issue <id> --journal <j> --lane-label <label> --branch <branch> --integration-branch main --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --latest-generation-admissible --execute` | managed process / lifecycleを変更。remote branchやworktreeは削除しない |
 
 `docs validate`はcatalogを検査するcommandであり、関連文書を解決するcommandではない。解決は必ず
 `mozyo-bridge docs resolve`で行う。また`mozyo-bridge workflow admission`や
-`mozyo-bridge workflow dispatch-plan`のadvisory出力は、providerへ記録
-されるまでdurable decisionではない。
+`mozyo-bridge workflow dispatch-plan`のadvisory出力は、providerへ記録されるまでdurable
+decisionではない。
 
-## 公開commandを含む標準シーケンス
+`DurableWorkRecordPort` / `append_event`は`target-only`であり、上のprovider read / writeを現行
+0.12.2で代行する公開commandではない。review判断も同様に`external-authority`であり、
+mozyo-bridgeは対象identityの検証、marker-bearing resultの記録、callback配送だけを担う。
 
-次の図は現行0.12.2の公開surfaceを基準にした標準シーケンスである。PlantUML `box`は
-package相当の責務layerを表す。各起動矢印にはcommandを置き、commandが無い工程は明示的に
-`現行公開commandなし`とする。`DurableWorkRecordPort`は目標内部境界としてだけ表示する。
-
-```plantuml
-@startuml ticket_system_neutral_orchestrator_intake
-title 現行0.12.2 command trace 1/2: intake・implementation・callback
-
-box "人間 / workflow role" #EAF2F8
-actor "所有者" as Owner
-participant "coordinator / reviewer" as Coordinator
-participant "実装gateway" as Gateway
-participant "実装worker" as Worker
-end box
-
-box "mozyo-bridge public CLI (current-public)" #E8F8F5
-control "docs resolve" as DocsCLI
-control "workflow step / admission" as DecisionCLI
-control "sublane create / dispatch-worker" as SublaneCLI
-control "workflow dispatch-ir" as DispatchCLI
-control "workflow callbacks" as CallbackCLI
-control "workflow supervisor" as SupervisorCLI
-end box
-
-box "mozyo core / runtime" #FCF3CF
-collections "方針文書 / catalog" as Policy
-boundary "DurableWorkRecordPort\n(target-only)" as WorkPort
-database "runtime store\nevent / outbox / fence" as Runtime
-participant "lane lifecycle / route resolver" as Lane
-end box
-
-box "外部authority" #FDEDEC
-database "ticket provider\n現行binding: Redmine" as WorkSystem
-database "Git / CI / artifact" as Git
-end box
-
-Owner -> Coordinator: 人間の依頼 / durable pointer\n（mozyo commandなし）
-Coordinator -> DocsCLI: mozyo-bridge docs resolve <paths...> --repo .
-DocsCLI -> Policy: catalogから関連正本を解決（read-only）
-Policy --> Coordinator: 読むべきdocs
-Coordinator -> DecisionCLI: mozyo-bridge workflow step --dry-run --json
-DecisionCLI -> WorkSystem: 現行Redmine bindingからgateを読む
-note over DecisionCLI, WorkPort
-  targetではDurableWorkRecordPort経由へ置換する。
-  0.12.2にprovider-neutral read/append commandはない。
-end note
-Coordinator -> DecisionCLI: mozyo-bridge workflow admission / lane-admission / dispatch-plan
-DecisionCLI --> Coordinator: advisory decision（ticketは未変更）
-Coordinator -> WorkSystem: provider UI / API / MCPで判断を記録\n（provider-neutral mozyo writerなし）
-
-alt 実装対象でありlane admission通過
-  Coordinator -> SublaneCLI: mozyo-bridge sublane create ... --execute
-  SublaneCLI -> Lane: worktree・lane generation・managed pairを作成/adopt
-  SublaneCLI -> Gateway: 既存journal anchor付きIRをdispatch
-  alt gatewayがIR marker記録と送信を一体実行
-    Gateway -> DispatchCLI: mozyo-bridge workflow dispatch-ir ... --execute
-    DispatchCLI -> WorkSystem: implementation_request markerを記録
-    DispatchCLI -> Worker: exact marker anchor付きhandoff
-  else 既存IR journalをsame-lane workerへforward
-    Gateway -> SublaneCLI: mozyo-bridge sublane dispatch-worker\n--issue <id> --lane-label <label> --journal <j> --execute
-    SublaneCLI -> Worker: same-lane IRを一回送信
-  end
-  Worker -> Git: 実装・test・commit・push\n（Git command、mozyo commandなし）
-  Git --> Worker: exact commit / CI evidence
-  Worker -> CallbackCLI: mozyo-bridge workflow callbacks --emit-gate\n--gate implementation_done / review_request
-  CallbackCLI -> WorkSystem: marker-bearing gateを記録
-else coordinator / review / owner作業
-  Coordinator -> WorkSystem: provider UI / API / MCPで判断を記録\n（generic mozyo writerなし）
-end
-
-WorkSystem --> SupervisorCLI: 任意のwake hint（authorityではない）
-Coordinator -> SupervisorCLI: mozyo-bridge workflow supervisor --run-once --json
-SupervisorCLI -> WorkSystem: 新しいstructured gateを列挙
-SupervisorCLI -> Runtime: fold・outbox claim・exact fence確認
-SupervisorCLI -> Lane: current route / lane generationを解決
-alt exact routeへ配送成功
-  SupervisorCLI -> Gateway: durable anchor付きcallback
-  Gateway -> Coordinator: durable anchor付きcallback
-  SupervisorCLI -> Runtime: deliveredを記録
-else 不在・曖昧・send result uncertain
-  SupervisorCLI -> Runtime: pending / uncertainを保持
-  note right of Runtime
-    loss recoveryは supervisor --run-once。
-    完了済みworkは再dispatchしない。
-    uncertain sendは無条件再送しない。
-  end note
-end
-@enduml
-```
-
-review判断は`external-authority`であり、mozyo-bridgeは判断を代行せず、対象identityの検証、
-marker-bearing resultの記録、callback配送だけを担う。後半は次の図に分ける。
-
-```plantuml
-@startuml ticket_system_neutral_orchestrator_review_close
-title 現行0.12.2 command trace 2/2: review・integration・owner・close・retire
-
-box "人間 / workflow role" #EAF2F8
-actor "所有者" as Owner
-participant "coordinator / reviewer" as Coordinator
-participant "実装gateway" as Gateway
-participant "実装worker" as Worker
-end box
-
-box "mozyo-bridge public CLI (current-public)" #E8F8F5
-control "workflow callbacks" as CallbackCLI
-control "workflow supervisor" as SupervisorCLI
-control "workflow glance / resume" as ProjectionCLI
-control "sublane hibernate / retire" as LifecycleCLI
-end box
-
-box "mozyo core / runtime" #FCF3CF
-database "runtime store\nevent / outbox / named fences" as Runtime
-participant "lane lifecycle / route resolver" as Lane
-end box
-
-box "外部authority" #FDEDEC
-database "ticket provider\n現行binding: Redmine" as WorkSystem
-database "Git / CI / artifact" as Git
-end box
-
-Coordinator -> ProjectionCLI: mozyo-bridge workflow glance / resume / step\n--dry-run --json
-ProjectionCLI -> Runtime: current state / next actionを読む
-Coordinator -> Git: head・diff・CI evidenceを検証\n（Git操作、mozyo commandなし）
-alt review changes requested
-  Coordinator -> CallbackCLI: mozyo-bridge workflow callbacks --emit-gate\n--gate review_result --review-decision changes_requested
-  CallbackCLI -> WorkSystem: exact head + request journal付きresult
-  SupervisorCLI -> Gateway: exact review request + owning-lane generationに\nfenceしたcorrection callback
-  Gateway -> Worker: same-lane限定の修正依頼
-else review approved
-  Coordinator -> CallbackCLI: mozyo-bridge workflow callbacks --emit-gate\n--gate review_result --review-decision approval\n--target-head <sha> --review-request-journal <j>\n--review-generation-json <path> --consumer-id <id>
-  CallbackCLI -> WorkSystem: review-generation fence通過後だけ記録
-  Coordinator -> Git: approved exact commitを統合\n（mozyo integration commandなし）
-  alt owner close approvalが必要
-    Coordinator -> CallbackCLI: mozyo-bridge workflow callbacks --emit-gate\n--gate owner_close_approval_waiting
-    CallbackCLI -> WorkSystem: waiting gateを記録
-    Coordinator --> Owner: 対象限定の承認依頼（人間操作）
-    Owner -> WorkSystem: provider UI / API / MCPで\nowner_close_approvalを記録
-  end
-  Coordinator -> WorkSystem: Close Gate / issue close\n（provider-neutral mozyo commandなし）
-  Coordinator -> LifecycleCLI: openならmozyo-bridge sublane hibernate --execute\nclose後ならmozyo-bridge sublane retire --execute
-  LifecycleCLI -> Lane: callback / integration drain確認後にprocessを解放
-end
-@enduml
-```
+`handoff send --role-profile`の現行closed vocabularyにはReviewer / Auditor専用profileがない。
+従って`A09`は`kind=review_request`、durable anchor、明示targetでreview workを配送し、reviewerの
+独立性はpresetのrole境界とReview Request / Resultの別actor記録で担保する。未実装profile名を
+設計書だけで追加しない。
 
 ## 再照合契約と停止条件
 
