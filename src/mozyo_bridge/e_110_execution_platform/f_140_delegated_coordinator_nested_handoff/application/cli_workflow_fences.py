@@ -50,7 +50,9 @@ def register_fence_operator_parsers(workflow_sub) -> None:
             "is a DRY-RUN loss recovery; add `--apply --expect-fingerprint <token>` to actuate, "
             "which backs up the prior artifacts first and mints a fresh store under a new nonce "
             "(invalidating every outstanding grant). A live owner / an unreadable store / a "
-            "concurrent mutation is zero-write. `sublane callback-recovery --execute` never "
+            "concurrent mutation is zero-write, except that a concurrent mutation caught mid-backup "
+            "whose backup copies cannot be removed reports a typed `rollback_incomplete` with the "
+            "residue named and `zero_write=False`. `sublane callback-recovery --execute` never "
             "auto-creates or auto-recovers the store: a silent re-create would hand a second live "
             "owner the same anchor."
         ),

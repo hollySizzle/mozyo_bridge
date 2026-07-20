@@ -594,5 +594,46 @@ class ConcurrentRefusalZeroWriteTest(unittest.TestCase):
         self.assertIn(out.status, (RECOVERY_ROLLBACK_INCOMPLETE, RECOVERY_REFUSED_CONCURRENT))
 
 
+class PublicContractDriftTest(unittest.TestCase):
+    """The operator/maintainer-facing text must not assert the stale absolute "every refusal is
+    zero-write" claim, which R3's typed residue outcome contradicts (re-review j#83376, Low).
+
+    A string-assertion guard: it fails if the rollback-incomplete residue exception is dropped from
+    the public surfaces, so the drift cannot silently return.
+    """
+
+    def test_recovery_outcome_docstring_names_the_residue_exception(self):
+        from mozyo_bridge.core.state.callback_sweep_lease import LeaseRecoveryOutcome
+
+        doc = LeaseRecoveryOutcome.__doc__ or ""
+        self.assertIn("ROLLBACK_INCOMPLETE", doc)
+        # the stale absolute claim must be gone
+        self.assertNotIn("Only ``RECOVERY_APPLIED`` ever wrote", doc)
+
+    def test_cli_module_doc_names_the_residue_exception(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_workflow_callback_lease,
+        )
+
+        doc = cli_workflow_callback_lease.__doc__ or ""
+        self.assertIn("rollback_incomplete", doc)
+        self.assertIn("zero_write=False", doc)
+
+    def test_callback_lease_help_documents_the_residue_exception(self):
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_fences import (  # noqa: E501
+            register_fence_operator_parsers,
+        )
+
+        parser = argparse.ArgumentParser(prog="mozyo-bridge")
+        workflow_sub = parser.add_subparsers()
+        register_fence_operator_parsers(workflow_sub)
+        help_text = workflow_sub.choices["callback-lease"].format_help()
+        # the help must document the exception, not assert an unconditional zero-write
+        self.assertIn("rollback_incomplete", help_text)
+        self.assertIn("zero_write=False", help_text)
+
+
 if __name__ == "__main__":
     unittest.main()

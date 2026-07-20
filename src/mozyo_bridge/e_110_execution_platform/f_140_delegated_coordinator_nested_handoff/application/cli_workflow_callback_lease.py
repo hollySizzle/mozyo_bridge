@@ -8,7 +8,10 @@ status plus a **backup-first, identity-bound, dry-run-default** recovery. Status
 DB/sidecar pair into one typed state and prints the artifact fingerprint; ``--recover`` alone is a
 dry-run that reports what an apply would do; ``--recover --apply --expect-fingerprint <token>``
 actuates only when the store is a recoverable clean loss and the quoted fingerprint still matches.
-A live owner / an unreadable store / a concurrent mutation is zero-write / zero-send.
+A live owner / an unreadable store / a concurrent mutation is zero-write / zero-send — with one
+reported exception: if a concurrent mutation is caught mid-backup and the backup copies cannot be
+removed, the outcome is a typed ``rollback_incomplete`` that names the residue and reports
+``zero_write=False`` rather than hiding the leftover.
 """
 
 from __future__ import annotations

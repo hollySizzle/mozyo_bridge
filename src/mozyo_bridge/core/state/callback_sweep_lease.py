@@ -78,8 +78,11 @@ LEASE_NONCE_MISMATCH = "nonce_mismatch"
 LEASE_UNREADABLE = "unreadable"
 
 # --- Recovery outcomes (Redmine #13951) --------------------------------------
-# The result vocabulary of :meth:`CallbackSweepLease.recover_guarded`. Exactly ONE status per call,
-# and only ``RECOVERY_APPLIED`` ever writes; every other status is zero-write / zero-send.
+# The result vocabulary of :meth:`CallbackSweepLease.recover_guarded`. Exactly ONE status per call.
+# ``RECOVERY_APPLIED`` mints a fresh store (a write). Every refusal is zero-write / zero-send EXCEPT
+# ``RECOVERY_ROLLBACK_INCOMPLETE``, where a concurrent mutation was caught but this call's backup
+# copies could not be removed, so a residue remains (``zero_write`` is then False). Read the outcome's
+# ``zero_write`` — it is computed from what actually happened, not assumed from the status name.
 
 #: A fresh store was minted under a new nonce, after the prior artifacts were backed up first.
 RECOVERY_APPLIED = "applied"
@@ -229,7 +232,12 @@ class LeaseDiagnosis:
 
 @dataclass(frozen=True)
 class LeaseRecoveryOutcome:
-    """The outcome of a guarded recovery. Only ``RECOVERY_APPLIED`` ever wrote (#13951)."""
+    """The outcome of a guarded recovery (#13951).
+
+    ``RECOVERY_APPLIED`` wrote (a fresh store). Every refusal is zero-write EXCEPT
+    ``RECOVERY_ROLLBACK_INCOMPLETE``, which leaves a backup residue on disk (a cleanup ``unlink``
+    failed) — read :attr:`zero_write`, which reflects what actually happened rather than the status.
+    """
 
     status: str
     #: The diagnosis the decision was made on (its fingerprint is the identity that was checked).
