@@ -227,7 +227,7 @@ class DispatchLegTest(unittest.TestCase):
         orig_ts = _herdr_ops.HerdrWorkerDispatchOps.dispatch_to_worker_turn_start
         _cli._resolve_target_locator = lambda name, env: "pane1"
         _herdr_ops.HerdrWorkerDispatchOps.dispatch_to_worker_turn_start = (
-            lambda self, **kw: (0, ops_turn_start)
+            lambda self, **kw: (0, ops_turn_start, False)
         )
         try:
             return execute_herdr_dispatch(

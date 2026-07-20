@@ -126,7 +126,11 @@ def _default_send_factory(
         # the delivery ACK alone (submit-completion) is not a turn-start, so `delivered` is
         # confirmed only when the ops observes the exact worker's turn actually started
         # (`started`); ACK-without-turn / unobservable -> uncertain. No raw wait loop.
-        rc, ops_turn_start = ops.dispatch_to_worker_turn_start(
+        # Redmine #14192: this dispatch leg keys only on the ACK + turn-start; the third
+        # `known_not_sent` element (a proven pre-injection zero-send) is consumed by the
+        # `sublane dispatch-worker` fence path, not this callback-recovery leg, so it is
+        # discarded here (behaviour unchanged).
+        rc, ops_turn_start, _known_not_sent = ops.dispatch_to_worker_turn_start(
             issue=authorization.issue,
             journal=journal,
             worker_pane=worker_pane,
