@@ -42,9 +42,13 @@ The boundary (j#74307):
   older review_result (F6); the callback-facing ``owner_close_approval_waiting`` and the
   fact-bearing ``implementation_done`` / ``blocked`` markers are NOT promoted from a marker alone
   (their gate comes from the heading), so a waiting-callback marker never reads as owner approval
-  (F7); (3) when a review marker and the heading DISAGREE on the review family, the structured
-  marker wins — a ``## Gate: Review`` + ``結論`` body cannot beat a ``gate=review_request`` marker
-  into a false approval (F8).
+  (F7); (3) when a review marker and the heading DISAGREE, the structured marker wins — a
+  ``## Gate: Review`` + ``結論`` body cannot beat a ``gate=review_request`` marker into a false
+  approval (F8), and an open review round SUPPRESSES a conflicting ``close`` / ``owner_close``
+  heading so the lane cannot advance to close / retire past it (:data:`_REVIEW_SUPERSEDES_PROGRESSION`;
+  ``blocked`` stays as the safe side, ``implementation_done`` stays as a sticky-fact gate — F10);
+  (4) a single journal carrying BOTH a review_request and a review_result marker is contradictory
+  and folds to ``pending`` / review_waiting, never a body/heading approval (F9).
 - **Only line-anchored gate headings are read**, in the two governed shapes: the prefixed
   ``## Gate: <kind>`` and the suffixed ``## <kind> Gate`` (Redmine #13952: same-lane reviewers
   durably write ``## Review Gate — 要修正``). Both are normalized (case / surrounding
@@ -455,6 +459,18 @@ def _issue_markers(journals: Sequence[Tuple[object, str]]) -> Tuple[JournalMarke
 #: semantics-preserving. Those gates come from the heading (always present on the real journal).
 _MARKER_ESTABLISHED_GATES: frozenset[str] = frozenset({GATE_REVIEW, GATE_REVIEW_REQUEST})
 
+#: The heading-derived gates a structured review marker SUPPRESSES on the same journal (Redmine
+#: #13952 R8 review j#83594 F10). When a review round is open (a review_request / review_result
+#: marker is present), a conflicting ``## Gate: Close`` / ``owner_close_approval`` heading must NOT
+#: advance the lane past the open round to close / retire — the structured review authority is
+#: current. ``blocked`` is deliberately NOT here (a stop is the safe side, never a false
+#: progression) and ``implementation_done`` is not here (it is a sticky-fact gate BELOW review that
+#: never advances past it, so a combined ``Implementation Done + Review Request`` keeps its commit
+#: fact while folding to review_waiting).
+_REVIEW_SUPERSEDES_PROGRESSION: frozenset[str] = frozenset(
+    {GATE_CLOSE, GATE_OWNER_CLOSE_APPROVAL}
+)
+
 
 def _journal_marker_gates(markers: Sequence[JournalMarker], journal: str) -> set:
     """The review-family runtime gates the ``workflow-event`` markers on ``journal`` establish (pure).
@@ -480,6 +496,14 @@ def _has_review_result_marker(markers: Sequence[JournalMarker], journal: str) ->
     j = str(journal).strip()
     return any(
         mk.gate == _MARKER_REVIEW_GATE and str(mk.journal).strip() == j for mk in markers
+    )
+
+
+def _has_review_request_marker(markers: Sequence[JournalMarker], journal: str) -> bool:
+    """Whether ``journal`` carries any review_request (``review_request`` gate) marker (pure)."""
+    j = str(journal).strip()
+    return any(
+        mk.gate == GATE_REVIEW_REQUEST and str(mk.journal).strip() == j for mk in markers
     )
 
 
@@ -515,6 +539,12 @@ def _canonical_review_outcome(
     """
     issue = _CORRELATION_ISSUE
     j = str(journal).strip()
+    # Redmine #13952 R8 review j#83594 F9: a single journal carrying BOTH a review_result and a
+    # review_request marker is contradictory — it claims an old round's outcome AND a fresh round
+    # at once, with no order authority to resolve which. It is not a clean action authority, so it
+    # is never canonical (the caller shadows it to pending -> review_waiting, no approval).
+    if _has_review_request_marker(markers, j):
+        return None
     if review_result_is_ambiguous(markers, issue, j):
         return None
     declared_req = review_result_marker_request(markers, issue, j)
@@ -688,7 +718,12 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         jid_s = str(journal_id).strip()
         marker_review_gates = _journal_marker_gates(issue_markers, jid_s)
         if marker_review_gates:
+            # F8: the structured review authority replaces a conflicting heading review gate.
             gates -= _MARKER_ESTABLISHED_GATES
+            # F10: an open review round is current, so a conflicting close / owner-close heading may
+            # not advance the lane past it (blocked stays — a stop is safe-side; impl_done stays —
+            # it is a sticky-fact gate below review).
+            gates -= _REVIEW_SUPERSEDES_PROGRESSION
             gates |= marker_review_gates
         marker_disposition, marker_conclusion, marker_blocker = _review_result_disposition(
             issue_markers, jid_s

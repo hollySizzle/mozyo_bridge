@@ -1071,6 +1071,86 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         facts, state, _ = self._fold(journals)
         self.assertEqual((facts.latest_gate, facts.review_conclusion, state), (_GATE_REVIEW, REVIEW_CHANGES_REQUESTED, "implementing"))
 
+    # -- ambiguous mixed markers on one journal (review j#83594 F9) -----------------------
+
+    def _mixed_journal(self, jid, *, result_conclusion, result_head=_HEAD, req="90", request_head=_HEAD2, result_first=True):
+        result = f"[mozyo:workflow-event:gate=review_result:conclusion={result_conclusion}:head={result_head}:req={req}]"
+        request = f"[mozyo:workflow-event:gate=review_request:head={request_head}]"
+        body = f"{result}\n{request}" if result_first else f"{request}\n{result}"
+        return _j(jid, f"## Gate: Review\n{body}")
+
+    def test_mixed_request_and_result_markers_fail_closed_both_orders(self):
+        # F9: one journal that carries BOTH a review_result and a review_request marker claims an
+        # old round's outcome AND a new round at once — contradictory, so it folds to review_waiting
+        # (never the correlated approval), regardless of marker order or the result conclusion.
+        for result_first in (True, False):
+            for conclusion in ("approved", "changes_requested"):
+                with self.subTest(result_first=result_first, conclusion=conclusion):
+                    journals = [
+                        _request_journal(head=_HEAD, jid="90"),
+                        self._mixed_journal("110", result_conclusion=conclusion, result_first=result_first),
+                    ]
+                    facts, state, _ = self._fold(journals)
+                    self.assertEqual(facts.latest_gate_journal, "110")
+                    self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_mixed_markers_with_same_head_still_fail_closed(self):
+        # F9: even when the result and request markers pin the SAME head, two review-family kinds on
+        # one durable event is ambiguous — never a clean action authority.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            self._mixed_journal("110", result_conclusion="approved", request_head=_HEAD),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    # -- review marker vs non-review heading conflict (review j#83594 F10) ----------------
+
+    def test_close_heading_does_not_advance_past_an_open_review_request(self):
+        # F10: a ``## Gate: Close`` heading on a journal that also carries a structured
+        # ``gate=review_request`` marker must not give close / retire authority — the review round
+        # is open, so it folds to review_waiting.
+        for heading in ("## Gate: Close", "## Gate: owner_close_approval"):
+            with self.subTest(heading=heading):
+                journals = [
+                    _request_journal(head=_HEAD, jid="90"),
+                    _j("110", f"{heading}\n[mozyo:workflow-event:gate=review_request:head={_HEAD2}]"),
+                ]
+                facts, state, _ = self._fold(journals)
+                self.assertEqual((facts.latest_gate, state), (GATE_REVIEW_REQUEST, "review_waiting"))
+
+    def test_combined_impl_done_review_request_keeps_commit_and_is_review_waiting(self):
+        # F10 / verdict 2: the canonical combined gate keeps its sticky commit fact (implementation_done
+        # is below review and does not advance past it) while folding to review_waiting.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _j(
+                "110",
+                "## Gate: Implementation Done + Review Request\n- commit: `abc1234`\n"
+                f"[mozyo:workflow-event:gate=review_request:head={_HEAD2}]",
+            ),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual((facts.latest_gate, state), (GATE_REVIEW_REQUEST, "review_waiting"))
+        self.assertTrue(facts.commit_bearing)
+
+    def test_blocked_heading_stays_blocked_over_a_review_marker(self):
+        # F10: ``blocked`` is the safe side — a stop is never a false progression, so it is not
+        # suppressed by a review marker.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _j("110", f"## Gate: Blocked\n[mozyo:workflow-event:gate=review_request:head={_HEAD2}]"),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual((facts.latest_gate, state), (GATE_BLOCKED, "blocked"))
+
+    def test_real_close_heading_without_a_review_marker_still_retires(self):
+        # Non-regression: a genuine close gate (no competing review marker) still reaches close /
+        # retire — the F10 suppression only applies when a review round is actually open.
+        facts = fold_issue_gate_facts([_j("100", "## Gate: close\n- commit_hash: `abc1234`")])
+        sig = lane_signal_from_gate_facts("7", facts, issue_open=False)
+        self.assertEqual(classify_lane_state(sig), "integration_waiting")
+
     # -- non-review markers ---------------------------------------------------------------
 
     def test_review_finding_verdict_marker_is_not_an_audit_review(self):
