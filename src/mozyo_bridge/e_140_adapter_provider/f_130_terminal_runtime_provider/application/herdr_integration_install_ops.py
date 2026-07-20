@@ -45,6 +45,7 @@ from typing import Callable, Mapping, Optional
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_integration_install import (
     AGENT_CONFIG_DIRNAME,
     REASON_CONFIG_DIR_MISSING,
+    REASON_CONFIG_DIR_UNREADABLE,
     REASON_HERDR_ERROR,
     REASON_HERDR_UNRESOLVED,
     REASON_PARTIAL_FAILURE,
@@ -119,18 +120,39 @@ def _iter_files(root: Path):
             yield rel, abspath
 
 
+#: The snapshot digest for a file that could not be read. It is intentionally NOT a
+#: 64-char sha256 hexdigest, so it never collides with a real content hash. Crucially,
+#: two of these sentinels comparing *equal* is NOT proof the bytes match (they were
+#: never read) — :func:`_has_unreadable` and :func:`_rollback_dir` treat any snapshot
+#: carrying it as unverifiable (Redmine #13249 review j#83674 finding 1).
+_UNREADABLE_SENTINEL = "\x00unreadable\x00"
+
+
 def _snapshot_dir(root: Path) -> DirSnapshot:
-    """Content manifest (relpath -> sha256) of ``root``'s non-credential files."""
+    """Content manifest (relpath -> sha256) of ``root``'s non-credential files.
+
+    An unreadable file is recorded with :data:`_UNREADABLE_SENTINEL` (never a real
+    hash) so its presence is still detected, but its bytes never enter the snapshot —
+    and a snapshot carrying the sentinel can never be used as restoration *proof*.
+    """
     manifest: "dict[str, str]" = {}
     for rel, abspath in _iter_files(root):
         try:
             digest = hashlib.sha256(abspath.read_bytes()).hexdigest()
         except OSError:
-            # An unreadable file is recorded with a sentinel so a later change is
-            # still detected, but its bytes never enter the snapshot.
-            digest = "unreadable"
+            digest = _UNREADABLE_SENTINEL
         manifest[rel] = digest
     return DirSnapshot.of(manifest)
+
+
+def _has_unreadable(snapshot: DirSnapshot) -> bool:
+    """True iff ``snapshot`` carries an unreadable non-credential file.
+
+    Such a file could not be hashed or backed up, so no snapshot equality involving
+    it is a byte-level proof — an apply must refuse to start (rollback unprovable) and
+    a rollback must never report itself verified.
+    """
+    return any(digest == _UNREADABLE_SENTINEL for _rel, digest in snapshot.entries)
 
 
 def _backup_dir(root: Path) -> "dict[str, bytes]":
@@ -172,8 +194,14 @@ def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -
             target.write_bytes(data)
         except OSError:
             pass
-    # Prove the restoration: the post-rollback snapshot must match the pre-apply one.
-    return _snapshot_dir(root) == before
+    # Prove the restoration: the post-rollback snapshot must match the pre-apply one
+    # AND carry no unreadable file — a sentinel that only *equals* another sentinel is
+    # not byte proof, so a dir that became unreadable is reported unverified, never
+    # "restored" (Redmine #13249 review j#83674 finding 1).
+    after = _snapshot_dir(root)
+    if _has_unreadable(after) or _has_unreadable(before):
+        return False
+    return after == before
 
 
 # --- gating (read-only) ------------------------------------------------------
@@ -358,12 +386,38 @@ def _run_apply_transaction(
     # herdr resolves the agent config dirs from HOME; pin it to the resolved home so
     # a managed apply and the gate look at the same dirs.
     env["HOME"] = str(inputs.home)
-    applied: "list[tuple[str, Path, dict, DirSnapshot]]" = []
-    outcomes: "list[AgentInstallOutcome]" = []
+    # Preflight, BEFORE any mutation: snapshot + back up every agent's dir. If any dir
+    # holds an unreadable non-credential file, a rollback of it could never be
+    # byte-verified, so the whole transaction is refused with zero mutation — an
+    # un-provable rollback must never be started (Redmine #13249 review j#83674
+    # finding 1). Snapshots are captured here (pre-mutation) and reused by the loop.
+    staged: "list[tuple[str, Path, DirSnapshot, dict]]" = []
     for agent in inputs.agents:
         config_dir = _config_dir(inputs.home, agent)
         before = _snapshot_dir(config_dir)
-        backup = _backup_dir(config_dir)
+        if _has_unreadable(before):
+            return InstallReport(
+                applied=False,
+                ok=False,
+                plans=(
+                    AgentInstallPlan(
+                        agent=agent,
+                        config_dir=str(config_dir),
+                        ready=False,
+                        reason=REASON_CONFIG_DIR_UNREADABLE,
+                        detail=f"config dir {config_dir} holds an unreadable "
+                        f"non-credential file; a rollback could not be proven so "
+                        f"nothing was mutated",
+                    ),
+                ),
+                detail="apply refused: an un-provable rollback would be required; "
+                "nothing was mutated",
+                pin_mode=pin_mode,
+            )
+        staged.append((agent, config_dir, before, _backup_dir(config_dir)))
+    applied: "list[tuple[str, Path, dict, DirSnapshot]]" = []
+    outcomes: "list[AgentInstallOutcome]" = []
+    for agent, config_dir, before, backup in staged:
         ok, detail = _invoke_herdr(runner, binary, agent, env)
         if not ok:
             # Roll back this agent's partial write (verified), then every prior agent.

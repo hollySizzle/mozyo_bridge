@@ -86,6 +86,12 @@ REASON_HERDR_UNRESOLVED = "herdr_unresolved"
 #: remains). The installer must never claim ``home left as found`` / ``rolled_back``
 #: when restoration could not be *proven* (Redmine #13249 review j#83613 finding 1).
 REASON_ROLLBACK_INCOMPLETE = "rollback_incomplete"
+#: A target config dir holds a non-credential file the installer cannot read, so a
+#: rollback of that dir could never be byte-verified. The apply is refused *before*
+#: any mutation — an un-provable rollback must never be started, and a pair of
+#: unreadable files must never read as "restored" (Redmine #13249 review j#83674
+#: finding 1: `unreadable == unreadable` is not restoration proof).
+REASON_CONFIG_DIR_UNREADABLE = "config_dir_unreadable"
 #: Apply was requested for several agents and at least one failed after another had
 #: already been mutated — the whole operation is reported failed and rolled back.
 REASON_PARTIAL_FAILURE = "partial_failure"
@@ -98,6 +104,7 @@ INSTALL_FAILURE_REASONS: frozenset[str] = frozenset(
     {
         REASON_UNKNOWN_AGENT,
         REASON_CONFIG_DIR_MISSING,
+        REASON_CONFIG_DIR_UNREADABLE,
         REASON_UNSAFE_CONFIG_PATH,
         REASON_UNPINNED_REMOTE,
         REASON_HERDR_ERROR,
@@ -352,6 +359,7 @@ __all__ = (
     "INSTALL_FAILURE_REASONS",
     "INTEGRATION_AGENTS",
     "REASON_CONFIG_DIR_MISSING",
+    "REASON_CONFIG_DIR_UNREADABLE",
     "REASON_HERDR_ERROR",
     "REASON_HERDR_UNRESOLVED",
     "REASON_NOT_OPTED_IN",

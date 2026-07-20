@@ -40,6 +40,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_CLAUDE,
     AGENT_CODEX,
     REASON_CONFIG_DIR_MISSING,
+    REASON_CONFIG_DIR_UNREADABLE,
     REASON_HERDR_ERROR,
     REASON_HERDR_UNRESOLVED,
     REASON_PARTIAL_FAILURE,
@@ -531,6 +532,24 @@ class InstallOpsTest(unittest.TestCase):
         self.assertEqual(by_agent[AGENT_CLAUDE].reason, REASON_ROLLBACK_INCOMPLETE)
         self.assertFalse(by_agent[AGENT_CLAUDE].rolled_back)
         self.assertIn("INCOMPLETE", report.detail)
+
+    def test_apply_refused_when_config_file_unreadable(self) -> None:
+        # Review j#83674 finding 1: an unreadable non-credential file means a rollback
+        # could never be byte-verified, so apply must refuse BEFORE mutating (an
+        # `unreadable == unreadable` match must never read as "restored").
+        self.addCleanup(self._restore_perms)
+        settings = self.home / ".claude" / "settings.json"
+        settings.write_text("orig", encoding="utf-8")
+        settings.chmod(0o000)  # owner cannot read → snapshot/backup fail
+        fake = FakeHerdrIntegration()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked → zero mutation
+        self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_UNREADABLE)
+        # the file is untouched
+        settings.chmod(0o600)
+        self.assertEqual(settings.read_text(encoding="utf-8"), "orig")
 
     def _restore_perms(self) -> None:
         import stat as _stat
