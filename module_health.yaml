@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3306
+    lines: 3044
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1104,6 +1104,19 @@ allowlist:
       builds the typed request from the resolved envelope and returns the use case result.
       Net -36. Shared baseline change: reconcile at integration if another tranche/lane also
       edits this file.
+      Tightened 3306 -> 3044 for #13729 tranche 4 (common tmux transport rail): the ~308-line
+      inline block that injects the marker+body once and drives it to a terminal disposition
+      (pending park / marker landing gate + C-u rollback / Enter-only retry / standard turn-start
+      confirmation / final sent assembly with the emit / persist / ledger / focus-restore side
+      effects) moved to the new
+      `f_130_handoff_routing/application/handoff_tmux_transport_rail.py`
+      (`TmuxTransportRailUseCase` over a typed `TmuxTransportRailRequest` + a side-effect
+      `TmuxTransportRailOps` port; `LiveTmuxTransportRailOps` routes run_tmux / capture_pane /
+      wait_for_text and the observe / persist / ledger / restore / die seams through `commands`
+      at call time so the transport-wiring swap and every monkeypatch seam stay in force). The
+      facade keeps one thin call site that builds the typed request from the resolved envelope +
+      raw scalars and returns the use case result. Net -262. Shared baseline change: reconcile at
+      integration if another tranche/lane also edits this file.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

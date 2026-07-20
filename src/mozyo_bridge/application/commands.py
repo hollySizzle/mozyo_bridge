@@ -154,6 +154,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     HerdrStandardRailRequest,
     run_herdr_standard_rail,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail import (
+    TmuxTransportRailRequest,
+    run_tmux_transport_rail,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     resolve_canonical_session,
@@ -2773,314 +2777,48 @@ def orchestrate_handoff(
             emit=_emit,
         )
 
-    run_tmux("send-keys", "-t", target, "-l", "--", f"{marker} {body}")
-
-    if mode == MODE_PENDING:
-        outcome = make_outcome(
-            status="pending_input",
-            reason="ok",
-            receiver=receiver,
+    # Redmine #13729 tranche 4: the common tmux transport rail slice owns its own control flow
+    # (every path returns / dies without falling through). It is carved into the typed
+    # ``handoff_tmux_transport_rail`` use case — the facade only assembles the typed request (the
+    # resolved envelope value objects + terminal outcome context + the raw landing / submit /
+    # retry scalars + the pre-resolved focus-restore activation) and hands it the per-call
+    # publishing emitter. The inject / marker gate / C-u rollback / Enter-only retry / standard
+    # turn-start confirmation / final sent assembly choreography, the emit / persist / ledger /
+    # restore side effects, and both ``die`` messages are unchanged.
+    return run_tmux_transport_rail(
+        TmuxTransportRailRequest(
             target=target,
+            marker=marker,
+            body=body,
+            receiver=receiver,
             anchor=anchor,
             mode=mode,
             kind=kind,
-            notification_marker=marker,
             execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
+            role_profile_resolution=role_profile_resolution,
+            role_profile_contract=role_profile_contract,
+            transition_role_boundary=transition_role_boundary,
+            workflow_contract_bundle=workflow_contract_bundle,
             ticketless_callback=ticketless_callback_payload,
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
-        )
-        _emit(
-            outcome,
             record_format=record_format,
-            command=record_command,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(
-                outcome, submit_intent=inp.submit_intent,
-                submit_delivery_id=inp.submit_delivery_id,
-            ),
-        )
-        _maybe_persist_delivery_record(
-            outcome,
-            persist_delivery=bool(inp.persist_delivery),
+            record_command=record_command,
             duplicate_lane_panes=duplicate_lane_panes,
-            record_format=record_format,
-        )
-        return 0
-
-    landing_timeout = float(inp.landing_timeout or 8.0)
-    landing_lines = max(read_lines, 200)
-    marker_observed = wait_for_text(target, marker, landing_lines, landing_timeout)
-
-    if not marker_observed and mode != MODE_QUEUE_ENTER:
-        run_tmux("send-keys", "-t", target, "C-u")
-        outcome = make_outcome(
-            status="blocked",
-            reason="marker_timeout",
-            receiver=receiver,
-            target=target,
-            anchor=anchor,
-            mode=mode,
-            kind=kind,
-            notification_marker=marker,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
-        )
-        _emit(
-            outcome,
-            record_format=record_format,
-            command=record_command,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(
-                outcome, submit_intent=inp.submit_intent,
-                submit_delivery_id=inp.submit_delivery_id,
-            ),
-        )
-        _emit_handoff_marker_timeout_guidance(receiver)
-        die(
-            "handoff marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
-            f"target={target} marker={marker}"
-        )
-        raise AssertionError("unreachable")
-
-    submit_delay = max(0.0, float(inp.submit_delay or 0.0))
-    if submit_delay:
-        time.sleep(submit_delay)
-
-    # Redmine #13166 / #13262: on the strict `--mode standard` rail, snapshot the
-    # receiver pane immediately before Enter so the post-Enter turn-start
-    # observation below has a pre-submit baseline. The marker was already observed
-    # (a marker miss died at `marker_timeout` above), so this baseline holds the
-    # marker+body sitting in the composer. #13166 gated this on codex only; #13262
-    # generalizes it to any `--mode standard` send (claude and codex) since the
-    # observation is receiver-agnostic. The queue-enter rail keeps its prior
-    # behavior untouched (its marker-unobserved path stays `sent` / `queue_enter`).
-    standard_rail = mode == MODE_STANDARD
-    turn_start_window = _resolve_turn_start_window(
-        inp.landing_timeout, landing_timeout
-    )
-    turn_start_baseline = (
-        capture_pane(target, landing_lines) if standard_rail else None
-    )
-
-    run_tmux("send-keys", "-t", target, "Enter")
-    enter_attempts = 1
-
-    # Enter-only retry (Redmine #12580 / #12581). Only the `queue-enter` rail,
-    # and only when the landing marker was not observed: a busy or redrawing
-    # Claude/Codex TUI can drop the first Enter even though the marker+body
-    # landed cleanly. Re-issue Enter — and ONLY Enter; the marker+body typed
-    # once above is never re-injected, and an empty Enter on an idle agent
-    # composer is a no-op, so the payload cannot be duplicated — on the policy
-    # interval until the marker is observed or the window elapses. The
-    # `standard` / `pending` rails never reach this branch, so their semantics
-    # are untouched. The 30s/2s defaults live behind
-    # `resolve_queue_enter_retry_policy` (the config boundary) and are
-    # overridable via `--queue-enter-retry-window` / `-interval`.
-    retry_policy = resolve_queue_enter_retry_policy(
-        inp.queue_enter_retry_window,
-        inp.queue_enter_retry_interval,
-    )
-    retry_engaged = (
-        mode == MODE_QUEUE_ENTER and not marker_observed and retry_policy.enabled
-    )
-    if retry_engaged:
-        for _ in range(retry_policy.max_retries):
-            if retry_policy.interval_seconds:
-                time.sleep(retry_policy.interval_seconds)
-            if _marker_visible_in(capture_pane(target, landing_lines), marker):
-                marker_observed = True
-                break
-            run_tmux("send-keys", "-t", target, "Enter")
-            enter_attempts += 1
-
-    # Redmine #13166 / #13262: standard-rail turn-start verification. Marker
-    # observed + Enter issued proves the sender pressed Enter, not that the receiver
-    # TUI submitted the prompt and started a turn — a busy / redrawing composer can
-    # absorb the Enter and leave the marker+body unsubmitted while the rail still
-    # reported `sent` / `ok` (the false-positive delivery this bug fixes). The rail
-    # now observes the receiver pane for post-Enter turn-start activity (read-only;
-    # no re-typed marker+body, no re-issued Enter, no auto-resend). #13166 ran this
-    # for codex only; #13262 generalizes it to any `--mode standard` send (claude
-    # and codex). The queue-enter rail is untouched: its marker-unobserved path
-    # stays `sent` / `queue_enter`, never blocking.
-    turn_start_lines = None
-    if standard_rail:
-        turn_start = _observe_standard_turn_start(
-            target,
-            baseline_capture=turn_start_baseline or "",
-            capture=capture_pane,
-            sleep=time.sleep,
-            window_seconds=turn_start_window,
-            lines=landing_lines,
-        )
-        turn_start_lines = _turn_start_record_lines(
-            turn_start, rail_label=f"{receiver} standard-rail"
-        )
-        if not turn_start.confirmed:
-            outcome = make_outcome(
-                status="blocked",
-                reason="turn_start_unconfirmed",
-                receiver=receiver,
-                target=target,
-                anchor=anchor,
-                mode=mode,
-                kind=kind,
-                notification_marker=marker,
-                execution_root=execution_root,
-                role_profile=role_profile_resolution,
-                transition_role=transition_role_boundary,
-                workflow_contract=workflow_contract_bundle,
-                ticketless_callback=ticketless_callback_payload,
-                ticketless_consultation=ticketless_consultation_payload,
-                ticketless_work_intake=ticketless_work_intake_payload,
-            )
-            _emit(
-                outcome,
-                record_format=record_format,
-                command=record_command,
-                duplicate_lane_panes=duplicate_lane_panes or None,
-                role_profile_contract=role_profile_contract,
-                submit_lines=_submit_lines_for(
-                outcome, submit_intent=inp.submit_intent,
-                submit_delivery_id=inp.submit_delivery_id,
-            ),
-                turn_start_lines=turn_start_lines,
-            )
-            die(
-                "handoff landing marker was observed and Enter was pressed, but the "
-                f"{receiver} receiver pane showed no turn-start activity within the "
-                "observation window; the Enter may have been absorbed by a busy / "
-                "redrawing composer. No C-u rollback and no re-send were issued (the "
-                "marker+body was typed once). Read the receiver to confirm whether "
-                "the turn started before re-issuing under --mode standard. "
-                f"target={target} marker={marker}"
-            )
-            raise AssertionError("unreachable")
-
-    # Redmine #13292: additive, telemetry-only queue-enter turn-start observation
-    # under the herdr backend (j#72602 decision 5's deferred follow-up, design
-    # confirmed #13292 j#72759). The queue-enter inject → Enter → Enter-only retry
-    # choreography above is left BYTE-IDENTICAL; only AFTER it, and only for a herdr
-    # send, do we take a read-only `agent get` runtime-state snapshot (#13246
-    # `read_agent_state`, borrowed from the already-resolved rail's reader — no
-    # second config read, no `drive_turn_start`, no injection ownership, no
-    # `precondition_not_idle` fail-close). The result is recorded as additive
-    # telemetry ONLY: it never changes `status` / `reason` / `next_action_owner`
-    # (they stay `sent` / `ok`|`queue_enter` / `receiver`) and never blocks the send
-    # — a read failure / `unknown` / `awaiting_input` all just record telemetry. It
-    # is kept structurally separate from the event rail's `turn_start_outcome` (a
-    # post-hoc snapshot does not prove causality like an armed `wait agent-status`
-    # transition). The tmux backend and every non-queue-enter rail are untouched
-    # (`queue_enter_observation` stays `None`).
-    queue_enter_observation = None
-    if herdr_send and mode == MODE_QUEUE_ENTER:
-        rail = active_herdr_turn_start_rail
-        if rail is not None:  # always installed under herdr; skip defensively if not
-            queue_enter_snapshot = _observe_queue_enter_turn_start(
-                target,
-                read=rail.reader.read_agent_state,
-                sleep=time.sleep,
-            )
-            queue_enter_observation = queue_enter_snapshot.to_telemetry_dict()
-            # Reuse the additive `turn_start_lines` record channel (appended, never
-            # overrides `next_action`); the queue-enter renderer labels itself
-            # telemetry-only and does not reuse the event rail's wording.
-            turn_start_lines = _queue_enter_turn_start_record_lines(queue_enter_snapshot)
-
-    # Wording-layer differentiation under the relaxed `queue-enter` rail:
-    # marker observed (possibly via the Enter-only retry above) → strict
-    # `sent`/`ok`; marker still unobserved → `sent`/`queue_enter` (sender did
-    # not pre-confirm landing). The receiver-side contract and
-    # `next_action_owner` stay identical to strict `sent` per the contract.
-    relaxed_unobserved = mode == MODE_QUEUE_ENTER and not marker_observed
-    outcome = make_outcome(
-        status="sent",
-        reason="queue_enter" if relaxed_unobserved else "ok",
-        receiver=receiver,
-        target=target,
-        anchor=anchor,
-        mode=mode,
-        kind=kind,
-        notification_marker=marker,
-        execution_root=execution_root,
-        role_profile=role_profile_resolution,
-        # Redmine #12706 carried the transition boundary on the pending /
-        # marker_timeout paths but dropped it on this successful-delivery path, so
-        # the durable record / JSON wire showed no boundary on a real send. Thread
-        # it here so the standard transition payload carries the boundary on the
-        # delivery that matters; #12700 adds the workflow-contract bundle alongside.
-        transition_role=transition_role_boundary,
-        workflow_contract=workflow_contract_bundle,
-        ticketless_callback=ticketless_callback_payload,
-        ticketless_consultation=ticketless_consultation_payload,
-        ticketless_work_intake=ticketless_work_intake_payload,
-        # Redmine #13292: additive, telemetry-only herdr queue-enter turn-start
-        # snapshot (`None` for tmux / non-queue-enter). Never influences the wire.
-        queue_enter_turn_start_observation=queue_enter_observation,
-    )
-    # Durable retry telemetry (policy + attempted count + interval) is recorded
-    # in the delivery record / narrative only when the Enter-only retry actually
-    # engaged. It is wording-layer only: it never reaches the wire enums or the
-    # inspector projection (`Status` / `reason` / `next_action_owner` are
-    # unchanged), matching the contract's strong boundary.
-    retry_record = (
-        QueueEnterRetryOutcome(
-            window_seconds=retry_policy.window_seconds,
-            interval_seconds=retry_policy.interval_seconds,
-            enter_attempts=enter_attempts,
-            marker_observed=marker_observed,
-        )
-        if retry_engaged
-        else None
-    )
-    # Redmine #12597: if standard_target_admission activated an inactive split
-    # and the policy asks to restore focus, re-select the previously-active pane
-    # after delivery. Pane selection only, best-effort (a vanished pane must not
-    # break the already-completed send), and the restore fact is recorded.
-    target_activation = _maybe_restore_previous_active(
-        target_activation,
-        restore_previous_active=admission_policy.restore_previous_active,
-    )
-    _emit(
-        outcome,
-        record_format=record_format,
-        command=record_command,
-        duplicate_lane_panes=duplicate_lane_panes or None,
-        role_profile_contract=role_profile_contract,
-        retry=retry_record,
-        activation=target_activation,
-        submit_lines=_submit_lines_for(
-            outcome, submit_intent=inp.submit_intent,
+            submit_intent=inp.submit_intent,
             submit_delivery_id=inp.submit_delivery_id,
+            persist_delivery=bool(inp.persist_delivery),
+            herdr_send=herdr_send,
+            read_lines=read_lines,
+            landing_timeout=inp.landing_timeout,
+            submit_delay=inp.submit_delay,
+            queue_enter_retry_window=inp.queue_enter_retry_window,
+            queue_enter_retry_interval=inp.queue_enter_retry_interval,
+            target_activation=target_activation,
+            restore_previous_active=admission_policy.restore_previous_active,
         ),
-        turn_start_lines=turn_start_lines,
+        emit=_emit,
     )
-    _maybe_persist_delivery_record(
-        outcome,
-        persist_delivery=bool(inp.persist_delivery),
-        duplicate_lane_panes=duplicate_lane_panes,
-        record_format=record_format,
-        retry=retry_record,
-        activation=target_activation,
-        turn_start_lines=turn_start_lines,
-    )
-    # Redmine #13300: persist the herdr queue-enter outcome to the #13296 ledger. This
-    # terminal block is shared with tmux, so the emission is guarded on `herdr_send`
-    # (tmux 経路不変); the Enter-only retry telemetry enriches the same entry.
-    if herdr_send:
-        _record_herdr_send_ledger(outcome, retry_outcome=retry_record)
-    return 0
 
 
 # ``CONSULT_DEFAULT_KIND`` and the four ``handoff`` command entry bodies moved to
