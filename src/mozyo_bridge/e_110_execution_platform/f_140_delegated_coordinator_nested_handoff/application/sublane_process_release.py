@@ -42,6 +42,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.lane_pin_role import (
+    resolve_declared_pin_pair,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     RELEASE_NOT_REQUESTED,
@@ -51,6 +54,8 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessGenerationPin,
+    ProcessPinError,
     ReleasePin,
     ReleasePinError,
 )
@@ -278,6 +283,193 @@ def pin_matched_close_plan(
     )
 
 
+def _live_provider(row: Mapping[str, object], decoded_provider: str) -> str:
+    """The provider a live row carries for the exact-generation match (Redmine #13811 F1).
+
+    The herdr row surfaces the bound provider two ways — its ``provider`` field and its
+    detected-agent field (``agent``, which on a live pane holds the provider id) — and
+    falls back to the name-encoded provider token when neither is surfaced (the #13846
+    slot-less-path shape ``... or norm(provider)``). ``decoded_provider`` is that token: in
+    the current gateway/peer topology the assigned name's role segment IS the provider
+    (``GATEWAY_ROLE='codex'`` / ``WORKER_ROLE='claude'``), so a decode gives an honest,
+    non-fabricated provider even when the live row omits the explicit field.
+    """
+    return (
+        _norm(row.get("provider"))
+        or _norm(row.get("agent"))
+        or _norm(decoded_provider)
+    )
+
+
+def declared_generation_exactly_live(
+    declared_pins: Sequence[ProcessGenerationPin],
+    rows: Sequence[Mapping[str, object]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+) -> bool:
+    """Does every LIVE managed slot of the lane exactly match its declared pin? (pure).
+
+    The project-gateway action-time exact-generation fence (Redmine #13811; design #13780
+    j#78386 §1-3): a process-only lifecycle action may release ONLY the lane's declared
+    generation, so a caller must prove the *current* live inventory carries that exact
+    generation before it releases anything.
+
+    **Match on the declared identity, not on a provider-as-slot alias (Redmine #13811 R4
+    F1).** A declared ``ProcessGenerationPin.role`` names a canonical SLOT (``gateway`` /
+    ``worker``, #13920) and its ``provider`` names the provider that fills it — the two are
+    independent (a **swapped** binding declares ``gateway`` filled by ``claude`` and
+    ``worker`` by ``codex``). A live herdr row's decoded ``identity.role`` is that provider
+    token, NOT a slot label — so it is NEVER re-mapped to a slot (that alias broke a valid
+    swapped binding). Instead each live row is matched to a declared pin by the strong
+    identity the row actually carries — its **assigned name** — and then the pin's
+    ``provider`` + ``locator`` (+ ``runtime_revision``, both-observed only) are verified via
+    :meth:`ProcessGenerationPin.binds_same_generation`. The declared set is first resolved
+    through :func:`resolve_declared_pin_pair`, so a foreign / mixed-vocabulary / duplicate /
+    incomplete declaration fails closed (never guessed past).
+
+    Any live row that is not exactly a declared pin — an **undeclared** assigned name, a
+    **wrong-provider** row (``pin.provider`` is a real match axis), a **recycled** locator, a
+    **raw-duplicate** assigned name (the same name in the inventory more than once, counted
+    BEFORE the locator / liveness filter so a locatorless or stale duplicate cannot slip past,
+    Redmine #13811 R4 F3 / ``herdr-native-identity.md`` §3.4), or an **ambiguous** one (one
+    name live at two locators) — is a newer / foreign generation the declared authority does
+    not name, and the action fails closed rather than close it (§2 "newer generation / stale
+    approval -> zero-actuation"). A declared slot that is simply **gone** (no live row) needs
+    no close and does not block (the 0/1/2-slot / dead-process case).
+
+    ``runtime_revision`` is supplementary evidence, not identity (#13810 R4-F1 / #13846):
+    the herdr process-generation discriminant is the **live locator**, and the startup
+    self-attestation store records NO runtime version, so a live row surfaces an empty
+    revision. :meth:`~ProcessGenerationPin.binds_same_generation` therefore treats revision
+    as a discriminant ONLY when BOTH sides observe it (a re-launched newer runtime), and a
+    declared-non-empty / live-unobserved pairing is not a mismatch — matching the
+    action-time generation contract in ``managed-state-model.md`` (``runtime_revision`` is
+    非 discriminant when either side is empty). A caller wanting a strict revision fence
+    would re-introduce the #13846 false conflict.
+    """
+    # Resolve the declared set (foreign role / mixed-vocabulary / duplicate slot / half pair
+    # all fail closed, #13920), then key the declared pins by their assigned NAME — the strong
+    # identity a live row carries. Two declared slots sharing one assigned name (a degenerate
+    # same-name pair) is itself ambiguous and fails closed.
+    pair = resolve_declared_pin_pair(declared_pins)
+    if not pair.ok:
+        return False
+    declared_by_name: dict[str, ProcessGenerationPin] = {}
+    for pin in (pair.gateway, pair.worker):
+        name = _norm(pin.assigned_name)
+        if name in declared_by_name:
+            return False
+        declared_by_name[name] = pin
+
+    want_ws = _norm(workspace_id)
+    want_lane = _norm_lane(lane_id)
+    # Pass over the raw inventory. RAW assigned-name multiplicity is counted for every
+    # in-scope managed candidate BEFORE the locator / liveness filter (Redmine #13811 R4 F3):
+    # a locatorless or stale duplicate of a live name is a herdr name-uniqueness violation the
+    # dedupe below would otherwise hide. Only locator-bearing rows become match candidates.
+    raw_name_count: dict[str, int] = {}
+    live_by_name: dict[str, set[tuple[str, str, str]]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        identity = decode.identity
+        if identity.workspace_id != want_ws or _norm_lane(identity.lane_id) != want_lane:
+            continue
+        assigned_name = _norm(row.get(AGENT_KEY_NAME))
+        if not assigned_name:
+            continue
+        raw_name_count[assigned_name] = raw_name_count.get(assigned_name, 0) + 1
+        locator = _agent_locator(row)
+        if not locator:
+            continue
+        # ``runtime_revision`` is empty for a normal herdr row (no live observation surface,
+        # #13810 R4-F1); a richer surface that DOES carry it enters the both-observed match.
+        live_by_name.setdefault(assigned_name, set()).add(
+            (
+                locator,
+                _live_provider(row, identity.role),
+                _norm(row.get("runtime_revision")),
+            )
+        )
+    if any(count > 1 for count in raw_name_count.values()):
+        # A raw duplicate assigned name (exact, locatorless, or stale) — fail closed.
+        return False
+
+    for assigned_name, live in live_by_name.items():
+        if len(live) != 1:
+            # This name is live at more than one distinct observation — an ambiguous
+            # inventory. Fail closed rather than guess the declared process.
+            return False
+        (locator, provider, runtime_revision) = next(iter(live))
+        declared = declared_by_name.get(assigned_name)
+        if declared is None:
+            # A live managed row the declaration never named — a newer / foreign generation.
+            # Fail closed.
+            return False
+        try:
+            # Compare on the declared pin's own slot label (so ``role`` is trivially equal and
+            # the discriminants are provider / locator / revision) — the live provider token is
+            # never re-mapped to a slot.
+            live_pin = ProcessGenerationPin(
+                role=declared.role,
+                provider=provider,
+                assigned_name=assigned_name,
+                locator=locator,
+                runtime_revision=runtime_revision,
+            )
+        except ProcessPinError:
+            # A pin that cannot form an identity is anomalous — fail closed.
+            return False
+        if not declared.binds_same_generation(live_pin):
+            # A live row that is not the declared generation (wrong provider / recycled
+            # locator / both-observed-revision drift): fail closed.
+            return False
+    return True
+
+
+def declared_generation_attested(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    lane: str,
+    read_attestation: Callable[[str], Optional[IdentityAttestationRecord]],
+) -> bool:
+    """Is every LIVE managed slot generation-matched startup-attested? (pure, fail-closed).
+
+    The project-gateway action-time attestation gate (Redmine #13811 R1 F1 item 4; design
+    #13780 j#78386 §2 "startup self-attestation を action-time 再読 ... unattested ->
+    zero-actuation"). A release closes the lane's CURRENT live slots, so before any mutation
+    each live target must carry a #13637 startup self-attestation that is generation-matched
+    to its **live locator** (:func:`evaluate_attestation`). A missing / stale (locator-drift)
+    / conflict / unreadable attestation on any live slot fails the gate (pre-CAS
+    zero-write / zero-close): an optional ``attested_at`` declaration snapshot is not an
+    action-time attestation, so this re-reads the store now rather than trusting the pin.
+
+    An empty live inventory (nothing to close) is vacuously attested — there is no target
+    to actuate. ``read_attestation`` raising (an unreadable store) is folded to a non-match
+    for that slot (fail closed), never mistaken for "attested".
+    """
+    slots = unit_slots(rows, workspace_id, lane)
+    for role, (assigned_name, locator) in slots.items():
+        try:
+            record = read_attestation(assigned_name)
+        except Exception:  # noqa: BLE001 — attestation unreadable -> fail closed (NOT attested)
+            return False
+        join = evaluate_attestation(
+            record,
+            live_locator=locator,
+            expected_workspace_id=workspace_id,
+            expected_role=role,
+            expected_lane=lane,
+        )
+        if not join.ok:
+            return False
+    return True
+
+
 def release_pins(
     rows: Sequence[Mapping[str, object]], workspace_id: str, lane: str
 ) -> list[ReleasePin]:
@@ -439,6 +631,8 @@ def drive_process_release(
 __all__ = (
     "ReleaseOutcome",
     "SublaneReleaseOps",
+    "declared_generation_attested",
+    "declared_generation_exactly_live",
     "drive_process_release",
     "evaluate_pair_attestation",
     "pin_matched_close_plan",

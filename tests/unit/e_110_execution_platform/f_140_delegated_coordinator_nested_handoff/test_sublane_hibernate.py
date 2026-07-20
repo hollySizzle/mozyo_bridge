@@ -20,7 +20,14 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    VERDICT_PRESENT,
+    IdentityAttestationRecord,
+)
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+from mozyo_bridge.core.state.lane_pin_role import PIN_ROLE_GATEWAY, PIN_ROLE_WORKER
 from mozyo_bridge.core.state.lane_lifecycle import (
+    BINDING_KIND_PROJECT_GATEWAY,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     RELEASE_NOT_REQUESTED,
@@ -29,6 +36,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessGenerationPin,
     load_lane_lifecycle_readonly,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
@@ -42,7 +50,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_ORIGINAL_IDENTITY,
     BLOCK_OWNER_PENDING,
     BLOCK_PENDING_PROMPT,
+    BLOCK_PROJECT_GENERATION_MISMATCH,
+    BLOCK_PROJECT_UNATTESTED,
     BLOCK_REVIEW_PENDING,
+    BLOCK_STALE_ACTION_GENERATION,
+    BLOCK_STALE_ACTION_IDENTITY,
+    BLOCK_STALE_ACTION_REVISION,
     BLOCK_UNPUSHED_COMMITS,
     BLOCK_UNRECORDED_BOUNDARY,
     BLOCK_WORKING,
@@ -52,6 +65,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HibernateRequest,
     LiveSublaneHibernateOps,
     SublaneHibernateUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
     cmd_sublane_hibernate,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -88,10 +103,11 @@ def _all_gates(**overrides) -> HibernateAssertions:
 class _FakeOps:
     """Fake hibernate IO port: canned workspace / inventory (rows + readability) / close."""
 
-    def __init__(self, *, rows, close_result=None, readable=True):
+    def __init__(self, *, rows, close_result=None, readable=True, attestations=None):
         self._rows = list(rows)
         self._readable = readable
         self._close_result = close_result
+        self._attestations = dict(attestations or {})
         self.close_calls: list = []
 
     def workspace_id(self) -> str:
@@ -99,6 +115,9 @@ class _FakeOps:
 
     def read_inventory(self):
         return list(self._rows), self._readable
+
+    def read_attestation(self, assigned_name):
+        return self._attestations.get(assigned_name)
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
@@ -739,6 +758,462 @@ class SublaneEarlyHibernateTest(unittest.TestCase):
             )
             self.assertFalse(outcome.is_blocked)
             self.assertEqual(outcome.preflight.park_basis, PARK_BASIS_DEPENDENCY)
+
+
+# ---------------------------------------------------------------------------
+# Project-gateway lane hibernate (Redmine #13811 R1 F1 — action-time exact-generation).
+# ---------------------------------------------------------------------------
+
+PG_LANE = "pgwv1_scope_abc"
+PG_SCOPE = "workspace/full/project/scope"
+PG_GW_NAME = encode_assigned_name(WS, "codex", PG_LANE)
+PG_WK_NAME = encode_assigned_name(WS, "claude", PG_LANE)
+PG_GW_LOC = f"{WS}:p2"
+PG_WK_LOC = f"{WS}:p3"
+
+
+def _pg_attestations(gw_loc=PG_GW_LOC, wk_loc=PG_WK_LOC):
+    return {
+        PG_GW_NAME: IdentityAttestationRecord(
+            assigned_name=PG_GW_NAME,
+            workspace_id=WS,
+            role="codex",
+            lane_id=PG_LANE,
+            locator=gw_loc,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-07-20T00:00:00Z",
+        ),
+        PG_WK_NAME: IdentityAttestationRecord(
+            assigned_name=PG_WK_NAME,
+            workspace_id=WS,
+            role="claude",
+            lane_id=PG_LANE,
+            locator=wk_loc,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-07-20T00:00:00Z",
+        ),
+    }
+
+
+class SublaneProjectGatewayHibernateTest(unittest.TestCase):
+    """The project-gateway binding path: the three action-time fences (F1 items 1-4)."""
+
+    def _store(self, tmp) -> LaneLifecycleStore:
+        return LaneLifecycleStore(home=Path(tmp))
+
+    def _declare_pg(self, tmp, *, roles=(PIN_ROLE_GATEWAY, PIN_ROLE_WORKER)) -> None:
+        # Declare a project-gateway lane (binding_kind=project_gateway, empty issue) with its
+        # provider-bound declared slot set at generation 1. Default uses the CANONICAL slot
+        # roles (gateway/worker) the CURRENT writer emits — the live pair decodes to the
+        # provider roles (codex/claude), so this is the Redmine #13811 R2 F1 integration
+        # regression (a healthy canonical declaration MUST still hibernate).
+        gw_role, wk_role = roles
+        decl = LaneDeclarationStore(home=Path(tmp))
+        decl.declare_lane(
+            LaneLifecycleKey(WS, PG_LANE),
+            decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+            binding_kind=BINDING_KIND_PROJECT_GATEWAY,
+            project_scope=PG_SCOPE,
+            declared_slots=(
+                ProcessGenerationPin(
+                    role=gw_role, provider="codex", assigned_name=PG_GW_NAME, locator=PG_GW_LOC
+                ),
+                ProcessGenerationPin(
+                    role=wk_role, provider="claude", assigned_name=PG_WK_NAME, locator=PG_WK_LOC
+                ),
+            ),
+        )
+
+    def _rows(self, gw_loc=PG_GW_LOC, wk_loc=PG_WK_LOC, **gw_extra):
+        gw = {"name": PG_GW_NAME, "pane_id": gw_loc}
+        gw.update(gw_extra)
+        return [gw, {"name": PG_WK_NAME, "pane_id": wk_loc}]
+
+    def _ops(self, *, rows=None, attestations=None, readable=True):
+        return _FakeOps(
+            rows=self._rows() if rows is None else rows,
+            attestations=_pg_attestations() if attestations is None else attestations,
+            readable=readable,
+        )
+
+    def _request(
+        self, *, project_scope=PG_SCOPE, expected_lane_generation="1", expected_revision="1"
+    ):
+        return HibernateRequest(
+            issue=ISSUE,
+            lane=PG_LANE,
+            journal=JOURNAL,
+            project_scope=project_scope,
+            expected_lane_generation=expected_lane_generation,
+            expected_revision=expected_revision,
+            assertions=_all_gates(),
+        )
+
+    def test_happy_path_hibernates_project_gateway_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            outcome = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.executed)
+            self.assertEqual(outcome.project_scope, PG_SCOPE)
+            self.assertTrue(outcome.preflight.project_generation_matched)
+            self.assertTrue(outcome.preflight.project_attestation_ok)
+            self.assertTrue(outcome.preflight.action_generation_current)
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+
+    def test_missing_expected_generation_blocks_zero_mutation(self) -> None:
+        # An approval that does not assert its approved generation cannot actuate (F1 item 3).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(expected_lane_generation=""), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_STALE_ACTION_GENERATION, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_stale_generation_approval_blocks(self) -> None:
+        # The approval asserts a superseded generation (the row is at 1, approval names 0).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(expected_lane_generation="0"), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_STALE_ACTION_GENERATION, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_provider_rebind_blocks_zero_mutation(self) -> None:
+        # The live codex pane surfaces a different provider than the declared pin (F1 item 1).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops(rows=self._rows(provider="rebound"))
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_PROJECT_GENERATION_MISMATCH, outcome.preflight.blocked_reasons
+            )
+            self.assertEqual(ops.close_calls, [])
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_recycled_locator_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops(
+                rows=self._rows(gw_loc=f"{WS}:p99"),
+                attestations=_pg_attestations(gw_loc=f"{WS}:p99"),
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_PROJECT_GENERATION_MISMATCH, outcome.preflight.blocked_reasons
+            )
+            self.assertEqual(ops.close_calls, [])
+
+    def test_missing_attestation_blocks_zero_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            # Only the worker is attested; the gateway slot is unattested.
+            atts = _pg_attestations()
+            del atts[PG_GW_NAME]
+            ops = self._ops(attestations=atts)
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_PROJECT_UNATTESTED, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_stale_attestation_locator_drift_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            # Live locator is PG_GW_LOC but the attestation pins an older locator.
+            ops = self._ops(attestations=_pg_attestations(gw_loc=f"{WS}:pOLD"))
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_PROJECT_UNATTESTED, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_wrong_scope_is_not_this_lane(self) -> None:
+        # A caller naming a different scope does not match this project lane's binding.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(project_scope="workspace/other/scope"), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_ORIGINAL_IDENTITY, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_declared_runtime_revision_live_unobserved_still_hibernates(self) -> None:
+        # 正本 lenient revision: a declared non-empty runtime_revision with an unobserved live
+        # revision is NOT a mismatch (would-be F1.2 strict fail-closed is superseded by the
+        # documented action-time contract / #13846 false-conflict fix).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            decl = LaneDeclarationStore(home=Path(tmp))
+            decl.declare_lane(
+                LaneLifecycleKey(WS, PG_LANE),
+                decision=DecisionPointer(
+                    source="redmine", issue_id=ISSUE, journal_id=JOURNAL
+                ),
+                binding_kind=BINDING_KIND_PROJECT_GATEWAY,
+                project_scope=PG_SCOPE,
+                declared_slots=(
+                    ProcessGenerationPin(
+                        role="codex",
+                        provider="codex",
+                        assigned_name=PG_GW_NAME,
+                        locator=PG_GW_LOC,
+                        runtime_revision="runtime-v2",
+                    ),
+                    ProcessGenerationPin(
+                        role="claude",
+                        provider="claude",
+                        assigned_name=PG_WK_NAME,
+                        locator=PG_WK_LOC,
+                    ),
+                ),
+            )
+            outcome = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.executed)
+
+    def test_legacy_role_declaration_read_compatible_hibernates(self) -> None:
+        # A pre-#13920 legacy (codex/claude) declared-slot set still resolves to the same
+        # canonical slots as the live pair — read-compatible, no regression (Redmine #13811
+        # R2 F1: canonical is the primary shape, legacy stays readable).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp, roles=("codex", "claude"))
+            outcome = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.executed)
+
+    def test_missing_expected_revision_blocks_zero_mutation(self) -> None:
+        # Redmine #13811 R2 F2: a project-gateway hibernate that does not assert the approved
+        # revision cannot actuate (the fresh CAS has no approved authority to bind to).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(expected_revision=""), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_STALE_ACTION_REVISION, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_same_generation_revision_drift_blocks_zero_mutation(self) -> None:
+        # Redmine #13811 R2 F2: the approval asserts an OLDER revision than the row's current
+        # revision — the process authority advanced within the same generation (pin repair /
+        # replacement / decision update) since the approval. The stale approval fails closed
+        # pre-CAS; it never re-binds to the current revision / pins, and the CAS is bound to
+        # the approved revision so even the atomic commit would refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)  # declared at generation 1, revision 1
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                self._request(expected_revision="0"), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_STALE_ACTION_REVISION, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+            self.assertEqual(rec.revision, 1)
+
+    def test_correct_revision_and_generation_hibernates(self) -> None:
+        # Positive control: the approved (generation=1, revision=1) exactly names the current
+        # row, so the fresh CAS binds and the lane hibernates.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            outcome = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(expected_lane_generation="1", expected_revision="1"),
+                execute=True,
+            )
+            self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.preflight.action_revision_current)
+            rec = store.get(LaneLifecycleKey(WS, PG_LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+
+    def test_already_hibernated_redrive_not_blocked_by_advanced_revision(self) -> None:
+        # Redmine #13811 R2 F2 boundary: the fresh hibernate bumps the row's revision (1->2),
+        # so the approval's revision (1) is now older than the current row. The redrive must
+        # NOT re-apply the revision fence (it resumes the STORED release action id / pins, the
+        # immutable authority) — otherwise every project-gateway redrive would falsely block.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            first = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(), execute=True
+            )
+            self.assertFalse(first.is_blocked, first.preflight.blocked_reasons)
+            # The hibernate CAS + release open + release-outcome each bump the revision, so it
+            # is now well past the approval's revision (1) — the redrive must still resume.
+            self.assertGreater(store.get(LaneLifecycleKey(WS, PG_LANE)).revision, 1)
+            # Re-run the SAME approval (expected_revision=1) against the now-hibernated row.
+            redrive = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(expected_revision="1"), execute=True
+            )
+            self.assertTrue(redrive.already_hibernated)
+            self.assertFalse(redrive.redrive_blocked, redrive.preflight.blocked_reasons)
+            self.assertNotIn(
+                BLOCK_STALE_ACTION_REVISION, redrive.preflight.blocked_reasons
+            )
+
+    def test_stale_cross_cycle_approval_cannot_redrive(self) -> None:
+        # Redmine #13811 R4 F2: a DIFFERENT hibernate cycle's approval (a different journal)
+        # must not redrive THIS cycle's stored release. Cycle B hibernates under JOURNAL and
+        # opens release action id `hibernate:<lane>:<JOURNAL>`. A stale cycle-A approval (a
+        # different journal) then targets the already-hibernated row — its journal-scoped
+        # action id differs from the stored release, so the redrive fails closed zero-close.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            first = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(), execute=True
+            )
+            self.assertFalse(first.is_blocked, first.preflight.blocked_reasons)
+            other = HibernateRequest(
+                issue=ISSUE,
+                lane=PG_LANE,
+                journal="90001",  # a DIFFERENT approval / cycle
+                project_scope=PG_SCOPE,
+                expected_lane_generation="1",
+                expected_revision="1",
+                assertions=_all_gates(),
+            )
+            ops = self._ops()
+            redrive = SublaneHibernateUseCase(ops=ops, store=store).run(
+                other, execute=True
+            )
+            self.assertTrue(redrive.already_hibernated)
+            self.assertTrue(redrive.redrive_blocked)
+            self.assertIn(
+                BLOCK_STALE_ACTION_IDENTITY, redrive.preflight.blocked_reasons
+            )
+            self.assertEqual(ops.close_calls, [])
+
+    def _hibernate_cas_only(self, store, journal) -> None:
+        # Reproduce the R5 crash window: the `active -> hibernated` CAS lands (storing THIS
+        # cycle's decision) but a crash precedes the release open, so `release_action_id` is
+        # empty. Declaration is done by the caller.
+        store.transition_disposition(
+            LaneLifecycleKey(WS, PG_LANE),
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id=journal
+            ),
+        )
+
+    def test_crash_window_old_journal_cannot_hijack(self) -> None:
+        # Redmine #13811 R5: the row is hibernated by cycle B (journal 90002) with the release
+        # NOT yet opened (release_action_id == ""). A stale cycle-A approval (journal 77485)
+        # must NOT be treated as current just because the action id is empty — the row carries
+        # cycle B's durable decision, so the old approval is fenced out (zero-close).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            self._hibernate_cas_only(store, "90002")
+            self.assertEqual(store.get(LaneLifecycleKey(WS, PG_LANE)).release_action_id, "")
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                HibernateRequest(
+                    issue=ISSUE,
+                    lane=PG_LANE,
+                    journal="77485",  # a DIFFERENT (older) cycle's approval
+                    project_scope=PG_SCOPE,
+                    expected_lane_generation="1",
+                    expected_revision="2",
+                    assertions=_all_gates(),
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.already_hibernated)
+            self.assertTrue(outcome.redrive_blocked)
+            self.assertFalse(outcome.preflight.action_identity_current)
+            self.assertIn(
+                BLOCK_STALE_ACTION_IDENTITY, outcome.preflight.blocked_reasons
+            )
+            self.assertEqual(ops.close_calls, [])
+
+    def test_crash_window_same_journal_recovery_resumes(self) -> None:
+        # The SAME cycle's approval (journal 90002) recovering the crash window IS current —
+        # the row's stored decision matches, so the release is opened / driven now.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            self._hibernate_cas_only(store, "90002")
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                HibernateRequest(
+                    issue=ISSUE,
+                    lane=PG_LANE,
+                    journal="90002",  # the SAME cycle's approval
+                    project_scope=PG_SCOPE,
+                    expected_lane_generation="1",
+                    expected_revision="2",
+                    assertions=_all_gates(),
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.already_hibernated)
+            self.assertFalse(outcome.redrive_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.preflight.action_identity_current)
+            self.assertEqual(len(ops.close_calls), 1)
+
+    def test_issue_request_does_not_match_project_lane(self) -> None:
+        # An issue-binding request (no project_scope) never matches a project-gateway row —
+        # its empty issue_id != ISSUE — so the project lane is not hibernated by an issue call.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                HibernateRequest(
+                    issue=ISSUE, lane=PG_LANE, journal=JOURNAL, assertions=_all_gates()
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_ORIGINAL_IDENTITY, outcome.preflight.blocked_reasons)
+            self.assertEqual(ops.close_calls, [])
 
 
 if __name__ == "__main__":
