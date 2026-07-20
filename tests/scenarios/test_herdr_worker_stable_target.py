@@ -266,22 +266,31 @@ class StableWorkerTargetScenario(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp_ctx.cleanup()
 
-    def test_unpinned_dispatch_false_positive_acks_on_the_wrong_lane(self) -> None:
-        # Bug #13486: with no `--target-lane`, the herdr rail derives the sender's
-        # (default) lane and resolves the coordinator's own default-lane claude — the
-        # send delivery-ACKs (exit 0) on that WRONG agent while the real LANE worker is
-        # never touched (idle). This is the ACK↔turn-start divergence (#13483).
+    def test_unpinned_dispatch_with_explicit_target_now_fails_closed(self) -> None:
+        # Bug #13486 was: with no `--target-lane`, the herdr rail derives the sender's
+        # (default) lane and resolves the coordinator's own default-lane claude, and the
+        # unpinned dispatch — which still passes the worker's own `--target <locator>` —
+        # delivery-ACKed (exit 0) on that WRONG agent while the real LANE worker stayed idle
+        # (the ACK↔turn-start divergence #13483). #13488 worked around it by pinning the
+        # lane; Redmine #13884 fixes it at the RAIL: the explicit `--target <worker-locator>`
+        # (in LANE) now MISMATCHES the derived route (the default-lane peer), so the rail
+        # fails closed instead of false-positive-ACKing on the wrong agent. No `--target-lane`
+        # + an explicit target that names a different lane is exactly the #13884 sender-echo
+        # shape, and the unsafe unpinned dispatch is now REFUSED rather than silently misrouted.
         rc, out, err = self.world.drive_unpinned()
-        self.assertEqual(rc, 0, msg=f"the misrouted send still ACKs\nout={out}\nerr={err}")
-        # The delivery landed on the default-lane peer, NOT the target sublane worker.
-        self.assertTrue(
+        self.assertNotEqual(
+            rc, 0, msg=f"the unpinned mismatch must fail closed, not ACK\nout={out}\nerr={err}"
+        )
+        # Zero-send: neither the (wrong) default-lane peer nor the LANE worker is touched.
+        self.assertEqual(
             self.world.injections_to(self.world.default_locator),
-            msg=f"expected the misroute onto the default-lane claude; calls={self.world.fake.calls}",
+            [],
+            msg=f"the misroute onto the default-lane claude must be refused; calls={self.world.fake.calls}",
         )
         self.assertEqual(
             self.world.injections_to(self.world.worker_locator),
             [],
-            msg="the real lane worker must have received nothing (idle) — the bug",
+            msg="nothing is sent anywhere on a fail-closed mismatch (zero-send)",
         )
 
     def test_pinned_dispatch_resolves_the_stable_lane_worker(self) -> None:
