@@ -251,6 +251,16 @@ class _Herdr:
         self.workspace_creates: list = []
         self.tab_creates: list = []
         self.pane_closes: list = []
+        # Redmine #14139: the shared-coordinators label authority (`workspace list`).
+        # `{herdr_workspace_id: label}` the fake reports; a `workspace create --label`
+        # records the created workspace's label here so a later `workspace list`
+        # reflects it. `None` forces an unparseable payload (labels-unreadable path).
+        self.workspace_labels: dict = {}
+        self.workspace_list_unreadable = False
+        # `workspace list` exits non-zero (a mechanical command failure) so `_invoke`
+        # fails closed — used to prove an own-pin heal never depends on it (#14139 F2).
+        self.workspace_list_fails = False
+        self.workspace_lists: list = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
@@ -292,9 +302,37 @@ class _Herdr:
                 stdout=json.dumps({"agents": self.existing_rows + self.started_rows}),
                 stderr="",
             )
+        if rest[:2] == ["workspace", "list"]:
+            self.workspace_lists.append(rest)
+            if self.workspace_list_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="workspace list refused"
+                )
+            if self.workspace_list_unreadable:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="not json", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "workspace_list",
+                            "workspaces": [
+                                {"workspace_id": wid, "label": label}
+                                for wid, label in sorted(self.workspace_labels.items())
+                            ],
+                        }
+                    }
+                ),
+                stderr="",
+            )
         if rest[:2] == ["workspace", "create"]:
             self.workspace_creates.append(rest)
             wid = self.created_workspace
+            if "--label" in rest:
+                self.workspace_labels[wid] = rest[rest.index("--label") + 1]
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -468,6 +506,7 @@ class _SessionStartHarness:
         extra_env=None,
         claude_permission_mode_default=None,
         agent_launch=None,
+        coordinator_placement_mode="per_project_space",
     ):
         # `exist_ok`: a scenario may drive TWO runs through one tmp (Redmine #13948 pins
         # that a re-run of the same command in the same lane is a NEW action), and the
@@ -501,6 +540,7 @@ class _SessionStartHarness:
                 dry_run=dry_run,
                 claude_permission_mode_default=claude_permission_mode_default,
                 agent_launch=agent_launch,
+                coordinator_placement_mode=coordinator_placement_mode,
                 probe=_FAST_PROBE,
             )
             anchor = read_anchor(repo)
@@ -1728,6 +1768,409 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         create = herdr.workspace_creates[0]
         self.assertNotIn("--label", create)
+
+    def test_shared_space_default_lane_creates_labelled_coordinators_workspace(self) -> None:
+        # Redmine #14139 shared_space: the coordinator pair (default lane) mints ONE
+        # stable shared coordinators workspace, labelled `coordinators` (cosmetic,
+        # operator-readable) — distinct from the per-project (unlabelled) default.
+        herdr = _Herdr(created_workspace="wS")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        create = herdr.workspace_creates[0]
+        self.assertIn("--label", create)
+        self.assertEqual(create[create.index("--label") + 1], "coordinators")
+
+    def test_per_project_default_lane_is_byte_invariant_under_explicit_mode(self) -> None:
+        # Passing the explicit default mode is byte-for-byte the pre-#14139 launch:
+        # the coordinator pair's project workspace is created with no label.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="",
+                coordinator_placement_mode="per_project_space",
+            )
+        self.assertNotIn("--label", herdr.workspace_creates[0])
+
+    def test_shared_space_leaves_sublane_placement_unchanged(self) -> None:
+        # shared_space only diverges the DEFAULT lane; a sublane launch under the same
+        # mode keeps the #13380 host label (`<project>_sublanes`), never `coordinators`.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, repo = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="lane-1",
+                coordinator_placement_mode="shared_space",
+            )
+        create = herdr.workspace_creates[0]
+        self.assertEqual(create[create.index("--label") + 1], f"{repo.name}_sublanes")
+
+    def test_shared_space_reads_workspace_labels_and_per_project_does_not(self) -> None:
+        # Redmine #14139 F1: the shared path consults `workspace list` (the label
+        # authority); per_project issues no such call (byte-invariant).
+        shared = _Herdr(created_workspace="wS")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, providers=["claude", "codex"], herdr=shared, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertTrue(shared.workspace_lists, "shared_space must read workspace labels")
+
+        per_project = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, providers=["claude", "codex"], herdr=per_project, lane="",
+                coordinator_placement_mode="per_project_space",
+            )
+        self.assertEqual(
+            per_project.workspace_lists, [], "per_project must not read workspace labels"
+        )
+
+    def test_shared_space_fails_closed_on_unlabelled_foreign_pair(self) -> None:
+        # The R1 defect fix: a live foreign per-project coordinator pair in an
+        # UNLABELLED workspace must not be adopted as the shared space — fail closed
+        # with zero workspace create.
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(created_workspace="wS", existing_rows=foreign)
+        # w5 is present but unlabelled (not "coordinators").
+        herdr.workspace_labels = {"w5": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_shared_space_adopts_existing_labelled_space(self) -> None:
+        # Idempotent adopt: a foreign coordinator pair in a `coordinators`-labelled
+        # workspace IS the shared space — join it, create nothing.
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(existing_rows=foreign)
+        herdr.workspace_labels = {"w5": "coordinators"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertEqual(herdr.workspace_creates, [], "must adopt, not create")
+        self.assertEqual(result.herdr_workspace_id, "w5")
+
+    def test_shared_space_adopt_appends_without_relayout(self) -> None:
+        # Redmine #14139 F2 / Design Answer j#83385 Decision 2: adopting an existing
+        # labelled shared space APPENDS this project's column and NEVER reorders /
+        # moves / swaps the existing columns (no live relayout). Existing foreign
+        # panes are neither closed nor moved.
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(existing_rows=foreign)
+        herdr.workspace_labels = {"w5": "coordinators"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "w5")
+        self.assertEqual(herdr.workspace_creates, [])
+        # Tail-append: this project's pair launches INTO the adopted space w5.
+        self.assertTrue(herdr.start_argvs, "the new coordinator pair must launch")
+        for start in herdr.start_argvs:
+            self.assertIn("w5", start, msg=f"launch must target adopted w5: {start}")
+        # No live relayout: never a pane move / swap / reorder, and the existing
+        # foreign panes are never closed.
+        reorder_verbs = {("pane", "move"), ("pane", "swap"), ("agent", "move")}
+        for call in herdr.calls:
+            self.assertNotIn(tuple(call[:2]), reorder_verbs, msg=f"unexpected relayout: {call}")
+        closed_tokens = {tok for call in herdr.pane_closes for tok in call}
+        self.assertNotIn("w5:p1", closed_tokens)
+        self.assertNotIn("w5:p2", closed_tokens)
+
+    def test_shared_space_own_pin_heal_does_not_read_workspace_list(self) -> None:
+        # Redmine #14139 R4 review j#83473 F2: an own-pin heal rejoins its own live
+        # space by identity and MUST NOT depend on the `workspace list` command. Here
+        # this project's own coordinator (claude) is already live and codex heals; the
+        # `workspace list` command is rigged to FAIL, yet the launch succeeds because
+        # the own pin is resolved before (and instead of) any label read.
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                existing = [
+                    {"name": encode_assigned_name(ws, "claude", ""), "pane_id": "w3:pC"}
+                ]
+                herdr = _Herdr(existing_rows=existing)
+                herdr.workspace_list_fails = True  # would raise IF a label read happened
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude", "codex"],
+                    lane_id="",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    coordinator_placement_mode="shared_space",
+                    attestation_reader=_present_attestation_reader(
+                        ws, "claude", "", "w3:pC"
+                    ),
+                    probe=_FAST_PROBE,
+                )
+        # The own pin (w3) was resolved WITHOUT any `workspace list` call, so the
+        # rigged failure never fired; codex healed into the own space, no create.
+        self.assertEqual(herdr.workspace_lists, [])
+        self.assertEqual(result.herdr_workspace_id, "w3")
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_shared_space_no_own_pin_with_workspace_list_failure_fails_closed(self) -> None:
+        # The other half: with NO own pin (only a foreign pair), the label read is
+        # required — and a `workspace list` command failure fails closed with zero
+        # workspace create (never a guessed shared space).
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(created_workspace="wS", existing_rows=foreign)
+        herdr.workspace_list_fails = True
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_shared_space_partial_failure_husk_is_adopted_not_duplicated(self) -> None:
+        # Redmine #14139 R5 review j#83516 F1: a create that succeeds then whose
+        # agent-start FAILS leaves a labelled `coordinators` husk. A retry must ADOPT
+        # that husk (its label is the authority) and NOT mint a second shared space.
+        # Step 1: a launch whose agent-start fails leaves the labelled husk.
+        run1 = _Herdr(created_workspace="wZ", start_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=run1, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        # The workspace was created and carries the shared label, but holds no agents.
+        self.assertEqual(run1.workspace_labels, {"wZ": "coordinators"})
+        self.assertEqual(len(run1.workspace_creates), 1)
+
+        # Step 2: the retry sees the labelled husk (no live slots) and adopts it —
+        # zero new workspace create.
+        run2 = _Herdr(created_workspace="wZ2")
+        run2.workspace_labels = dict(run1.workspace_labels)  # persistent herdr backend
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=run2, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "wZ")
+        self.assertEqual(run2.workspace_creates, [], "retry must adopt the husk, not create")
+
+    def test_shared_space_lock_failure_converts_to_session_start_error(self) -> None:
+        # Redmine #14139 R6 review j#83569 F2: a single-flight lock failure must fail
+        # closed through the session-start typed error boundary (HerdrSessionStartError),
+        # with zero herdr actuation — not a raw fence exception / traceback at the CLI.
+        import contextlib
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateLockUnavailable,
+        )
+
+        @contextlib.contextmanager
+        def _unavailable(home):
+            raise CoordinatorSharedCreateLockUnavailable("lock unavailable (simulated)")
+            yield  # pragma: no cover
+
+        herdr = _Herdr(created_workspace="wS")
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(lock_path, _unavailable):
+                with self.assertRaises(HerdrSessionStartError):
+                    self._prepare(
+                        tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                        coordinator_placement_mode="shared_space",
+                    )
+        # Zero actuation: the lock fails before any workspace / agent is created.
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def test_shared_space_release_failure_after_create_reports_husk_not_zero(self) -> None:
+        # Redmine #14139 R8 review j#83633 F1: a RELEASE failure happens AFTER the
+        # guarded body, so on the clean-slate path the shared `workspace create` has
+        # already run. session-start must NOT report "no workspace was created"; it
+        # must report the labelled husk + un-started agents so a retry adopts it.
+        import contextlib
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateReleaseError,
+        )
+
+        @contextlib.contextmanager
+        def _release_boom(home):
+            # Run the body (list -> resolve -> create) to completion, THEN fail on
+            # release (only when the body succeeded — mirrors the real fence).
+            yield
+            raise CoordinatorSharedCreateReleaseError("release failed (simulated)")
+
+        herdr = _Herdr(created_workspace="wS")
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(lock_path, _release_boom):
+                with self.assertRaises(HerdrSessionStartError) as cm:
+                    self._prepare(
+                        tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                        coordinator_placement_mode="shared_space",
+                    )
+        msg = str(cm.exception)
+        # Phase-accurate: agents NOT started, labelled husk may exist, retry adopts.
+        self.assertIn("were NOT started", msg)
+        self.assertIn("adopt", msg)
+        self.assertNotIn("no workspace / tab / agent was created", msg)
+        # Truthful state: the workspace WAS created; the agents were NOT started.
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def test_concurrent_clean_slate_launches_create_one_shared_workspace(self) -> None:
+        # Redmine #14139 R5 j#83516 required coverage 2 / R6 review j#83569 F1: two
+        # clean-slate shared-space launches racing the SAME home + backend must
+        # converge to ONE shared workspace. A `threading.Barrier` forces both into the
+        # create critical section together; `fcntl.flock` contends across the two
+        # threads' separate fds (flock(2)), so only one creates and the other adopts.
+        import contextlib
+        import threading
+
+        from mozyo_bridge.core.state import coordinator_placement_fence as _fence
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        real_lock = _fence.coordinator_shared_create_lock
+        barrier = threading.Barrier(2)
+
+        @contextlib.contextmanager
+        def _barriered(home):
+            # Both threads arrive together, THEN race the real flock.
+            barrier.wait(timeout=20)
+            with real_lock(home):
+                yield
+
+        class _ConcurrentHerdr(_Herdr):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self._run_lock = threading.Lock()
+
+            def run(self, argv, **kw):  # thread-safe shared backend bookkeeping
+                with self._run_lock:
+                    return super().run(argv, **kw)
+
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            herdr = _ConcurrentHerdr(created_workspace="wZ")
+            herdr.attest_home = home
+            repos = []
+            results: dict = {}
+            errors: dict = {}
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                for name in ("A", "B"):
+                    repo = Path(tmp) / f"repo{name}"
+                    repo.mkdir()
+                    register_workspace(repo, home=home)
+                    repos.append(repo)
+
+                def _launch(name, repo):
+                    try:
+                        # Isolate the ORTHOGONAL home-scoped startup-transaction fence
+                        # (a brief, non-blocking per-DB-write lock) per thread, so the
+                        # two launches never collide on IT — this test targets the
+                        # shared-coordinators create single-flight, which still uses the
+                        # shared home lock.
+                        results[name] = prepare_session(
+                            repo_root=repo,
+                            providers=["claude", "codex"],
+                            lane_id="",
+                            env=_launch_env(binpath),
+                            runner=herdr.run,
+                            coordinator_placement_mode="shared_space",
+                            startup_fence=StartupTransactionFence(
+                                path=Path(tmp) / f"startup-{name}.sqlite"
+                            ),
+                            probe=_FAST_PROBE,
+                        )
+                    except BaseException as exc:  # noqa: BLE001 - surfaced via assert
+                        errors[name] = exc
+
+                with patch(lock_path, _barriered):
+                    t1 = threading.Thread(target=_launch, args=("A", repos[0]))
+                    t2 = threading.Thread(target=_launch, args=("B", repos[1]))
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=30)
+                    t2.join(timeout=30)
+
+        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
+        # Single-flight: exactly one shared workspace was created, and BOTH projects
+        # resolved to it (the loser adopted the winner's workspace).
+        self.assertEqual(
+            len(herdr.workspace_creates), 1, "concurrent launches must create one workspace"
+        )
+        self.assertEqual(results["A"].herdr_workspace_id, results["B"].herdr_workspace_id)
+        self.assertEqual(results["A"].herdr_workspace_id, "wZ")
+
+    def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
+        # Redmine #14139: an unknown mode string fails closed at the pure entry point,
+        # before any herdr actuation (mirrors the unknown-provider guard).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp,
+                    providers=["claude"],
+                    herdr=herdr,
+                    lane="",
+                    coordinator_placement_mode="everywhere",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.calls, [])
 
     def test_unknown_provider_fails_closed(self) -> None:
         herdr = _Herdr()

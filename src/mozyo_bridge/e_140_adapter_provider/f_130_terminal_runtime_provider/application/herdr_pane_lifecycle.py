@@ -39,6 +39,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
     _parse_tab_created,
     _parse_workspace_created,
+    _parse_workspace_list,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     MOZYO_BRIDGE_LAUNCHER_ENV,
@@ -266,6 +267,23 @@ def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[
     return rows
 
 
+def _list_workspace_labels(
+    binary: str, runner: Runner, timeout: float
+) -> Optional[Mapping[str, str]]:
+    """Run herdr ``workspace list`` and return ``{workspace_id: label}`` (or ``None``).
+
+    The backend-readable label authority for the shared coordinators space
+    (Redmine #14139 ``shared_space``, Design Answer j#83385 Decision 1). Called ONLY
+    on the shared-space default-lane path, so ``per_project_space`` and every
+    sublane launch never issue this extra command and stay byte-for-byte the
+    pre-#14139 choreography. Returns ``None`` — "labels unreadable" — when the
+    payload is not a recognisable ``workspace list`` shape, which the resolver
+    treats as fail-closed (never a guessed shared space).
+    """
+    completed = _invoke(binary, ["workspace", "list"], runner, timeout, env=None)
+    return _parse_workspace_list(completed.stdout)
+
+
 def _create_workspace(
     binary: str,
     repo_root: Path,
@@ -279,9 +297,13 @@ def _create_workspace(
     Making the workspace ourselves (rather than letting the first ``agent start``
     auto-create it) is what turns the empty base pane into a *known* handle we can
     reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
-    operator's focus. ``label`` (Redmine #13380) names a minted sublane host
-    workspace for the operator — cosmetic only, never a join key. Fails closed if
-    the response is unparseable.
+    operator's focus. ``label`` names a minted workspace for the operator: for a
+    **sublane host** (Redmine #13380) it is cosmetic and never a join key; for the
+    **shared coordinators space** (Redmine #14139) the SAME label
+    (``coordinators``) is the backend-readable adopt authority a later project
+    re-reads via ``workspace list`` (:func:`_shared_coordinator_target`). Either
+    way the label is set once at create and never mutated. Fails closed if the
+    response is unparseable.
     """
     argv = ["workspace", "create", "--cwd", str(repo_root)]
     if label:

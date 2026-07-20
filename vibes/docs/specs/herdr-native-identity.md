@@ -452,6 +452,133 @@ v1 に含めない**: launch 経路の語彙は現状 lane_class (`default` / `s
 には lane-role 語彙の launch 時解決が別途必要。schema は lane class key を追加するだけで拡張でき
 (closed set に新 class を足す)、既存 class の意味論は変わらないため、この拡張点は塞がっていない。
 
+## 5.1.1 coordinator placement mode — operator-scoped 配置 (Redmine #14139)
+
+coordinator pair (default lane) を **どの herdr workspace に置くか**を operator ごとに切り替える
+closed knob。§5.1 `lane_placement` (pair 内部の split 方向 / 役割順序、repo-committed) とは**別関心・別
+source**であり、`_launch_target_for_lane` (#13380) / `_tab_target_for_lane` (#13411) の sublane 配置軸は
+一切変えない。
+
+### Scope は operator-scoped (home-level、非 commit)
+
+設定は mozyo-bridge **home** root の `coordinator-placement.yaml` に置く (`mozyo_bridge_home()` = `MOZYO_BRIDGE_HOME`
+または `~/.mozyo_bridge`)。repo-committed config に置かない理由は portable 値 vs operator-private 境界: 同じ N
+repo を扱う 2 人の operator が「全 project の coordinator を 1 window で俯瞰したい」「小型モニタで project 別に
+切替えたい」と正当に対立し、committed 値は N repo 間で衝突し、operator の私的選好を上書きしてしまう。repo に
+残るのは pair 内部配置 (`lane_placement`, #13646/#13647) までとする。file は本 mode 専用の小 file とし、repo-local
+schema とも将来の home-config schema (#14148) とも衝突させない。
+
+```yaml
+# ~/.mozyo_bridge/coordinator-placement.yaml
+mode: shared_space          # per_project_space | shared_space
+```
+
+### Closed vocabulary (unknown fail-closed)
+
+- `per_project_space` (**既定**、file 不在時): coordinator pair は各 project の project workspace に置く
+  (#13380 の従来動作)。opt-in しない operator は pre-#14139 と byte 一致で起動する。
+- `shared_space`: 全 project の coordinator pair を **1 つの stable shared coordinators workspace** に置き、
+  project ごとに column とする (tmux 時代の俯瞰運用の復元)。
+- それ以外の `mode` 文字列 / unknown key / 非 mapping / unsupported version は
+  `CoordinatorPlacementError` で fail-closed (未知 shape が per_project_space に化けない)。
+
+### shared_space の workspace identity / label authority / 冪等 adopt
+
+shared space の identity は **backend が read できる stable workspace label `coordinators`** が authority で
+ある (R1 review j#83383 F1 / Design Answer j#83385 Decision 1)。**locator prefix だけで shared space を
+認定してはならない**: per-project coordinator workspace と shared workspace は inventory 上区別できず、prefix
+guess は mode 切替時に per-project window を誤 adopt する。label は create 時に付与し、adopt/join は
+action-time に `herdr workspace list` の **exact label (verbatim、trim / case-fold しない)** を再読して判断する
+(R4 review j#83473 F1: `"  coordinators  "` や `"Coordinators"` は別 label で adopt しない)。**per-project
+workspace を暗黙に shared へ昇格・relabel しない。**
+
+own-pin (自 project の live/adopted default-lane slot) は自 identity が pin するので **label read を要しない**。
+その解決は label read の **前** に行い、own pin が存在すれば `workspace list` を発行せず join する (R4 review
+j#83473 F2: own-pin heal は `workspace list` command の成否に依存しない)。own pin が無いときだけ label を読む。
+
+`shared_space` の default-lane target 解決 (`herdr_lane_topology._shared_coordinator_target(rows, workspace_id,
+adopted_locators, workspace_labels, shared_label)`):
+
+1. **自 project の live/adopted default-lane slot** が pin する (heal は coordinator pair を workspace 跨ぎで
+   分割しない)。自 identity が pin するので label read は不要。
+2. 自 pin が無ければ label authority で判断する (`workspace_labels` = `{herdr_workspace_id: label}`、
+   `herdr workspace list` で action-time 取得):
+   - **`workspace_labels` が読めない (None)** → typed fail-closed (推測しない)。
+   - `shared_label` を持つ herdr workspace (= labelled candidate)。**live default-lane slot の有無を問わない**
+     (R5 review j#83516 F1): create 後 agent-start が失敗した **partial-failure husk** や、single-flight fence
+     下で先行 process が create したがまだ launch していない space も shared space であり adopt 対象とする:
+     - **ちょうど 1 つ** → その space を adopt する。#13380 の sublane host 解決と違いここは意図的に mozyo
+       `workspace` identity 境界を跨ぐ (各 coordinator は自 project identity `mzb1_<project-ws>_<role>_default`
+       を保つ) が、境界跨ぎは **label 一致に gate される**。これが 2 番目以降の project の launch を
+       「先行 project が作った space の冪等 adopt」にする。
+     - **複数** → ambiguous shared space として fail-closed。
+3. labelled candidate が無い場合:
+   - **他 project の coordinator pair が live だが shared label を持たない (per-project workspace)** → fail-closed
+     (mode-transition guard: per-project window を暗黙昇格しない)。
+   - coordinator pair が 1 つも live でない (clean slate) → `""` → caller が stable label `coordinators` で create。
+
+### create の single-flight fence (concurrent 収束)
+
+husk-adoption だけでは **clean-slate 同時起動** race は閉じない (双方が「labelled candidate 無し」を読んで双方
+create する)。launch admission は attestation store lock を **shared** で持つため create を直列化しない。そこで
+shared default-lane の **list→resolve→create を home-scoped exclusive advisory lock**
+(`core/state/coordinator_placement_fence.coordinator_shared_create_lock`、`attestation_store_lock` と同じ
+`fcntl.flock` protocol、別 lock file で相互非干渉) の下で実行する。lock 取得後に label を再読して resolve
+(double-checked) し、無いときだけ create する。よって同時起動でも create するのは 1 process だけで、他は待機後
+再 resolve で husk-adoption/adopt に収束し、**shared workspace は 1 個**になる。**own-pin heal は lock を取らない**
+(create しない = R5 F2 契約維持)。lock は home 下の 0600 advisory artifact で state を持たず、operator config
+write ではない (`flock` のみ)。lock lifecycle 全体で raw `OSError` を出さない: acquire error (fcntl 不能 / home permission /
+`LOCK_EX`) は list/create の**前**なので **zero herdr actuation** で、release error (`LOCK_UN` / `close`、両方必ず
+試行し fd は必ず close) は **body 成功時のみ**、いずれも session-start の typed error (`HerdrSessionStartError`) へ
+変換して fail-closed する (R6 review j#83569 F2 / R7 review j#83596 F1、public CLI が raw traceback にならない)。
+**body が例外を投げた場合は release error で上書きせず元例外を不変伝播**する (`_FenceLock.__exit__` と同 pattern)。
+release error は acquire error と**別 subtype** (`CoordinatorSharedCreateReleaseError`) で、session-start は phase-accurate に報告する
+(R8 review j#83633 F1): acquire failure は「zero workspace/tab/agent create」、release failure は body の後なので
+「labelled `coordinators` workspace は作成済みの可能性があり agent 未起動、re-run が idempotently adopt」。
+concurrent 収束は `threading.Barrier` + 共有 fake backend + `fcntl.flock` の別-fd 競合で **create count 1** を
+deterministic に regression 固定する (live Herdr smoke 不要)。
+
+sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin が複数 herdr
+workspace に跨る場合は identity conflict として fail-closed (#13330 posture)。この label read / fence は shared_space の
+default-lane path でのみ発火し、`per_project_space` と全 sublane launch は `workspace list` も lock も発行せず
+byte-invariant を保つ。
+
+### project 列順 — deterministic append order (not arbitrary live reorder)
+
+Herdr の public launch API は既存 workspace 内への任意 insert / reorder target を持たない (`agent start` に
+pane-target flag 無し)。したがって**独立 launch を跨ぐ厳密な左右順は保証しない** (R1 review j#83383 F2 /
+Design Answer j#83385 Decision 2 / premise 訂正 j#83433)。
+
+現行 architecture では coordinator launch (`herdr_launch_command.prepare` の bare `mozyo` / `herdr_session_start_cli`)
+は **単一 project の coordinator pair を 1 回だけ** 起動する。複数 project を一括生成する batch seam は存在しない。
+したがって **current-scope の acceptance** は次の realizable invariant である (j#83433):
+
+- 単独 project の coordinator launch は backend の既存列 **末尾へ append** する。
+- 既存 column の順序を変更せず、**live reorder / relayout を行わない** (既存 pane を move / swap / close しない)。
+- resolver の adopt / create / fail-closed 判断は **inventory row の iteration 順に依存しない** (集合演算 + sorted)。
+- **duplicate workspace identity** は label 一致 / 不一致に関わらず fail-closed し、**順序を反転しても同一 verdict** となる
+  (`_parse_workspace_list` は重複 `workspace_id` を検出したら `None` へ倒す)。
+
+**将来 invariant (現行 R3 は未実装)**: 複数 project を一括生成する実在 batch seam を追加する場合、その seam は
+stable project key 順に append する。これは今回、未使用 helper や架空 batch path を追加する根拠にはしない。
+
+厳密左右順を望む operator の live 再配置は live-relayout runbook (#13648) の領分であり、本 mode は
+**deterministic append order であって arbitrary live reorder ではない**。
+
+### Launch-time only (適用条件)
+
+mode は **launch / adopt 時のみ**読む。設定を変えても既存 live pair は自動で動かない (herdr は same-tab
+re-split を拒否する; live 再配置は live-relayout runbook のみ, #13648)。適用は **次回の fresh launch / adopt**
+から。config 読取りは composition root (`herdr_launch_command` の bare `mozyo` coordinator launch /
+`herdr_session_start_cli`) で行い、pure な `prepare_session` へ解決済み mode 文字列を渡す (ambient IO を pure core に
+持ち込まない)。壊れた operator file は composition root で actionable に fail-closed する。
+
+### Compatibility
+
+- 未設定 = `per_project_space` = pre-#14139 と byte 一致 (project workspace は無 label で create)。
+- `shared_space` が分岐させるのは **default lane のみ**。同 mode 下でも sublane launch は #13380 host label
+  (`<project>_sublanes`) を保ち、`coordinators` にはならない。
+
 ## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
 
 §5 の同一 tab pair placement / heal contract は、**それを実装した runtime が heal を

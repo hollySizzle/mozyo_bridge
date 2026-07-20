@@ -22,9 +22,19 @@ N lanes shows N tabs instead of 2N loose panes (owner intent #13377 j#73654 "親
 - :func:`_tab_target_for_lane` resolves the herdr *tab* within that workspace a
   non-default lane's launches join (#13411 axis).
 
-Both key on the live mzb1 inventory only (``tab_id`` / assigned-name identity),
-never on a cosmetic label: the identity model (``mzb1_<project-ws>_<role>_<lane>``)
-and route authority are unchanged; only the herdr placement subdivides.
+Both of these two axes key on the live mzb1 inventory only (``tab_id`` /
+assigned-name identity), never on a herdr label: the identity model
+(``mzb1_<project-ws>_<role>_<lane>``) and route authority are unchanged; only the
+herdr placement subdivides.
+
+The one deliberate exception is the **operator-scoped shared coordinators space**
+(Redmine #14139, ``shared_space`` mode, :func:`_shared_coordinator_target`): there
+the default-lane pair spans every project's mozyo ``workspace`` identity, so the
+inventory alone cannot tell the shared space from a per-project coordinator
+window. That axis — and ONLY that axis — uses the stable workspace *label*
+(:data:`SHARED_COORDINATOR_WORKSPACE_LABEL`) as the backend-readable adopt
+authority. It still never touches the mzb1 identity or route authority; the label
+gates *adopt*, nothing else.
 """
 
 from __future__ import annotations
@@ -226,6 +236,249 @@ def _launch_target_for_lane(
             "refuse to guess which one is the sublane host"
         )
     return next(iter(host_prefixes)) if host_prefixes else ""
+
+
+#: The stable label of the single shared coordinators herdr workspace (Redmine
+#: #14139, ``shared_space`` placement mode). Unlike the sublane host / tab labels
+#: (#13380 / #13411, which are cosmetic and never a join key), this label IS the
+#: **backend-readable adopt authority**: a fresh shared space is created carrying
+#: it, and :func:`_shared_coordinator_target` adopts an existing space ONLY when a
+#: live workspace carries exactly this label (R2 review j#83383 F1 / Design Answer
+#: j#83385 Decision 1). Constant, not derived from any project, precisely because
+#: the space is shared across projects. (The mzb1 assigned-name identity and route
+#: authority are still unchanged — this label gates *adopt*, not identity/routing.)
+SHARED_COORDINATOR_WORKSPACE_LABEL = "coordinators"
+
+
+def _parse_workspace_list(stdout: object) -> Optional[dict]:
+    """``{herdr_workspace_id: label}`` from a herdr ``workspace list`` payload (fail-closed).
+
+    The shared coordinators space (Redmine #14139 ``shared_space``) is identified by
+    its stable ``label`` (Design Answer j#83385 Decision 1: the label is the
+    backend-readable authority, NOT a locator-prefix guess), so a launch that adopts
+    the space must read the live workspace labels. Accepts the herdr envelope shape::
+
+        {"result": {"type": "workspace_list",
+                    "workspaces": [{"workspace_id": "w1", "label": "coordinators"},
+                                   {"workspace_id": "w2", "label": ""}, ...]}}
+
+    and the tolerant variants a bare list of workspace objects / an object carrying
+    the list under ``workspaces`` (mirroring the ``agent list`` tolerance). Each
+    entry contributes ``workspace_id -> label``. The label is kept **raw / verbatim**
+    (NOT trimmed or case-folded): the shared space is adopted only on an EXACT label
+    match (spec §5.1.1 / Design Answer j#83385 Decision 1 / R4 review j#83473 F1), so
+    a padded ``" coordinators "`` or a case-variant ``"Coordinators"`` is a DIFFERENT
+    label and must not be normalised into the authority label. A missing / non-string
+    label is the empty string (present but unlabelled, so it never matches). An entry
+    with no ``workspace_id`` is skipped. An EMPTY list is a valid readable result (no
+    workspaces) and yields ``{}``.
+
+    Returns ``None`` — "labels unreadable", which the resolver treats as
+    fail-closed — when the payload is not JSON, exposes no recognisable workspace
+    container, **or repeats a ``workspace_id``** (a herdr identity that appears
+    twice in one snapshot is an identity conflict: keeping the last-seen label would
+    make the whole label authority order-dependent — R2 review j#83425 F1 / Design
+    Answer j#83385 Decision 1 "identity conflict は typed fail-closed"). Never a
+    guess; never raises.
+    """
+    payload = stdout
+    if isinstance(stdout, str):
+        try:
+            payload = json.loads(stdout)
+        except (ValueError, TypeError):
+            return None
+    container = _workspace_list_container(payload)
+    if container is None:
+        return None
+    labels: dict = {}
+    for entry in container:
+        if not isinstance(entry, Mapping):
+            continue
+        workspace_id = _norm(entry.get("workspace_id"))
+        if not workspace_id:
+            continue
+        if workspace_id in labels:
+            # A duplicate herdr workspace identity in one snapshot: the label
+            # authority must not depend on which row we saw last. Fail closed on the
+            # whole payload rather than pick a winner.
+            return None
+        raw_label = entry.get("label")
+        # Verbatim — no strip / case-fold: the adopt authority is an EXACT label
+        # match, so normalising here would let a padded / case-variant label pass
+        # as the shared label (R4 review j#83473 F1).
+        labels[workspace_id] = raw_label if isinstance(raw_label, str) else ""
+    return labels
+
+
+def _workspace_list_container(payload: object) -> Optional[list]:
+    """The list of workspace objects inside a decoded ``workspace list`` payload."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, Mapping):
+        candidate = payload.get("workspaces")
+        if isinstance(candidate, list):
+            return candidate
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            return _workspace_list_container(result)
+    return None
+
+
+def _shared_coordinator_own_target(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    adopted_locators: Sequence[str],
+) -> str:
+    """This project's own live/adopted default-lane pin, or ``""`` if none (no label read).
+
+    Step 1 of the shared-space resolution, split out so the caller can resolve an
+    own-pin heal WITHOUT reading the workspace labels first (Redmine #14139 R4 review
+    j#83473 F2): the spec §5.1.1 contract is that own identity pins the target, so a
+    heal must not depend on the ``workspace list`` command succeeding. Returns the
+    single herdr workspace this project's own live default-lane slots (plus this
+    run's adopted slots — always same-lane, same-project) occupy, or ``""`` when the
+    project has no own coordinator slot yet. Raises when own slots span more than one
+    herdr workspace (identity conflict — refuse to guess).
+    """
+    own = [loc for loc in adopted_locators if loc]
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        if (decode.identity.lane_id or DEFAULT_LANE) != DEFAULT_LANE:
+            continue
+        if decode.identity.workspace_id != workspace_id:
+            continue
+        locator = _agent_locator(row)
+        if locator:
+            own.append(locator)
+    own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
+    if len(own_prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"live coordinator slots of workspace {workspace_id!r} span multiple herdr "
+            f"workspaces {sorted(own_prefixes)!r}; refuse to guess which one new launches "
+            "belong to"
+        )
+    return next(iter(own_prefixes)) if own_prefixes else ""
+
+
+def _shared_coordinator_target(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    adopted_locators: Sequence[str],
+    workspace_labels: Optional[Mapping[str, str]],
+    shared_label: str,
+) -> str:
+    """The shared coordinators herdr workspace the default-lane pair joins (``""`` -> create).
+
+    ``shared_space`` placement mode (Redmine #14139, operator-scoped): every
+    project's coordinator pair (default lane) shares ONE stable herdr workspace,
+    each project a column, so an operator oversees every project's coordinators in
+    a single window (the tmux-era overview). The ``per_project_space`` default is
+    unchanged and never reaches here — it keeps :func:`_launch_target_for_lane`.
+
+    The shared space is identified by its **stable label** (``shared_label`` ==
+    :data:`SHARED_COORDINATOR_WORKSPACE_LABEL`), the backend-readable authority
+    (Design Answer j#83385 Decision 1 — R1 review j#83383 F1). A live foreign
+    default-lane workspace is NOT assumed to be the shared space just because it
+    holds a coordinator pair: a ``per_project_space`` coordinator workspace is
+    indistinguishable from the shared one by inventory alone, so R1's prefix-only
+    guess would wrongly ADOPT a per-project window on a mode transition. Resolution,
+    in order:
+
+    1. this project's OWN live/adopted default-lane slots pin the target
+       (:func:`_shared_coordinator_own_target`) — no label read needed (rejoining its
+       own live space). The caller resolves this BEFORE reading labels so an own-pin
+       heal never depends on the ``workspace list`` command (R4 review j#83473 F2);
+       this function re-checks it so it stays correct when called directly.
+    2. no own pins, so a join/create decision is needed and the labels are the
+       authority. ``workspace_labels is None`` (the ``workspace list`` read failed)
+       fails closed — never guess. Among the herdr workspaces carrying ``shared_label``
+       (an EXACT, verbatim match — no trim / case-fold, R4 review j#83473 F1),
+       INCLUDING a labelled workspace with no live default-lane slot yet (R5 review
+       j#83516 F1 — a partial-failure husk or a concurrent peer's not-yet-launched
+       space is still the shared space and must be adopted, not duplicated):
+
+       - exactly one -> ADOPT it (idempotent join; this is what crosses the mozyo
+         ``workspace`` identity boundary safely, gated on the label);
+       - more than one -> fail closed (ambiguous shared space);
+
+    3. no labelled candidate at all:
+
+       - but foreign default-lane pairs ARE live (in un/differently-labelled
+         per-project workspaces) -> fail closed. This is the mode-transition guard:
+         refuse to silently promote a per-project coordinator window to the shared
+         space (Decision 1: no implicit promotion / relabel);
+       - otherwise (no foreign coordinator pair live at all) -> ``""``: the caller
+         creates the shared workspace with ``shared_label`` UNDER the single-flight
+         fence (``coordinator_placement_fence.coordinator_shared_create_lock``), so
+         concurrent clean-slate launches converge to one workspace.
+
+    Only default-lane (coordinator) slots are ever consulted: a sublane slot never
+    pins the coordinators space (its placement is the untouched #13380/#13411 axis).
+    Own pins spanning more than one herdr workspace fail closed (identity conflict).
+    """
+    own_target = _shared_coordinator_own_target(rows, workspace_id, adopted_locators)
+    if own_target:
+        return own_target
+
+    if workspace_labels is None:
+        raise HerdrSessionStartError(
+            "shared coordinators workspace labels are unreadable (herdr workspace list "
+            f"returned no recognisable payload); refuse to guess the shared space for "
+            f"workspace {workspace_id!r}"
+        )
+    # Candidates are the herdr workspaces carrying the EXACT shared label — read from
+    # the labels directly, INCLUDING a labelled workspace with no live default-lane
+    # slot yet (R5 review j#83516 F1). That covers two idempotency cases the earlier
+    # "labelled AND has a live slot" set missed: a partial-failure HUSK (created +
+    # labelled, then its agent-start failed) and a concurrent peer's workspace created
+    # under the single-flight fence but not yet launched into — both are the shared
+    # space and must be ADOPTED, not duplicated. The match is EXACT / verbatim (no
+    # `_norm`): a padded or case-variant label is a different label (R4 F1). Sorted for
+    # an inventory-iteration-independent decision (Design Answer j#83385 Decision 2).
+    labelled_candidates = sorted(
+        ws for ws, label in workspace_labels.items() if label == shared_label
+    )
+    if len(labelled_candidates) > 1:
+        raise HerdrSessionStartError(
+            f"multiple herdr workspaces carry the shared coordinators label "
+            f"{shared_label!r} ({labelled_candidates!r}); refuse to guess which one is "
+            "the shared space"
+        )
+    if labelled_candidates:
+        return labelled_candidates[0]
+    # No labelled shared workspace exists. If foreign per-project coordinator pairs
+    # ARE live (in un/differently-labelled workspaces), this is a mode transition:
+    # refuse to promote a per-project window to the shared space (Decision 1).
+    foreign_by_workspace: dict = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        if (decode.identity.lane_id or DEFAULT_LANE) != DEFAULT_LANE:
+            continue
+        if decode.identity.workspace_id == workspace_id:
+            continue
+        locator = _agent_locator(row)
+        if not locator:
+            continue
+        prefix = _workspace_prefix(locator)
+        if prefix:
+            foreign_by_workspace.setdefault(prefix, True)
+    if foreign_by_workspace:
+        raise HerdrSessionStartError(
+            "shared_space launch found live coordinator pairs but none in a workspace "
+            f"labelled {shared_label!r} "
+            f"({sorted(foreign_by_workspace)!r}); refuse to promote a per-project "
+            "coordinator workspace to the shared space (retire the per-project pairs, "
+            "or launch into an existing shared space)"
+        )
+    return ""
 
 
 def _lane_live_slot_tabs(
@@ -689,8 +942,11 @@ __all__ = (
     "AGENT_KEY_TAB",
     "HerdrSessionStartError",
     "_host_workspace_label",
+    "SHARED_COORDINATOR_WORKSPACE_LABEL",
     "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "_shared_coordinator_own_target",
+    "_shared_coordinator_target",
     "ContainerPlan",
     "initial_container_occupancy",
     "resolve_container_plan",
@@ -702,6 +958,7 @@ __all__ = (
     "_parse_started_agent",
     "_parse_tab_created",
     "_parse_workspace_created",
+    "_parse_workspace_list",
     "_tab_id_of_row",
     "_tab_target_for_lane",
     "_workspace_prefix",
