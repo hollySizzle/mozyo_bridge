@@ -1104,7 +1104,7 @@ allowlist:
       builds the typed request from the resolved envelope and returns the use case result.
       Net -36. Shared baseline change: reconcile at integration if another tranche/lane also
       edits this file.
-      Tightened 3306 -> 3040 for #13729 tranche 4 (common tmux transport rail): the ~308-line
+      Tightened 3306 -> 3044 for #13729 tranche 4 (common tmux transport rail): the ~308-line
       inline block that injects the marker+body once and drives it to a terminal disposition
       (pending park / marker landing gate + C-u rollback / Enter-only retry / standard turn-start
       confirmation / final sent assembly with the emit / persist / ledger / focus-restore side
