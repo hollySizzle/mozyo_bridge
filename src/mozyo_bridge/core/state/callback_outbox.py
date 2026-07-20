@@ -133,6 +133,11 @@ class CallbackOutboxRow:
     target_lane: str = ""
     target_receiver: str = ""
     target_generation: str = ""
+    #: The owning-lane generation read from the LOCAL lifecycle authority at ingest (Redmine #14150).
+    #: The local outbox drain compares it to the current local lane generation to attest a coordinator
+    #: row is still current WITHOUT a ticket-provider read; a stale row (the lane advanced) is fenced,
+    #: never blind-sent. Distinct from ``target_generation`` so it never perturbs the delivery authority.
+    enqueue_lane_generation: str = ""
 
     @property
     def key(self) -> CallbackOutboxKey:
@@ -166,6 +171,7 @@ class CallbackOutboxRow:
             "target_lane": self.target_lane,
             "target_receiver": self.target_receiver,
             "target_generation": self.target_generation,
+            "enqueue_lane_generation": self.enqueue_lane_generation,
         }
 
 
@@ -182,13 +188,32 @@ class CallbackEnqueueResult:
     current_state: str
 
 
-_SELECT = (
+#: The persisted-column read list up to and including ``target_generation`` (19 columns). The
+#: additive ``enqueue_lane_generation`` (Redmine #14150) is appended ONLY when the table actually
+#: carries it — a read-only reader (``read_strict_readonly``) must tolerate a not-yet-migrated
+#: existing store that predates the column, since it never migrates (it would otherwise raise "no
+#: such column" and a fail-closed caller — the retire obligation gate — would read it as unreadable).
+#: ``_row`` already defaults a missing trailing column to ``""`` (``len(r) > 19`` guard).
+_SELECT_BASE = (
     "SELECT source, issue, journal, normalized_gate, callback_route, state, "
     "attempts, max_attempts, send_attempted, notification_kind, "
     "notification_summary, gate_mismatch, detail, payload, claim_token, workspace_id, "
-    "target_lane, target_receiver, target_generation "
-    "FROM callback_outbox"
+    "target_lane, target_receiver, target_generation"
 )
+_SELECT = _SELECT_BASE + ", enqueue_lane_generation FROM callback_outbox"
+
+
+def _select_for(conn: sqlite3.Connection) -> str:
+    """The row-select tailored to the columns THIS table actually has (Redmine #14150).
+
+    Includes ``enqueue_lane_generation`` only when present, so a strict read-only read of a
+    not-yet-migrated store (one that predates the additive column) selects a valid subset and
+    ``_row`` defaults the absent column, instead of raising "no such column".
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+    if "enqueue_lane_generation" in have:
+        return _SELECT
+    return _SELECT_BASE + " FROM callback_outbox"
 
 
 def _row(r: tuple) -> CallbackOutboxRow:
@@ -212,22 +237,29 @@ def _row(r: tuple) -> CallbackOutboxRow:
         target_lane=r[16] if len(r) > 16 else "",
         target_receiver=r[17] if len(r) > 17 else "",
         target_generation=r[18] if len(r) > 18 else "",
+        enqueue_lane_generation=r[19] if len(r) > 19 else "",
     )
 
 
 def _select_rows(conn, states) -> tuple["CallbackOutboxRow", ...]:
-    """The one row-select both the migrating and the strict read-only reads use."""
+    """The one row-select both the migrating and the strict read-only reads use.
+
+    Column-aware (Redmine #14150): the SELECT is tailored to the table's actual columns, so a strict
+    read-only read of a store that predates the additive ``enqueue_lane_generation`` column reads a
+    valid subset (the column defaults to ``""``) instead of raising.
+    """
+    select = _select_for(conn)
     if states is not None:
         wanted = list(states)
         if not wanted:
             return ()
         placeholders = ",".join("?" for _ in wanted)
         rows = conn.execute(
-            _SELECT + f" WHERE state IN ({placeholders}) ORDER BY seq, rowid",
+            select + f" WHERE state IN ({placeholders}) ORDER BY seq, rowid",
             tuple(wanted),
         ).fetchall()
     else:
-        rows = conn.execute(_SELECT + " ORDER BY seq, rowid").fetchall()
+        rows = conn.execute(select + " ORDER BY seq, rowid").fetchall()
     return tuple(_row(r) for r in rows)
 
 
@@ -308,6 +340,7 @@ class CallbackOutbox:
         target_lane: str = "",
         target_receiver: str = "",
         target_generation: str = "",
+        enqueue_lane_generation: str = "",
         cursor_source: Optional[str] = None,
         cursor: Optional[str] = None,
         now: Optional[str] = None,
@@ -356,8 +389,9 @@ class CallbackOutbox:
                     "INSERT INTO callback_outbox (source, issue, journal, normalized_gate, "
                     "callback_route, workspace_id, state, attempts, max_attempts, send_attempted, "
                     "notification_kind, notification_summary, gate_mismatch, detail, payload, "
-                    "target_lane, target_receiver, target_generation, seq, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "target_lane, target_receiver, target_generation, enqueue_lane_generation, "
+                    "seq, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(workspace_id, source, issue, journal, normalized_gate, callback_route) "
                     "DO NOTHING",
                     (
@@ -372,6 +406,7 @@ class CallbackOutbox:
                         str(target_lane or ""),
                         str(target_receiver or ""),
                         str(target_generation or ""),
+                        str(enqueue_lane_generation or ""),
                         next_seq,
                         stamp,
                         stamp,
@@ -428,6 +463,7 @@ class CallbackOutbox:
         now: Optional[str] = None,
         workspace_id: Optional[str] = None,
         issue: Optional[str] = None,
+        route: Optional[str] = None,
     ) -> tuple[CallbackOutboxRow, ...]:
         """Atomically claim up to ``limit`` pending rows, moving them to ``inflight``.
 
@@ -447,6 +483,12 @@ class CallbackOutbox:
         that applies an issue-specific generation authority (the supervisor's dispatch-anchor fence)
         must not drain another issue's rows under this issue's anchor, because each issue's
         generation baseline is independent. ``None`` (the default) keeps the workspace-wide claim.
+
+        ``route`` (Redmine #14150) **restricts the claim to one callback route**: the local outbox
+        drain claims ONLY the locally-attestable route (``coordinator``), so a route that needs a
+        ticket-provider read to attest (``review_return:<lane>`` / ``lane_gateway:<lane>``) is never
+        claimed by a provider-free drain (it stays pending for the provider reconciliation leg). A
+        blind send is thereby structurally impossible in the drain. ``None`` keeps the all-routes claim.
         """
         stamp = now or _utc_now()
         conn = self._connect_immediate()
@@ -460,6 +502,9 @@ class CallbackOutbox:
             if issue is not None:
                 where += " AND issue=?"
                 params.append(str(issue))
+            if route is not None:
+                where += " AND callback_route=?"
+                params.append(str(route))
             rows = conn.execute(
                 _SELECT + f" {where} ORDER BY seq LIMIT ?",
                 (*params, int(limit)),
@@ -496,6 +541,7 @@ class CallbackOutbox:
         now: Optional[str] = None,
         workspace_id: Optional[str] = None,
         issue: Optional[str] = None,
+        route: Optional[str] = None,
     ) -> tuple[CallbackOutboxRow, ...]:
         """Reconcile ``inflight`` rows whose claim **lease has expired** (crash recovery).
 
@@ -531,6 +577,9 @@ class CallbackOutbox:
             if issue is not None:
                 where += " AND issue=?"
                 params.append(str(issue))
+            if route is not None:
+                where += " AND callback_route=?"
+                params.append(str(route))
             rows = conn.execute(
                 _SELECT + f" {where} AND (claimed_at='' OR claimed_at <= ?) ORDER BY seq",
                 (*params, cutoff),
@@ -621,6 +670,30 @@ class CallbackOutbox:
         return self._update(
             key, "state=?, detail=?", (CALLBACK_DEAD_LETTER, detail or "callback dead-lettered"),
             now=now or _utc_now(),
+        )
+
+    def release_claim(
+        self,
+        key: CallbackOutboxKey,
+        *,
+        claim_token: Optional[str] = None,
+        detail: str = "",
+        now: Optional[str] = None,
+    ) -> bool:
+        """Return a claimed row to ``pending`` WITHOUT a terminal mark or an attempt bump (#14150).
+
+        The **defer** disposition the local outbox drain needs: a claimed row it cannot attest as
+        current from LOCAL state (a blank / mismatched ``enqueue_lane_generation``) is neither sent nor
+        terminally fenced — it is released back to ``pending`` so the provider reconciliation leg (which
+        reads the durable authority) decides its fate. Token-conditional (a de-owned processor no-ops),
+        clears the claim token, and resets ``send_attempted`` to ``0`` so the row is claimed fresh next
+        pass. Unlike :meth:`mark_retry_or_dead` it does **not** increment ``attempts`` — a defer is not a
+        delivery failure, so it never counts toward the bounded-retry dead-letter budget.
+        """
+        return self._update(
+            key, "state=?, send_attempted=0, claim_token=?, detail=?",
+            (CALLBACK_PENDING, "", detail or "deferred to provider reconciliation"),
+            now=now or _utc_now(), claim_token=claim_token,
         )
 
     def mark_retry_or_dead(

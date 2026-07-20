@@ -32,15 +32,19 @@ pane id / absolute path).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json as _json
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     SUPERVISION_BOUNDED_RECONCILIATION,
+    SUPERVISION_LOCAL_DRAIN,
     SUPERVISION_LOCAL_WAKE,
     build_service_definition,
 )
@@ -96,18 +100,31 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
 
     holder = (getattr(args, "holder", None) or "").strip() or _default_holder()
     wake_hints = tuple(getattr(args, "wake", None) or ())
-    # local_wake mode is selected explicitly (--local-wake, the wake-driven consume path that
-    # drains the durable wake queue) or implicitly when explicit --wake hints are supplied.
+    # Redmine #14150: --drain-only selects the LOCAL outbox drain (local state only, zero
+    # ticket-provider reads). Otherwise local_wake mode is selected explicitly (--local-wake, the
+    # wake-driven consume path) or implicitly when explicit --wake hints are supplied; the default is
+    # the bounded provider reconciliation sweep.
+    drain_only = bool(getattr(args, "drain_only", False))
     local_wake = bool(getattr(args, "local_wake", False)) or bool(wake_hints)
-    mode = SUPERVISION_LOCAL_WAKE if local_wake else SUPERVISION_BOUNDED_RECONCILIATION
+    if drain_only:
+        mode = SUPERVISION_LOCAL_DRAIN
+    elif local_wake:
+        mode = SUPERVISION_LOCAL_WAKE
+    else:
+        mode = SUPERVISION_BOUNDED_RECONCILIATION
     supervisor = build_supervisor(
         holder=holder, home=_home_from_args(args), store_path=_store_path_from_args(args)
     )
-    report = supervisor.run_once(mode=mode, wake_hints=wake_hints)
+    started = time.monotonic()
+    report = supervisor.run_once(mode=mode, wake_hints=() if drain_only else wake_hints)
+    # duration_ms is the reconcile / drain duration close condition 5 asks be measurable (secret-safe).
+    report = dataclasses.replace(report, duration_ms=int((time.monotonic() - started) * 1000))
     payload = report.as_payload()
+    action_label = "drain" if drain_only else "run-once"
     lines = [
-        "action: run-once",
+        f"action: {action_label}",
         f"mode: {report.mode}",
+        f"duration_ms: {report.duration_ms}",
         f"workspaces_total: {len(report.workspaces)}",
         f"workspaces_supervised: {report.workspaces_supervised}",
         f"workspaces_skipped: {report.workspaces_skipped}",
@@ -117,12 +134,18 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         # uncertain / reconciled-away), held as retryable / uncertain receipts — surfaced alongside
         # ``delivered`` so the projection never presents a non-wake as a delivery.
         f"blocked: {report.blocked}",
+        # Redmine #14150 observability: provider (Redmine) reads this pass (0 for a drain), rows
+        # deferred to the reconciliation leg, and whether the whole pass was empty.
+        f"deferred: {report.deferred}",
+        f"provider_calls: {report.provider_calls}",
+        f"empty_pass: {report.empty_pass}",
     ]
     for w in report.workspaces:
         if w.lease_acquired:
             lines.append(
                 f"  ws {w.workspace_id}: supervised {len(w.supervised_issues)} issue(s), "
-                f"events={w.events_supplied} delivered={w.delivered} blocked={w.blocked}"
+                f"events={w.events_supplied} delivered={w.delivered} blocked={w.blocked} "
+                f"deferred={w.deferred} provider_reads={w.provider_reads}"
                 + (f" [{w.skipped_reason}]" if w.skipped_reason else "")
             )
         else:
@@ -212,6 +235,12 @@ def _service_definition(args: argparse.Namespace):
     return build_service_definition(reconciliation_interval_seconds=interval)
 
 
+def _drain_service_definition(args: argparse.Namespace):
+    """The LOCAL-drain service definition (Redmine #14150): finer cadence, same bounded command adapter."""
+    interval = int(getattr(args, "drain_interval", None) or DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS)
+    return build_service_definition(reconciliation_interval_seconds=interval, local_drain=True)
+
+
 def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     """The service lifecycle command contract (Phase B1: real macOS LaunchAgent lifecycle).
 
@@ -238,9 +267,14 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         status = supervisor_launchd.service_status(
             mozyo_home=mozyo_home, interval_hint=definition.reconciliation_interval_seconds
         )
+        drain_definition = _drain_service_definition(args)
         payload = dict(status)
         payload["phase"] = "B1"
         payload["definition"] = definition.as_payload()
+        # Redmine #14150: the split is two bounded one-shot cadences — the coarse provider
+        # reconciliation agent (`--run-once`) and the finer local-drain agent (`--drain-only`). Both
+        # declarative definitions are surfaced so the separate cadences are operator-visible.
+        payload["drain_definition"] = drain_definition.as_payload()
         lines = [
             "action: service-status",
             "phase: B1 (macOS LaunchAgent lifecycle; RunAtLoad + StartInterval, no KeepAlive)",
@@ -254,7 +288,11 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
             f"executable_matches: {status['executable_matches']}",
             f"keep_alive_present: {status['keep_alive_present']}",
             f"credential_readiness: {status['credential_readiness']}",
-            f"command: {' '.join(definition.command)}",
+            f"reconciliation_command: {' '.join(definition.command)}",
+            f"reconciliation_interval_seconds: {definition.reconciliation_interval_seconds}",
+            f"drain_service_label: {drain_definition.label}",
+            f"drain_command: {' '.join(drain_definition.command)}",
+            f"drain_interval_seconds: {drain_definition.reconciliation_interval_seconds}",
         ]
         _emit(payload, as_json=as_json, text_lines=lines)
         return 0
@@ -345,12 +383,21 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         wait_binary=wait_binary,
         timeout_ms=timeout_ms,
     )
-    results = run_event_pump(
-        supervisor_pass=supervisor_pass,
-        targets_fn=targets_fn,
-        wait_multiplex_fn=wait_multiplex_fn,
-        max_iterations=max_iterations,
-    )
+    # Redmine #14150 (live evidence j#83437 / j#83443): the bounded watch holds workspace leases
+    # across its iterations (release_after=False) so it keeps ownership between wakes — but when it
+    # TERMINATES (normal end, an exception, or a wake=error edge) those leases MUST be released, or
+    # the fallback --run-once starves every workspace as lease_held_by_other until the ~5-min TTL.
+    # The release is token-conditional, so a workspace taken over by a NEW live owner is never
+    # evicted: only this terminated holder's own leases drop, and the duplicate-owner fence stands.
+    try:
+        results = run_event_pump(
+            supervisor_pass=supervisor_pass,
+            targets_fn=targets_fn,
+            wait_multiplex_fn=wait_multiplex_fn,
+            max_iterations=max_iterations,
+        )
+    finally:
+        supervisor.release_all_leases()
     as_json = bool(getattr(args, "as_json", False))
     if as_json:
         print(_json.dumps({"action": "watch", "iterations": results}, ensure_ascii=False, sort_keys=True))
@@ -365,6 +412,8 @@ def cmd_workflow_supervisor(args: argparse.Namespace) -> int:
     """Run one `workflow supervisor` action (run-once / watch / status / service lifecycle contract)."""
     if getattr(args, "watch", False):
         return _cmd_watch(args)
+    if getattr(args, "drain_only", False):
+        return _cmd_run_once(args)
     if getattr(args, "run_once", False):
         return _cmd_run_once(args)
     if getattr(args, "status", False):
@@ -378,8 +427,8 @@ def cmd_workflow_supervisor(args: argparse.Namespace) -> int:
     if getattr(args, "uninstall", False):
         return _cmd_service(args, verb="uninstall")
     raise SystemExit(
-        "workflow supervisor requires an action: --run-once | --status | --service-status | "
-        "--install | --restart | --uninstall"
+        "workflow supervisor requires an action: --run-once | --drain-only | --watch | --status | "
+        "--service-status | --install | --restart | --uninstall"
     )
 
 
@@ -416,6 +465,13 @@ def register_supervisor(workflow_sub) -> None:
         help="Bounded event pump (Redmine #13758): Herdr turn events drive the reconcile passes "
              "(supervisor is the sole reconcile owner). --max-iterations bounds it; --run-once is "
              "the loss-recovery fallback.",
+    )
+    action.add_argument(
+        "--drain-only", dest="drain_only", action="store_true",
+        help="Local outbox drain (Redmine #14150): read LOCAL state only and deliver already-enqueued, "
+             "locally-attestable coordinator rows through a provider-free sender. Makes ZERO "
+             "ticket-provider calls (an empty pass and a safe-pending pass both). A row it cannot "
+             "attest from local state is deferred to the provider reconciliation leg (--run-once).",
     )
     p.add_argument(
         "--max-iterations", dest="max_iterations", type=int, default=1,
@@ -466,7 +522,14 @@ def register_supervisor(workflow_sub) -> None:
     )
     p.add_argument(
         "--reconciliation-interval", dest="reconciliation_interval", type=int, default=None,
-        help="Bounded reconciliation interval seconds for the service definition (default: portable default).",
+        help="Bounded provider-reconciliation interval seconds for the service definition "
+             "(default: portable default). The low-frequency ticket-provider fallback cadence.",
+    )
+    p.add_argument(
+        "--drain-interval", dest="drain_interval", type=int, default=None,
+        help="Local-drain interval seconds for the service definition (Redmine #14150; default: "
+             "portable default). Finer than the reconciliation cadence — the local drain reads no "
+             "provider, so it delivers already-safe pending rows more promptly at zero provider cost.",
     )
     p.add_argument("--json", action="store_true", dest="as_json", help="Emit a structured JSON result.")
     p.add_argument("--home", default=None, help=argparse.SUPPRESS)  # test/debug: override mozyo home

@@ -43,6 +43,9 @@ from mozyo_bridge.core.state.supervisor_lease import (
     SupervisorLeaseStore,
 )
 from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_DELIVERED, CALLBACK_INFLIGHT, CALLBACK_PENDING, WorkflowRuntimeStore  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    workspace_callback_drain as _drain,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
@@ -95,11 +98,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    ISSUE_LEASE_LOST,
+    ISSUE_PASS_ERROR,
+    ISSUE_SOURCE_UNREADABLE,
     SKIP_LEASE_LOST,
     SKIP_LEASE_REFUSED,
     SKIP_NO_ACTIVE_ISSUES,
     SKIP_ROSTER_UNREADABLE,
     SUPERVISION_BOUNDED_RECONCILIATION,
+    SUPERVISION_LOCAL_DRAIN,
     IssueSupervisionOutcome,
     SupervisorReport,
     WorkspaceSupervisionOutcome,
@@ -127,14 +134,9 @@ class _NullSource:
 
 _NULL_SOURCE = _NullSource()
 
-#: A per-issue supply error token: the Redmine source could not be read for durable-event supply /
-#: candidate discovery (fail-open per issue — the callback drain still ran).
-ISSUE_SOURCE_UNREADABLE = "redmine_source_unreadable"
-#: A per-issue error token: the whole issue pass raised (recorded, not fatal to the sweep).
-ISSUE_PASS_ERROR = "issue_pass_error"
-#: A per-issue error token: the send-boundary ownership fence tripped (a takeover during this
-#: issue's source reads), so the outbox delivery was skipped — zero-send (Redmine #13683 R2-F1).
-ISSUE_LEASE_LOST = "lease_lost_before_send"
+# The per-issue error tokens (``ISSUE_SOURCE_UNREADABLE`` / ``ISSUE_PASS_ERROR`` / ``ISSUE_LEASE_LOST``)
+# moved to the pure domain module (#14150 module-health leaf split), imported + re-exported below so the
+# public import surface (and ``__all__``) is unchanged; the drain sibling reads them from the domain too.
 # ``REVIEW_RETURN_OWNER_READ_ERROR`` (#13684 R1-F3) / ``LANE_GATEWAY_OWNER_READ_ERROR`` (#13683 R2) now
 # live in the sibling leaf; imported above and re-exported via ``__all__`` for a stable import surface.
 # ``SupervisedWorkspace`` and the ``default_*`` production wiring live in the ``supervisor_wiring``
@@ -170,6 +172,12 @@ class WorkspaceCallbackSupervisor:
             Callable[[str, str, Optional[RedmineJournalSource]], Optional[str]]
         ] = None,
         backlog_drain_fn: Optional[Callable[..., BacklogDrainOutcome]] = None,
+        lane_generation_fn: Optional[Callable[[str, str], str]] = None,
+        drain_sender_fn: Optional[
+            Callable[[SupervisedWorkspace], Callable[[CallbackOutboxRow], str]]
+        ] = None,
+        reconcile_due_fn: Optional[Callable[[str], bool]] = None,
+        reconcile_mark_fn: Optional[Callable[[str, bool], None]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -211,6 +219,25 @@ class WorkspaceCallbackSupervisor:
         # each leased workspace converges ITS OWN pending partition (a hibernated / superseded owning lane
         # never re-supervised) through the action-time fence. Optional; production drainer in build_supervisor.
         self._backlog_drain_fn = backlog_drain_fn
+        # Redmine #14150: the LOCAL owning-lane generation reader ``(workspace_id, issue) -> generation``.
+        # Read from the LOCAL lifecycle authority (no provider call). Stamped on coordinator candidates at
+        # ingest (so the drain can attest currency locally) and read again by the drain to fence stale
+        # rows. Optional (unit fakes unchanged); the production reader is wired in build_supervisor.
+        self._lane_generation_fn = lane_generation_fn
+        # Redmine #14150: the provider-free sender factory for the LOCAL drain — a background-service
+        # sender with NO round-fence (the only provider read in the send path), so a drain delivery makes
+        # zero ticket-provider calls. Optional; when absent a drain pass delivers nothing (fail-safe).
+        self._drain_sender_fn = drain_sender_fn
+        # Redmine #14150 provider-reconciliation cadence: ``reconcile_due_fn(workspace_id)`` is the
+        # durable watermark + jitter/backoff gate. When wired and it returns False for a workspace, the
+        # bounded-reconciliation pass DOWNGRADES that workspace to a LOCAL drain (0 provider reads) —
+        # so a full-roster / full-journal provider re-read is not the always-on default; a recently
+        # reconciled workspace is only drained. ``reconcile_mark_fn(workspace_id, produced_new)`` advances
+        # the watermark after a completed provider read (and feeds the empty-pass backoff). Both optional
+        # (default None -> always due -> the pre-#14150 every-pass reconcile, unit-fake behaviour). A
+        # due-check failure fails toward reconciling (never silently suppresses the provider fallback).
+        self._reconcile_due_fn = reconcile_due_fn
+        self._reconcile_mark_fn = reconcile_mark_fn
 
     # -- public entrypoint -------------------------------------------------
 
@@ -235,6 +262,17 @@ class WorkspaceCallbackSupervisor:
         workspace and merged with the drained wakes. Bounded reconciliation (the whole-roster
         mode) is the loss recovery: a dropped wake is still caught because the roster is re-read.
         """
+        # Redmine #14150: the LOCAL outbox drain is a distinct execution path — it reads local state
+        # only (the outbox + the local lifecycle authority) and delivers already-enqueued, locally
+        # attestable coordinator rows through a provider-free sender. It never resolves a Redmine
+        # source, never supplies events, and never runs the reconcile leg, so an empty pass and a
+        # safe-pending pass both reach the ticket provider ZERO times (close condition 1). The
+        # duplicate-supervisor lease fence is unchanged (a live duplicate owner still skips).
+        if mode == SUPERVISION_LOCAL_DRAIN:
+            outcomes = [self._drain_workspace_locally(ws) for ws in self._workspaces_fn()]
+            return SupervisorReport(
+                mode=mode, holder=self._holder, workspaces=tuple(outcomes)
+            )
         wake_by_ws = _group_wake_hints(wake_hints)
         # Redmine #13968 F1: resolve the authoritative-workspace map ONCE per sweep (a single
         # home-global lifecycle read), so every workspace's authoritative filter reads the same
@@ -339,6 +377,34 @@ class WorkspaceCallbackSupervisor:
                     non_authoritative_issues=non_authoritative,
                     skipped_reason=SKIP_NO_ACTIVE_ISSUES,
                 )
+            # Redmine #14150 provider-reconciliation cadence: if this workspace is NOT due for a
+            # provider reconcile (its durable watermark is still inside the backoff window), DOWNGRADE
+            # it to a LOCAL drain this pass — zero provider reads — instead of re-reading every journal.
+            # This is what stops "全workspace・全journal再読を常時の既定にする". The gate applies ONLY to
+            # bounded reconciliation (local_wake / drain modes never reach here) and only when a due-fn
+            # is wired; a due-check failure fails toward reconciling, never suppressing the fallback.
+            if mode == SUPERVISION_BOUNDED_RECONCILIATION and self._reconcile_due_fn is not None:
+                try:
+                    reconcile_due = bool(self._reconcile_due_fn(wsid))
+                except Exception:  # noqa: BLE001 - a due-check failure fails toward reconciling
+                    reconcile_due = True
+                if not reconcile_due:
+                    drain_sender = (
+                        self._drain_sender_fn(ws) if self._drain_sender_fn is not None else None
+                    )
+                    drain_outcomes, drain_lease_lost = self._drain_issues_from_outbox(
+                        wsid, drain_sender
+                    )
+                    return WorkspaceSupervisionOutcome(
+                        workspace_id=wsid,
+                        lease_acquired=True,
+                        lease_reason=lease.reason,
+                        supervised_issues=supervised,
+                        ignored_wake_issues=selection.ignored_wake,
+                        non_authoritative_issues=non_authoritative,
+                        issues=tuple(drain_outcomes),
+                        skipped_reason=SKIP_LEASE_LOST if drain_lease_lost else "",
+                    )
             source = self._redmine_source_fn(ws)
             sender = self._sender_fn(ws)
             binding = self._binding_fn(ws) if self._binding_fn is not None else None
@@ -363,6 +429,20 @@ class WorkspaceCallbackSupervisor:
                     # source reads): the lease is gone, so stop before any further workspace work.
                     lease_lost = True
                     break
+            # Redmine #14150: a completed provider reconcile advances this workspace's durable
+            # watermark (and feeds the empty-pass backoff), so the next passes within the backoff
+            # window downgrade to a local drain. ``produced`` = this pass supplied an event or
+            # delivered a callback (non-empty), which resets the backoff toward the floor.
+            if (
+                mode == SUPERVISION_BOUNDED_RECONCILIATION
+                and self._reconcile_mark_fn is not None
+                and not lease_lost
+            ):
+                produced = any(o.events_supplied or o.delivered for o in issue_outcomes)
+                try:
+                    self._reconcile_mark_fn(wsid, produced)
+                except Exception:  # noqa: BLE001 - a watermark write never breaks the sweep
+                    pass
             # Redmine #13974 R2: while we still hold the lease, drain THIS workspace's own pending +
             # stale-inflight backlog (issues NOT in the active roster) through the same action-time fence
             # (renew guard stops before a send on takeover; own-partition only; skip supervised issues).
@@ -413,6 +493,21 @@ class WorkspaceCallbackSupervisor:
         except Exception:  # noqa: BLE001 - an unreadable outbox gates no drain (fail-open)
             return False
 
+    # -- local outbox drain (Redmine #14150) -------------------------------
+    # The drain leg lives in the ``workspace_callback_drain`` sibling leaf (module-health split); the
+    # methods below are thin delegators so the public class surface and every call site are unchanged.
+
+    def release_all_leases(self) -> tuple[str, ...]:
+        return _drain.release_all_leases(self)
+
+    def _drain_workspace_locally(self, ws: SupervisedWorkspace) -> WorkspaceSupervisionOutcome:
+        return _drain.drain_workspace_locally(self, ws)
+
+    def _drain_issues_from_outbox(
+        self, workspace_id: str, sender: Optional[Callable[[CallbackOutboxRow], str]]
+    ) -> tuple[list[IssueSupervisionOutcome], bool]:
+        return _drain.drain_issues_from_outbox(self, workspace_id, sender)
+
     # -- per-issue ---------------------------------------------------------
 
     def _supervise_issue(
@@ -451,10 +546,22 @@ class WorkspaceCallbackSupervisor:
                 # keep their prior coordinator route, so no worker gate is silently dropped.
                 lane_gateway_active = self._owner_binding_fn is not None
                 target_lane, target_receiver = coordinator_target_tuple(binding, self._route)
+                # Redmine #14150: stamp the coordinator candidates with the owning-lane generation read
+                # from the LOCAL lifecycle authority, so the local outbox drain can later attest the row
+                # is still current WITHOUT a provider read (a stale row is deferred, never blind-sent).
+                enqueue_lane_gen = ""
+                if self._lane_generation_fn is not None:
+                    try:
+                        enqueue_lane_gen = str(
+                            self._lane_generation_fn(workspace_id, issue) or ""
+                        ).strip()
+                    except Exception:  # noqa: BLE001 - an unreadable local generation just leaves it blank
+                        enqueue_lane_gen = ""
                 candidates = tuple(
                     discover_candidates(
                         source, issue, route=self._route, workspace_id=workspace_id,
                         target_lane=target_lane, target_receiver=target_receiver,
+                        enqueue_lane_generation=enqueue_lane_gen,
                         exclude_gates=LANE_GATEWAY_GATES if lane_gateway_active else (),
                     )
                 )
@@ -524,6 +631,7 @@ class WorkspaceCallbackSupervisor:
             return IssueSupervisionOutcome(
                 issue=issue, events_supplied=events_supplied, error=error,
                 historical_fenced=historical_fenced,
+                provider_read=source is not None,
                 review_return_refusals=review_return_refusals,
                 lane_gateway_refusals=lane_gateway_refusals,
             )
@@ -540,6 +648,7 @@ class WorkspaceCallbackSupervisor:
             return IssueSupervisionOutcome(
                 issue=issue, events_supplied=events_supplied, error=ISSUE_LEASE_LOST,
                 historical_fenced=historical_fenced,
+                provider_read=source is not None,
                 review_return_refusals=review_return_refusals,
                 lane_gateway_refusals=lane_gateway_refusals,
             )
@@ -558,6 +667,7 @@ class WorkspaceCallbackSupervisor:
             return IssueSupervisionOutcome(
                 issue=issue, events_supplied=events_supplied, error=error or ISSUE_PASS_ERROR,
                 historical_fenced=historical_fenced,
+                provider_read=source is not None,
                 review_return_refusals=review_return_refusals,
                 lane_gateway_refusals=lane_gateway_refusals,
             )
@@ -594,6 +704,8 @@ class WorkspaceCallbackSupervisor:
             pending=len(sweep.get("pending") or []),
             dead_letter=len(sweep.get("dead_letter") or []),
             historical_fenced=historical_fenced,
+            deferred=len(deliver.get("deferred") or []),
+            provider_read=source is not None,
             error=error,
             review_return_refusals=review_return_refusals,
             lane_gateway_refusals=lane_gateway_refusals,
@@ -651,6 +763,8 @@ def build_supervisor(
     store_path: Optional[Path] = None,
     release_after: bool = True,
     lease_ttl_seconds: int = SUPERVISOR_LEASE_TTL_SECONDS,
+    reconcile_interval_seconds: Optional[int] = None,
+    reconcile_max_interval_seconds: Optional[int] = None,
 ) -> WorkspaceCallbackSupervisor:
     """Build the production supervisor over the home registry, shared store, and shared outbox.
 
@@ -707,6 +821,29 @@ def build_supervisor(
             round_fence_fn=review_round_send_fence(lambda: default_redmine_source(ws, home=home)),
         )
 
+    def _drain_sender_fn(ws: SupervisedWorkspace):
+        # Redmine #14150: the LOCAL-drain sender. Identical to _sender_fn EXCEPT it wires NO
+        # round_fence_fn — the round fence (review_round_send_fence) is the only ticket-provider read in
+        # the send path, so omitting it makes a drain delivery provider-free by construction. The lease /
+        # claim / target-resolve / retirement gates it keeps are all LOCAL (lease store / outbox / pane
+        # inventory / retire store), so a coordinator row is fully attested without any Redmine read.
+        return BackgroundServiceCallbackSender(
+            workspace_id=ws.workspace_id,
+            holder=holder,
+            lease_store=lease_store,
+            target_resolver=default_target_resolver(ws, lifecycle_store=lifecycle_store),
+            transport=default_background_transport(ws),
+            outbox=outbox,
+        )
+
+    def _lane_generation_fn(workspace_id: str, issue: str) -> str:
+        # Redmine #14150: the LOCAL owning-lane generation (no provider read). Blank when the lane is
+        # unresolvable, so the drain defers the issue rather than deliver un-attested.
+        lane_id, generation, _disposition = resolve_lane_facts(
+            lifecycle_store, workspace_id, issue
+        )
+        return str(generation) if lane_id else ""
+
     def _owner_binding_fn(workspace_id: str, issue: str, binding: object) -> OwningLaneBinding:
         return owning_lane_binding(
             workspace_id, issue, binding, lifecycle_store=lifecycle_store
@@ -738,6 +875,36 @@ def build_supervisor(
         runtime_fn=lane_worker_runtime,
     )
 
+    # Redmine #14150 provider-reconciliation cadence: the durable per-workspace watermark + exponential
+    # empty-pass backoff + jitter. A workspace inside its backoff window is downgraded to a local drain
+    # (0 provider reads); a completed reconcile advances the watermark. A blank watermark reads as
+    # "never reconciled -> due", so the FIRST pass over a workspace always reconciles (single run-once
+    # is unchanged); only repeated passes within the window downgrade. The values are portable defaults
+    # (measurement-based, not private): the reconcile interval is the coarse provider fallback cadence.
+    import random as _random
+
+    from mozyo_bridge.core.state.reconcile_cadence import ReconcileCadenceStore
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+        DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+        reconcile_backoff_seconds,
+        should_reconcile_source,
+    )
+
+    base_interval = int(reconcile_interval_seconds or DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
+    max_interval = int(reconcile_max_interval_seconds or (base_interval * 4))
+    cadence_store = ReconcileCadenceStore(home=home)
+
+    def _reconcile_due_fn(workspace_id: str) -> bool:
+        watermark = cadence_store.read(workspace_id)
+        due_after = reconcile_backoff_seconds(
+            base_interval, watermark.empty_passes, max_interval_seconds=max_interval,
+            jitter_unit=_random.random(), jitter_fraction=0.2,
+        )
+        return should_reconcile_source(watermark.last_reconciled_at, _utc_now_iso(), due_after)
+
+    def _reconcile_mark_fn(workspace_id: str, produced_new: bool) -> None:
+        cadence_store.mark(workspace_id, now=_utc_now_iso(), produced=produced_new)
+
     return WorkspaceCallbackSupervisor(
         holder=holder,
         lease_store=lease_store,
@@ -756,6 +923,10 @@ def build_supervisor(
         authoritative_fn=lambda: default_authoritative_map(lifecycle_store),
         candidate_fence_fn=_candidate_fence_fn,
         backlog_drain_fn=_backlog_drain_fn,
+        lane_generation_fn=_lane_generation_fn,
+        drain_sender_fn=_drain_sender_fn,
+        reconcile_due_fn=_reconcile_due_fn,
+        reconcile_mark_fn=_reconcile_mark_fn,
     )
 
 

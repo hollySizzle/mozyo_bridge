@@ -402,6 +402,57 @@ recovery:
   - never infer progress from notification or pane text
 ```
 
+## local drain と provider reconciliation の分離（#14150）
+
+`mozyo-bridge workflow supervisor` の bounded one-shot pass は、次の三つの独立した実行経路へ分離する。
+いずれも `WorkspaceCallbackSupervisor` を唯一の reconcile owner として共有し、第二 supervisor / 第二
+outbox を作らない。local 状態 DB は derived state であり Ticket System Port の durable work record を
+置き換えない。
+
+| 経路 | current-public 入口 | provider 読み取り | 役割 |
+| --- | --- | --- | --- |
+| local outbox drain | `workflow supervisor --drain-only`（`SUPERVISION_LOCAL_DRAIN`） | **0** | local 状態だけを読み、local に attest 済みの pending row を claim・deliver する |
+| event-driven ingest / wake | `workflow supervisor --watch`（`SUPERVISION_LOCAL_WAKE`） | 起床 issue のみ bounded | canonical gate 記録後、periodic reconcile を待たず即時 one-shot で到達する |
+| ticket-provider reconciliation | `workflow supervisor --run-once`（`SUPERVISION_BOUNDED_RECONCILIATION`） | cursor/watermark + jitter/backoff で有界 | 起床喪失・外部/MCP 更新・restart を回収する低頻度 fallback |
+
+### local drain の 0 provider-call 契約
+
+local drain は ticket-provider source を一切 resolve しない（`redmine_source_fn` を呼ばない）。空 pass
+と「安全に送信可能な pending pass」の双方で provider call は 0 である（`SupervisorReport.provider_calls`
+で観測可能、`empty_pass` も併記）。row を local に安全に attest できる条件は、その row の
+`enqueue_lane_generation`（ingest 時に **local lifecycle authority** から刻んだ owning-lane generation）が
+現在の local lane generation と一致することである。coordinator route のみがこの local 属性で attest でき、
+`review_return:<lane>` / `lane_gateway:<lane>` は送信時 round-fence（provider 読み）が必要なため drain は
+それらを claim せず（route filter）、reconciliation 経路へ倒す。attest できない row は blind send せず
+`deferred`（pending へ戻す。terminal 化しない・retry を消費しない）として reconciliation に委ねる。
+
+drain の配送冪等性は outbox の row-level `claim_token`（`BEGIN IMMEDIATE` の単一勝者）が担う。workspace
+lease は duplicate-supervisor fence（active duplicate owner の二重実行防止）として維持し、drain もこの lease
+を通常取得する。
+
+### provider reconciliation の cadence
+
+provider reconciliation は per-workspace durable watermark（`reconcile-cadence.sqlite`）+ 連続空 pass の
+指数 backoff + jitter で、全 workspace・全 journal の再読を常時の既定にしない。backoff window 内の workspace
+は当該 pass で local drain へ downgrade する（provider 読み 0）。watermark は完了した provider 読みでのみ前進
+し、drain-only tick は watermark を進めない（fallback を抑制しない）。cadence が壊れても安全側（未 reconcile
+→ due）に倒れる rebuildable cache である。
+
+### lease lifecycle（bounded / error 終了）
+
+通常 `--run-once` 終了は workspace lease を解放する。`--watch` は iteration 跨ぎで lease を保持
+（`release_after=False`）するが、bounded 終了・exception・`wake=error` の終了時に
+`release_all_leases()`（token-conditional）で保持 lease を解放する。これにより終了済み holder の lease が
+fallback `--run-once` を TTL まで starve させない。token-conditional なので新規 live owner の lease は evict
+せず、duplicate-owner fence は維持する。
+
+### OS scheduler adapter
+
+LaunchAgent / systemd timer / cron は同じ bounded one-shot command を起動する adapter であり、LLM turn 内の
+sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain 経路（`--drain-only`）は別 cadence の
+別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
+測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
+
 ## 現行0.12.2と目標状態の差
 
 | 領域 | 現行0.12.2 | 目標の契約 |
