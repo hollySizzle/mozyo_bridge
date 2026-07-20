@@ -42,11 +42,24 @@ def _run(argv) -> tuple[int, str]:
 class CliWorkflowSupervisorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = str(Path(tempfile.mkdtemp()))
+        # A hermetic OS user home for the owned LaunchAgent plist/log, so the
+        # projection never reads the dogfood host's real ~/Library/LaunchAgents
+        # (Redmine #14103). --home is the mozyo home and by design never
+        # relocates the plist, so the plist root is isolated via Path.home().
+        self.os_home = Path(tempfile.mkdtemp())
+
+    def _service_status(self) -> tuple[int, str]:
+        """Run ``--service-status`` with both host reads isolated: launchctl is a
+        fake subprocess and ``Path.home()`` resolves to a temp root, so
+        ``installed`` reflects only the plist this test controls under
+        ``self.os_home`` — never the host's installed service."""
+        with patch.object(sl.subprocess, "run", side_effect=_fake_run), patch(
+            "pathlib.Path.home", return_value=self.os_home
+        ):
+            return _run(["workflow", "supervisor", "--service-status", "--home", self.home, "--json"])
 
     def test_service_status_reports_projection_and_definition_exit_zero(self) -> None:
-        # Patch the launchctl subprocess so no real host service is probed.
-        with patch.object(sl.subprocess, "run", side_effect=_fake_run):
-            rc, out = _run(["workflow", "supervisor", "--service-status", "--home", self.home, "--json"])
+        rc, out = self._service_status()
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         self.assertFalse(payload["installed"])
@@ -58,6 +71,20 @@ class CliWorkflowSupervisorTest(unittest.TestCase):
         # Secret-free and path-free.
         self.assertNotIn("api_key", out.lower())
         self.assertNotIn(self.home, out)
+
+    def test_service_status_reports_installed_when_owned_plist_present(self) -> None:
+        # Positive verdict held deterministic by the same OS-home seam: an owned
+        # plist under the isolated home is reported installed, proving the
+        # projection reflects the controlled home rather than being always-false.
+        target = sl.plist_path(self.os_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        argv = ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", self.home]
+        target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=self.os_home))
+        rc, out = self._service_status()
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["installed"])
+        self.assertTrue(payload["plist_exists"])
 
     def test_mutating_verbs_fail_closed_zero_mutation_on_non_darwin(self) -> None:
         with patch.object(sl, "_running_on_darwin", return_value=False), patch.object(

@@ -788,32 +788,81 @@ class InventoryActivityJoinTest(unittest.TestCase):
         )
 
 
+class _FakeHealthzResponse:
+    """Context-manager stand-in for ``urllib.request.urlopen`` returning a 200
+    ``/healthz`` body, so the OTel receiver probe is deterministic and never
+    reads the host's real ``127.0.0.1:4318`` receiver (Redmine #14103)."""
+
+    def __enter__(self) -> "_FakeHealthzResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return b"{}"
+
+
+def _healthz_up(*_a: object, **_k: object) -> _FakeHealthzResponse:
+    return _FakeHealthzResponse()
+
+
+def _healthz_down(*_a: object, **_k: object):
+    raise urllib.error.URLError("otel receiver down (fixture)")
+
+
 class DoctorOtelSectionTest(unittest.TestCase):
-    def test_receiver_down_is_by_design_and_gaps_are_listed(self) -> None:
+    # A fixed tmux pane view (one claude pane that never emitted telemetry),
+    # injected so the section is judged off the fixture, not the live host.
+    _PANES = [
+        {
+            "id": "%1",
+            "location": "mozyo-demo:1.0",
+            "command": "claude",
+            "cwd": "",
+            "window_name": "claude",
+            "pane_active": "1",
+        },
+    ]
+
+    def _run_section(self, *, healthz) -> dict:
+        """Run ``doctor_otel_section`` over a hermetic temp home with the tmux
+        pane view fixed and the receiver ``/healthz`` probe faked (``healthz`` is
+        the ``urlopen`` double). Reads neither the host receiver nor
+        ``~/.mozyo_bridge`` — the section's verdict comes only from the fixtures.
+        """
         from mozyo_bridge.application.doctor import doctor_otel_section
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
-            panes = [
-                {
-                    "id": "%1",
-                    "location": "mozyo-demo:1.0",
-                    "command": "claude",
-                    "cwd": "",
-                    "window_name": "claude",
-                    "pane_active": "1",
-                },
-            ]
             with patch.dict(
                 "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
             ), patch(
                 "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
-                return_value=panes,
-            ):
-                section = doctor_otel_section(argparse.Namespace())
+                return_value=[dict(pane) for pane in self._PANES],
+            ), patch("urllib.request.urlopen", healthz):
+                return doctor_otel_section(argparse.Namespace())
+
+    def test_receiver_down_is_by_design_and_gaps_are_listed(self) -> None:
+        section = self._run_section(healthz=_healthz_down)
         self.assertEqual("ok", section["status"])
         self.assertFalse(section["receiver_reachable"])
         self.assertTrue(
+            any("BY DESIGN" in note for note in section["notes"])
+        )
+        self.assertEqual(
+            [{"pane_id": "%1", "session": "mozyo-demo", "agent": "claude"}],
+            section["unobserved_agents"],
+        )
+
+    def test_receiver_reachable_is_reported_when_healthz_responds(self) -> None:
+        # Positive verdict, held deterministic by the same seam: a responding
+        # /healthz is reported reachable and drops the BY DESIGN down-note, while
+        # the section stays a diagnosis and still lists the unobserved pane.
+        section = self._run_section(healthz=_healthz_up)
+        self.assertEqual("ok", section["status"])
+        self.assertTrue(section["receiver_reachable"])
+        self.assertFalse(
             any("BY DESIGN" in note for note in section["notes"])
         )
         self.assertEqual(
