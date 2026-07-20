@@ -74,9 +74,19 @@ def coordinator_shared_create_lock(home: Path):
     unmakeable / unopenable (permission, a directory in its place), or a ``flock``
     error — is raised as :class:`CoordinatorSharedCreateLockUnavailable` rather than
     a raw ``OSError``, so the single caller can convert exactly one type into the
-    session-start typed error boundary (R6 review j#83569 F2). Exceptions raised
-    inside the guarded body are propagated unchanged (they are the launch's own
-    fail-closed errors, not the fence's).
+    session-start typed error boundary (R6 review j#83569 F2 / R7 review j#83596 F1).
+    This holds for the WHOLE lock lifecycle, mirroring
+    :meth:`...startup_transaction_fence._FenceLock.__exit__`:
+
+    - **acquisition** (``mkdir`` / ``open`` / ``flock LOCK_EX``): a failure closes any
+      opened fd quietly (a secondary close error must not mask the acquire error) and
+      raises :class:`CoordinatorSharedCreateLockUnavailable`;
+    - **release** (``flock LOCK_UN`` and ``os.close``): BOTH are always attempted and
+      the fd is always closed, so no fd leaks. A release failure is surfaced as
+      :class:`CoordinatorSharedCreateLockUnavailable` **only when the guarded body
+      succeeded** — a body exception is the real fault and is propagated UNCHANGED,
+      never overwritten by a secondary unlock/close error (that is the whole point of
+      "body exceptions are propagated unchanged").
     """
     try:
         import fcntl
@@ -88,26 +98,50 @@ def coordinator_shared_create_lock(home: Path):
         ) from exc
 
     path = coordinator_shared_create_lock_path(home)
+    fd = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
     except OSError as exc:
+        _close_fd_quietly(fd)
         raise CoordinatorSharedCreateLockUnavailable(
-            f"could not open the shared coordinators single-flight lock at {path}: {exc}"
+            f"could not acquire the shared coordinators single-flight lock at {path}: "
+            f"{exc}"
         ) from exc
+
+    body_failed = False
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as exc:  # pragma: no cover - blocking flock rarely errors here
-            raise CoordinatorSharedCreateLockUnavailable(
-                f"could not acquire the shared coordinators single-flight lock: {exc}"
-            ) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        yield
+    except BaseException:
+        # The body's own fail-closed error (or any exception) is the real fault; a
+        # secondary release error below must not overwrite it.
+        body_failed = True
+        raise
     finally:
-        os.close(fd)
+        release_error = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as unlock_exc:  # pragma: no cover - unlock rarely errors
+            release_error = unlock_exc
+        try:
+            os.close(fd)
+        except OSError as close_exc:  # pragma: no cover - close rarely errors
+            release_error = release_error or close_exc
+        if release_error is not None and not body_failed:
+            raise CoordinatorSharedCreateLockUnavailable(
+                "could not release the shared coordinators single-flight lock "
+                f"({release_error}); fail closed"
+            ) from release_error
+
+
+def _close_fd_quietly(fd: Optional[int]) -> None:
+    """Close ``fd`` swallowing any error, so a cleanup close never masks a real one."""
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 __all__ = (

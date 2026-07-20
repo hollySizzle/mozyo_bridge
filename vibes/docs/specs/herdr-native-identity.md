@@ -527,11 +527,13 @@ shared default-lane の **list→resolve→create を home-scoped exclusive advi
 (double-checked) し、無いときだけ create する。よって同時起動でも create するのは 1 process だけで、他は待機後
 再 resolve で husk-adoption/adopt に収束し、**shared workspace は 1 個**になる。**own-pin heal は lock を取らない**
 (create しない = R5 F2 契約維持)。lock は home 下の 0600 advisory artifact で state を持たず、operator config
-write ではない (`flock` のみ)。lock protocol 不能 / home permission / acquire error は list/create の**前**に起きるので
-**zero herdr actuation** で session-start の typed error (`HerdrSessionStartError`) へ変換して fail-closed する
-(R6 review j#83569 F2、public CLI が raw traceback にならない)。concurrent 収束は `threading.Barrier` +
-共有 fake backend + `fcntl.flock` の別-fd 競合で **create count 1** を deterministic に regression 固定する
-(live Herdr smoke 不要)。
+write ではない (`flock` のみ)。lock lifecycle 全体で raw `OSError` を出さない: acquire error (fcntl 不能 / home permission /
+`LOCK_EX`) は list/create の**前**なので **zero herdr actuation** で、release error (`LOCK_UN` / `close`、両方必ず
+試行し fd は必ず close) は **body 成功時のみ**、いずれも session-start の typed error (`HerdrSessionStartError`) へ
+変換して fail-closed する (R6 review j#83569 F2 / R7 review j#83596 F1、public CLI が raw traceback にならない)。
+**body が例外を投げた場合は release error で上書きせず元例外を不変伝播**する (`_FenceLock.__exit__` と同 pattern)。
+concurrent 収束は `threading.Barrier` + 共有 fake backend + `fcntl.flock` の別-fd 競合で **create count 1** を
+deterministic に regression 固定する (live Herdr smoke 不要)。
 
 sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin が複数 herdr
 workspace に跨る場合は identity conflict として fail-closed (#13330 posture)。この label read / fence は shared_space の

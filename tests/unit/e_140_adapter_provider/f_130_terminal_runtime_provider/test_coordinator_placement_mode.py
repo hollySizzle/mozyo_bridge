@@ -459,6 +459,112 @@ class CoordinatorSharedCreateLockTest(unittest.TestCase):
         finally:
             os.close(fd)
 
+    # --- Release-lifecycle fault injection (Redmine #14139 R7 review j#83596 F1) ---
+    # A release (unlock / close) failure must (a) become the typed error only when the
+    # body SUCCEEDED, and (b) NEVER overwrite a body exception.
+
+    def _unlock_boom(self):
+        import fcntl
+
+        real = fcntl.flock
+
+        def flaky(fd, op):
+            if op & fcntl.LOCK_UN:
+                raise OSError(5, "simulated unlock failure")
+            return real(fd, op)
+
+        return flaky
+
+    def _close_boom(self):
+        import os
+
+        real = os.close
+        seen: list = []
+
+        def flaky(fd):
+            seen.append(fd)
+            if len(seen) == 1:  # the fence's release close is the first close here
+                try:
+                    real(fd)
+                except OSError:
+                    pass
+                raise OSError(5, "simulated close failure")
+            return real(fd)
+
+        return flaky
+
+    def test_unlock_failure_with_body_success_raises_typed(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateLockUnavailable,
+            coordinator_shared_create_lock,
+        )
+
+        home = self._home()
+        with patch("fcntl.flock", self._unlock_boom()):
+            with self.assertRaises(CoordinatorSharedCreateLockUnavailable):
+                with coordinator_shared_create_lock(home):
+                    pass
+
+    def test_unlock_failure_with_body_failure_preserves_body(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateLockUnavailable,
+            coordinator_shared_create_lock,
+        )
+
+        class _BodyError(Exception):
+            pass
+
+        home = self._home()
+        with patch("fcntl.flock", self._unlock_boom()):
+            with self.assertRaises(_BodyError):
+                with coordinator_shared_create_lock(home):
+                    raise _BodyError("body")
+        # And definitely NOT the release error type.
+        with patch("fcntl.flock", self._unlock_boom()):
+            try:
+                with coordinator_shared_create_lock(home):
+                    raise _BodyError("body")
+            except CoordinatorSharedCreateLockUnavailable:  # pragma: no cover
+                self.fail("release error overwrote the body exception")
+            except _BodyError:
+                pass
+
+    def test_close_failure_with_body_success_raises_typed(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state import coordinator_placement_fence as _fence
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateLockUnavailable,
+            coordinator_shared_create_lock,
+        )
+
+        home = self._home()
+        with patch.object(_fence.os, "close", self._close_boom()):
+            with self.assertRaises(CoordinatorSharedCreateLockUnavailable):
+                with coordinator_shared_create_lock(home):
+                    pass
+
+    def test_close_failure_with_body_failure_preserves_body(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state import coordinator_placement_fence as _fence
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            coordinator_shared_create_lock,
+        )
+
+        class _BodyError(Exception):
+            pass
+
+        home = self._home()
+        with patch.object(_fence.os, "close", self._close_boom()):
+            with self.assertRaises(_BodyError):
+                with coordinator_shared_create_lock(home):
+                    raise _BodyError("body")
+
 
 class ParseWorkspaceListTest(unittest.TestCase):
     """`_parse_workspace_list`: fail-closed herdr `workspace list` label parser."""
