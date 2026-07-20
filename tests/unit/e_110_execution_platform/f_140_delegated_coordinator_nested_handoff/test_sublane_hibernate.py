@@ -1128,6 +1128,76 @@ class SublaneProjectGatewayHibernateTest(unittest.TestCase):
             )
             self.assertEqual(ops.close_calls, [])
 
+    def _hibernate_cas_only(self, store, journal) -> None:
+        # Reproduce the R5 crash window: the `active -> hibernated` CAS lands (storing THIS
+        # cycle's decision) but a crash precedes the release open, so `release_action_id` is
+        # empty. Declaration is done by the caller.
+        store.transition_disposition(
+            LaneLifecycleKey(WS, PG_LANE),
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=1,
+            target=DISPOSITION_HIBERNATED,
+            decision=DecisionPointer(
+                source="redmine", issue_id=ISSUE, journal_id=journal
+            ),
+        )
+
+    def test_crash_window_old_journal_cannot_hijack(self) -> None:
+        # Redmine #13811 R5: the row is hibernated by cycle B (journal 90002) with the release
+        # NOT yet opened (release_action_id == ""). A stale cycle-A approval (journal 77485)
+        # must NOT be treated as current just because the action id is empty — the row carries
+        # cycle B's durable decision, so the old approval is fenced out (zero-close).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            self._hibernate_cas_only(store, "90002")
+            self.assertEqual(store.get(LaneLifecycleKey(WS, PG_LANE)).release_action_id, "")
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                HibernateRequest(
+                    issue=ISSUE,
+                    lane=PG_LANE,
+                    journal="77485",  # a DIFFERENT (older) cycle's approval
+                    project_scope=PG_SCOPE,
+                    expected_lane_generation="1",
+                    expected_revision="2",
+                    assertions=_all_gates(),
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.already_hibernated)
+            self.assertTrue(outcome.redrive_blocked)
+            self.assertFalse(outcome.preflight.action_identity_current)
+            self.assertIn(
+                BLOCK_STALE_ACTION_IDENTITY, outcome.preflight.blocked_reasons
+            )
+            self.assertEqual(ops.close_calls, [])
+
+    def test_crash_window_same_journal_recovery_resumes(self) -> None:
+        # The SAME cycle's approval (journal 90002) recovering the crash window IS current —
+        # the row's stored decision matches, so the release is opened / driven now.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            self._hibernate_cas_only(store, "90002")
+            ops = self._ops()
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                HibernateRequest(
+                    issue=ISSUE,
+                    lane=PG_LANE,
+                    journal="90002",  # the SAME cycle's approval
+                    project_scope=PG_SCOPE,
+                    expected_lane_generation="1",
+                    expected_revision="2",
+                    assertions=_all_gates(),
+                ),
+                execute=True,
+            )
+            self.assertTrue(outcome.already_hibernated)
+            self.assertFalse(outcome.redrive_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.preflight.action_identity_current)
+            self.assertEqual(len(ops.close_calls), 1)
+
     def test_issue_request_does_not_match_project_lane(self) -> None:
         # An issue-binding request (no project_scope) never matches a project-gateway row —
         # its empty issue_id != ISSUE — so the project lane is not hibernated by an issue call.
