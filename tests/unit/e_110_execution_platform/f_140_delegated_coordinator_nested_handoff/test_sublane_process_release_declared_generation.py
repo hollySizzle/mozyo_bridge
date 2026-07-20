@@ -133,6 +133,40 @@ class DeclaredGenerationExactlyLiveTest(unittest.TestCase):
     def test_provider_match_via_explicit_row_field(self) -> None:
         self.assertTrue(_match(_declared(), _live(provider="codex", agent="codex")))
 
+    # --- R4 F1: match on declared identity, not provider-as-slot ------------------
+    def test_swapped_binding_matches(self) -> None:
+        # A valid SWAPPED binding: the gateway SLOT is filled by the `claude` provider and the
+        # worker SLOT by `codex`. The old R3 matcher mapped the live provider token to a slot
+        # (claude->worker) and so misassigned both slots -> False. Matching by assigned name
+        # keeps the declared slot label authoritative, so a swapped binding matches.
+        gw_name = encode_assigned_name(WS, "claude", LANE)  # gateway slot, claude provider
+        wk_name = encode_assigned_name(WS, "codex", LANE)  # worker slot, codex provider
+        declared = [
+            _pin("gateway", "claude", gw_name, GW_LOC),
+            _pin("worker", "codex", wk_name, WK_LOC),
+        ]
+        rows = [_row(gw_name, GW_LOC), _row(wk_name, WK_LOC)]
+        self.assertTrue(_match(declared, rows))
+
+    def test_swapped_binding_wrong_provider_fails_closed(self) -> None:
+        # Same swapped binding, but the live gateway row surfaces a provider that disagrees
+        # with the declared pin — a wrong-provider generation, fail closed.
+        gw_name = encode_assigned_name(WS, "claude", LANE)
+        wk_name = encode_assigned_name(WS, "codex", LANE)
+        declared = [
+            _pin("gateway", "claude", gw_name, GW_LOC),
+            _pin("worker", "codex", wk_name, WK_LOC),
+        ]
+        rows = [_row(gw_name, GW_LOC, provider="rebound"), _row(wk_name, WK_LOC)]
+        self.assertFalse(_match(declared, rows))
+
+    def test_undeclared_extra_live_row_fails_closed(self) -> None:
+        # An extra in-scope live process the declaration never named (a third provider in the
+        # same lane unit) is a foreign / newer generation -> fail closed.
+        other = encode_assigned_name(WS, "gemini", LANE)
+        rows = _live() + [_row(other, "wProj:p5")]
+        self.assertFalse(_match(_declared(), rows))
+
     # --- F1 item 2: runtime_revision is a both-observed-only discriminant --------
     def test_declared_revision_live_unobserved_does_not_block(self) -> None:
         # 正本 (managed-state-model.md action-time match / #13846): a declared non-empty
@@ -200,6 +234,13 @@ class DeclaredGenerationExactlyLiveTest(unittest.TestCase):
         # The SAME assigned name + locator appears twice. A set would collapse it to one; the
         # raw name-count catches it as a herdr name-uniqueness violation (Redmine #13811 R2 F3).
         rows = [_row(GW_NAME, GW_LOC), _row(GW_NAME, GW_LOC), _row(WK_NAME, WK_LOC)]
+        self.assertFalse(_match(_declared(), rows))
+
+    def test_locatorless_duplicate_row_fails_closed(self) -> None:
+        # Redmine #13811 R4 F3: a duplicate of a valid live name that carries NO locator was
+        # skipped before the raw count, so it slipped past. The raw multiplicity is now counted
+        # BEFORE the locator filter, so a locatorless / stale duplicate fails closed.
+        rows = [_row(GW_NAME, GW_LOC), {"name": GW_NAME}, _row(WK_NAME, WK_LOC)]
         self.assertFalse(_match(_declared(), rows))
 
 

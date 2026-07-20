@@ -121,6 +121,13 @@ BLOCK_STALE_ACTION_GENERATION = "stale_action_generation"
 #: The disposition CAS is bound to the approved revision, so a stale approval is a pre-CAS
 #: zero-write / zero-close, never re-bound to the current revision / pins.
 BLOCK_STALE_ACTION_REVISION = "stale_action_revision"
+#: The already-hibernated redrive was invoked by an approval whose immutable action identity
+#: (the journal-scoped release action id) does NOT match the release the row already opened —
+#: a DIFFERENT hibernate cycle's approval trying to redrive this cycle's stored release
+#: (Redmine #13811 R4 F2; design j#78386 §1-3 "approved ... action_id" exact-match on both
+#: fresh execution and redrive). A stale cross-cycle approval never resumes another cycle's
+#: release; it fails closed zero-close.
+BLOCK_STALE_ACTION_IDENTITY = "stale_action_identity"
 # Early-hibernate (Redmine #13967 item 1) unpushed fence: an early-hibernate basis
 # presupposes the commits are integrated to staging, so an early-hibernate attempt whose
 # commits are not pushed / origin-reachable fails closed (unlike a dependency park, which
@@ -343,6 +350,12 @@ class HibernatePreflight:
     #: revision has advanced past the approval by the hibernate itself). ``True`` for an
     #: issue lane.
     action_revision_current: bool = True
+    #: The approval's immutable action identity matches the release the row already opened
+    #: (Redmine #13811 R4 F2). ONLY meaningful on the already-hibernated REDRIVE path — a
+    #: cross-cycle approval whose journal-scoped action id differs from the stored
+    #: ``release_action_id`` fails closed. ``True`` on the fresh path (no stored release yet)
+    #: and for an issue lane.
+    action_identity_current: bool = True
     assertions: HibernateAssertions = field(default_factory=HibernateAssertions)
 
     @property
@@ -358,6 +371,7 @@ class HibernatePreflight:
             and self.project_attestation_ok
             and self.action_generation_current
             and self.action_revision_current
+            and self.action_identity_current
         )
 
     @property
@@ -402,6 +416,8 @@ class HibernatePreflight:
             reasons.append(BLOCK_STALE_ACTION_GENERATION)
         if not self.action_revision_current:
             reasons.append(BLOCK_STALE_ACTION_REVISION)
+        if not self.action_identity_current:
+            reasons.append(BLOCK_STALE_ACTION_IDENTITY)
         if not self.project_generation_matched:
             reasons.append(BLOCK_PROJECT_GENERATION_MISMATCH)
         if not self.project_attestation_ok:
@@ -422,6 +438,7 @@ class HibernatePreflight:
             "project_attestation_ok": self.project_attestation_ok,
             "action_generation_current": self.action_generation_current,
             "action_revision_current": self.action_revision_current,
+            "action_identity_current": self.action_identity_current,
             "blocked_reasons": list(self.blocked_reasons),
         }
 
@@ -613,7 +630,15 @@ class SublaneHibernateUseCase:
         issue = _norm(request.issue)
         lane = _norm(request.lane)
         project_scope = _norm(request.project_scope)
+        journal = _norm(request.journal)
         workspace_id = _norm(self.ops.workspace_id())
+
+        # The immutable per-approval action identity (Redmine #13811 R4 F2). For a
+        # project-gateway lane the release action id is scoped to the approving journal, so a
+        # DIFFERENT hibernate cycle's approval (a different journal) can never resume THIS
+        # cycle's stored release on the already-hibernated redrive. An issue lane keeps the
+        # byte-identical ``hibernate:<lane>`` id (no behaviour change).
+        action_id = f"hibernate:{lane}:{journal}" if project_scope else f"hibernate:{lane}"
 
         # A malformed identity / anchor can address nothing — fail closed before any read.
         # The decision anchor is required (and issue-addressable) for BOTH binding kinds: a
@@ -704,6 +729,17 @@ class SublaneHibernateUseCase:
             and record_matches_binding(rec, issue_id=issue, project_scope=project_scope)
         )
         if already_hibernated:
+            # Redmine #13811 R4 F2: the redrive resumes the STORED release, so a project-gateway
+            # redrive is honored only when THIS approval's immutable action identity (the
+            # journal-scoped action id) matches the release the row already opened. A different
+            # hibernate cycle's approval (a different journal) fails closed here rather than
+            # redriving this cycle's stored release. An issue lane / a row with no open release
+            # is unchanged.
+            action_identity_current = (
+                (not project_scope)
+                or (not _norm(rec.release_action_id))
+                or (_norm(rec.release_action_id) == action_id)
+            )
             # The redrive also honors the project exact-generation / attestation / approval
             # gates: a partial release is resumed only while the lane's live slots are still
             # its declared, attested generation and the approval still names it — never
@@ -712,12 +748,13 @@ class SublaneHibernateUseCase:
                 inventory_readable
                 and request.assertions.preservation_satisfied
                 and action_generation_current
+                and action_identity_current
                 and project_generation_matched
                 and project_attestation_ok
             )
             release = None
             if execute and redrive_ok:
-                release = self._drive_release(key, lane, workspace_id, rows)
+                release = self._drive_release(key, lane, workspace_id, rows, action_id)
             preflight = HibernatePreflight(
                 original_identity_known=True,  # the hibernated lane is known
                 park_satisfied=request.assertions.park_satisfied,
@@ -728,6 +765,7 @@ class SublaneHibernateUseCase:
                 project_generation_matched=project_generation_matched,
                 project_attestation_ok=project_attestation_ok,
                 action_generation_current=action_generation_current,
+                action_identity_current=action_identity_current,
                 assertions=request.assertions,
             )
             return HibernateOutcome(
@@ -828,7 +866,7 @@ class SublaneHibernateUseCase:
                 detail=f"hibernate commit refused ({transition.reason})",
             )
 
-        release = self._drive_release(key, lane, workspace_id, rows)
+        release = self._drive_release(key, lane, workspace_id, rows, action_id)
         return HibernateOutcome(
             executed=True,
             preflight=preflight,
@@ -903,6 +941,7 @@ class SublaneHibernateUseCase:
         lane: str,
         workspace_id: str,
         rows: Sequence[Mapping[str, object]],
+        action_id: str,
     ) -> ReleaseOutcome:
         """Open (or resume) the release generation and close the lane's managed slots.
 
@@ -910,7 +949,9 @@ class SublaneHibernateUseCase:
         deletes a branch, or writes a metadata tombstone, and a partial close leaves the
         generation open and re-drivable (Redmine #13682). ``rows`` is the readability-vetted
         inventory snapshot the caller already read (R1-F1), so an empty ``rows`` means a
-        *confirmed*-empty inventory, never an unreadable one.
+        *confirmed*-empty inventory, never an unreadable one. ``action_id`` is the caller's
+        immutable action identity — journal-scoped for a project-gateway lane (Redmine #13811
+        R4 F2), the byte-identical ``hibernate:<lane>`` for an issue lane.
         """
         return drive_process_release(
             store=self.store,
@@ -918,7 +959,7 @@ class SublaneHibernateUseCase:
             key=key,
             lane_id=lane,
             workspace_id=workspace_id,
-            action_id=f"hibernate:{key.lane_id}",
+            action_id=action_id,
             rows=rows,
         )
 
@@ -935,6 +976,7 @@ __all__ = (
     "BLOCK_PROJECT_UNATTESTED",
     "BLOCK_REVIEW_PENDING",
     "BLOCK_STALE_ACTION_GENERATION",
+    "BLOCK_STALE_ACTION_IDENTITY",
     "BLOCK_STALE_ACTION_REVISION",
     "BLOCK_UNRECORDED_BOUNDARY",
     "BLOCK_UNPUSHED_COMMITS",

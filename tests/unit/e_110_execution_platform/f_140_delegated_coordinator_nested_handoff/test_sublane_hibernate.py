@@ -54,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_PROJECT_UNATTESTED,
     BLOCK_REVIEW_PENDING,
     BLOCK_STALE_ACTION_GENERATION,
+    BLOCK_STALE_ACTION_IDENTITY,
     BLOCK_STALE_ACTION_REVISION,
     BLOCK_UNPUSHED_COMMITS,
     BLOCK_UNRECORDED_BOUNDARY,
@@ -1093,6 +1094,39 @@ class SublaneProjectGatewayHibernateTest(unittest.TestCase):
             self.assertNotIn(
                 BLOCK_STALE_ACTION_REVISION, redrive.preflight.blocked_reasons
             )
+
+    def test_stale_cross_cycle_approval_cannot_redrive(self) -> None:
+        # Redmine #13811 R4 F2: a DIFFERENT hibernate cycle's approval (a different journal)
+        # must not redrive THIS cycle's stored release. Cycle B hibernates under JOURNAL and
+        # opens release action id `hibernate:<lane>:<JOURNAL>`. A stale cycle-A approval (a
+        # different journal) then targets the already-hibernated row — its journal-scoped
+        # action id differs from the stored release, so the redrive fails closed zero-close.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_pg(tmp)
+            first = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
+                self._request(), execute=True
+            )
+            self.assertFalse(first.is_blocked, first.preflight.blocked_reasons)
+            other = HibernateRequest(
+                issue=ISSUE,
+                lane=PG_LANE,
+                journal="90001",  # a DIFFERENT approval / cycle
+                project_scope=PG_SCOPE,
+                expected_lane_generation="1",
+                expected_revision="1",
+                assertions=_all_gates(),
+            )
+            ops = self._ops()
+            redrive = SublaneHibernateUseCase(ops=ops, store=store).run(
+                other, execute=True
+            )
+            self.assertTrue(redrive.already_hibernated)
+            self.assertTrue(redrive.redrive_blocked)
+            self.assertIn(
+                BLOCK_STALE_ACTION_IDENTITY, redrive.preflight.blocked_reasons
+            )
+            self.assertEqual(ops.close_calls, [])
 
     def test_issue_request_does_not_match_project_lane(self) -> None:
         # An issue-binding request (no project_scope) never matches a project-gateway row —
