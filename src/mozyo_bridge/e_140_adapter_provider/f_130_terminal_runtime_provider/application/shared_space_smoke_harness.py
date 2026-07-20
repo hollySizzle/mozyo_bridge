@@ -122,6 +122,7 @@ PHASE_LOCK_ACQUIRE = "lock_acquire"  # single-flight fence could not be acquired
 PHASE_LOCK_RELEASE = "lock_release_after_create"  # fence release failed AFTER create/adopt
 PHASE_LAUNCHER_PREFLIGHT = "launcher_preflight"  # managed-launch launcher incompatible
 PHASE_SESSION_START = "session_start"  # any other fail-closed session-start refusal
+PHASE_WORKER_ERROR = "worker_error"  # an UNCLASSIFIED exception crashed a concurrent worker
 
 #: The closed set of failure phases the harness can report.
 SMOKE_FAILURE_PHASES = (
@@ -131,6 +132,7 @@ SMOKE_FAILURE_PHASES = (
     PHASE_LOCK_RELEASE,
     PHASE_LAUNCHER_PREFLIGHT,
     PHASE_SESSION_START,
+    PHASE_WORKER_ERROR,
 )
 
 
@@ -278,24 +280,55 @@ class SharedSpaceSmokeObservation:
     """
 
     projects: tuple = ()
+    requested_projects: int = 0  # how many projects the smoke was asked to run
     coordinators_create_count: int = 0  # MUST be 1 (single-flight convergence)
     duplicate_agents: int = 0  # MUST be 0 (no assigned name minted twice)
     lock_engaged: bool = False  # the single-flight fence file was created
     lock_released_clean: bool = False  # the fence is free again after the run
-    residue_workspaces: int = -1  # after cleanup; MUST be 0 (unset = not verified)
-    residue_agents: int = -1  # after cleanup; MUST be 0 (unset = not verified)
+    residue_workspaces: int = -1  # after cleanup; MUST be 0 (unset/failed = not verified)
+    residue_agents: int = -1  # after cleanup; MUST be 0 (unset/failed = not verified)
+    residue_verified: bool = False  # cleanup residue was read back successfully
     cleanup_attempted: bool = False
 
     @property
+    def all_projects_completed(self) -> bool:
+        """Every requested project produced an observation and none failed (F2).
+
+        A crashed / dropped project must never let the aggregate claim success over
+        the survivors alone (review j#83870 F2): both the count must match AND no
+        observation may carry a ``failed`` outcome.
+        """
+        return (
+            len(self.projects) == self.requested_projects
+            and self.requested_projects > 0
+            and all(p.outcome != "failed" for p in self.projects)
+        )
+
+    @property
     def converged(self) -> bool:
-        """The core acceptance: exactly one ``coordinators`` space, no duplicates."""
-        return self.coordinators_create_count == 1 and self.duplicate_agents == 0
+        """The core acceptance: exactly one ``coordinators`` space, no duplicates.
+
+        Now gated on completeness (F2): a false green from a dropped project — where
+        the survivors happen to show create-count 1 / duplicate 0 — is no longer
+        ``converged``, because a missing or failed project fails
+        :attr:`all_projects_completed`.
+        """
+        return (
+            self.all_projects_completed
+            and self.coordinators_create_count == 1
+            and self.duplicate_agents == 0
+        )
 
     @property
     def residue_clear(self) -> bool:
-        """Cleanup ran and left zero residue (Acceptance 5)."""
+        """Cleanup ran, residue was READ BACK, and it was zero (Acceptance 5).
+
+        Gated on :attr:`residue_verified` (F3): an unreadable inventory can no longer
+        masquerade as residue-0 — an unverified residue is never clear.
+        """
         return (
             self.cleanup_attempted
+            and self.residue_verified
             and self.residue_workspaces == 0
             and self.residue_agents == 0
         )
@@ -307,12 +340,16 @@ class SharedSpaceSmokeObservation:
         ``--env`` value, or a raw herdr payload (Redmine #14187 Acceptance 4/6).
         """
         return {
+            "requested_projects": self.requested_projects,
+            "completed_projects": len(self.projects),
+            "all_projects_completed": self.all_projects_completed,
             "coordinators_create_count": self.coordinators_create_count,
             "duplicate_agents": self.duplicate_agents,
             "lock_engaged": self.lock_engaged,
             "lock_released_clean": self.lock_released_clean,
             "residue_workspaces": self.residue_workspaces,
             "residue_agents": self.residue_agents,
+            "residue_verified": self.residue_verified,
             "cleanup_attempted": self.cleanup_attempted,
             "converged": self.converged,
             "residue_clear": self.residue_clear,
@@ -450,7 +487,11 @@ class SharedSpaceSmokeHarness:
         startup_fence_factory: "Optional[Callable[[str], StartupTransactionFence]]" = None,
         probe: "Optional[StartupProbe]" = None,
     ) -> None:
-        self.home = Path(home)
+        # Resolved once: the actuation-time isolation guard (`_assert_isolation_bound`)
+        # compares this against the AMBIENT `mozyo_bridge_home()` the production path
+        # actually reads, so a split-brain (self.home isolated but ambient still the
+        # operator home) can never reach a herdr write (R1 review j#83870 F1).
+        self.home = Path(home).resolve()
         self.recorder = RecordingHerdrRunner(runner)
         self.env = dict(env)
         self.timeout = timeout
@@ -477,6 +518,36 @@ class SharedSpaceSmokeHarness:
         #: real code resolves it from the trusted env; the fake ignores the value.
         self._binary = _session._resolve_binary_or_die(self.env)
 
+    # -- isolation binding (fail-closed before any actuation) -----------------
+
+    def _assert_isolation_bound(self) -> None:
+        """Fail closed unless the AMBIENT home the production path reads is the isolated one.
+
+        The split-brain guard (R1 review j#83870 F1): the harness stores ``self.home``,
+        but the production ``prepare_session`` / the single-flight fence / the internal
+        ``register_workspace(repo_root)`` all resolve the home from the ambient
+        ``MOZYO_BRIDGE_HOME`` (``mozyo_bridge_home()``). If a caller constructs the
+        harness with an isolated ``home`` WITHOUT running inside
+        :func:`isolated_smoke_home` (so the ambient env still points at the operator
+        home), those production writes would land in the operator home even though the
+        harness's own reads (``preflight_clean_slate`` / ``observe_lock``) use
+        ``self.home``. This guard runs at EVERY mutating entry, BEFORE the first herdr
+        command, so an unbound / mismatched ambient home fails closed with zero
+        workspace / agent create and zero operator-home write — the public use-case is
+        the safety authority, never the caller's discipline. The message names no path
+        (redaction).
+        """
+        if mozyo_bridge_home() != self.home:
+            raise SmokeIsolationError(
+                "the ambient MOZYO_BRIDGE_HOME does not resolve to the harness's isolated "
+                "home; the production shared-space path (prepare_session / the single-"
+                "flight fence / the workspace registry) reads the ambient home, so a "
+                "mismatch would actuate into the operator home. Construct the harness "
+                "inside `isolated_smoke_home(...)` so both resolve to the same isolated "
+                "home. Refuse to actuate (Redmine #14187 Acceptance 1/5/6; review j#83870 "
+                "F1)."
+            )
+
     # -- clean-slate preflight (cleanup authority, herdr dimension) ------------
 
     def preflight_clean_slate(self) -> None:
@@ -493,6 +564,7 @@ class SharedSpaceSmokeHarness:
         labels also fail closed (never guess a clean slate). This is a no-op against the
         empty isolated fake, and the real safety fence for the #14185 live smoke.
         """
+        self._assert_isolation_bound()
         labels = _list_workspace_labels(self._binary, self.recorder, self.timeout)
         if labels is None:
             raise SharedSpaceSmokeError(
@@ -524,6 +596,10 @@ class SharedSpaceSmokeHarness:
         shared_space``, default lane). A fail-closed refusal is captured as a
         ``failed`` observation carrying the closed failure phase — never a raw message.
         """
+        # The split-brain guard, BEFORE any registry / herdr write (review j#83870 F1):
+        # the production path reads the ambient home, so refuse unless it is the
+        # isolated one — zero operator-home write on a mismatch.
+        self._assert_isolation_bound()
         register_workspace(spec.repo_root, home=self.home)
         try:
             result = _session.prepare_session(
@@ -595,7 +671,31 @@ class SharedSpaceSmokeHarness:
 
         def _worker(index: int, spec: _ProjectSpec) -> None:
             barrier.wait()
-            results[index] = self.run_project(spec)
+            try:
+                results[index] = self.run_project(spec)
+            except BaseException as exc:  # noqa: BLE001 - never drop a project silently
+                # A worker that crashes with an UNCLASSIFIED exception must NOT vanish
+                # from the results (review j#83870 F2): a dropped project let the
+                # aggregate claim `converged` / `residue_clear` over the survivors
+                # alone — a false green — and its partial actuation would escape
+                # cleanup. Record a typed `failed` observation instead, so the count
+                # of completed projects always equals the count requested and the
+                # aggregate can fail closed on it.
+                phase = (
+                    _classify_failure_phase(exc)
+                    if isinstance(
+                        exc,
+                        (HerdrSessionStartError, CoordinatorSharedCreateLockUnavailable),
+                    )
+                    else PHASE_WORKER_ERROR
+                )
+                results[index] = ProjectSmokeObservation(
+                    project_key=spec.project_key,
+                    workspace_id="",
+                    outcome="failed",
+                    coordinators_workspace_id="",
+                    failure_phase=phase,
+                )
 
         threads = [
             threading.Thread(target=_worker, args=(index, spec), name=f"smoke-{spec.project_key}")
@@ -605,6 +705,8 @@ class SharedSpaceSmokeHarness:
             thread.start()
         for thread in threads:
             thread.join()
+        # Every index is now populated (a crash produced a typed `failed` result, not a
+        # None), so a `None` here would be a real internal invariant break.
         return [r for r in results if r is not None]
 
     # -- teardown by exact identity ------------------------------------------
@@ -643,6 +745,15 @@ class SharedSpaceSmokeHarness:
         runner and counts how many of THIS run's created ``coordinators`` workspaces /
         launched ``mzb1_...`` names are still present. Both must be zero
         (Redmine #14187 Acceptance 5).
+
+        Fails closed on an UNREADABLE inventory (review j#83870 F3): an unreadable /
+        unrecognised ``workspace list`` (``_list_workspace_labels`` -> ``None``) must
+        NOT be treated as an empty inventory — that would turn an unknown into a
+        residue-0 success and let a labelled husk hide. It raises
+        :class:`SharedSpaceSmokeError`, exactly the fail-closed posture
+        :meth:`preflight_clean_slate` already takes on the same ``None`` (the contract
+        was asymmetric before). ``_list_rows`` already raises on an unreadable ``agent
+        list``.
         """
         created_workspaces = {
             o.coordinators_workspace_id
@@ -652,7 +763,14 @@ class SharedSpaceSmokeHarness:
         created_names = {
             name for o in observations for name in o.launched_names if name
         }
-        labels = _list_workspace_labels(self._binary, self.recorder, self.timeout) or {}
+        labels = _list_workspace_labels(self._binary, self.recorder, self.timeout)
+        if labels is None:
+            raise SharedSpaceSmokeError(
+                "residue verification could not read the herdr workspace labels "
+                "(unreadable / unrecognised `workspace list`); refuse to claim residue-0 "
+                "on an unreadable inventory — a labelled husk could be hiding "
+                "(Redmine #14187 Acceptance 5; review j#83870 F3)"
+            )
         residue_workspaces = sum(1 for ws in created_workspaces if ws in labels)
         rows = _list_rows(self._binary, self.recorder, self.timeout)
         live_names = {
@@ -690,13 +808,20 @@ class SharedSpaceSmokeHarness:
 
         The single entry the CLI / #14185 call: run every project concurrently,
         summarise the redaction-safe convergence evidence, tear down by exact
-        identity, and prove zero residue. Isolation authority is the caller's
-        responsibility (established via :func:`isolated_smoke_home` before construction),
-        which is also the pre-create cleanup-authority gate.
+        identity, and prove zero residue.
 
-        The herdr-dimension cleanup-authority gate (:meth:`preflight_clean_slate`)
-        runs FIRST — before any project launches — so a pre-existing ``coordinators``
-        space fails the whole smoke closed with zero actuation.
+        Two cleanup-authority gates run FIRST, before any project launches, so the
+        public use-case is itself the safety authority (not the caller's discipline —
+        review j#83870 F1): :meth:`preflight_clean_slate` calls
+        :meth:`_assert_isolation_bound` (the ambient home must be the isolated one) and
+        then refuses a pre-existing ``coordinators`` space. Either failure aborts the
+        whole smoke with zero actuation.
+
+        The aggregate never claims a false green: :attr:`converged` requires every
+        requested project to have completed (F2), and :attr:`residue_clear` requires
+        the residue to have been READ BACK, not merely assumed on an unreadable
+        inventory (F3 — :meth:`verify_residue` fails closed there, caught here so the
+        observation records ``residue_verified = False`` instead of crashing).
         """
         self.preflight_clean_slate()
         observations = self.run_concurrent(specs)
@@ -705,16 +830,26 @@ class SharedSpaceSmokeHarness:
             1 for o in observations if o.created_coordinators_space
         )
         self.cleanup(observations)
-        residue_workspaces, residue_agents = self.verify_residue(observations)
+        residue_verified = True
+        residue_workspaces, residue_agents = -1, -1
+        try:
+            residue_workspaces, residue_agents = self.verify_residue(observations)
+        except (SharedSpaceSmokeError, HerdrSessionStartError):
+            # Unreadable inventory (F3): keep the failure as an observation
+            # (`residue_verified=False` → `residue_clear` stays False) rather than
+            # crashing the whole summary — the honest "could not prove residue-0".
+            residue_verified = False
         lock_engaged, lock_released_clean = self.observe_lock()
         return SharedSpaceSmokeObservation(
             projects=tuple(observations),
+            requested_projects=len(specs),
             coordinators_create_count=coordinators_create_count,
             duplicate_agents=duplicate_agents,
             lock_engaged=lock_engaged,
             lock_released_clean=lock_released_clean,
             residue_workspaces=residue_workspaces,
             residue_agents=residue_agents,
+            residue_verified=residue_verified,
             cleanup_attempted=True,
         )
 
@@ -776,6 +911,7 @@ __all__ = (
     "PHASE_LOCK_RELEASE",
     "PHASE_NONE",
     "PHASE_SESSION_START",
+    "PHASE_WORKER_ERROR",
     "SMOKE_FAILURE_PHASES",
     "ProjectSmokeObservation",
     "RecordingHerdrRunner",
