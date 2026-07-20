@@ -395,24 +395,26 @@ def _shared_coordinator_target(
        this function re-checks it so it stays correct when called directly.
     2. no own pins, so a join/create decision is needed and the labels are the
        authority. ``workspace_labels is None`` (the ``workspace list`` read failed)
-       fails closed — never guess. Among the herdr workspaces that BOTH carry
-       ``shared_label`` (an EXACT, verbatim match — no trim / case-fold, R4 review
-       j#83473 F1) AND hold a live default-lane slot (a live, labelled shared column):
+       fails closed — never guess. Among the herdr workspaces carrying ``shared_label``
+       (an EXACT, verbatim match — no trim / case-fold, R4 review j#83473 F1),
+       INCLUDING a labelled workspace with no live default-lane slot yet (R5 review
+       j#83516 F1 — a partial-failure husk or a concurrent peer's not-yet-launched
+       space is still the shared space and must be adopted, not duplicated):
 
-       - exactly one -> ADOPT it (idempotent join of the space an earlier project
-         created; this is what crosses the mozyo ``workspace`` identity boundary
-         safely, now gated on the label);
+       - exactly one -> ADOPT it (idempotent join; this is what crosses the mozyo
+         ``workspace`` identity boundary safely, gated on the label);
        - more than one -> fail closed (ambiguous shared space);
 
-    3. no labelled live candidate:
+    3. no labelled candidate at all:
 
        - but foreign default-lane pairs ARE live (in un/differently-labelled
          per-project workspaces) -> fail closed. This is the mode-transition guard:
          refuse to silently promote a per-project coordinator window to the shared
          space (Decision 1: no implicit promotion / relabel);
        - otherwise (no foreign coordinator pair live at all) -> ``""``: the caller
-         creates the shared workspace with ``shared_label``. herdr auto-closes a
-         zero-pane workspace (#13380), so a stale label never lingers.
+         creates the shared workspace with ``shared_label`` UNDER the single-flight
+         fence (``coordinator_placement_fence.coordinator_shared_create_lock``), so
+         concurrent clean-slate launches converge to one workspace.
 
     Only default-lane (coordinator) slots are ever consulted: a sublane slot never
     pins the coordinators space (its placement is the untouched #13380/#13411 axis).
@@ -428,6 +430,29 @@ def _shared_coordinator_target(
             f"returned no recognisable payload); refuse to guess the shared space for "
             f"workspace {workspace_id!r}"
         )
+    # Candidates are the herdr workspaces carrying the EXACT shared label — read from
+    # the labels directly, INCLUDING a labelled workspace with no live default-lane
+    # slot yet (R5 review j#83516 F1). That covers two idempotency cases the earlier
+    # "labelled AND has a live slot" set missed: a partial-failure HUSK (created +
+    # labelled, then its agent-start failed) and a concurrent peer's workspace created
+    # under the single-flight fence but not yet launched into — both are the shared
+    # space and must be ADOPTED, not duplicated. The match is EXACT / verbatim (no
+    # `_norm`): a padded or case-variant label is a different label (R4 F1). Sorted for
+    # an inventory-iteration-independent decision (Design Answer j#83385 Decision 2).
+    labelled_candidates = sorted(
+        ws for ws, label in workspace_labels.items() if label == shared_label
+    )
+    if len(labelled_candidates) > 1:
+        raise HerdrSessionStartError(
+            f"multiple herdr workspaces carry the shared coordinators label "
+            f"{shared_label!r} ({labelled_candidates!r}); refuse to guess which one is "
+            "the shared space"
+        )
+    if labelled_candidates:
+        return labelled_candidates[0]
+    # No labelled shared workspace exists. If foreign per-project coordinator pairs
+    # ARE live (in un/differently-labelled workspaces), this is a mode transition:
+    # refuse to promote a per-project window to the shared space (Decision 1).
     foreign_by_workspace: dict = {}
     for row in rows:
         if not isinstance(row, Mapping):
@@ -445,22 +470,6 @@ def _shared_coordinator_target(
         prefix = _workspace_prefix(locator)
         if prefix:
             foreign_by_workspace.setdefault(prefix, True)
-    # Sorted for a deterministic, inventory-iteration-independent decision (Design
-    # Answer j#83385 Decision 2). The label match is EXACT / verbatim (no `_norm`):
-    # a padded or case-variant label is a different label, not the authority (F1).
-    labelled_candidates = sorted(
-        ws
-        for ws in foreign_by_workspace
-        if workspace_labels.get(ws) == shared_label
-    )
-    if len(labelled_candidates) > 1:
-        raise HerdrSessionStartError(
-            f"multiple live herdr workspaces carry the shared coordinators label "
-            f"{shared_label!r} ({labelled_candidates!r}); refuse to guess which one is "
-            "the shared space"
-        )
-    if labelled_candidates:
-        return labelled_candidates[0]
     if foreign_by_workspace:
         raise HerdrSessionStartError(
             "shared_space launch found live coordinator pairs but none in a workspace "

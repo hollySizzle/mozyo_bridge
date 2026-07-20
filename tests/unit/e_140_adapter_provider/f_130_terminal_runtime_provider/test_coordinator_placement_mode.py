@@ -269,13 +269,33 @@ class SharedCoordinatorTargetTest(unittest.TestCase):
 
     def test_sublane_slots_never_pin_coordinator_space(self) -> None:
         # Only DEFAULT-lane slots are consulted; a live sublane pair is the untouched
-        # #13380/#13411 axis. With no foreign coordinator pair -> clean-slate create.
+        # #13380/#13411 axis. With no labelled shared workspace and no foreign
+        # coordinator pair -> clean-slate create. (w8 here is unlabelled — a sublane
+        # host, not the coordinators space.)
         rows = [
             _row("wsA", "claude", "lane-x", "w8:p1"),
             _row("wsA", "codex", "lane-x", "w8:p2"),
             _row("wsB", "claude", "lane-y", "w8:p3"),
         ]
-        self.assertEqual(self._target(rows, "wsA", [], {"w8": SHARED}), "")
+        self.assertEqual(self._target(rows, "wsA", [], {"w8": ""}), "")
+
+    def test_labelled_husk_without_live_slots_is_adopted(self) -> None:
+        # Redmine #14139 R5 review j#83516 F1: a workspace labelled `coordinators`
+        # with NO live default-lane slot (a partial-failure husk, or a concurrent
+        # peer's not-yet-launched space) IS the shared space and must be ADOPTED, so a
+        # retry converges instead of minting a second workspace.
+        self.assertEqual(self._target([], "wsA", [], {"w5": SHARED}), "w5")
+
+    def test_labelled_husk_adopted_even_with_per_project_pair_present(self) -> None:
+        # A labelled shared space (even slot-less) is unambiguous; a separate live
+        # per-project coordinator pair does not block adopting it.
+        rows = [
+            _row("wsB", "claude", "default", "w9:p1"),
+            _row("wsB", "codex", "default", "w9:p2"),
+        ]
+        self.assertEqual(
+            self._target(rows, "wsA", [], {"w5": SHARED, "w9": ""}), "w5"
+        )
 
     def test_own_slots_spanning_two_workspaces_fail_closed(self) -> None:
         rows = [
@@ -387,6 +407,57 @@ class SharedCoordinatorDeterministicOrderTest(unittest.TestCase):
             _shared_coordinator_target(rows, "wsA", [], labels, SHARED)
         with self.assertRaises(HerdrSessionStartError):
             _shared_coordinator_target(list(reversed(rows)), "wsA", [], labels, SHARED)
+
+
+class CoordinatorSharedCreateLockTest(unittest.TestCase):
+    """`coordinator_shared_create_lock`: the home-scoped single-flight fence (F1)."""
+
+    def _home(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        return Path(self._tmp.name)
+
+    def test_lock_is_exclusive_while_held(self) -> None:
+        # Redmine #14139 R5 review j#83516 F1: only one holder at a time, so the
+        # shared-space create is single-flight across processes.
+        import fcntl
+        import os
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            coordinator_shared_create_lock,
+            coordinator_shared_create_lock_path,
+        )
+
+        home = self._home()
+        with coordinator_shared_create_lock(home):
+            fd = os.open(str(coordinator_shared_create_lock_path(home)), os.O_RDWR)
+            try:
+                with self.assertRaises(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+    def test_lock_released_after_context(self) -> None:
+        import fcntl
+        import os
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            coordinator_shared_create_lock,
+            coordinator_shared_create_lock_path,
+        )
+
+        home = self._home()
+        with coordinator_shared_create_lock(home):
+            pass
+        # A fresh non-blocking exclusive acquire now succeeds (lock was released).
+        fd = os.open(str(coordinator_shared_create_lock_path(home)), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 class ParseWorkspaceListTest(unittest.TestCase):

@@ -241,6 +241,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     DEFAULT_COORDINATOR_PLACEMENT_MODE,
     SHARED_SPACE,
 )
+from mozyo_bridge.core.state.coordinator_placement_fence import (
+    coordinator_shared_create_lock,
+)
 from mozyo_bridge.shared.errors import die
 
 def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
@@ -715,20 +718,38 @@ def _prepare_session_locked(
             # `workspace list` command succeeding, so the label read is skipped when
             # an own pin exists. Only a fresh / mode-transition launch with no own pin
             # reads the labels — and per_project / sublane launches never reach here,
-            # so they issue no extra `workspace list` (byte-invariant). Unreadable
-            # labels fail closed inside the resolver.
+            # so they issue no extra `workspace list` (byte-invariant).
             target_workspace = _shared_coordinator_own_target(
                 rows, workspace_id, adopt_locators
             )
             if not target_workspace:
-                workspace_labels = _list_workspace_labels(binary, runner, timeout)
-                target_workspace = _shared_coordinator_target(
-                    rows,
-                    workspace_id,
-                    adopt_locators,
-                    workspace_labels,
-                    SHARED_COORDINATOR_WORKSPACE_LABEL,
-                )
+                # No own pin -> the shared space must be adopted or created. Run the
+                # whole list->resolve->create under a home-scoped single-flight fence
+                # (R5 review j#83516 F1) so concurrent clean-slate launches converge to
+                # ONE workspace: the first creates it under the lock; the rest wait,
+                # re-read the labels under the lock and ADOPT it (double-checked). A
+                # partial-failure husk is adopted the same way (resolver F1). Own-pin
+                # heal above never takes the lock (it creates nothing). Unreadable
+                # labels / ambiguity / mode-transition all fail closed in the resolver.
+                with coordinator_shared_create_lock(mozyo_bridge_home()):
+                    workspace_labels = _list_workspace_labels(binary, runner, timeout)
+                    target_workspace = _shared_coordinator_target(
+                        rows,
+                        workspace_id,
+                        adopt_locators,
+                        workspace_labels,
+                        SHARED_COORDINATOR_WORKSPACE_LABEL,
+                    )
+                    if not target_workspace:
+                        target_workspace, base_pane_id = _create_workspace(
+                            binary,
+                            repo_root,
+                            runner,
+                            timeout,
+                            env,
+                            label=SHARED_COORDINATOR_WORKSPACE_LABEL,
+                        )
+                        result.base_pane_id = base_pane_id
         else:
             target_workspace = _launch_target_for_lane(
                 rows,
@@ -736,22 +757,21 @@ def _prepare_session_locked(
                 result.lane_id,
                 adopt_locators,
             )
-        if not target_workspace:
-            if shared_coordinator_space:
-                create_label = SHARED_COORDINATOR_WORKSPACE_LABEL
-            elif result.lane_id != DEFAULT_LANE:
-                create_label = _host_workspace_label(resolved_root)
-            else:
-                create_label = ""
-            target_workspace, base_pane_id = _create_workspace(
-                binary,
-                repo_root,
-                runner,
-                timeout,
-                env,
-                label=create_label,
-            )
-            result.base_pane_id = base_pane_id
+            if not target_workspace:
+                create_label = (
+                    _host_workspace_label(resolved_root)
+                    if result.lane_id != DEFAULT_LANE
+                    else ""
+                )
+                target_workspace, base_pane_id = _create_workspace(
+                    binary,
+                    repo_root,
+                    runner,
+                    timeout,
+                    env,
+                    label=create_label,
+                )
+                result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace
 
     # Resolve the launch-target tab within the host workspace (Redmine #13411,

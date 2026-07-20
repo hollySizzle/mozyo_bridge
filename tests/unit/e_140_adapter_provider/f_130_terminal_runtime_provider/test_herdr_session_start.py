@@ -1963,6 +1963,34 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 )
         self.assertEqual(herdr.workspace_creates, [])
 
+    def test_shared_space_partial_failure_husk_is_adopted_not_duplicated(self) -> None:
+        # Redmine #14139 R5 review j#83516 F1: a create that succeeds then whose
+        # agent-start FAILS leaves a labelled `coordinators` husk. A retry must ADOPT
+        # that husk (its label is the authority) and NOT mint a second shared space.
+        # Step 1: a launch whose agent-start fails leaves the labelled husk.
+        run1 = _Herdr(created_workspace="wZ", start_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=run1, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        # The workspace was created and carries the shared label, but holds no agents.
+        self.assertEqual(run1.workspace_labels, {"wZ": "coordinators"})
+        self.assertEqual(len(run1.workspace_creates), 1)
+
+        # Step 2: the retry sees the labelled husk (no live slots) and adopts it —
+        # zero new workspace create.
+        run2 = _Herdr(created_workspace="wZ2")
+        run2.workspace_labels = dict(run1.workspace_labels)  # persistent herdr backend
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=run2, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertEqual(result.herdr_workspace_id, "wZ")
+        self.assertEqual(run2.workspace_creates, [], "retry must adopt the husk, not create")
+
     def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
         # Redmine #14139: an unknown mode string fails closed at the pure entry point,
         # before any herdr actuation (mirrors the unknown-provider guard).

@@ -504,22 +504,34 @@ adopted_locators, workspace_labels, shared_label)`):
 2. 自 pin が無ければ label authority で判断する (`workspace_labels` = `{herdr_workspace_id: label}`、
    `herdr workspace list` で action-time 取得):
    - **`workspace_labels` が読めない (None)** → typed fail-closed (推測しない)。
-   - `shared_label` を持ち、かつ live default-lane slot を持つ herdr workspace (= live labelled shared column):
+   - `shared_label` を持つ herdr workspace (= labelled candidate)。**live default-lane slot の有無を問わない**
+     (R5 review j#83516 F1): create 後 agent-start が失敗した **partial-failure husk** や、single-flight fence
+     下で先行 process が create したがまだ launch していない space も shared space であり adopt 対象とする:
      - **ちょうど 1 つ** → その space を adopt する。#13380 の sublane host 解決と違いここは意図的に mozyo
        `workspace` identity 境界を跨ぐ (各 coordinator は自 project identity `mzb1_<project-ws>_<role>_default`
        を保つ) が、境界跨ぎは **label 一致に gate される**。これが 2 番目以降の project の launch を
        「先行 project が作った space の冪等 adopt」にする。
      - **複数** → ambiguous shared space として fail-closed。
-3. labelled live candidate が無い場合:
+3. labelled candidate が無い場合:
    - **他 project の coordinator pair が live だが shared label を持たない (per-project workspace)** → fail-closed
      (mode-transition guard: per-project window を暗黙昇格しない)。
-   - coordinator pair が 1 つも live でない (clean slate) → `""` → caller が stable label `coordinators` で
-     create する。column ゼロの space は最終 pane close で herdr が自動 close する (#13380) ため husk は残らず、
-     次 project が on-demand で再 mint する。
+   - coordinator pair が 1 つも live でない (clean slate) → `""` → caller が stable label `coordinators` で create。
+
+### create の single-flight fence (concurrent 収束)
+
+husk-adoption だけでは **clean-slate 同時起動** race は閉じない (双方が「labelled candidate 無し」を読んで双方
+create する)。launch admission は attestation store lock を **shared** で持つため create を直列化しない。そこで
+shared default-lane の **list→resolve→create を home-scoped exclusive advisory lock**
+(`core/state/coordinator_placement_fence.coordinator_shared_create_lock`、`attestation_store_lock` と同じ
+`fcntl.flock` protocol、別 lock file で相互非干渉) の下で実行する。lock 取得後に label を再読して resolve
+(double-checked) し、無いときだけ create する。よって同時起動でも create するのは 1 process だけで、他は待機後
+再 resolve で husk-adoption/adopt に収束し、**shared workspace は 1 個**になる。**own-pin heal は lock を取らない**
+(create しない = R5 F2 契約維持)。lock は home 下の 0600 advisory artifact で state を持たず、operator config
+write ではない (`flock` のみ)。
 
 sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin が複数 herdr
-workspace に跨る場合は identity conflict として fail-closed (#13330 posture)。この label read は shared_space の
-default-lane path でのみ発火し、`per_project_space` と全 sublane launch は `workspace list` を発行せず
+workspace に跨る場合は identity conflict として fail-closed (#13330 posture)。この label read / fence は shared_space の
+default-lane path でのみ発火し、`per_project_space` と全 sublane launch は `workspace list` も lock も発行せず
 byte-invariant を保つ。
 
 ### project 列順 — deterministic append order (not arbitrary live reorder)
