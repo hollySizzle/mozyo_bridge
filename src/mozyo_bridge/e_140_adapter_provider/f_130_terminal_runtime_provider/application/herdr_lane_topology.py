@@ -22,9 +22,19 @@ N lanes shows N tabs instead of 2N loose panes (owner intent #13377 j#73654 "親
 - :func:`_tab_target_for_lane` resolves the herdr *tab* within that workspace a
   non-default lane's launches join (#13411 axis).
 
-Both key on the live mzb1 inventory only (``tab_id`` / assigned-name identity),
-never on a cosmetic label: the identity model (``mzb1_<project-ws>_<role>_<lane>``)
-and route authority are unchanged; only the herdr placement subdivides.
+Both of these two axes key on the live mzb1 inventory only (``tab_id`` /
+assigned-name identity), never on a herdr label: the identity model
+(``mzb1_<project-ws>_<role>_<lane>``) and route authority are unchanged; only the
+herdr placement subdivides.
+
+The one deliberate exception is the **operator-scoped shared coordinators space**
+(Redmine #14139, ``shared_space`` mode, :func:`_shared_coordinator_target`): there
+the default-lane pair spans every project's mozyo ``workspace`` identity, so the
+inventory alone cannot tell the shared space from a per-project coordinator
+window. That axis — and ONLY that axis — uses the stable workspace *label*
+(:data:`SHARED_COORDINATOR_WORKSPACE_LABEL`) as the backend-readable adopt
+authority. It still never touches the mzb1 identity or route authority; the label
+gates *adopt*, nothing else.
 """
 
 from __future__ import annotations
@@ -228,11 +238,15 @@ def _launch_target_for_lane(
     return next(iter(host_prefixes)) if host_prefixes else ""
 
 
-#: The stable, operator-readable label for the single shared coordinators herdr
-#: workspace (Redmine #14139, ``shared_space`` placement mode). Cosmetic only —
-#: every join decision keys on the live default-lane inventory, never this label
-#: (a herdr label is neither unique nor durable identity). Constant, not derived
-#: from any project, precisely because the space is shared across projects.
+#: The stable label of the single shared coordinators herdr workspace (Redmine
+#: #14139, ``shared_space`` placement mode). Unlike the sublane host / tab labels
+#: (#13380 / #13411, which are cosmetic and never a join key), this label IS the
+#: **backend-readable adopt authority**: a fresh shared space is created carrying
+#: it, and :func:`_shared_coordinator_target` adopts an existing space ONLY when a
+#: live workspace carries exactly this label (R2 review j#83383 F1 / Design Answer
+#: j#83385 Decision 1). Constant, not derived from any project, precisely because
+#: the space is shared across projects. (The mzb1 assigned-name identity and route
+#: authority are still unchanged — this label gates *adopt*, not identity/routing.)
 SHARED_COORDINATOR_WORKSPACE_LABEL = "coordinators"
 
 

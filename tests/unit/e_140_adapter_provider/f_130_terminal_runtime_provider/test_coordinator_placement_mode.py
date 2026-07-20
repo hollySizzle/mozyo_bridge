@@ -380,7 +380,7 @@ class ParseWorkspaceListTest(unittest.TestCase):
         self.assertIsNone(_parse_workspace_list('{"result": {"type": "other"}}'))
         self.assertIsNone(_parse_workspace_list("42"))
 
-    def test_duplicate_workspace_id_fails_closed_order_independent(self) -> None:
+    def test_conflicting_label_duplicate_fails_closed_order_independent(self) -> None:
         # Redmine #14139 R2 review j#83425 F1: a repeated workspace_id is an identity
         # conflict — the label authority must not depend on iteration order, so the
         # whole payload is unreadable (None) BOTH ways round, never last-wins.
@@ -400,6 +400,38 @@ class ParseWorkspaceListTest(unittest.TestCase):
         )
         self.assertIsNone(_parse_workspace_list(fwd))
         self.assertIsNone(_parse_workspace_list(rev))
+
+    def test_same_label_duplicate_also_fails_closed(self) -> None:
+        # Redmine #14139 R3 review j#83450 F2 / Design Answer j#83433 acceptance 4: a
+        # duplicate workspace_id fails closed REGARDLESS of whether the repeated
+        # labels agree — the identity conflict is the workspace_id repeating, not the
+        # label mismatching. Pins the label-MATCH half so a future "only reject on
+        # label mismatch" regression is caught.
+        import json
+
+        same = json.dumps(
+            {"workspaces": [
+                {"workspace_id": "w5", "label": "coordinators"},
+                {"workspace_id": "w5", "label": "coordinators"},
+            ]}
+        )
+        self.assertIsNone(_parse_workspace_list(same))
+
+    def test_skipped_no_id_entry_does_not_trip_duplicate_detection(self) -> None:
+        # An entry without a workspace_id is skipped, so it can never be mistaken for
+        # a duplicate of a real id — two distinct ids plus a no-id entry parse fine.
+        import json
+
+        payload = json.dumps(
+            {"workspaces": [
+                {"workspace_id": "w5", "label": "coordinators"},
+                {"label": "orphan"},
+                {"workspace_id": "w6", "label": ""},
+            ]}
+        )
+        self.assertEqual(
+            _parse_workspace_list(payload), {"w5": "coordinators", "w6": ""}
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

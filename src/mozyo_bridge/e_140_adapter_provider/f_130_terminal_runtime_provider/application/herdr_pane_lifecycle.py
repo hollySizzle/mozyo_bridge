@@ -297,9 +297,13 @@ def _create_workspace(
     Making the workspace ourselves (rather than letting the first ``agent start``
     auto-create it) is what turns the empty base pane into a *known* handle we can
     reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
-    operator's focus. ``label`` (Redmine #13380) names a minted sublane host
-    workspace for the operator — cosmetic only, never a join key. Fails closed if
-    the response is unparseable.
+    operator's focus. ``label`` names a minted workspace for the operator: for a
+    **sublane host** (Redmine #13380) it is cosmetic and never a join key; for the
+    **shared coordinators space** (Redmine #14139) the SAME label
+    (``coordinators``) is the backend-readable adopt authority a later project
+    re-reads via ``workspace list`` (:func:`_shared_coordinator_target`). Either
+    way the label is set once at create and never mutated. Fails closed if the
+    response is unparseable.
     """
     argv = ["workspace", "create", "--cwd", str(repo_root)]
     if label:
