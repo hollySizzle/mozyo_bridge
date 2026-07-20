@@ -65,6 +65,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
+    RELEASE_NOT_REQUESTED,
+    RELEASE_RELEASED,
     CasOutcome,
     DecisionPointer,
     DecisionPointerError,
@@ -91,8 +93,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorktreeMutationFingerprint,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+    LaneActivityObservation,
     post_release_residue,
     read_fingerprint,
+    read_live_lane_activity,
     read_live_worktree_fingerprint,
     redrive_detail,
     revalidate_boundary,
@@ -330,8 +334,22 @@ class HibernateOutcome:
 
     @property
     def is_success(self) -> bool:
-        """A clean, fully-actuated success: executed, not blocked, nothing withheld (#13843)."""
-        return self.executed and not self.is_blocked and not self.success_withheld
+        """A clean, FULLY-actuated hibernate success (Redmine #13843 review F5).
+
+        Not merely "executed and not blocked / withheld": the process release must have
+        completed — ``released`` (every managed slot closed) or ``not_requested`` (no live
+        slot to release / dead processes). A ``partial`` / ``requested`` / refused release is
+        an INCOMPLETE actuation that still needs a re-drive, so it is NOT a clean success and
+        must not read as fully-actuated to the gateway / coordinator.
+        """
+        if not self.executed or self.is_blocked or self.success_withheld:
+            return False
+        if self.release is not None and self.release.process_release not in (
+            RELEASE_RELEASED,
+            RELEASE_NOT_REQUESTED,
+        ):
+            return False
+        return True
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -378,6 +396,10 @@ class SublaneHibernateOps(Protocol):
     ) -> Optional[IdentityAttestationRecord]: ...
 
     def read_worktree_mutation(self) -> WorktreeMutationFingerprint: ...
+
+    def read_lane_activity(
+        self, workspace_id: str, lane: str, rows: Sequence[Mapping[str, object]]
+    ) -> LaneActivityObservation: ...
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult: ...
 
@@ -438,14 +460,17 @@ class LiveSublaneHibernateOps:
             return None
 
     def read_worktree_mutation(self) -> WorktreeMutationFingerprint:
-        """A fresh live worktree mutation fingerprint for the #13843 release-boundary fence.
-
-        Delegates to :func:`read_live_worktree_fingerprint` (git-status probe over the lane's
-        ``repo_root``), which is tri-state fail-closed: a git-invocation failure is unreadable
-        (never "clean"), a non-git scaffold lane is readable-clean, and an un-inspectable work
-        tree is unreadable.
-        """
+        """Live worktree fingerprint (#13843) — delegates to the tri-state fail-closed probe."""
         return read_live_worktree_fingerprint(self.repo_root, self.timeout)
+
+    def read_lane_activity(
+        self, workspace_id: str, lane: str, rows: Sequence[Mapping[str, object]]
+    ) -> LaneActivityObservation:
+        """Live worker-busy / pending-composer observation (#13843 F2), fail-closed."""
+        return read_live_lane_activity(
+            rows, workspace_id, lane, repo_root=self.repo_root, env=self.env,
+            runner=self.runner, timeout=self.timeout,
+        )
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult:
         return execute_herdr_retire_close(
@@ -656,10 +681,14 @@ class SublaneHibernateUseCase:
             if execute and redrive_ok:
                 rows1, fingerprint_boundary, boundary_reasons = revalidate_boundary(
                     ops=self.ops,
+                    store=self.store,
+                    key=key,
+                    rec0=rec,
                     rows0=rows,
                     fingerprint_preflight=fingerprint_preflight,
                     workspace_id=workspace_id,
                     lane=lane,
+                    project_scope=project_scope,
                 )
                 if not boundary_reasons:
                     release = self._drive_release(
@@ -765,10 +794,14 @@ class SublaneHibernateUseCase:
         # and nothing is closed.
         rows1, fingerprint_boundary, boundary_reasons = revalidate_boundary(
             ops=self.ops,
+            store=self.store,
+            key=key,
+            rec0=rec,
             rows0=rows,
             fingerprint_preflight=fingerprint_preflight,
             workspace_id=workspace_id,
             lane=lane,
+            project_scope=project_scope,
         )
         if boundary_reasons:
             return HibernateOutcome(

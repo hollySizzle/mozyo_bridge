@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle import RELEASE_PARTIAL, LaneLifecycleStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
     HibernateAssertions,
     HibernateOutcome,
@@ -111,7 +111,17 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
         print(format_hibernate_text(outcome), file=sys.stdout)
     # Redmine #13843: a withheld success (post-release residue) is not a clean success — it
     # must exit non-zero so the coordinator converges to the recovery / boundary-record path.
-    return 1 if outcome.is_blocked or outcome.success_withheld else 0
+    if outcome.is_blocked or outcome.success_withheld:
+        return 1
+    # Review F5: a partial (incomplete) release under --execute still needs a re-drive, so it
+    # is not a clean exit — surface it non-zero rather than reporting a fully-actuated success.
+    if (
+        outcome.executed
+        and outcome.release is not None
+        and outcome.release.process_release == RELEASE_PARTIAL
+    ):
+        return 1
+    return 0
 
 
 def register_sublane_hibernate_parser(sublane_sub: Any) -> None:

@@ -70,6 +70,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneHibernateUseCase,
     WorktreeMutationFingerprint,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_toctou import (  # noqa: E501
+    BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT,
+    BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+    LaneActivityObservation,
+    read_live_lane_activity,
+    read_live_worktree_fingerprint,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
     cmd_sublane_hibernate,
 )
@@ -108,6 +117,8 @@ def _all_gates(**overrides) -> HibernateAssertions:
 #: does not exercise the #13843 TOCTOU fence). Two of these compare equal, so the fence is a
 #: no-op unless a test scripts a diverging sequence.
 _CLEAN_FP = WorktreeMutationFingerprint(readable=True)
+#: A readable, quiescent live lane-activity observation (no running turn, no pending composer).
+_QUIESCENT_ACTIVITY = LaneActivityObservation(readable=True)
 
 
 class _FakeOps:
@@ -130,6 +141,7 @@ class _FakeOps:
         attestations=None,
         fingerprints=None,
         inventory_sequence=None,
+        activities=None,
     ):
         self._rows = list(rows)
         self._readable = readable
@@ -141,8 +153,10 @@ class _FakeOps:
             if inventory_sequence is not None
             else None
         )
+        self._activities = list(activities) if activities is not None else None
         self.close_calls: list = []
         self.worktree_reads = 0
+        self.activity_reads = 0
 
     def workspace_id(self) -> str:
         return WS
@@ -160,6 +174,15 @@ class _FakeOps:
         if self._fingerprints:
             return self._fingerprints.pop(0)
         return _CLEAN_FP
+
+    def read_lane_activity(self, workspace_id, lane, rows):
+        # Redmine #13843 review F2: the boundary reads live worker-busy / pending-composer
+        # separately from the worktree fingerprint. Script a sequence to drive a synthetic
+        # running-mutation / pending-composer at the boundary; default is a quiescent lane.
+        self.activity_reads += 1
+        if self._activities:
+            return self._activities.pop(0)
+        return _QUIESCENT_ACTIVITY
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
@@ -1370,11 +1393,13 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             self.assertEqual(ops.worktree_reads, 2)
 
     def test_boundary_running_mutation_blocks(self) -> None:
+        # F2: a live worker turn observed at the boundary (T1) — even with a clean worktree —
+        # blocks with zero mutation.
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
             self._declare(store)
-            running = WorktreeMutationFingerprint(readable=True, mutation_in_flight=True)
-            ops = _FakeOps(rows=self._rows(), fingerprints=[_CLEAN_FP, running])
+            running = LaneActivityObservation(readable=True, worker_busy=True)
+            ops = _FakeOps(rows=self._rows(), activities=[running])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1385,18 +1410,38 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_ACTIVE,
             )
+            self.assertEqual(ops.activity_reads, 1)  # the fence actually observed activity
 
     def test_boundary_pending_composer_blocks(self) -> None:
+        # F2: a live pending composer observed at the boundary blocks with zero mutation.
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
             self._declare(store)
-            composer = WorktreeMutationFingerprint(readable=True, pending_composer=True)
-            ops = _FakeOps(rows=self._rows(), fingerprints=[_CLEAN_FP, composer])
+            composer = LaneActivityObservation(readable=True, composer_pending=True)
+            ops = _FakeOps(rows=self._rows(), activities=[composer])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
             self.assertTrue(outcome.is_blocked)
             self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_boundary_unreadable_activity_blocks(self) -> None:
+        # F2: an unreadable live activity observation fails closed (never "quiescent").
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            ops = _FakeOps(
+                rows=self._rows(),
+                activities=[LaneActivityObservation(readable=False)],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            # An unreadable activity makes the boundary fingerprint unreadable -> the
+            # worktree-unreadable fence fires (fail closed).
+            self.assertIn(BLOCK_WORKTREE_UNREADABLE, outcome.boundary_reasons)
             self.assertEqual(ops.close_calls, [])
 
     def test_boundary_unreadable_worktree_blocks(self) -> None:
@@ -1573,34 +1618,35 @@ _LIVE_MOD_SUBPROCESS = f"{_BOUNDARY_MOD}.subprocess.run"
 class _CP:
     """A minimal stand-in for subprocess.CompletedProcess."""
 
-    def __init__(self, returncode, stdout=""):
+    def __init__(self, returncode, stdout="", stderr=""):
         self.returncode = returncode
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
+
+
+# A work-tree read is 3 git calls: rev-parse --is-inside-work-tree, status, diff HEAD.
+def _worktree_calls(status_out, diff_out=""):
+    return [_CP(0, "true\n"), _CP(0, status_out), _CP(0, diff_out)]
 
 
 class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
-    """R (Redmine #13843): the REAL adapter's git-status -> fingerprint conversion, incl.
-    the fail-closed / non-git tri-state (a git-invocation failure is never "clean")."""
+    """R (Redmine #13843): the REAL adapter's git -> fingerprint conversion, incl. the
+    fail-closed / non-git tri-state (F4: a git-invocation failure is never "clean")."""
 
     def _ops(self):
         return LiveSublaneHibernateOps(repo_root=Path("."))
 
     def test_clean_repo_is_readable_and_clean(self) -> None:
-        with mock.patch(
-            _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(0, "true\n"), _CP(0, "")],
-        ):
+        with mock.patch(_LIVE_MOD_SUBPROCESS, side_effect=_worktree_calls("")):
             fp = self._ops().read_worktree_mutation()
         self.assertTrue(fp.readable)
         self.assertFalse(fp.dirty)
         self.assertFalse(fp.untracked)
 
     def test_dirty_repo_reports_dirty_and_untracked(self) -> None:
-        status = " M src/foo.py\n?? bar.txt\n"
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(0, "true\n"), _CP(0, status)],
+            side_effect=_worktree_calls(" M src/foo.py\n?? bar.txt\n", "diff-body"),
         ):
             fp = self._ops().read_worktree_mutation()
         self.assertTrue(fp.readable)
@@ -1617,15 +1663,42 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
             fp = self._ops().read_worktree_mutation()
         self.assertFalse(fp.readable)
 
-    def test_non_git_directory_is_readable_clean(self) -> None:
-        # git ran and said "not a work tree" -> a non-git scaffold lane (readable, clean).
+    def test_diff_error_is_unreadable_not_clean(self) -> None:
+        # F1: `git diff HEAD` (tracked content) failed -> fail closed (never a clean digest).
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(128, "")],
+            side_effect=[_CP(0, "true\n"), _CP(0, " M a.py\n"), _CP(128, "")],
+        ):
+            fp = self._ops().read_worktree_mutation()
+        self.assertFalse(fp.readable)
+
+    def test_non_git_directory_is_readable_clean(self) -> None:
+        # F4: git ran and reported a genuine "not a git repository" -> a non-git scaffold
+        # lane (readable, clean) — recognized by the stderr signature, not a blanket non-zero.
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(128, "", "fatal: not a git repository (or any parent)")],
         ):
             fp = self._ops().read_worktree_mutation()
         self.assertTrue(fp.readable)
         self.assertFalse(fp.dirty)
+
+    def test_not_a_work_tree_false_is_readable_clean(self) -> None:
+        # rev-parse succeeds but reports "false" (a git dir / bare) -> clean, no diff surface.
+        with mock.patch(_LIVE_MOD_SUBPROCESS, side_effect=[_CP(0, "false\n")]):
+            fp = self._ops().read_worktree_mutation()
+        self.assertTrue(fp.readable)
+        self.assertFalse(fp.dirty)
+
+    def test_fatal_non_git_error_is_unreadable_not_clean(self) -> None:
+        # F4: a non-zero rev-parse that is NOT a genuine "not a git repository" (permission /
+        # dubious ownership / cwd I/O) must fail CLOSED, never be treated as a clean non-git lane.
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(128, "", "fatal: detected dubious ownership in repository")],
+        ):
+            fp = self._ops().read_worktree_mutation()
+        self.assertFalse(fp.readable)
 
     def test_git_invocation_failure_is_unreadable(self) -> None:
         # The git binary is missing / the call raised -> fail closed, NOT a clean non-git lane.
@@ -1634,18 +1707,356 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
         self.assertFalse(fp.readable)
 
     def test_digest_is_stable_and_order_independent(self) -> None:
-        # The digest is over the SORTED status lines, so row order does not change it.
+        # The digest is over the SORTED status lines + diff, so row order does not change it.
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(0, "true\n"), _CP(0, " M a.py\n?? b.txt\n")],
+            side_effect=_worktree_calls(" M a.py\n?? b.txt\n", "D"),
         ):
             fp1 = self._ops().read_worktree_mutation()
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(0, "true\n"), _CP(0, "?? b.txt\n M a.py\n")],
+            side_effect=_worktree_calls("?? b.txt\n M a.py\n", "D"),
         ):
             fp2 = self._ops().read_worktree_mutation()
         self.assertEqual(fp1.digest, fp2.digest)
+
+    def test_same_porcelain_rows_different_content_flip_digest(self) -> None:
+        # F1 regression: identical porcelain rows (same ` M path` / `?? path`) but changed
+        # tracked CONTENT (a worker writing more into an already-modified file) must flip the
+        # digest — the row-only digest would have missed it.
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=_worktree_calls(" M a.py\n", "diff v1"),
+        ):
+            fp1 = self._ops().read_worktree_mutation()
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=_worktree_calls(" M a.py\n", "diff v2 (more content)"),
+        ):
+            fp2 = self._ops().read_worktree_mutation()
+        self.assertNotEqual(fp1.digest, fp2.digest)
+
+
+class LiveHibernateWorktreeRealGitTest(unittest.TestCase):
+    """F1 (Redmine #13843): the content-sensitive digest over a REAL git worktree — a worker
+    writing more into an already-dirty tracked / untracked file flips the fingerprint."""
+
+    def _git(self, cwd, *args):
+        import subprocess
+
+        return subprocess.run(
+            ["git", *args], cwd=cwd, text=True, capture_output=True, check=True
+        )
+
+    def _init_repo(self, tmp):
+        self._git(tmp, "init", "-q")
+        self._git(tmp, "config", "user.email", "t@example.com")
+        self._git(tmp, "config", "user.name", "t")
+        (Path(tmp) / "tracked.py").write_text("v1\n")
+        self._git(tmp, "add", "tracked.py")
+        self._git(tmp, "commit", "-q", "-m", "base")
+
+    def test_tracked_content_change_flips_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            (Path(tmp) / "tracked.py").write_text("v1\nmodified\n")
+            fp1 = ops.read_worktree_mutation()
+            self.assertTrue(fp1.readable)
+            self.assertTrue(fp1.dirty)
+            # The SAME already-modified file gets MORE content — porcelain row stays ` M
+            # tracked.py`, but the digest must flip.
+            (Path(tmp) / "tracked.py").write_text("v1\nmodified\nmore\n")
+            fp2 = ops.read_worktree_mutation()
+            self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_untracked_content_change_flips_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            (Path(tmp) / "residue.py").write_text("a")
+            fp1 = ops.read_worktree_mutation()
+            self.assertTrue(fp1.untracked)
+            # The SAME untracked file grows — `?? residue.py` row unchanged, digest must flip.
+            (Path(tmp) / "residue.py").write_text("a" * 500)
+            fp2 = ops.read_worktree_mutation()
+            self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_clean_real_repo_is_readable_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            fp = LiveSublaneHibernateOps(repo_root=Path(tmp)).read_worktree_mutation()
+            self.assertTrue(fp.readable)
+            self.assertFalse(fp.dirty)
+            self.assertFalse(fp.untracked)
+
+
+# ---------------------------------------------------------------------------
+# F2: live lane-activity probe (running turn / pending composer), via the live path.
+# ---------------------------------------------------------------------------
+
+_HSS = (
+    "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application"
+    ".herdr_session_start._resolve_binary_or_die"
+)
+_STATE_READER = (
+    "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure"
+    ".herdr_state.HerdrCliAgentStateReader"
+)
+_TRANSPORT = (
+    "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure"
+    ".herdr_transport.HerdrCliTransport"
+)
+_OBSERVE = (
+    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+    ".application.sublane_quarantine.observe_composer_text"
+)
+_GHOST = (
+    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+    ".application.sublane_ghost_composer_observation"
+)
+
+
+class _Obs:
+    def __init__(self, readable, has_pending):
+        self.readable = readable
+        self.has_pending = has_pending
+        self.marker_ids = ()
+
+
+def _state_reader(state_ok=True, state="turn_ended"):
+    inst = mock.MagicMock()
+    inst.read_agent_state.return_value = mock.MagicMock(ok=state_ok, state=state)
+    return mock.MagicMock(return_value=inst)
+
+
+def _transport(read_ok=True, content=""):
+    inst = mock.MagicMock()
+    inst.read_pane.return_value = mock.MagicMock(ok=read_ok, content=content)
+    return mock.MagicMock(return_value=inst)
+
+
+class LiveLaneActivityTest(unittest.TestCase):
+    """F2 (Redmine #13843): the REAL live worker-busy / pending-composer observation and its
+    fail-closed behaviour, exercised through the live adapter path (read_live_lane_activity)."""
+
+    def _rows(self):
+        return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+
+    def _run(self, *, state_ok=True, state="turn_ended", read_ok=True, has_pending=False):
+        with mock.patch(_HSS, return_value="herdr"), mock.patch(
+            _STATE_READER, _state_reader(state_ok, state)
+        ), mock.patch(_TRANSPORT, _transport(read_ok, "text")), mock.patch(
+            _OBSERVE, return_value=_Obs(read_ok, has_pending)
+        ), mock.patch(
+            f"{_GHOST}.default_ghost_policy", return_value=None
+        ), mock.patch(
+            f"{_GHOST}.apply_ghost_empty", side_effect=lambda hp, **kw: hp
+        ):
+            return read_live_lane_activity(
+                self._rows(), WS, LANE,
+                repo_root=Path("."), env={}, runner=None, timeout=5.0,
+            )
+
+    def test_idle_lane_is_readable_quiescent(self) -> None:
+        act = self._run(state="turn_ended", has_pending=False)
+        self.assertTrue(act.readable)
+        self.assertFalse(act.worker_busy)
+        self.assertFalse(act.composer_pending)
+
+    def test_busy_worker_is_observed(self) -> None:
+        act = self._run(state="busy")
+        self.assertTrue(act.readable)
+        self.assertTrue(act.worker_busy)
+
+    def test_pending_composer_is_observed(self) -> None:
+        act = self._run(has_pending=True)
+        self.assertTrue(act.readable)
+        self.assertTrue(act.composer_pending)
+
+    def test_unreadable_runtime_state_fails_closed(self) -> None:
+        act = self._run(state_ok=False)
+        self.assertFalse(act.readable)
+
+    def test_unreadable_composer_read_fails_closed(self) -> None:
+        act = self._run(read_ok=False)
+        self.assertFalse(act.readable)
+
+    def test_no_live_slots_is_readable_quiescent(self) -> None:
+        # Nothing live to observe (nothing to release either) -> vacuously readable-quiescent.
+        act = read_live_lane_activity(
+            [], WS, LANE, repo_root=Path("."), env={}, runner=None, timeout=5.0
+        )
+        self.assertTrue(act.readable)
+        self.assertFalse(act.worker_busy)
+
+
+# ---------------------------------------------------------------------------
+# F3: boundary (T1) re-validation re-reads lifecycle revision + attestation.
+# ---------------------------------------------------------------------------
+
+
+class RevalidateBoundaryReReadTest(unittest.TestCase):
+    """F3 (Redmine #13843): revalidate_boundary re-reads the lifecycle revision and (for a
+    project lane) the exact declared generation + startup attestation on the fresh snapshot."""
+
+    def _rows(self):
+        return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+
+    def test_revision_drift_since_preflight_blocks(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            revalidate_boundary,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            key = LaneLifecycleKey(WS, LANE)
+            store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+            rec0 = store.get(key)
+            # Another process advances the lane's authority (revision bump) after preflight.
+            store.transition_disposition(
+                key,
+                expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=rec0.revision,
+                target=DISPOSITION_HIBERNATED,
+                decision=_decision(),
+            )
+            self.assertGreater(store.get(key).revision, rec0.revision)
+            ops = _FakeOps(rows=self._rows())
+            _rows1, _fp, reasons = revalidate_boundary(
+                ops=ops, store=store, key=key, rec0=rec0, rows0=self._rows(),
+                fingerprint_preflight=_CLEAN_FP, workspace_id=WS, lane=LANE,
+                project_scope="",
+            )
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT, reasons)
+
+    def test_no_drift_when_stable(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            revalidate_boundary,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            key = LaneLifecycleKey(WS, LANE)
+            store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+            rec0 = store.get(key)
+            ops = _FakeOps(rows=self._rows())
+            _rows1, _fp, reasons = revalidate_boundary(
+                ops=ops, store=store, key=key, rec0=rec0, rows0=self._rows(),
+                fingerprint_preflight=_CLEAN_FP, workspace_id=WS, lane=LANE,
+                project_scope="",
+            )
+            self.assertEqual(reasons, ())
+
+    def test_project_attestation_drift_at_boundary_blocks(self) -> None:
+        # A project lane whose gateway slot loses its attestation between preflight and the
+        # boundary re-read blocks on the boundary attestation fence.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            revalidate_boundary,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            decl = LaneDeclarationStore(home=Path(tmp))
+            key = LaneLifecycleKey(WS, PG_LANE)
+            decl.declare_lane(
+                key,
+                decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
+                binding_kind=BINDING_KIND_PROJECT_GATEWAY,
+                project_scope=PG_SCOPE,
+                declared_slots=(
+                    ProcessGenerationPin(
+                        role=PIN_ROLE_GATEWAY, provider="codex",
+                        assigned_name=PG_GW_NAME, locator=PG_GW_LOC,
+                    ),
+                    ProcessGenerationPin(
+                        role=PIN_ROLE_WORKER, provider="claude",
+                        assigned_name=PG_WK_NAME, locator=PG_WK_LOC,
+                    ),
+                ),
+            )
+            rec0 = store.get(key)
+            rows = [{"name": PG_GW_NAME, "pane_id": PG_GW_LOC},
+                    {"name": PG_WK_NAME, "pane_id": PG_WK_LOC}]
+            # Worker attested, gateway NOT -> boundary attestation fence fires.
+            atts = _pg_attestations()
+            del atts[PG_GW_NAME]
+            ops = _FakeOps(rows=rows, attestations=atts)
+            _rows1, _fp, reasons = revalidate_boundary(
+                ops=ops, store=store, key=key, rec0=rec0, rows0=rows,
+                fingerprint_preflight=_CLEAN_FP, workspace_id=WS, lane=PG_LANE,
+                project_scope=PG_SCOPE,
+            )
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT, reasons)
+
+
+# ---------------------------------------------------------------------------
+# F5: partial release is not a clean success.
+# ---------------------------------------------------------------------------
+
+
+class PartialReleaseSuccessTest(unittest.TestCase):
+    """F5 (Redmine #13843): a partial (incomplete) release is not a fully-actuated success."""
+
+    def _rows(self):
+        return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+
+    def test_partial_release_is_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            outcome = SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            self.assertEqual(outcome.release.process_release, RELEASE_PARTIAL)
+            # Executed and not blocked / withheld, but NOT a clean success (re-drive needed).
+            self.assertFalse(outcome.is_blocked)
+            self.assertFalse(outcome.success_withheld)
+            self.assertFalse(outcome.is_success)
+
+    def test_released_is_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            outcome = SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows()), store=store
+            ).run(_request(), execute=True)
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            self.assertTrue(outcome.is_success)
+
+    def test_cmd_returns_nonzero_on_partial_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            ops = _FakeOps(rows=self._rows(), close_result=partial)
+            args = argparse.Namespace(
+                repo=None, issue=ISSUE, lane=LANE, journal=JOURNAL,
+                explicitly_parked=True, callbacks_drained=True, no_review_pending=True,
+                no_owner_approval_pending=True, no_integration_pending=True,
+                no_pending_prompt=True, not_working=True, worktree_clean=True,
+                boundary_recorded=False, execute=True, json=False,
+            )
+            with mock.patch(
+                f"{_CLI_MOD}.LiveSublaneHibernateOps", return_value=ops
+            ), mock.patch(f"{_CLI_MOD}.LaneLifecycleStore", return_value=store):
+                rc = cmd_sublane_hibernate(args)
+            self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

@@ -52,8 +52,20 @@ from typing import Mapping
 #: composer is live at the boundary: a worktree mutation appeared AFTER preflight.
 BLOCK_RELEASE_BOUNDARY_MUTATION = "release_boundary_mutation"
 #: The lane's live managed slot set (assigned-name → locator) changed between the preflight
-#: snapshot and the boundary re-read — a recycled / relaunched / vanished process generation.
+#: snapshot and the boundary re-read, OR the fresh boundary inventory no longer carries the
+#: lane's exact declared generation (a recycled / relaunched / provider-rebound / ambiguous
+#: process generation the preflight snapshot no longer describes).
 BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT = "release_boundary_generation_drift"
+#: The lane's lifecycle revision advanced between the preflight read and the boundary re-read
+#: (another process — pin repair / replacement / decision update — bumped it), so the release
+#: authority the preflight validated is stale (Redmine #13843 review F3; IR j#83536 item 2
+#: "lifecycle revision" fresh revalidate).
+BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT = "release_boundary_revision_drift"
+#: A live managed slot no longer carries an action-time, generation-matched startup
+#: attestation at the boundary re-read (Redmine #13843 review F3; IR j#83536 item 2
+#: "attestation" fresh revalidate). A missing / stale / conflict / unreadable attestation on
+#: any live target fails the boundary closed.
+BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT = "release_boundary_attestation_drift"
 #: The boundary worktree fingerprint could not be read (fail closed — never actuate on a
 #: worktree we could not prove is unchanged).
 BLOCK_WORKTREE_UNREADABLE = "worktree_fingerprint_unreadable"
@@ -205,8 +217,10 @@ def post_release_check(
 
 
 __all__ = (
+    "BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT",
     "BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT",
     "BLOCK_RELEASE_BOUNDARY_MUTATION",
+    "BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT",
     "BLOCK_WORKTREE_UNREADABLE",
     "CLEAN_WORKTREE_FINGERPRINT",
     "RECOVERY_ACTION_DETAIL",
