@@ -60,6 +60,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADOPT_DECL_UNRESOLVED_UNIT,
     resolve_declared_pins,
 )
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.project_scope import (  # noqa: E501
+    path_under_repo_relative,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
     WorkflowRoleAuthorityError,
     project_gateway_lane_id,
@@ -99,15 +102,18 @@ class ObservedGatewayRoute:
     What the semantic discovery resolver (``resolve_launch_or_adopt`` over the live candidate
     list) observed for the DECLARED identity: the adopted gateway pane's stamped ``repo_root``
     / ``project_scope`` / ``project_path`` and its live ``locator``. The declaration exact-
-    matches these against the declared canonical identity before writing, so a foreign
-    project's gateway, a wrong repo / cwd, or a cross-revision alias-equivalent scope never
-    binds the owner row. Absent (``None`` at the call site) means no live gateway matched the
-    declared identity — owner-unbound.
+    matches the stamps against the declared canonical identity AND re-checks the live ``cwd``
+    is under the canonical project path (the stamp is a projection cache; a stale
+    correct-looking stamp never bypasses the live-cwd gate, Redmine #13811 T2 R3 F2), so a
+    foreign project's gateway, a wrong repo / cwd, or an alias-equivalent scope never binds the
+    owner row. ``repo_root`` / ``cwd`` are already resolved (symlinks / ``..``) by the adapter.
+    Absent (``None`` at the call site) means no live gateway matched — owner-unbound.
     """
 
     repo_root: str
     project_scope: str
     project_path: str
+    cwd: str
     locator: str
 
 
@@ -255,6 +261,18 @@ def declare_project_gateway_owner_row(
         return _fail(
             PG_DECL_ROUTE_MISMATCH,
             "the live gateway's stamped route identity disagrees with the declaration",
+        )
+    # The stamps are a projection CACHE; the authoritative gate is the live cwd (design j#78386
+    # §2 action-time cwd re-read). Re-verify the resolved live cwd is at / under the repo's
+    # canonical project path — a stale-but-correct-looking stamp over a wrong live cwd never
+    # binds the owner row (Redmine #13811 T2 R3 F2). ``exp_path`` is the repo-relative project
+    # path; ``observed_route.cwd`` / ``exp_repo`` are adapter-resolved absolute paths.
+    if not path_under_repo_relative(
+        _norm(observed_route.cwd), repo_root=exp_repo, project_path=exp_path
+    ):
+        return _fail(
+            PG_DECL_ROUTE_MISMATCH,
+            "the live gateway's cwd is not under the canonical project path (stale stamp)",
         )
 
     try:

@@ -32,6 +32,23 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
 )
 
+def _canonical_path(raw: object) -> str:
+    """Resolve ``raw`` to a canonical absolute path (symlinks / ``..`` / relative -> absolute).
+
+    The SAME normalization the semantic project-gateway resolver applies to a repo root
+    (``Path.expanduser().resolve()``), so a ``--repo .`` invocation and the resolver's absolute
+    repo root compare equal instead of failing the route-identity join on a spelling difference
+    (Redmine #13811 T2 R3 F4). Fails open to the trimmed input when the path cannot be resolved.
+    """
+    text = _norm(raw)
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return text
+
+
 #: The live inventory could not be read at declaration time (herdr down / unconfigured binary)
 #: — never folded to a *confirmed-empty* pair (which would fail closed as ``incomplete_pair``
 #: and hide the outage). An unreadable inventory is its own zero-write outcome.
@@ -119,18 +136,24 @@ class LiveProjectGatewayDeclareOps:
             resolve_launch_or_adopt,
         )
 
+        # Canonicalize the repo root with the resolver's own normalization (R3 F4), so a
+        # relative ``--repo .`` and the resolver's absolute repo root compare equal.
+        canon_repo = _canonical_path(self.repo_root)
         try:
-            identity = _gateway_identity(str(self.repo_root), project_scope)
+            identity = _gateway_identity(canon_repo, project_scope)
             decision = resolve_launch_or_adopt(_discover_candidates(), identity)
         except Exception:  # noqa: BLE001 — discovery / resolution unreadable -> owner-unbound
             return ("", "", None)
         observed: Optional[ObservedGatewayRoute] = None
         if decision.action == ACTION_ADOPT and decision.adopted is not None:
             cand = decision.adopted
+            # Keep the pane's LIVE cwd (resolved) — the authoritative gate the declaration
+            # re-checks against the canonical project path (R3 F2), not just the cached stamp.
             observed = ObservedGatewayRoute(
-                repo_root=cand.repo_root,
+                repo_root=_canonical_path(cand.repo_root or ""),
                 project_scope=cand.project_scope,
                 project_path=cand.project_path,
+                cwd=_canonical_path(cand.cwd),
                 locator=cand.pane_id,
             )
         return (identity.repo_root, identity.project_path, observed)

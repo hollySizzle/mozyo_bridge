@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PG_DECL_UNRESOLVED_PROVIDER,
     ProjectGatewayDeclareRequest,
     ProjectGatewayDeclareUseCase,
+    _canonical_path,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.project_gateway_declaration import (  # noqa: E501
     PG_DECL_DRY_RUN,
@@ -73,13 +74,14 @@ GW_NAME = encode_assigned_name(WS, "codex", LANE)
 WK_NAME = encode_assigned_name(WS, "claude", LANE)
 GW_LOC = "wProj:p2"
 WK_LOC = "wProj:p3"
-REPO = "/repo/cloud-drive"
-PPATH = "/repo/cloud-drive/project"
+REPO = "/repo/cloud-drive"          # absolute repo root (canonical)
+PPATH = "project"                   # repo-relative canonical project path
+CWD = "/repo/cloud-drive/project"   # absolute live pane cwd, under the project
 
 
-def _route(scope=SCOPE, repo=REPO, path=PPATH, locator=GW_LOC) -> ObservedGatewayRoute:
+def _route(scope=SCOPE, repo=REPO, path=PPATH, cwd=CWD, locator=GW_LOC) -> ObservedGatewayRoute:
     return ObservedGatewayRoute(
-        repo_root=repo, project_scope=scope, project_path=path, locator=locator
+        repo_root=repo, project_scope=scope, project_path=path, cwd=cwd, locator=locator
     )
 
 
@@ -355,9 +357,31 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
 
     def test_route_wrong_project_path_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            o = _declare(tmp, dry_run=False, observed_route=_route(path="/other/cwd"))
+            o = _declare(tmp, dry_run=False, observed_route=_route(path="other-project"))
             self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
             self.assertIsNone(self._row_at(tmp))
+
+    def test_stale_stamp_wrong_live_cwd_fails_closed(self) -> None:
+        # Redmine #13811 T2 R3 F2: the stamps (repo / scope / project_path) are all CORRECT,
+        # but the live pane cwd is NOT under the canonical project path — a stale-but-correct-
+        # looking stamp over a wrong live cwd. The cwd gate (not the cached stamp) is
+        # authoritative, so this is owner-unbound zero-write.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(
+                tmp, dry_run=False,
+                observed_route=_route(cwd="/repo/cloud-drive/SOMEWHERE-ELSE"),
+            )
+            self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_live_cwd_in_subdir_of_project_is_adopted(self) -> None:
+        # A live cwd in a SUBDIRECTORY of the canonical project path is still under it -> ok.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(
+                tmp, dry_run=False,
+                observed_route=_route(cwd="/repo/cloud-drive/project/sub/dir"),
+            )
+            self.assertEqual(o.status, ADOPT_DECL_DECLARED)
 
     def test_route_alias_equivalent_scope_fails_closed(self) -> None:
         # A live gateway stamped a DIFFERENT project_scope (an alias-equivalent scope that
@@ -521,6 +545,33 @@ class ProjectGatewayDeclareUseCaseTest(unittest.TestCase):
             self.assertTrue(o.applied)
             rec = LaneLifecycleStore(home=Path(tmp)).get(LaneLifecycleKey(WS, LANE))
             self.assertEqual(rec.binding_kind, "project_gateway")
+
+
+class CanonicalRepoRootTest(unittest.TestCase):
+    """Redmine #13811 T2 R3 F4: a relative / absolute / trailing-separator spelling of the
+    SAME repo canonicalizes to one path, so the route-identity repo join does not falsely
+    mismatch a valid ``--repo .`` invocation against the resolver's absolute repo root."""
+
+    def test_relative_absolute_trailing_all_canonicalize_equal(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = str(Path(tmp).resolve())
+            prev = os.getcwd()
+            try:
+                os.chdir(real)
+                canon_dot = _canonical_path(".")
+                canon_abs = _canonical_path(real)
+                canon_trailing = _canonical_path(real + "/")
+            finally:
+                os.chdir(prev)
+            self.assertEqual(canon_dot, real)
+            self.assertEqual(canon_abs, real)
+            self.assertEqual(canon_trailing, real)
+            self.assertEqual(canon_dot, canon_abs)
+
+    def test_empty_is_empty(self) -> None:
+        self.assertEqual(_canonical_path(""), "")
 
 
 if __name__ == "__main__":
