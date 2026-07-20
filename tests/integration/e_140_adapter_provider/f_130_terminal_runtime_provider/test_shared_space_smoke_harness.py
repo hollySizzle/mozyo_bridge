@@ -32,6 +32,7 @@ from support.herdr_fake import FakeHerdr  # noqa: E402
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_harness import (  # noqa: E402,E501
     PHASE_WORKER_ERROR,
+    IsolationCapability,
     ProjectSmokeObservation,
     SharedSpaceSmokeError,
     SharedSpaceSmokeHarness,
@@ -73,7 +74,8 @@ class _HarnessFixture:
         self.fake = FakeHerdr(read_text="$ ready\n> ")
         self.tmp = tmp
         self._ctx = isolated_smoke_home(self.isolated, operator_home=self.operator)
-        self.home = self._ctx.__enter__()
+        self.capability = self._ctx.__enter__()
+        self.home = self.capability.isolated_home
         return self
 
     def __exit__(self, *exc):
@@ -91,7 +93,7 @@ class _HarnessFixture:
 
     def harness(self) -> SharedSpaceSmokeHarness:
         return SharedSpaceSmokeHarness(
-            home=self.home, runner=self.fake.run, env=self.env
+            capability=self.capability, runner=self.fake.run, env=self.env
         )
 
 
@@ -188,34 +190,66 @@ class SharedSpaceSmokeIntegrationTests(unittest.TestCase):
 
 
 class IsolationBindingTests(unittest.TestCase):
-    """F1: actuation is bound to the isolated home; a split-brain fails closed."""
+    """F1: actuation is bound to a VERIFIED isolation capability (review j#83905 F1)."""
 
-    def test_ambient_operator_home_fails_closed_with_zero_write(self) -> None:
-        # review j#83870 F1: construct the harness with an isolated `home` while the
-        # AMBIENT MOZYO_BRIDGE_HOME still points at the operator home (i.e. NOT inside
-        # `isolated_smoke_home`). The mutating entry must refuse before any write, so
-        # the operator home gains no registry / lock / attestation artifact.
+    def test_harness_requires_a_capability(self) -> None:
+        # The harness cannot be constructed without an IsolationCapability, so the
+        # "never used the context manager" misuse cannot even build a harness.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _make_env(Path(tmp) / "bin")
+            with self.assertRaises(SmokeIsolationError):
+                SharedSpaceSmokeHarness(
+                    capability=Path(tmp) / "isolated",  # type: ignore[arg-type]
+                    runner=FakeHerdr().run, env=env,
+                )
+
+    def test_hand_built_capability_is_refused(self) -> None:
+        # A capability can only be minted by isolated_smoke_home (token-guarded); a
+        # forged one (naming the operator home as "isolated") is refused at construction.
+        with tempfile.TemporaryDirectory() as tmp:
+            operator = Path(tmp) / "operator"
+            with self.assertRaises(SmokeIsolationError):
+                IsolationCapability(operator, Path(tmp) / "other")
+
+    def test_operator_home_as_both_cannot_mint_and_writes_nothing(self) -> None:
+        # review j#83905 F1 counterexample: the operator home passed as BOTH ambient and
+        # the smoke home. isolated_smoke_home re-runs prove_smoke_isolation, so a
+        # capability is never minted (same home) — no harness, no actuation, no write.
+        with tempfile.TemporaryDirectory() as tmp:
+            operator = Path(tmp) / "operator"
+            operator.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
+                with self.assertRaises(SmokeIsolationError):
+                    with isolated_smoke_home(operator, operator_home=operator):
+                        self.fail("must not mint a capability for operator==smoke home")
+            self.assertEqual(
+                list(operator.rglob("*")), [], "operator home must be untouched"
+            )
+
+    def test_ambient_drift_fails_closed_with_zero_write(self) -> None:
+        # A validly-minted capability, but the ambient MOZYO_BRIDGE_HOME no longer
+        # resolves to its isolated home (the split-brain). The actuation-time guard
+        # refuses before any write, so the operator home gains no artifact.
         with tempfile.TemporaryDirectory() as tmp:
             operator = Path(tmp) / "operator"
             operator.mkdir()
             isolated = Path(tmp) / "isolated"
-            isolated.mkdir()
             env = _make_env(Path(tmp) / "bin")
             repo = Path(tmp) / "proj"
             repo.mkdir()
+            # Mint a real capability, then leave the context so ambient reverts.
+            with isolated_smoke_home(isolated, operator_home=operator) as capability:
+                pass
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(operator)}, clear=False):
                 harness = SharedSpaceSmokeHarness(
-                    home=isolated, runner=FakeHerdr().run, env=env
+                    capability=capability, runner=FakeHerdr().run, env=env
                 )
                 with self.assertRaises(SmokeIsolationError):
                     harness.run_project(_ProjectSpec("p0", repo))
                 with self.assertRaises(SmokeIsolationError):
                     harness.preflight_clean_slate()
-            # The operator home is untouched: no registry, no single-flight lock, no
-            # attestation store were created there.
-            operator_artifacts = list(operator.rglob("*"))
             self.assertEqual(
-                operator_artifacts, [], f"operator home was written: {operator_artifacts!r}"
+                list(operator.rglob("*")), [], "operator home was written"
             )
 
 
@@ -252,6 +286,36 @@ class ConcurrentFailureTests(unittest.TestCase):
             )
             self.assertFalse(summary.all_projects_completed)
             self.assertFalse(summary.converged)
+
+    def test_post_actuation_crash_is_cleaned_via_receipt_and_not_clear(self) -> None:
+        # review j#83905 F2: a project that crashes AFTER its agent-start succeeds loses
+        # its observation, but the receipt tape still carries the launched panes — so
+        # cleanup closes them (no live residue) AND residue_clear is False (honest,
+        # because a project failed). This is the exact reviewer counterexample.
+        for n in (1, 2):
+            with _HarnessFixture() as fx:
+                harness = fx.harness()
+                specs = fx.specs(n)
+                original = harness.run_project
+
+                def _crash_after(spec, _orig=original):
+                    obs = _orig(spec)  # actuates: launches this project's agents
+                    if spec.project_key == f"p{n - 1}":  # the last project crashes
+                        raise RuntimeError("crash AFTER actuation succeeded")
+                    return obs
+
+                harness.run_project = _crash_after  # type: ignore[assignment]
+                summary = harness.smoke(specs)
+                # Honest: a failed project -> neither converged nor residue_clear.
+                self.assertFalse(summary.all_projects_completed)
+                self.assertFalse(summary.residue_clear)
+                # But the receipt-tape cleanup still closed the leaked project's panes:
+                # the shared coordinators workspace auto-vanished, zero live residue.
+                self.assertEqual(
+                    fx.fake.workspace_ids, [], "receipt cleanup must close leaked panes"
+                )
+                self.assertEqual(summary.residue_workspaces, 0)
+                self.assertEqual(summary.residue_agents, 0)
 
 
 class ResidueVerificationTests(unittest.TestCase):

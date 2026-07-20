@@ -82,7 +82,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SHARED_COORDINATOR_WORKSPACE_LABEL,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-    HerdrLauncherIncompatibleError,
     _invoke,
     _list_rows,
     _list_workspace_labels,
@@ -92,280 +91,29 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.core.state.coordinator_placement_fence import (
     CoordinatorSharedCreateLockUnavailable,
-    CoordinatorSharedCreateReleaseError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
 )
 
 
-class SharedSpaceSmokeError(RuntimeError):
-    """A shared-space smoke harness step cannot proceed (fail-closed)."""
-
-
-class SmokeIsolationError(SharedSpaceSmokeError):
-    """Isolation / cleanup authority could not be established (pre-actuation).
-
-    Raised BEFORE any herdr command runs when the requested smoke home is not
-    provably distinct from the real operator home, so the harness never creates
-    something it could not later tear down exactly (Redmine #14187 Acceptance 5 —
-    "cleanup 不能時は create 前に fail-closed").
-    """
-
-
-# -- failure-phase vocabulary (closed; redaction-safe evidence) ----------------
-#: The phase a project run failed in, or :data:`PHASE_NONE`. A closed enum so the
-#: durable evidence names *where* a run stopped without ever carrying a raw message.
-PHASE_NONE = "none"
-PHASE_ISOLATION = "isolation"  # pre-create: cleanup authority not established
-PHASE_LOCK_ACQUIRE = "lock_acquire"  # single-flight fence could not be acquired (zero create)
-PHASE_LOCK_RELEASE = "lock_release_after_create"  # fence release failed AFTER create/adopt
-PHASE_LAUNCHER_PREFLIGHT = "launcher_preflight"  # managed-launch launcher incompatible
-PHASE_SESSION_START = "session_start"  # any other fail-closed session-start refusal
-PHASE_WORKER_ERROR = "worker_error"  # an UNCLASSIFIED exception crashed a concurrent worker
-
-#: The closed set of failure phases the harness can report.
-SMOKE_FAILURE_PHASES = (
-    PHASE_NONE,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E501
     PHASE_ISOLATION,
+    PHASE_LAUNCHER_PREFLIGHT,
     PHASE_LOCK_ACQUIRE,
     PHASE_LOCK_RELEASE,
-    PHASE_LAUNCHER_PREFLIGHT,
+    PHASE_NONE,
     PHASE_SESSION_START,
     PHASE_WORKER_ERROR,
+    SMOKE_FAILURE_PHASES,
+    ProjectSmokeObservation,
+    RecordingHerdrRunner,
+    SharedSpaceSmokeError,
+    SharedSpaceSmokeObservation,
+    SmokeIsolationError,
+    _classify_failure_phase,
+    _flag_value,
 )
-
-
-def _classify_failure_phase(exc: BaseException) -> str:
-    """Map a session-start fail-closed exception to a redaction-safe phase token.
-
-    The subtype order matters: :class:`CoordinatorSharedCreateReleaseError` is a
-    subclass of :class:`CoordinatorSharedCreateLockUnavailable`, and the release
-    phase is *materially different* from the acquire phase (a release failure runs
-    AFTER the shared ``workspace create`` — R8 review j#83633 F1), so it is checked
-    first. ``prepare_session`` wraps both fence errors in a
-    :class:`HerdrSessionStartError` (phase-accurate message), so the raw fence types
-    are matched via the chained ``__cause__`` when present, then the message-free
-    fallback keeps the enum closed.
-    """
-    cause = getattr(exc, "__cause__", None)
-    if isinstance(cause, CoordinatorSharedCreateReleaseError):
-        return PHASE_LOCK_RELEASE
-    if isinstance(cause, CoordinatorSharedCreateLockUnavailable):
-        return PHASE_LOCK_ACQUIRE
-    if isinstance(exc, CoordinatorSharedCreateReleaseError):
-        return PHASE_LOCK_RELEASE
-    if isinstance(exc, CoordinatorSharedCreateLockUnavailable):
-        return PHASE_LOCK_ACQUIRE
-    if isinstance(exc, HerdrLauncherIncompatibleError):
-        return PHASE_LAUNCHER_PREFLIGHT
-    return PHASE_SESSION_START
-
-
-# -- redaction-safe command observation ----------------------------------------
-
-
-class RecordingHerdrRunner:
-    """Wrap an injected ``runner``; record redaction-safe herdr command observations.
-
-    Injected where the production path takes a ``runner`` (the
-    :data:`~...infrastructure.herdr_transport.Runner` port). Every call is forwarded
-    verbatim to the wrapped runner (so the real code drives the real state machine /
-    fake), while a redaction-safe *tape* is kept for the evidence summary:
-
-    - ``workspace create`` — the ``--label`` only (``coordinators`` is a fixed,
-      non-secret vocabulary token, never a path);
-    - ``workspace list`` — a bare count (the label read the shared path performs);
-    - ``agent start`` — the durable ``mzb1_...`` NAME positional only (a mozyo
-      identity token, not a secret);
-    - ``pane close`` — the exact ``wN:pM`` handle.
-
-    It never records ``--env`` values, ``--cwd`` paths, or any full payload, so the
-    tape can be summarised into a Redmine journal without leaking a home path or a
-    credential-shaped literal (Redmine #14187 Acceptance 4/6). Thread-safe: the
-    concurrent driver shares one instance across threads, so a lock guards both the
-    forward call and the tape append (the ``flock`` fence already serialises the
-    list→create critical section; this lock only keeps the *tape* consistent).
-    """
-
-    def __init__(self, inner) -> None:
-        self._inner = inner
-        self._lock = threading.Lock()
-        #: ``--label`` values of every ``workspace create`` (``""`` when unlabelled).
-        self.workspace_create_labels: list = []
-        #: How many ``workspace list`` reads happened (the shared-path label read).
-        self.workspace_list_count = 0
-        #: Durable ``mzb1_...`` names passed to ``agent start`` (identity tokens).
-        self.agent_start_names: list = []
-        #: Exact ``wN:pM`` handles passed to ``pane close`` (teardown tape).
-        self.pane_close_handles: list = []
-
-    def __call__(self, argv, *args, **kwargs):
-        rest = list(argv[1:])
-        with self._lock:
-            self._record(rest)
-            return self._inner(argv, *args, **kwargs)
-
-    #: ``support.herdr_fake.FakeHerdr`` and ``subprocess.run`` are both accepted as
-    #: the wrapped ``runner``; expose ``.run`` too so an inner object that is *itself*
-    #: a bound ``run`` method or a callable both work uniformly.
-    run = __call__
-
-    def _record(self, rest: Sequence[str]) -> None:
-        head = list(rest[:2])
-        if head == ["workspace", "create"]:
-            self.workspace_create_labels.append(_flag_value(rest, "--label"))
-        elif head == ["workspace", "list"]:
-            self.workspace_list_count += 1
-        elif head == ["agent", "start"]:
-            # argv is ["agent", "start", NAME, ...]; NAME is the durable identity.
-            name = rest[2] if len(rest) > 2 and not str(rest[2]).startswith("--") else ""
-            self.agent_start_names.append(_norm(name))
-        elif head == ["pane", "close"]:
-            self.pane_close_handles.append(rest[2] if len(rest) > 2 else "")
-
-    @property
-    def coordinators_create_count(self) -> int:
-        """How many workspaces were created carrying the exact ``coordinators`` label."""
-        return sum(
-            1
-            for label in self.workspace_create_labels
-            if label == SHARED_COORDINATOR_WORKSPACE_LABEL
-        )
-
-
-def _flag_value(rest: Sequence[str], flag: str) -> str:
-    """The token following ``flag`` in ``rest`` (``""`` if absent / trailing)."""
-    tokens = list(rest)
-    try:
-        index = tokens.index(flag)
-    except ValueError:
-        return ""
-    return tokens[index + 1] if index + 1 < len(tokens) else ""
-
-
-# -- per-project + aggregate observations (redaction-safe) ---------------------
-
-
-@dataclass(frozen=True)
-class ProjectSmokeObservation:
-    """One project's shared-space run outcome (redaction-safe value).
-
-    ``project_key`` is an abstract label (``"p1"`` …), never a real path. Every id
-    is a herdr / mozyo identity token, not a secret.
-    """
-
-    project_key: str
-    workspace_id: str  # the mozyo workspace segment (this project's identity)
-    outcome: str  # "created" | "adopted" | "failed"
-    coordinators_workspace_id: str  # the shared herdr workspace (``wN``), ``""`` on fail
-    launched_roles: tuple = ()
-    adopted_roles: tuple = ()
-    launched_names: tuple = ()  # durable ``mzb1_...`` names this project launched
-    launched_locators: tuple = ()  # exact ``wN:pM`` handles this project launched
-    failure_phase: str = PHASE_NONE
-
-    @property
-    def created_coordinators_space(self) -> bool:
-        """Whether THIS project created the shared ``coordinators`` workspace."""
-        return self.outcome == "created"
-
-
-@dataclass(frozen=True)
-class SharedSpaceSmokeObservation:
-    """The aggregate, residue-proven evidence of a shared-space smoke run.
-
-    Every field is a count / bool / closed token, so :meth:`as_evidence` can be
-    summarised straight into a Redmine journal with no path or payload leak.
-    """
-
-    projects: tuple = ()
-    requested_projects: int = 0  # how many projects the smoke was asked to run
-    coordinators_create_count: int = 0  # MUST be 1 (single-flight convergence)
-    duplicate_agents: int = 0  # MUST be 0 (no assigned name minted twice)
-    lock_engaged: bool = False  # the single-flight fence file was created
-    lock_released_clean: bool = False  # the fence is free again after the run
-    residue_workspaces: int = -1  # after cleanup; MUST be 0 (unset/failed = not verified)
-    residue_agents: int = -1  # after cleanup; MUST be 0 (unset/failed = not verified)
-    residue_verified: bool = False  # cleanup residue was read back successfully
-    cleanup_attempted: bool = False
-
-    @property
-    def all_projects_completed(self) -> bool:
-        """Every requested project produced an observation and none failed (F2).
-
-        A crashed / dropped project must never let the aggregate claim success over
-        the survivors alone (review j#83870 F2): both the count must match AND no
-        observation may carry a ``failed`` outcome.
-        """
-        return (
-            len(self.projects) == self.requested_projects
-            and self.requested_projects > 0
-            and all(p.outcome != "failed" for p in self.projects)
-        )
-
-    @property
-    def converged(self) -> bool:
-        """The core acceptance: exactly one ``coordinators`` space, no duplicates.
-
-        Now gated on completeness (F2): a false green from a dropped project — where
-        the survivors happen to show create-count 1 / duplicate 0 — is no longer
-        ``converged``, because a missing or failed project fails
-        :attr:`all_projects_completed`.
-        """
-        return (
-            self.all_projects_completed
-            and self.coordinators_create_count == 1
-            and self.duplicate_agents == 0
-        )
-
-    @property
-    def residue_clear(self) -> bool:
-        """Cleanup ran, residue was READ BACK, and it was zero (Acceptance 5).
-
-        Gated on :attr:`residue_verified` (F3): an unreadable inventory can no longer
-        masquerade as residue-0 — an unverified residue is never clear.
-        """
-        return (
-            self.cleanup_attempted
-            and self.residue_verified
-            and self.residue_workspaces == 0
-            and self.residue_agents == 0
-        )
-
-    def as_evidence(self) -> dict:
-        """A redaction-safe summary dict for a durable Redmine journal.
-
-        Counts, bools, and closed phase tokens only — never a home path, an
-        ``--env`` value, or a raw herdr payload (Redmine #14187 Acceptance 4/6).
-        """
-        return {
-            "requested_projects": self.requested_projects,
-            "completed_projects": len(self.projects),
-            "all_projects_completed": self.all_projects_completed,
-            "coordinators_create_count": self.coordinators_create_count,
-            "duplicate_agents": self.duplicate_agents,
-            "lock_engaged": self.lock_engaged,
-            "lock_released_clean": self.lock_released_clean,
-            "residue_workspaces": self.residue_workspaces,
-            "residue_agents": self.residue_agents,
-            "residue_verified": self.residue_verified,
-            "cleanup_attempted": self.cleanup_attempted,
-            "converged": self.converged,
-            "residue_clear": self.residue_clear,
-            "projects": [
-                {
-                    "project_key": p.project_key,
-                    "outcome": p.outcome,
-                    "launched_roles": list(p.launched_roles),
-                    "adopted_roles": list(p.adopted_roles),
-                    "failure_phase": p.failure_phase,
-                }
-                for p in self.projects
-            ],
-        }
-
-
 # -- isolation authority (fail-closed before actuation) ------------------------
 
 
@@ -403,10 +151,50 @@ def prove_smoke_isolation(isolated_home: Path, *, operator_home: Path) -> Path:
     return isolated
 
 
+#: Private mint token: an :class:`IsolationCapability` can only be constructed by
+#: :func:`isolated_smoke_home` (which holds this token), so a caller cannot hand-build
+#: a capability that names the operator home as "isolated" to bypass the guard
+#: (review j#83905 F1). Module-private; never exported.
+_ISOLATION_CAPABILITY_TOKEN = object()
+
+
+class IsolationCapability:
+    """Proof that an isolated smoke home was established distinct from the operator home.
+
+    The R2 fix (:meth:`SharedSpaceSmokeHarness._assert_isolation_bound`) only proved the
+    ambient home *agreed* with ``self.home`` — value agreement, not isolation authority.
+    A caller who never used :func:`isolated_smoke_home` and passed the REAL operator home
+    as BOTH the ambient ``MOZYO_BRIDGE_HOME`` and the harness ``home`` slipped through,
+    because the two agreed (review j#83905 F1). This capability closes that: it is minted
+    ONLY by :func:`isolated_smoke_home`, AFTER :func:`prove_smoke_isolation` has proven the
+    isolated home is distinct from (and un-nested with) the REAL operator home captured
+    before the ``MOZYO_BRIDGE_HOME`` override. It carries that operator home so the
+    harness can RE-prove isolation at actuation time rather than trust a bare value.
+
+    Construction requires the module-private mint token, so a hand-built capability
+    (the only way to forge one) is refused. The harness requires an ``IsolationCapability``
+    to construct, so the "never used the context manager" misuse cannot even build a
+    harness — the public use-case is the safety authority, not caller discipline.
+    """
+
+    __slots__ = ("isolated_home", "operator_home")
+
+    def __init__(
+        self, isolated_home: Path, operator_home: Path, *, _mint_token: object = None
+    ) -> None:
+        if _mint_token is not _ISOLATION_CAPABILITY_TOKEN:
+            raise SmokeIsolationError(
+                "IsolationCapability must be minted by isolated_smoke_home(); refuse a "
+                "hand-built capability (Redmine #14187 Acceptance 1/5; review j#83905 F1)"
+            )
+        self.isolated_home = Path(isolated_home).expanduser().resolve()
+        self.operator_home = Path(operator_home).expanduser().resolve()
+
+
 @contextmanager
 def isolated_smoke_home(
     isolated_home: Path, *, operator_home: Optional[Path] = None
-) -> Iterator[Path]:
+) -> Iterator[IsolationCapability]:
     """Establish the isolated operator home for a smoke run (fail-closed, restoring).
 
     Proves isolation (:func:`prove_smoke_isolation`) BEFORE touching anything, then
@@ -418,6 +206,11 @@ def isolated_smoke_home(
     Restores the prior ``MOZYO_BRIDGE_HOME`` on exit. ``operator_home`` defaults to
     the currently-resolved home (captured before the override) so the distinctness
     guard is measured against the real operator home.
+
+    Yields an :class:`IsolationCapability` (review j#83905 F1) — the verified proof the
+    harness requires to construct, carrying the operator home the isolation was proven
+    against so the harness can re-prove it at actuation time. The value is unforgeable
+    (mint-token-guarded), so a caller cannot bypass the isolation authority.
     """
     import os
 
@@ -426,6 +219,9 @@ def isolated_smoke_home(
     # right thing (a caller may pass it explicitly for a fully hermetic test).
     operator = Path(operator_home) if operator_home is not None else mozyo_bridge_home()
     isolated = prove_smoke_isolation(isolated_home, operator_home=operator)
+    capability = IsolationCapability(
+        isolated, operator, _mint_token=_ISOLATION_CAPABILITY_TOKEN
+    )
     isolated.mkdir(parents=True, exist_ok=True)
     # Write the operator placement file into the isolated home and prove it round-trips
     # through the real loader (the semantic facade) to `shared_space`.
@@ -441,7 +237,7 @@ def isolated_smoke_home(
                 f"through the loader (got {resolved_mode!r}); refuse to run the "
                 "shared-space smoke on an unverified facade"
             )
-        yield isolated
+        yield capability
     finally:
         if prior is None:
             os.environ.pop("MOZYO_BRIDGE_HOME", None)
@@ -463,12 +259,13 @@ class _ProjectSpec:
 class SharedSpaceSmokeHarness:
     """Drive + observe + tear down the real ``shared_space`` path in an isolated home.
 
-    Construct with the isolated home already established (see
-    :func:`isolated_smoke_home`), an injected ``runner`` (the fake for tests, a real
-    subprocess runner for the #14185 live smoke), and the trusted launch ``env`` (must
-    carry ``MOZYO_HERDR_BINARY`` — the harness never resolves a binary itself). The
-    ``runner`` is wrapped in a :class:`RecordingHerdrRunner` so the evidence tape is
-    kept without the subject-under-test knowing.
+    Construct with the :class:`IsolationCapability` :func:`isolated_smoke_home` minted
+    (the verified isolation proof — review j#83905 F1), an injected ``runner`` (the fake
+    for tests, a real subprocess runner for the #14185 live smoke), and the trusted
+    launch ``env`` (must carry ``MOZYO_HERDR_BINARY`` — the harness never resolves a
+    binary itself). The ``runner`` is wrapped in a :class:`RecordingHerdrRunner` that
+    keeps the actuation-receipt tape (what was created / launched / closed) so cleanup
+    and residue verification never depend on a crashed project's observation.
 
     The harness makes NO placement decision: every project runs the production
     :func:`prepare_session` in ``shared_space`` mode for the DEFAULT (coordinator)
@@ -479,7 +276,7 @@ class SharedSpaceSmokeHarness:
     def __init__(
         self,
         *,
-        home: Path,
+        capability: IsolationCapability,
         runner,
         env: Mapping[str, str],
         timeout: float = COMMAND_TIMEOUT_SECONDS,
@@ -487,11 +284,20 @@ class SharedSpaceSmokeHarness:
         startup_fence_factory: "Optional[Callable[[str], StartupTransactionFence]]" = None,
         probe: "Optional[StartupProbe]" = None,
     ) -> None:
-        # Resolved once: the actuation-time isolation guard (`_assert_isolation_bound`)
-        # compares this against the AMBIENT `mozyo_bridge_home()` the production path
-        # actually reads, so a split-brain (self.home isolated but ambient still the
-        # operator home) can never reach a herdr write (R1 review j#83870 F1).
-        self.home = Path(home).resolve()
+        # The verified isolation proof (review j#83905 F1): the harness cannot be
+        # constructed without an `IsolationCapability` that `isolated_smoke_home` minted
+        # after proving distinctness from the REAL operator home. `_assert_isolation_bound`
+        # re-proves it at actuation time, so neither a split-brain (ambient != isolated)
+        # nor an operator-home-as-both (value agreement without isolation) can reach a
+        # herdr write. A caller that hand-builds a capability is refused at mint.
+        if not isinstance(capability, IsolationCapability):
+            raise SmokeIsolationError(
+                "SharedSpaceSmokeHarness requires an IsolationCapability from "
+                "isolated_smoke_home(); refuse to actuate without a verified isolation "
+                "proof (Redmine #14187 Acceptance 1/5; review j#83905 F1)"
+            )
+        self._capability = capability
+        self.home = capability.isolated_home
         self.recorder = RecordingHerdrRunner(runner)
         self.env = dict(env)
         self.timeout = timeout
@@ -521,31 +327,39 @@ class SharedSpaceSmokeHarness:
     # -- isolation binding (fail-closed before any actuation) -----------------
 
     def _assert_isolation_bound(self) -> None:
-        """Fail closed unless the AMBIENT home the production path reads is the isolated one.
+        """Fail closed unless the run is bound to a proven-isolated home (two checks).
 
-        The split-brain guard (R1 review j#83870 F1): the harness stores ``self.home``,
-        but the production ``prepare_session`` / the single-flight fence / the internal
-        ``register_workspace(repo_root)`` all resolve the home from the ambient
-        ``MOZYO_BRIDGE_HOME`` (``mozyo_bridge_home()``). If a caller constructs the
-        harness with an isolated ``home`` WITHOUT running inside
-        :func:`isolated_smoke_home` (so the ambient env still points at the operator
-        home), those production writes would land in the operator home even though the
-        harness's own reads (``preflight_clean_slate`` / ``observe_lock``) use
-        ``self.home``. This guard runs at EVERY mutating entry, BEFORE the first herdr
-        command, so an unbound / mismatched ambient home fails closed with zero
-        workspace / agent create and zero operator-home write — the public use-case is
-        the safety authority, never the caller's discipline. The message names no path
-        (redaction).
+        Runs at EVERY mutating entry, BEFORE the first herdr command, so any isolation
+        break fails closed with zero workspace / agent create and zero operator-home
+        write. The public use-case is the safety authority, never caller discipline.
+        Two independent checks (the messages name no path — redaction):
+
+        1. **Distinctness re-proof (review j#83905 F1).** Re-run
+           :func:`prove_smoke_isolation` on the capability's ``(isolated_home,
+           operator_home)`` — the operator home the isolation was minted against. This
+           is what value-agreement (the R2 check alone) missed: a home that IS the
+           operator home never mints a capability (the mint runs the same proof), and
+           re-proving here refuses a stale one. Proving isolation ≠ proving two values
+           are equal.
+        2. **Ambient binding (R1 review j#83870 F1).** The production path
+           (``prepare_session`` / the single-flight fence / the internal
+           ``register_workspace(repo_root)``) resolves the home from the ambient
+           ``MOZYO_BRIDGE_HOME`` (``mozyo_bridge_home()``), so it must equal the proven
+           isolated home; otherwise a write would land in whatever the ambient home is.
         """
+        # 1. The capability's isolated home is genuinely distinct from the operator home.
+        prove_smoke_isolation(
+            self._capability.isolated_home, operator_home=self._capability.operator_home
+        )
+        # 2. The ambient home the production path reads IS that isolated home.
         if mozyo_bridge_home() != self.home:
             raise SmokeIsolationError(
                 "the ambient MOZYO_BRIDGE_HOME does not resolve to the harness's isolated "
                 "home; the production shared-space path (prepare_session / the single-"
                 "flight fence / the workspace registry) reads the ambient home, so a "
-                "mismatch would actuate into the operator home. Construct the harness "
-                "inside `isolated_smoke_home(...)` so both resolve to the same isolated "
-                "home. Refuse to actuate (Redmine #14187 Acceptance 1/5/6; review j#83870 "
-                "F1)."
+                "mismatch would actuate into the operator home. Run inside "
+                "`isolated_smoke_home(...)` so both resolve to the same isolated home. "
+                "Refuse to actuate (Redmine #14187 Acceptance 1/5/6; review j#83870 F1)."
             )
 
     # -- clean-slate preflight (cleanup authority, herdr dimension) ------------
@@ -711,33 +525,37 @@ class SharedSpaceSmokeHarness:
 
     # -- teardown by exact identity ------------------------------------------
 
-    def cleanup(self, observations: Sequence[ProjectSmokeObservation]) -> None:
+    def cleanup(self, observations: Sequence[ProjectSmokeObservation] = ()) -> None:
         """Close exactly the panes this run launched (herdr auto-vanishes the workspace).
 
-        Teardown by exact identity (Redmine #14187 Acceptance 5): only the ``wN:pM``
-        handles this run launched are closed — never a scanned-for pane — so a herdr
-        workspace with its last pane closed auto-vanishes (live-measured #13380). A
-        close that fails is left for :meth:`verify_residue` to catch rather than
-        hidden; the harness never issues a generic kill.
+        Teardown by exact identity (Redmine #14187 Acceptance 5), driven by the
+        **actuation-receipt tape** (review j#83905 F2): the recorder captured the
+        ``wN:pM`` locator of every SUCCESSFUL ``agent start``, so this is the authoritative
+        set of panes actually launched — a superset of the per-project observations. A
+        worker that crashed AFTER its ``agent start`` succeeded lost its observation, but
+        its pane is on the tape, so it is still closed here (never a scanned-for pane, so
+        a user's own shell can never be mis-closed; the harness never issues a generic
+        kill). A herdr workspace with its last pane closed auto-vanishes (live-measured
+        #13380). A close that fails is left for :meth:`verify_residue` to catch, not
+        hidden. ``observations`` is accepted for API stability but the tape is the source.
         """
-        for observation in observations:
-            for locator in observation.launched_locators:
-                if not locator:
-                    continue
-                try:
-                    _invoke(
-                        self._binary,
-                        ["pane", "close", locator],
-                        self.recorder,
-                        self.timeout,
-                        env=None,
-                    )
-                except HerdrSessionStartError:
-                    # Residue verification is the proof; a close failure surfaces there.
-                    continue
+        for locator in list(self.recorder.launched_locators):
+            if not locator:
+                continue
+            try:
+                _invoke(
+                    self._binary,
+                    ["pane", "close", locator],
+                    self.recorder,
+                    self.timeout,
+                    env=None,
+                )
+            except HerdrSessionStartError:
+                # Residue verification is the proof; a close failure surfaces there.
+                continue
 
     def verify_residue(
-        self, observations: Sequence[ProjectSmokeObservation]
+        self, observations: Sequence[ProjectSmokeObservation] = ()
     ) -> "tuple[int, int]":
         """Prove zero residue after cleanup: ``(residue_workspaces, residue_agents)``.
 
@@ -745,6 +563,11 @@ class SharedSpaceSmokeHarness:
         runner and counts how many of THIS run's created ``coordinators`` workspaces /
         launched ``mzb1_...`` names are still present. Both must be zero
         (Redmine #14187 Acceptance 5).
+
+        The created-set is the **actuation-receipt tape** (review j#83905 F2), NOT the
+        per-project observations: the recorder captured every SUCCESSFUL ``workspace
+        create`` (id + label) and ``agent start`` (name), so a crashed project's leaked
+        workspace / agents — absent from its blanked observation — are still counted here.
 
         Fails closed on an UNREADABLE inventory (review j#83870 F3): an unreadable /
         unrecognised ``workspace list`` (``_list_workspace_labels`` -> ``None``) must
@@ -755,14 +578,8 @@ class SharedSpaceSmokeHarness:
         was asymmetric before). ``_list_rows`` already raises on an unreadable ``agent
         list``.
         """
-        created_workspaces = {
-            o.coordinators_workspace_id
-            for o in observations
-            if o.created_coordinators_space and o.coordinators_workspace_id
-        }
-        created_names = {
-            name for o in observations for name in o.launched_names if name
-        }
+        created_workspaces = set(self.recorder.created_coordinators_workspaces)
+        created_names = {name for name in self.recorder.agent_start_names if name}
         labels = _list_workspace_labels(self._binary, self.recorder, self.timeout)
         if labels is None:
             raise SharedSpaceSmokeError(
@@ -874,8 +691,8 @@ def smoke_shared_space_preflight(
     into a durable Redmine journal.
     """
     count = max(2, int(projects))
-    with isolated_smoke_home(isolated_home, operator_home=operator_home) as home:
-        harness = SharedSpaceSmokeHarness(home=home, runner=runner, env=env)
+    with isolated_smoke_home(isolated_home, operator_home=operator_home) as capability:
+        harness = SharedSpaceSmokeHarness(capability=capability, runner=runner, env=env)
         harness.preflight_clean_slate()
     return {
         "isolated_home_ok": True,
@@ -913,6 +730,7 @@ __all__ = (
     "PHASE_SESSION_START",
     "PHASE_WORKER_ERROR",
     "SMOKE_FAILURE_PHASES",
+    "IsolationCapability",
     "ProjectSmokeObservation",
     "RecordingHerdrRunner",
     "SharedSpaceSmokeError",

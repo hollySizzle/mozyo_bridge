@@ -93,7 +93,10 @@ class IsolatedSmokeHomeTests(unittest.TestCase):
             operator = Path(tmp) / "real"
             operator.mkdir()
             isolated = Path(tmp) / "smoke"
-            with isolated_smoke_home(isolated, operator_home=operator) as home:
+            with isolated_smoke_home(isolated, operator_home=operator) as capability:
+                # Yields a verified IsolationCapability (review j#83905 F1), not a bare path.
+                self.assertEqual(capability.operator_home, operator.resolve())
+                home = capability.isolated_home
                 text = coordinator_placement_path(home).read_text(encoding="utf-8")
                 self.assertIn("shared_space", text)
                 self.assertEqual(os.environ["MOZYO_BRIDGE_HOME"], str(home))
@@ -131,6 +134,26 @@ class RecordingHerdrRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("/secret/path", blob)
         self.assertNotIn("SECRET", blob)
+
+    def test_captures_actuation_receipts(self) -> None:
+        # review j#83905 F2: the tape records the RESULT of successful mutations (the
+        # created workspace id + label, the launched pane locator) so cleanup / residue
+        # verification never depend on a per-project observation.
+        fake = FakeHerdr()
+        recorder = RecordingHerdrRunner(fake.run)
+        binary = "/fake/herdr"
+        recorder(
+            [binary, "workspace", "create", "--label", SHARED_COORDINATOR_WORKSPACE_LABEL,
+             "--no-focus"],
+            capture_output=True, text=True, timeout=5, env={},
+        )
+        self.assertEqual(recorder.created_coordinators_workspaces, ["w1"])
+        recorder(
+            [binary, "agent", "start", "mzb1_x_claude_default", "--workspace", "w1",
+             "--", "claude"],
+            capture_output=True, text=True, timeout=5, env={},
+        )
+        self.assertEqual(recorder.launched_locators, ["w1:p2"])
 
 
 class ClassifyFailurePhaseTests(unittest.TestCase):
@@ -203,16 +226,29 @@ class ObservationAggregateTests(unittest.TestCase):
 
     def test_residue_clear_requires_verification(self) -> None:
         # residue counts 0 but NOT verified (unreadable inventory) -> not clear (F3).
+        complete = (self._obs("0", "created"), self._obs("1", "adopted"))
         unverified = SharedSpaceSmokeObservation(
+            projects=complete, requested_projects=2,
             cleanup_attempted=True, residue_verified=False,
             residue_workspaces=0, residue_agents=0,
         )
         self.assertFalse(unverified.residue_clear)
         verified = SharedSpaceSmokeObservation(
+            projects=complete, requested_projects=2,
             cleanup_attempted=True, residue_verified=True,
             residue_workspaces=0, residue_agents=0,
         )
         self.assertTrue(verified.residue_clear)
+
+    def test_residue_clear_false_when_a_project_failed(self) -> None:
+        # review j#83905 F2: even a receipt-driven residue-0 read is not "clear" while a
+        # project failed (its actuation-identity coverage may be incomplete).
+        failed = SharedSpaceSmokeObservation(
+            projects=(self._obs("0", "created"), self._obs("1", "failed")),
+            requested_projects=2, cleanup_attempted=True, residue_verified=True,
+            residue_workspaces=0, residue_agents=0,
+        )
+        self.assertFalse(failed.residue_clear)
 
 
 class CountDuplicateAgentsTests(unittest.TestCase):
