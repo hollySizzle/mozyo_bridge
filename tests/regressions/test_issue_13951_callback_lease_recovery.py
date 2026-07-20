@@ -289,15 +289,15 @@ class SupervisorBlockerProjectionTest(unittest.TestCase):
         # the shared formatter renders it without KeyError (same shape as a callback verdict)
         self.assertIn(CALLBACK_LEASE_INCONSISTENT, format_callback_recovery_text(blocker))
 
-    def test_execute_sweep_returns_the_blocker_instead_of_raising(self):
+    def test_execute_sweep_projects_the_blocker_to_the_durable_journal(self):
         # Wire the actuating sweep just far enough to reach the lease bootstrap on an inconsistent
-        # store, and assert it returns a typed blocker (zero-send) rather than propagating the
-        # fail-closed CallbackSweepLeaseError as an opaque crash.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            sublane_diagnostics,
-        )
+        # store, and assert it PROJECTS the typed blocker onto the issue's durable journal (review
+        # R1-F1) — not merely returns a payload — while never delivering a coordinator callback
+        # (the recovery send path returns before it runs). The projection note is written via the
+        # note transport; that is a durable projection, not a callback send.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_diagnostics import (  # noqa: E501
             CALLBACK_LEASE_INCONSISTENT,
+            PROJECTION_RECORDED,
             _execute_sweep,
         )
 
@@ -315,9 +315,15 @@ class SupervisorBlockerProjectionTest(unittest.TestCase):
             def from_environment(cls):
                 return cls()
 
+            def read_entries(self, issue_id):
+                return []  # no prior projection -> the write happens
+
+        posted = []
+
         class _Transport:
-            def post_issue_note(self, *a, **k):  # pragma: no cover - never reached (zero-send)
-                raise AssertionError("no send while the lease is inconsistent")
+            def post_issue_note(self, issue_id, notes):
+                posted.append((issue_id, notes))
+                return "90210"
 
         with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}), \
                 mock.patch(
@@ -331,7 +337,184 @@ class SupervisorBlockerProjectionTest(unittest.TestCase):
 
         self.assertEqual(result["state"], CALLBACK_LEASE_INCONSISTENT)
         self.assertTrue(result["is_stall"])
-        self.assertIn("callback_lease_diagnosis", result)
+        self.assertEqual(result["projection"], PROJECTION_RECORDED)
+        self.assertEqual(result["projection_journal"], "90210")
+        # exactly ONE journal write happened — the durable projection, not a coordinator callback
+        self.assertEqual(len(posted), 1)
+        posted_issue, posted_note = posted[0]
+        self.assertEqual(posted_issue, "13951")
+        # the durable note is bound to the exact dispatch round and is redaction-safe
+        self.assertIn("issue=13951", posted_note)
+        self.assertIn("lane=lane-1", posted_note)
+        self.assertIn("generation=g1", posted_note)
+        self.assertNotIn(str(home), posted_note)  # no absolute home path in the durable record
+
+
+class DurableProjectionTest(unittest.TestCase):
+    """The blocker is recorded to the durable journal idempotently, fail-closed on write (#13951 #3)."""
+
+    def _args(self):
+        return types.SimpleNamespace(
+            issue="13951", lane="lane-9", lane_generation="g3",
+            dispatch_delivered=False, stale_cli=False,
+        )
+
+    def _diag(self):
+        lease = _bootstrapped()
+        lease.path.unlink()  # a store loss -> inconsistent
+        return lease.diagnose()
+
+    class _Source:
+        def __init__(self, entries=()):
+            self._entries = list(entries)
+
+        def read_entries(self, issue_id):
+            return self._entries
+
+    def test_recorded_when_no_prior_projection_exists(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_diagnostics import (  # noqa: E501
+            PROJECTION_RECORDED,
+            _project_lease_blocker,
+        )
+
+        posted = []
+        blk = _project_lease_blocker(
+            self._diag(), self._args(), source=self._Source(),
+            post_note=lambda i, n: (posted.append((i, n)), "j1")[1],
+        )
+        self.assertEqual(blk["projection"], PROJECTION_RECORDED)
+        self.assertEqual(blk["projection_journal"], "j1")
+        self.assertEqual(len(posted), 1)
+        # the marker binds issue/lane/generation + the artifact fingerprint
+        marker = blk["blocker_marker"]
+        self.assertIn("issue=13951", marker)
+        self.assertIn("lane=lane-9", marker)
+        self.assertIn("generation=g3", marker)
+        self.assertIn(blk["callback_lease_diagnosis"]["fingerprint"], marker)
+        # redaction: the durable note carries no absolute path
+        self.assertNotIn(str(Path.home()), posted[0][1])
+
+    def test_duplicate_projection_is_an_idempotent_skip(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_diagnostics import (  # noqa: E501
+            PROJECTION_SKIPPED_DUPLICATE,
+            _lease_blocker_marker,
+            _callback_lease_blocker,
+            _project_lease_blocker,
+        )
+
+        diag = self._diag()
+        args = self._args()
+        marker = _lease_blocker_marker(_callback_lease_blocker(diag, args), diag)
+        prior = types.SimpleNamespace(notes=f"## Gate: Blocked\n{marker}\n...")
+        posted = []
+        blk = _project_lease_blocker(
+            diag, args, source=self._Source([prior]),
+            post_note=lambda i, n: (posted.append(1), "jX")[1],
+        )
+        self.assertEqual(blk["projection"], PROJECTION_SKIPPED_DUPLICATE)
+        self.assertEqual(len(posted), 0)  # no duplicate journal
+
+    def test_write_failure_is_fail_closed_and_retryable(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_diagnostics import (  # noqa: E501
+            PROJECTION_FAILED,
+            _project_lease_blocker,
+        )
+
+        def boom(issue_id, notes):
+            raise RuntimeError("redmine down")
+
+        blk = _project_lease_blocker(
+            self._diag(), self._args(), source=self._Source(), post_note=boom,
+        )
+        self.assertEqual(blk["projection"], PROJECTION_FAILED)
+        self.assertEqual(blk["projection_error"], "RuntimeError")
+        # still an actionable blocker (non-zero / is_stall) so the failure is not swallowed; the
+        # marker was NOT recorded, so the next sweep re-attempts (retryable).
+        self.assertTrue(blk["is_stall"])
+
+    def test_unreadable_source_falls_open_to_projecting(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_diagnostics import (  # noqa: E501
+            PROJECTION_RECORDED,
+            _project_lease_blocker,
+        )
+
+        class _Broken:
+            def read_entries(self, issue_id):
+                raise OSError("cannot read")
+
+        posted = []
+        blk = _project_lease_blocker(
+            self._diag(), self._args(), source=_Broken(),
+            post_note=lambda i, n: (posted.append(1), "jZ")[1],
+        )
+        # a read failure must not SUPPRESS a real blocker: it projects (at-least-once), never skips.
+        self.assertEqual(blk["projection"], PROJECTION_RECORDED)
+        self.assertEqual(len(posted), 1)
+
+
+class ConcurrentRefusalZeroWriteTest(unittest.TestCase):
+    """A concurrent-mutation refusal is truly zero net write — no backup file left behind (R1-F2)."""
+
+    def _lost(self):
+        lease = _bootstrapped()
+        lease.path.unlink()  # recoverable clean loss
+        return lease
+
+    def _backup_files(self, lease):
+        return [p for p in lease.path.parent.iterdir() if "recovery-backup" in p.name]
+
+    def test_mutation_before_backup_writes_nothing(self):
+        from mozyo_bridge.core.state.callback_sweep_lease import RECOVERY_REFUSED_CONCURRENT
+
+        lease = self._lost()
+        diag = lease.diagnose()
+        lease.sidecar_path.write_text("changed-before-apply", encoding="utf-8")
+        out = lease.recover_guarded(expected_fingerprint=diag.fingerprint, apply=True)
+        self.assertEqual(out.status, RECOVERY_REFUSED_CONCURRENT)
+        self.assertTrue(out.zero_write)
+        self.assertFalse(self._backup_files(lease))  # nothing was backed up
+
+    def test_mutation_during_backup_is_rolled_back_to_zero_write(self):
+        from mozyo_bridge.core.state.callback_sweep_lease import RECOVERY_REFUSED_CONCURRENT
+
+        lease = self._lost()
+        diag = lease.diagnose()
+        original = lease._backup_artifacts
+
+        def mutate_mid_backup(recovery_id):
+            result = original(recovery_id)
+            lease.sidecar_path.write_text("mutated-during-backup", encoding="utf-8")
+            return result
+
+        lease._backup_artifacts = mutate_mid_backup
+        out = lease.recover_guarded(expected_fingerprint=diag.fingerprint, apply=True)
+        self.assertEqual(out.status, RECOVERY_REFUSED_CONCURRENT)
+        # zero_write is honest: the backup this call created was rolled back.
+        self.assertTrue(out.zero_write)
+        self.assertFalse(self._backup_files(lease))
+
+    def test_a_preexisting_backup_is_never_deleted_by_a_rollback(self):
+        from mozyo_bridge.core.state.callback_sweep_lease import RECOVERY_REFUSED_CONCURRENT
+
+        lease = self._lost()
+        diag = lease.diagnose()
+        # a prior attempt already left a forensic backup for this recovery id
+        lease._backup_artifacts(diag.fingerprint)
+        preexisting = self._backup_files(lease)
+        self.assertTrue(preexisting)
+
+        original = lease._backup_artifacts
+
+        def mutate_mid_backup(recovery_id):
+            result = original(recovery_id)  # reuses the pre-existing backup (creates nothing new)
+            lease.sidecar_path.write_text("mutated-again", encoding="utf-8")
+            return result
+
+        lease._backup_artifacts = mutate_mid_backup
+        out = lease.recover_guarded(expected_fingerprint=diag.fingerprint, apply=True)
+        self.assertEqual(out.status, RECOVERY_REFUSED_CONCURRENT)
+        # the rollback deletes only files THIS call created — the pre-existing forensic copy survives.
+        self.assertTrue(self._backup_files(lease))
 
 
 if __name__ == "__main__":

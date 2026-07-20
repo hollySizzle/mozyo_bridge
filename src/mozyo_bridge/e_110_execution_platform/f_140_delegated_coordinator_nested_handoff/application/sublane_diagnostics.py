@@ -166,6 +166,19 @@ PROGRESS_ASSERTED = "asserted_unanchored"
 #: error the supervisor/service would swallow as a silent stop.
 CALLBACK_LEASE_INCONSISTENT = "callback_lease_inconsistent"
 
+#: Marker channel for the durable lease-blocker projection. NOT a ``workflow-event`` gate channel,
+#: so the gate watcher / callback discovery treat it as inert prose — it never mints a callback
+#: candidate. Its fields are the idempotency key: the same (issue, lane, generation, state,
+#: fingerprint) yields the same marker, so a prior projection is detectable in the durable record.
+CALLBACK_LEASE_BLOCKER_CHANNEL = "callback-lease-blocker"
+
+#: Projection dispositions recorded on the blocker (review R1-F1 #13951): the blocker was newly
+#: recorded to the issue journal, a matching projection already existed (idempotent skip), or the
+#: journal write failed (fail-closed + retryable — the next sweep re-attempts).
+PROJECTION_RECORDED = "recorded"
+PROJECTION_SKIPPED_DUPLICATE = "skipped_duplicate"
+PROJECTION_FAILED = "failed"
+
 
 def _callback_lease_blocker(diagnosis, args) -> dict[str, Any]:
     """Build the actionable, redaction-safe blocker for an inconsistent lease store (#13951 #3).
@@ -173,11 +186,19 @@ def _callback_lease_blocker(diagnosis, args) -> dict[str, Any]:
     ``diagnosis`` is a :class:`...callback_sweep_lease.LeaseDiagnosis` (already redaction-safe: no
     owner token, raw row, or absolute path). The result matches the ``callback-recovery`` verdict
     shape so the same text/JSON formatter and non-zero exit apply — the operator sees the typed
-    state, the zero-send invariant, and the exact public recovery rail, never a stack trace.
+    state, the zero-send invariant, and the exact public recovery rail, never a stack trace. It is
+    bound to the exact issue / lane / generation the sweep was actuating (review R1-F1), so the
+    durable projection names one dispatch round, never a wildcard.
     """
+    issue = str(getattr(args, "issue", "") or "").strip()
+    lane = str(getattr(args, "lane", "") or "").strip()
+    generation = str(getattr(args, "lane_generation", "") or "").strip()
     return {
         "state": CALLBACK_LEASE_INCONSISTENT,
         "is_stall": True,
+        "issue": issue,
+        "lane": lane,
+        "lane_generation": generation,
         "dispatch_delivered": bool(getattr(args, "dispatch_delivered", False)),
         "new_durable_progress": False,
         "callback": getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
@@ -200,6 +221,94 @@ def _callback_lease_blocker(diagnosis, args) -> dict[str, Any]:
         "progress_provenance": PROGRESS_DERIVED,
         "callback_lease_diagnosis": diagnosis.as_dict(),
     }
+
+
+def _lease_blocker_marker(blocker: dict[str, Any], diagnosis) -> str:
+    """The machine-readable idempotency marker: one per (issue, lane, generation, state, fingerprint).
+
+    A plain substring match of this exact token against a prior journal note proves the same blocker
+    was already projected — so a repeated sweep over a still-inconsistent store does not spawn a
+    duplicate journal. When the store's state or fingerprint changes, the marker changes and a fresh
+    projection is warranted. Every field is non-sensitive (no path, no owner token).
+    """
+    return (
+        f"[mozyo:{CALLBACK_LEASE_BLOCKER_CHANNEL}"
+        f":issue={blocker['issue']}:lane={blocker['lane']}"
+        f":generation={blocker['lane_generation']}:state={diagnosis.state}"
+        f":fingerprint={diagnosis.fingerprint}]"
+    )
+
+
+def _blocker_already_projected(source, issue: str, marker: str) -> bool:
+    """True iff a prior journal on ``issue`` already carries ``marker`` (durable-record dedup).
+
+    Fail-OPEN toward projecting: a read error returns False (not-yet-projected), so an unreadable
+    source never silently SUPPRESSES a real blocker — idempotency degrades to at-least-once, which
+    is the safe direction for a fail-closed operator signal.
+    """
+    if source is None or not marker:
+        return False
+    try:
+        for entry in source.read_entries(issue):
+            if marker in (getattr(entry, "notes", "") or ""):
+                return True
+    except Exception:  # noqa: BLE001 - a read failure must not suppress a real projection
+        return False
+    return False
+
+
+def _format_lease_blocker_note(blocker: dict[str, Any], marker: str) -> str:
+    """Render the redaction-safe durable blocker note (canonical Blocked heading + the dedup marker)."""
+    diag = blocker["callback_lease_diagnosis"]
+    lines = [
+        "## Gate: Blocked — callback-sweep lease store inconsistent",
+        "",
+        marker,
+        "",
+        f"- state: {blocker['state']}",
+        f"- issue: #{blocker['issue']} lane: {blocker['lane']} generation: {blocker['lane_generation']}",
+        f"- lease_state: {diag['state']} (recoverable={diag['recoverable']} "
+        f"has_live_owner={diag['has_live_owner']} fingerprint={diag['fingerprint']})",
+        f"- {blocker['summary']}",
+        "",
+        "### recovery",
+    ]
+    lines += [f"- {step}" for step in blocker["recovery"]]
+    lines += ["", "### invariants"]
+    lines += [f"- {inv}" for inv in blocker["invariants"]]
+    return "\n".join(lines)
+
+
+def _project_lease_blocker(diagnosis, args, *, source, post_note) -> dict[str, Any]:
+    """Record the lease-inconsistency blocker to the issue's durable journal, idempotently (#13951 #3).
+
+    The acceptance requires the supervisor/service to PROJECT the inconsistency as an actionable
+    typed blocker onto the durable record — a return payload / stdout line is not a durable work
+    record. This writes the redaction-safe blocker (bound to the exact issue/lane/generation) to the
+    issue journal via ``post_note``, deduped against the durable record so a repeated sweep does not
+    stack duplicate journals. Zero-send is preserved: this is a projection onto the issue's own
+    journal, NOT a coordinator callback delivery (that path never runs — the sweep returns here).
+
+    A journal write failure is fail-closed and retryable: the blocker still returns (non-zero,
+    ``is_stall``) with ``projection == failed`` and the marker is NOT recorded, so the next sweep
+    re-attempts. The blocker always carries its ``projection`` disposition for the operator surface.
+    """
+    blocker = _callback_lease_blocker(diagnosis, args)
+    marker = _lease_blocker_marker(blocker, diagnosis)
+    blocker["blocker_marker"] = marker
+    if _blocker_already_projected(source, blocker["issue"], marker):
+        blocker["projection"] = PROJECTION_SKIPPED_DUPLICATE
+        return blocker
+    note = _format_lease_blocker_note(blocker, marker)
+    try:
+        journal_id = post_note(blocker["issue"], note)
+    except Exception as exc:  # noqa: BLE001 - a write failure is fail-closed + retryable, never a crash
+        blocker["projection"] = PROJECTION_FAILED
+        blocker["projection_error"] = type(exc).__name__
+        return blocker
+    blocker["projection"] = PROJECTION_RECORDED
+    blocker["projection_journal"] = str(journal_id or "")
+    return blocker
 
 
 def _snapshot_source(args: argparse.Namespace) -> MappingRedmineJournalSource:
@@ -339,17 +448,22 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
         )
     # The lease store is identity-pinned and never auto-creates (R6-F2), so the composition root
     # bootstraps it explicitly; a store LOSS then fails closed instead of minting a duplicate lease.
-    # #13951 #3: a fail-closed store must PROJECT as an actionable typed blocker, not raise an opaque
-    # error the supervisor/service swallows as a silent stop. Diagnose it (read-only) and return the
-    # zero-send blocker naming the public recovery rail — do NOT auto-recover here (a silent
-    # re-create would hand a second live owner the same anchor).
+    # #13951 #3: a fail-closed store must PROJECT as an actionable typed blocker onto the DURABLE
+    # record, not raise an opaque error the supervisor/service swallows as a silent stop, and not
+    # merely return a payload (a return value / stdout line is not a durable work record — review
+    # R1-F1). Diagnose it (read-only), then record the redaction-safe blocker to the issue journal
+    # idempotently via the note transport already resolved above. Zero-send is preserved: this is a
+    # projection onto the issue's own journal, NOT a coordinator callback. Do NOT auto-recover here
+    # (a silent re-create would hand a second live owner the same anchor).
     from mozyo_bridge.core.state.callback_sweep_lease import CallbackSweepLeaseError
 
     lease = CallbackSweepLease(home=None)
     try:
         lease.bootstrap()
     except CallbackSweepLeaseError:
-        return _callback_lease_blocker(lease.diagnose(), args)
+        return _project_lease_blocker(
+            lease.diagnose(), args, source=source, post_note=transport.post_issue_note
+        )
     # The publication authority (j#80383 option (d)). Ordinary execute must NEVER bootstrap it:
     # bootstrap's both-absent branch re-mints the store, and a re-minted store forgets the
     # reservation a suspended sweep still holds -- the same store-wide reclaim that `recover()`
@@ -430,6 +544,21 @@ def format_callback_recovery_text(result: dict[str, Any]) -> str:
         f"new_durable_progress={result['new_durable_progress']} "
         f"callback={result['callback']} stale_cli={result['stale_cli']}",
     ]
+    # #13951 #3: when this is a lease-inconsistency blocker, surface whether it was durably PROJECTED
+    # to the issue journal — a recorded projection is the difference between an actionable blocker and
+    # a silent stop. A failed write is fail-closed and retryable; the operator must see it.
+    projection = result.get("projection")
+    if projection == PROJECTION_RECORDED:
+        lines.append(
+            f"  projection: recorded to durable journal j#{result.get('projection_journal') or '?'}"
+        )
+    elif projection == PROJECTION_SKIPPED_DUPLICATE:
+        lines.append("  projection: already recorded (idempotent skip; no duplicate journal)")
+    elif projection == PROJECTION_FAILED:
+        lines.append(
+            f"  projection: FAILED to write durable journal "
+            f"({result.get('projection_error') or 'unknown'}) — fail-closed, retry the sweep"
+        )
     provenance = result.get("progress_provenance", "")
     if provenance == PROGRESS_DERIVED:
         lines.append(

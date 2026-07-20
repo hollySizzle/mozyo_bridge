@@ -524,22 +524,26 @@ class CallbackSweepLease:
             ),
         )
 
-    def _backup_artifacts(self, recovery_id: str) -> tuple[str, ...]:
+    def _backup_artifacts(self, recovery_id: str) -> tuple[tuple[str, ...], tuple[Path, ...]]:
         """Copy the existing DB + sidecar to backup files BEFORE a mint. Idempotent, redaction-safe.
 
-        Returns the backup basenames (never absolute paths). An existing backup for the same
-        recovery id is never clobbered, so a replayed apply reuses it rather than overwriting the
-        forensic copy.
+        Returns ``(names, newly_created)`` — the backup basenames (never absolute paths) for the
+        outcome, and the full paths this call actually created (so a caller can roll them back if a
+        later gate refuses). An existing backup for the same recovery id is never clobbered, so a
+        replayed apply reuses it rather than overwriting the forensic copy — and reused files are NOT
+        in ``newly_created`` (rolling back must never delete a pre-existing forensic copy).
         """
         infix = f"{RECOVERY_BACKUP_INFIX}{recovery_id[:16]}"
-        made: list[str] = []
+        names: list[str] = []
+        created: list[Path] = []
         for src in (self.path, self.sidecar_path):
             if src.exists():
                 dst = src.with_name(src.name + infix)
                 if not dst.exists():
                     dst.write_bytes(src.read_bytes())
-                made.append(dst.name)
-        return tuple(made)
+                    created.append(dst)
+                names.append(dst.name)
+        return tuple(names), tuple(created)
 
     def recover_guarded(
         self, *, expected_fingerprint: str = "", apply: bool = False, now: Optional[float] = None,
@@ -614,21 +618,38 @@ class CallbackSweepLease:
                 "an apply must quote the fingerprint from a prior diagnosis so a concurrent "
                 "mutation is detectable; re-run status and pass its fingerprint",
             )
-        backups = self._backup_artifacts(diagnosis.fingerprint)
-        # Re-check the fingerprint right before the mint: a mutation DURING the backup would
-        # otherwise slip past the entry gate. The backups already written are harmless copies.
+        # Re-read the LIVE fingerprint immediately BEFORE any write (review R1-F2 #13951). The entry
+        # gate above compared the caller's asserted fingerprint against the diagnosis; this catches a
+        # mutation between that diagnosis and now with ZERO side-effect — no backup is written, so a
+        # refusal here is genuinely write-0 (the earlier revision backed up first and then reported
+        # ``zero_write=True`` while a backup file remained on disk — a false claim).
         if self.fingerprint() != diagnosis.fingerprint:
             return outcome(
                 RECOVERY_REFUSED_CONCURRENT,
-                "the store changed while backing it up (concurrent mutation); zero-write",
-                backups=backups,
+                "the store changed since the diagnosis this apply was bound to (concurrent "
+                "mutation); zero-write, nothing backed up",
+            )
+        names, created = self._backup_artifacts(diagnosis.fingerprint)
+        # Re-check once more: a mutation DURING the backup means the artifacts changed under us. Roll
+        # back the backups THIS call created (never a pre-existing forensic copy) so the refusal is
+        # truly zero net write, then refuse.
+        if self.fingerprint() != diagnosis.fingerprint:
+            for path in created:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            return outcome(
+                RECOVERY_REFUSED_CONCURRENT,
+                "the store changed while backing it up (concurrent mutation); rolled back this "
+                "call's backups — zero net write",
             )
         self._create_fresh(secrets.token_hex(16))
         return outcome(
             RECOVERY_APPLIED,
             "backed the prior artifacts up and minted a fresh store under a new nonce; every "
             "outstanding grant is now invalid",
-            backups=backups,
+            backups=names,
         )
 
     def _connect(self) -> sqlite3.Connection:
