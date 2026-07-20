@@ -468,6 +468,7 @@ class _SessionStartHarness:
         extra_env=None,
         claude_permission_mode_default=None,
         agent_launch=None,
+        coordinator_placement_mode="per_project_space",
     ):
         # `exist_ok`: a scenario may drive TWO runs through one tmp (Redmine #13948 pins
         # that a re-run of the same command in the same lane is a NEW action), and the
@@ -501,6 +502,7 @@ class _SessionStartHarness:
                 dry_run=dry_run,
                 claude_permission_mode_default=claude_permission_mode_default,
                 agent_launch=agent_launch,
+                coordinator_placement_mode=coordinator_placement_mode,
                 probe=_FAST_PROBE,
             )
             anchor = read_anchor(repo)
@@ -1728,6 +1730,68 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         create = herdr.workspace_creates[0]
         self.assertNotIn("--label", create)
+
+    def test_shared_space_default_lane_creates_labelled_coordinators_workspace(self) -> None:
+        # Redmine #14139 shared_space: the coordinator pair (default lane) mints ONE
+        # stable shared coordinators workspace, labelled `coordinators` (cosmetic,
+        # operator-readable) — distinct from the per-project (unlabelled) default.
+        herdr = _Herdr(created_workspace="wS")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        create = herdr.workspace_creates[0]
+        self.assertIn("--label", create)
+        self.assertEqual(create[create.index("--label") + 1], "coordinators")
+
+    def test_per_project_default_lane_is_byte_invariant_under_explicit_mode(self) -> None:
+        # Passing the explicit default mode is byte-for-byte the pre-#14139 launch:
+        # the coordinator pair's project workspace is created with no label.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="",
+                coordinator_placement_mode="per_project_space",
+            )
+        self.assertNotIn("--label", herdr.workspace_creates[0])
+
+    def test_shared_space_leaves_sublane_placement_unchanged(self) -> None:
+        # shared_space only diverges the DEFAULT lane; a sublane launch under the same
+        # mode keeps the #13380 host label (`<project>_sublanes`), never `coordinators`.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, repo = self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="lane-1",
+                coordinator_placement_mode="shared_space",
+            )
+        create = herdr.workspace_creates[0]
+        self.assertEqual(create[create.index("--label") + 1], f"{repo.name}_sublanes")
+
+    def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
+        # Redmine #14139: an unknown mode string fails closed at the pure entry point,
+        # before any herdr actuation (mirrors the unknown-provider guard).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp,
+                    providers=["claude"],
+                    herdr=herdr,
+                    lane="",
+                    coordinator_placement_mode="everywhere",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.calls, [])
 
     def test_unknown_provider_fails_closed(self) -> None:
         herdr = _Herdr()

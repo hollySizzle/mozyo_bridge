@@ -452,6 +452,66 @@ v1 に含めない**: launch 経路の語彙は現状 lane_class (`default` / `s
 には lane-role 語彙の launch 時解決が別途必要。schema は lane class key を追加するだけで拡張でき
 (closed set に新 class を足す)、既存 class の意味論は変わらないため、この拡張点は塞がっていない。
 
+## 5.1.1 coordinator placement mode — operator-scoped 配置 (Redmine #14139)
+
+coordinator pair (default lane) を **どの herdr workspace に置くか**を operator ごとに切り替える
+closed knob。§5.1 `lane_placement` (pair 内部の split 方向 / 役割順序、repo-committed) とは**別関心・別
+source**であり、`_launch_target_for_lane` (#13380) / `_tab_target_for_lane` (#13411) の sublane 配置軸は
+一切変えない。
+
+### Scope は operator-scoped (home-level、非 commit)
+
+設定は mozyo-bridge **home** root の `coordinator-placement.yaml` に置く (`mozyo_bridge_home()` = `MOZYO_BRIDGE_HOME`
+または `~/.mozyo_bridge`)。repo-committed config に置かない理由は portable 値 vs operator-private 境界: 同じ N
+repo を扱う 2 人の operator が「全 project の coordinator を 1 window で俯瞰したい」「小型モニタで project 別に
+切替えたい」と正当に対立し、committed 値は N repo 間で衝突し、operator の私的選好を上書きしてしまう。repo に
+残るのは pair 内部配置 (`lane_placement`, #13646/#13647) までとする。file は本 mode 専用の小 file とし、repo-local
+schema とも将来の home-config schema (#14148) とも衝突させない。
+
+```yaml
+# ~/.mozyo_bridge/coordinator-placement.yaml
+mode: shared_space          # per_project_space | shared_space
+```
+
+### Closed vocabulary (unknown fail-closed)
+
+- `per_project_space` (**既定**、file 不在時): coordinator pair は各 project の project workspace に置く
+  (#13380 の従来動作)。opt-in しない operator は pre-#14139 と byte 一致で起動する。
+- `shared_space`: 全 project の coordinator pair を **1 つの stable shared coordinators workspace** に置き、
+  project ごとに column とする (tmux 時代の俯瞰運用の復元)。
+- それ以外の `mode` 文字列 / unknown key / 非 mapping / unsupported version は
+  `CoordinatorPlacementError` で fail-closed (未知 shape が per_project_space に化けない)。
+
+### shared_space の workspace identity / 冪等 adopt
+
+`shared_space` の default-lane target 解決 (`herdr_lane_topology._shared_coordinator_target`):
+
+1. **自 project の live/adopted default-lane slot** が pin する (heal は coordinator pair を workspace 跨ぎで
+   分割しない)。
+2. 自 pin が無ければ、**他 project の live default-lane slot** が占有する herdr workspace へ join する。#13380 の
+   sublane host 解決と違い、ここは意図的に mozyo `workspace` identity 境界を跨ぐ (各 project の coordinator は
+   自 project identity `mzb1_<project-ws>_<role>_default` を保つ)。shared space は全 project coordinator column の
+   union だからで、これが 2 番目以降の project の launch を「先行 project が作った space の冪等 adopt」にする。
+3. どちらも pin しなければ `""` → caller が stable label `coordinators` で create する。column ゼロの space は
+   最終 pane close で herdr が自動 close する (#13380) ため husk は残らず、次 project が on-demand で再 mint する。
+
+sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin / sibling column が
+複数 herdr workspace に跨る場合は「どれが shared space か推測しない」fail-closed (#13330 posture)。
+
+### Launch-time only (適用条件)
+
+mode は **launch / adopt 時のみ**読む。設定を変えても既存 live pair は自動で動かない (herdr は same-tab
+re-split を拒否する; live 再配置は live-relayout runbook のみ, #13648)。適用は **次回の fresh launch / adopt**
+から。config 読取りは composition root (`herdr_launch_command` の bare `mozyo` coordinator launch /
+`herdr_session_start_cli`) で行い、pure な `prepare_session` へ解決済み mode 文字列を渡す (ambient IO を pure core に
+持ち込まない)。壊れた operator file は composition root で actionable に fail-closed する。
+
+### Compatibility
+
+- 未設定 = `per_project_space` = pre-#14139 と byte 一致 (project workspace は無 label で create)。
+- `shared_space` が分岐させるのは **default lane のみ**。同 mode 下でも sublane launch は #13380 host label
+  (`<project>_sublanes`) を保ち、`coordinators` にはならない。
+
 ## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
 
 §5 の同一 tab pair placement / heal contract は、**それを実装した runtime が heal を

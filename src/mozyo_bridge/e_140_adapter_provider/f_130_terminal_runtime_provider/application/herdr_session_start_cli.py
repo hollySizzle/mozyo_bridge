@@ -128,6 +128,22 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
         raise AssertionError("unreachable")
     agent_launch = repo_config.agent_launch
     lane_placement = repo_config.lane_placement
+    # Operator-scoped coordinator placement mode (Redmine #14139): read from the
+    # mozyo-bridge HOME, not the repo. It only affects the default (coordinator) lane;
+    # a lane session-start passes it through harmlessly. A broken operator file fails
+    # closed with an actionable refusal, exactly like the repo-local config above.
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
+        resolve_coordinator_placement_mode,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+        CoordinatorPlacementError,
+    )
+
+    try:
+        coordinator_placement_mode = resolve_coordinator_placement_mode()
+    except CoordinatorPlacementError as exc:
+        die(f"herdr session-start failed: invalid operator coordinator placement: {exc}")
+        raise AssertionError("unreachable")
     try:
         result = _use_case.prepare_session(
             repo_root=repo_root,
@@ -138,6 +154,7 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=agent_launch,
             lane_placement=lane_placement,
+            coordinator_placement_mode=coordinator_placement_mode,
         )
     except HerdrSessionStartError as exc:
         die(f"herdr session-start failed: {exc}")

@@ -228,6 +228,86 @@ def _launch_target_for_lane(
     return next(iter(host_prefixes)) if host_prefixes else ""
 
 
+#: The stable, operator-readable label for the single shared coordinators herdr
+#: workspace (Redmine #14139, ``shared_space`` placement mode). Cosmetic only —
+#: every join decision keys on the live default-lane inventory, never this label
+#: (a herdr label is neither unique nor durable identity). Constant, not derived
+#: from any project, precisely because the space is shared across projects.
+SHARED_COORDINATOR_WORKSPACE_LABEL = "coordinators"
+
+
+def _shared_coordinator_target(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    adopted_locators: Sequence[str],
+) -> str:
+    """The shared coordinators herdr workspace the default-lane pair joins (``""`` -> create).
+
+    ``shared_space`` placement mode (Redmine #14139, operator-scoped): every
+    project's coordinator pair (default lane) shares ONE stable herdr workspace,
+    each project a column, so an operator oversees every project's coordinators in
+    a single window (the tmux-era overview). The ``per_project_space`` default is
+    unchanged and never reaches here — it keeps :func:`_launch_target_for_lane`.
+
+    The target is picked from the live inventory, in order:
+
+    1. this project's OWN live default-lane slots (plus this run's adopted slots —
+       always same-lane, same-project) pin the target. A heal never splits the
+       coordinator gateway/worker pair across workspaces.
+    2. no own pins -> join the herdr workspace ANY OTHER project's live default-
+       lane slots occupy — the shared coordinators space. Unlike the #13380
+       sublane-host resolution this deliberately crosses the mozyo ``workspace``
+       identity boundary (each project's coordinator carries its own project
+       identity, ``mzb1_<project-ws>_<role>_default``), because the SHARED space is
+       exactly the union of every project's coordinator column. This is what makes
+       the second project's launch idempotently ADOPT the space the first created.
+    3. nothing pins one -> ``""``: the caller creates the shared workspace with the
+       stable :data:`SHARED_COORDINATOR_WORKSPACE_LABEL`. A zero-column space cannot
+       linger to be rejoined — herdr auto-closes a workspace with its last pane
+       (#13380) — so the next project simply re-mints it on demand.
+
+    Only default-lane (coordinator) slots are ever consulted: a sublane slot never
+    pins the coordinators space (its placement is the untouched #13380/#13411
+    axis). Raises when the own pins, or the sibling coordinator columns, span more
+    than one herdr workspace: refusing to guess which one the launches belong to
+    (the #13330 fail-closed posture).
+    """
+    own = [loc for loc in adopted_locators if loc]
+    siblings: list = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        if (decode.identity.lane_id or DEFAULT_LANE) != DEFAULT_LANE:
+            continue
+        locator = _agent_locator(row)
+        if not locator:
+            continue
+        if decode.identity.workspace_id == workspace_id:
+            own.append(locator)
+        else:
+            siblings.append(locator)
+    own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
+    if len(own_prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"live coordinator slots of workspace {workspace_id!r} span multiple herdr "
+            f"workspaces {sorted(own_prefixes)!r}; refuse to guess which one new launches "
+            "belong to"
+        )
+    if own_prefixes:
+        return next(iter(own_prefixes))
+    sibling_prefixes = {p for p in (_workspace_prefix(loc) for loc in siblings) if p}
+    if len(sibling_prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"live coordinator columns span multiple herdr workspaces "
+            f"{sorted(sibling_prefixes)!r}; refuse to guess which one is the shared "
+            "coordinators space"
+        )
+    return next(iter(sibling_prefixes)) if sibling_prefixes else ""
+
+
 def _lane_live_slot_tabs(
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
@@ -689,8 +769,10 @@ __all__ = (
     "AGENT_KEY_TAB",
     "HerdrSessionStartError",
     "_host_workspace_label",
+    "SHARED_COORDINATOR_WORKSPACE_LABEL",
     "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "_shared_coordinator_target",
     "ContainerPlan",
     "initial_container_occupancy",
     "resolve_container_plan",

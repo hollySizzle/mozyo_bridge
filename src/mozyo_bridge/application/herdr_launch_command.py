@@ -255,6 +255,12 @@ class LiveHerdrLaunchOps:
         from mozyo_bridge.application.repo_local_config_loader import (
             load_repo_local_config,
         )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
+            resolve_coordinator_placement_mode,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+            CoordinatorPlacementError,
+        )
 
         # Config-driven pane placement (Redmine #13646): the bare `mozyo` coordinator pair
         # is the `default` lane_class, so the config's `lane_placement.default` split /
@@ -262,6 +268,15 @@ class LiveHerdrLaunchOps:
         # main window) and which provider occupies first. Unconfigured repos keep the herdr
         # server default placement and the requested provider order, byte-for-byte.
         repo_config = load_repo_local_config(repo_root)
+        # Operator-scoped coordinator placement mode (Redmine #14139): read from the
+        # mozyo-bridge HOME (never a repo-committed value), so the coordinator pair lands
+        # in a per-project workspace (default) or the shared coordinators space per this
+        # operator's choice. A broken operator file fails closed with an actionable refusal.
+        try:
+            coordinator_placement_mode = resolve_coordinator_placement_mode()
+        except CoordinatorPlacementError as exc:
+            self.die(f"mozyo launch failed: invalid operator coordinator placement: {exc}")
+            raise AssertionError("unreachable")
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
@@ -270,6 +285,7 @@ class LiveHerdrLaunchOps:
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=repo_config.agent_launch,
             lane_placement=repo_config.lane_placement,
+            coordinator_placement_mode=coordinator_placement_mode,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:
