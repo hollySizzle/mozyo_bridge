@@ -31,6 +31,12 @@ stale-locator addendum j#83362 + the callback-lease addendum j#83426):
    diagnoses ``missing_db`` and recovers under a fingerprint-bound apply; a live owner / an
    unreadable store / a concurrent mutation is zero-write; a rollback whose backup cleanup fails
    is a typed ``rollback_incomplete`` residue (honestly ``zero_write=False``), never hidden.
+5. **Hibernated-legacy migration foreign-inventory gate** (#13897 / j#83575) — ``sublane retire
+   --migrate-hibernated-legacy``. A lane unit occupied by a foreign / duplicate / unreadable
+   occupant is zero-write / zero-close / fixed-reason (``foreign_inventory_present`` /
+   ``duplicate_inventory`` / ``expected_identity_unresolved``); exact managed-slot absence stays a
+   necessary conjunct; a quiescent unit migrates and an already-retired replay re-verifies
+   quiescence. Added per j#83575 without re-implementing the #13897 runtime source.
 
 Every fault is prepared through the safe isolated fixture rails the harness owns (the home-scoped
 public stores + the fake's one-shot stimuli), so an operator/agent driving it never issues a raw
@@ -319,6 +325,97 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         self.assertEqual(result.rc, 1)
         self.assertFalse(result.json()["observation"]["is_standard_sublane_worker"])
         self.assertFalse(result.json()["closed_old_worker"])
+
+
+# ---------------------------------------------------------------------------
+# Shape 5 — hibernated-legacy migration foreign-inventory gate (#13897 / j#83575)
+# ---------------------------------------------------------------------------
+class LegacyMigrationForeignInventoryThroughPublicCli(unittest.TestCase):
+    """``sublane retire --migrate-hibernated-legacy``: a foreign / duplicate / unreadable
+    occupant of the lane unit must be zero-write / zero-close / fixed-reason. Exact managed-slot
+    absence stays a necessary conjunct; an already-retired replay re-verifies quiescence.
+
+    This drives the #13897 gate through the PUBLIC CLI dispatch over a real (isolated) git-backed
+    lane + a fake herdr inventory — the installed-surface counterpart of the internal #13897
+    regression, added per j#83575 without re-implementing the #13897 runtime source.
+    """
+
+    def _migration(self, result):
+        return result.json()["hibernated_legacy_retire_migration"]
+
+    def test_foreign_only_occupant_blocks_zero_write_zero_close(self):
+        h = InstalledFaultHarness(self)
+        ctx = h.legacy_migration_lane("issue_14097_legacyA", issue="14097")
+        h.seed_foreign_occupant(ctx, provider="gemini")
+        before = h.live_locator_count()
+        result = h.retire_migrate_cli(ctx)
+        self.assertEqual(result.rc, 1)
+        migration = self._migration(result)
+        self.assertEqual(migration["reason"], "foreign_inventory_present")
+        self.assertEqual(migration["expected_live"], [])  # no expected managed slot is live
+        self.assertTrue(migration["foreign_names"])  # yet the unit is not quiescent
+        self.assertFalse(result.json()["retire_ok"])
+        # zero-write: the durable row stays hibernated; zero-close: the foreign agent survives.
+        self.assertEqual(h.legacy_disposition(ctx), "hibernated")
+        self.assertEqual(h.live_locator_count(), before)
+
+    def test_duplicate_managed_rows_block_zero_write(self):
+        h = InstalledFaultHarness(self)
+        ctx = h.legacy_migration_lane("issue_14097_legacyB", issue="14097")
+        h.seed_duplicate_managed(ctx, role="codex")
+        result = h.retire_migrate_cli(ctx)
+        self.assertEqual(result.rc, 1)
+        self.assertEqual(self._migration(result)["reason"], "duplicate_inventory")
+        self.assertEqual(h.legacy_disposition(ctx), "hibernated")
+
+    def test_locatorless_expected_row_blocks_zero_write(self):
+        # An unreadable / locator-less expected row is "cannot resolve", not "absent".
+        h = InstalledFaultHarness(self)
+        ctx = h.legacy_migration_lane("issue_14097_legacyC", issue="14097")
+        h.seed_locatorless_expected(ctx, role="codex")
+        result = h.retire_migrate_cli(ctx)
+        self.assertEqual(result.rc, 1)
+        self.assertEqual(self._migration(result)["reason"], "expected_identity_unresolved")
+        self.assertEqual(h.legacy_disposition(ctx), "hibernated")
+
+    def test_a_quiescent_unit_migrates_and_replay_is_idempotent(self):
+        # Exact managed-slot absence + no foreign / duplicate / unreadable = quiescent -> migrate;
+        # a duplicate replay re-verifies quiescence and is an idempotent no-op.
+        h = InstalledFaultHarness(self)
+        ctx = h.legacy_migration_lane("issue_14097_legacyD", issue="14097")
+        first = h.retire_migrate_cli(ctx)
+        self.assertEqual(first.rc, 0)
+        self.assertEqual(self._migration(first)["state"], "retired")
+        self.assertEqual(h.legacy_disposition(ctx), "retired")
+        replay = h.retire_migrate_cli(ctx)
+        self.assertEqual(replay.rc, 0)
+        self.assertEqual(self._migration(replay)["state"], "already_retired")
+        self.assertEqual(h.legacy_disposition(ctx), "retired")
+
+    def test_already_retired_replay_re_blocks_on_a_foreign_occupant(self):
+        # A persisted `retired` does not prove present quiescence: an occupant appearing after
+        # the migration must re-block the replay (success withheld), zero-write.
+        h = InstalledFaultHarness(self)
+        ctx = h.legacy_migration_lane("issue_14097_legacyE", issue="14097")
+        self.assertEqual(h.retire_migrate_cli(ctx).rc, 0)
+        self.assertEqual(h.legacy_disposition(ctx), "retired")
+        h.seed_foreign_occupant(ctx, provider="gemini")
+        replay = h.retire_migrate_cli(ctx)
+        self.assertEqual(replay.rc, 1)
+        self.assertEqual(self._migration(replay)["reason"], "foreign_inventory_present")
+        self.assertEqual(h.legacy_disposition(ctx), "retired")  # stays retired, success withheld
+
+    def test_a_foreign_occupant_in_another_lane_does_not_block(self):
+        # The fence is scoped to the TARGETED unit: a foreign occupant of a different lane is
+        # none of this migration's business (exact managed-slot absence stays the conjunct).
+        h = InstalledFaultHarness(self)
+        ctx = h.legacy_migration_lane("issue_14097_legacyF", issue="14097")
+        # A foreign occupant in a DIFFERENT lane of the SAME workspace.
+        h.seed_foreign_occupant(ctx, provider="gemini", lane_id="issue_99999_other_lane")
+        result = h.retire_migrate_cli(ctx)
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(self._migration(result)["state"], "retired")
+        self.assertEqual(self._migration(result)["foreign_names"], [])
 
 
 # ---------------------------------------------------------------------------
