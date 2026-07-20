@@ -703,19 +703,41 @@ class JournalGrammarTest(unittest.TestCase):
                 self.assertIsNone(fold_issue_gate_facts([_j("100", notes)]))
 
 
+#: A canonical Review Generation Marker Contract v2 identity: a full 40-hex head + numeric req.
+_HEAD = "6109b1573ec192cf67e596e24831b6524f4c40bf"
+
+
+def _rr_marker(conclusion=None, *, head=_HEAD, req="83241", extra=""):
+    """A ``review_result`` marker literal (defaults to a canonical v2 identity)."""
+    fields = ["gate=review_result"]
+    if conclusion is not None:
+        fields.append(f"conclusion={conclusion}")
+    if extra:
+        fields.append(extra)
+    if head is not None:
+        fields.append(f"head={head}")
+    if req is not None:
+        fields.append(f"req={req}")
+    return "[mozyo:workflow-event:" + ":".join(fields) + "]"
+
+
 class StructuredMarkerAuthorityTest(unittest.TestCase):
     """Redmine #13952 R3: the canonical ``[mozyo:workflow-event:gate=review_result:...]`` marker.
 
     Live evidence (installed 0.12.2, j#83324): #13811 j#83313 and #13951 j#83311 both carried
-    ``gate=review_result:conclusion=changes_requested`` but fell to ``review_waiting`` /
-    "auditor review owed", while #13884 j#83307 projected ``implementing`` / worker. The cause
-    was that the conclusion was read only from a plain ``結論:`` field / heading qualifier: a
-    Markdown-emphasized value (``結論: **changes_requested**``) or an English ``conclusion:``
-    label was dropped to ``pending``. The structured marker is now the unambiguous authority.
+    ``gate=review_result:conclusion=changes_requested`` (with a full head + req) but fell to
+    ``review_waiting`` / "auditor review owed", while #13884 j#83307 projected ``implementing`` /
+    worker. The cause was that the conclusion was read only from a plain ``結論:`` field / heading
+    qualifier: a Markdown-emphasized value (``結論: **changes_requested**``) or an English
+    ``conclusion:`` label was dropped to ``pending``. The structured marker is now the
+    authority — but ONLY when it meets the v2 identity (full head + numeric req + explicit
+    conclusion); a malformed / missing marker fails closed (review j#83388 F1/F2).
     """
 
     def _owner(self, notes):
         facts = fold_issue_gate_facts([_j("100", notes)])
+        if facts is None:
+            return None, None, None
         row = fold_glance_row(
             IssueGlanceSnapshot(
                 issue_id="13",
@@ -725,14 +747,16 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         )
         return facts, row.workflow_state, row.next_owner
 
+    # -- the three live j#83324 shapes (all carry a canonical marker) --------------------
+
     def test_marker_recovers_conclusion_when_the_field_carries_markdown_emphasis(self):
         # #13951 j#83311 verbatim shape: the ``結論`` value is bold, so the exact-match field
-        # read drops it — but the marker is authoritative, so the review still folds to worker.
+        # read drops it — but the canonical marker is authoritative, so it still folds to worker.
         notes = (
             "## Gate: Review — public callback lease recovery rail R1\n"
             "- 再review要否: true\n"
             "- 結論: **changes_requested**\n\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head=7e535672:req=83188]"
+            + _rr_marker("changes_requested", head="7e535672b01c5a188846a10d84511c68ec386e4b", req="83188")
         )
         facts, state, owner = self._owner(notes)
         self.assertEqual(facts.latest_gate, _GATE_REVIEW)
@@ -746,7 +770,7 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
             "## Gate: Review — project-gateway hibernate exact-generation fence (T1 R2)\n"
             "- review_request: j#83236\n"
             "- conclusion: **changes_requested**\n\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head=aa6a150f:req=83236]"
+            + _rr_marker("changes_requested", head="aa6a150f74329732e99af78ea193e27a78dc01f4", req="83236")
         )
         facts, state, owner = self._owner(notes)
         self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_CHANGES_REQUESTED, "implementing", OWNER_WORKER))
@@ -754,68 +778,89 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
     def test_plain_field_shape_is_unchanged(self):
         # #13884 j#83307 verbatim shape: a plain ``結論: 要修正`` field already worked; the marker
         # agrees, so the projection is unchanged (no regression on the shape that was correct).
-        notes = (
-            "## Gate: Review\n"
-            "- 結論: 要修正\n\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head=6109b157:req=83241]"
-        )
+        notes = "## Gate: Review\n- 結論: 要修正\n\n" + _rr_marker("changes_requested")
         facts, state, owner = self._owner(notes)
         self.assertEqual((state, owner), ("implementing", OWNER_WORKER))
 
+    # -- authority + robustness (canonical markers) --------------------------------------
+
     def test_marker_conclusion_outranks_a_disagreeing_field(self):
-        # The marker is the machine authority: it wins over the body field when they disagree.
-        notes = (
-            "## Gate: Review\n- 結論: 承認\n\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested]"
-        )
-        facts, state, owner = self._owner(notes)
+        # A canonical marker is the machine authority: it wins over the body field on disagreement.
+        facts, state, _ = self._owner("## Gate: Review\n- 結論: 承認\n\n" + _rr_marker("changes_requested"))
         self.assertEqual((facts.review_conclusion, state), (REVIEW_CHANGES_REQUESTED, "implementing"))
 
     def test_marker_position_and_trailing_placement_do_not_lose_it(self):
-        # The marker is read wherever it sits (mid-body, or as the final line after findings).
+        # The canonical marker is read wherever it sits (before the heading, or last after findings).
         for notes in (
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested]\n## Gate: Review\n- finding_1",
-            "## Gate: Review\n### Findings\n- F1 ...\n- F2 ...\n\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head=abc123:req=9]",
+            _rr_marker("changes_requested") + "\n## Gate: Review\n- finding_1",
+            "## Gate: Review\n### Findings\n- F1 ...\n- F2 ...\n\n" + _rr_marker("changes_requested"),
         ):
             with self.subTest(notes=notes):
                 facts, state, _ = self._owner(notes)
                 self.assertEqual((facts.review_conclusion, state), (REVIEW_CHANGES_REQUESTED, "implementing"))
 
     def test_approved_and_blocker_markers_project_their_outcomes(self):
-        approved, state_a, owner_a = self._owner(
-            "## Gate: Review\n[mozyo:workflow-event:gate=review_result:conclusion=approved:head=a:req=1]"
-        )
+        approved, state_a, owner_a = self._owner("## Gate: Review\n" + _rr_marker("approved"))
         self.assertEqual((approved.review_conclusion, state_a, owner_a), ("approved", "owner_waiting", OWNER_COORDINATOR))
         blocker, state_b, owner_b = self._owner(
-            "## Gate: Review\n[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:blocker=1]"
+            "## Gate: Review\n" + _rr_marker("changes_requested", extra="blocker=1")
         )
         self.assertTrue(blocker.blocker_recorded)
         self.assertEqual((state_b, owner_b), ("blocked", OWNER_COORDINATOR))
 
-    def test_marker_establishes_the_review_gate_without_a_gate_heading(self):
-        # A reworded heading (the exact drift class #13952 keeps hitting) still folds, because
-        # the structured marker independently establishes the review gate.
-        facts, state, owner = self._owner(
-            "## Durable review note (reworded heading)\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head=abc:req=1]"
-        )
+    def test_canonical_marker_establishes_the_review_gate_without_a_gate_heading(self):
+        # A reworded heading (the exact drift class #13952 keeps hitting) still folds, because a
+        # CANONICAL marker independently establishes the review gate.
+        facts, state, owner = self._owner("## Durable review note (reworded heading)\n" + _rr_marker("changes_requested"))
         self.assertEqual((facts.latest_gate, state, owner), (_GATE_REVIEW, "implementing", OWNER_WORKER))
 
-    def test_review_result_marker_without_a_conclusion_is_audit_owed(self):
-        # A review gate whose marker speaks no conclusion (and no field) is fail-closed to
-        # pending — the audit is still owed, never guessed.
-        facts, state, owner = self._owner(
-            "## Gate: Review\n[mozyo:workflow-event:gate=review_result:head=abc:req=1]"
-        )
+    # -- fail-closed identity fence (review j#83388 F1/F2) -------------------------------
+
+    def test_malformed_conclusion_marker_does_not_fall_back_to_the_body(self):
+        # F1: a review_result marker with an out-of-vocabulary conclusion must NOT let the body
+        # ``結論: 承認`` promote the lane — the marker's presence forbids the fallback.
+        facts, state, owner = self._owner("## Gate: Review\n- 結論: 承認\n" + _rr_marker("bogus"))
         self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_AUDITOR))
 
-    def test_conflicting_review_result_markers_fail_closed(self):
-        # Two review_result markers that disagree are ambiguous -> pending (never a coin-flip).
+    def test_a_valid_and_an_invalid_marker_together_fail_closed(self):
+        # F1: a valid changes_requested marker alongside a malformed one is not "one clear
+        # outcome" — the malformed marker shadows the journal to pending.
         facts, state, _ = self._owner(
-            "## Gate: Review\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=approved]\n"
-            "[mozyo:workflow-event:gate=review_result:conclusion=changes_requested]"
+            "## Gate: Review\n" + _rr_marker("changes_requested") + "\n" + _rr_marker("bogus")
+        )
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_marker_missing_head_is_not_authoritative(self):
+        # F2: no head -> malformed identity -> shadow. With a gate heading the review is pending;
+        # with a reworded heading there is no marker-only gate at all (unknown).
+        facts, state, _ = self._owner("## Gate: Review\n" + _rr_marker("changes_requested", head=None))
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+        self.assertIsNone(self._owner("## Durable review\n" + _rr_marker("changes_requested", head=None))[0])
+
+    def test_marker_abbreviated_or_upper_head_is_not_authoritative(self):
+        # F2: a truncated / upper-case head is not a full commit head (v2 identity fails closed).
+        for bad in ("abc123", _HEAD.upper(), _HEAD[:39], _HEAD + "0"):
+            with self.subTest(head=bad):
+                facts, state, _ = self._owner("## Gate: Review\n" + _rr_marker("approved", head=bad))
+                self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_marker_missing_or_nonnumeric_req_is_not_authoritative(self):
+        # F2: the answered review_request journal must be a non-blank numeric id.
+        for bad in (None, "x", "j83188", ""):
+            with self.subTest(req=bad):
+                facts, state, _ = self._owner("## Gate: Review\n" + _rr_marker("changes_requested", req=bad))
+                self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_canonical_marker_without_a_conclusion_is_audit_owed(self):
+        # A review whose canonical-identity marker speaks no conclusion (and no field) is
+        # fail-closed to pending — the audit is still owed, never guessed.
+        facts, state, owner = self._owner("## Gate: Review\n" + _rr_marker(None))
+        self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_AUDITOR))
+
+    def test_conflicting_canonical_markers_fail_closed(self):
+        # Two canonical markers that disagree are ambiguous -> pending (never a coin-flip).
+        facts, state, _ = self._owner(
+            "## Gate: Review\n" + _rr_marker("approved") + "\n" + _rr_marker("changes_requested")
         )
         self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
 
@@ -827,27 +872,11 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         self.assertIsNone(facts)
 
     def test_dispatch_marker_does_not_become_a_review(self):
-        # An implementation_request dispatch marker (``kind=`` field) is not gate-bearing here.
+        # An implementation_request dispatch marker (``kind=`` field) is not a review_result here.
         facts = fold_issue_gate_facts(
             [_j("100", "## Gate: Implementation Request\n[mozyo:workflow-event:kind=implementation_request:lane=x:lane_generation=1]")]
         )
         self.assertEqual(facts.latest_gate, GATE_START)  # from the heading, not a review
-
-    def test_marker_gate_map_stays_pinned_to_the_shared_vocabulary(self):
-        # Guard the reuse: the marker->gate map is built from the watcher's own vocabulary, so it
-        # cannot silently re-fork. Every value is a known runtime gate.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
-            _MARKER_GATE,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-            GATE_BEARING_KINDS,
-        )
-        self.assertEqual(set(_MARKER_GATE), set(GATE_BEARING_KINDS))
-        self.assertEqual(_MARKER_GATE["review_result"], _GATE_REVIEW)
-        self.assertLessEqual(
-            set(_MARKER_GATE.values()),
-            {_GATE_REVIEW, GATE_START, GATE_BLOCKED, GATE_CLOSE, "implementation_done", "review_request", "owner_close_approval"},
-        )
 
 
 class _FakeRedmineSource:

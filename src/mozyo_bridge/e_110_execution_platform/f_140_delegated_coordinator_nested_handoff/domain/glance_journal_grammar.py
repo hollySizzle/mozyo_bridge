@@ -14,17 +14,23 @@ The boundary (j#74307):
   produces no watcher events and mutates nothing.
 - **The canonical structured marker is the unambiguous authority (Redmine #13952 R3).** In
   addition to the ``## Gate:`` heading grammar, this module reads the SAME structured
-  ``[mozyo:workflow-event:gate=<kind>:conclusion=<token>:...]`` token the #12672 watcher
-  standardizes on (via :func:`...redmine_journal_source.marker_fields_in_note`), UNIONED with
-  the heading facts. A same-lane reviewer already emits it, so a durable review is recognized
-  even when its heading is reworded or its ``結論`` value carries Markdown emphasis / an
-  English label — the drift class this issue keeps hitting (#13811 j#83313 / #13951 j#83311
-  both fell to "auditor review owed" although each carried
-  ``gate=review_result:conclusion=changes_requested``). The marker's ``conclusion`` OUTRANKS
-  the body ``結論`` field and the heading qualifier; a ``review_result`` marker that speaks no
-  in-vocabulary conclusion (and no ``blocker`` flag), or two review_result markers that
-  disagree, fail closed to ``pending`` (the audit is still owed) rather than being guessed.
-  Reading the token is still read-only: it produces no watcher events and mutates nothing.
+  ``[mozyo:workflow-event:gate=review_result:conclusion=<token>:head=<full_head>:req=<journal>]``
+  token the #12672 watcher standardizes on (via
+  :func:`...redmine_journal_source.marker_fields_in_note`). A same-lane reviewer already emits
+  it, so a durable review is recognized even when its heading is reworded or its ``結論`` value
+  carries Markdown emphasis / an English label — the drift class this issue keeps hitting
+  (#13811 j#83313 / #13951 j#83311 both fell to "auditor review owed" although each carried
+  ``gate=review_result:conclusion=changes_requested``). The marker is authoritative only when it
+  meets the **Review Generation Marker Contract v2** identity — a full 40/64 lowercase hex
+  ``head``, a non-blank numeric ``req``, and an explicit ``conclusion`` / ``blocker`` flag
+  (review j#83388 F2, validated by the REUSED :func:`...review_return_route.is_full_commit_head`
+  so the grammar is not re-forked). Such a canonical marker's ``conclusion`` OUTRANKS the body
+  ``結論`` field / heading qualifier and, on its own, establishes the review gate. But the moment
+  ANY ``review_result`` marker is present, the body is no longer consulted (review j#83388 F1):
+  a malformed / missing identity or conclusion, or two markers that disagree, fails closed to
+  ``pending`` (the audit is still owed) and never advances the owner — the same disposition the
+  callback generation fence gives a malformed review marker. Reading the token is still
+  read-only: it produces no watcher events and mutates nothing.
 - **Only line-anchored gate headings are read**, in the two governed shapes: the prefixed
   ``## Gate: <kind>`` and the suffixed ``## <kind> Gate`` (Redmine #13952: same-lane reviewers
   durably write ``## Review Gate — 要修正``). Both are normalized (case / surrounding
@@ -71,13 +77,12 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
-    MARKER_GATE_ALIASES,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-    GATE_BEARING_KINDS,
     MARKER_CHANNEL_WORKFLOW_EVENT,
     marker_fields_in_note,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+    is_full_commit_head,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     CALLBACK_NONE,
@@ -256,28 +261,38 @@ CANONICAL_REVIEW_CONCLUSION_TOKENS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# The canonical structured workflow-event marker (Redmine #13952 R3).
+# The canonical structured workflow-event review_result marker (Redmine #13952 R3).
 #
 # The SAME machine token the #12672 watcher standardizes on
-# (``[mozyo:workflow-event:gate=<kind>:conclusion=<token>:...]``). The glance grammar reads it
-# as a first-class gate/conclusion authority, UNIONED with the ``## Gate:`` heading grammar, so
-# a durable review recorded with the canonical marker is recognized even when its heading is
-# reworded or its ``結論`` value carries Markdown emphasis / an English label. The gate-bearing
-# vocabulary and the marker-name -> runtime-gate mapping are REUSED from the one producer /
-# consumer contract (:data:`...redmine_journal_source.GATE_BEARING_KINDS` /
-# :data:`...redmine_event_intake.MARKER_GATE_ALIASES`) so the two sides cannot re-fork into
-# separate literal lists.
+# (``[mozyo:workflow-event:gate=review_result:conclusion=<token>:head=<full_head>:req=<journal>]``).
+# The glance grammar reads it as the unambiguous review conclusion authority (and, for a canonical
+# marker, a first-class review-gate source), so a durable review is recognized even when its
+# heading is reworded or its ``結論`` value carries Markdown emphasis / an English label.
+#
+# A marker is only AUTHORITATIVE when it satisfies the canonical **Review Generation Marker
+# Contract v2** identity (Redmine #13974 / #13952 R3 review j#83388 F2): a full 40/64 lowercase
+# hex ``head`` (validated by the REUSED :func:`...review_return_route.is_full_commit_head`, so the
+# grammar is not re-forked), a non-blank numeric ``req`` (the answered review_request journal),
+# and an explicit ``conclusion`` (``approved`` / ``changes_requested``) or an explicit ``blocker``
+# flag. A missing / malformed identity or a missing / out-of-vocabulary conclusion is fail-closed:
+# it never confirms an owner-advancing state; instead it SHADOWS the journal to ``pending`` (the
+# audit is still owed) and never fallbacks to the body ``結論`` field / heading qualifier. That is
+# the same fail-closed disposition the callback generation fence gives a malformed review marker.
 # ---------------------------------------------------------------------------
 
 #: The marker-facing gate name of a recorded review outcome (maps onto the runtime review gate).
 _MARKER_REVIEW_RESULT_KIND = "review_result"
 
-#: Marker-facing gate kind -> runtime gate. Built from the shared vocabularies so it stays
-#: pinned to the watcher's gate set (``review_result`` -> ``review``,
-#: ``owner_close_approval_waiting`` -> ``owner_close_approval``; the rest pass through).
-_MARKER_GATE: dict[str, str] = {
-    kind: MARKER_GATE_ALIASES.get(kind, kind) for kind in GATE_BEARING_KINDS
-}
+#: The disposition of the review_result marker(s) in one journal (Redmine #13952 R3 review
+#: j#83388). ``absent`` — no review_result marker (the legacy heading / ``結論`` field fallback
+#: applies). ``canonical`` — one or more review_result markers, ALL satisfying the v2 identity,
+#: agreeing on a single outcome (authoritative conclusion + establishes the review gate).
+#: ``shadow`` — a review_result marker is present but malformed (bad identity / conclusion) or two
+#: canonical markers disagree: fail-closed to ``pending`` with NO body fallback, and it does NOT
+#: establish a marker-only gate.
+_MARKER_ABSENT = "absent"
+_MARKER_CANONICAL = "canonical"
+_MARKER_SHADOW = "shadow"
 
 # A line-anchored ``## Integration disposition: <value>`` heading (the canonical governed
 # form; a ``## Gate: Integration disposition:`` variant is also accepted). ``<value>`` is the
@@ -390,68 +405,98 @@ def _workflow_event_markers(notes: str) -> Tuple[Mapping[str, str], ...]:
     )
 
 
-def _marker_gates(notes: str) -> set:
-    """Every runtime gate a structured workflow-event marker names in a note (pure).
+def _is_marker_request_journal(req: Optional[str]) -> bool:
+    """Whether ``req`` is a non-blank numeric review_request journal id (v2 identity; pure).
 
-    Each marker's ``gate`` (or legacy ``kind``) field is mapped through :data:`_MARKER_GATE`,
-    the shared gate-bearing vocabulary. A non-gate kind (``implementation_request`` /
-    ``review_finding_verdict`` / an unknown token) contributes nothing — the same fail-closed
-    exclusion the ``## Gate:`` heading allowlist applies, kept structural (never prose).
+    The answered review_request journal a canonical review_result marker must name (#13974). A
+    Redmine journal id is a positive integer; a blank / non-numeric ``req`` is malformed and
+    fails the identity closed. Kept a strict digit check (not :func:`_int_journal`, which would
+    accept a signed token) so the identity fence stays exactly the contract's "numeric/nonblank".
     """
-    gates: set = set()
-    for fields in _workflow_event_markers(notes):
-        kind = (fields.get("gate") or fields.get("kind") or "").strip()
-        gate = _MARKER_GATE.get(kind)
-        if gate is not None:
-            gates.add(gate)
-    return gates
+    token = str(req or "").strip()
+    return token.isdigit()
 
 
-def _marker_review_conclusion(notes: str) -> Tuple[str, bool, bool]:
-    """The review conclusion from the canonical ``gate=review_result`` marker (pure).
+def _canonical_review_outcome(fields: Mapping[str, str]) -> Optional[Tuple[str, bool]]:
+    """The ``(conclusion, blocker)`` a CANONICAL review_result marker speaks, or None if malformed.
 
-    Returns ``(conclusion, blocker, explicit)``. ``explicit`` is True only when a
-    ``review_result`` marker actually SPEAKS an outcome: an in-vocabulary ``conclusion`` token
-    (classified against the SAME closed :data:`CANONICAL_REVIEW_CONCLUSION_TOKENS` the ``結論``
-    field uses) or an explicit ``blocker`` flag. That is the unambiguous machine authority
-    (#13952 R3): it OUTRANKS the ``結論`` field and the heading qualifier, so a
-    Markdown-emphasized / English-labelled body conclusion no longer drops the review to
-    "audit owed". When no review_result marker speaks a conclusion, ``explicit`` is False and
-    the caller falls back to the field / qualifier. Two review_result markers that speak
-    DIFFERENT outcomes are ambiguous and fail closed to ``pending`` (still explicit, so the
-    caller does not then guess from the body) — never a fabricated conclusion.
+    Canonical identity (Review Generation Marker Contract v2 — #13974 / #13952 R3 review j#83388
+    F2): a full 40/64 lowercase hex ``head`` (:func:`...review_return_route.is_full_commit_head`,
+    reused so the grammar is not re-forked), a non-blank numeric ``req``, and either an explicit
+    in-vocabulary ``conclusion`` (``approved`` / ``changes_requested``, classified by the SAME
+    :func:`_classify_conclusion` the ``結論`` field uses) or an explicit ``blocker`` flag. A
+    ``conclusion`` that is a blocker token also counts. A missing / abbreviated / upper-case head,
+    a blank / non-numeric req, or a missing / out-of-vocabulary conclusion WITHOUT a blocker flag
+    is malformed -> None (the caller shadows the journal to ``pending``).
     """
+    if not is_full_commit_head(fields.get("head")):
+        return None
+    if not _is_marker_request_journal(fields.get("req")):
+        return None
+    raw = (fields.get("conclusion") or "").strip()
+    blocker_flag = _marker_flag(fields.get("blocker"))
+    if raw:
+        conclusion, token_blocker = _classify_conclusion(raw)
+        blocker = blocker_flag or token_blocker
+        if conclusion != REVIEW_PENDING:
+            return conclusion, blocker
+        if blocker:
+            return REVIEW_PENDING, True
+        return None  # a present conclusion that is out-of-vocabulary (e.g. ``bogus``) is malformed
+    if blocker_flag:
+        return REVIEW_PENDING, True
+    return None  # no conclusion and no blocker -> malformed
+
+
+def _review_result_marker_disposition(notes: str) -> Tuple[str, str, bool]:
+    """Fold a journal's review_result markers -> ``(disposition, conclusion, blocker)`` (pure).
+
+    ``disposition`` is one of :data:`_MARKER_ABSENT` / :data:`_MARKER_CANONICAL` /
+    :data:`_MARKER_SHADOW` (Redmine #13952 R3 review j#83388 F1/F2). The moment ANY review_result
+    marker is present, the body ``結論`` field / heading qualifier is no longer consulted — a
+    durable review's outcome is read from the machine token, never re-guessed from prose. A
+    single set of canonical markers agreeing on one outcome is ``canonical`` (authoritative); a
+    malformed marker, or canonical markers that disagree, is ``shadow`` -> ``pending`` (the audit
+    is still owed). ``absent`` alone permits the legacy heading / field fallback.
+    """
+    present = False
+    any_malformed = False
     outcomes: set = set()
     for fields in _workflow_event_markers(notes):
         kind = (fields.get("gate") or fields.get("kind") or "").strip()
         if kind != _MARKER_REVIEW_RESULT_KIND:
             continue
-        raw = (fields.get("conclusion") or "").strip()
-        conclusion, blocker = _classify_conclusion(raw) if raw else (REVIEW_PENDING, False)
-        if _marker_flag(fields.get("blocker")):
-            blocker = True
-        if conclusion != REVIEW_PENDING or blocker:
-            outcomes.add((conclusion, blocker))
-    if not outcomes:
-        return REVIEW_PENDING, False, False
-    if len(outcomes) == 1:
-        conclusion, blocker = next(iter(outcomes))
-        return conclusion, blocker, True
-    return REVIEW_PENDING, False, True
+        present = True
+        outcome = _canonical_review_outcome(fields)
+        if outcome is None:
+            any_malformed = True
+        else:
+            outcomes.add(outcome)
+    if not present:
+        return _MARKER_ABSENT, REVIEW_PENDING, False
+    if any_malformed or len(outcomes) != 1:
+        return _MARKER_SHADOW, REVIEW_PENDING, False
+    conclusion, blocker = next(iter(outcomes))
+    return _MARKER_CANONICAL, conclusion, blocker
 
 
-def _review_outcome(notes: str, heading_qualifier: str) -> Tuple[str, bool]:
+def _review_outcome(
+    notes: str, heading_qualifier: str, disposition: str, marker_conclusion: str, marker_blocker: bool
+) -> Tuple[str, bool]:
     """Read an audit review journal's outcome -> ``(conclusion, blocker)`` (never sentiment).
 
-    Priority (#13952 R3): the canonical structured ``gate=review_result`` marker is the
-    unambiguous machine authority and wins when it speaks an outcome. Otherwise the canonical
-    explicit ``結論:`` field wins, and only when both are absent does the review heading's own
-    bounded qualifier stand in (#13952 j#81029 ``## Gate: Review Result — changes_requested``),
-    each read against the same closed vocabulary.
+    Priority (#13952 R3): a CANONICAL structured ``gate=review_result`` marker is the unambiguous
+    machine authority and wins. When a review_result marker is present but not canonical
+    (``shadow``), the outcome is fail-closed ``pending`` and the body is NOT consulted — a
+    malformed / conflicting marker never advances the owner. Only when NO review_result marker is
+    present (``absent``) does the legacy path apply: the explicit ``結論:`` field wins, and only
+    when it too is absent does the review heading's own bounded qualifier stand in (#13952 j#81029
+    ``## Gate: Review Result — changes_requested``), each read against the same closed vocabulary.
     """
-    conclusion, blocker, explicit = _marker_review_conclusion(notes)
-    if explicit:
-        return conclusion, blocker
+    if disposition == _MARKER_CANONICAL:
+        return marker_conclusion, marker_blocker
+    if disposition == _MARKER_SHADOW:
+        return REVIEW_PENDING, False
     match = _CONCLUSION_RE.search(notes or "")
     if match:
         return _classify_conclusion(match.group("value"))
@@ -551,16 +596,21 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
             gates.add(gate)
             if gate == GATE_REVIEW and qualifier and not review_qualifier:
                 review_qualifier = qualifier
-        # Redmine #13952 R3: union the canonical structured workflow-event marker gates. A
-        # review recorded with a reworded heading but the canonical
-        # ``gate=review_result:...`` marker is still recognized; when both agree the union is
-        # a no-op. The conclusion is resolved marker-first below (:func:`_review_outcome`).
-        gates |= _marker_gates(notes)
+        # Redmine #13952 R3: a CANONICAL review_result marker (v2 identity) establishes the review
+        # gate on its own and supplies the authoritative conclusion, so a durable review recorded
+        # under a reworded heading is still recognized; when the heading already names the review
+        # gate this union is a no-op. A malformed / shadow marker does NOT establish a marker-only
+        # gate (review j#83388 F2) — it only shadows an already-recognized review to ``pending``.
+        marker_disposition, marker_conclusion, marker_blocker = _review_result_marker_disposition(notes)
+        if marker_disposition == _MARKER_CANONICAL:
+            gates.add(GATE_REVIEW)
         if not gates:
             continue
         top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
         if GATE_REVIEW in gates:
-            conclusion, blocker = _review_outcome(notes, review_qualifier)
+            conclusion, blocker = _review_outcome(
+                notes, review_qualifier, marker_disposition, marker_conclusion, marker_blocker
+            )
         else:
             conclusion, blocker = REVIEW_PENDING, False
         commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))
