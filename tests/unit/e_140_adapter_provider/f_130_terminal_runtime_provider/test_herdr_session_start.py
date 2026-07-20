@@ -257,6 +257,9 @@ class _Herdr:
         # reflects it. `None` forces an unparseable payload (labels-unreadable path).
         self.workspace_labels: dict = {}
         self.workspace_list_unreadable = False
+        # `workspace list` exits non-zero (a mechanical command failure) so `_invoke`
+        # fails closed — used to prove an own-pin heal never depends on it (#14139 F2).
+        self.workspace_list_fails = False
         self.workspace_lists: list = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
@@ -301,6 +304,10 @@ class _Herdr:
             )
         if rest[:2] == ["workspace", "list"]:
             self.workspace_lists.append(rest)
+            if self.workspace_list_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="workspace list refused"
+                )
             if self.workspace_list_unreadable:
                 return subprocess.CompletedProcess(
                     argv, 0, stdout="not json", stderr=""
@@ -1895,6 +1902,66 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         closed_tokens = {tok for call in herdr.pane_closes for tok in call}
         self.assertNotIn("w5:p1", closed_tokens)
         self.assertNotIn("w5:p2", closed_tokens)
+
+    def test_shared_space_own_pin_heal_does_not_read_workspace_list(self) -> None:
+        # Redmine #14139 R4 review j#83473 F2: an own-pin heal rejoins its own live
+        # space by identity and MUST NOT depend on the `workspace list` command. Here
+        # this project's own coordinator (claude) is already live and codex heals; the
+        # `workspace list` command is rigged to FAIL, yet the launch succeeds because
+        # the own pin is resolved before (and instead of) any label read.
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                existing = [
+                    {"name": encode_assigned_name(ws, "claude", ""), "pane_id": "w3:pC"}
+                ]
+                herdr = _Herdr(existing_rows=existing)
+                herdr.workspace_list_fails = True  # would raise IF a label read happened
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude", "codex"],
+                    lane_id="",
+                    env=_launch_env(binpath),
+                    runner=herdr.run,
+                    coordinator_placement_mode="shared_space",
+                    attestation_reader=_present_attestation_reader(
+                        ws, "claude", "", "w3:pC"
+                    ),
+                    probe=_FAST_PROBE,
+                )
+        # The own pin (w3) was resolved WITHOUT any `workspace list` call, so the
+        # rigged failure never fired; codex healed into the own space, no create.
+        self.assertEqual(herdr.workspace_lists, [])
+        self.assertEqual(result.herdr_workspace_id, "w3")
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_shared_space_no_own_pin_with_workspace_list_failure_fails_closed(self) -> None:
+        # The other half: with NO own pin (only a foreign pair), the label read is
+        # required — and a `workspace list` command failure fails closed with zero
+        # workspace create (never a guessed shared space).
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(created_workspace="wS", existing_rows=foreign)
+        herdr.workspace_list_fails = True
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
 
     def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
         # Redmine #14139: an unknown mode string fails closed at the pure entry point,

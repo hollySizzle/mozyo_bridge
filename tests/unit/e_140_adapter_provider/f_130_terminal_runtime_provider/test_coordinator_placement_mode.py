@@ -31,6 +31,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SHARED_COORDINATOR_WORKSPACE_LABEL,
     HerdrSessionStartError,
     _parse_workspace_list,
+    _shared_coordinator_own_target,
     _shared_coordinator_target,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
@@ -299,6 +300,58 @@ class SharedCoordinatorTargetTest(unittest.TestCase):
     def test_stable_label_is_constant(self) -> None:
         self.assertEqual(SHARED_COORDINATOR_WORKSPACE_LABEL, "coordinators")
 
+    def test_padded_label_is_not_adopted(self) -> None:
+        # Redmine #14139 R4 review j#83473 F1: the label authority is an EXACT match,
+        # so a leading/trailing-whitespace-padded label is a DIFFERENT label — never
+        # the shared space. Foreign pair present -> mode-transition guard fail-closed.
+        rows = [
+            _row("wsB", "claude", "default", "w5:p1"),
+            _row("wsB", "codex", "default", "w5:p2"),
+        ]
+        with self.assertRaises(HerdrSessionStartError):
+            self._target(rows, "wsA", [], {"w5": "  coordinators  "})
+
+    def test_case_variant_label_is_not_adopted(self) -> None:
+        rows = [_row("wsB", "claude", "default", "w5:p1")]
+        with self.assertRaises(HerdrSessionStartError):
+            self._target(rows, "wsA", [], {"w5": "Coordinators"})
+
+    def test_exact_label_is_adopted(self) -> None:
+        rows = [_row("wsB", "claude", "default", "w5:p1")]
+        self.assertEqual(self._target(rows, "wsA", [], {"w5": "coordinators"}), "w5")
+
+
+class SharedCoordinatorOwnTargetTest(unittest.TestCase):
+    """`_shared_coordinator_own_target`: own-pin resolution WITHOUT a label read.
+
+    Redmine #14139 R4 review j#83473 F2: split out so an own-pin heal can resolve
+    before (and instead of) reading the workspace labels — a heal must not depend on
+    the `workspace list` command.
+    """
+
+    def test_own_row_pins_without_labels(self) -> None:
+        rows = [_row("wsA", "claude", "default", "w3:p1")]
+        self.assertEqual(_shared_coordinator_own_target(rows, "wsA", []), "w3")
+
+    def test_own_adopted_locator_pins(self) -> None:
+        self.assertEqual(_shared_coordinator_own_target([], "wsA", ["w7:pX"]), "w7")
+
+    def test_no_own_pin_is_empty(self) -> None:
+        # Only foreign / sublane rows -> no own pin (caller then reads labels).
+        rows = [
+            _row("wsB", "claude", "default", "w9:p1"),
+            _row("wsA", "claude", "lane-x", "w8:p1"),
+        ]
+        self.assertEqual(_shared_coordinator_own_target(rows, "wsA", []), "")
+
+    def test_own_spanning_two_workspaces_fails_closed(self) -> None:
+        rows = [
+            _row("wsA", "claude", "default", "w2:p1"),
+            _row("wsA", "codex", "default", "w3:p1"),
+        ]
+        with self.assertRaises(HerdrSessionStartError):
+            _shared_coordinator_own_target(rows, "wsA", [])
+
 
 class SharedCoordinatorDeterministicOrderTest(unittest.TestCase):
     """Redmine #14139 F2 / Design Answer j#83385 Decision 2: deterministic append.
@@ -416,6 +469,22 @@ class ParseWorkspaceListTest(unittest.TestCase):
             ]}
         )
         self.assertIsNone(_parse_workspace_list(same))
+
+    def test_label_is_kept_verbatim_not_trimmed(self) -> None:
+        # Redmine #14139 R4 review j#83473 F1: labels are kept raw (no strip / case
+        # fold) so the resolver's EXACT match is not loosened by the parser.
+        import json
+
+        payload = json.dumps(
+            {"workspaces": [
+                {"workspace_id": "w1", "label": "  coordinators  "},
+                {"workspace_id": "w2", "label": "Coordinators"},
+            ]}
+        )
+        self.assertEqual(
+            _parse_workspace_list(payload),
+            {"w1": "  coordinators  ", "w2": "Coordinators"},
+        )
 
     def test_skipped_no_id_entry_does_not_trip_duplicate_detection(self) -> None:
         # An entry without a workspace_id is skipped, so it can never be mistaken for

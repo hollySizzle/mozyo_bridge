@@ -488,8 +488,13 @@ shared space の identity は **backend が read できる stable workspace labe
 ある (R1 review j#83383 F1 / Design Answer j#83385 Decision 1)。**locator prefix だけで shared space を
 認定してはならない**: per-project coordinator workspace と shared workspace は inventory 上区別できず、prefix
 guess は mode 切替時に per-project window を誤 adopt する。label は create 時に付与し、adopt/join は
-action-time に `herdr workspace list` の exact label を再読して判断する。**per-project workspace を暗黙に
-shared へ昇格・relabel しない。**
+action-time に `herdr workspace list` の **exact label (verbatim、trim / case-fold しない)** を再読して判断する
+(R4 review j#83473 F1: `"  coordinators  "` や `"Coordinators"` は別 label で adopt しない)。**per-project
+workspace を暗黙に shared へ昇格・relabel しない。**
+
+own-pin (自 project の live/adopted default-lane slot) は自 identity が pin するので **label read を要しない**。
+その解決は label read の **前** に行い、own pin が存在すれば `workspace list` を発行せず join する (R4 review
+j#83473 F2: own-pin heal は `workspace list` command の成否に依存しない)。own pin が無いときだけ label を読む。
 
 `shared_space` の default-lane target 解決 (`herdr_lane_topology._shared_coordinator_target(rows, workspace_id,
 adopted_locators, workspace_labels, shared_label)`):

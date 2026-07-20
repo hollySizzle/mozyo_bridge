@@ -264,10 +264,14 @@ def _parse_workspace_list(stdout: object) -> Optional[dict]:
 
     and the tolerant variants a bare list of workspace objects / an object carrying
     the list under ``workspaces`` (mirroring the ``agent list`` tolerance). Each
-    entry contributes ``workspace_id -> label`` (a missing / non-string label is the
-    empty string — present but unlabelled, so it never matches the shared label);
-    an entry with no ``workspace_id`` is skipped. An EMPTY list is a valid readable
-    result (no workspaces) and yields ``{}``.
+    entry contributes ``workspace_id -> label``. The label is kept **raw / verbatim**
+    (NOT trimmed or case-folded): the shared space is adopted only on an EXACT label
+    match (spec §5.1.1 / Design Answer j#83385 Decision 1 / R4 review j#83473 F1), so
+    a padded ``" coordinators "`` or a case-variant ``"Coordinators"`` is a DIFFERENT
+    label and must not be normalised into the authority label. A missing / non-string
+    label is the empty string (present but unlabelled, so it never matches). An entry
+    with no ``workspace_id`` is skipped. An EMPTY list is a valid readable result (no
+    workspaces) and yields ``{}``.
 
     Returns ``None`` — "labels unreadable", which the resolver treats as
     fail-closed — when the payload is not JSON, exposes no recognisable workspace
@@ -299,7 +303,10 @@ def _parse_workspace_list(stdout: object) -> Optional[dict]:
             # whole payload rather than pick a winner.
             return None
         raw_label = entry.get("label")
-        labels[workspace_id] = raw_label.strip() if isinstance(raw_label, str) else ""
+        # Verbatim — no strip / case-fold: the adopt authority is an EXACT label
+        # match, so normalising here would let a padded / case-variant label pass
+        # as the shared label (R4 review j#83473 F1).
+        labels[workspace_id] = raw_label if isinstance(raw_label, str) else ""
     return labels
 
 
@@ -315,6 +322,46 @@ def _workspace_list_container(payload: object) -> Optional[list]:
         if isinstance(result, Mapping):
             return _workspace_list_container(result)
     return None
+
+
+def _shared_coordinator_own_target(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    adopted_locators: Sequence[str],
+) -> str:
+    """This project's own live/adopted default-lane pin, or ``""`` if none (no label read).
+
+    Step 1 of the shared-space resolution, split out so the caller can resolve an
+    own-pin heal WITHOUT reading the workspace labels first (Redmine #14139 R4 review
+    j#83473 F2): the spec §5.1.1 contract is that own identity pins the target, so a
+    heal must not depend on the ``workspace list`` command succeeding. Returns the
+    single herdr workspace this project's own live default-lane slots (plus this
+    run's adopted slots — always same-lane, same-project) occupy, or ``""`` when the
+    project has no own coordinator slot yet. Raises when own slots span more than one
+    herdr workspace (identity conflict — refuse to guess).
+    """
+    own = [loc for loc in adopted_locators if loc]
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        if (decode.identity.lane_id or DEFAULT_LANE) != DEFAULT_LANE:
+            continue
+        if decode.identity.workspace_id != workspace_id:
+            continue
+        locator = _agent_locator(row)
+        if locator:
+            own.append(locator)
+    own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
+    if len(own_prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"live coordinator slots of workspace {workspace_id!r} span multiple herdr "
+            f"workspaces {sorted(own_prefixes)!r}; refuse to guess which one new launches "
+            "belong to"
+        )
+    return next(iter(own_prefixes)) if own_prefixes else ""
 
 
 def _shared_coordinator_target(
@@ -341,15 +388,16 @@ def _shared_coordinator_target(
     guess would wrongly ADOPT a per-project window on a mode transition. Resolution,
     in order:
 
-    1. this project's OWN live default-lane slots (plus this run's adopted slots —
-       always same-lane, same-project) pin the target. A heal never splits the
-       coordinator gateway/worker pair across workspaces, and it needs no label read
-       (rejoining its own live space).
+    1. this project's OWN live/adopted default-lane slots pin the target
+       (:func:`_shared_coordinator_own_target`) — no label read needed (rejoining its
+       own live space). The caller resolves this BEFORE reading labels so an own-pin
+       heal never depends on the ``workspace list`` command (R4 review j#83473 F2);
+       this function re-checks it so it stays correct when called directly.
     2. no own pins, so a join/create decision is needed and the labels are the
        authority. ``workspace_labels is None`` (the ``workspace list`` read failed)
        fails closed — never guess. Among the herdr workspaces that BOTH carry
-       ``shared_label`` AND hold a live default-lane slot (a live, labelled shared
-       column):
+       ``shared_label`` (an EXACT, verbatim match — no trim / case-fold, R4 review
+       j#83473 F1) AND hold a live default-lane slot (a live, labelled shared column):
 
        - exactly one -> ADOPT it (idempotent join of the space an earlier project
          created; this is what crosses the mozyo ``workspace`` identity boundary
@@ -370,7 +418,16 @@ def _shared_coordinator_target(
     pins the coordinators space (its placement is the untouched #13380/#13411 axis).
     Own pins spanning more than one herdr workspace fail closed (identity conflict).
     """
-    own = [loc for loc in adopted_locators if loc]
+    own_target = _shared_coordinator_own_target(rows, workspace_id, adopted_locators)
+    if own_target:
+        return own_target
+
+    if workspace_labels is None:
+        raise HerdrSessionStartError(
+            "shared coordinators workspace labels are unreadable (herdr workspace list "
+            f"returned no recognisable payload); refuse to guess the shared space for "
+            f"workspace {workspace_id!r}"
+        )
     foreign_by_workspace: dict = {}
     for row in rows:
         if not isinstance(row, Mapping):
@@ -380,39 +437,21 @@ def _shared_coordinator_target(
             continue
         if (decode.identity.lane_id or DEFAULT_LANE) != DEFAULT_LANE:
             continue
+        if decode.identity.workspace_id == workspace_id:
+            continue
         locator = _agent_locator(row)
         if not locator:
             continue
-        if decode.identity.workspace_id == workspace_id:
-            own.append(locator)
-        else:
-            prefix = _workspace_prefix(locator)
-            if prefix:
-                foreign_by_workspace.setdefault(prefix, True)
-    own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
-    if len(own_prefixes) > 1:
-        raise HerdrSessionStartError(
-            f"live coordinator slots of workspace {workspace_id!r} span multiple herdr "
-            f"workspaces {sorted(own_prefixes)!r}; refuse to guess which one new launches "
-            "belong to"
-        )
-    if own_prefixes:
-        # A heal / adopt rejoins this project's own live shared column — no label
-        # read needed (own identity pins it).
-        return next(iter(own_prefixes))
-
-    if workspace_labels is None:
-        raise HerdrSessionStartError(
-            "shared coordinators workspace labels are unreadable (herdr workspace list "
-            f"returned no recognisable payload); refuse to guess the shared space for "
-            f"workspace {workspace_id!r}"
-        )
-    # Sorted for a deterministic, inventory-iteration-independent decision
-    # (Design Answer j#83385 Decision 2).
+        prefix = _workspace_prefix(locator)
+        if prefix:
+            foreign_by_workspace.setdefault(prefix, True)
+    # Sorted for a deterministic, inventory-iteration-independent decision (Design
+    # Answer j#83385 Decision 2). The label match is EXACT / verbatim (no `_norm`):
+    # a padded or case-variant label is a different label, not the authority (F1).
     labelled_candidates = sorted(
         ws
         for ws in foreign_by_workspace
-        if _norm(workspace_labels.get(ws)) == shared_label
+        if workspace_labels.get(ws) == shared_label
     )
     if len(labelled_candidates) > 1:
         raise HerdrSessionStartError(
@@ -897,6 +936,7 @@ __all__ = (
     "SHARED_COORDINATOR_WORKSPACE_LABEL",
     "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "_shared_coordinator_own_target",
     "_shared_coordinator_target",
     "ContainerPlan",
     "initial_container_occupancy",

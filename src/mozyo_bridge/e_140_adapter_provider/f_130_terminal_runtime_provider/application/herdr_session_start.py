@@ -226,6 +226,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _parse_started_agent,
     _parse_tab_created,
     _parse_workspace_created,
+    _shared_coordinator_own_target,
     _shared_coordinator_target,
     _tab_target_for_lane,
     _workspace_prefix,
@@ -707,18 +708,27 @@ def _prepare_session_locked(
             # The shared coordinators space is identified by its stable LABEL, the
             # backend-readable authority (Redmine #14139 review j#83383 F1 / Design
             # Answer j#83385 Decision 1) — never a locator-prefix guess that would
-            # adopt a per-project coordinator window on a mode transition. Read the
-            # live labels ONLY here, so per_project / sublane launches issue no extra
-            # `workspace list` and stay byte-invariant. Unreadable labels fail closed
-            # inside the resolver.
-            workspace_labels = _list_workspace_labels(binary, runner, timeout)
-            target_workspace = _shared_coordinator_target(
-                rows,
-                workspace_id,
-                adopt_locators,
-                workspace_labels,
-                SHARED_COORDINATOR_WORKSPACE_LABEL,
+            # adopt a per-project coordinator window on a mode transition.
+            #
+            # Resolve this project's OWN pin FIRST (R4 review j#83473 F2): an own-pin
+            # heal rejoins its own live space by identity and must NOT depend on the
+            # `workspace list` command succeeding, so the label read is skipped when
+            # an own pin exists. Only a fresh / mode-transition launch with no own pin
+            # reads the labels — and per_project / sublane launches never reach here,
+            # so they issue no extra `workspace list` (byte-invariant). Unreadable
+            # labels fail closed inside the resolver.
+            target_workspace = _shared_coordinator_own_target(
+                rows, workspace_id, adopt_locators
             )
+            if not target_workspace:
+                workspace_labels = _list_workspace_labels(binary, runner, timeout)
+                target_workspace = _shared_coordinator_target(
+                    rows,
+                    workspace_id,
+                    adopt_locators,
+                    workspace_labels,
+                    SHARED_COORDINATOR_WORKSPACE_LABEL,
+                )
         else:
             target_workspace = _launch_target_for_lane(
                 rows,
