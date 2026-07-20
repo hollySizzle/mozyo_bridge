@@ -1962,6 +1962,31 @@ class HashUntrackedIdentityStabilityTest(unittest.TestCase):
             with mock.patch.object(B.os, "read", side_effect=racing_read):
                 self.assertIsNone(B._hash_untracked(Path(tmp), b"r"))
 
+    def test_same_size_mtime_restored_mid_read_fails_closed(self) -> None:
+        # F1 R6 (review j#83889): a same-inode, SAME-SIZE in-place rewrite during the read
+        # with mtime RESTORED via os.utime leaves (dev, ino, size, mtime) equal — only ctime
+        # (not user-settable) drifts. The ctime check must still fail closed.
+        B = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r"
+            f.write_bytes(b"A" * 200000)
+            st0 = os.stat(f)
+            real_read = os.read
+            fired = {"n": 0}
+
+            def racing_read(fd, n):
+                chunk = real_read(fd, n)
+                if chunk and fired["n"] == 0:
+                    fired["n"] = 1
+                    with open(f, "r+b") as handle:  # same-size in-place rewrite
+                        handle.seek(0)
+                        handle.write(b"B" * 200000)
+                    os.utime(f, ns=(st0.st_atime_ns, st0.st_mtime_ns))  # restore mtime
+                return chunk
+
+            with mock.patch.object(B.os, "read", side_effect=racing_read):
+                self.assertIsNone(B._hash_untracked(Path(tmp), b"r"))
+
     def test_symlink_swap_in_readlink_window_fails_closed(self) -> None:
         B = self._mod()
         with tempfile.TemporaryDirectory() as tmp:

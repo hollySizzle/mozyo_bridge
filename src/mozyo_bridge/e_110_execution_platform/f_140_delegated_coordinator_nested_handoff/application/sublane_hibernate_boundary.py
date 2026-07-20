@@ -231,8 +231,15 @@ def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
             after = os.lstat(full)
         except OSError:
             return None
-        if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
-            return None  # the link was swapped during the readlink window -> fail closed
+        # Identity + ``ctime`` stability across the readlink window: a retarget makes a NEW
+        # inode (caught by dev/ino), and ``ctime`` catches any in-place metadata change a
+        # user cannot restore.
+        if (after.st_dev, after.st_ino, after.st_ctime_ns) != (
+            info.st_dev,
+            info.st_ino,
+            info.st_ctime_ns,
+        ):
+            return None  # the link changed during the readlink window -> fail closed
         return hashlib.sha256(b"SYMLINK\0" + os.fsencode(target)).digest()
     if not stat.S_ISREG(info.st_mode):
         return None  # FIFO / device / socket / dir -> fail closed (never open)
@@ -264,13 +271,17 @@ def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
                 return None  # over the per-file cap -> fail closed
             file_digest.update(chunk)
         # The open fd pins the inode, but its CONTENT could be rewritten in place during the
-        # read; a drift in identity / size / mtime means we hashed an inconsistent snapshot.
+        # read; a drift in identity / size / mtime / ctime means we hashed an inconsistent
+        # snapshot. ``st_ctime_ns`` is the load-bearing field (Redmine #13843 review j#83889):
+        # it bumps on ANY inode change and — unlike atime / mtime — cannot be restored with
+        # ``utime``, so a same-inode, same-size, mtime-RESTORED mid-read rewrite is still caught.
         settled = os.fstat(fd)
-        if (settled.st_dev, settled.st_ino, settled.st_size, settled.st_mtime_ns) != (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-            opened.st_mtime_ns,
+        if (
+            settled.st_dev, settled.st_ino, settled.st_size,
+            settled.st_mtime_ns, settled.st_ctime_ns,
+        ) != (
+            opened.st_dev, opened.st_ino, opened.st_size,
+            opened.st_mtime_ns, opened.st_ctime_ns,
         ):
             return None  # mutated during the read -> fail closed
         return file_digest.digest()
