@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = ROOT / "scripts" / "disposable_ubuntu_smoke.py"
 
 _spec = importlib.util.spec_from_file_location("disposable_ubuntu_smoke", _SCRIPT)
