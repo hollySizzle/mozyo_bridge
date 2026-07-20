@@ -431,6 +431,20 @@ Table naming:
       pair が再稼働/inventory unreadable なら idempotent replay も fail-closed。★`--migrate-hibernated-legacy`
       と `--execute` は競合する destructive intent ゆえ **両指定は command-time zero-write error**(#13841
       review j#79150 F3、黙って一方へ解決しない)。disposition / decision anchor 以外は不変。
+      ★**foreign / duplicate / unreadable occupant gate**(#13897、first observed #13845 j#80123):
+      `expected_live_slots` は **managed role のみ**を集計するため、`live_pair_present` の live-zero
+      read だけでは「expected slot が live でない」しか言えず「unit が quiescent」を言えない。foreign
+      provider **だけ**が占有する unit は live 0 と測定され、これを quiescent と誤認すると実 process
+      稼働中の legacy row を terminal `retired` に確定してしまう (実測: foreign-only inventory で
+      `exit 0` / `state=retired`)。修正は #13845 bound-retire と同じ共有 primitive(`expected_slot_rows`
+      raw scan / `classify_named_slot`)で raw scan を対にし、**exact managed-slot absence を必須のまま**
+      連言で 3 事実を各個 gate する: target unit の foreign/unexpected occupant → `foreign_inventory_present`、
+      同一 canonical slot の重複 row → `duplicate_inventory`、locator 無し expected row を liveness contract が
+      dead と断じない → `expected_identity_unresolved`。いずれも zero-write。present-but-blank residue
+      (`classify_named_slot`==`SLOT_STALE`) は positive proof of deadness ゆえ block しない。fence は target
+      unit scope(別 lane occupant / default-lane coordinator pair は foreign 扱いしない)。idempotent replay も
+      同 gate を通過してから success(persisted `retired` + foreign 稼働 → success withhold)。#13842 reconcile /
+      #13845 bound-retire / #13754 guarded close は非退行。
     - **hibernated live-contradiction reconcile (retire-first)** (`LaneReconcileBindingStore.retire_reconciled_hibernated_legacy`,
       #13842、live evidence #13756 j#79188)。#13841 migration が **拒否**する側の隙間: **hibernated / released
       legacy** row（`worktree_identity` 空）だが action-time Herdr inventory に exact managed pair が **live** で
