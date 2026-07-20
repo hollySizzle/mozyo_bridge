@@ -25,17 +25,31 @@ Action-time verification, every axis fail-closed (nothing is written unless ALL 
   (:data:`MIGRATE_HEAD_NOT_INTEGRATED`). The clean-worktree / issue-closed / latest-review /
   callback-drain invariants are the command's ``may_retire`` preflight (which gates whether
   this path runs at all), so a dirty / open / unapproved lane never reaches here.
-- **no live pair** — the live herdr inventory is read (read-only) and MUST show zero expected
-  managed slots for the lane unit. A live pair is :data:`MIGRATE_LIVE_PAIR_PRESENT`
-  (``active/live pair`` fails closed) — a durable ``released`` record is *not* liveness
-  (``lane_lifecycle`` boundary), so the durable proof is paired with this live-zero read.
+- **quiescent unit** — the live herdr inventory is read (read-only) and the lane unit MUST be
+  provably empty, not merely free of expected managed slots. A live expected slot is
+  :data:`MIGRATE_LIVE_PAIR_PRESENT` — a durable ``released`` record is *not* liveness
+  (``lane_lifecycle`` boundary), so the durable proof is paired with this live read. But
+  ``expected_live_slots`` aggregates ONLY the managed roles, so three facts fall out of it and
+  each is gated separately (Redmine #13897, first observed at #13845 j#80123): a
+  **foreign / unexpected occupant** is :data:`MIGRATE_FOREIGN_INVENTORY_PRESENT` (a unit
+  occupied solely by an unexpected provider measures zero live yet is not quiescent — the
+  foreign-only-live-inventory defect this ticket closes), a **duplicate** canonical slot is
+  :data:`MIGRATE_DUPLICATE_INVENTORY` (a corrupt / ambiguous inventory), and an expected slot
+  **row with no readable locator** the liveness contract does not call dead is
+  :data:`MIGRATE_EXPECTED_IDENTITY_UNRESOLVED`. The foreign gate is an ADDITIONAL conjunctive
+  condition — exact-managed-slot absence is still required, never relaxed. An unreadable
+  inventory is NOT an empty one (:data:`REASON_INVENTORY_UNREADABLE`).
 - **released legacy state** — the bounded CAS additionally requires ``hibernated`` +
   durable ``released`` + **empty** ``worktree_identity`` + settled replacement, guarded on
   the row's exact revision (a revision race loses :data:`MIGRATE_REVISION_RACE`).
 
-A duplicate replay is idempotent: an already-``retired`` row owning this issue is a verified
-no-op success (:data:`MIGRATE_ALREADY_RETIRED`), read before the live check so a completed
-migration replays without depending on a live inventory.
+A duplicate replay is idempotent, but never trusted blind: an already-``retired`` row owning
+this issue is a verified no-op success (:data:`MIGRATE_ALREADY_RETIRED`) reported ONLY AFTER
+the full live / quiescence gate above confirms the unit is empty — no expected managed slot
+live, no duplicate or unreadable slot, and no foreign occupant (the #13841 review j#79150 F2
+invariant, extended to the foreign / duplicate / unreadable axes by Redmine #13897). A
+persisted ``retired`` disposition does not prove the unit is quiescent now, so the replay
+never reports success while a pair — or a foreign process — is still running under it.
 
 Boundary (Redmine #13841): no process launch / close / resume, no worktree / branch removal,
 no raw Herdr / tmux, no origin/main, no production / tag / publish. Synthetic regression only.
@@ -63,6 +77,27 @@ MIGRATE_BLOCKED = "blocked"
 #: Blocked reasons (migration-specific). The lane-resolution reasons are reused from the
 #: guarded close (:mod:`...sublane_herdr_retire`) so an operator reads one vocabulary.
 MIGRATE_LIVE_PAIR_PRESENT = "live_pair_present"
+#: A foreign / unexpected provider occupies one of the targeted units (Redmine #13897,
+#: independent of #13845 j#80123). Distinct from :data:`MIGRATE_LIVE_PAIR_PRESENT`, which
+#: names an *expected managed* slot: ``expected_live_slots`` only aggregates the managed
+#: roles, so a unit holding solely an unexpected provider measures zero live and would
+#: otherwise be read as live-zero. Terminalizing then would record the lane permanently
+#: ``retired`` while a real foreign process is still running in its unit — the exact
+#: foreign-only-live-inventory defect this ticket closes on the legacy migration surface.
+MIGRATE_FOREIGN_INVENTORY_PRESENT = "foreign_inventory_present"
+#: More than one row in the targeted units carries the SAME canonical expected managed slot
+#: (Redmine #13897). A herdr assigned name is unique by construction, so a duplicate is a
+#: corrupt / ambiguous inventory — ``herdr_target_resolution`` refuses to *send* to one
+#: (``multiple_matches``: "refuse to guess"), and this refuses to terminalize off one. The
+#: aggregated ``expected_live_slots`` collapses roles into a set and cannot express it.
+MIGRATE_DUPLICATE_INVENTORY = "duplicate_inventory"
+#: An expected managed slot's row exists in the targeted units but carries NO locator, and
+#: the shared liveness contract does not positively call it dead (Redmine #13897).
+#: ``classify_named_slot`` returns ``SLOT_STALE`` only on a positive shell-residue signal and
+#: reads a minimal row as LIVE, so such a row is "cannot be resolved", never "absent".
+#: Terminalizing off it would record the lane permanently gone on the *absence of proof of
+#: liveness* rather than on proof of absence.
+MIGRATE_EXPECTED_IDENTITY_UNRESOLVED = "expected_identity_unresolved"
 MIGRATE_HEAD_NOT_INTEGRATED = "head_not_integrated"
 #: The caller's ``--worktree`` is not actually checked out on the caller's ``--branch``
 #: (a mismatch, a detached HEAD, or an unresolvable checkout). The clean / integrated
@@ -100,6 +135,10 @@ class HibernatedLegacyRetireVerdict:
     workspace_id: str = ""
     lane_id: str = ""
     expected_live: tuple[str, ...] = ()
+    #: Foreign / unexpected occupants decoded into the targeted unit(s) (Redmine #13897).
+    #: Recorded on every blocked verdict so an operator can see WHAT made the unit
+    #: non-quiescent, exactly as the #13845 bound-retire sibling reports it.
+    foreign_names: tuple[str, ...] = ()
     #: The shared-store schema migration this retire's write gate performed, if any (Redmine
     #: #13844 R3-F2): the typed audit record (from/to version, backup, peer-reader risk) so the
     #: migration is legible in JSON/text, not only the pre-migration stderr advisory.
@@ -117,6 +156,7 @@ class HibernatedLegacyRetireVerdict:
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
             "expected_live": list(self.expected_live),
+            "foreign_names": list(self.foreign_names),
             "lifecycle_migration": self.lifecycle_migration,
         }
 
@@ -128,6 +168,7 @@ def _blocked(
     workspace_id: str = "",
     lane_id: str = "",
     expected_live: tuple[str, ...] = (),
+    foreign_names: tuple[str, ...] = (),
     lifecycle_migration: Optional[dict] = None,
 ) -> HibernatedLegacyRetireVerdict:
     return HibernatedLegacyRetireVerdict(
@@ -137,6 +178,7 @@ def _blocked(
         workspace_id=workspace_id,
         lane_id=lane_id,
         expected_live=expected_live,
+        foreign_names=foreign_names,
         lifecycle_migration=lifecycle_migration,
     )
 
@@ -177,7 +219,12 @@ def run_hibernated_legacy_retire_migration(
         REASON_PROVIDER_UNRESOLVED,
         REASON_WORKSPACE_UNRESOLVED,
         expected_live_slots,
+        expected_slot_rows,
         plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+        SLOT_STALE,
+        classify_named_slot,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
         WorkflowProviderUnresolved,
@@ -372,6 +419,48 @@ def run_hibernated_legacy_retire_migration(
         legacy_workspace_id=legacy_token,
         managed_roles=managed_roles,
     )
+    # ``expected_live_slots`` is an AGGREGATE over the MANAGED roles only, so its empty result
+    # means "no expected role is live", NEVER "the unit is quiescent" (Redmine #13897, first
+    # observed at #13845 j#80123). Three facts fall out of it — a unit occupied solely by a
+    # foreign provider, duplicate slot multiplicity (roles collapse into a set), and rows with
+    # no locator (skipped) — and reading its empty result as absence would terminalize the
+    # legacy row while a real process is still running. The acceptance requires the STRONGER
+    # "every expected slot absent AND no foreign / duplicate / unreadable occupant" (a
+    # conjunctive ADDITION to the exact-managed-slot-absence condition, not a relaxation of it),
+    # so read the raw scan alongside the aggregate and fail closed on each dropped fact. This
+    # mirrors the #13845 bound-retire sibling's quiescence gate against the same shared
+    # primitives; the empty-worktree-binding CAS keeps the two surfaces mutually exclusive.
+    candidates = expected_slot_rows(rows, plan, managed_roles=managed_roles)
+    # Duplicate BEFORE the live read: a herdr assigned name is unique by construction, so two
+    # rows claiming the same canonical ``(workspace_id, lane_id, role)`` slot is an ambiguous /
+    # corrupt inventory, not two slots — and no reading of it can license a terminal write. Keyed
+    # on the decoded slot identity (one-to-one with the assigned name), NOT on ``role``: the
+    # shared ``(project workspace, lane, role)`` slot and its legacy ``(worktree token, default,
+    # role)`` twin legitimately share a role while being two distinct slots. A real duplicate
+    # carrying locators would otherwise surface as an ordinary ``live_pair_present``, naming the
+    # wrong problem (``herdr_target_resolution`` refuses to send to it — ``multiple_matches``).
+    seen_slots: dict[tuple[str, str, str], int] = {}
+    for found in candidates:
+        seen_slots[found.slot_key] = seen_slots.get(found.slot_key, 0) + 1
+    duplicates = sorted(
+        f"{role}@{ws}/{lane or '<default>'}"
+        for (ws, lane, role), count in seen_slots.items()
+        if count > 1
+    )
+    if duplicates:
+        return _blocked(
+            MIGRATE_DUPLICATE_INVENTORY,
+            detail=(
+                "the lane unit's inventory carries more than one row for the same canonical "
+                f"managed slot ({', '.join(duplicates)}); a herdr assigned name is unique, so "
+                "this is an ambiguous / corrupt inventory and no reading of it can prove the "
+                "lane quiescent — resolve the duplicate before a terminal retire"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            expected_live=expected_live_slots(rows, plan, managed_roles=managed_roles),
+            foreign_names=plan.foreign_names,
+        )
     live = expected_live_slots(rows, plan, managed_roles=managed_roles)
     if live:
         return _blocked(
@@ -384,22 +473,78 @@ def run_hibernated_legacy_retire_migration(
             workspace_id=workspace_id,
             lane_id=lane_label,
             expected_live=live,
+            foreign_names=plan.foreign_names,
+        )
+    # An expected slot's row with NO locator is the third thing the aggregate drops. It is NOT
+    # absence: the row is right there in the inventory, and the shared liveness contract reads a
+    # minimal one as LIVE — ``classify_named_slot`` returns ``SLOT_STALE`` *only* on a positive
+    # shell-residue signal and is "conservative in the never-clobber direction". So the bar for
+    # proceeding is positive proof of DEADNESS, never absence of proof of liveness: a positively
+    # stale row is genuine residue and does not block (blocking it would recreate this ticket's
+    # own defect — a lane stuck un-terminalizable — in a new shape); anything else fails closed.
+    # Per-candidate, not per-role, so a shared slot and its legacy twin are decided independently.
+    unresolved = sorted(
+        {
+            found.role
+            for found in candidates
+            if not found.locator and classify_named_slot(found.row) != SLOT_STALE
+        }
+    )
+    if unresolved:
+        return _blocked(
+            MIGRATE_EXPECTED_IDENTITY_UNRESOLVED,
+            detail=(
+                f"expected managed slot(s) ({', '.join(unresolved)}) have a row in the lane "
+                "unit but no readable locator, and the shared liveness contract does not call "
+                "them dead; their identity cannot be resolved, so absence is unproven and the "
+                "migration fails closed"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            expected_live=live,
+            foreign_names=plan.foreign_names,
+        )
+    # No foreign / unexpected occupant may remain either (Redmine #13897, the acceptance's
+    # "foreign inventory is zero-write" axis). ``expected_live_slots`` above aggregates ONLY the
+    # managed roles, so a unit occupied solely by an unexpected provider measures zero live and
+    # would sail past that check — recording the lane permanently ``retired`` while a real
+    # process still runs in its unit. "No expected slot is live" and "the unit is quiescent" are
+    # different facts, and only the second licenses a terminal disposition. Refused zero-write
+    # rather than coerced: this surface closes nothing, so it cannot make the unit empty, and the
+    # occupant is a foreign process it must never touch. The #13842 reconcile gates the same
+    # class through its own ``foreign_at_position`` observation; #13845 through the same axis.
+    if plan.foreign_names:
+        return _blocked(
+            MIGRATE_FOREIGN_INVENTORY_PRESENT,
+            detail=(
+                "foreign / unexpected occupant(s) are live in the lane unit "
+                f"({', '.join(plan.foreign_names)}); the unit is not quiescent, so a terminal "
+                "retire would record the lane gone while a real process still runs there. "
+                "This surface never closes a foreign agent — resolve the occupant first"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            expected_live=live,
+            foreign_names=plan.foreign_names,
         )
     if record.lane_disposition == DISPOSITION_RETIRED and (
         record.issue_id or ""
     ).strip() == issue:
         # Idempotent duplicate replay: the row already reached the terminal disposition and
-        # owns this exact issue. A verified no-op success — reported only AFTER the live-zero
-        # read above confirmed no pair is currently live (review j#79150 finding 2), so a
-        # persisted ``retired`` never reports success while a pair was relaunched under it.
+        # owns this exact issue. A verified no-op success — reported only AFTER the full
+        # quiescence gate above confirmed the unit is empty (no expected slot live, no
+        # duplicate / unreadable slot, no foreign occupant: review j#79150 finding 2 extended
+        # by Redmine #13897), so a persisted ``retired`` never reports success while a pair —
+        # or a foreign process — is running under it.
         return HibernatedLegacyRetireVerdict(
             state=MIGRATE_ALREADY_RETIRED,
             detail=(
-                "the lane is already durably retired and no expected managed slot is live; "
-                "migration is an idempotent no-op"
+                "the lane is already durably retired and the unit is quiescent (no expected "
+                "managed slot live and no foreign occupant); migration is an idempotent no-op"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
+            foreign_names=plan.foreign_names,
         )
     # The released-legacy-state CAS: hibernated + durable released + empty worktree binding +
     # this exact issue + settled replacement, guarded on the row's exact revision. Every other
@@ -509,6 +654,14 @@ def format_migration_text(result: HibernatedLegacyRetireVerdict) -> str:
         lines.append(
             "    live expected managed slots: " + ", ".join(result.expected_live)
         )
+    if result.foreign_names:
+        # Named separately from the managed slots (Redmine #13897): an operator must be able to
+        # tell "no expected slot is live" from "the unit is quiescent". This surface never
+        # closes a foreign agent — it is recorded for the audit trail, never a retire target.
+        lines.append(
+            "    foreign / unexpected occupants in the lane unit (never closed here): "
+            + ", ".join(result.foreign_names)
+        )
     if result.lifecycle_migration:
         mig = result.lifecycle_migration
         lines.append(
@@ -524,6 +677,9 @@ __all__ = (
     "MIGRATE_ALREADY_RETIRED",
     "MIGRATE_BLOCKED",
     "MIGRATE_LIVE_PAIR_PRESENT",
+    "MIGRATE_FOREIGN_INVENTORY_PRESENT",
+    "MIGRATE_DUPLICATE_INVENTORY",
+    "MIGRATE_EXPECTED_IDENTITY_UNRESOLVED",
     "MIGRATE_HEAD_NOT_INTEGRATED",
     "MIGRATE_WORKTREE_BRANCH_MISMATCH",
     "MIGRATE_LIFECYCLE_UNREADABLE",
