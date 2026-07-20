@@ -201,20 +201,24 @@ def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
     caller then returns an unreadable fingerprint). A content hash (not a ``(size, mtime)``
     stat) so a same-size / mtime-restored rewrite still flips the fingerprint.
 
-    Redmine #13843 review j#83805 F1 hardening:
+    Redmine #13843 review j#83805 / j#83853 F1 hardening — kind-aware, no-follow, bounded,
+    and IDENTITY-STABLE (the object we classify is the object we hash, unchanged throughout):
 
     - **symlink** — hashed by its OWN target *bytes* (``lstat`` + ``readlink``), NOT the
       followed target's content: a retarget (even to a same-content or dangling target) flips
-      the digest, and a dangling link never reads a target.
-    - **regular file** — opened ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK`` and re-confirmed regular
-      via ``fstat`` (a TOCTOU swap to a symlink / FIFO between ``lstat`` and ``open`` fails the
-      open or the re-check), then read up to :data:`_MAX_UNTRACKED_FILE_BYTES` — a larger file
-      fails closed rather than hashing a prefix.
+      the digest, and a dangling link never reads a target. A re-``lstat`` after ``readlink``
+      confirms the link's ``(st_dev, st_ino)`` did not change under us (observation-window
+      swap -> fail closed).
+    - **regular file** — opened ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK`` and re-confirmed both
+      REGULAR **and the SAME ``(st_dev, st_ino)`` as the ``lstat``** (a regular->regular inode
+      swap in the ``lstat``->``open`` window is caught, review j#83853), then read up to
+      :data:`_MAX_UNTRACKED_FILE_BYTES`, then re-``fstat`` to confirm the ``(dev, ino, size,
+      mtime_ns)`` did not drift DURING the read (a mid-read mutation -> fail closed). A larger
+      file fails closed rather than hashing a prefix.
     - **any other kind** (FIFO / device / socket / directory) — ``None`` (fail closed): a FIFO
       would otherwise BLOCK ``open`` indefinitely (outside git's timeout), and a device / socket
       has no bounded content.
-    - an ``lstat`` failure (a path that vanished / became unreadable since ``git status`` — a
-      race) — ``None`` (fail closed).
+    - an ``lstat`` failure / identity drift / read-window mutation — ``None`` (fail closed).
     """
     full = repo_root / os.fsdecode(path)
     try:
@@ -224,8 +228,11 @@ def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
     if stat.S_ISLNK(info.st_mode):
         try:
             target = os.readlink(full)
+            after = os.lstat(full)
         except OSError:
             return None
+        if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+            return None  # the link was swapped during the readlink window -> fail closed
         return hashlib.sha256(b"SYMLINK\0" + os.fsencode(target)).digest()
     if not stat.S_ISREG(info.st_mode):
         return None  # FIFO / device / socket / dir -> fail closed (never open)
@@ -235,8 +242,14 @@ def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
     except OSError:
         return None  # a swap to a symlink (ELOOP) / FIFO / vanished path -> fail closed
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None  # a swap to a non-regular kind after lstat -> fail closed
+        opened = os.fstat(fd)
+        # Same KIND and same IDENTITY as the lstat: a regular->regular inode swap in the
+        # lstat->open window opens a DIFFERENT object, caught here (review j#83853).
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            info.st_dev,
+            info.st_ino,
+        ):
+            return None
         file_digest = hashlib.sha256(b"FILE\0")
         total = 0
         while True:
@@ -250,6 +263,16 @@ def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
             if total > _MAX_UNTRACKED_FILE_BYTES:
                 return None  # over the per-file cap -> fail closed
             file_digest.update(chunk)
+        # The open fd pins the inode, but its CONTENT could be rewritten in place during the
+        # read; a drift in identity / size / mtime means we hashed an inconsistent snapshot.
+        settled = os.fstat(fd)
+        if (settled.st_dev, settled.st_ino, settled.st_size, settled.st_mtime_ns) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ):
+            return None  # mutated during the read -> fail closed
         return file_digest.digest()
     finally:
         os.close(fd)

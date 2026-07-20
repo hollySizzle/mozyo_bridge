@@ -1914,6 +1914,84 @@ class LiveHibernateWorktreeRealGitTest(unittest.TestCase):
             self.assertFalse(fp.readable)
 
 
+class HashUntrackedIdentityStabilityTest(unittest.TestCase):
+    """F1 R5 (review j#83853): `_hash_untracked` must fail closed on any identity drift — a
+    regular->regular inode swap, a symlink observation-window swap, or a mid-read mutation —
+    so the object it classifies is exactly the object it hashes, unchanged throughout."""
+
+    def _mod(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary as B  # noqa: E501
+
+        return B
+
+    def test_regular_inode_swap_in_open_window_fails_closed(self) -> None:
+        B = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "A").write_text("content-A")
+            (Path(tmp) / "B").write_text("content-B-different-inode")
+            os.link(Path(tmp) / "A", Path(tmp) / "residue")
+            real_lstat = os.lstat
+            fired = {"n": 0}
+
+            def racing_lstat(p, *a, **k):
+                r = real_lstat(p, *a, **k)
+                if str(p).endswith("residue") and fired["n"] == 0:
+                    fired["n"] = 1
+                    os.replace(Path(tmp) / "B", Path(tmp) / "residue")  # -> different regular inode
+                return r
+
+            with mock.patch.object(B.os, "lstat", side_effect=racing_lstat):
+                self.assertIsNone(B._hash_untracked(Path(tmp), b"residue"))
+
+    def test_read_during_mutation_fails_closed(self) -> None:
+        B = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "r"
+            f.write_bytes(b"x" * 200000)
+            real_read = os.read
+            fired = {"n": 0}
+
+            def racing_read(fd, n):
+                chunk = real_read(fd, n)
+                if chunk and fired["n"] == 0:
+                    fired["n"] = 1
+                    with open(f, "ab") as handle:  # rewrite in place -> size / mtime drift
+                        handle.write(b"MORE")
+                return chunk
+
+            with mock.patch.object(B.os, "read", side_effect=racing_read):
+                self.assertIsNone(B._hash_untracked(Path(tmp), b"r"))
+
+    def test_symlink_swap_in_readlink_window_fails_closed(self) -> None:
+        B = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink("target-one", Path(tmp) / "link")
+            real_readlink = os.readlink
+            fired = {"n": 0}
+
+            def racing_readlink(p, *a, **k):
+                out = real_readlink(p, *a, **k)
+                if str(p).endswith("link") and fired["n"] == 0:
+                    fired["n"] = 1
+                    os.remove(Path(tmp) / "link")
+                    os.symlink("target-two", Path(tmp) / "link")  # different inode
+                return out
+
+            with mock.patch.object(B.os, "readlink", side_effect=racing_readlink):
+                self.assertIsNone(B._hash_untracked(Path(tmp), b"link"))
+
+    def test_stable_regular_file_hashes(self) -> None:
+        B = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "r").write_text("stable")
+            self.assertIsNotNone(B._hash_untracked(Path(tmp), b"r"))
+
+    def test_stable_symlink_hashes(self) -> None:
+        B = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink("some-target", Path(tmp) / "link")
+            self.assertIsNotNone(B._hash_untracked(Path(tmp), b"link"))
+
 # ---------------------------------------------------------------------------
 # F2: live lane-activity probe (running turn / pending composer), via the live path.
 # ---------------------------------------------------------------------------
