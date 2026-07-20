@@ -15,6 +15,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -549,6 +550,32 @@ class InstallOpsTest(unittest.TestCase):
         self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_UNREADABLE)
         # the file is untouched
         settings.chmod(0o600)
+        self.assertEqual(settings.read_text(encoding="utf-8"), "orig")
+
+    def test_apply_refused_when_backup_read_fails(self) -> None:
+        # Review j#83737 finding 1: a file readable at snapshot time but failing the
+        # SEPARATE backup read leaves the backup incomplete, so rollback is unprovable
+        # and apply must refuse before mutating — even though the snapshot pass passed.
+        settings = self.home / ".claude" / "settings.json"
+        settings.write_text("orig", encoding="utf-8")
+        orig_read = Path.read_bytes
+        counts: "dict[str, int]" = {}
+
+        def flaky_read(path_self):
+            key = str(path_self)
+            counts[key] = counts.get(key, 0) + 1
+            # settings.json: 1st read (snapshot) succeeds, 2nd read (backup) fails.
+            if key.endswith("settings.json") and counts[key] >= 2:
+                raise OSError("injected backup read failure")
+            return orig_read(path_self)
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(Path, "read_bytes", flaky_read):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked → zero mutation
+        self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_UNREADABLE)
         self.assertEqual(settings.read_text(encoding="utf-8"), "orig")
 
     def _restore_perms(self) -> None:

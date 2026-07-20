@@ -155,15 +155,25 @@ def _has_unreadable(snapshot: DirSnapshot) -> bool:
     return any(digest == _UNREADABLE_SENTINEL for _rel, digest in snapshot.entries)
 
 
-def _backup_dir(root: Path) -> "dict[str, bytes]":
-    """Capture the bytes of ``root``'s non-credential files for rollback."""
+def _backup_dir(root: Path) -> "tuple[dict[str, bytes], list[str]]":
+    """Capture the bytes of ``root``'s non-credential files for rollback.
+
+    Returns ``(backup, unreadable)``: ``backup`` maps each successfully-read
+    non-credential file to its bytes, and ``unreadable`` lists the files whose read
+    failed. A backup read can fail even when the snapshot read succeeded (a transient
+    error, or a file that turned unreadable between the two passes), and an incomplete
+    backup means a rollback of that dir could never be restored — so the caller MUST
+    refuse the apply before mutating rather than silently proceeding with a partial
+    backup (Redmine #13249 review j#83737 finding 1).
+    """
     backup: "dict[str, bytes]" = {}
+    unreadable: "list[str]" = []
     for rel, abspath in _iter_files(root):
         try:
             backup[rel] = abspath.read_bytes()
         except OSError:
-            continue
-    return backup
+            unreadable.append(rel)
+    return backup, unreadable
 
 
 def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -> bool:
@@ -386,16 +396,20 @@ def _run_apply_transaction(
     # herdr resolves the agent config dirs from HOME; pin it to the resolved home so
     # a managed apply and the gate look at the same dirs.
     env["HOME"] = str(inputs.home)
-    # Preflight, BEFORE any mutation: snapshot + back up every agent's dir. If any dir
-    # holds an unreadable non-credential file, a rollback of it could never be
-    # byte-verified, so the whole transaction is refused with zero mutation — an
-    # un-provable rollback must never be started (Redmine #13249 review j#83674
-    # finding 1). Snapshots are captured here (pre-mutation) and reused by the loop.
+    # Preflight, BEFORE any mutation: snapshot + back up every agent's dir. A rollback
+    # of a dir is only provable when every non-credential file could be both
+    # snapshotted AND backed up. So the whole transaction is refused with zero mutation
+    # (Redmine #13249 reviews j#83674 / j#83737) when either pass cannot fully read the
+    # dir: the snapshot carries an unreadable sentinel, OR the backup had a read error /
+    # does not cover every snapshot path (a file readable at snapshot time can fail the
+    # separate backup read). Snapshots are captured here (pre-mutation) and reused.
     staged: "list[tuple[str, Path, DirSnapshot, dict]]" = []
     for agent in inputs.agents:
         config_dir = _config_dir(inputs.home, agent)
         before = _snapshot_dir(config_dir)
-        if _has_unreadable(before):
+        backup, backup_unreadable = _backup_dir(config_dir)
+        missing_from_backup = before.paths - set(backup)
+        if _has_unreadable(before) or backup_unreadable or missing_from_backup:
             return InstallReport(
                 applied=False,
                 ok=False,
@@ -405,16 +419,16 @@ def _run_apply_transaction(
                         config_dir=str(config_dir),
                         ready=False,
                         reason=REASON_CONFIG_DIR_UNREADABLE,
-                        detail=f"config dir {config_dir} holds an unreadable "
-                        f"non-credential file; a rollback could not be proven so "
-                        f"nothing was mutated",
+                        detail=f"config dir {config_dir} holds a non-credential file "
+                        f"that could not be fully snapshotted and backed up; a "
+                        f"rollback could not be proven so nothing was mutated",
                     ),
                 ),
                 detail="apply refused: an un-provable rollback would be required; "
                 "nothing was mutated",
                 pin_mode=pin_mode,
             )
-        staged.append((agent, config_dir, before, _backup_dir(config_dir)))
+        staged.append((agent, config_dir, before, backup))
     applied: "list[tuple[str, Path, dict, DirSnapshot]]" = []
     outcomes: "list[AgentInstallOutcome]" = []
     for agent, config_dir, before, backup in staged:
