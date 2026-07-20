@@ -150,6 +150,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     EnvelopePlanError,
     HandoffEnvelopePlanner,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail import (
+    HerdrStandardRailRequest,
+    run_herdr_standard_rail,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     resolve_canonical_session,
@@ -2735,79 +2739,39 @@ def orchestrate_handoff(
     # common shim-backed choreography (auditor j#72602 decisions 1/2/3/5). The rail is
     # stashed on `active_herdr_turn_start_rail` by `bind_runtime_transport`.
     if herdr_send and mode == MODE_STANDARD:
-        rail = active_herdr_turn_start_rail
-        if rail is None:  # defensive: the decorator always stashes it under herdr
-            die(
-                "herdr backend selected for a --mode standard send but no turn-start "
-                "rail was installed; refusing to fall back to the capture rail. "
-                f"target={target}"
-            )
-            raise AssertionError("unreachable")
-        turn_start = rail.drive_turn_start(target, f"{marker} {body}")
-        status, reason = _project_herdr_turn_start(turn_start)
-        # Machine-readable turn-start telemetry (turn_start_outcome / snapshot_state /
-        # wait_kind / enter_resends / reclassified_blocked) for EVERY rail outcome,
-        # rendered redaction-safe by the rail's own record renderer and persisted on
-        # the delivery record (auditor j#72602 decision 4).
-        turn_start_lines = _turn_start_rail_record_lines(turn_start)
-        # Redmine #13255 j#72695: carry the SAME telemetry as a structured field on
-        # the outcome so it lands in the JSON / persisted record (an auditor / the
-        # future #12656 ledger reads this, not the reused `(status, reason)` wire
-        # alone) AND so the delivery-record wording discriminates a herdr
-        # `delivered_not_started` from the tmux/capture standard rail's
-        # `turn_start_unconfirmed`.
-        turn_start_telemetry = turn_start.to_telemetry_dict()
-        outcome = make_outcome(
-            status=status,
-            reason=reason,
-            receiver=receiver,
-            target=target,
-            anchor=anchor,
-            mode=mode,
-            kind=kind,
-            notification_marker=marker,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
-            turn_start_outcome=turn_start_telemetry,
-        )
-        _emit(
-            outcome,
-            record_format=record_format,
-            command=record_command,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(
-                outcome, submit_intent=inp.submit_intent,
-                submit_delivery_id=inp.submit_delivery_id,
-            ),
-            turn_start_lines=turn_start_lines,
-        )
-        # Redmine #13300: persist every event-rail outcome (incl. delivered-not-started)
-        # before the sent/die branch, so no terminal event-rail path escapes the ledger.
-        _record_herdr_send_ledger(outcome)
-        if status == "sent":
-            _maybe_persist_delivery_record(
-                outcome,
-                persist_delivery=bool(inp.persist_delivery),
-                duplicate_lane_panes=duplicate_lane_panes,
+        # Redmine #13729 tranche 3: the herdr event-driven turn-start rail slice owns its own
+        # control flow (returns / dies without falling through). It is carved into the typed
+        # ``handoff_herdr_standard_rail`` use case — the facade only assembles the typed request
+        # (the resolved envelope value objects + terminal outcome context) and hands it the
+        # stashed rail + the per-call publishing emitter. The emit / ledger / persist / die side
+        # effects, the marker+body-once-only choreography, and both die messages are unchanged.
+        return run_herdr_standard_rail(
+            active_herdr_turn_start_rail,
+            HerdrStandardRailRequest(
+                target=target,
+                marker=marker,
+                body=body,
+                receiver=receiver,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                execution_root=execution_root,
+                role_profile_resolution=role_profile_resolution,
+                role_profile_contract=role_profile_contract,
+                transition_role_boundary=transition_role_boundary,
+                workflow_contract_bundle=workflow_contract_bundle,
+                ticketless_callback=ticketless_callback_payload,
+                ticketless_consultation=ticketless_consultation_payload,
+                ticketless_work_intake=ticketless_work_intake_payload,
                 record_format=record_format,
-                turn_start_lines=turn_start_lines,
-            )
-            return 0
-        die(
-            "handoff was routed through the herdr event-driven turn-start rail but "
-            f"no turn start was confirmed (rail outcome {turn_start.outcome}); the "
-            f"{receiver} receiver was not observed starting a turn. The marker+body "
-            "was typed at most once and only Enter was sent (no C-u rollback, no "
-            f"re-send). Read the receiver before re-issuing. target={target} "
-            f"marker={marker}"
+                record_command=record_command,
+                duplicate_lane_panes=duplicate_lane_panes,
+                submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+                persist_delivery=bool(inp.persist_delivery),
+            ),
+            emit=_emit,
         )
-        raise AssertionError("unreachable")
 
     run_tmux("send-keys", "-t", target, "-l", "--", f"{marker} {body}")
 

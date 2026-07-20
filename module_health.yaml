@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3342
+    lines: 3306
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1093,6 +1093,17 @@ allowlist:
       keeps two thin try/except call sites that map `EnvelopePlanError` back to the
       byte-identical blocked outcome. Net -294. Shared baseline change: reconcile at
       integration if another tranche/lane also edits this file.
+      Tightened 3342 -> 3306 for #13729 tranche 3 (herdr event-driven --mode standard
+      turn-start rail): the ~74-line inline block that drives the `HerdrTurnStartRail`,
+      projects the `(status, reason)` wire, and assembles + emits + ledgers the terminal
+      outcome then persists (`sent`) or dies (no C-u rollback, no re-send) moved to the new
+      `f_130_handoff_routing/application/handoff_herdr_standard_rail.py`
+      (`HerdrStandardRailUseCase` over a typed `HerdrStandardRailRequest` + a side-effect
+      `HerdrStandardRailOps` port; `LiveHerdrStandardRailOps` routes the ledger / persist /
+      die seams through `commands` at call time). The facade keeps one thin call site that
+      builds the typed request from the resolved envelope and returns the use case result.
+      Net -36. Shared baseline change: reconcile at integration if another tranche/lane also
+      edits this file.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
