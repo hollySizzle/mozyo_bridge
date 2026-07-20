@@ -50,6 +50,23 @@ class CoordinatorSharedCreateLockUnavailable(RuntimeError):
     Raised rather than proceeding unlocked — a silent no-op would advertise a
     single-flight guarantee that is not there (mirrors
     :class:`...herdr_identity_attestation_schema.AttestationStoreLockUnavailable`).
+
+    Used for the **acquisition** phase (before any herdr command runs), so a caller
+    that catches only this base type can still treat it as a zero-actuation failure.
+    The **release** phase raises the :class:`CoordinatorSharedCreateReleaseError`
+    subtype so the caller can tell the two phases apart (R8 review j#83633 F1).
+    """
+
+
+class CoordinatorSharedCreateReleaseError(CoordinatorSharedCreateLockUnavailable):
+    """The lock could not be RELEASED after the guarded body already succeeded.
+
+    A subtype of :class:`CoordinatorSharedCreateLockUnavailable` (so one ``except``
+    still catches every fence failure), but distinct so the caller can report the
+    truth: the release runs AFTER the body, so on the clean-slate path the shared
+    ``workspace create`` has already happened — the "no workspace was created"
+    message that fits an acquisition failure is FALSE here (R8 review j#83633 F1). A
+    re-run adopts the (possibly labelled-husk) workspace idempotently.
     """
 
 
@@ -129,7 +146,7 @@ def coordinator_shared_create_lock(home: Path):
         except OSError as close_exc:  # pragma: no cover - close rarely errors
             release_error = release_error or close_exc
         if release_error is not None and not body_failed:
-            raise CoordinatorSharedCreateLockUnavailable(
+            raise CoordinatorSharedCreateReleaseError(
                 "could not release the shared coordinators single-flight lock "
                 f"({release_error}); fail closed"
             ) from release_error
@@ -147,6 +164,7 @@ def _close_fd_quietly(fd: Optional[int]) -> None:
 __all__ = (
     "COORDINATOR_SHARED_CREATE_LOCK_FILENAME",
     "CoordinatorSharedCreateLockUnavailable",
+    "CoordinatorSharedCreateReleaseError",
     "coordinator_shared_create_lock",
     "coordinator_shared_create_lock_path",
 )

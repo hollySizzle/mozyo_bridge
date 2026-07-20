@@ -2022,6 +2022,45 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.workspace_creates, [])
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
 
+    def test_shared_space_release_failure_after_create_reports_husk_not_zero(self) -> None:
+        # Redmine #14139 R8 review j#83633 F1: a RELEASE failure happens AFTER the
+        # guarded body, so on the clean-slate path the shared `workspace create` has
+        # already run. session-start must NOT report "no workspace was created"; it
+        # must report the labelled husk + un-started agents so a retry adopts it.
+        import contextlib
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateReleaseError,
+        )
+
+        @contextlib.contextmanager
+        def _release_boom(home):
+            # Run the body (list -> resolve -> create) to completion, THEN fail on
+            # release (only when the body succeeded — mirrors the real fence).
+            yield
+            raise CoordinatorSharedCreateReleaseError("release failed (simulated)")
+
+        herdr = _Herdr(created_workspace="wS")
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(lock_path, _release_boom):
+                with self.assertRaises(HerdrSessionStartError) as cm:
+                    self._prepare(
+                        tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                        coordinator_placement_mode="shared_space",
+                    )
+        msg = str(cm.exception)
+        # Phase-accurate: agents NOT started, labelled husk may exist, retry adopts.
+        self.assertIn("were NOT started", msg)
+        self.assertIn("adopt", msg)
+        self.assertNotIn("no workspace / tab / agent was created", msg)
+        # Truthful state: the workspace WAS created; the agents were NOT started.
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
     def test_concurrent_clean_slate_launches_create_one_shared_workspace(self) -> None:
         # Redmine #14139 R5 j#83516 required coverage 2 / R6 review j#83569 F1: two
         # clean-slate shared-space launches racing the SAME home + backend must

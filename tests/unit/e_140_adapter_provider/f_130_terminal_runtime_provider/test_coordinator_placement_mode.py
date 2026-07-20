@@ -497,13 +497,15 @@ class CoordinatorSharedCreateLockTest(unittest.TestCase):
         from unittest.mock import patch
 
         from mozyo_bridge.core.state.coordinator_placement_fence import (
-            CoordinatorSharedCreateLockUnavailable,
+            CoordinatorSharedCreateReleaseError,
             coordinator_shared_create_lock,
         )
 
         home = self._home()
         with patch("fcntl.flock", self._unlock_boom()):
-            with self.assertRaises(CoordinatorSharedCreateLockUnavailable):
+            # A release failure is the distinct RELEASE subtype (R8 review j#83633 F1),
+            # still an instance of the base type so one `except` catches both phases.
+            with self.assertRaises(CoordinatorSharedCreateReleaseError):
                 with coordinator_shared_create_lock(home):
                     pass
 
@@ -538,13 +540,12 @@ class CoordinatorSharedCreateLockTest(unittest.TestCase):
 
         from mozyo_bridge.core.state import coordinator_placement_fence as _fence
         from mozyo_bridge.core.state.coordinator_placement_fence import (
-            CoordinatorSharedCreateLockUnavailable,
             coordinator_shared_create_lock,
         )
 
         home = self._home()
         with patch.object(_fence.os, "close", self._close_boom()):
-            with self.assertRaises(CoordinatorSharedCreateLockUnavailable):
+            with self.assertRaises(_fence.CoordinatorSharedCreateReleaseError):
                 with coordinator_shared_create_lock(home):
                     pass
 

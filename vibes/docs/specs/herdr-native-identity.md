@@ -532,6 +532,9 @@ write ではない (`flock` のみ)。lock lifecycle 全体で raw `OSError` を
 試行し fd は必ず close) は **body 成功時のみ**、いずれも session-start の typed error (`HerdrSessionStartError`) へ
 変換して fail-closed する (R6 review j#83569 F2 / R7 review j#83596 F1、public CLI が raw traceback にならない)。
 **body が例外を投げた場合は release error で上書きせず元例外を不変伝播**する (`_FenceLock.__exit__` と同 pattern)。
+release error は acquire error と**別 subtype** (`CoordinatorSharedCreateReleaseError`) で、session-start は phase-accurate に報告する
+(R8 review j#83633 F1): acquire failure は「zero workspace/tab/agent create」、release failure は body の後なので
+「labelled `coordinators` workspace は作成済みの可能性があり agent 未起動、re-run が idempotently adopt」。
 concurrent 収束は `threading.Barrier` + 共有 fake backend + `fcntl.flock` の別-fd 競合で **create count 1** を
 deterministic に regression 固定する (live Herdr smoke 不要)。
 

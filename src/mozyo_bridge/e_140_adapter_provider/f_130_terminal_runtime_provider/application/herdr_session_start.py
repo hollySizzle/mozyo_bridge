@@ -243,6 +243,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.core.state.coordinator_placement_fence import (
     CoordinatorSharedCreateLockUnavailable,
+    CoordinatorSharedCreateReleaseError,
     coordinator_shared_create_lock,
 )
 from mozyo_bridge.shared.errors import die
@@ -733,11 +734,14 @@ def _prepare_session_locked(
                 # heal above never takes the lock (it creates nothing). Unreadable
                 # labels / ambiguity / mode-transition all fail closed in the resolver.
                 #
-                # The fence is acquired BEFORE any herdr command, so a lock failure
-                # (protocol unavailable, home permission, acquisition error) is a
-                # zero-actuation fail-closed condition — convert it into the launch's
-                # typed error boundary so the public CLI reports a controlled refusal,
-                # not a raw traceback (R6 review j#83569 F2).
+                # The fence's ACQUISITION runs before any herdr command, so an
+                # acquisition failure is zero-actuation; its RELEASE runs AFTER the
+                # body, so on the clean-slate path the shared `workspace create` has
+                # already happened. Both convert into the launch's typed error boundary
+                # (no raw traceback at the CLI, R6 review j#83569 F2), but the message
+                # must be phase-accurate: an acquisition failure created nothing, while
+                # a release failure may have left a labelled `coordinators` workspace a
+                # re-run adopts idempotently (R8 review j#83633 F1).
                 try:
                     with coordinator_shared_create_lock(mozyo_bridge_home()):
                         workspace_labels = _list_workspace_labels(binary, runner, timeout)
@@ -758,6 +762,20 @@ def _prepare_session_locked(
                                 label=SHARED_COORDINATOR_WORKSPACE_LABEL,
                             )
                             result.base_pane_id = base_pane_id
+                except CoordinatorSharedCreateReleaseError as exc:
+                    # Release runs AFTER the body: the shared workspace was already
+                    # resolved (created on a clean slate, or adopted), and the
+                    # coordinator agents were NOT started. A labelled `coordinators`
+                    # workspace may exist as an empty husk; a re-run adopts it
+                    # idempotently (no duplicate is created).
+                    raise HerdrSessionStartError(
+                        "managed-launch admission resolved the shared coordinators "
+                        f"workspace but could not release the single-flight lock ({exc}); "
+                        "the coordinator agents were NOT started. A labelled "
+                        "'coordinators' workspace may have been created and remain as an "
+                        "empty husk — re-run to adopt it idempotently (no duplicate is "
+                        "created)."
+                    ) from exc
                 except CoordinatorSharedCreateLockUnavailable as exc:
                     raise HerdrSessionStartError(
                         "managed-launch admission could not acquire the shared "
