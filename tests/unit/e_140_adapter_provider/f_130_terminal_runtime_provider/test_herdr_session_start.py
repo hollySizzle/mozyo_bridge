@@ -1991,6 +1991,132 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(result.herdr_workspace_id, "wZ")
         self.assertEqual(run2.workspace_creates, [], "retry must adopt the husk, not create")
 
+    def test_shared_space_lock_failure_converts_to_session_start_error(self) -> None:
+        # Redmine #14139 R6 review j#83569 F2: a single-flight lock failure must fail
+        # closed through the session-start typed error boundary (HerdrSessionStartError),
+        # with zero herdr actuation — not a raw fence exception / traceback at the CLI.
+        import contextlib
+
+        from mozyo_bridge.core.state.coordinator_placement_fence import (
+            CoordinatorSharedCreateLockUnavailable,
+        )
+
+        @contextlib.contextmanager
+        def _unavailable(home):
+            raise CoordinatorSharedCreateLockUnavailable("lock unavailable (simulated)")
+            yield  # pragma: no cover
+
+        herdr = _Herdr(created_workspace="wS")
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(lock_path, _unavailable):
+                with self.assertRaises(HerdrSessionStartError):
+                    self._prepare(
+                        tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                        coordinator_placement_mode="shared_space",
+                    )
+        # Zero actuation: the lock fails before any workspace / agent is created.
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+
+    def test_concurrent_clean_slate_launches_create_one_shared_workspace(self) -> None:
+        # Redmine #14139 R5 j#83516 required coverage 2 / R6 review j#83569 F1: two
+        # clean-slate shared-space launches racing the SAME home + backend must
+        # converge to ONE shared workspace. A `threading.Barrier` forces both into the
+        # create critical section together; `fcntl.flock` contends across the two
+        # threads' separate fds (flock(2)), so only one creates and the other adopts.
+        import contextlib
+        import threading
+
+        from mozyo_bridge.core.state import coordinator_placement_fence as _fence
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        real_lock = _fence.coordinator_shared_create_lock
+        barrier = threading.Barrier(2)
+
+        @contextlib.contextmanager
+        def _barriered(home):
+            # Both threads arrive together, THEN race the real flock.
+            barrier.wait(timeout=20)
+            with real_lock(home):
+                yield
+
+        class _ConcurrentHerdr(_Herdr):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self._run_lock = threading.Lock()
+
+            def run(self, argv, **kw):  # thread-safe shared backend bookkeeping
+                with self._run_lock:
+                    return super().run(argv, **kw)
+
+        lock_path = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start.coordinator_shared_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            herdr = _ConcurrentHerdr(created_workspace="wZ")
+            herdr.attest_home = home
+            repos = []
+            results: dict = {}
+            errors: dict = {}
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                for name in ("A", "B"):
+                    repo = Path(tmp) / f"repo{name}"
+                    repo.mkdir()
+                    register_workspace(repo, home=home)
+                    repos.append(repo)
+
+                def _launch(name, repo):
+                    try:
+                        # Isolate the ORTHOGONAL home-scoped startup-transaction fence
+                        # (a brief, non-blocking per-DB-write lock) per thread, so the
+                        # two launches never collide on IT — this test targets the
+                        # shared-coordinators create single-flight, which still uses the
+                        # shared home lock.
+                        results[name] = prepare_session(
+                            repo_root=repo,
+                            providers=["claude", "codex"],
+                            lane_id="",
+                            env=_launch_env(binpath),
+                            runner=herdr.run,
+                            coordinator_placement_mode="shared_space",
+                            startup_fence=StartupTransactionFence(
+                                path=Path(tmp) / f"startup-{name}.sqlite"
+                            ),
+                            probe=_FAST_PROBE,
+                        )
+                    except BaseException as exc:  # noqa: BLE001 - surfaced via assert
+                        errors[name] = exc
+
+                with patch(lock_path, _barriered):
+                    t1 = threading.Thread(target=_launch, args=("A", repos[0]))
+                    t2 = threading.Thread(target=_launch, args=("B", repos[1]))
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=30)
+                    t2.join(timeout=30)
+
+        self.assertEqual(errors, {}, msg=f"launch errors: {errors}")
+        # Single-flight: exactly one shared workspace was created, and BOTH projects
+        # resolved to it (the loser adopted the winner's workspace).
+        self.assertEqual(
+            len(herdr.workspace_creates), 1, "concurrent launches must create one workspace"
+        )
+        self.assertEqual(results["A"].herdr_workspace_id, results["B"].herdr_workspace_id)
+        self.assertEqual(results["A"].herdr_workspace_id, "wZ")
+
     def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
         # Redmine #14139: an unknown mode string fails closed at the pure entry point,
         # before any herdr actuation (mirrors the unknown-provider guard).

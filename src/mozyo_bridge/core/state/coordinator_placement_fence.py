@@ -70,8 +70,13 @@ def coordinator_shared_create_lock(home: Path):
     ``workspace create``) and a normal concurrent ``mozyo`` launch should wait, not
     error. A holder's crash releases the lock at the OS level.
 
-    Raises :class:`CoordinatorSharedCreateLockUnavailable` where ``fcntl.flock`` is
-    unavailable rather than proceeding without the guarantee.
+    Every acquisition failure — ``fcntl`` unavailable, the home lock file being
+    unmakeable / unopenable (permission, a directory in its place), or a ``flock``
+    error — is raised as :class:`CoordinatorSharedCreateLockUnavailable` rather than
+    a raw ``OSError``, so the single caller can convert exactly one type into the
+    session-start typed error boundary (R6 review j#83569 F2). Exceptions raised
+    inside the guarded body are propagated unchanged (they are the launch's own
+    fail-closed errors, not the fence's).
     """
     try:
         import fcntl
@@ -83,18 +88,20 @@ def coordinator_shared_create_lock(home: Path):
         ) from exc
 
     path = coordinator_shared_create_lock_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise CoordinatorSharedCreateLockUnavailable(
+            f"could not open the shared coordinators single-flight lock at {path}: {exc}"
+        ) from exc
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError as exc:  # pragma: no cover - blocking flock rarely errors here
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
-                # Should not happen with a blocking lock, but never proceed unlocked.
-                raise CoordinatorSharedCreateLockUnavailable(
-                    "could not acquire the shared coordinators single-flight lock"
-                ) from exc
-            raise
+            raise CoordinatorSharedCreateLockUnavailable(
+                f"could not acquire the shared coordinators single-flight lock: {exc}"
+            ) from exc
         try:
             yield
         finally:

@@ -242,6 +242,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SHARED_SPACE,
 )
 from mozyo_bridge.core.state.coordinator_placement_fence import (
+    CoordinatorSharedCreateLockUnavailable,
     coordinator_shared_create_lock,
 )
 from mozyo_bridge.shared.errors import die
@@ -731,25 +732,38 @@ def _prepare_session_locked(
                 # partial-failure husk is adopted the same way (resolver F1). Own-pin
                 # heal above never takes the lock (it creates nothing). Unreadable
                 # labels / ambiguity / mode-transition all fail closed in the resolver.
-                with coordinator_shared_create_lock(mozyo_bridge_home()):
-                    workspace_labels = _list_workspace_labels(binary, runner, timeout)
-                    target_workspace = _shared_coordinator_target(
-                        rows,
-                        workspace_id,
-                        adopt_locators,
-                        workspace_labels,
-                        SHARED_COORDINATOR_WORKSPACE_LABEL,
-                    )
-                    if not target_workspace:
-                        target_workspace, base_pane_id = _create_workspace(
-                            binary,
-                            repo_root,
-                            runner,
-                            timeout,
-                            env,
-                            label=SHARED_COORDINATOR_WORKSPACE_LABEL,
+                #
+                # The fence is acquired BEFORE any herdr command, so a lock failure
+                # (protocol unavailable, home permission, acquisition error) is a
+                # zero-actuation fail-closed condition — convert it into the launch's
+                # typed error boundary so the public CLI reports a controlled refusal,
+                # not a raw traceback (R6 review j#83569 F2).
+                try:
+                    with coordinator_shared_create_lock(mozyo_bridge_home()):
+                        workspace_labels = _list_workspace_labels(binary, runner, timeout)
+                        target_workspace = _shared_coordinator_target(
+                            rows,
+                            workspace_id,
+                            adopt_locators,
+                            workspace_labels,
+                            SHARED_COORDINATOR_WORKSPACE_LABEL,
                         )
-                        result.base_pane_id = base_pane_id
+                        if not target_workspace:
+                            target_workspace, base_pane_id = _create_workspace(
+                                binary,
+                                repo_root,
+                                runner,
+                                timeout,
+                                env,
+                                label=SHARED_COORDINATOR_WORKSPACE_LABEL,
+                            )
+                            result.base_pane_id = base_pane_id
+                except CoordinatorSharedCreateLockUnavailable as exc:
+                    raise HerdrSessionStartError(
+                        "managed-launch admission could not acquire the shared "
+                        f"coordinators single-flight lock ({exc}); no workspace / tab / "
+                        "agent was created. Re-run once the home lock is reachable."
+                    ) from exc
         else:
             target_workspace = _launch_target_for_lane(
                 rows,

@@ -527,7 +527,11 @@ shared default-lane の **list→resolve→create を home-scoped exclusive advi
 (double-checked) し、無いときだけ create する。よって同時起動でも create するのは 1 process だけで、他は待機後
 再 resolve で husk-adoption/adopt に収束し、**shared workspace は 1 個**になる。**own-pin heal は lock を取らない**
 (create しない = R5 F2 契約維持)。lock は home 下の 0600 advisory artifact で state を持たず、operator config
-write ではない (`flock` のみ)。
+write ではない (`flock` のみ)。lock protocol 不能 / home permission / acquire error は list/create の**前**に起きるので
+**zero herdr actuation** で session-start の typed error (`HerdrSessionStartError`) へ変換して fail-closed する
+(R6 review j#83569 F2、public CLI が raw traceback にならない)。concurrent 収束は `threading.Barrier` +
+共有 fake backend + `fcntl.flock` の別-fd 競合で **create count 1** を deterministic に regression 固定する
+(live Herdr smoke 不要)。
 
 sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin が複数 herdr
 workspace に跨る場合は identity conflict として fail-closed (#13330 posture)。この label read / fence は shared_space の
