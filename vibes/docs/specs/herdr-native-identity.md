@@ -482,21 +482,54 @@ mode: shared_space          # per_project_space | shared_space
 - それ以外の `mode` 文字列 / unknown key / 非 mapping / unsupported version は
   `CoordinatorPlacementError` で fail-closed (未知 shape が per_project_space に化けない)。
 
-### shared_space の workspace identity / 冪等 adopt
+### shared_space の workspace identity / label authority / 冪等 adopt
 
-`shared_space` の default-lane target 解決 (`herdr_lane_topology._shared_coordinator_target`):
+shared space の identity は **backend が read できる stable workspace label `coordinators`** が authority で
+ある (R1 review j#83383 F1 / Design Answer j#83385 Decision 1)。**locator prefix だけで shared space を
+認定してはならない**: per-project coordinator workspace と shared workspace は inventory 上区別できず、prefix
+guess は mode 切替時に per-project window を誤 adopt する。label は create 時に付与し、adopt/join は
+action-time に `herdr workspace list` の exact label を再読して判断する。**per-project workspace を暗黙に
+shared へ昇格・relabel しない。**
+
+`shared_space` の default-lane target 解決 (`herdr_lane_topology._shared_coordinator_target(rows, workspace_id,
+adopted_locators, workspace_labels, shared_label)`):
 
 1. **自 project の live/adopted default-lane slot** が pin する (heal は coordinator pair を workspace 跨ぎで
-   分割しない)。
-2. 自 pin が無ければ、**他 project の live default-lane slot** が占有する herdr workspace へ join する。#13380 の
-   sublane host 解決と違い、ここは意図的に mozyo `workspace` identity 境界を跨ぐ (各 project の coordinator は
-   自 project identity `mzb1_<project-ws>_<role>_default` を保つ)。shared space は全 project coordinator column の
-   union だからで、これが 2 番目以降の project の launch を「先行 project が作った space の冪等 adopt」にする。
-3. どちらも pin しなければ `""` → caller が stable label `coordinators` で create する。column ゼロの space は
-   最終 pane close で herdr が自動 close する (#13380) ため husk は残らず、次 project が on-demand で再 mint する。
+   分割しない)。自 identity が pin するので label read は不要。
+2. 自 pin が無ければ label authority で判断する (`workspace_labels` = `{herdr_workspace_id: label}`、
+   `herdr workspace list` で action-time 取得):
+   - **`workspace_labels` が読めない (None)** → typed fail-closed (推測しない)。
+   - `shared_label` を持ち、かつ live default-lane slot を持つ herdr workspace (= live labelled shared column):
+     - **ちょうど 1 つ** → その space を adopt する。#13380 の sublane host 解決と違いここは意図的に mozyo
+       `workspace` identity 境界を跨ぐ (各 coordinator は自 project identity `mzb1_<project-ws>_<role>_default`
+       を保つ) が、境界跨ぎは **label 一致に gate される**。これが 2 番目以降の project の launch を
+       「先行 project が作った space の冪等 adopt」にする。
+     - **複数** → ambiguous shared space として fail-closed。
+3. labelled live candidate が無い場合:
+   - **他 project の coordinator pair が live だが shared label を持たない (per-project workspace)** → fail-closed
+     (mode-transition guard: per-project window を暗黙昇格しない)。
+   - coordinator pair が 1 つも live でない (clean slate) → `""` → caller が stable label `coordinators` で
+     create する。column ゼロの space は最終 pane close で herdr が自動 close する (#13380) ため husk は残らず、
+     次 project が on-demand で再 mint する。
 
-sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin / sibling column が
-複数 herdr workspace に跨る場合は「どれが shared space か推測しない」fail-closed (#13330 posture)。
+sublane slot は coordinators space を pin しない (default-lane slot のみ consult する)。自 pin が複数 herdr
+workspace に跨る場合は identity conflict として fail-closed (#13330 posture)。この label read は shared_space の
+default-lane path でのみ発火し、`per_project_space` と全 sublane launch は `workspace list` を発行せず
+byte-invariant を保つ。
+
+### project 列順 — deterministic append order (not arbitrary live reorder)
+
+Herdr の public launch API は既存 workspace 内への任意 insert / reorder target を持たない (`agent start` に
+pane-target flag 無し)。したがって**独立 launch を跨ぐ厳密な左右順は保証しない** (R1 review j#83383 F2 /
+Design Answer j#83385 Decision 2)。契約:
+
+- fresh shared space に複数 project を batch で作る場合は **stable project key 順に append** する。
+- 既存 column は現在順を保持し、**自動 reorder / live relayout しない**。
+- 単独 project launch は **末尾 append**。global strict order は別の live-relayout US。
+
+resolver の判断は inventory の row 順に依存しない (集合演算 + sorted で deterministic)。厳密左右順を望む
+operator の live 再配置は live-relayout runbook (#13648) の領分であり、本 mode は
+**deterministic append order であって arbitrary live reorder ではない**。
 
 ### Launch-time only (適用条件)
 

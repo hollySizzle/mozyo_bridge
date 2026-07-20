@@ -251,6 +251,13 @@ class _Herdr:
         self.workspace_creates: list = []
         self.tab_creates: list = []
         self.pane_closes: list = []
+        # Redmine #14139: the shared-coordinators label authority (`workspace list`).
+        # `{herdr_workspace_id: label}` the fake reports; a `workspace create --label`
+        # records the created workspace's label here so a later `workspace list`
+        # reflects it. `None` forces an unparseable payload (labels-unreadable path).
+        self.workspace_labels: dict = {}
+        self.workspace_list_unreadable = False
+        self.workspace_lists: list = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
@@ -292,9 +299,33 @@ class _Herdr:
                 stdout=json.dumps({"agents": self.existing_rows + self.started_rows}),
                 stderr="",
             )
+        if rest[:2] == ["workspace", "list"]:
+            self.workspace_lists.append(rest)
+            if self.workspace_list_unreadable:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="not json", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "workspace_list",
+                            "workspaces": [
+                                {"workspace_id": wid, "label": label}
+                                for wid, label in sorted(self.workspace_labels.items())
+                            ],
+                        }
+                    }
+                ),
+                stderr="",
+            )
         if rest[:2] == ["workspace", "create"]:
             self.workspace_creates.append(rest)
             wid = self.created_workspace
+            if "--label" in rest:
+                self.workspace_labels[wid] = rest[rest.index("--label") + 1]
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -1776,6 +1807,63 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         create = herdr.workspace_creates[0]
         self.assertEqual(create[create.index("--label") + 1], f"{repo.name}_sublanes")
+
+    def test_shared_space_reads_workspace_labels_and_per_project_does_not(self) -> None:
+        # Redmine #14139 F1: the shared path consults `workspace list` (the label
+        # authority); per_project issues no such call (byte-invariant).
+        shared = _Herdr(created_workspace="wS")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, providers=["claude", "codex"], herdr=shared, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertTrue(shared.workspace_lists, "shared_space must read workspace labels")
+
+        per_project = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, providers=["claude", "codex"], herdr=per_project, lane="",
+                coordinator_placement_mode="per_project_space",
+            )
+        self.assertEqual(
+            per_project.workspace_lists, [], "per_project must not read workspace labels"
+        )
+
+    def test_shared_space_fails_closed_on_unlabelled_foreign_pair(self) -> None:
+        # The R1 defect fix: a live foreign per-project coordinator pair in an
+        # UNLABELLED workspace must not be adopted as the shared space — fail closed
+        # with zero workspace create.
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(created_workspace="wS", existing_rows=foreign)
+        # w5 is present but unlabelled (not "coordinators").
+        herdr.workspace_labels = {"w5": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                    coordinator_placement_mode="shared_space",
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+
+    def test_shared_space_adopts_existing_labelled_space(self) -> None:
+        # Idempotent adopt: a foreign coordinator pair in a `coordinators`-labelled
+        # workspace IS the shared space — join it, create nothing.
+        foreign = [
+            {"name": encode_assigned_name("foreignws", "claude", ""), "pane_id": "w5:p1"},
+            {"name": encode_assigned_name("foreignws", "codex", ""), "pane_id": "w5:p2"},
+        ]
+        herdr = _Herdr(existing_rows=foreign)
+        herdr.workspace_labels = {"w5": "coordinators"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, lane="",
+                coordinator_placement_mode="shared_space",
+            )
+        self.assertEqual(herdr.workspace_creates, [], "must adopt, not create")
+        self.assertEqual(result.herdr_workspace_id, "w5")
 
     def test_unknown_placement_mode_fails_closed_before_side_effect(self) -> None:
         # Redmine #14139: an unknown mode string fails closed at the pure entry point,

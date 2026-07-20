@@ -212,6 +212,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _create_workspace,
     _invoke,
     _list_rows,
+    _list_workspace_labels,
     preflight_attest_launcher_capability,
     preflight_attest_store_schema,
     HerdrLauncherIncompatibleError,
@@ -703,8 +704,20 @@ def _prepare_session_locked(
         )
         adopt_locators = [p.locator for p in plans if p.kind == "adopt"]
         if shared_coordinator_space:
+            # The shared coordinators space is identified by its stable LABEL, the
+            # backend-readable authority (Redmine #14139 review j#83383 F1 / Design
+            # Answer j#83385 Decision 1) — never a locator-prefix guess that would
+            # adopt a per-project coordinator window on a mode transition. Read the
+            # live labels ONLY here, so per_project / sublane launches issue no extra
+            # `workspace list` and stay byte-invariant. Unreadable labels fail closed
+            # inside the resolver.
+            workspace_labels = _list_workspace_labels(binary, runner, timeout)
             target_workspace = _shared_coordinator_target(
-                rows, workspace_id, adopt_locators
+                rows,
+                workspace_id,
+                adopt_locators,
+                workspace_labels,
+                SHARED_COORDINATOR_WORKSPACE_LABEL,
             )
         else:
             target_workspace = _launch_target_for_lane(

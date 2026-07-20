@@ -236,10 +236,69 @@ def _launch_target_for_lane(
 SHARED_COORDINATOR_WORKSPACE_LABEL = "coordinators"
 
 
+def _parse_workspace_list(stdout: object) -> Optional[dict]:
+    """``{herdr_workspace_id: label}`` from a herdr ``workspace list`` payload (fail-closed).
+
+    The shared coordinators space (Redmine #14139 ``shared_space``) is identified by
+    its stable ``label`` (Design Answer j#83385 Decision 1: the label is the
+    backend-readable authority, NOT a locator-prefix guess), so a launch that adopts
+    the space must read the live workspace labels. Accepts the herdr envelope shape::
+
+        {"result": {"type": "workspace_list",
+                    "workspaces": [{"workspace_id": "w1", "label": "coordinators"},
+                                   {"workspace_id": "w2", "label": ""}, ...]}}
+
+    and the tolerant variants a bare list of workspace objects / an object carrying
+    the list under ``workspaces`` (mirroring the ``agent list`` tolerance). Each
+    entry contributes ``workspace_id -> label`` (a missing / non-string label is the
+    empty string — present but unlabelled, so it never matches the shared label);
+    an entry with no ``workspace_id`` is skipped. An EMPTY list is a valid readable
+    result (no workspaces) and yields ``{}``. Returns ``None`` — "labels
+    unreadable", which the resolver treats as fail-closed — only when the payload is
+    not JSON or exposes no recognisable workspace container, never a guess. Never
+    raises.
+    """
+    payload = stdout
+    if isinstance(stdout, str):
+        try:
+            payload = json.loads(stdout)
+        except (ValueError, TypeError):
+            return None
+    container = _workspace_list_container(payload)
+    if container is None:
+        return None
+    labels: dict = {}
+    for entry in container:
+        if not isinstance(entry, Mapping):
+            continue
+        workspace_id = _norm(entry.get("workspace_id"))
+        if not workspace_id:
+            continue
+        raw_label = entry.get("label")
+        labels[workspace_id] = raw_label.strip() if isinstance(raw_label, str) else ""
+    return labels
+
+
+def _workspace_list_container(payload: object) -> Optional[list]:
+    """The list of workspace objects inside a decoded ``workspace list`` payload."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, Mapping):
+        candidate = payload.get("workspaces")
+        if isinstance(candidate, list):
+            return candidate
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            return _workspace_list_container(result)
+    return None
+
+
 def _shared_coordinator_target(
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
     adopted_locators: Sequence[str],
+    workspace_labels: Optional[Mapping[str, str]],
+    shared_label: str,
 ) -> str:
     """The shared coordinators herdr workspace the default-lane pair joins (``""`` -> create).
 
@@ -249,31 +308,46 @@ def _shared_coordinator_target(
     a single window (the tmux-era overview). The ``per_project_space`` default is
     unchanged and never reaches here — it keeps :func:`_launch_target_for_lane`.
 
-    The target is picked from the live inventory, in order:
+    The shared space is identified by its **stable label** (``shared_label`` ==
+    :data:`SHARED_COORDINATOR_WORKSPACE_LABEL`), the backend-readable authority
+    (Design Answer j#83385 Decision 1 — R1 review j#83383 F1). A live foreign
+    default-lane workspace is NOT assumed to be the shared space just because it
+    holds a coordinator pair: a ``per_project_space`` coordinator workspace is
+    indistinguishable from the shared one by inventory alone, so R1's prefix-only
+    guess would wrongly ADOPT a per-project window on a mode transition. Resolution,
+    in order:
 
     1. this project's OWN live default-lane slots (plus this run's adopted slots —
        always same-lane, same-project) pin the target. A heal never splits the
-       coordinator gateway/worker pair across workspaces.
-    2. no own pins -> join the herdr workspace ANY OTHER project's live default-
-       lane slots occupy — the shared coordinators space. Unlike the #13380
-       sublane-host resolution this deliberately crosses the mozyo ``workspace``
-       identity boundary (each project's coordinator carries its own project
-       identity, ``mzb1_<project-ws>_<role>_default``), because the SHARED space is
-       exactly the union of every project's coordinator column. This is what makes
-       the second project's launch idempotently ADOPT the space the first created.
-    3. nothing pins one -> ``""``: the caller creates the shared workspace with the
-       stable :data:`SHARED_COORDINATOR_WORKSPACE_LABEL`. A zero-column space cannot
-       linger to be rejoined — herdr auto-closes a workspace with its last pane
-       (#13380) — so the next project simply re-mints it on demand.
+       coordinator gateway/worker pair across workspaces, and it needs no label read
+       (rejoining its own live space).
+    2. no own pins, so a join/create decision is needed and the labels are the
+       authority. ``workspace_labels is None`` (the ``workspace list`` read failed)
+       fails closed — never guess. Among the herdr workspaces that BOTH carry
+       ``shared_label`` AND hold a live default-lane slot (a live, labelled shared
+       column):
+
+       - exactly one -> ADOPT it (idempotent join of the space an earlier project
+         created; this is what crosses the mozyo ``workspace`` identity boundary
+         safely, now gated on the label);
+       - more than one -> fail closed (ambiguous shared space);
+
+    3. no labelled live candidate:
+
+       - but foreign default-lane pairs ARE live (in un/differently-labelled
+         per-project workspaces) -> fail closed. This is the mode-transition guard:
+         refuse to silently promote a per-project coordinator window to the shared
+         space (Decision 1: no implicit promotion / relabel);
+       - otherwise (no foreign coordinator pair live at all) -> ``""``: the caller
+         creates the shared workspace with ``shared_label``. herdr auto-closes a
+         zero-pane workspace (#13380), so a stale label never lingers.
 
     Only default-lane (coordinator) slots are ever consulted: a sublane slot never
-    pins the coordinators space (its placement is the untouched #13380/#13411
-    axis). Raises when the own pins, or the sibling coordinator columns, span more
-    than one herdr workspace: refusing to guess which one the launches belong to
-    (the #13330 fail-closed posture).
+    pins the coordinators space (its placement is the untouched #13380/#13411 axis).
+    Own pins spanning more than one herdr workspace fail closed (identity conflict).
     """
     own = [loc for loc in adopted_locators if loc]
-    siblings: list = []
+    foreign_by_workspace: dict = {}
     for row in rows:
         if not isinstance(row, Mapping):
             continue
@@ -288,7 +362,9 @@ def _shared_coordinator_target(
         if decode.identity.workspace_id == workspace_id:
             own.append(locator)
         else:
-            siblings.append(locator)
+            prefix = _workspace_prefix(locator)
+            if prefix:
+                foreign_by_workspace.setdefault(prefix, True)
     own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
     if len(own_prefixes) > 1:
         raise HerdrSessionStartError(
@@ -297,15 +373,40 @@ def _shared_coordinator_target(
             "belong to"
         )
     if own_prefixes:
+        # A heal / adopt rejoins this project's own live shared column — no label
+        # read needed (own identity pins it).
         return next(iter(own_prefixes))
-    sibling_prefixes = {p for p in (_workspace_prefix(loc) for loc in siblings) if p}
-    if len(sibling_prefixes) > 1:
+
+    if workspace_labels is None:
         raise HerdrSessionStartError(
-            f"live coordinator columns span multiple herdr workspaces "
-            f"{sorted(sibling_prefixes)!r}; refuse to guess which one is the shared "
-            "coordinators space"
+            "shared coordinators workspace labels are unreadable (herdr workspace list "
+            f"returned no recognisable payload); refuse to guess the shared space for "
+            f"workspace {workspace_id!r}"
         )
-    return next(iter(sibling_prefixes)) if sibling_prefixes else ""
+    # Sorted for a deterministic, inventory-iteration-independent decision
+    # (Design Answer j#83385 Decision 2).
+    labelled_candidates = sorted(
+        ws
+        for ws in foreign_by_workspace
+        if _norm(workspace_labels.get(ws)) == shared_label
+    )
+    if len(labelled_candidates) > 1:
+        raise HerdrSessionStartError(
+            f"multiple live herdr workspaces carry the shared coordinators label "
+            f"{shared_label!r} ({labelled_candidates!r}); refuse to guess which one is "
+            "the shared space"
+        )
+    if labelled_candidates:
+        return labelled_candidates[0]
+    if foreign_by_workspace:
+        raise HerdrSessionStartError(
+            "shared_space launch found live coordinator pairs but none in a workspace "
+            f"labelled {shared_label!r} "
+            f"({sorted(foreign_by_workspace)!r}); refuse to promote a per-project "
+            "coordinator workspace to the shared space (retire the per-project pairs, "
+            "or launch into an existing shared space)"
+        )
+    return ""
 
 
 def _lane_live_slot_tabs(
@@ -784,6 +885,7 @@ __all__ = (
     "_parse_started_agent",
     "_parse_tab_created",
     "_parse_workspace_created",
+    "_parse_workspace_list",
     "_tab_id_of_row",
     "_tab_target_for_lane",
     "_workspace_prefix",

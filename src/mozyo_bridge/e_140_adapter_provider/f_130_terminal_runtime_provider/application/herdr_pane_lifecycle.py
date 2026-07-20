@@ -39,6 +39,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
     _parse_tab_created,
     _parse_workspace_created,
+    _parse_workspace_list,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     MOZYO_BRIDGE_LAUNCHER_ENV,
@@ -264,6 +265,23 @@ def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[
             "herdr agent list payload was not a recognised JSON array or agents object"
         )
     return rows
+
+
+def _list_workspace_labels(
+    binary: str, runner: Runner, timeout: float
+) -> Optional[Mapping[str, str]]:
+    """Run herdr ``workspace list`` and return ``{workspace_id: label}`` (or ``None``).
+
+    The backend-readable label authority for the shared coordinators space
+    (Redmine #14139 ``shared_space``, Design Answer j#83385 Decision 1). Called ONLY
+    on the shared-space default-lane path, so ``per_project_space`` and every
+    sublane launch never issue this extra command and stay byte-for-byte the
+    pre-#14139 choreography. Returns ``None`` — "labels unreadable" — when the
+    payload is not a recognisable ``workspace list`` shape, which the resolver
+    treats as fail-closed (never a guessed shared space).
+    """
+    completed = _invoke(binary, ["workspace", "list"], runner, timeout, env=None)
+    return _parse_workspace_list(completed.stdout)
 
 
 def _create_workspace(

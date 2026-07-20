@@ -111,7 +111,21 @@ class CoordinatorPlacementConfig:
 
     def __post_init__(self) -> None:
         # Validate on construction too, so a directly-built config is checked as
-        # thoroughly as one parsed from a record (no dataclass back door).
+        # thoroughly as one parsed from a record (no dataclass back door — review
+        # j#83383 F3 / Design Answer j#83385 Decision 3: a direct
+        # ``CoordinatorPlacementConfig(version=2)`` must fail closed exactly like a
+        # record carrying that version, so both the version and the mode are checked
+        # here, not only in ``from_record``).
+        if isinstance(self.version, bool) or not isinstance(self.version, int):
+            raise CoordinatorPlacementError(
+                f"operator coordinator placement 'version' must be an integer, got "
+                f"{self.version!r}"
+            )
+        if self.version != COORDINATOR_PLACEMENT_CONFIG_VERSION:
+            raise CoordinatorPlacementError(
+                f"unsupported operator coordinator placement version {self.version!r}; "
+                f"this build understands version {COORDINATOR_PLACEMENT_CONFIG_VERSION}"
+            )
         if self.mode not in COORDINATOR_PLACEMENT_MODES:
             raise CoordinatorPlacementError(
                 f"operator coordinator placement 'mode' must be one of "

@@ -62,6 +62,42 @@ class CoordinatorPlacementLoadError(CoordinatorPlacementError):
     """
 
 
+class _NoDuplicateKeyLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` that fails closed on a duplicate mapping key.
+
+    Redmine #14139 review j#83383 F3 / Design Answer j#83385 Decision 3: plain
+    ``yaml.safe_load`` accepts a duplicate key and silently keeps the *last* value
+    (``mode: per_project_space`` then ``mode: shared_space`` -> ``shared_space``),
+    so a *conflicting* config value is not fail-closed as Required work 2 demands.
+    This loader overrides mapping construction to raise
+    :class:`CoordinatorPlacementLoadError` the moment a key repeats, so an ambiguous
+    operator file is rejected rather than resolved by declaration order. The error
+    is a :class:`CoordinatorPlacementError` (not a ``yaml.YAMLError``), so it
+    propagates out of construction unchanged and the call site's single
+    ``except CoordinatorPlacementError`` catches it.
+    """
+
+
+def _construct_mapping_no_duplicates(
+    loader: "_NoDuplicateKeyLoader", node: "yaml.MappingNode", deep: bool = False
+) -> dict:
+    mapping: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise CoordinatorPlacementLoadError(
+                f"operator coordinator placement file has a duplicate key {key!r}; a "
+                "conflicting value is rejected rather than resolved by declaration order"
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_NoDuplicateKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping_no_duplicates
+)
+
+
 def coordinator_placement_path(home: Union[str, Path, None] = None) -> Path:
     """Resolve the absolute path of the operator placement file under ``home``.
 
@@ -101,9 +137,10 @@ def load_coordinator_placement_from_path(
       non-UTF-8 file) is re-raised as :class:`CoordinatorPlacementLoadError`, so a
       *present* file that cannot be read fails closed rather than silently
       defaulting;
-    - the text is parsed with ``yaml.safe_load`` only; a malformed document is
-      re-raised as :class:`CoordinatorPlacementLoadError` — never a bare
-      ``yaml.YAMLError``;
+    - the text is parsed with the safe, **duplicate-key-rejecting** loader only
+      (never ``yaml.load`` / ``yaml.full_load``); a malformed document is re-raised
+      as :class:`CoordinatorPlacementLoadError` — never a bare ``yaml.YAMLError`` —
+      and a duplicate key fails closed (Design Answer j#83385 Decision 3);
     - an empty document (``yaml.safe_load`` -> ``None``) resolves to the default;
     - any other parsed value is handed to
       :meth:`CoordinatorPlacementConfig.from_record`, which fails closed on a
@@ -122,7 +159,7 @@ def load_coordinator_placement_from_path(
         ) from exc
 
     try:
-        parsed = yaml.safe_load(text)
+        parsed = yaml.load(text, Loader=_NoDuplicateKeyLoader)
     except yaml.YAMLError as exc:
         raise CoordinatorPlacementLoadError(
             f"could not parse operator coordinator placement file {path} as YAML: {exc}"
