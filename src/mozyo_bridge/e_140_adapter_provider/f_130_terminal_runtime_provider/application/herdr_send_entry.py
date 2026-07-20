@@ -21,7 +21,10 @@ Fail-closed: an un-attested sender identity, an unavailable herdr binary / inven
 or a receiver that does not resolve to a single live agent raises
 :class:`HerdrSendEntryError`; the caller emits a structured ``blocked`` /
 ``target_unavailable`` outcome and ``die``s — never a silent tmux fallback, never a send
-to a guessed target.
+to a guessed target. One case projects differently (Redmine #13884): an explicit
+``--target`` that names a different agent than the resolved route raises
+:class:`HerdrExplicitTargetMismatchError` and projects onto ``blocked`` / ``invalid_args``
+(an inconsistent argument, not an unavailable window) — still a zero-send.
 """
 
 from __future__ import annotations
@@ -422,12 +425,13 @@ def resolve_herdr_send_target(
     # on that wrong agent, and it reported a false-positive `sent` (a sender echo). Cross-check
     # the explicit target against the resolved identity: a `--target` that agrees with the
     # derived route (same live locator or same durable assigned name) passes through unchanged
-    # (resolve-to-exact); a MISMATCH fails closed with a typed zero-send reason instead of a
-    # coordinator / sender-lane fallback (the `orchestrate_handoff` herdr branch projects this
-    # raise onto a `blocked` / `target_unavailable` outcome, `target=None`, no injection). The
-    # locator stays evidence, never the authority — the pin (`--target-lane`), not the
-    # locator, is what resolves the intended target; this guard only refuses to send when the
-    # named target and the resolved target disagree.
+    # (resolve-to-exact); a MISMATCH raises :class:`HerdrExplicitTargetMismatchError`, which the
+    # `orchestrate_handoff` herdr branch projects onto a zero-send `blocked` / `invalid_args`
+    # outcome (`target=None`, no injection — an inconsistent `--target` argument, not an
+    # unavailable window; see EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON), never a coordinator /
+    # sender-lane fallback. The locator stays evidence, never the authority — the pin
+    # (`--target-lane`), not the locator, is what resolves the intended target; this guard only
+    # refuses to send when the named target and the resolved target disagree.
     if norm_target and norm_target != RECEIVER_COORDINATOR and norm_target not in AGENT_PROVIDERS:
         if norm_target not in (_norm(resolution.locator), _norm(resolution.assigned_name)):
             raise HerdrExplicitTargetMismatchError(
