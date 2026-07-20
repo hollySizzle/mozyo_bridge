@@ -1645,9 +1645,10 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
         self.assertFalse(fp.dirty)
         self.assertFalse(fp.untracked)
 
-    def test_dirty_repo_reports_dirty_and_untracked(self) -> None:
-        # -z porcelain: NUL-separated `XY SP path` records.
-        status = b" M src/foo.py\x00?? bar.txt\x00"
+    def test_dirty_repo_reports_dirty(self) -> None:
+        # -z porcelain: NUL-separated `XY SP path` records. Tracked-only (an untracked path
+        # would need a real file to content-hash — covered by the real-git tests).
+        status = b" M src/foo.py\x00 M src/bar.py\x00"
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
             side_effect=_worktree_calls(status, b"diff-body"),
@@ -1655,7 +1656,7 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
             fp = self._ops().read_worktree_mutation()
         self.assertTrue(fp.readable)
         self.assertTrue(fp.dirty)
-        self.assertTrue(fp.untracked)
+        self.assertFalse(fp.untracked)
         self.assertTrue(fp.digest)
 
     def test_status_error_is_unreadable_not_clean(self) -> None:
@@ -1838,6 +1839,79 @@ class LiveHibernateWorktreeRealGitTest(unittest.TestCase):
             spaced.write_text("y")  # same size, different content
             fp2 = ops.read_worktree_mutation()
             self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_untracked_symlink_retarget_flips_digest(self) -> None:
+        # F1 R4 (review j#83805): an untracked symlink retargeted to a DIFFERENT but
+        # SAME-CONTENT target must flip the digest — hashing the link's own target bytes
+        # (no-follow), never the followed target's content.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            (Path(tmp) / "a").write_text("SAME")
+            (Path(tmp) / "b").write_text("SAME")
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            os.symlink("a", Path(tmp) / "link")
+            fp1 = ops.read_worktree_mutation()
+            self.assertTrue(fp1.readable)
+            self.assertTrue(fp1.untracked)
+            os.remove(Path(tmp) / "link")
+            os.symlink("b", Path(tmp) / "link")
+            fp2 = ops.read_worktree_mutation()
+            self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_untracked_dangling_symlink_retarget_flips_digest(self) -> None:
+        # F1 R4: two dangling symlinks (nonexistent targets) must still be distinguished by
+        # their target bytes — never both collapsed to a MISSING marker.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            os.symlink("ghost-1", Path(tmp) / "link")
+            fp1 = ops.read_worktree_mutation()
+            os.remove(Path(tmp) / "link")
+            os.symlink("ghost-2", Path(tmp) / "link")
+            fp2 = ops.read_worktree_mutation()
+            self.assertTrue(fp1.readable)
+            self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_fifo_hash_fails_closed_without_hanging(self) -> None:
+        # F1 R4: `git status` does not enumerate a FIFO, so one only reaches `_hash_untracked`
+        # via a TOCTOU swap (a path listed as a regular file, then replaced by a FIFO). The
+        # kind-check + O_NONBLOCK must return None (fail closed) WITHOUT blocking — a plain
+        # open(fifo) would hang forever. This test returning at all proves it does not hang.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            _hash_untracked,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkfifo(Path(tmp) / "pipe")
+            self.assertIsNone(_hash_untracked(Path(tmp), b"pipe"))
+
+    def test_directory_hash_fails_closed(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            _hash_untracked,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(Path(tmp) / "sub")
+            self.assertIsNone(_hash_untracked(Path(tmp), b"sub"))
+
+    def test_vanished_untracked_path_fails_closed(self) -> None:
+        # A path listed by `git status` but gone by the time we lstat it (a race) fails closed.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+            _hash_untracked,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(_hash_untracked(Path(tmp), b"gone.py"))
+
+    def test_untracked_over_size_cap_fails_closed(self) -> None:
+        # F1 R4: an untracked file over the per-file byte cap fails closed (never a partial
+        # prefix hash). Patch the cap low so the test writes a small file.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            (Path(tmp) / "big.bin").write_bytes(b"x" * 4096)
+            with mock.patch(f"{_BOUNDARY_MOD}._MAX_UNTRACKED_FILE_BYTES", 1024):
+                fp = LiveSublaneHibernateOps(repo_root=Path(tmp)).read_worktree_mutation()
+            self.assertFalse(fp.readable)
 
 
 # ---------------------------------------------------------------------------

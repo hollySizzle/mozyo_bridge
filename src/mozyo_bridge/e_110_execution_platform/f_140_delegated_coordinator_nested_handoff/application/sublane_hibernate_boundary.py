@@ -19,10 +19,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
+
+#: Redmine #13843 review (j#83805) F1: bound the untracked content fingerprint so it can
+#: never hang or read without limit. A worker's residue is small code; anything past these
+#: caps is anomalous and fails the fingerprint CLOSED (never a silent partial hash).
+_MAX_UNTRACKED_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB per untracked file
+_MAX_UNTRACKED_FILES = 20_000  # total untracked paths hashed
 
 from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleError,
@@ -121,9 +128,13 @@ def read_live_worktree_fingerprint(
     dirty = any(not r.startswith(b"??") for r in records)
     untracked = bool(untracked_paths)
 
-    # Tracked content (binary-safe, external-differ-proof). An unreadable diff -> fail closed.
+    # Tracked content (binary-safe, external-differ-proof). ``--no-ext-diff`` + ``--no-textconv``
+    # pin the output to git's own raw diff, immune to a repo-configured external / textconv diff
+    # driver that could otherwise collapse distinct contents. An unreadable diff -> fail closed.
     diff = _run_git(
-        repo_root, timeout, "diff", "HEAD", "--no-ext-diff", "--binary", text=False
+        repo_root, timeout,
+        "diff", "HEAD", "--no-ext-diff", "--no-textconv", "--binary",
+        text=False,
     )
     if diff is None or diff.returncode != 0:
         return WorktreeMutationFingerprint(readable=False)
@@ -135,10 +146,18 @@ def read_live_worktree_fingerprint(
     digest.update(b"DIFF\0")
     digest.update(diff.stdout or b"")
     digest.update(b"\0UNTRACKED\0")
+    if len(untracked_paths) > _MAX_UNTRACKED_FILES:
+        # Anomalously many untracked paths -> fail closed (never a partially-hashed fingerprint).
+        return WorktreeMutationFingerprint(readable=False)
     for path in sorted(untracked_paths):
+        content = _hash_untracked(repo_root, path)
+        if content is None:
+            # A non-regular kind (symlink swap / FIFO / device), an lstat race, or a
+            # size-cap breach -> fail closed (Redmine #13843 review j#83805 F1).
+            return WorktreeMutationFingerprint(readable=False)
         digest.update(path)
         digest.update(b"\0")
-        digest.update(_hash_untracked(repo_root, path))
+        digest.update(content)
         digest.update(b"\0")
     return WorktreeMutationFingerprint(
         readable=True, dirty=dirty, untracked=untracked, digest=digest.hexdigest()
@@ -175,22 +194,65 @@ def _parse_porcelain_z(raw: bytes) -> tuple[list[bytes], list[bytes]]:
     return records, untracked
 
 
-def _hash_untracked(repo_root: Path, path: bytes) -> bytes:
-    """A SHA-256 of an untracked file's bytes, or a typed marker (Redmine #13843 review F1).
+def _hash_untracked(repo_root: Path, path: bytes) -> Optional[bytes]:
+    """A path-kind-aware, no-follow, bounded content hash of an untracked path (#13843 F1 R4).
 
-    A content hash (not a stat) so a same-size / same-mtime rewrite of an already-untracked
-    file still flips the fingerprint. Only non-ignored untracked files reach here (``git
-    status`` omits ignored paths), so the read is bounded to real residue. An unreadable path
-    (a directory / dangling / permission) contributes a stable ``MISSING`` marker.
+    Returns the content digest bytes, or ``None`` to fail the WHOLE fingerprint closed (the
+    caller then returns an unreadable fingerprint). A content hash (not a ``(size, mtime)``
+    stat) so a same-size / mtime-restored rewrite still flips the fingerprint.
+
+    Redmine #13843 review j#83805 F1 hardening:
+
+    - **symlink** — hashed by its OWN target *bytes* (``lstat`` + ``readlink``), NOT the
+      followed target's content: a retarget (even to a same-content or dangling target) flips
+      the digest, and a dangling link never reads a target.
+    - **regular file** — opened ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK`` and re-confirmed regular
+      via ``fstat`` (a TOCTOU swap to a symlink / FIFO between ``lstat`` and ``open`` fails the
+      open or the re-check), then read up to :data:`_MAX_UNTRACKED_FILE_BYTES` — a larger file
+      fails closed rather than hashing a prefix.
+    - **any other kind** (FIFO / device / socket / directory) — ``None`` (fail closed): a FIFO
+      would otherwise BLOCK ``open`` indefinitely (outside git's timeout), and a device / socket
+      has no bounded content.
+    - an ``lstat`` failure (a path that vanished / became unreadable since ``git status`` — a
+      race) — ``None`` (fail closed).
     """
+    full = repo_root / os.fsdecode(path)
     try:
-        with open(repo_root / os.fsdecode(path), "rb") as handle:
-            file_digest = hashlib.sha256()
-            for chunk in iter(lambda: handle.read(65536), b""):
-                file_digest.update(chunk)
-            return file_digest.digest()
+        info = os.lstat(full)  # NO-follow: classify the path itself, never its target.
     except OSError:
-        return b"MISSING"
+        return None  # race / permission -> fail closed
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            target = os.readlink(full)
+        except OSError:
+            return None
+        return hashlib.sha256(b"SYMLINK\0" + os.fsencode(target)).digest()
+    if not stat.S_ISREG(info.st_mode):
+        return None  # FIFO / device / socket / dir -> fail closed (never open)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(full, flags)
+    except OSError:
+        return None  # a swap to a symlink (ELOOP) / FIFO / vanished path -> fail closed
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None  # a swap to a non-regular kind after lstat -> fail closed
+        file_digest = hashlib.sha256(b"FILE\0")
+        total = 0
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return None  # e.g. EAGAIN on a non-blocking special file -> fail closed
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_UNTRACKED_FILE_BYTES:
+                return None  # over the per-file cap -> fail closed
+            file_digest.update(chunk)
+        return file_digest.digest()
+    finally:
+        os.close(fd)
 
 
 def _run_git(
