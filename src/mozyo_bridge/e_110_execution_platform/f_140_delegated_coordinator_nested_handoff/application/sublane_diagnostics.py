@@ -161,6 +161,46 @@ def cmd_sublane_readiness(args: argparse.Namespace) -> int:
 PROGRESS_DERIVED = "derived_dispatch_anchored"
 PROGRESS_ASSERTED = "asserted_unanchored"
 
+#: The actuating sweep found the callback-sweep lease store inconsistent (Redmine #13951). The
+#: sweep zero-sends and PROJECTS this as an actionable typed blocker rather than raising an opaque
+#: error the supervisor/service would swallow as a silent stop.
+CALLBACK_LEASE_INCONSISTENT = "callback_lease_inconsistent"
+
+
+def _callback_lease_blocker(diagnosis, args) -> dict[str, Any]:
+    """Build the actionable, redaction-safe blocker for an inconsistent lease store (#13951 #3).
+
+    ``diagnosis`` is a :class:`...callback_sweep_lease.LeaseDiagnosis` (already redaction-safe: no
+    owner token, raw row, or absolute path). The result matches the ``callback-recovery`` verdict
+    shape so the same text/JSON formatter and non-zero exit apply — the operator sees the typed
+    state, the zero-send invariant, and the exact public recovery rail, never a stack trace.
+    """
+    return {
+        "state": CALLBACK_LEASE_INCONSISTENT,
+        "is_stall": True,
+        "dispatch_delivered": bool(getattr(args, "dispatch_delivered", False)),
+        "new_durable_progress": False,
+        "callback": getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
+        "stale_cli": bool(getattr(args, "stale_cli", False)),
+        "summary": (
+            f"the callback-sweep attempt lease store is inconsistent ({diagnosis.state}: "
+            f"{diagnosis.reason}); the sweep zero-sent rather than run unserialized, and this is an "
+            "actionable operator blocker — the supervisor/service must project it, not silent-stop"
+        ),
+        "recovery": [
+            "inspect: `mozyo-bridge workflow callback-lease` (typed status + artifact fingerprint)",
+            "dry-run: `mozyo-bridge workflow callback-lease --recover` (writes nothing)",
+            "actuate: `mozyo-bridge workflow callback-lease --recover --apply --expect-fingerprint "
+            "<token>` ONLY after confirming no sweep is mid-attempt (it invalidates every grant)",
+        ],
+        "invariants": [
+            "zero-send: no callback was delivered while the lease store is inconsistent",
+            f"recoverable={diagnosis.recoverable} has_live_owner={diagnosis.has_live_owner}",
+        ],
+        "progress_provenance": PROGRESS_DERIVED,
+        "callback_lease_diagnosis": diagnosis.as_dict(),
+    }
+
 
 def _snapshot_source(args: argparse.Namespace) -> MappingRedmineJournalSource:
     payload = json.loads(Path(str(args.journals_json)).read_text(encoding="utf-8"))
@@ -299,8 +339,17 @@ def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
         )
     # The lease store is identity-pinned and never auto-creates (R6-F2), so the composition root
     # bootstraps it explicitly; a store LOSS then fails closed instead of minting a duplicate lease.
+    # #13951 #3: a fail-closed store must PROJECT as an actionable typed blocker, not raise an opaque
+    # error the supervisor/service swallows as a silent stop. Diagnose it (read-only) and return the
+    # zero-send blocker naming the public recovery rail — do NOT auto-recover here (a silent
+    # re-create would hand a second live owner the same anchor).
+    from mozyo_bridge.core.state.callback_sweep_lease import CallbackSweepLeaseError
+
     lease = CallbackSweepLease(home=None)
-    lease.bootstrap()
+    try:
+        lease.bootstrap()
+    except CallbackSweepLeaseError:
+        return _callback_lease_blocker(lease.diagnose(), args)
     # The publication authority (j#80383 option (d)). Ordinary execute must NEVER bootstrap it:
     # bootstrap's both-absent branch re-mints the store, and a re-minted store forgets the
     # reservation a suspended sweep still holds -- the same store-wide reclaim that `recover()`

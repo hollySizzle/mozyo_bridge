@@ -31,6 +31,7 @@ native way its contract supports. Neither is asked to do the other's job.
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import sqlite3
 import time
@@ -51,6 +52,58 @@ LEASE_ACQUIRED = "acquired"
 LEASE_HELD = "held"
 #: A previous owner's lease passed its deadline and was reclaimed by this caller.
 LEASE_RECLAIMED = "reclaimed"
+
+# --- Diagnosis states (Redmine #13951) ---------------------------------------
+# A read-only classification of the store's DB/sidecar pair, used by the operator status surface and
+# the recovery gate. Every state names exactly ONE of: healthy, a clean loss that recovery may mint
+# past, or a state recovery must NOT touch (a live owner, or an unreadable store that could still
+# hold one). The values are the public, redaction-safe vocabulary — no owner token, no absolute
+# path, no raw row is ever part of a diagnosis.
+
+#: DB + sidecar co-exist at the same nonce AND schema version. Nothing to recover.
+LEASE_HEALTHY = "healthy"
+#: Neither the DB nor the sidecar exists: never bootstrapped. Use ``bootstrap()``, not recovery.
+LEASE_ABSENT = "absent"
+#: The sidecar remains but the DB is gone. A clean loss: no DB means no readable owner row.
+LEASE_MISSING_DB = "missing_db"
+#: The DB remains but the sidecar is gone. The DB may still hold a live owner row, so this is only
+#: recoverable when the DB reads clean AND holds no live lease.
+LEASE_MISSING_SIDECAR = "missing_sidecar"
+#: Both exist but the DB nonce (or schema version) disagrees with the sidecar: a replaced / foreign
+#: store. A grant issued under the DB nonce cannot pass an owner's ``store_nonce`` check, so no row
+#: is a send-capable owner; a clean loss recovery may mint past it.
+LEASE_NONCE_MISMATCH = "nonce_mismatch"
+#: The DB file exists but cannot be read (corrupt). Recovery must NOT mint past it: an unreadable
+#: store could hold a live owner we cannot see. Restore from backup, do not re-create.
+LEASE_UNREADABLE = "unreadable"
+
+# --- Recovery outcomes (Redmine #13951) --------------------------------------
+# The result vocabulary of :meth:`CallbackSweepLease.recover_guarded`. Exactly ONE status per call,
+# and only ``RECOVERY_APPLIED`` ever writes; every other status is zero-write / zero-send.
+
+#: A fresh store was minted under a new nonce, after the prior artifacts were backed up first.
+RECOVERY_APPLIED = "applied"
+#: Dry-run: the store is a recoverable clean loss and the fingerprint still matches, so an
+#: ``--apply`` would mint. Nothing was written.
+RECOVERY_PLANNED = "planned"
+#: The store is already healthy: recovery is for a LOSS, not a re-mint of a live store. Zero-write.
+RECOVERY_REFUSED_HEALTHY = "refused_healthy"
+#: The store was never bootstrapped. Use ``bootstrap()`` (a first init), not recovery. Zero-write.
+RECOVERY_REFUSED_ABSENT = "refused_absent"
+#: A live lease owner is present (healthy store, or a sidecar-lost DB that still holds a live row).
+#: Re-minting would invalidate that owner's grant and hand its anchor to a second owner. Zero-write.
+RECOVERY_REFUSED_LIVE_OWNER = "refused_live_owner"
+#: The DB is unreadable, so we cannot prove no live owner exists. Restore from backup. Zero-write.
+RECOVERY_REFUSED_UNREADABLE = "refused_unreadable"
+#: The artifacts changed since the diagnosis whose fingerprint the caller asserted: a concurrent
+#: mutation (another process, or a replay against a stale fingerprint). Zero-write.
+RECOVERY_REFUSED_CONCURRENT = "refused_concurrent_mutation"
+#: ``--apply`` was requested without the ``expected_fingerprint`` that binds it to a diagnosis. An
+#: unbound apply cannot detect a concurrent mutation, so it is refused. Zero-write.
+RECOVERY_REFUSED_UNBOUND = "refused_unbound"
+
+#: Backup filename infix for the artifacts recovery preserves before minting a fresh store.
+RECOVERY_BACKUP_INFIX = ".recovery-backup-"
 
 #: How long an attempt may hold the lease before another sweep may reclaim it. Generous relative to
 #: a sweep (a few Redmine round-trips) so a slow-but-live owner is never stolen from; short enough
@@ -121,6 +174,83 @@ class LeaseResult:
     @property
     def owned(self) -> bool:
         return self.status in (LEASE_ACQUIRED, LEASE_RECLAIMED)
+
+
+@dataclass(frozen=True)
+class LeaseDiagnosis:
+    """A read-only, redaction-safe classification of the lease store's DB/sidecar pair (#13951).
+
+    Carries only booleans, counts, a typed ``state`` and an artifact ``fingerprint`` — never an
+    owner token, a raw row, or an absolute path. ``fingerprint`` is the action-generation identity
+    the recovery gate binds to: an ``--apply`` that quotes a fingerprint different from the store's
+    current one is acting on a state that has since changed, and is refused.
+    """
+
+    state: str
+    db_present: bool
+    sidecar_present: bool
+    #: True only when the DB and sidecar nonces (and schema version) agree; meaningless unless both
+    #: artifacts are present and the DB is readable.
+    nonce_matches: bool
+    #: True when the DB opened and its nonce could be read; False for a missing or corrupt DB.
+    readable: bool
+    #: Non-expired lease rows the DB holds. 0 for a missing / unreadable DB.
+    live_lease_count: int
+    #: True when a non-expired row is one an owner could still act on: a healthy store, or a
+    #: sidecar-lost DB (conservatively). A row under a mismatched nonce is NOT send-capable.
+    has_live_owner: bool
+    #: True when :meth:`CallbackSweepLease.recover_guarded` would mint past this state.
+    recoverable: bool
+    fingerprint: str
+    reason: str
+    recovery_action: str
+
+    def as_dict(self) -> dict[str, object]:
+        """The redaction-safe projection for a durable blocker / typed status (no path, no token)."""
+        return {
+            "state": self.state,
+            "db_present": self.db_present,
+            "sidecar_present": self.sidecar_present,
+            "nonce_matches": self.nonce_matches,
+            "readable": self.readable,
+            "live_lease_count": self.live_lease_count,
+            "has_live_owner": self.has_live_owner,
+            "recoverable": self.recoverable,
+            "fingerprint": self.fingerprint,
+            "reason": self.reason,
+            "recovery_action": self.recovery_action,
+        }
+
+
+@dataclass(frozen=True)
+class LeaseRecoveryOutcome:
+    """The outcome of a guarded recovery. Only ``RECOVERY_APPLIED`` ever wrote (#13951)."""
+
+    status: str
+    #: The diagnosis the decision was made on (its fingerprint is the identity that was checked).
+    diagnosis: LeaseDiagnosis
+    #: Basenames (redaction-safe) of the artifacts backed up before a mint; empty unless applied.
+    backups: tuple[str, ...]
+    reason: str
+
+    @property
+    def applied(self) -> bool:
+        return self.status == RECOVERY_APPLIED
+
+    @property
+    def zero_write(self) -> bool:
+        """True for every non-applying outcome — the whole point of the gate."""
+        return self.status != RECOVERY_APPLIED
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "applied": self.applied,
+            "zero_write": self.zero_write,
+            "backups": list(self.backups),
+            "reason": self.reason,
+            "diagnosis": self.diagnosis.as_dict(),
+        }
 
 
 def callback_sweep_lease_path(home: Optional[Path] = None) -> Path:
@@ -237,8 +367,269 @@ class CallbackSweepLease:
         release path is a permanent stall, not a safety property. An operator invokes this after
         confirming no sweep is mid-attempt; every lingering grant is invalidated by the new nonce,
         which is the point.
+
+        This is the low-level, UNCONDITIONAL primitive. The operator-facing recovery is
+        :meth:`recover_guarded`, which backs the artifacts up first, refuses on a live owner / an
+        unreadable store / a concurrent mutation, and binds to a diagnosis fingerprint. This method
+        stays for that guarded path to call once every gate has passed.
         """
         self._create_fresh(secrets.token_hex(16))
+
+    # -- read-only diagnosis + guarded recovery (Redmine #13951) -----------
+
+    def _read_sidecar_bytes(self) -> Optional[bytes]:
+        try:
+            return self.sidecar_path.read_bytes()
+        except OSError:
+            return None
+
+    def fingerprint(self) -> str:
+        """A content-addressed identity over BOTH artifacts — the recovery action-generation token.
+
+        Deterministic in the artifacts' bytes (no clock, no path), so a diagnosis and a later
+        ``--apply`` that quote the same fingerprint prove the store did not change between them. Any
+        write to the DB or the sidecar (a fresh lease, a re-mint, a partial swap) changes it, which
+        is what lets :meth:`recover_guarded` detect a concurrent mutation and zero-write.
+        """
+        digest = hashlib.sha256()
+        sidecar = self._read_sidecar_bytes()
+        digest.update(b"sidecar:")
+        digest.update(b"\x00absent" if sidecar is None else sidecar)
+        digest.update(b"|db:")
+        if self.path.exists():
+            data = self.path.read_bytes()
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(hashlib.sha256(data).digest())
+        else:
+            digest.update(b"\x00absent")
+        return digest.hexdigest()[:32]
+
+    def _probe_db(self, stamp: float) -> tuple[bool, bool, Optional[str], int]:
+        """Read-only probe of an existing DB: ``(readable, version_ok, db_nonce, live_count)``.
+
+        Opened ``mode=ro`` so inspecting the store cannot create, migrate, or otherwise touch it (the
+        same discipline :meth:`is_bootstrapped` keeps). A corrupt DB reads as ``(False, ...)`` — an
+        unreadable store is diagnosed, never assumed empty.
+        """
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        except sqlite3.DatabaseError:
+            return (False, False, None, 0)
+        try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            version_ok = version == CALLBACK_SWEEP_LEASE_SCHEMA_VERSION
+            db_nonce = self._db_nonce(conn)
+            try:
+                live = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM sweep_lease WHERE expires_at > ?", (stamp,)
+                    ).fetchone()[0]
+                )
+            except sqlite3.DatabaseError:
+                # The identity meta may exist without the lease table (a half-written store): a
+                # readable DB with no countable rows, not a corruption.
+                live = 0
+            return (True, version_ok, db_nonce, live)
+        except (sqlite3.DatabaseError, TypeError, ValueError):
+            return (False, False, None, 0)
+        finally:
+            conn.close()
+
+    def diagnose(self, *, now: Optional[float] = None) -> LeaseDiagnosis:
+        """Classify the DB/sidecar pair for the operator status surface and the recovery gate.
+
+        Pure read-only: opens the DB ``mode=ro`` and never writes. Returns a redaction-safe
+        :class:`LeaseDiagnosis` — a typed state, the DB/sidecar presence, nonce agreement, the live
+        lease count, whether a live owner is present, whether recovery may mint past the state, and
+        the artifact ``fingerprint``. No owner token, raw row, or absolute path is exposed.
+        """
+        stamp = float(now if now is not None else time.time())
+        sidecar_nonce = self._read_sidecar_nonce()
+        sidecar_present = sidecar_nonce is not None
+        db_present = self.path.exists()
+        fp = self.fingerprint()
+
+        def build(state, *, readable, nonce_matches, live, has_live_owner, recoverable, reason, action):
+            return LeaseDiagnosis(
+                state=state, db_present=db_present, sidecar_present=sidecar_present,
+                nonce_matches=nonce_matches, readable=readable, live_lease_count=live,
+                has_live_owner=has_live_owner, recoverable=recoverable, fingerprint=fp,
+                reason=reason, recovery_action=action,
+            )
+
+        if not db_present and not sidecar_present:
+            return build(
+                LEASE_ABSENT, readable=False, nonce_matches=False, live=0,
+                has_live_owner=False, recoverable=False,
+                reason="neither the DB nor the sidecar exists (never bootstrapped)",
+                action="run `--bootstrap` (a first init), not recovery",
+            )
+        if sidecar_present and not db_present:
+            # Clean loss: no DB means no readable owner row could exist. Recoverable.
+            return build(
+                LEASE_MISSING_DB, readable=False, nonce_matches=False, live=0,
+                has_live_owner=False, recoverable=True,
+                reason="the sidecar remains but the DB is gone (store loss)",
+                action="recover: backup-first mint past the lost DB",
+            )
+        # DB is present past here.
+        readable, version_ok, db_nonce, live = self._probe_db(stamp)
+        if not readable:
+            return build(
+                LEASE_UNREADABLE, readable=False, nonce_matches=False, live=0,
+                has_live_owner=False, recoverable=False,
+                reason="the DB exists but cannot be read (corrupt); a live owner cannot be ruled out",
+                action="restore the store from backup — do NOT re-create it",
+            )
+        if not sidecar_present:
+            # DB present, sidecar gone: the DB may hold a live owner. Conservatively treat a
+            # non-expired row as a live owner (zero-write); only a clean, ownerless DB is recoverable.
+            has_live = live > 0
+            return build(
+                LEASE_MISSING_SIDECAR, readable=True, nonce_matches=False, live=live,
+                has_live_owner=has_live, recoverable=not has_live,
+                reason=(
+                    "the DB remains but the sidecar is gone; the DB still holds a live lease"
+                    if has_live else
+                    "the DB remains but the sidecar is gone (store loss); no live lease"
+                ),
+                action=(
+                    "wait for the live lease to expire or confirm the owner is gone, then recover"
+                    if has_live else "recover: backup-first mint past the lost sidecar"
+                ),
+            )
+        if not version_ok or db_nonce != sidecar_nonce:
+            # Replaced / foreign store: a grant under this DB nonce fails an owner's store_nonce
+            # check, so no row is a send-capable owner. A clean loss recovery may mint past it.
+            return build(
+                LEASE_NONCE_MISMATCH, readable=True, nonce_matches=False, live=live,
+                has_live_owner=False, recoverable=True,
+                reason=(
+                    "the DB schema version is foreign to this store"
+                    if not version_ok else
+                    "the DB nonce disagrees with the sidecar (replaced / recreated store)"
+                ),
+                action="recover: backup-first mint a fresh identity past the mismatch",
+            )
+        # Healthy: DB + sidecar agree. A non-expired row is a genuine live owner.
+        has_live = live > 0
+        return build(
+            LEASE_HEALTHY, readable=True, nonce_matches=True, live=live,
+            has_live_owner=has_live, recoverable=False,
+            reason=(
+                f"healthy; {live} live lease(s) held" if has_live else "healthy; no live lease"
+            ),
+            action="no recovery needed" if not has_live else (
+                "no recovery: a live owner holds a lease — recovery would strand its anchor"
+            ),
+        )
+
+    def _backup_artifacts(self, recovery_id: str) -> tuple[str, ...]:
+        """Copy the existing DB + sidecar to backup files BEFORE a mint. Idempotent, redaction-safe.
+
+        Returns the backup basenames (never absolute paths). An existing backup for the same
+        recovery id is never clobbered, so a replayed apply reuses it rather than overwriting the
+        forensic copy.
+        """
+        infix = f"{RECOVERY_BACKUP_INFIX}{recovery_id[:16]}"
+        made: list[str] = []
+        for src in (self.path, self.sidecar_path):
+            if src.exists():
+                dst = src.with_name(src.name + infix)
+                if not dst.exists():
+                    dst.write_bytes(src.read_bytes())
+                made.append(dst.name)
+        return tuple(made)
+
+    def recover_guarded(
+        self, *, expected_fingerprint: str = "", apply: bool = False, now: Optional[float] = None,
+    ) -> LeaseRecoveryOutcome:
+        """Operator-gated, backup-first, identity-bound loss recovery (Redmine #13951).
+
+        Default is read-only / dry-run (``apply=False``): it classifies the store and reports what an
+        ``--apply`` WOULD do, writing nothing. Every one of the following is zero-write / zero-send:
+
+        - a **live owner** (a healthy store with a live lease, or a sidecar-lost DB that still holds
+          one) — re-minting would invalidate a live grant and hand its anchor to a second owner;
+        - an **unreadable** DB — a live owner cannot be ruled out, so the store must be restored,
+          not re-created;
+        - a **concurrent mutation** — the artifacts changed since the diagnosis whose
+          ``expected_fingerprint`` the caller quoted (another process, or a replay against a stale
+          fingerprint), so the action no longer matches the state it was authorized for;
+        - an already **healthy** or never-bootstrapped store — recovery is for a loss, not a re-mint.
+
+        Only a clean loss (missing DB, missing sidecar with no live lease, or a nonce/schema
+        mismatch) is minted past, and only under ``apply=True`` with a matching
+        ``expected_fingerprint``: the artifacts are backed up first, the fingerprint is re-checked
+        immediately before the mint (catching a mutation during the backup), and only then is a fresh
+        store created. Replaying an apply is idempotent: once recovered the store is healthy under a
+        new fingerprint, so the stale ``expected_fingerprint`` no longer matches and the replay
+        zero-writes. Recovery never sends a callback — it only mints the store.
+        """
+        expected = str(expected_fingerprint or "").strip()
+        diagnosis = self.diagnose(now=now)
+
+        def outcome(status, reason, backups=()):
+            return LeaseRecoveryOutcome(
+                status=status, diagnosis=diagnosis, backups=tuple(backups), reason=reason,
+            )
+
+        # Identity / action-generation bind + concurrent-mutation gate: if the caller asserted a
+        # fingerprint and the store no longer matches it, the state changed under them — zero-write.
+        if expected and diagnosis.fingerprint != expected:
+            return outcome(
+                RECOVERY_REFUSED_CONCURRENT,
+                "the store changed since the diagnosis this apply was bound to "
+                "(concurrent mutation or a replay against a stale fingerprint); zero-write",
+            )
+        if diagnosis.state == LEASE_HEALTHY:
+            return outcome(
+                RECOVERY_REFUSED_LIVE_OWNER if diagnosis.has_live_owner else RECOVERY_REFUSED_HEALTHY,
+                "a live owner holds a lease; recovery would strand its anchor"
+                if diagnosis.has_live_owner else "the store is already healthy; nothing to recover",
+            )
+        if diagnosis.state == LEASE_ABSENT:
+            return outcome(RECOVERY_REFUSED_ABSENT, "never bootstrapped; run `--bootstrap` instead")
+        if diagnosis.state == LEASE_UNREADABLE:
+            return outcome(
+                RECOVERY_REFUSED_UNREADABLE,
+                "the DB is unreadable; a live owner cannot be ruled out — restore from backup",
+            )
+        if diagnosis.has_live_owner:
+            return outcome(
+                RECOVERY_REFUSED_LIVE_OWNER,
+                "the DB still holds a live lease; wait for expiry or confirm the owner is gone",
+            )
+        # A recoverable clean loss from here (missing DB / sidecar-no-live / nonce mismatch).
+        if not apply:
+            return outcome(
+                RECOVERY_PLANNED,
+                "recoverable clean loss; re-run with `--apply` (and this fingerprint) to mint past it",
+            )
+        if not expected:
+            # An unbound apply cannot detect a concurrent mutation, so it is refused: recovery is
+            # deliberately bound to a diagnosis the operator read.
+            return outcome(
+                RECOVERY_REFUSED_UNBOUND,
+                "an apply must quote the fingerprint from a prior diagnosis so a concurrent "
+                "mutation is detectable; re-run status and pass its fingerprint",
+            )
+        backups = self._backup_artifacts(diagnosis.fingerprint)
+        # Re-check the fingerprint right before the mint: a mutation DURING the backup would
+        # otherwise slip past the entry gate. The backups already written are harmless copies.
+        if self.fingerprint() != diagnosis.fingerprint:
+            return outcome(
+                RECOVERY_REFUSED_CONCURRENT,
+                "the store changed while backing it up (concurrent mutation); zero-write",
+                backups=backups,
+            )
+        self._create_fresh(secrets.token_hex(16))
+        return outcome(
+            RECOVERY_APPLIED,
+            "backed the prior artifacts up and minted a fresh store under a new nonce; every "
+            "outstanding grant is now invalid",
+            backups=backups,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         """Open an EXISTING, identity-matched store, or fail closed (mirrors the outbox fence).
@@ -430,4 +821,23 @@ __all__ = (
     "CallbackSweepLease",
     "callback_sweep_lease_path",
     "CALLBACK_SWEEP_LEASE_SIDECAR_SUFFIX",
+    # Diagnosis (#13951)
+    "LEASE_HEALTHY",
+    "LEASE_ABSENT",
+    "LEASE_MISSING_DB",
+    "LEASE_MISSING_SIDECAR",
+    "LEASE_NONCE_MISMATCH",
+    "LEASE_UNREADABLE",
+    "LeaseDiagnosis",
+    # Guarded recovery (#13951)
+    "RECOVERY_APPLIED",
+    "RECOVERY_PLANNED",
+    "RECOVERY_REFUSED_HEALTHY",
+    "RECOVERY_REFUSED_ABSENT",
+    "RECOVERY_REFUSED_LIVE_OWNER",
+    "RECOVERY_REFUSED_UNREADABLE",
+    "RECOVERY_REFUSED_CONCURRENT",
+    "RECOVERY_REFUSED_UNBOUND",
+    "RECOVERY_BACKUP_INFIX",
+    "LeaseRecoveryOutcome",
 )

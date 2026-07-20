@@ -44,14 +44,17 @@ def register_fence_operator_parsers(workflow_sub) -> None:
     lease_p = workflow_sub.add_parser(
         "callback-lease",
         description=(
-            "Operator surface for the callback-sweep attempt lease (Redmine #13889). "
-            "`--bootstrap` initializes it; `--recover` mints a fresh store after a loss, which "
-            "invalidates every outstanding grant (invoke ONLY after confirming no sweep is "
-            "mid-attempt); no flag reports status. `sublane callback-recovery --execute` never "
+            "Operator surface for the callback-sweep attempt lease (Redmine #13889 / #13951). "
+            "No flag reports a typed read-only status (DB/sidecar pair, nonce, live owner, "
+            "recoverability, artifact fingerprint). `--bootstrap` is a safe first init. `--recover` "
+            "is a DRY-RUN loss recovery; add `--apply --expect-fingerprint <token>` to actuate, "
+            "which backs up the prior artifacts first and mints a fresh store under a new nonce "
+            "(invalidating every outstanding grant). A live owner / an unreadable store / a "
+            "concurrent mutation is zero-write. `sublane callback-recovery --execute` never "
             "auto-creates or auto-recovers the store: a silent re-create would hand a second live "
             "owner the same anchor."
         ),
-        help="Bootstrap / recover / status the callback-sweep attempt lease.",
+        help="Status / bootstrap / gated recover the callback-sweep attempt lease.",
     )
     lease_p.add_argument(
         "--bootstrap", dest="lease_bootstrap", action="store_true",
@@ -59,7 +62,16 @@ def register_fence_operator_parsers(workflow_sub) -> None:
     )
     lease_p.add_argument(
         "--recover", dest="lease_recover", action="store_true",
-        help="Deliberate loss recovery: fresh store under a new nonce (invalidates all grants).",
+        help="Gated loss recovery (DRY-RUN by default; add --apply to actuate).",
+    )
+    lease_p.add_argument(
+        "--apply", dest="lease_apply", action="store_true",
+        help="With --recover: actuate the mint (needs --expect-fingerprint from a prior status).",
+    )
+    lease_p.add_argument(
+        "--expect-fingerprint", dest="lease_expect_fingerprint", metavar="TOKEN", default="",
+        help="Bind --recover --apply to the fingerprint a prior status reported; a mismatch is "
+             "a concurrent mutation and zero-writes.",
     )
     lease_p.set_defaults(func=cmd_workflow_callback_lease)
 
