@@ -73,14 +73,42 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: that omits it addressed no lane and fails closed (the scope is never inferred, j#78386 §6).
 PG_DECL_NO_SCOPE = "no_project_scope"
 #: A live pane resolved for a declared slot SURFACES a ``project_scope`` stamp that disagrees
-#: with the declared scope — a foreign / wrong-stamped-scope process at this lane (a
-#: cross-revision digest alias would present this way when the stamp is observable). Zero-write
-#: (Redmine #13811 T2 R2 F2). When no stamp is surfaced (the raw ``agent list`` row shape), the
-#: full-scope adoption fence is the documented #13583 R2-F2 separate Design Consultation.
+#: with the declared scope — a foreign / wrong-stamped-scope process at this lane. Zero-write
+#: (Redmine #13811 T2 R2 F2). A secondary raw-row check; the primary fence is the route join.
 PG_DECL_SCOPE_STAMP_MISMATCH = "scope_stamp_mismatch"
+#: No live project-gateway was adopt-resolvable for the DECLARED canonical route identity
+#: (repo_root + full project_scope + role), or the declared identity is incomplete (no adopted
+#: project metadata / project_path). The write requires a live gateway whose semantic identity
+#: the discovery resolver matched — missing / unresolvable is owner-unbound zero-write (Redmine
+#: #13811 T2 R3; design #13780 j#78386 §2 action-time full-scope re-verify).
+PG_DECL_ROUTE_UNRESOLVED = "route_identity_unresolved"
+#: A live gateway WAS resolved, but its stamped canonical route identity (repo_root /
+#: project_scope / project_path) does not exactly match the declaration — a foreign project's
+#: gateway, a wrong repo/cwd, or a cross-revision alias-equivalent scope. Zero-write (Redmine
+#: #13811 T2 R3; the 48-bit alias fence design j#78386 §2 folded into #13811).
+PG_DECL_ROUTE_MISMATCH = "route_identity_mismatch"
 #: The dry-run outcome: the live pair resolved and a declaration WOULD apply, but nothing was
 #: written (the default surface). ``--execute`` opts into the actual declaration.
 PG_DECL_DRY_RUN = "dry_run_plan"
+
+
+@dataclass(frozen=True)
+class ObservedGatewayRoute:
+    """The live project-gateway's resolved canonical route identity (Redmine #13811 T2 R3).
+
+    What the semantic discovery resolver (``resolve_launch_or_adopt`` over the live candidate
+    list) observed for the DECLARED identity: the adopted gateway pane's stamped ``repo_root``
+    / ``project_scope`` / ``project_path`` and its live ``locator``. The declaration exact-
+    matches these against the declared canonical identity before writing, so a foreign
+    project's gateway, a wrong repo / cwd, or a cross-revision alias-equivalent scope never
+    binds the owner row. Absent (``None`` at the call site) means no live gateway matched the
+    declared identity — owner-unbound.
+    """
+
+    repo_root: str
+    project_scope: str
+    project_path: str
+    locator: str
 
 
 @dataclass(frozen=True)
@@ -142,6 +170,9 @@ def declare_project_gateway_owner_row(
     workspace_id: str,
     providers: tuple[str, str],
     rows: Sequence[Mapping[str, object]],
+    expected_repo_root: str,
+    expected_project_path: str,
+    observed_route: Optional[ObservedGatewayRoute],
     dry_run: bool = True,
     worktree_identity: str = "",
     attestation_home: Optional[Path] = None,
@@ -156,12 +187,18 @@ def declare_project_gateway_owner_row(
     provider pair, ``rows`` the RAW herdr inventory. ``dry_run`` (default) writes nothing.
 
     **This boundary OWNS the scope -> lane derivation (Redmine #13811 T2 R2 F2).** The lane id
-    is derived here as :func:`project_gateway_lane_id(scope)`, never taken from a caller — so a
-    caller can never write a scope / lane-mismatched row, and the live pair is resolved against
-    THIS scope's derived lane (a foreign-lane process fails closed as an incomplete pair). A
-    cross-revision digest alias (two scopes deriving to one lane) is then bounded by the
-    ``(workspace, lane_id)`` primary key: the second scope's declaration is a divergent
-    re-declare at the same key and is refused (owner conflict), so one scope owns the lane.
+    is derived here as :func:`project_gateway_lane_id(scope)`, never taken from a caller.
+
+    **It also action-time joins the live gateway's canonical ROUTE identity (T2 R3; design
+    #13780 j#78386 §2, which folded the 48-bit alias fence into #13811).** ``expected_repo_root``
+    / ``expected_project_path`` are the DECLARED canonical identity (from the adopted project
+    metadata); ``observed_route`` is what the semantic discovery resolver
+    (``resolve_launch_or_adopt``) matched for that identity — the live adopted gateway's stamped
+    ``repo_root`` / ``project_scope`` / ``project_path``. The declaration REQUIRES a complete
+    declared identity AND a live gateway whose stamped identity EXACTLY matches it; a missing /
+    unresolvable route, an incomplete declared identity, or any repo / scope / path disagreement
+    (a foreign project's gateway, a wrong cwd, a cross-revision alias-equivalent scope) is
+    owner-unbound zero-write — never trusting the caller's raw rows alone.
 
     Returns a :class:`ProjectGatewayDeclarationOutcome`; every refusal is zero-write.
     """
@@ -193,6 +230,33 @@ def declare_project_gateway_owner_row(
         return _fail(PG_DECL_NO_SCOPE, "the project scope does not derive a project-gateway lane")
     if not workspace:
         return _fail(ADOPT_DECL_UNRESOLVED_UNIT, "the project-gateway workspace is unresolved")
+
+    # Action-time route-identity join (T2 R3; design j#78386 §2). The declared canonical
+    # identity must be COMPLETE (an adopted project supplies repo_root + project_path) and a
+    # live gateway must have been semantic-identity resolved for it; then its stamped
+    # repo_root / project_scope / project_path must EXACTLY match. Any gap is owner-unbound.
+    exp_repo = _norm(expected_repo_root)
+    exp_path = _norm(expected_project_path)
+    if not (exp_repo and exp_path):
+        return _fail(
+            PG_DECL_ROUTE_UNRESOLVED,
+            "the declared canonical project identity (repo_root / project_path) is incomplete",
+        )
+    if observed_route is None:
+        return _fail(
+            PG_DECL_ROUTE_UNRESOLVED,
+            "no live project-gateway resolved for the declared canonical identity",
+        )
+    if (
+        _norm(observed_route.repo_root) != exp_repo
+        or _norm(observed_route.project_scope) != scope
+        or _norm(observed_route.project_path) != exp_path
+    ):
+        return _fail(
+            PG_DECL_ROUTE_MISMATCH,
+            "the live gateway's stamped route identity disagrees with the declaration",
+        )
+
     try:
         decision = DecisionPointer(source="redmine", issue_id=issue, journal_id=journal)
     except (DecisionPointerError, ValueError):
@@ -214,11 +278,16 @@ def declare_project_gateway_owner_row(
         # zero-write, the live pair is not the exact declared generation.
         return _fail(reason, "the live pair did not resolve to an exact attested generation")
 
-    # Action-time route-identity join (F2): if a resolved live pane SURFACES its adopted
-    # ``project_scope`` stamp and it disagrees with THIS declaration's scope, a foreign /
-    # wrong-stamped process is at this lane (how a cross-revision digest alias would present
-    # when observable) — fail closed. A raw ``agent list`` row surfaces no stamp, so this is
-    # tolerant there (the unobservable full-scope alias fence is the #13583 R2-F2 consultation).
+    # The adopted gateway the route resolver matched must be ONE of the resolved slots — so the
+    # route join and the slot pins name the same live processes, not two unrelated resolutions.
+    if _norm(observed_route.locator) not in {pin.locator for pin in pins}:
+        return _fail(
+            PG_DECL_ROUTE_MISMATCH,
+            "the resolved live slots do not include the adopted gateway pane",
+        )
+
+    # Secondary raw-row check: a resolved live pane that ALSO surfaces a ``project_scope`` stamp
+    # disagreeing with the declaration fails closed (belt-and-suspenders to the route join).
     declared_names = {pin.assigned_name for pin in pins}
     for row in rows:
         if not isinstance(row, Mapping):
@@ -290,6 +359,10 @@ def declare_project_gateway_owner_row(
 __all__ = (
     "PG_DECL_DRY_RUN",
     "PG_DECL_NO_SCOPE",
+    "PG_DECL_ROUTE_MISMATCH",
+    "PG_DECL_ROUTE_UNRESOLVED",
+    "PG_DECL_SCOPE_STAMP_MISMATCH",
+    "ObservedGatewayRoute",
     "ProjectGatewayDeclarationOutcome",
     "declare_project_gateway_owner_row",
 )

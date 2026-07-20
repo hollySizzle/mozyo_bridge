@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.project_gateway_declaration import (  # noqa: E501
+    ObservedGatewayRoute,
     ProjectGatewayDeclarationOutcome,
     declare_project_gateway_owner_row,
 )
@@ -48,6 +49,10 @@ class ProjectGatewayDeclareOps(Protocol):
     def read_inventory(self) -> tuple[Sequence[Mapping[str, object]], bool]: ...
 
     def providers(self) -> tuple[str, str]: ...
+
+    def resolve_route(
+        self, project_scope: str
+    ) -> tuple[str, str, Optional[ObservedGatewayRoute]]: ...
 
 
 @dataclass
@@ -91,6 +96,44 @@ class LiveProjectGatewayDeclareOps:
             return (resolve_gateway_provider(root), resolve_worker_provider(root))
         except WorkflowProviderUnresolved:
             return ("", "")
+
+    def resolve_route(
+        self, project_scope: str
+    ) -> tuple[str, str, Optional[ObservedGatewayRoute]]:
+        """``(declared_repo_root, declared_project_path, observed_route)`` (Redmine #13811 R3).
+
+        Resolves the DECLARED canonical identity from the adopted project metadata
+        (:func:`_gateway_identity`) and the OBSERVED live gateway by SEMANTIC identity over the
+        live candidate list (:func:`resolve_launch_or_adopt`) — an ``adopt`` decision means a
+        live pane matched ``repo_root + project_scope + role``, so a foreign / alias-equivalent
+        pane never resolves. ``observed_route`` is that adopted pane's stamped identity, or
+        ``None`` when no live gateway matched (launch / blocked / discovery error) — the
+        declaration then fails closed owner-unbound.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway import (  # noqa: E501
+            _discover_candidates,
+            _gateway_identity,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (  # noqa: E501
+            ACTION_ADOPT,
+            resolve_launch_or_adopt,
+        )
+
+        try:
+            identity = _gateway_identity(str(self.repo_root), project_scope)
+            decision = resolve_launch_or_adopt(_discover_candidates(), identity)
+        except Exception:  # noqa: BLE001 — discovery / resolution unreadable -> owner-unbound
+            return ("", "", None)
+        observed: Optional[ObservedGatewayRoute] = None
+        if decision.action == ACTION_ADOPT and decision.adopted is not None:
+            cand = decision.adopted
+            observed = ObservedGatewayRoute(
+                repo_root=cand.repo_root,
+                project_scope=cand.project_scope,
+                project_path=cand.project_path,
+                locator=cand.pane_id,
+            )
+        return (identity.repo_root, identity.project_path, observed)
 
 
 @dataclass(frozen=True)
@@ -147,6 +190,10 @@ class ProjectGatewayDeclareUseCase:
                 execute,
                 "gateway / worker provider binding unresolved; zero-write",
             )
+        # Resolve the DECLARED canonical identity + the OBSERVED live gateway route (R3). The
+        # declaration verifies they exactly match before writing; an unresolved / mismatched
+        # route is owner-unbound zero-write.
+        expected_repo_root, expected_project_path, observed_route = self.ops.resolve_route(scope)
         kwargs: dict[str, Any] = {}
         if self.store_factory is not None:
             kwargs["store_factory"] = self.store_factory
@@ -159,6 +206,9 @@ class ProjectGatewayDeclareUseCase:
             workspace_id=workspace_id,
             providers=(gateway_provider, worker_provider),
             rows=rows,
+            expected_repo_root=expected_repo_root,
+            expected_project_path=expected_project_path,
+            observed_route=observed_route,
             dry_run=not execute,
             worktree_identity=request.worktree_identity,
             **kwargs,

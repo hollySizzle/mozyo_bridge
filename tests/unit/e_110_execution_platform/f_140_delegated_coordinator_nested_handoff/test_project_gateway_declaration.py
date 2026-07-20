@@ -38,7 +38,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.project_gateway_declaration import (  # noqa: E501
     PG_DECL_DRY_RUN,
     PG_DECL_NO_SCOPE,
+    PG_DECL_ROUTE_MISMATCH,
+    PG_DECL_ROUTE_UNRESOLVED,
     PG_DECL_SCOPE_STAMP_MISMATCH,
+    ObservedGatewayRoute,
     declare_project_gateway_owner_row,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
@@ -70,6 +73,14 @@ GW_NAME = encode_assigned_name(WS, "codex", LANE)
 WK_NAME = encode_assigned_name(WS, "claude", LANE)
 GW_LOC = "wProj:p2"
 WK_LOC = "wProj:p3"
+REPO = "/repo/cloud-drive"
+PPATH = "/repo/cloud-drive/project"
+
+
+def _route(scope=SCOPE, repo=REPO, path=PPATH, locator=GW_LOC) -> ObservedGatewayRoute:
+    return ObservedGatewayRoute(
+        repo_root=repo, project_scope=scope, project_path=path, locator=locator
+    )
 
 
 def _row(name: str, locator: str, **extra) -> dict:
@@ -104,12 +115,18 @@ def _seed_attestations_for(home, gw_name, wk_name, lane, gw_loc=GW_LOC, wk_loc=W
         locator=wk_loc, verdict=VERDICT_PRESENT))
 
 
+_UNSET = object()
+
+
 def _declare(tmp, *, rows=None, scope=SCOPE, dry_run, seed_att=True,
              providers=("codex", "claude"), issue=ISSUE, journal=JOURNAL,
-             workspace_id=WS, gw_loc=GW_LOC, wk_loc=WK_LOC):
+             workspace_id=WS, gw_loc=GW_LOC, wk_loc=WK_LOC,
+             expected_repo_root=REPO, expected_project_path=PPATH, observed_route=_UNSET):
     home = Path(tmp)
     if seed_att:
         _seed_attestations(home, gw_loc=gw_loc, wk_loc=wk_loc)
+    # Default to a live gateway route that exactly matches the declaration (the happy join).
+    route = _route(scope=scope) if observed_route is _UNSET else observed_route
     return declare_project_gateway_owner_row(
         journal=journal,
         issue=issue,
@@ -117,6 +134,9 @@ def _declare(tmp, *, rows=None, scope=SCOPE, dry_run, seed_att=True,
         workspace_id=workspace_id,
         providers=providers,
         rows=_pair_rows() if rows is None else rows,
+        expected_repo_root=expected_repo_root,
+        expected_project_path=expected_project_path,
+        observed_route=route,
         dry_run=dry_run,
         store_factory=lambda: LaneDeclarationStore(home=home),
         attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=home),
@@ -227,6 +247,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             o = declare_project_gateway_owner_row(
                 journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=_pair_rows(),
+                expected_repo_root=REPO, expected_project_path=PPATH, observed_route=_route(),
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=home),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=home))
             self.assertEqual(o.status, ADOPT_DECL_UNATTESTED)
@@ -309,6 +330,52 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             o = _declare(tmp, dry_run=False, rows=rows)
             self.assertEqual(o.status, ADOPT_DECL_DECLARED)
 
+    # --- R3: action-time route-identity join --------------------------------------
+    def test_no_live_gateway_route_fails_closed(self) -> None:
+        # Redmine #13811 T2 R3: no live gateway was semantic-identity resolved for the declared
+        # identity (observed_route is None) -> owner-unbound zero-write.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=False, observed_route=None)
+            self.assertEqual(o.status, PG_DECL_ROUTE_UNRESOLVED)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_incomplete_declared_identity_fails_closed(self) -> None:
+        # The declared canonical identity is incomplete (project not adopted -> no project_path)
+        # -> cannot bind the owner row.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=False, expected_project_path="")
+            self.assertEqual(o.status, PG_DECL_ROUTE_UNRESOLVED)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_route_wrong_repo_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=False, observed_route=_route(repo="/other/repo"))
+            self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_route_wrong_project_path_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=False, observed_route=_route(path="/other/cwd"))
+            self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_route_alias_equivalent_scope_fails_closed(self) -> None:
+        # A live gateway stamped a DIFFERENT project_scope (an alias-equivalent scope that
+        # derived to the same lane) -> the route join rejects it, even for a rowless first
+        # declaration (the primary-key argument does not apply when no row exists yet).
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=False, observed_route=_route(scope="foreign/aliased/scope"))
+            self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_route_gateway_not_among_resolved_slots_fails_closed(self) -> None:
+        # The adopted gateway's locator is not one of the resolved slot locators -> the route
+        # join and the slot pins named different processes.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=False, observed_route=_route(locator="wProj:p99"))
+            self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
     def test_scope_lane_mismatch_foreign_lane_rows_fail_closed(self) -> None:
         # Redmine #13811 T2 R2 F2: the caller cannot write a scope/lane-mismatched row — the
         # lane is derived from the scope inside the boundary. Live rows that belong to a
@@ -342,6 +409,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             o = declare_project_gateway_owner_row(
                 journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=rows,
+                expected_repo_root=REPO, expected_project_path=PPATH, observed_route=_route(),
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=Path(tmp)),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=Path(tmp)))
             self.assertEqual(o.status, ADOPT_DECL_AMBIGUOUS_LOCATORS)
@@ -362,6 +430,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             o = declare_project_gateway_owner_row(
                 journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=_pair_rows(),
+                expected_repo_root=REPO, expected_project_path=PPATH, observed_route=_route(),
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=home),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=home))
             self.assertEqual(o.status, ADOPT_DECL_OWNER_CONFLICT)
@@ -389,10 +458,12 @@ def _a_pin():
 
 
 class _FakeOps:
-    def __init__(self, *, rows=None, readable=True, providers=("codex", "claude")):
+    def __init__(self, *, rows=None, readable=True, providers=("codex", "claude"),
+                 route=_UNSET):
         self._rows = _pair_rows() if rows is None else rows
         self._readable = readable
         self._providers = providers
+        self._route = (REPO, PPATH, _route()) if route is _UNSET else route
 
     def workspace_id(self):
         return WS
@@ -402,6 +473,9 @@ class _FakeOps:
 
     def providers(self):
         return self._providers
+
+    def resolve_route(self, project_scope):
+        return self._route
 
 
 class ProjectGatewayDeclareUseCaseTest(unittest.TestCase):
