@@ -148,10 +148,14 @@ def verify_artifact_dir_is_artifact_only(artifact_dir: Path) -> list[str]:
 # Every docker flag that can introduce a mount / filesystem into the container.
 # ``-v`` / ``--volume`` / ``--mount`` are normalized and compared to the one
 # expected bind; ``--tmpfs`` / ``--volumes-from`` are never emitted by this tool,
-# so their mere presence is a regression and fails closed. Both the separate
-# (``--mount X``) and inline (``--mount=X``) spellings are covered so an
-# equivalent syntax cannot smuggle a source tree past the check
-# (Redmine #14100 review j#82888).
+# so their mere presence is a regression and fails closed. All of docker's
+# equivalent spellings are covered so an equivalent syntax cannot smuggle a
+# source tree past the check:
+#   - separate:  ``-v X`` / ``--volume X`` / ``--mount X``
+#   - inline `=`: ``-v=X`` / ``--volume=X`` / ``--mount=X``
+#   - compact short form: ``-vX`` (a single glued token — docker accepts a short
+#     option's value glued to the flag, e.g. ``-v/src:/dst:ro``)
+# (Redmine #14100 reviews j#82888 and j#82912).
 _MOUNT_VALUE_FLAGS = ("-v", "--volume", "--mount")
 _OTHER_MOUNT_FLAGS = ("--tmpfs", "--volumes-from")
 
@@ -196,13 +200,14 @@ def verify_command_mounts_artifact_only(command: list[str], artifact_dir: Path) 
     """Fail closed unless the docker argv mounts EXACTLY the artifact dir ro.
 
     Collects EVERY mount-introducing flag from the assembled argv — ``-v`` /
-    ``--volume`` / ``--mount`` in both separate and ``=`` spellings, plus
-    ``--tmpfs`` / ``--volumes-from`` — normalizes them, and requires the single
-    normalized mount ``<artifact_dir>:/artifacts:ro`` and nothing else. This
-    makes "no source mount" a verified property of the actual command in every
-    equivalent syntax, so a regression that bind-mounted a source tree via
-    ``--mount`` (even under a ``/dev`` / ``/proc`` / ``/sys`` target) trips here
-    before the container starts (Redmine #14100 review j#82888).
+    ``--volume`` / ``--mount`` in the separate, ``=`` and compact ``-vX``
+    spellings, plus ``--tmpfs`` / ``--volumes-from`` — normalizes them, and
+    requires the single normalized mount ``<artifact_dir>:/artifacts:ro`` and
+    nothing else. This makes "no source mount" a verified property of the actual
+    command in every equivalent syntax, so a regression that bind-mounted a
+    source tree via ``--mount`` (even under a ``/dev`` / ``/proc`` / ``/sys``
+    target) or via the compact ``-v/src:/dst`` glued form trips here before the
+    container starts (Redmine #14100 reviews j#82888, j#82912).
     """
     mounts: list[str] = []
     offenders: list[str] = []
@@ -224,6 +229,34 @@ def verify_command_mounts_artifact_only(command: list[str], artifact_dir: Path) 
                 break
         if matched_value:
             index += 1
+            continue
+        # Short-flag cluster containing ``v`` (the volume flag). Docker accepts a
+        # short option's value glued to the flag (``-v/src:/dst``) and short
+        # flags clustered together (``-itv/src:/dst`` == ``-i -t -v /src:/dst``).
+        # ``v`` is the ONLY value-taking short flag whose letter is ``v``, so any
+        # single-dash cluster containing ``v`` introduces a volume mount whose
+        # value is either glued after the ``v`` or, if ``v`` is the last char,
+        # the next token. ``-v`` (exact) and ``-v=X`` are handled above; this
+        # catches every other glued / clustered spelling (Redmine #14100 review
+        # j#82912).
+        if (
+            token.startswith("-")
+            and not token.startswith("--")
+            and len(token) > 1
+            and "v" in token[1:]
+        ):
+            value = token[token.index("v", 1) + 1:]
+            if value.startswith("="):
+                value = value[1:]
+            if value:
+                mounts.append(_normalize_mount_spec(value))
+                index += 1
+            elif index + 1 < len(command):  # `v` is the last char: value is next token
+                mounts.append(_normalize_mount_spec(command[index + 1]))
+                index += 2
+            else:
+                offenders.append(token)  # dangling clustered volume flag
+                index += 1
             continue
         if token in _OTHER_MOUNT_FLAGS or any(
             token.startswith(flag + "=") for flag in _OTHER_MOUNT_FLAGS

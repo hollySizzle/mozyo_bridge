@@ -201,6 +201,35 @@ class CommandMountsArtifactOnlyTests(unittest.TestCase):
                 with self.assertRaises(mod.SmokeError):
                     mod.verify_command_mounts_artifact_only(cmd, root)
 
+    def test_compact_short_form_source_injection_fails_closed(self):
+        # Docker accepts a value glued to the short flag (`-v/src:/dst`), which
+        # the separate / `=` branches miss (review j#82912). Compact and
+        # clustered spellings targeting /dev/src must all be rejected.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for injection in (
+                ["-v/tmp/x:/dev/src:ro"],          # compact, glued value
+                ["-v=/tmp/x:/dev/src:ro"],         # = form
+                ["-itv/tmp/x:/dev/src:ro"],        # cluster, glued value
+                ["-itv", "/tmp/x:/dev/src:ro"],    # cluster, value in next token
+            ):
+                cmd = self._base_cmd(root)
+                cmd = cmd[:-4] + injection + cmd[-4:]
+                with self.assertRaises(mod.SmokeError):
+                    mod.verify_command_mounts_artifact_only(cmd, root)
+
+    def test_compact_short_form_artifact_mount_is_accepted(self):
+        # The SAME artifact bind expressed as the compact `-v<spec>` glued form
+        # normalizes to the expected mount and is accepted.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cmd = [
+                "docker", "run", "--rm", "-i",
+                f"-v{root.resolve()}:/artifacts:ro",
+                _DIGEST, "bash",
+            ]
+            mod.verify_command_mounts_artifact_only(cmd, root)  # no raise
+
     def test_mount_form_artifact_equivalent_is_accepted(self):
         # The SAME artifact bind expressed as --mount normalizes to the expected
         # spec and is accepted (equivalent-syntax awareness, not blanket reject).
