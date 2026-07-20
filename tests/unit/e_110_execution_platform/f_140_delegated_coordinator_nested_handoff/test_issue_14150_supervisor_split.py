@@ -266,6 +266,42 @@ class ReconcileCadenceStoreTest(unittest.TestCase):
         self.assertEqual(wm.last_reconciled_at, "2026-07-20T00:10:00+00:00")
 
 
+class ProviderCallCountTest(unittest.TestCase):
+    """Redmine #14150 review F2: provider_calls is the ACTUAL read_entries count, not issues-touched."""
+
+    def test_provider_calls_counts_actual_reads_not_issues(self) -> None:
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+            MappingRedmineJournalSource,
+        )
+
+        d = Path(tempfile.mkdtemp())
+        sp = d / "wf.sqlite"
+        payload = {
+            "issue": {"id": ISSUE},
+            "journals": [
+                {"id": "100", "notes": "## Gate: review_request\n"
+                 "[mozyo:workflow-event:gate=review_request:conclusion=pending]"}
+            ],
+        }
+        src = MappingRedmineJournalSource(payload=payload)
+        sup = WorkspaceCallbackSupervisor(
+            holder="h",
+            lease_store=SupervisorLeaseStore(path=d / "l.sqlite"),
+            store=WorkflowRuntimeStore(path=sp),
+            outbox=CallbackOutbox(path=sp),
+            workspaces_fn=lambda: [SupervisedWorkspace(workspace_id="wsA", canonical_path=str(d))],
+            roster_fn=lambda ws: ((ISSUE,), ""),
+            redmine_source_fn=lambda ws: src,
+            sender_fn=lambda ws: _RecordingSender(),
+            clock=lambda: CLOCK,
+        )
+        report = sup.run_once()
+        # One supervised issue, but it fires supply + discovery + ... reads -> provider_calls > 1.
+        self.assertGreaterEqual(report.provider_calls, 2)
+        self.assertEqual(report.workspaces[0].provider_read_issues, 1)  # one issue touched provider
+
+
 class SchemaForwardCompatTest(unittest.TestCase):
     """Redmine #14150: a strict read-only read must tolerate a store predating the additive column.
 
@@ -304,6 +340,50 @@ class SchemaForwardCompatTest(unittest.TestCase):
         rows = outbox.read_strict_readonly(states=[CALLBACK_PENDING])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].enqueue_lane_generation, "")  # absent column -> default, no raise
+
+
+class EventCursorTest(unittest.TestCase):
+    """Redmine #14150 review F3: durable per-issue event cursor bounds incremental discovery."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.store = ReconcileCadenceStore(path=self.dir / "reconcile-cadence.sqlite")
+
+    def test_missing_cursor_reads_blank(self) -> None:
+        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "")
+
+    def test_cursor_advances_and_is_monotonic_across_restart(self) -> None:
+        self.store.advance_event_cursor("wsA", ISSUE, cursor="100", now=CLOCK)
+        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "100")
+        # A lower cursor never rewinds a higher stored one (idempotent restart safety).
+        self.store.advance_event_cursor("wsA", ISSUE, cursor="50", now=CLOCK)
+        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "100")
+        # A newer journal (lost wake / external update) advances it.
+        self.store.advance_event_cursor("wsA", ISSUE, cursor="150", now=CLOCK)
+        self.assertEqual(self.store.read_event_cursor("wsA", ISSUE), "150")
+        # A fresh store instance (a restart) reads the persisted cursor.
+        reopened = ReconcileCadenceStore(path=self.dir / "reconcile-cadence.sqlite")
+        self.assertEqual(reopened.read_event_cursor("wsA", ISSUE), "150")
+
+    def test_fence_candidates_after_cursor(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+            fence_candidates_after_cursor,
+        )
+
+        def cand(j):
+            return type("C", (), {"journal": j})()
+
+        # First pass (blank cursor): keep all, cursor -> max journal.
+        fresh, nxt = fence_candidates_after_cursor([cand("100"), cand("120")], "")
+        self.assertEqual([c.journal for c in fresh], ["100", "120"])
+        self.assertEqual(nxt, "120")
+        # Incremental: only journals strictly newer than the cursor; a lost/external newer id passes.
+        fresh, nxt = fence_candidates_after_cursor([cand("100"), cand("120"), cand("150")], "120")
+        self.assertEqual([c.journal for c in fresh], ["150"])
+        self.assertEqual(nxt, "150")
+        # A non-numeric journal is kept (fail-open toward delivery; UNIQUE key is the authority).
+        fresh, _ = fence_candidates_after_cursor([cand("abc")], "120")
+        self.assertEqual([c.journal for c in fresh], ["abc"])
 
 
 class PureHelperTest(unittest.TestCase):

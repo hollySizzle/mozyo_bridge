@@ -30,6 +30,49 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
+class _NullSource:
+    """A source yielding no journal entries — used when no Redmine source is configured.
+
+    The callback drain (recover / deliver-once / sweep) still runs against it, so an unconfigured
+    Redmine degrades to "drain the existing outbox" rather than skipping the workspace entirely.
+    """
+
+    def read_entries(self, issue_id: object = None):
+        return []
+
+
+#: The shared no-op source singleton (used by the drain path and the unconfigured-Redmine degrade).
+_NULL_SOURCE = _NullSource()
+
+
+class _CountingSource:
+    """Wrap a Redmine source and count every ``read_entries`` (Redmine #14150 review F2).
+
+    Each ``read_entries`` is one fresh ticket-provider fetch (``LiveRedmineJournalSource`` issues a new
+    HTTP request per call, by contract), so a per-issue reconcile firing supply + discovery +
+    dispatch-anchor + review-identity + review_return / lane_gateway discovery reads makes MANY provider
+    calls. This wrapper counts the ACTUAL transport invocations through the reconcile source (the
+    dominant provider-read path — supply / discover / fences / reconcile leg / own-workspace backlog
+    drain, which shares this same source), so ``SupervisorReport.provider_calls`` reports the real HTTP
+    fetch count rather than "issues that touched the provider" (which under-counted 1/issue). Send-edge
+    round-fence reads use a SEPARATELY-constructed source (a different delivery-path concern, bounded by
+    the number of review rows actually delivered) and are not folded into this count.
+    """
+
+    __slots__ = ("_inner", "count")
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.count = 0
+
+    def read_entries(self, issue_id: object = None):
+        self.count += 1
+        return self._inner.read_entries(issue_id)
+
+    def __getattr__(self, name: str):  # delegate any other source attribute unchanged
+        return getattr(self._inner, name)
+
+
 @dataclasses.dataclass(frozen=True)
 class SupervisedWorkspace:
     """The minimal workspace facts the supervisor needs (id + canonical checkout path).

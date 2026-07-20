@@ -341,6 +341,35 @@ def select_drain_issues(pending_rows: Iterable[object], workspace_id: str) -> tu
     return tuple(issues)
 
 
+def fence_candidates_after_cursor(candidates, cursor):
+    """Bound candidate DISCOVERY to events newer than the durable event cursor (Redmine #14150 F3; pure).
+
+    ``cursor`` is the highest source journal id already folded for the issue (blank / non-numeric ->
+    first pass, keep everything). Returns ``(fresh, next_cursor)``: ``fresh`` is the candidates on a
+    journal strictly newer than ``cursor`` (an incremental read after the stored cursor); a candidate
+    with a non-numeric journal is kept (fail-open toward delivery — the generation fence + outbox
+    UNIQUE key remain the correctness authority, not the cursor). ``next_cursor`` is the max of
+    ``cursor`` and every candidate journal seen this pass, as a string, so the caller advances the
+    durable cursor past all discovered events on a successful pass. Order-preserving. Because a newer
+    gate always has a higher journal id, an over-advance never drops a future gate — the cursor only
+    filters re-discovery of already-folded events.
+    """
+    cur = _as_journal_int(cursor)
+    fresh: list = []
+    max_seen = cur
+    for candidate in candidates:
+        journal = _as_journal_int(getattr(candidate, "journal", ""))
+        if journal is None:
+            fresh.append(candidate)  # non-numeric journal: cannot cursor-filter -> keep (fail-open)
+            continue
+        if max_seen is None or journal > max_seen:
+            max_seen = journal
+        if cur is None or journal > cur:
+            fresh.append(candidate)
+    next_cursor = str(max_seen) if max_seen is not None else str(cursor or "")
+    return tuple(fresh), next_cursor
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -452,6 +481,12 @@ class WorkspaceSupervisionOutcome:
     non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
+    #: The ACTUAL ticket-provider read count for this workspace (Redmine #14150 review F2): the number
+    #: of ``read_entries`` (one HTTP fetch each) the reconcile source served this pass — supply +
+    #: discovery + dispatch-anchor + review-identity + review_return / lane_gateway discovery +
+    #: own-workspace backlog drain. NOT the count of issues that touched the provider (which
+    #: under-counted a multi-read issue as 1). A local drain / downgraded workspace reads 0.
+    provider_calls: int = 0
     #: Own-workspace review_return backlog dispositions (Redmine #13974 R2): rows reserved for a
     #: now-hibernated / superseded lane whose issue is no longer in any active roster, drained under the
     #: lease. ``backlog_fenced`` terminally converged (zero-send); ``backlog_delivered`` is a REAL send
@@ -488,8 +523,9 @@ class WorkspaceSupervisionOutcome:
         return sum(i.deferred for i in self.issues)
 
     @property
-    def provider_reads(self) -> int:
-        # Redmine #14150: issues whose pass performed a ticket-provider read (0 for a drain workspace).
+    def provider_read_issues(self) -> int:
+        # Redmine #14150: how many issues touched the provider this pass (observability alongside the
+        # ACTUAL ``provider_calls`` count — an issue can make several reads, so these differ by design).
         return sum(1 for i in self.issues if i.provider_read)
 
     def as_payload(self) -> dict[str, object]:
@@ -505,7 +541,8 @@ class WorkspaceSupervisionOutcome:
             "delivered": self.delivered,
             "blocked": self.blocked,
             "deferred": self.deferred,
-            "provider_reads": self.provider_reads,
+            "provider_calls": self.provider_calls,
+            "provider_read_issues": self.provider_read_issues,
             "backlog_fenced": self.backlog_fenced,
             "backlog_delivered": self.backlog_delivered,
             "backlog_blocked": self.backlog_blocked,
@@ -556,11 +593,12 @@ class SupervisorReport:
     def provider_calls(self) -> int:
         """Ticket-provider reads this whole sweep performed (Redmine #14150 close condition 1).
 
-        Counted as the number of issue-level provider reads (the unit of provider work — one issue's
-        journal is read at most once per pass). A LOCAL drain never reads the provider, so an empty
-        drain pass and a safe-pending drain pass both roll up to ``0`` here — the testable contract.
+        Counted as the number of ACTUAL ``read_entries`` (one HTTP fetch each) the reconcile source
+        served across all workspaces (Redmine #14150 review F2) — NOT the number of issues that touched
+        the provider (a single issue makes several reads). A LOCAL drain never reads the provider, so an
+        empty drain pass and a safe-pending drain pass both roll up to ``0`` here — the testable contract.
         """
-        return sum(w.provider_reads for w in self.workspaces)
+        return sum(w.provider_calls for w in self.workspaces)
 
     @property
     def empty_pass(self) -> bool:
@@ -788,6 +826,7 @@ __all__ = (
     "partition_delivery_receipts",
     "is_locally_attestable_route",
     "select_drain_issues",
+    "fence_candidates_after_cursor",
     "reconcile_backoff_seconds",
     "should_reconcile_source",
     "IssueSelection",
