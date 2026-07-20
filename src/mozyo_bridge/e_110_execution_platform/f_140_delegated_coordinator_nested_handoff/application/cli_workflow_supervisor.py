@@ -242,15 +242,17 @@ def _drain_service_definition(args: argparse.Namespace):
 
 
 def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
-    """The service lifecycle command contract (Phase B1: real macOS LaunchAgent lifecycle).
+    """The service lifecycle command contract (Phase B1: macOS LaunchAgent lifecycle, DUAL agent).
 
-    ``--service-status`` reports the redacted host-service projection + the secret-free declarative
-    definition (exit 0, mutates nothing). ``--install`` / ``--restart`` / ``--uninstall`` drive the
-    owned LaunchAgent (:mod:`...application.supervisor_launchd`): they exit 0 on a performed action
-    and non-zero on a fail-closed refusal (non-darwin host, missing executable, non-ready Redmine
-    credential, or — for restart — a service that is not loaded), never touching anything but the
-    owned label / plist. No Redmine fetch, gate progression, route, or callback delivery happens
-    here; installing the agent is orthogonal to what it does when it runs.
+    Redmine #14150: the split runs TWO owned bounded one-shot LaunchAgents — the coarse
+    provider-reconciliation agent (``--run-once``) and the finer local-drain agent (``--drain-only``).
+    ``--service-status`` reports the redacted host projection of BOTH agents + both secret-free
+    definitions (exit 0, mutates nothing). ``--install`` / ``--restart`` / ``--uninstall`` drive the
+    owned PAIR (:mod:`...application.supervisor_launchd` ``*_pair``): install is atomic-or-nothing (a
+    partial failure rolls the first agent back), so an operator never ends up with a half-installed
+    pair. They exit 0 only when BOTH agents performed, and non-zero on any fail-closed refusal
+    (non-darwin / missing executable / non-ready credential / not-loaded), touching nothing but the
+    two owned labels / plists.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
         supervisor_launchd,
@@ -262,64 +264,67 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
     # from ``Path.home()`` (never relocated by ``--home``) — j#79092 R2-F1.
     mozyo_home = _home_from_args(args)
     definition = _service_definition(args)
+    drain_definition = _drain_service_definition(args)
 
     if verb == "service-status":
-        status = supervisor_launchd.service_status(
-            mozyo_home=mozyo_home, interval_hint=definition.reconciliation_interval_seconds
+        status = supervisor_launchd.service_status_pair(
+            mozyo_home=mozyo_home,
+            reconcile_interval_hint=definition.reconciliation_interval_seconds,
+            drain_interval_hint=drain_definition.reconciliation_interval_seconds,
         )
-        drain_definition = _drain_service_definition(args)
+        agents = status["agents"]
+        reconcile_host, drain_host = agents[0], agents[1]
         payload = dict(status)
         payload["phase"] = "B1"
         payload["definition"] = definition.as_payload()
-        # Redmine #14150: the split is two bounded one-shot cadences — the coarse provider
-        # reconciliation agent (`--run-once`) and the finer local-drain agent (`--drain-only`). Both
-        # declarative definitions are surfaced so the separate cadences are operator-visible.
         payload["drain_definition"] = drain_definition.as_payload()
-        lines = [
-            "action: service-status",
-            "phase: B1 (macOS LaunchAgent lifecycle; RunAtLoad + StartInterval, no KeepAlive)",
-            f"service_label: {status['label']}",
-            f"platform_supported: {status['platform_supported']}",
-            f"installed: {status['installed']}",
-            f"loaded: {status['loaded']}",
-            f"pid: {status['pid']}",
-            f"scheduled_interval_seconds: {status['scheduled_interval_seconds']}",
-            f"home_pin: {status['home_pin']}",
-            f"executable_matches: {status['executable_matches']}",
-            f"keep_alive_present: {status['keep_alive_present']}",
-            f"credential_readiness: {status['credential_readiness']}",
-            f"reconciliation_command: {' '.join(definition.command)}",
-            f"reconciliation_interval_seconds: {definition.reconciliation_interval_seconds}",
-            f"drain_service_label: {drain_definition.label}",
-            f"drain_command: {' '.join(drain_definition.command)}",
-            f"drain_interval_seconds: {drain_definition.reconciliation_interval_seconds}",
-        ]
+        lines = ["action: service-status", "phase: B1 (dual owned LaunchAgent pair; #14150)"]
+        for host, defn, kind in (
+            (reconcile_host, definition, "reconciliation"),
+            (drain_host, drain_definition, "drain"),
+        ):
+            lines += [
+                f"[{kind}] service_label: {host['label']}",
+                f"[{kind}] installed: {host['installed']} loaded: {host['loaded']} pid: {host['pid']}",
+                f"[{kind}] scheduled_interval_seconds: {host['scheduled_interval_seconds']}",
+                f"[{kind}] home_pin: {host['home_pin']} executable_matches: {host['executable_matches']}",
+                f"[{kind}] keep_alive_present: {host['keep_alive_present']}",
+                f"[{kind}] credential_readiness: {host['credential_readiness']}",
+                f"[{kind}] command: {' '.join(defn.command)}",
+            ]
         _emit(payload, as_json=as_json, text_lines=lines)
         return 0
 
     if verb == "install":
-        result = supervisor_launchd.install(
-            mozyo_home=mozyo_home, interval_seconds=definition.reconciliation_interval_seconds
+        result = supervisor_launchd.install_pair(
+            mozyo_home=mozyo_home,
+            reconcile_interval_seconds=definition.reconciliation_interval_seconds,
+            drain_interval_seconds=drain_definition.reconciliation_interval_seconds,
         )
     elif verb == "restart":
-        result = supervisor_launchd.restart(mozyo_home=mozyo_home)
+        result = supervisor_launchd.restart_pair(mozyo_home=mozyo_home)
     else:  # uninstall
-        result = supervisor_launchd.uninstall()
+        result = supervisor_launchd.uninstall_pair()
 
     payload = dict(result)
     performed = bool(result.get("performed"))
     lines = [
         f"action: {result.get('action', verb)}",
         f"performed: {performed}",
-        f"reason: {result.get('reason', '')}",
     ]
-    if "credential_readiness" in result:
-        lines.append(f"credential_readiness: {result['credential_readiness']}")
-    if "removed" in result:
-        lines.append(f"removed: {result['removed']}")
-    if "scheduled_interval_seconds" in result:
-        lines.append(f"scheduled_interval_seconds: {result['scheduled_interval_seconds']}")
-    lines.append(f"service_label: {definition.label}")
+    if result.get("reason"):
+        lines.append(f"reason: {result['reason']}")
+    if result.get("rolled_back"):
+        lines.append("rolled_back: True (partial-failure fail-closed)")
+    for a in result.get("agents", []):
+        detail = f"  agent {a.get('label', '')}: performed={a.get('performed')}"
+        if a.get("reason"):
+            detail += f" reason={a['reason']}"
+        if "removed" in a:
+            detail += f" removed={a['removed']}"
+        if "credential_readiness" in a:
+            detail += f" credential_readiness={a['credential_readiness']}"
+        lines.append(detail)
     _emit(payload, as_json=as_json, text_lines=lines)
     return 0 if performed else 1
 

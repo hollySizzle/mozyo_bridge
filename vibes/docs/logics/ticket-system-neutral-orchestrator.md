@@ -453,6 +453,15 @@ sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain
 別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
 測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
 
+macOS LaunchAgent の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
+`uninstall_pair` / `restart_pair` / `service_status_pair`）: 二つの独立した owned label / plist / log
+（`callback-supervisor` と `callback-supervisor.drain`）を管理する。install は **atomic-or-nothing** で、
+reconcile agent が失敗すれば何もせず、reconcile 成功後に drain agent が失敗すれば両 agent を rollback
+（partial failure で half-installed pair を残さない fail-closed）。各 verb は非 darwin / 実行ファイル欠落 /
+credential 未整備 / not-loaded で zero-mutation 拒否し、既存の RunAtLoad + StartInterval（KeepAlive なし、
+EnvironmentVariables なし）契約を両 agent で維持する。`workflow supervisor --service-status` は両 agent の
+redacted host 投影と両 definition を表示する。
+
 ## 現行0.12.2と目標状態の差
 
 | 領域 | 現行0.12.2 | 目標の契約 |
