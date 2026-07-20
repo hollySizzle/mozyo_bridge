@@ -40,6 +40,12 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   panes left, auto-closes the workspace (live-measured #13380: a lane-zero host
   workspace has no husk). Symmetrically, when a **tab** has zero panes left the
   tab auto-vanishes (live-measured #13411 j#73668), the tab analogue of E.
+- **H ``workspace list``** (Redmine #14139) — renders each live workspace as
+  ``{workspace_id, label}`` in the real 0.7.1 ``workspace_list`` envelope, where the
+  ``label`` is the verbatim value a ``workspace create --label`` set. This is the
+  backend-readable adopt authority the shared ``coordinators`` space keys on, so a
+  create carrying ``--label coordinators`` is visible to a later project's adopt, and
+  a vanished workspace is absent (residue verification, Redmine #14187).
 - **G ``tab create`` / ``agent start --tab [--split right]``** (Redmine #13411) —
   ``tab create --workspace <id>`` mints a fresh ``<id>:t<n>`` tab born with one
   empty ``root_pane`` (the tab analogue of D), returned in a ``tab_created``
@@ -147,6 +153,11 @@ class _Workspace:
     pane_seq: int = 0  # monotonic per-workspace pane counter (never reused)
     pane_tab: dict = field(default_factory=dict)  # pane_id -> tab_id ("" = default)
     tab_seq: int = 0  # monotonic per-workspace tab counter (never reused)
+    #: The stable operator-readable label set at ``workspace create --label`` (Redmine
+    #: #13380 sublane host / #14139 shared ``coordinators`` space). Verbatim; ``""``
+    #: when unlabelled. ``workspace list`` (face H) reports it so the #14139 shared
+    #: label authority can be exercised end-to-end through the fake.
+    label: str = ""
 
 
 @dataclass
@@ -311,6 +322,8 @@ class FakeHerdr:
         head = rest[:2]
         if head == ["workspace", "create"]:
             return self._cmd_workspace_create(argv, rest)
+        if head == ["workspace", "list"]:
+            return self._cmd_workspace_list(argv)
         if head == ["tab", "create"]:
             return self._cmd_tab_create(argv, rest)
         if head == ["agent", "start"]:
@@ -352,6 +365,9 @@ class FakeHerdr:
 
     def _cmd_workspace_create(self, argv, rest):
         ws = self._mint_workspace(cwd=_flag_value(rest, "--cwd") or "")
+        # Record the verbatim `--label` (Redmine #13380 host / #14139 shared space) so a
+        # later `workspace list` reflects it — the backend-readable adopt authority.
+        ws.label = _flag_value(rest, "--label") or ""
         root_pane = ws.panes[0]
         return _ok(
             argv,
@@ -361,6 +377,25 @@ class FakeHerdr:
                     "workspace": {"workspace_id": ws.workspace_id},
                     "root_pane": {"pane_id": root_pane},
                     "pane_count": 1,
+                }
+            },
+        )
+
+    def _cmd_workspace_list(self, argv):
+        # H (Redmine #14139): the live workspace label authority. Each live workspace
+        # contributes `{workspace_id, label}` in the real 0.7.1 envelope shape, so the
+        # shared-`coordinators`-space resolver can be exercised end-to-end (a create
+        # carrying `--label coordinators` is visible to a later project's adopt). A
+        # vanished workspace (its last pane closed) is absent — residue verification.
+        return _ok(
+            argv,
+            {
+                "result": {
+                    "type": "workspace_list",
+                    "workspaces": [
+                        {"workspace_id": ws.workspace_id, "label": ws.label}
+                        for ws in self._workspaces.values()
+                    ],
                 }
             },
         )

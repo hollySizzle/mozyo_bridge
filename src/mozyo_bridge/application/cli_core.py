@@ -839,6 +839,13 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     )
 
     register_herdr_composer_render_parser(herdr_sub)
+    # Redmine #14187: the read-only isolated shared_space smoke preflight (no agent
+    # actuation; the live cross-process smoke is the #14185 driver's job).
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_cli import (  # noqa: E501
+        register_herdr_smoke_shared_space_parser,
+    )
+
+    register_herdr_smoke_shared_space_parser(herdr_sub)
     herdr_session_start = herdr_sub.add_parser(
         "session-start",
         help=(
