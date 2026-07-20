@@ -1,12 +1,13 @@
 """Isolated-home + scratch-workspace rail for deterministic *installed* fault paths (#14097).
 
-The four fault shapes this repo pins for release verification — post-close stale-worker
-resume (#13806), the nested unhealthy-launch rollback pointer (#13948), the stale-locator
-``sublane list`` projection (#14063), and callback-sweep lease recovery (#13951) — each
-already have deterministic regressions, but every one of those drives its use case / store /
-domain fold through **internal module imports**. None routes ``argv`` through the *public*
-CLI dispatch (``build_parser() -> args.func``), which is exactly the surface the installed
-``mozyo-bridge`` binary runs. This harness closes that gap:
+The fault shapes this repo pins for release verification — post-close stale-worker resume
+(#13806), the nested unhealthy-launch rollback pointer (#13948), the stale-locator ``sublane
+list`` projection (#14063), callback-sweep lease recovery (#13951), and the hibernated-legacy
+migration foreign-inventory gate (#13897) — each already have deterministic regressions, but
+every one of those drives its use case / store / domain fold through **internal module
+imports**. None routes ``argv`` through the *public* CLI dispatch (``build_parser() ->
+args.func``), which is exactly the surface the installed ``mozyo-bridge`` binary runs. This
+harness closes that gap:
 
 - it drives the SAME public command dispatch the installed CLI runs (the real argparse tree
   + the real ``cmd_*`` handlers), so the scenario measures the public orchestration path, not
@@ -63,6 +64,23 @@ STALE_SLOT_STATUS = "unknown"
 COORDINATOR_LANE = "default"
 
 
+def _decision_pointer(issue: str, journal: str = "83614"):
+    """A durable decision pointer for the legacy lifecycle row transitions (#13897 shape)."""
+    from mozyo_bridge.core.state.replacement_transaction import DecisionPointer
+
+    return DecisionPointer(source="redmine", issue_id=issue, journal_id=journal)
+
+
+class _LegacyLaneContext(NamedTuple):
+    """A git-backed hibernated-legacy lane the #13897 migration acceptance drives."""
+
+    repo: Path
+    worktree: Path
+    lane_id: str
+    workspace_id: str
+    issue: str
+
+
 class CliResult(NamedTuple):
     """The captured outcome of one public CLI dispatch (exit code + streams)."""
 
@@ -85,19 +103,25 @@ class _HerdrRunner:
     and raises, preserving the fail-closed posture (no silent canned success).
     """
 
-    def __init__(self, fake: FakeHerdr, herdr_bin: str) -> None:
+    def __init__(self, fake: FakeHerdr, herdr_bin: str, real_run, real_popen) -> None:
         self.fake = fake
         self.herdr_bin = herdr_bin
+        #: The unpatched ``subprocess.run`` / ``subprocess.Popen`` captured before the
+        #: driving-context patch, so a git probe against a real git-backed lane root (shape 5)
+        #: runs real git instead of the non-git degrade. ``subprocess.run`` internally calls the
+        #: (patched) ``subprocess.Popen``, so the git delegation must cover BOTH entry points.
+        #: The default scratch root is not a git checkout, so its git probes still degrade.
+        self._real_run = real_run
+        self._real_popen = real_popen
 
     def run(self, argv, **kwargs):  # noqa: ANN001 - subprocess.run signature
         head = str(argv[0])
         if head == self.herdr_bin:
             return self.fake.run(argv, **kwargs)
         if head == "git" or head.endswith("/git"):
-            # The scratch root is a plain directory, not a git checkout: every git probe
-            # (rev-parse / worktree list) reports "not a work tree" the way an external
-            # herdr-only project does.
-            return subprocess.CompletedProcess(list(argv), 128, stdout="", stderr="not a git repository")
+            # Delegate to REAL git: a git-backed lane root (shape 5) needs real ancestry /
+            # worktree probes; a plain scratch root simply returns git's own "not a work tree".
+            return self._real_run(argv, **kwargs)
         if head in ("sh", "/bin/sh", "bash", "/bin/bash"):
             # ``require_tmux`` runs ``sh -c 'command -v tmux'``; report tmux absent so a
             # misrouted send fails closed exactly as a pure-herdr session would.
@@ -108,6 +132,9 @@ class _HerdrRunner:
         head = str(argv[0])
         if head == self.herdr_bin:
             return self.fake.popen(argv, **kwargs)
+        if head == "git" or head.endswith("/git"):
+            # ``_real_run`` for a git probe re-enters this patched Popen; delegate to real Popen.
+            return self._real_popen(argv, **kwargs)
         raise AssertionError(f"unexpected Popen in installed fault harness: {argv!r}")
 
 
@@ -153,7 +180,7 @@ class InstalledFaultHarness:
         # is closeable.
         self.fake = FakeHerdr(read_text="idle\n> ")
         self._ws = self.fake.seed_workspace(cwd=str(self.repo_root))
-        self._runner = _HerdrRunner(self.fake, self.herdr_bin)
+        self._runner = _HerdrRunner(self.fake, self.herdr_bin, subprocess.run, subprocess.Popen)
         #: assigned-name -> seeded locator, for callers that re-reference a seeded slot.
         self._locators: dict[str, str] = {}
 
@@ -420,6 +447,152 @@ class InstalledFaultHarness:
         if execute:
             argv.append("--execute")
         return self.run_cli(argv)
+
+    # -- hibernated-legacy foreign-inventory fixture rail (#13897 / j#83575) ---
+
+    def legacy_migration_lane(self, lane_id: str, *, issue: str):
+        """A git-backed legacy lane whose durable row is hibernated + released + empty-binding.
+
+        The #13897 migration's public preflight probes real git ancestry / worktree branch, so
+        this rail stands up a real (isolated, temp) git repo + lane worktree — never a managed
+        repo — anchors it to a fresh workspace id, and drives the durable lifecycle row to the
+        exact legacy signature through the REAL store transitions. Returns a context the inventory
+        seeders + :meth:`retire_migrate_cli` key their rows and argv on.
+        """
+        import json as _json
+
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DISPOSITION_ACTIVE,
+            DISPOSITION_HIBERNATED,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+            ReleasePin,
+        )
+        from mozyo_bridge.core.state.replacement_transaction_model import norm  # noqa: F401
+
+        repo = self._tmp / f"legacy_repo_{lane_id}"
+        self._git("init", "-b", "main", cwd=self._tmp, extra=[str(repo)])
+        self._git("config", "user.email", "harness@example.invalid", cwd=repo)
+        self._git("config", "user.name", "harness", cwd=repo)
+        (repo / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+        )
+        ws_id = f"fixture-14097-legacy-{lane_id}"
+        (repo / ".mozyo-bridge" / "workspace-anchor.json").write_text(
+            _json.dumps(
+                {
+                    "schema_version": 1,
+                    "workspace_id": ws_id,
+                    "canonical_session": "fixture_14097_legacy",
+                    "project_name": "mozyo-bridge",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (repo / "README.md").write_text("x\n", encoding="utf-8")
+        self._git("add", "-A", cwd=repo)
+        self._git("commit", "-m", "base", cwd=repo)
+        worktree = self._tmp / f"legacy_lane_wt_{lane_id}"
+        self._git("worktree", "add", "-b", lane_id, str(worktree), "main", cwd=repo)
+
+        # Drive the durable row to hibernated + released + empty worktree binding (legacy sig).
+        store = LaneLifecycleStore(home=self.home)
+        key = LaneLifecycleKey(ws_id, lane_id)
+        dec = _decision_pointer(issue)
+        store.declare_active(key, decision=dec, issue_id=issue, worktree_identity="")
+        rec = store.get(key)
+        store.transition_disposition(
+            key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=rec.revision,
+            target=DISPOSITION_HIBERNATED, decision=dec,
+        )
+        rec = store.get(key)
+        store.request_release(
+            key, expected_revision=rec.revision, action_id="rel-1",
+            pins=[ReleasePin("gateway", "codex-mzb1", "w1:p1"),
+                  ReleasePin("worker", "claude-mzb1", "w1:p2")],
+        )
+        rec = store.get(key)
+        from mozyo_bridge.core.state.lane_lifecycle import RELEASE_RELEASED
+
+        store.record_release_outcome(
+            key, action_id="rel-1", expected_revision=rec.revision, target=RELEASE_RELEASED,
+        )
+        return _LegacyLaneContext(
+            repo=repo, worktree=worktree, lane_id=lane_id, workspace_id=ws_id, issue=issue,
+        )
+
+    def _git(self, *args: str, cwd: Path, extra: Optional[list] = None) -> None:
+        argv = ["git", *args, *(extra or [])]
+        self._runner._real_run(  # real git (bypasses the driving-context herdr fake)
+            argv, cwd=str(cwd), check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def seed_foreign_occupant(
+        self, ctx, *, provider: str = "gemini", lane_id: Optional[str] = None
+    ) -> str:
+        """A live row under an UNEXPECTED provider in ctx's workspace.
+
+        Defaults to ctx's own lane unit (the foreign-occupant fault). Pass ``lane_id`` for a
+        DIFFERENT lane of the same workspace — the scope test: a foreign occupant of another
+        lane must not block ctx's migration.
+        """
+        return self.fake.seed_agent(
+            encode_assigned_name(ctx.workspace_id, provider, lane_id or ctx.lane_id),
+            workspace_id=self._ws, provider=provider, status=STATUS_WORKING,
+        )
+
+    def seed_managed_pair(self, ctx) -> None:
+        """Seed ctx's lane with a live managed gateway+worker pair (the live-pair-present axis)."""
+        for role in ("codex", "claude"):
+            self.fake.seed_agent(
+                encode_assigned_name(ctx.workspace_id, role, ctx.lane_id),
+                workspace_id=self._ws, provider=role, status=STATUS_WORKING,
+            )
+
+    def seed_duplicate_managed(self, ctx, *, role: str = "codex") -> None:
+        """Two rows claiming the SAME canonical managed slot (a corrupt / ambiguous inventory)."""
+        for _ in range(2):
+            self.fake.seed_agent(
+                encode_assigned_name(ctx.workspace_id, role, ctx.lane_id),
+                workspace_id=self._ws, provider=role, status=STATUS_WORKING,
+            )
+
+    def seed_locatorless_expected(self, ctx, *, role: str = "codex") -> None:
+        """A single locator-less EXPECTED row: 'cannot resolve', which reads LIVE (not absent)."""
+        self.fake.extra_list_rows = list(self.fake.extra_list_rows) + [
+            {"name": encode_assigned_name(ctx.workspace_id, role, ctx.lane_id), "pane_id": ""}
+        ]
+
+    def retire_migrate_cli(self, ctx) -> CliResult:
+        """Drive ``sublane retire --migrate-hibernated-legacy`` through the public CLI dispatch.
+
+        Passes the operator's retire-preflight assertions (issue-closed / callbacks-drained /
+        verified / durable-record / target-identity-known / latest-generation-admissible) so the
+        preflight permits retirement and the migration path is reached — the same assertions a
+        real operator passes; the foreign / duplicate / unreadable gate then decides zero-write.
+        """
+        return self.run_cli([
+            "sublane", "retire", "--migrate-hibernated-legacy",
+            "--issue", ctx.issue, "--journal", "83614", "--lane", ctx.lane_id,
+            "--worktree", str(ctx.worktree), "--branch", ctx.lane_id,
+            "--integration-branch", "main",
+            "--issue-closed", "--callbacks-drained", "--verified",
+            "--durable-record", "--target-identity-known", "--latest-generation-admissible",
+            "--json", "--repo", str(ctx.repo),
+        ])
+
+    def legacy_disposition(self, ctx) -> str:
+        """The durable lifecycle disposition of ctx's lane row (retire-residue probe)."""
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleKey, LaneLifecycleStore
+
+        rec = LaneLifecycleStore(home=self.home).get(
+            LaneLifecycleKey(ctx.workspace_id, ctx.lane_id)
+        )
+        return "" if rec is None else rec.lane_disposition
 
     # -- inventory snapshots (cleanup / residue assertions) -------------------
 
