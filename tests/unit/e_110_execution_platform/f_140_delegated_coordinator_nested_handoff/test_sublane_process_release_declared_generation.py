@@ -57,9 +57,22 @@ def _pin(role: str, provider: str, name: str, locator: str, rev: str = "") -> Pr
 
 
 def _declared(rev_gw: str = "", rev_wk: str = "") -> list[ProcessGenerationPin]:
+    # CANONICAL slot-role vocabulary (Redmine #13920) — the shape the CURRENT writer
+    # (`sublane_adopt_declaration`) emits: role names the slot (`gateway`/`worker`), provider
+    # is a separate field. The live pair's decoded role is the PROVIDER token (`codex` /
+    # `claude`), resolved to the same canonical slot for the match. Using canonical fixtures
+    # (not legacy `codex`/`claude` roles) is what surfaces the R2 F1 regression.
     return [
-        _pin("codex", "codex", GW_NAME, GW_LOC, rev_gw),
-        _pin("claude", "claude", WK_NAME, WK_LOC, rev_wk),
+        _pin("gateway", "codex", GW_NAME, GW_LOC, rev_gw),
+        _pin("worker", "claude", WK_NAME, WK_LOC, rev_wk),
+    ]
+
+
+def _declared_legacy() -> list[ProcessGenerationPin]:
+    # The pre-#13920 spelling the #13809 adopt writer shipped — read-compatible only.
+    return [
+        _pin("codex", "codex", GW_NAME, GW_LOC),
+        _pin("claude", "claude", WK_NAME, WK_LOC),
     ]
 
 
@@ -81,8 +94,16 @@ def _match(declared, rows) -> bool:
 
 class DeclaredGenerationExactlyLiveTest(unittest.TestCase):
     # --- positive ---------------------------------------------------------------
-    def test_live_pair_exactly_matches_declared(self) -> None:
+    def test_canonical_declaration_matches_live_pair(self) -> None:
+        # Redmine #13811 R2 F1 regression: the CURRENT writer emits canonical slot roles
+        # (`gateway`/`worker`); the live pair decodes to provider roles (`codex`/`claude`).
+        # Both resolve to the same canonical slot, so a healthy canonical declaration matches
+        # — the old raw-role matcher forced this to False (healthy lane could not hibernate).
         self.assertTrue(_match(_declared(), _live()))
+
+    def test_legacy_declaration_read_compatible_matches(self) -> None:
+        # A pre-#13920 legacy `codex`/`claude` declaration still resolves to the same slots.
+        self.assertTrue(_match(_declared_legacy(), _live()))
 
     def test_declared_slot_that_is_gone_does_not_block(self) -> None:
         # A declared slot with no live row is a dead process, not a mismatch (0/1/2-slot).
@@ -93,11 +114,11 @@ class DeclaredGenerationExactlyLiveTest(unittest.TestCase):
 
     # --- F1 item 1: provider is a real match axis -------------------------------
     def test_provider_rebind_fails_closed(self) -> None:
-        # Declared codex pin's provider is `foreign`; live surfaces the normal codex.
+        # Declared gateway pin's provider is `foreign`; live surfaces the normal codex.
         # The old matcher collapsed to (role, assigned_name, locator) and matched — the bug.
         declared = [
-            _pin("codex", "foreign", GW_NAME, GW_LOC),
-            _pin("claude", "claude", WK_NAME, WK_LOC),
+            _pin("gateway", "foreign", GW_NAME, GW_LOC),
+            _pin("worker", "claude", WK_NAME, WK_LOC),
         ]
         self.assertFalse(_match(declared, _live()))
 
@@ -145,23 +166,41 @@ class DeclaredGenerationExactlyLiveTest(unittest.TestCase):
         rows = [_row(other_lane, GW_LOC), _row(WK_NAME, WK_LOC)]
         self.assertTrue(_match(_declared(), rows))
 
-    def test_undeclared_role_live_fails_closed(self) -> None:
-        # Only the worker is declared, but both slots are live -> the codex slot is a live
-        # managed slot the declaration never named.
-        declared = [_pin("claude", "claude", WK_NAME, WK_LOC)]
+    def test_incomplete_declaration_fails_closed(self) -> None:
+        # Only the worker slot is declared (a half pair) — resolve_declared_pin_pair returns
+        # INCOMPLETE, so the declaration is not an unambiguous authority and fails closed.
+        declared = [_pin("worker", "claude", WK_NAME, WK_LOC)]
         self.assertFalse(_match(declared, _live()))
 
-    def test_ambiguous_role_two_locators_fails_closed(self) -> None:
+    def test_ambiguous_slot_two_locators_fails_closed(self) -> None:
+        # Same assigned name at two locators -> raw name multiplicity (also ambiguous slot).
         rows = [_row(GW_NAME, GW_LOC), _row(GW_NAME, "wProj:p88"), _row(WK_NAME, WK_LOC)]
         self.assertFalse(_match(_declared(), rows))
 
-    def test_internally_ambiguous_declaration_fails_closed(self) -> None:
-        # Two declared pins for the same canonical role that disagree on locator.
+    def test_mixed_vocabulary_declaration_fails_closed(self) -> None:
+        # One canonical (`gateway`) + one legacy (`claude`) pin — two disagreeing writers
+        # touched the row; its provenance is not established (#13920 MIXED) -> fail closed.
         declared = [
+            _pin("gateway", "codex", GW_NAME, GW_LOC),
+            _pin("claude", "claude", WK_NAME, WK_LOC),
+        ]
+        self.assertFalse(_match(declared, _live()))
+
+    def test_duplicate_slot_declaration_fails_closed(self) -> None:
+        # Two declared pins that resolve to the SAME canonical slot (`gateway` + legacy
+        # `codex`) — the model's stable_identity dedupe cannot see it (#13920 DUPLICATE).
+        declared = [
+            _pin("gateway", "codex", GW_NAME, GW_LOC),
             _pin("codex", "codex", GW_NAME, GW_LOC),
-            _pin("codex", "codex", GW_NAME, "wProj:p77"),
         ]
         self.assertFalse(_match(declared, [_row(GW_NAME, GW_LOC)]))
+
+    # --- F3: raw duplicate inventory (name-uniqueness violation) -----------------
+    def test_raw_exact_duplicate_row_fails_closed(self) -> None:
+        # The SAME assigned name + locator appears twice. A set would collapse it to one; the
+        # raw name-count catches it as a herdr name-uniqueness violation (Redmine #13811 R2 F3).
+        rows = [_row(GW_NAME, GW_LOC), _row(GW_NAME, GW_LOC), _row(WK_NAME, WK_LOC)]
+        self.assertFalse(_match(_declared(), rows))
 
 
 class _FakeAttestReader:

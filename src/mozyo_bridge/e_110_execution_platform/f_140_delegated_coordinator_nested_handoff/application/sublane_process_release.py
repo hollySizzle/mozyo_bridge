@@ -42,6 +42,12 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.lane_pin_role import (
+    PIN_ROLE_GATEWAY,
+    PIN_ROLE_WORKER,
+    canonical_pin_role,
+    resolve_declared_pin_pair,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     RELEASE_NOT_REQUESTED,
@@ -310,18 +316,33 @@ def declared_generation_exactly_live(
     The project-gateway action-time exact-generation fence (Redmine #13811; design #13780
     j#78386 §1-3): a process-only lifecycle action may release ONLY the lane's declared
     generation, so a caller must prove the *current* live inventory carries that exact
-    generation before it releases anything. A live managed slot is the declared generation
-    only when it :meth:`ProcessGenerationPin.binds_same_generation` its declared pin — the
-    ``(role, provider, assigned_name, locator)`` identity, the type 正本's required identity
-    (``lane_lifecycle_model.py`` / ``managed-state-model.md`` ``### ...world state``). Any
-    other live slot — a **recycled** locator (the declared process died and relaunched), a
-    **renamed** slot, a **provider-rebound** slot (Redmine #13811 R1 F1: ``pin.provider`` is
-    a real match axis, never collapsed to ``role``), an **undeclared** role, or an
-    **ambiguous** inventory (one role live at two locators) — is a newer / foreign
-    generation the declared authority does not name, and the action fails closed rather than
-    close it (§2 "newer generation / stale approval -> zero-actuation"). A declared slot that
-    is simply **gone** (no live row) needs no close and does not block (the 0/1/2-slot /
-    dead-process case).
+    generation before it releases anything.
+
+    **Slot label vs live provider role (Redmine #13811 R2 F1 / #13920).** A declared
+    ``ProcessGenerationPin.role`` names a canonical SLOT — ``gateway`` / ``worker`` in the
+    #13920 vocabulary the current writer (``sublane_adopt_declaration``) emits, or a legacy
+    ``codex`` / ``claude`` spelling read-compatibly — NOT a provider. A live herdr row, by
+    contrast, decodes its name's role segment to the provider token that fills the slot
+    (``identity.role`` == provider, ``GATEWAY_ROLE='codex'`` / ``WORKER_ROLE='claude'``). The
+    two are resolved to the same canonical slot through
+    :func:`~mozyo_bridge.core.state.lane_pin_role.canonical_pin_role` before any comparison,
+    so a healthy ``gateway``/``worker`` declaration is never forced to a generation mismatch
+    against its live ``codex``/``claude`` pair (the F1 regression). The declared set is
+    resolved through :func:`resolve_declared_pin_pair`, so a foreign / mixed-vocabulary /
+    duplicate / incomplete declaration fails closed (never guessed past).
+
+    A live managed slot is the declared generation only when, ONCE both sides are keyed on
+    the canonical slot, it :meth:`ProcessGenerationPin.binds_same_generation` its declared pin
+    — the ``(provider, assigned_name, locator)`` identity. Any other live slot — a
+    **recycled** locator (the declared process died and relaunched), a **renamed** slot, a
+    **provider-rebound** slot (``pin.provider`` is a real match axis, never collapsed to
+    ``role``), an **undeclared** slot, a **raw-duplicate** row (the same assigned name in the
+    inventory twice, Redmine #13811 R2 F3 / ``herdr-native-identity.md`` §3.4 name
+    uniqueness), or an **ambiguous** inventory (one slot live at two locators) — is a newer /
+    foreign generation the declared authority does not name, and the action fails closed
+    rather than close it (§2 "newer generation / stale approval -> zero-actuation"). A
+    declared slot that is simply **gone** (no live row) needs no close and does not block (the
+    0/1/2-slot / dead-process case).
 
     ``runtime_revision`` is supplementary evidence, not identity (#13810 R4-F1 / #13846):
     the herdr process-generation discriminant is the **live locator**, and the startup
@@ -333,19 +354,26 @@ def declared_generation_exactly_live(
     非 discriminant when either side is empty). A caller wanting a strict revision fence
     would re-introduce the #13846 false conflict.
     """
-    declared_by_role: dict[str, ProcessGenerationPin] = {}
-    for pin in declared_pins:
-        role = _norm(pin.role)
-        prior = declared_by_role.get(role)
-        if prior is not None and not prior.binds_same_generation(pin):
-            # Two declared pins for one canonical role that are not the same generation:
-            # an internally ambiguous declaration. Fail closed rather than pick one.
-            return False
-        declared_by_role[role] = pin
+    # Resolve the declared set into canonical gateway/worker slots. A foreign role, a row
+    # mixing canonical + legacy spellings, two pins on one canonical slot, or a half pair is
+    # NOT an unambiguous declaration — fail closed rather than match against a guess (#13920).
+    pair = resolve_declared_pin_pair(declared_pins)
+    if not pair.ok:
+        return False
+    declared_by_slot: dict[str, ProcessGenerationPin] = {
+        PIN_ROLE_GATEWAY: pair.gateway,
+        PIN_ROLE_WORKER: pair.worker,
+    }
 
     want_ws = _norm(workspace_id)
     want_lane = _norm_lane(lane_id)
-    live_by_role: dict[str, set[tuple[str, str, str, str]]] = {}
+    # One pass over the raw inventory: collect each in-scope managed slot's distinct
+    # observations AND count raw rows per assigned name. The raw count is kept independent of
+    # the observation ``set`` so an EXACT duplicate row (same name + locator) — which the set
+    # would silently collapse — still surfaces as a name-uniqueness violation (Redmine #13811
+    # R2 F3 / ``herdr-native-identity.md`` §3.4).
+    raw_name_count: dict[str, int] = {}
+    live_obs: dict[str, set[tuple[str, str, str, str]]] = {}
     for row in rows:
         if not isinstance(row, Mapping):
             continue
@@ -355,45 +383,61 @@ def declared_generation_exactly_live(
         identity = decode.identity
         if identity.workspace_id != want_ws or _norm_lane(identity.lane_id) != want_lane:
             continue
-        if identity.role not in _LANE_ROLES:
+        slot = canonical_pin_role(identity.role)
+        if not slot:
             continue
         locator = _agent_locator(row)
         if not locator:
             continue
+        assigned_name = _norm(row.get(AGENT_KEY_NAME))
+        raw_name_count[assigned_name] = raw_name_count.get(assigned_name, 0) + 1
         # ``runtime_revision`` is empty for a normal herdr row (no live observation surface,
         # #13810 R4-F1); a richer surface that DOES carry it enters the both-observed match.
-        live_by_role.setdefault(identity.role, set()).add(
+        live_obs.setdefault(slot, set()).add(
             (
-                _norm(row.get(AGENT_KEY_NAME)),
+                assigned_name,
                 locator,
                 _live_provider(row, identity.role),
                 _norm(row.get("runtime_revision")),
             )
         )
+    if any(count > 1 for count in raw_name_count.values()):
+        # A raw duplicate assigned name (even an exact-duplicate row) — fail closed.
+        return False
 
-    for role, live in live_by_role.items():
+    for slot, live in live_obs.items():
         if len(live) != 1:
-            # This role is live at more than one distinct observation — an ambiguous
+            # This slot is live at more than one distinct observation — an ambiguous
             # inventory. Fail closed rather than guess the declared process.
             return False
         (assigned_name, locator, provider, runtime_revision) = next(iter(live))
-        declared = declared_by_role.get(role)
+        declared = declared_by_slot.get(slot)
         if declared is None:
             # A live managed slot the declaration never named — a newer / foreign
             # generation. Fail closed.
             return False
         try:
+            # Normalize BOTH sides to the canonical slot label so the identity compare is on
+            # (provider, assigned_name, locator) — the declared pin's own spelling (canonical
+            # or legacy) is not a match axis, only the slot it resolves to.
+            declared_norm = ProcessGenerationPin(
+                role=slot,
+                provider=declared.provider,
+                assigned_name=declared.assigned_name,
+                locator=declared.locator,
+                runtime_revision=declared.runtime_revision,
+            )
             live_pin = ProcessGenerationPin(
-                role=role,
+                role=slot,
                 provider=provider,
                 assigned_name=assigned_name,
                 locator=locator,
                 runtime_revision=runtime_revision,
             )
         except ProcessPinError:
-            # A live row that cannot form an identity pin is anomalous — fail closed.
+            # A pin that cannot form an identity is anomalous — fail closed.
             return False
-        if not declared.binds_same_generation(live_pin):
+        if not declared_norm.binds_same_generation(live_pin):
             # A live slot that is not the declared generation (recycled / renamed /
             # provider-rebound / both-observed-revision drift): fail closed.
             return False

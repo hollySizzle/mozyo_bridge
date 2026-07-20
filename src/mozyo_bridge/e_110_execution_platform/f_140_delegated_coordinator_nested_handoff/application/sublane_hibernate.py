@@ -114,6 +114,13 @@ BLOCK_PROJECT_UNATTESTED = "project_slot_unattested"
 #: it, §1 "generation を混ぜない"). A stale approval never re-binds to the current
 #: generation; the operator must assert the approved generation and it must still hold.
 BLOCK_STALE_ACTION_GENERATION = "stale_action_generation"
+#: The approval's asserted `revision` does not equal the row's current revision — the
+#: process authority advanced WITHIN the same generation (pin repair / replacement /
+#: decision update) since the approval, so the approved action authority is stale (Redmine
+#: #13811 R2 F2; design j#78386 §1-3 "approved lane_generation + revision + action_id").
+#: The disposition CAS is bound to the approved revision, so a stale approval is a pre-CAS
+#: zero-write / zero-close, never re-bound to the current revision / pins.
+BLOCK_STALE_ACTION_REVISION = "stale_action_revision"
 # Early-hibernate (Redmine #13967 item 1) unpushed fence: an early-hibernate basis
 # presupposes the commits are integrated to staging, so an early-hibernate attempt whose
 # commits are not pushed / origin-reachable fails closed (unlike a dependency park, which
@@ -330,6 +337,12 @@ class HibernatePreflight:
     project_generation_matched: bool = True
     project_attestation_ok: bool = True
     action_generation_current: bool = True
+    #: The approved ``revision`` still equals the row's current revision (Redmine #13811 R2
+    #: F2). ONLY meaningful on the fresh (active -> hibernated) path — the already-hibernated
+    #: redrive resumes the stored action authority, so it leaves this ``True`` (the row's
+    #: revision has advanced past the approval by the hibernate itself). ``True`` for an
+    #: issue lane.
+    action_revision_current: bool = True
     assertions: HibernateAssertions = field(default_factory=HibernateAssertions)
 
     @property
@@ -344,6 +357,7 @@ class HibernatePreflight:
             and self.project_generation_matched
             and self.project_attestation_ok
             and self.action_generation_current
+            and self.action_revision_current
         )
 
     @property
@@ -386,6 +400,8 @@ class HibernatePreflight:
         # operator sees exactly which exact-generation guard blocked the release.
         if not self.action_generation_current:
             reasons.append(BLOCK_STALE_ACTION_GENERATION)
+        if not self.action_revision_current:
+            reasons.append(BLOCK_STALE_ACTION_REVISION)
         if not self.project_generation_matched:
             reasons.append(BLOCK_PROJECT_GENERATION_MISMATCH)
         if not self.project_attestation_ok:
@@ -405,6 +421,7 @@ class HibernatePreflight:
             "project_generation_matched": self.project_generation_matched,
             "project_attestation_ok": self.project_attestation_ok,
             "action_generation_current": self.action_generation_current,
+            "action_revision_current": self.action_revision_current,
             "blocked_reasons": list(self.blocked_reasons),
         }
 
@@ -564,6 +581,15 @@ class HibernateRequest:
     #: ``open_next_generation`` bumps the generation) cannot re-bind to the current one.
     #: Ignored for an issue lane.
     expected_lane_generation: str = ""
+    #: The approved expected lifecycle ``revision`` the operator asserts from the durable
+    #: approval (Redmine #13811 R2 F2; design j#78386 §1-3). For a project-gateway lane it
+    #: MUST be supplied and the FRESH (active -> hibernated) disposition CAS is bound to it,
+    #: so an approval whose process authority has since advanced within the same generation
+    #: (pin repair / replacement / decision update) fails closed pre-CAS rather than
+    #: re-binding to the current revision / pins. Ignored for an issue lane; the
+    #: already-hibernated redrive resumes the row's STORED release action id / pins (the
+    #: immutable action authority), so it does not re-check this advanced revision.
+    expected_revision: str = ""
 
 
 @dataclass
@@ -721,6 +747,26 @@ class SublaneHibernateUseCase:
                 ),
             )
 
+        # Fresh-path stale-approval REVISION fence (Redmine #13811 R2 F2). For a
+        # project-gateway lane the operator asserts the approved lifecycle revision; the fresh
+        # active -> hibernated CAS is bound to it, so an approval whose process authority
+        # advanced WITHIN the same generation (pin repair / replacement / decision update)
+        # since the approval fails closed pre-CAS rather than re-binding to the current
+        # revision / pins. An issue lane is unchanged (the CAS uses the current revision). The
+        # already-hibernated redrive above does NOT apply this — it resumes the stored release
+        # action id / pins (the row's revision has advanced past the approval by the hibernate
+        # itself), so re-asserting the approval's revision there would wrongly block resume.
+        expected_revision = _norm(request.expected_revision)
+        cas_expected_revision = rec.revision if rec is not None else 0
+        action_revision_current = True
+        if project_scope and record_matches_binding(rec, project_scope=project_scope):
+            assert rec is not None  # record_matches_binding is False for None
+            action_revision_current = (
+                expected_revision.isdigit() and int(expected_revision) == rec.revision
+            )
+            if action_revision_current:
+                cas_expected_revision = int(expected_revision)
+
         original_identity_known = (
             rec is not None
             and rec.lane_disposition == DISPOSITION_ACTIVE
@@ -736,6 +782,7 @@ class SublaneHibernateUseCase:
             project_generation_matched=project_generation_matched,
             project_attestation_ok=project_attestation_ok,
             action_generation_current=action_generation_current,
+            action_revision_current=action_revision_current,
             assertions=request.assertions,
         )
         if not preflight.may_hibernate or not execute:
@@ -755,7 +802,10 @@ class SublaneHibernateUseCase:
         # Commit point: CAS active -> hibernated, guarded on the lane's exact state +
         # revision and the durable decision anchor. Nothing is closed until this lands, and
         # may_hibernate already required a readable inventory — so the CAS is never reached
-        # on an unverifiable one (zero-mutation on unreadable, R1-F1).
+        # on an unverifiable one (zero-mutation on unreadable, R1-F1). For a project-gateway
+        # lane ``cas_expected_revision`` is the operator's APPROVED revision (Redmine #13811 R2
+        # F2) — bound here so the atomic CAS itself refuses a same-generation revision drift,
+        # not only the pre-CAS gate; for an issue lane it is the current revision (unchanged).
         assert rec is not None  # guaranteed by original_identity_known
         # Redmine #13844 R3: hibernate is a schema-needing mutation. Its write opens through the
         # universal `_connect_write` gate, which emits the PRE-migration peer-reader advisory to
@@ -763,7 +813,7 @@ class SublaneHibernateUseCase:
         transition = self.store.transition_disposition(
             key,
             expected_disposition=DISPOSITION_ACTIVE,
-            expected_revision=rec.revision,
+            expected_revision=cas_expected_revision,
             target=DISPOSITION_HIBERNATED,
             decision=decision,
         )
@@ -885,6 +935,7 @@ __all__ = (
     "BLOCK_PROJECT_UNATTESTED",
     "BLOCK_REVIEW_PENDING",
     "BLOCK_STALE_ACTION_GENERATION",
+    "BLOCK_STALE_ACTION_REVISION",
     "BLOCK_UNRECORDED_BOUNDARY",
     "BLOCK_UNPUSHED_COMMITS",
     "BLOCK_WORKING",

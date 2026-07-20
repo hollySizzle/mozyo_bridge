@@ -74,6 +74,7 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
         journal=getattr(args, "journal", "") or "",
         project_scope=getattr(args, "project_scope", "") or "",
         expected_lane_generation=getattr(args, "expected_lane_generation", "") or "",
+        expected_revision=getattr(args, "expected_revision", "") or "",
         assertions=HibernateAssertions(
             explicitly_parked=bool(getattr(args, "explicitly_parked", False)),
             callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
@@ -164,6 +165,18 @@ def register_sublane_hibernate_parser(sublane_sub: Any) -> None:
             "generation, so a stale approval from a superseded incarnation "
             "(retire + open_next_generation) cannot re-bind to the current generation. "
             "Ignored for an issue-owned lane."
+        ),
+    )
+    sublane_hibernate.add_argument(
+        "--expected-revision",
+        dest="expected_revision",
+        default="",
+        help=(
+            "Redmine #13811: the approved lifecycle revision asserted from the durable "
+            "Redmine approval. Required with --project-scope; the fresh active->hibernated "
+            "CAS is bound to it, so an approval whose process authority advanced within the "
+            "same generation (pin repair / replacement / decision update) fails closed "
+            "pre-CAS. Ignored for an issue-owned lane."
         ),
     )
     # Durable-record invariants the operator asserts from the Redmine record (each
