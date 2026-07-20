@@ -579,6 +579,39 @@ re-split を拒否する; live 再配置は live-relayout runbook のみ, #13648
 - `shared_space` が分岐させるのは **default lane のみ**。同 mode 下でも sublane launch は #13380 host label
   (`<project>_sublanes`) を保ち、`coordinators` にはならない。
 
+### 高レベル isolated smoke harness (Redmine #14187)
+
+`shared_space` の実 cross-process 経路 (実 `coordinators` workspace create + coordinator pair launch/adopt +
+concurrent single-flight 収束 + teardown) を、raw Herdr (`HERDR_CONFIG_PATH` / `herdr server` / 手動
+`herdr workspace ...`) を使わずに隔離・観測・cleanup できる高レベル surface を
+`e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py`
+(`SharedSpaceSmokeHarness`) に置く (#14185 Review j#83785 の blocker 解消)。これは **新規 diagnostic surface で
+あり、上記の placement 契約・resolver・fence を一切変更しない**: 同じ `prepare_session`
+(`coordinator_placement_mode=shared_space`, default lane) を injected `runner` 越しに駆動し、`_shared_coordinator_target`
+resolver と `coordinator_shared_create_lock` fence をそのまま使う。
+
+- **isolation (Acceptance 1/5)**: 実行前に `prove_smoke_isolation` が isolated home を実 operator home と
+  distinct かつ非 nested と証明し (不能なら create 前 fail-closed)、`isolated_smoke_home` が `MOZYO_BRIDGE_HOME` を
+  isolated home に向け、operator placement facade (`coordinator-placement.yaml: mode: shared_space`) を isolated home に
+  書いて loader で round-trip 検証する。実 operator home / config は変更しない。
+- **clean-slate cleanup-authority (Acceptance 5、herdr 次元)**: `coordinators` label は herdr server global なので、
+  actuation 前に read-only `workspace list` で **既存 `coordinators` space 不在**を証明する。存在 / labels unreadable は
+  create 前 fail-closed (実 operator space を adopt / 汚染しないため)。
+- **observation (Acceptance 4)**: `RecordingHerdrRunner` が command 種別と非秘匿 identity token (`coordinators` label /
+  `mzb1_...` name / `wN:pM` handle) のみ記録し、`--env` 値 / home path / payload 全文は記録しない。evidence 要約は
+  count / bool / closed phase token のみ (durable journal 安全)。
+- **concurrent 収束 (Acceptance 3)**: `run_concurrent` が project ごと 1 thread を `threading.Barrier` で同時 release し、
+  isolated home 共有で実 `coordinator_shared_create_lock` を競合させる (§5.1.1 create fence と同じ deterministic 手法)。
+  **create count 1 / duplicate agent 0** を実測する。orthogonal な #13948 startup-transaction fence は project ごと
+  per-fence 隔離する (収束 test を coordinator create lock に集中、R7 j#83573 と同方針)。
+- **cleanup + residue (Acceptance 5)**: launch した exact pane handle のみ close し (workspace は最終 pane で auto-vanish、
+  #13380)、`workspace list` / `agent list` を読み返して residue 0 を証明する。generic kill は行わない。
+
+unit / integration は共有 fake (`support.herdr_fake.FakeHerdr`、face H `workspace list` を追加) で駆動し、実 live smoke
+(実 herdr binary + disposable instance) は Review 承認・integration・CI 後に #14185 が同 `SharedSpaceSmokeHarness` を
+真の `multiprocessing` driver で再駆動して行う。CLI `mozyo-bridge herdr smoke-shared-space --isolated-home PATH` は
+**read-only preflight** (isolation + clean-slate 証明) のみで agent を actuate しない。
+
 ## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
 
 §5 の同一 tab pair placement / heal contract は、**それを実装した runtime が heal を

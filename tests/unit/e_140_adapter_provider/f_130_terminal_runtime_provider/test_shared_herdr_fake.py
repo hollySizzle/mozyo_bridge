@@ -96,6 +96,35 @@ class WorkspaceCreateTest(unittest.TestCase):
         )
 
 
+# -- H: workspace list (label authority, Redmine #14139) -----------------------
+
+
+class WorkspaceListTest(unittest.TestCase):
+    def test_list_reports_each_live_workspace_with_its_label(self) -> None:
+        fake = FakeHerdr()
+        # A labelled create (the shared `coordinators` space) and an unlabelled one.
+        labelled = _payload(
+            fake.run([BINARY, "workspace", "create", "--label", "coordinators"])
+        )["result"]["workspace"]["workspace_id"]
+        plain = _payload(fake.run([BINARY, "workspace", "create"]))["result"][
+            "workspace"
+        ]["workspace_id"]
+        result = _payload(fake.run([BINARY, "workspace", "list"]))["result"]
+        self.assertEqual(result["type"], "workspace_list")
+        by_id = {w["workspace_id"]: w["label"] for w in result["workspaces"]}
+        self.assertEqual(by_id, {labelled: "coordinators", plain: ""})
+
+    def test_vanished_workspace_is_absent_from_list(self) -> None:
+        # A workspace whose last pane closed auto-vanishes (residue verification).
+        fake = FakeHerdr()
+        wid = _payload(fake.run([BINARY, "workspace", "create", "--label", "x"]))[
+            "result"
+        ]["workspace"]["workspace_id"]
+        fake.run([BINARY, "pane", "close", f"{wid}:p1"])
+        result = _payload(fake.run([BINARY, "workspace", "list"]))["result"]
+        self.assertEqual(result["workspaces"], [])
+
+
 # -- A: agent start ------------------------------------------------------------
 
 
@@ -377,7 +406,7 @@ class FailClosedTest(unittest.TestCase):
     def test_unmodelled_run_command_raises(self) -> None:
         fake = FakeHerdr()
         with self.assertRaises(UnknownHerdrCommandError):
-            fake.run([BINARY, "workspace", "list"])  # not modelled
+            fake.run([BINARY, "workspace", "rename"])  # not modelled
 
     def test_unmodelled_popen_command_raises(self) -> None:
         fake = FakeHerdr()
