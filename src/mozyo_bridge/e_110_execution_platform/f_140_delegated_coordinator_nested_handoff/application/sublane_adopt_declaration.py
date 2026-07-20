@@ -262,6 +262,52 @@ def _resolve_attested_slot(
     return (pin, "")
 
 
+def resolve_declared_pins(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+    providers: tuple[str, str],
+    attestation_store,
+) -> tuple[Optional[list[ProcessGenerationPin]], str]:
+    """Resolve the ``(gateway, worker)`` provider pair into typed declared pins (fail-closed).
+
+    The single fail-closed slot-resolution the issue-lane adopt (:func:`declare_adopted_owner_row`)
+    and the project-gateway create/adopt (:func:`declare_project_gateway_owner_row`) share, so
+    the raw-multiplicity / liveness / startup-attestation gate is authored ONCE (Redmine #13811
+    T2; #13780 j#78405 "共通 declaration helper でissue/project binding双方をfail-closedに扱い、
+    重複実装しない"). Each provider resolves to EXACTLY ONE live, attested slot via
+    :func:`_resolve_attested_slot`; two slots on one locator is an ambiguous / recycled target.
+
+    Returns ``(pins, "")`` when both slots resolve, or ``(None, reason)`` with a zero-write
+    outcome token on the first fail-closed condition. The pin ``role`` names the canonical SLOT
+    (``gateway`` / ``worker``, #13920), independent of ``provider`` — a swapped binding still
+    pins the gateway slot as ``gateway``.
+    """
+    gateway_provider, worker_provider = providers
+    pins: list[ProcessGenerationPin] = []
+    seen_locators: set[str] = set()
+    for provider, role in (
+        (gateway_provider, PIN_ROLE_GATEWAY),
+        (worker_provider, PIN_ROLE_WORKER),
+    ):
+        pin, reason = _resolve_attested_slot(
+            rows=rows,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            provider=provider,
+            role=role,
+            attestation_store=attestation_store,
+        )
+        if pin is None:
+            return (None, reason)
+        if pin.locator in seen_locators:
+            return (None, ADOPT_DECL_AMBIGUOUS_LOCATORS)
+        seen_locators.add(pin.locator)
+        pins.append(pin)
+    return (pins, "")
+
+
 def declare_adopted_owner_row(
     *,
     journal: str,
@@ -315,31 +361,15 @@ def declare_adopted_owner_row(
             attestation_store = attestation_store_factory()
         else:
             attestation_store = HerdrIdentityAttestationStore(home=attestation_home)
-        gateway_provider, worker_provider = providers
-        pins: list[ProcessGenerationPin] = []
-        seen_locators: set[str] = set()
-        # The pin ``role`` names the SLOT, in the canonical vocabulary the recover-pair /
-        # repair-pins consumers read (Redmine #13920). It is deliberately independent of
-        # ``provider``: under a swapped binding the gateway slot is still ``gateway``.
-        for provider, role in (
-            (gateway_provider, PIN_ROLE_GATEWAY),
-            (worker_provider, PIN_ROLE_WORKER),
-        ):
-            pin, reason = _resolve_attested_slot(
-                rows=rows,
-                workspace_id=workspace,
-                lane_id=lane,
-                provider=provider,
-                role=role,
-                attestation_store=attestation_store,
-            )
-            if pin is None:
-                return reason
-            if pin.locator in seen_locators:
-                # Two slots on one locator is an ambiguous / recycled target.
-                return ADOPT_DECL_AMBIGUOUS_LOCATORS
-            seen_locators.add(pin.locator)
-            pins.append(pin)
+        pins, reason = resolve_declared_pins(
+            rows,
+            workspace_id=workspace,
+            lane_id=lane,
+            providers=providers,
+            attestation_store=attestation_store,
+        )
+        if pins is None:
+            return reason
 
         if worktree_token is None:
             return ADOPT_DECL_BAD_TOKEN
