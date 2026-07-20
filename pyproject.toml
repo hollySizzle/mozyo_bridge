@@ -144,6 +144,14 @@ files = [
     # `HerdrStandardRailOps` / `TurnStartRailPort` structural-conformance assignments
     # are real gates against fake signature drift (review j#79040 F1').
     "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_herdr_standard_rail.py",
+    # Redmine #13729 tranche 4: the common tmux transport rail slice (typed request +
+    # Protocol port for the inject / marker gate / rollback / retry / turn-start / emit
+    # side effects + a fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_tmux_transport_rail.py",
+    # Its constructor-injected fake port: checked so the `TmuxTransportRailOps`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_tmux_transport_rail.py",
 ]
 # The repo is not yet type-clean as a whole: do not chase imports out of the
 # typed island into untyped modules, and tolerate third-party packages that
@@ -182,6 +190,15 @@ warn_return_any = true
 # fully-annotated bar (typed request / Protocol ports / live adapter all typed).
 [[tool.mypy.overrides]]
 module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 4: the common tmux transport rail slice is held to the same
+# fully-annotated bar (typed request / Protocol port / live adapter all typed).
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
