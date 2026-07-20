@@ -18,6 +18,7 @@ startup attestation, and blocks on any drift from the preflight (T0) capture.
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT,
     BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,
     CLEAN_WORKTREE_FINGERPRINT,
+    RECOVERY_ACTION_DETAIL,
     PostReleaseCheck,
     WorktreeMutationFingerprint,
     post_release_check,
@@ -75,13 +77,22 @@ def read_live_worktree_fingerprint(
       unreadable ``status`` / ``diff`` -> unreadable (fail closed). A blanket "non-zero ->
       clean" would fail OPEN on a worktree we merely could not inspect.
 
-    **Content-sensitive digest (Redmine #13843 review F1).** ``git status --porcelain`` rows
-    encode only a path's *status code* (`` M path`` / ``?? path``), not its content — so a
-    worker writing MORE into an already-modified / already-untracked path leaves the porcelain
-    rows unchanged. The digest therefore folds in the tracked diff CONTENT (``git diff HEAD``)
-    and each untracked path's ``(size, mtime)``, so a content change to an already-listed path
-    flips the digest (the concrete #13843 residue signal). The digest is order-independent
-    (sorted rows / sorted untracked stats).
+    **Content-sensitive digest (Redmine #13843 review F1, R2 hardening).** ``git status``
+    rows encode only a path's *status code* (`` M path`` / ``?? path``), not its content, so
+    the digest folds in the actual CONTENT of every change:
+
+    - **tracked** content via ``git diff HEAD --no-ext-diff --binary`` — the ``--binary`` full
+      patch is content-sensitive even for binary files (a plain ``git diff`` collapses a binary
+      change to ``Binary files ... differ``); ``--no-ext-diff`` pins the output to git's own
+      diff, immune to a repo-configured external differ.
+    - **untracked** content via a per-file SHA-256 of the file bytes — a ``(size, mtime)`` stat
+      alone misses a same-size rewrite whose mtime a worker preserves / restores.
+    - paths are enumerated from ``--porcelain=v1 -z`` (NUL-separated, UNQUOTED) so a
+      special-character path is matched exactly, not folded to a quoted / MISSING token.
+
+    So a content change to an ALREADY-listed (already-dirty / already-untracked) path flips the
+    digest. Order-independent (sorted records / sorted untracked paths). Any unreadable git
+    read (status / diff) fails closed.
     """
     probe = _run_git(repo_root, timeout, "rev-parse", "--is-inside-work-tree")
     if probe is None:
@@ -100,63 +111,98 @@ def read_live_worktree_fingerprint(
         return WorktreeMutationFingerprint(readable=False)
 
     status = _run_git(
-        repo_root, timeout, "status", "--porcelain=v1", "--untracked-files=all"
+        repo_root, timeout,
+        "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        text=False,
     )
     if status is None or status.returncode != 0:
         return WorktreeMutationFingerprint(readable=False)
-    lines = sorted(line for line in status.stdout.splitlines() if line.strip())
-    dirty = any(not line.startswith("??") for line in lines)
-    untracked = any(line.startswith("??") for line in lines)
+    records, untracked_paths = _parse_porcelain_z(status.stdout or b"")
+    dirty = any(not r.startswith(b"??") for r in records)
+    untracked = bool(untracked_paths)
 
-    # Tracked content: `git diff HEAD` is the total tracked change vs the committed state
-    # (staged + unstaged). Its output changes when any already-modified file's content
-    # changes. An unreadable diff -> fail closed (never a "clean" fingerprint).
-    diff = _run_git(repo_root, timeout, "diff", "HEAD")
+    # Tracked content (binary-safe, external-differ-proof). An unreadable diff -> fail closed.
+    diff = _run_git(
+        repo_root, timeout, "diff", "HEAD", "--no-ext-diff", "--binary", text=False
+    )
     if diff is None or diff.returncode != 0:
         return WorktreeMutationFingerprint(readable=False)
-    untracked_stats = _untracked_stats(repo_root, lines)
 
     digest = hashlib.sha256()
-    digest.update("\n".join(lines).encode("utf-8"))
-    digest.update(b"\0DIFF\0")
-    digest.update(diff.stdout.encode("utf-8", "surrogatepass"))
+    for record in sorted(records):
+        digest.update(record)
+        digest.update(b"\0")
+    digest.update(b"DIFF\0")
+    digest.update(diff.stdout or b"")
     digest.update(b"\0UNTRACKED\0")
-    digest.update("\n".join(untracked_stats).encode("utf-8", "surrogatepass"))
+    for path in sorted(untracked_paths):
+        digest.update(path)
+        digest.update(b"\0")
+        digest.update(_hash_untracked(repo_root, path))
+        digest.update(b"\0")
     return WorktreeMutationFingerprint(
         readable=True, dirty=dirty, untracked=untracked, digest=digest.hexdigest()
     )
 
 
-def _untracked_stats(repo_root: Path, porcelain_lines: Sequence[str]) -> list[str]:
-    """``path\\0size\\0mtime_ns`` for each untracked path (Redmine #13843 review F1).
+def _parse_porcelain_z(raw: bytes) -> tuple[list[bytes], list[bytes]]:
+    """Parse ``git status --porcelain=v1 -z`` bytes into (records, untracked_paths).
 
-    Folds each untracked path's ``(size, mtime_ns)`` into the digest so a content change to
-    an *already-untracked* file (whose ``?? path`` row does not change) still flips the
-    fingerprint. A path that cannot be ``stat``-ed (removed / quoted / permission) contributes
-    a stable ``MISSING`` marker rather than crashing — its ``?? path`` row already tracks
-    presence, and the fail-closed diff/probe guards cover an unreadable worktree.
+    Each record is ``XY SP <path>`` (unquoted, NUL-terminated); a rename / copy record is
+    followed by a separate ``<origPath>`` NUL field which is consumed (not mistaken for its
+    own record). ``records`` is the list of ``XY SP <path>`` fields; ``untracked_paths`` is
+    the raw path bytes of the ``??`` entries.
     """
-    stats: list[str] = []
-    for line in porcelain_lines:
-        if not line.startswith("??"):
+    fields = raw.split(b"\0")
+    records: list[bytes] = []
+    untracked: list[bytes] = []
+    i = 0
+    while i < len(fields):
+        field = fields[i]
+        if len(field) < 3:  # empty trailing field / malformed — skip
+            i += 1
             continue
-        path = line[3:].strip()
-        try:
-            st = (repo_root / path).stat()
-            stats.append(f"{path}\0{st.st_size}\0{st.st_mtime_ns}")
-        except OSError:
-            stats.append(f"{path}\0MISSING")
-    return sorted(stats)
+        xy = field[:2]
+        path = field[3:]
+        records.append(field)
+        if xy == b"??":
+            untracked.append(path)
+        # A rename / copy (X in {R, C}) carries an extra source-path NUL field.
+        if field[:1] in (b"R", b"C"):
+            i += 2
+        else:
+            i += 1
+    return records, untracked
+
+
+def _hash_untracked(repo_root: Path, path: bytes) -> bytes:
+    """A SHA-256 of an untracked file's bytes, or a typed marker (Redmine #13843 review F1).
+
+    A content hash (not a stat) so a same-size / same-mtime rewrite of an already-untracked
+    file still flips the fingerprint. Only non-ignored untracked files reach here (``git
+    status`` omits ignored paths), so the read is bounded to real residue. An unreadable path
+    (a directory / dangling / permission) contributes a stable ``MISSING`` marker.
+    """
+    try:
+        with open(repo_root / os.fsdecode(path), "rb") as handle:
+            file_digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(65536), b""):
+                file_digest.update(chunk)
+            return file_digest.digest()
+    except OSError:
+        return b"MISSING"
 
 
 def _run_git(
-    repo_root: Path, timeout: float, *args: str
+    repo_root: Path, timeout: float, *args: str, text: bool = True
 ) -> Optional[subprocess.CompletedProcess]:
+    # ``text=False`` captures raw BYTES — required for ``-z`` (NUL-separated, unquoted paths)
+    # and ``--binary`` diffs, which are not valid text and must not be utf-8 decoded.
     try:
         return subprocess.run(
             ["git", *args],
             cwd=repo_root,
-            text=True,
+            text=text,
             capture_output=True,
             timeout=timeout,
         )
@@ -215,13 +261,18 @@ def read_live_lane_activity(
     """Observe a lane's live worker-busy / pending-composer state at action time (F2).
 
     Mirrors the ``sublane_quarantine`` inspect path: for each live managed slot it reads the
-    runtime state (``herdr agent get`` -> ``busy`` == a running turn) and the composer text
-    (``read_pane`` -> :func:`observe_composer_text`, ghost-empty-refined so an idle
-    placeholder is not a false pending). Fail-closed: an unresolved binary, an unreadable
-    runtime state (``unknown``), or an unreadable composer read yields
-    ``LaneActivityObservation(readable=False)`` — the boundary then blocks rather than
-    trusting an un-observed lane. An empty live slot set (nothing to observe) is vacuously
-    readable-quiescent (there is nothing to release either).
+    runtime state (``herdr agent get``) and the composer text (``read_pane`` ->
+    :func:`observe_composer_text`, ghost-empty-refined so an idle placeholder is not a false
+    pending).
+
+    **State allowlist (Redmine #13843 review F2, R2 hardening).** Only an explicitly QUIESCENT
+    runtime state (``awaiting_input`` / ``turn_ended``) is safe to release over. Fail-closed:
+    an unresolved binary, a mechanically-failed read (``ok=False``), OR a *successful* read
+    whose state is ``unknown`` (an observed-but-unrecognised state, ``agent_state.py``
+    contract) yields ``readable=False`` — the boundary blocks. Any other observed state (a
+    running ``busy`` turn OR a ``blocked`` permission-prompt in-flight) is NON-quiescent and
+    sets ``worker_busy`` (never mistaken for idle). An empty live slot set (nothing to observe
+    / nothing to release) is vacuously readable-quiescent.
     """
     slots = unit_slots(rows, workspace_id, lane)
     if not slots:
@@ -237,8 +288,14 @@ def read_live_lane_activity(
         HerdrCliTransport,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
-        RUNTIME_BUSY,
+        RUNTIME_AWAITING_INPUT,
+        RUNTIME_TURN_ENDED,
+        RUNTIME_UNKNOWN,
     )
+
+    # Only these two states are quiescent (safe to hibernate over); everything else is either
+    # non-quiescent (busy / blocked) or a fail-closed unknown.
+    quiescent_states = {RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED}
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
         ComposerObservation,
         observe_composer_text,
@@ -267,10 +324,12 @@ def read_live_lane_activity(
             state = state_reader.read_agent_state(locator)
         except Exception:  # noqa: BLE001 — transport failure -> fail closed
             return LaneActivityObservation(readable=False)
-        if not state.ok:
-            # An unreadable / unknown runtime state -> fail closed (never "idle").
+        if not state.ok or state.state == RUNTIME_UNKNOWN:
+            # A mechanically-failed read OR an observed-but-unrecognised state -> fail closed
+            # (never "idle"); a novel/unknown observation must not authorize a release.
             return LaneActivityObservation(readable=False)
-        if state.state == RUNTIME_BUSY:
+        if state.state not in quiescent_states:
+            # busy (running turn) or blocked (permission prompt in-flight) -> non-quiescent.
             worker_busy = True
         try:
             read = transport.read_pane(locator, lines=80)
@@ -421,6 +480,32 @@ def post_release_residue(
     )
 
 
+def fresh_release_disposition(
+    release, post_check: PostReleaseCheck
+) -> tuple[bool, str, str]:
+    """Resolve a fresh hibernate's ``(success_withheld, recovery_detail, detail)`` (#13843).
+
+    A revision-drift admission block (review F3) OR a post-release residue withholds the
+    success (the lane stays hibernated; the release is resumed later with current authority).
+    A clean release is a plain success.
+    """
+    if getattr(release, "admission_blocked", False):
+        return (
+            True,
+            post_check.recovery_detail or RECOVERY_ACTION_DETAIL,
+            "lane hibernated; release admission blocked by revision drift — success withheld, "
+            "re-drive with current authority via `sublane resume`",
+        )
+    if post_check.residue_detected:
+        return (
+            True,
+            post_check.recovery_detail,
+            "lane hibernated; managed processes released but post-release worktree residue "
+            "detected — success withheld, converge to recovery/boundary-record",
+        )
+    return False, "", "lane hibernated; managed processes released"
+
+
 def redrive_detail(
     *,
     redrive_ok: bool,
@@ -449,6 +534,7 @@ def redrive_detail(
 __all__ = (
     "BLOCK_INVENTORY_UNREADABLE",
     "LaneActivityObservation",
+    "fresh_release_disposition",
     "post_release_residue",
     "read_activity",
     "read_fingerprint",

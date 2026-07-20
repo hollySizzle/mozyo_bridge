@@ -11,6 +11,7 @@ non-active, so the W4 roster join excludes it from active capacity).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 import unittest
@@ -1624,9 +1625,10 @@ class _CP:
         self.stderr = stderr
 
 
-# A work-tree read is 3 git calls: rev-parse --is-inside-work-tree, status, diff HEAD.
-def _worktree_calls(status_out, diff_out=""):
-    return [_CP(0, "true\n"), _CP(0, status_out), _CP(0, diff_out)]
+# A work-tree read is 3 git calls: rev-parse (text), status -z (bytes), diff --binary (bytes).
+# `status_z` is NUL-separated porcelain -z bytes; `diff_out` is raw diff bytes.
+def _worktree_calls(status_z=b"", diff_out=b""):
+    return [_CP(0, "true\n"), _CP(0, status_z), _CP(0, diff_out)]
 
 
 class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
@@ -1637,16 +1639,18 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
         return LiveSublaneHibernateOps(repo_root=Path("."))
 
     def test_clean_repo_is_readable_and_clean(self) -> None:
-        with mock.patch(_LIVE_MOD_SUBPROCESS, side_effect=_worktree_calls("")):
+        with mock.patch(_LIVE_MOD_SUBPROCESS, side_effect=_worktree_calls(b"")):
             fp = self._ops().read_worktree_mutation()
         self.assertTrue(fp.readable)
         self.assertFalse(fp.dirty)
         self.assertFalse(fp.untracked)
 
     def test_dirty_repo_reports_dirty_and_untracked(self) -> None:
+        # -z porcelain: NUL-separated `XY SP path` records.
+        status = b" M src/foo.py\x00?? bar.txt\x00"
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=_worktree_calls(" M src/foo.py\n?? bar.txt\n", "diff-body"),
+            side_effect=_worktree_calls(status, b"diff-body"),
         ):
             fp = self._ops().read_worktree_mutation()
         self.assertTrue(fp.readable)
@@ -1658,16 +1662,16 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
         # Inside a work tree but `status` failed -> fail closed (never "clean").
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(0, "true\n"), _CP(128, "")],
+            side_effect=[_CP(0, "true\n"), _CP(128, b"")],
         ):
             fp = self._ops().read_worktree_mutation()
         self.assertFalse(fp.readable)
 
     def test_diff_error_is_unreadable_not_clean(self) -> None:
-        # F1: `git diff HEAD` (tracked content) failed -> fail closed (never a clean digest).
+        # F1: `git diff HEAD --binary` (tracked content) failed -> fail closed.
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=[_CP(0, "true\n"), _CP(0, " M a.py\n"), _CP(128, "")],
+            side_effect=[_CP(0, "true\n"), _CP(0, b" M a.py\x00"), _CP(128, b"")],
         ):
             fp = self._ops().read_worktree_mutation()
         self.assertFalse(fp.readable)
@@ -1707,31 +1711,30 @@ class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
         self.assertFalse(fp.readable)
 
     def test_digest_is_stable_and_order_independent(self) -> None:
-        # The digest is over the SORTED status lines + diff, so row order does not change it.
+        # The digest is over the SORTED records + diff, so record order does not change it.
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=_worktree_calls(" M a.py\n?? b.txt\n", "D"),
+            side_effect=_worktree_calls(b" M a.py\x00", b"D"),
         ):
             fp1 = self._ops().read_worktree_mutation()
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=_worktree_calls("?? b.txt\n M a.py\n", "D"),
+            side_effect=_worktree_calls(b" M a.py\x00", b"D"),
         ):
             fp2 = self._ops().read_worktree_mutation()
         self.assertEqual(fp1.digest, fp2.digest)
 
     def test_same_porcelain_rows_different_content_flip_digest(self) -> None:
-        # F1 regression: identical porcelain rows (same ` M path` / `?? path`) but changed
-        # tracked CONTENT (a worker writing more into an already-modified file) must flip the
-        # digest — the row-only digest would have missed it.
+        # F1 regression (mock): identical porcelain records (same ` M path`) but changed
+        # tracked CONTENT (`git diff --binary` differs) must flip the digest.
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=_worktree_calls(" M a.py\n", "diff v1"),
+            side_effect=_worktree_calls(b" M a.py\x00", b"diff v1"),
         ):
             fp1 = self._ops().read_worktree_mutation()
         with mock.patch(
             _LIVE_MOD_SUBPROCESS,
-            side_effect=_worktree_calls(" M a.py\n", "diff v2 (more content)"),
+            side_effect=_worktree_calls(b" M a.py\x00", b"diff v2 more"),
         ):
             fp2 = self._ops().read_worktree_mutation()
         self.assertNotEqual(fp1.digest, fp2.digest)
@@ -1789,6 +1792,52 @@ class LiveHibernateWorktreeRealGitTest(unittest.TestCase):
             self.assertTrue(fp.readable)
             self.assertFalse(fp.dirty)
             self.assertFalse(fp.untracked)
+
+    def test_binary_tracked_content_change_flips_digest(self) -> None:
+        # F1 R2: a BINARY tracked file's content change — `git diff` would collapse to
+        # "Binary files ... differ" (same text); `--binary` makes it content-sensitive.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            binpath = Path(tmp) / "blob.bin"
+            binpath.write_bytes(b"\x00\x01\x02" * 100)
+            self._git(tmp, "add", "blob.bin")
+            self._git(tmp, "commit", "-q", "-m", "add blob")
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            binpath.write_bytes(b"\x00\x01\x03" * 100)  # same length, different bytes
+            fp1 = ops.read_worktree_mutation()
+            binpath.write_bytes(b"\x00\x01\x04" * 100)  # same length again, different bytes
+            fp2 = ops.read_worktree_mutation()
+            self.assertTrue(fp1.dirty)
+            self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_same_size_untracked_rewrite_flips_digest(self) -> None:
+        # F1 R2: an untracked file rewritten to the SAME size (mtime restored) — a stat-only
+        # fingerprint would miss it; the content hash flips the digest.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            residue = Path(tmp) / "residue.py"
+            residue.write_text("AAAAA")
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            fp1 = ops.read_worktree_mutation()
+            st = residue.stat()
+            residue.write_text("BBBBB")  # same 5-byte size, different content
+            os.utime(residue, ns=(st.st_atime_ns, st.st_mtime_ns))  # restore mtime
+            fp2 = ops.read_worktree_mutation()
+            self.assertNotEqual(fp1.digest, fp2.digest)
+
+    def test_special_char_untracked_path_is_content_sensitive(self) -> None:
+        # F1 R2: a path with a space (git porcelain would QUOTE it in non-`-z`); the `-z`
+        # enumeration matches it exactly, so its content change is detected.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_repo(tmp)
+            spaced = Path(tmp) / "a file.py"
+            spaced.write_text("x")
+            ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
+            fp1 = ops.read_worktree_mutation()
+            self.assertTrue(fp1.untracked)
+            spaced.write_text("y")  # same size, different content
+            fp2 = ops.read_worktree_mutation()
+            self.assertNotEqual(fp1.digest, fp2.digest)
 
 
 # ---------------------------------------------------------------------------
@@ -1877,6 +1926,24 @@ class LiveLaneActivityTest(unittest.TestCase):
     def test_unreadable_runtime_state_fails_closed(self) -> None:
         act = self._run(state_ok=False)
         self.assertFalse(act.readable)
+
+    def test_successful_unknown_state_fails_closed(self) -> None:
+        # F2 R2: a SUCCESSFUL read (ok=True) whose state is `unknown` (observed-but-
+        # unrecognised) must fail closed, not be treated as idle.
+        act = self._run(state_ok=True, state="unknown")
+        self.assertFalse(act.readable)
+
+    def test_blocked_state_is_non_quiescent(self) -> None:
+        # F2 R2: a `blocked` permission-prompt (in-flight) is NON-quiescent -> worker_busy,
+        # never released over.
+        act = self._run(state="blocked")
+        self.assertTrue(act.readable)
+        self.assertTrue(act.worker_busy)
+
+    def test_awaiting_input_is_quiescent(self) -> None:
+        act = self._run(state="awaiting_input")
+        self.assertTrue(act.readable)
+        self.assertFalse(act.worker_busy)
 
     def test_unreadable_composer_read_fails_closed(self) -> None:
         act = self._run(read_ok=False)
@@ -2057,6 +2124,127 @@ class PartialReleaseSuccessTest(unittest.TestCase):
             ), mock.patch(f"{_CLI_MOD}.LaneLifecycleStore", return_value=store):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
+
+
+# ---------------------------------------------------------------------------
+# F3: the release driver is bound to the caller's T1-verified lifecycle revision.
+# ---------------------------------------------------------------------------
+
+
+class DriveReleaseExpectedRevisionTest(unittest.TestCase):
+    """F3 (Redmine #13843): drive_process_release admission-blocks (zero-close) when the
+    fresh row read no longer carries the caller's expected (T1-verified) revision."""
+
+    def _rows(self):
+        return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+
+    def _hibernated_store(self, tmp):
+        store = LaneLifecycleStore(home=Path(tmp))
+        key = LaneLifecycleKey(WS, LANE)
+        store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+        store.transition_disposition(
+            key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=1,
+            target=DISPOSITION_HIBERNATED, decision=_decision(),
+        )
+        return store, key
+
+    def test_revision_mismatch_admission_blocks_zero_close(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            drive_process_release,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = self._hibernated_store(tmp)
+            current = store.get(key).revision
+            ops = _FakeOps(rows=self._rows())
+            outcome = drive_process_release(
+                store=store, ops=ops, key=key, lane_id=LANE, workspace_id=WS,
+                action_id="hibernate:x", rows=self._rows(),
+                expected_revision=current + 5,  # stale / advanced authority
+            )
+            self.assertTrue(outcome.admission_blocked)
+            self.assertEqual(outcome.closed, ())
+            self.assertEqual(ops.close_calls, [])
+
+    def test_matching_revision_releases(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            drive_process_release,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store, key = self._hibernated_store(tmp)
+            current = store.get(key).revision
+            ops = _FakeOps(rows=self._rows())
+            outcome = drive_process_release(
+                store=store, ops=ops, key=key, lane_id=LANE, workspace_id=WS,
+                action_id="hibernate:x", rows=self._rows(),
+                expected_revision=current,
+            )
+            self.assertFalse(outcome.admission_blocked)
+            self.assertEqual(outcome.process_release, RELEASE_RELEASED)
+
+
+class _RevisionRaceStore(LaneLifecycleStore):
+    """A store that advances the lane's revision right before the release driver's row read
+    (the Nth get), reproducing a concurrent external authority advance in the T1->driver
+    window (Redmine #13843 review F3)."""
+
+    def __init__(self, *args, bump_at_get, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._gets = 0
+        self._bump_at_get = bump_at_get
+
+    def get(self, key):
+        self._gets += 1
+        if self._gets == self._bump_at_get:
+            rec = super().get(key)
+            if rec is not None:
+                # A benign external authority advance (re-record the partial outcome): the
+                # revision bumps, so the driver's next read no longer matches the T1 revision.
+                super().record_release_outcome(
+                    key, action_id=rec.release_action_id,
+                    expected_revision=rec.revision, target=RELEASE_PARTIAL,
+                )
+        return super().get(key)
+
+
+class RedriveRevisionRaceTest(unittest.TestCase):
+    """F3 (Redmine #13843): a redrive whose lifecycle revision advances between the T1
+    re-validation and the driver read admission-blocks (zero-close), never resuming on the
+    stale authority."""
+
+    def _rows(self):
+        return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+
+    def test_redrive_revision_race_blocks_zero_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Seed a hibernated lane with an OPEN partial release (so the redrive resumes it).
+            store = LaneLifecycleStore(home=Path(tmp))
+            key = LaneLifecycleKey(WS, LANE)
+            store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+
+            # Re-open the same lane under a race store that advances the revision right before
+            # the redrive driver's read (the 3rd get: T0, T1, driver).
+            race = _RevisionRaceStore(home=Path(tmp), bump_at_get=3)
+            retry_ops = _FakeOps(rows=self._rows())
+            outcome = SublaneHibernateUseCase(ops=retry_ops, store=race).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.already_hibernated)
+            self.assertTrue(outcome.redrive_blocked)
+            self.assertIn(
+                BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT, outcome.boundary_reasons
+            )
+            self.assertIsNone(outcome.release)
+            self.assertEqual(retry_ops.close_calls, [])
 
 
 if __name__ == "__main__":
