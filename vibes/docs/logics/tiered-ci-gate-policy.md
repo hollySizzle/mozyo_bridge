@@ -152,10 +152,16 @@ build job 内で走り `id-token` を持たないため、#13601 の OIDC 境界
   へ drop** し、その user (`id -u != 0`)・fresh `HOME`・venv 配下の package path・
   両 console script の `--version == expected` を機械照合する。repo checkout は
   container に一切現れない。**source 不在は 2 層で検証する** (#14100 review j#82881
-  F1 / j#82888): host 側で docker argv の mount を **全構文** (`-v` / `--volume` /
-  `--mount` の separate・`=` 形、および `--tmpfs` / `--volumes-from`) 正規化して集合が
-  `artifact_dir:/artifacts:ro` ちょうど 1 件である事と artifact-only directory 境界
-  (distribution file のみ) を fail-closed 検証し (等価 mount 構文での迂回を封鎖)、
+  F1 / j#82888 / j#82912): host 側で docker argv の mount を **全構文** — `-v` /
+  `--volume` / `--mount` の separate・`=` 形に加え、Docker が受理する **compact
+  glued short form `-vVALUE`**、および boolean short flag と束ねた **cluster 形
+  `-itv VALUE` / `-itvVALUE`**(`v` は letter が `v` の唯一の value-taking short flag
+  ゆえ single-dash cluster 内 `v` は必ず volume mount)、さらに `--tmpfs` /
+  `--volumes-from`(本 tool が emit しない mount 系 flag は存在で拒否) — を正規化して
+  集合が `artifact_dir:/artifacts:ro` ちょうど 1 件である事と artifact-only directory
+  境界 (distribution file のみ) を fail-closed 検証し (等価 mount 構文での迂回を封鎖。
+  compact/cluster short form の欠落は j#82912 で blocking bypass と確認、escalation
+  j#82913)、
   container 側で `/proc/self/mountinfo` を **filesystem type で観測**して pseudo-fs
   (proc/sysfs/cgroup/tmpfs/devpts…) と allowed exact (`/`・`/artifacts`・
   `/etc/{resolv.conf,hostname,hosts}`) 以外の実 fs mount が無い事を `mount_isolation`
