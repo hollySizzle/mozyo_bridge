@@ -3,6 +3,9 @@
 Redmine #12755 Add workflow step as the single standard agent command の設計方針を固定する。
 本書は `mozyo-bridge workflow step` の思想、責務境界、既存 primitive との関係を定義する。
 具体的な CLI flag、JSON field、実装 module 名、error wording は実装側 help / tests を正本にする。
+provider-neutralな orchestrator / event / authority contractは
+`vibes/docs/specs/ticket-system-neutral-orchestrator.md`を正本とする。本書のRedmine語彙は
+current 0.12.2 bindingとincrement履歴であり、製品必須providerを意味しない。
 
 ## 背景
 
@@ -28,7 +31,7 @@ mozyo-bridge が current lane / durable gate / route identity から解く。
 
 3. **交通整理は自動化し、設計判断は自動化しない。**
    route 解決、delivery rail 選択、callback rail 選択、anchor requirement の fail-closed 判定は
-   command が持つ。domain/design answer、Redmine issue 作成・選択判断、owner approval、
+   command が持つ。domain/design answer、work item 作成・選択判断、owner approval、
    review approval、release / destructive / credential 操作は command が代行しない。
 
 4. **semantic identity を route authority にする。**
@@ -69,13 +72,14 @@ mozyo-bridge workflow step --json
 - `mozyo init` 済み lane metadata
 - current lane role / provider binding
 - project scope
-- Redmine issue / latest gate journal / pending gate state
+- `DurableWorkRecordPort` 経由のwork item / latest durable event / pending gate state
+  (current bindingはRedmine issue / gate journal)
 - route identity registry / live agent inventory
 - pending delivery / callback state
 - command compatibility policy
 
 pane scrollback、chat message、active pane だけを source of truth にしない。
-Redmine anchor が存在する場合、durable gate を読まずに実行してはならない。
+durable anchor が存在する場合、provider adapter経由でgateを読まずに実行してはならない。
 
 ## State machine の出力
 
@@ -88,7 +92,7 @@ execution: executed | ready | dry_run | blocked | no_op
 reason: <fixed_reason_token>
 next_owner: workflow | caller | parent | child | grandchild | operator | owner
 primitive: <internal_primitive_or_none>
-durable_anchor: <redmine_or_ticketless_pointer_or_none>
+durable_anchor: <provider_or_ticketless_pointer_or_none>
 ```
 
 実 field 名は実装時に固定してよい。本書が固定するのは「結果が replayable であり、
@@ -102,15 +106,16 @@ durable_anchor: <redmine_or_ticketless_pointer_or_none>
 - grandparent -> parent の ticketless consultation forward
 - parent project_gateway -> child delegated_coordinator の ticketless work-intake forward
 - callback state が既に決まっている場合の structured ticketless callback
-- Redmine issue / journal anchor が既に存在し、role transition が許可されている場合の anchored handoff
+- provider-issued durable anchor が既に存在し、role transition が許可されている場合の anchored handoff
+  (current bindingはRedmine issue / journal)
 
 ## 禁止される自動実行
 
 次は `workflow step` が自動判断してはならない。
 
 - domain/design answer の作成
-- Redmine issue 作成・既存 issue 選択の判断
-- Redmine anchor なし worker dispatch
+- work item 作成・既存 item 選択の判断
+- durable work-record anchor なし worker dispatch
 - owner close approval / review approval
 - release / publish / credential / destructive operation
 - rclone / Google Drive / Finder / mount / external service operation
@@ -124,8 +129,8 @@ durable_anchor: <redmine_or_ticketless_pointer_or_none>
 | --- | --- | --- |
 | grandparent | `project-gateway route-plan` + `project-gateway consult` | routing metadata だけで parent gateway を解決し、ticketless consultation を送る。分類不能なら blocked。 |
 | parent | `project-gateway route-plan --from-role project_gateway` + `project-gateway child-intake` | domain/design を答えず、child coordinator へ ticketless work-intake を送る。same-lane / missing / ambiguous は blocked。 |
-| child | Redmine anchor 判断 + `handoff send` | anchor が必要な state を検出し、anchor 未決定なら child decision required として止まる。anchor ready なら worker dispatch を行う。 |
-| grandchild | Redmine-governed work + reply/callback | Redmine anchor を読んで実装 state を進める。anchor なしなら実行しない。 |
+| child | durable work-record anchor 判断 + `handoff send` | anchor が必要な state を検出し、anchor 未決定なら child decision required として止まる。anchor ready なら worker dispatch を行う。 |
+| grandchild | governed work + reply/callback | provider-issued durable anchor を読んで実装 state を進める。anchor なしなら実行しない。 |
 | callback side | `ticketless-callback` / `q-enter consultation_callback` | pending callback state を検出し、caller lane へ structured result を返す。 |
 
 ## as-is / to-be 説明
@@ -139,7 +144,7 @@ durable_anchor: <redmine_or_ticketless_pointer_or_none>
 2. grandparent -> parent ticketless consultation を内部 primitive へ委譲する。
 3. parent -> child ticketless work-intake を内部 primitive へ委譲する。
 4. callback state を内部 primitive へ委譲する。
-5. anchored worker dispatch は Redmine anchor ready state に限定して委譲する。
+5. anchored worker dispatch はprovider-issued durable anchor ready stateに限定して委譲する。
 6. help / docs で `workflow step` を標準入口、既存 primitive を内部 / compatibility / debug として分類する。
 
 ## GK3500 を `workflow step` で駆動するシーケンス
@@ -153,15 +158,15 @@ identity (`@mozyo_lane_kind` stamp / project scope / provider binding) から la
 | --- | --- | --- | --- |
 | 1 | grandparent (`department_root_coordinator`) | inventory 内の唯一の cockpit-visible project gateway を解決し、ticketless consultation を forward する。gateway 0 件 / 複数件 / detached は fail-closed。 | `ready` (consultation_ready) / `parent` / `project-gateway consult` |
 | 2 | parent (`project_gateway`) | same-lane self-fence 付きで child coordinator を解決し、ticketless work-intake を forward する。domain/design は答えない。same-lane / missing / ambiguous は fail-closed。 | `ready` (work_intake_ready) / `child` / `project-gateway child-intake` |
-| 3 | child (`delegated_coordinator`) | worker dispatch の Redmine anchor 要件を検出する。anchor 未決定なら `anchor_required` で停止 (child decision required)。 | `blocked` (anchor_required) / `child` / なし |
+| 3 | child (`delegated_coordinator`) | worker dispatch のdurable work-record anchor要件を検出する。current bindingではRedmine anchorを検証する。anchor未決定なら`anchor_required`で停止 (child decision required)。 | `blocked` (anchor_required) / `child` / なし |
 | 4 | grandchild (`implementation_worker`) | anchor を読んで実装 state を進める。anchor が無ければ `worker_runs_without_anchor` で停止し、child へ blocked callback を返す。 | `no_op` (redmine_work_ready) / `grandchild` / なし |
 | callback | project_gateway / delegated_coordinator | 既に決まった consultation/work-intake 結果を caller lane へ no-anchor callback rail で返す。 | `ready` (callback_ready) / `caller` / `handoff ticketless-callback` |
 
-step 3 の anchor 決定 (Redmine issue 作成 / 選択) は `workflow step` が代行しない。child が
-anchor を決めた後、その already-determined anchor を渡す escape (`--issue` / `--journal`) で
-anchored worker dispatch が表現できるが、標準 arg-free surface では `anchor_required` に
-fail-closed する。これは `## 禁止される自動実行` の Redmine issue 作成・選択判断、および
-anchor なし worker dispatch 禁止と整合する。
+step 3 の anchor 決定 (work item作成 / 選択) は `workflow step` が代行しない。childが
+anchorを決めた後、そのalready-determined anchorを渡すprovider-specific escape
+(current Redmine bindingでは`--issue` / `--journal`) でanchored worker dispatchが表現できるが、
+標準arg-free surfaceでは`anchor_required`にfail-closedする。これは
+`## 禁止される自動実行`のwork item作成・選択判断、およびanchorなしworker dispatch禁止と整合する。
 
 `--dry-run` は各 step の解決結果 (`state` / `next_action` / `execution` / `reason` /
 `next_owner` / `primitive` / `durable_anchor`) を mutate せずに返す。`--json` は同じ envelope を
