@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 2860
+    lines: 2266
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1134,6 +1134,29 @@ allowlist:
       the typed result (and drop the now-orphaned `HerdrSendEntryError` / `AUTO_TARGET_REPO` /
       `is_explicit_pane_target` facade imports, whose only uses moved into the use case). Net -184.
       Shared baseline change: reconcile at integration if another tranche/lane also edits this file.
+      Tightened 2860 -> 2266 for #13729 tranche 6 (handoff admission pipeline): the ~637-line inline
+      block that runs the fixed-order sequence of die-able admission gates over the resolved target
+      (the #12441/#13174 main-lane implementation guard, the #11779/#11822/#11908 receiver binding,
+      the #11301/#13261 session binding, the #10332 cross-workspace `--to claude` gate, the #12918
+      gateway-route enforcement, the #11625/#12658 `--target-repo` identity gate, the #12658
+      `--target-project` scope gate, the #12597 standard_target_admission inactive-split plan, and
+      the #12597 foreground-agent binding) moved to the new
+      `f_130_handoff_routing/application/handoff_admission_pipeline.py`
+      (`AdmissionPipelineUseCase` over a typed `AdmissionPipelineRequest` + `AdmissionPipelineResult`
+      + a side-effect `AdmissionPipelineOps` port; `LiveAdmissionPipelineOps` routes the two
+      monkeypatched seams (`current_session_name` / `ensure_agent_target`) through `commands` at call
+      time and imports every other effect — the config-resolving main-lane / gateway-route gates, the
+      project-discovery resolvers, the cross-session diagnostic — directly from its f_110 / f_140 /
+      f_120 module). The facade keeps one thin call site that builds the typed request from the
+      resolved target + backend predicate + raw entry scalars and reads the two crossing values (the
+      resolved admission policy + the deferred inactive-split activation plan) back off the typed
+      result (and drop the now-orphaned `resolve_standard_target_admission_policy` /
+      `evaluate_standard_target_admission` / `build_inactive_pane_fallback_command` /
+      `is_receiver_agent_process` / `normalize_path_unicode` facade imports, whose only uses moved
+      into the use case). The inactive split is NOT actuated in the use case: the real `select-pane`
+      stays deferred to the facade, after every die-able gate AND the startup-admission gate. Net
+      -594. Shared baseline change: reconcile at integration if another tranche/lane also edits this
+      file.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
