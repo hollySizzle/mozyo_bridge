@@ -38,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.project_gateway_declaration import (  # noqa: E501
     PG_DECL_DRY_RUN,
     PG_DECL_NO_SCOPE,
+    PG_DECL_SCOPE_STAMP_MISMATCH,
     declare_project_gateway_owner_row,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
@@ -48,6 +49,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADOPT_DECL_INCOMPLETE_PAIR,
     ADOPT_DECL_NO_ANCHOR,
     ADOPT_DECL_OWNER_CONFLICT,
+    ADOPT_DECL_PROVIDER_MISMATCH,
     ADOPT_DECL_STALE_SLOT,
     ADOPT_DECL_UNATTESTED,
     ADOPT_DECL_UNRESOLVED_UNIT,
@@ -92,9 +94,19 @@ def _seed_attestations(home, gw_loc=GW_LOC, wk_loc=WK_LOC) -> None:
         locator=wk_loc, verdict=VERDICT_PRESENT))
 
 
-def _declare(tmp, *, rows=None, scope=SCOPE, lane_id=LANE, dry_run, seed_att=True,
+def _seed_attestations_for(home, gw_name, wk_name, lane, gw_loc=GW_LOC, wk_loc=WK_LOC) -> None:
+    store = HerdrIdentityAttestationStore(home=home)
+    store.upsert(IdentityAttestationRecord(
+        assigned_name=gw_name, workspace_id=WS, role="codex", lane_id=lane,
+        locator=gw_loc, verdict=VERDICT_PRESENT))
+    store.upsert(IdentityAttestationRecord(
+        assigned_name=wk_name, workspace_id=WS, role="claude", lane_id=lane,
+        locator=wk_loc, verdict=VERDICT_PRESENT))
+
+
+def _declare(tmp, *, rows=None, scope=SCOPE, dry_run, seed_att=True,
              providers=("codex", "claude"), issue=ISSUE, journal=JOURNAL,
-             gw_loc=GW_LOC, wk_loc=WK_LOC):
+             workspace_id=WS, gw_loc=GW_LOC, wk_loc=WK_LOC):
     home = Path(tmp)
     if seed_att:
         _seed_attestations(home, gw_loc=gw_loc, wk_loc=wk_loc)
@@ -102,8 +114,7 @@ def _declare(tmp, *, rows=None, scope=SCOPE, lane_id=LANE, dry_run, seed_att=Tru
         journal=journal,
         issue=issue,
         project_scope=scope,
-        lane_id=lane_id,
-        workspace_id=WS,
+        workspace_id=workspace_id,
         providers=providers,
         rows=_pair_rows() if rows is None else rows,
         dry_run=dry_run,
@@ -174,13 +185,19 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             self.assertIsNone(self._row_at(tmp))
 
     def test_unresolved_unit_fails_closed(self) -> None:
+        # An empty workspace_id addresses no unit -> fail closed (the lane is derived from
+        # scope internally, so the only unit gap is the workspace).
         with tempfile.TemporaryDirectory() as tmp:
-            o = declare_project_gateway_owner_row(
-                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE, lane_id="",
-                workspace_id=WS, providers=("codex", "claude"), rows=_pair_rows(),
-                dry_run=False, store_factory=lambda: LaneDeclarationStore(home=Path(tmp)),
-                attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=Path(tmp)))
+            o = _declare(tmp, dry_run=False, workspace_id="")
             self.assertEqual(o.status, ADOPT_DECL_UNRESOLVED_UNIT)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_declaration_derives_lane_from_scope(self) -> None:
+        # The boundary owns the scope -> lane derivation (F2): the outcome's lane_id is the
+        # canonical derivation of the scope, never a caller-supplied value.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=True)
+            self.assertEqual(o.lane_id, project_gateway_lane_id(SCOPE))
 
     def test_malformed_anchor_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,7 +225,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
                 assigned_name=WK_NAME, workspace_id=WS, role="claude", lane_id=LANE,
                 locator=WK_LOC, verdict=VERDICT_PRESENT))
             o = declare_project_gateway_owner_row(
-                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE, lane_id=LANE,
+                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=_pair_rows(),
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=home),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=home))
@@ -233,15 +250,77 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             self.assertEqual(o.status, ADOPT_DECL_INCOMPLETE_PAIR)
             self.assertIsNone(self._row_at(tmp))
 
-    def test_wrong_provider_rows_not_adopted(self) -> None:
-        # The live rows carry a provider token that is NOT the declared pair (a foreign
-        # provider under this lane): no candidate resolves for either slot -> incomplete.
+    def test_wrong_provider_names_not_adopted(self) -> None:
+        # The live rows carry a provider token in their NAME that is not the declared pair:
+        # no candidate resolves for either slot -> incomplete.
         with tempfile.TemporaryDirectory() as tmp:
             foreign = [
                 _row(encode_assigned_name(WS, "gemini", LANE), GW_LOC, agent="gemini"),
                 _row(encode_assigned_name(WS, "mistral", LANE), WK_LOC, agent="mistral"),
             ]
             o = _declare(tmp, dry_run=False, rows=foreign)
+            self.assertEqual(o.status, ADOPT_DECL_INCOMPLETE_PAIR)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_surfaced_provider_mismatch_fails_closed(self) -> None:
+        # Redmine #13811 T2 R2 F1: the expected assigned NAME is present (codex/claude) and
+        # startup-attested, but the live row's DETECTED agent is a foreign provider squatting
+        # on the name. The name alone is not authority to adopt it -> provider_mismatch.
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                _row(GW_NAME, GW_LOC, agent="gemini"),  # expected codex name, foreign agent
+                _row(WK_NAME, WK_LOC, agent="claude"),
+            ]
+            o = _declare(tmp, dry_run=False, rows=rows)
+            self.assertEqual(o.status, ADOPT_DECL_PROVIDER_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_surfaced_provider_field_mismatch_fails_closed(self) -> None:
+        # Same, via the explicit `provider` field disagreeing with the expected provider.
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                _row(GW_NAME, GW_LOC, agent="codex", provider="mistral"),
+                _row(WK_NAME, WK_LOC, agent="claude"),
+            ]
+            o = _declare(tmp, dry_run=False, rows=rows)
+            self.assertEqual(o.status, ADOPT_DECL_PROVIDER_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_surfaced_scope_stamp_mismatch_fails_closed(self) -> None:
+        # Redmine #13811 T2 R2 F2: a live pane at the expected name+lane but SURFACING a
+        # project_scope stamp that disagrees with the declaration (a foreign / wrong-stamped
+        # process; how a cross-revision alias presents when observable) -> zero-write.
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                _row(GW_NAME, GW_LOC, agent="codex", project_scope="a/foreign/scope"),
+                _row(WK_NAME, WK_LOC, agent="claude"),
+            ]
+            o = _declare(tmp, dry_run=False, rows=rows)
+            self.assertEqual(o.status, PG_DECL_SCOPE_STAMP_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
+    def test_matching_scope_stamp_is_adopted(self) -> None:
+        # A surfaced stamp that MATCHES the declared scope is fine (the richer-surface case).
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                _row(GW_NAME, GW_LOC, agent="codex", project_scope=SCOPE),
+                _row(WK_NAME, WK_LOC, agent="claude", project_scope=SCOPE),
+            ]
+            o = _declare(tmp, dry_run=False, rows=rows)
+            self.assertEqual(o.status, ADOPT_DECL_DECLARED)
+
+    def test_scope_lane_mismatch_foreign_lane_rows_fail_closed(self) -> None:
+        # Redmine #13811 T2 R2 F2: the caller cannot write a scope/lane-mismatched row — the
+        # lane is derived from the scope inside the boundary. Live rows that belong to a
+        # DIFFERENT lane (a foreign scope's derivation) do not resolve against THIS scope's
+        # derived lane, so the declaration fails closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            other_lane = project_gateway_lane_id("different/foreign/scope")
+            other_gw = encode_assigned_name(WS, "codex", other_lane)
+            other_wk = encode_assigned_name(WS, "claude", other_lane)
+            _seed_attestations_for(Path(tmp), other_gw, other_wk, other_lane)
+            rows = [_row(other_gw, GW_LOC, agent="codex"), _row(other_wk, WK_LOC, agent="claude")]
+            o = _declare(tmp, dry_run=False, seed_att=False, rows=rows)
             self.assertEqual(o.status, ADOPT_DECL_INCOMPLETE_PAIR)
             self.assertIsNone(self._row_at(tmp))
 
@@ -261,7 +340,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             _seed_attestations(Path(tmp), gw_loc=GW_LOC, wk_loc=GW_LOC)
             rows = [_row(GW_NAME, GW_LOC, agent="codex"), _row(WK_NAME, GW_LOC, agent="claude")]
             o = declare_project_gateway_owner_row(
-                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE, lane_id=LANE,
+                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=rows,
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=Path(tmp)),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=Path(tmp)))
@@ -281,7 +360,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
                 declared_slots=(_a_pin(),),
             )
             o = declare_project_gateway_owner_row(
-                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE, lane_id=LANE,
+                journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=_pair_rows(),
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=home),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=home))

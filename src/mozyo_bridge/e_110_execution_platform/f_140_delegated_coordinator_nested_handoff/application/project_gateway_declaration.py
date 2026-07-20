@@ -60,13 +60,24 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADOPT_DECL_UNRESOLVED_UNIT,
     resolve_declared_pins,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
+    WorkflowRoleAuthorityError,
+    project_gateway_lane_id,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    AGENT_KEY_NAME,
     _norm,
 )
 
 #: A project-gateway declaration that requires a canonical full ``project_scope``; a caller
 #: that omits it addressed no lane and fails closed (the scope is never inferred, j#78386 §6).
 PG_DECL_NO_SCOPE = "no_project_scope"
+#: A live pane resolved for a declared slot SURFACES a ``project_scope`` stamp that disagrees
+#: with the declared scope — a foreign / wrong-stamped-scope process at this lane (a
+#: cross-revision digest alias would present this way when the stamp is observable). Zero-write
+#: (Redmine #13811 T2 R2 F2). When no stamp is surfaced (the raw ``agent list`` row shape), the
+#: full-scope adoption fence is the documented #13583 R2-F2 separate Design Consultation.
+PG_DECL_SCOPE_STAMP_MISMATCH = "scope_stamp_mismatch"
 #: The dry-run outcome: the live pair resolved and a declaration WOULD apply, but nothing was
 #: written (the default surface). ``--execute`` opts into the actual declaration.
 PG_DECL_DRY_RUN = "dry_run_plan"
@@ -128,7 +139,6 @@ def declare_project_gateway_owner_row(
     journal: str,
     issue: str,
     project_scope: str,
-    lane_id: str,
     workspace_id: str,
     providers: tuple[str, str],
     rows: Sequence[Mapping[str, object]],
@@ -142,17 +152,24 @@ def declare_project_gateway_owner_row(
 
     ``journal`` / ``issue`` are the declaration's durable decision anchor (a project lane owns
     a scope, but the journal is filed on a real issue, R2-F1). ``project_scope`` is the
-    canonical full scope (never inferred here). ``lane_id`` is the derived ``pgwv1_...`` id
-    the caller computed from the scope. ``providers`` is the ``(gateway, worker)`` provider
-    pair, ``rows`` the RAW herdr inventory. ``dry_run`` (default) writes nothing.
+    canonical full scope (never inferred here). ``providers`` is the ``(gateway, worker)``
+    provider pair, ``rows`` the RAW herdr inventory. ``dry_run`` (default) writes nothing.
+
+    **This boundary OWNS the scope -> lane derivation (Redmine #13811 T2 R2 F2).** The lane id
+    is derived here as :func:`project_gateway_lane_id(scope)`, never taken from a caller — so a
+    caller can never write a scope / lane-mismatched row, and the live pair is resolved against
+    THIS scope's derived lane (a foreign-lane process fails closed as an incomplete pair). A
+    cross-revision digest alias (two scopes deriving to one lane) is then bounded by the
+    ``(workspace, lane_id)`` primary key: the second scope's declaration is a divergent
+    re-declare at the same key and is refused (owner conflict), so one scope owns the lane.
 
     Returns a :class:`ProjectGatewayDeclarationOutcome`; every refusal is zero-write.
     """
     journal = _norm(journal)
     issue = _norm(issue)
     scope = _norm(project_scope)
-    lane = _norm(lane_id)
     workspace = _norm(workspace_id)
+    lane = ""
 
     def _fail(status: str, detail: str = "") -> ProjectGatewayDeclarationOutcome:
         return ProjectGatewayDeclarationOutcome(
@@ -168,8 +185,14 @@ def declare_project_gateway_owner_row(
         return _fail(ADOPT_DECL_NO_ANCHOR, "a project-gateway declaration requires an issue + journal anchor")
     if not scope:
         return _fail(PG_DECL_NO_SCOPE, "a project-gateway lane requires a canonical full project scope")
-    if not (workspace and lane):
-        return _fail(ADOPT_DECL_UNRESOLVED_UNIT, "the project-gateway workspace / lane unit is unresolved")
+    # The lane id is DERIVED from the canonical scope here (never caller-supplied) so the
+    # stored scope and lane are congruent by construction (F2).
+    try:
+        lane = project_gateway_lane_id(scope)
+    except WorkflowRoleAuthorityError:
+        return _fail(PG_DECL_NO_SCOPE, "the project scope does not derive a project-gateway lane")
+    if not workspace:
+        return _fail(ADOPT_DECL_UNRESOLVED_UNIT, "the project-gateway workspace is unresolved")
     try:
         decision = DecisionPointer(source="redmine", issue_id=issue, journal_id=journal)
     except (DecisionPointerError, ValueError):
@@ -190,6 +213,23 @@ def declare_project_gateway_owner_row(
         # A fail-closed gate (unreadable / duplicate / stale / unattested / ambiguous slot):
         # zero-write, the live pair is not the exact declared generation.
         return _fail(reason, "the live pair did not resolve to an exact attested generation")
+
+    # Action-time route-identity join (F2): if a resolved live pane SURFACES its adopted
+    # ``project_scope`` stamp and it disagrees with THIS declaration's scope, a foreign /
+    # wrong-stamped process is at this lane (how a cross-revision digest alias would present
+    # when observable) — fail closed. A raw ``agent list`` row surfaces no stamp, so this is
+    # tolerant there (the unobservable full-scope alias fence is the #13583 R2-F2 consultation).
+    declared_names = {pin.assigned_name for pin in pins}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if _norm(row.get(AGENT_KEY_NAME)) in declared_names:
+            stamped = _norm(row.get("project_scope"))
+            if stamped and stamped != scope:
+                return _fail(
+                    PG_DECL_SCOPE_STAMP_MISMATCH,
+                    "a live pane's surfaced project_scope stamp disagrees with the declaration",
+                )
 
     planned = tuple(
         (pin.role, pin.provider, pin.assigned_name, pin.locator) for pin in pins

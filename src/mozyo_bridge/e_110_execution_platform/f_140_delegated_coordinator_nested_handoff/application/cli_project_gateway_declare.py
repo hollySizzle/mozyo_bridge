@@ -17,7 +17,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.project_gateway_declaration import (  # noqa: E501
     ProjectGatewayDeclarationOutcome,
@@ -119,8 +119,8 @@ class ProjectGatewayDeclareUseCase:
     ) -> ProjectGatewayDeclarationOutcome:
         scope = _norm(request.project_scope)
         workspace_id = _norm(self.ops.workspace_id())
-        # The derived lane id is deterministic from the canonical scope (never hand-authored,
-        # #13583). An empty scope has no derived lane; the declaration fn fails closed on it.
+        # The derived lane id is authoritative inside declare_project_gateway_owner_row (F2);
+        # here it is computed only for the pre-declaration fail-closed outcomes' display.
         try:
             lane_id = project_gateway_lane_id(scope) if scope else ""
         except WorkflowRoleAuthorityError:
@@ -156,7 +156,6 @@ class ProjectGatewayDeclareUseCase:
             journal=request.journal,
             issue=request.issue,
             project_scope=scope,
-            lane_id=lane_id,
             workspace_id=workspace_id,
             providers=(gateway_provider, worker_provider),
             rows=rows,

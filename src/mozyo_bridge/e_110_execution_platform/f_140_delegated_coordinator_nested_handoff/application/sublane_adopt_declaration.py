@@ -97,6 +97,12 @@ ADOPT_DECL_INCOMPLETE_PAIR = "incomplete_live_pair"
 ADOPT_DECL_DUPLICATE_CANDIDATES = "duplicate_live_candidates"
 ADOPT_DECL_STALE_SLOT = "stale_named_slot"
 ADOPT_DECL_AMBIGUOUS_LOCATORS = "ambiguous_locators"
+#: The candidate resolved by its assigned NAME's provider token, but the LIVE row surfaces a
+#: detected provider (``provider`` / ``agent`` field) that disagrees — a foreign / wrong
+#: provider process squatting on the expected name. The name alone is never enough authority
+#: to adopt it as the expected provider (Redmine #13811 T2 R2 F1; ``managed-state-model.md``
+#: "live surfaced provider / detected-agent が resolved provider と一致"): zero-write.
+ADOPT_DECL_PROVIDER_MISMATCH = "provider_mismatch"
 ADOPT_DECL_UNATTESTED = "unattested_slot"
 ADOPT_DECL_BAD_TOKEN = "unresolvable_worktree_token"
 ADOPT_DECL_BAD_ANCHOR = "unusable_decision_anchor"
@@ -139,6 +145,7 @@ ADOPT_DECL_OWNER_UNBOUND = frozenset(
         ADOPT_DECL_DUPLICATE_CANDIDATES,
         ADOPT_DECL_STALE_SLOT,
         ADOPT_DECL_AMBIGUOUS_LOCATORS,
+        ADOPT_DECL_PROVIDER_MISMATCH,
         ADOPT_DECL_UNATTESTED,
         ADOPT_DECL_BAD_TOKEN,
         ADOPT_DECL_BAD_ANCHOR,
@@ -160,6 +167,7 @@ ADOPT_DECL_ZERO_WRITE = frozenset(
         ADOPT_DECL_DUPLICATE_CANDIDATES,
         ADOPT_DECL_STALE_SLOT,
         ADOPT_DECL_AMBIGUOUS_LOCATORS,
+        ADOPT_DECL_PROVIDER_MISMATCH,
         ADOPT_DECL_UNATTESTED,
         ADOPT_DECL_BAD_TOKEN,
         ADOPT_DECL_BAD_ANCHOR,
@@ -230,6 +238,21 @@ def _resolve_attested_slot(
     if classify_named_slot(row) != SLOT_LIVE:
         # A locator-bearing stale shell residue is never adopted.
         return (None, ADOPT_DECL_STALE_SLOT)
+    # The candidate was resolved by its assigned NAME's provider token; but the live row also
+    # surfaces its detected provider two ways — its ``provider`` field and its detected-agent
+    # field (``agent``, which on a live pane holds the provider id, #13846). If EITHER is
+    # surfaced and disagrees with the expected provider, a foreign / wrong-provider process is
+    # squatting on the expected name — never adopted as this provider (Redmine #13811 T2 R2
+    # F1; ``managed-state-model.md`` "live surfaced provider / detected-agent が resolved
+    # provider と一致"). Only an UNsurfaced (legacy / minimal) row falls back to the
+    # name-encoded provider.
+    want_provider = _norm(provider)
+    live_row_provider = _norm(row.get("provider"))
+    live_detected_agent = _norm(row.get("agent"))
+    if (live_row_provider and live_row_provider != want_provider) or (
+        live_detected_agent and live_detected_agent != want_provider
+    ):
+        return (None, ADOPT_DECL_PROVIDER_MISMATCH)
     assigned_name = _norm(row.get(AGENT_KEY_NAME))
     locator = _norm(_agent_locator(row))
     if not assigned_name or not locator:
