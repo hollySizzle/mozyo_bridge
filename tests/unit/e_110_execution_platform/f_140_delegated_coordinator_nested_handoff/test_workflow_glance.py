@@ -703,39 +703,58 @@ class JournalGrammarTest(unittest.TestCase):
                 self.assertIsNone(fold_issue_gate_facts([_j("100", notes)]))
 
 
-#: A canonical Review Generation Marker Contract v2 identity: a full 40-hex head + numeric req.
+#: Two full 40-hex commit heads (Review Generation Marker Contract v2 identity).
 _HEAD = "6109b1573ec192cf67e596e24831b6524f4c40bf"
+_HEAD2 = "aa6a150f74329732e99af78ea193e27a78dc01f4"
+_REQ_J = "90"  # a review_request journal id (< the review_result journal id 100)
+_RES_J = "100"
 
 
-def _rr_marker(conclusion=None, *, head=_HEAD, req="83241", extra=""):
-    """A ``review_result`` marker literal (defaults to a canonical v2 identity)."""
+def _request_journal(*, head=_HEAD, jid=_REQ_J, heading="## Gate: Review Request"):
+    """A canonical review_request journal (carries the round's pinned head)."""
+    return _j(jid, f"{heading}\n[mozyo:workflow-event:gate=review_request:head={head}]")
+
+
+def _result_journal(
+    conclusion=None, *, head=_HEAD, req=_REQ_J, jid=_RES_J, heading="## Gate: Review", body="", blocker=False
+):
+    """A review_result journal marker (defaults to a shape that is canonical against `_request_journal`)."""
     fields = ["gate=review_result"]
     if conclusion is not None:
         fields.append(f"conclusion={conclusion}")
-    if extra:
-        fields.append(extra)
+    if blocker:
+        fields.append("blocker=1")
     if head is not None:
         fields.append(f"head={head}")
     if req is not None:
         fields.append(f"req={req}")
-    return "[mozyo:workflow-event:" + ":".join(fields) + "]"
+    marker = "[mozyo:workflow-event:" + ":".join(fields) + "]"
+    note = heading + (("\n" + body) if body else "") + "\n" + marker
+    return _j(jid, note)
+
+
+def _review(conclusion=None, **result_kw):
+    """A canonical review pair: the review_request journal + a review_result journal answering it."""
+    head = result_kw.pop("head", _HEAD)
+    return [_request_journal(head=head), _result_journal(conclusion, head=head, **result_kw)]
 
 
 class StructuredMarkerAuthorityTest(unittest.TestCase):
-    """Redmine #13952 R3: the canonical ``[mozyo:workflow-event:gate=review_result:...]`` marker.
+    """Redmine #13952 R3/R4: the generation-correlated ``gate=review_result`` marker authority.
 
-    Live evidence (installed 0.12.2, j#83324): #13811 j#83313 and #13951 j#83311 both carried
-    ``gate=review_result:conclusion=changes_requested`` (with a full head + req) but fell to
+    Live evidence (installed 0.12.2, j#83324): #13811 j#83313 and #13951 j#83311 both carried a
+    full-head ``gate=review_result:conclusion=changes_requested`` marker but fell to
     ``review_waiting`` / "auditor review owed", while #13884 j#83307 projected ``implementing`` /
-    worker. The cause was that the conclusion was read only from a plain ``結論:`` field / heading
-    qualifier: a Markdown-emphasized value (``結論: **changes_requested**``) or an English
-    ``conclusion:`` label was dropped to ``pending``. The structured marker is now the
-    authority — but ONLY when it meets the v2 identity (full head + numeric req + explicit
-    conclusion); a malformed / missing marker fails closed (review j#83388 F1/F2).
+    worker — because the conclusion was read only from a plain ``結論:`` field / heading qualifier
+    (a Markdown-emphasized value or an English ``conclusion:`` label was dropped to ``pending``).
+    The structured marker is now the authority, but ONLY when it EXACT-CORRELATES to the review
+    round it answers (its ``req`` = the correlated review_request journal, its full head = that
+    request's head, explicit conclusion). A malformed / uncorrelated marker fails closed to
+    ``pending`` yet still shadows an older review (reviews j#83388 F1/F2, j#83422 F3/F4).
     """
 
-    def _owner(self, notes):
-        facts = fold_issue_gate_facts([_j("100", notes)])
+    def _fold(self, journals):
+        facts = fold_issue_gate_facts(journals)
         if facts is None:
             return None, None, None
         row = fold_glance_row(
@@ -747,18 +766,21 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         )
         return facts, row.workflow_state, row.next_owner
 
-    # -- the three live j#83324 shapes (all carry a canonical marker) --------------------
+    # -- the three live j#83324 shapes (each carries a canonical, correlated marker) -----
 
     def test_marker_recovers_conclusion_when_the_field_carries_markdown_emphasis(self):
         # #13951 j#83311 verbatim shape: the ``結論`` value is bold, so the exact-match field
-        # read drops it — but the canonical marker is authoritative, so it still folds to worker.
-        notes = (
-            "## Gate: Review — public callback lease recovery rail R1\n"
-            "- 再review要否: true\n"
-            "- 結論: **changes_requested**\n\n"
-            + _rr_marker("changes_requested", head="7e535672b01c5a188846a10d84511c68ec386e4b", req="83188")
-        )
-        facts, state, owner = self._owner(notes)
+        # read drops it — but the correlated marker is authoritative, so it folds to worker.
+        h = "7e535672b01c5a188846a10d84511c68ec386e4b"
+        journals = [
+            _request_journal(head=h, jid="83188"),
+            _result_journal(
+                "changes_requested", head=h, req="83188", jid="83311",
+                heading="## Gate: Review — public callback lease recovery rail R1",
+                body="- 再review要否: true\n- 結論: **changes_requested**",
+            ),
+        ]
+        facts, state, owner = self._fold(journals)
         self.assertEqual(facts.latest_gate, _GATE_REVIEW)
         self.assertEqual(facts.review_conclusion, REVIEW_CHANGES_REQUESTED)
         self.assertEqual((state, owner), ("implementing", OWNER_WORKER))
@@ -766,103 +788,158 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
     def test_marker_recovers_conclusion_when_the_label_is_english_and_bold(self):
         # #13811 j#83313 verbatim shape: an English ``conclusion:`` label (not ``結論``) + bold
         # value + a topic-only heading qualifier — none read by the body grammar; the marker does.
-        notes = (
-            "## Gate: Review — project-gateway hibernate exact-generation fence (T1 R2)\n"
-            "- review_request: j#83236\n"
-            "- conclusion: **changes_requested**\n\n"
-            + _rr_marker("changes_requested", head="aa6a150f74329732e99af78ea193e27a78dc01f4", req="83236")
-        )
-        facts, state, owner = self._owner(notes)
+        journals = [
+            _request_journal(head=_HEAD2, jid="83236"),
+            _result_journal(
+                "changes_requested", head=_HEAD2, req="83236", jid="83313",
+                heading="## Gate: Review — project-gateway hibernate exact-generation fence (T1 R2)",
+                body="- review_request: j#83236\n- conclusion: **changes_requested**",
+            ),
+        ]
+        facts, state, owner = self._fold(journals)
         self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_CHANGES_REQUESTED, "implementing", OWNER_WORKER))
 
     def test_plain_field_shape_is_unchanged(self):
         # #13884 j#83307 verbatim shape: a plain ``結論: 要修正`` field already worked; the marker
         # agrees, so the projection is unchanged (no regression on the shape that was correct).
-        notes = "## Gate: Review\n- 結論: 要修正\n\n" + _rr_marker("changes_requested")
-        facts, state, owner = self._owner(notes)
+        facts, state, owner = self._fold(_review("changes_requested", body="- 結論: 要修正"))
         self.assertEqual((state, owner), ("implementing", OWNER_WORKER))
 
-    # -- authority + robustness (canonical markers) --------------------------------------
+    # -- authority + robustness (canonical, correlated markers) --------------------------
 
     def test_marker_conclusion_outranks_a_disagreeing_field(self):
-        # A canonical marker is the machine authority: it wins over the body field on disagreement.
-        facts, state, _ = self._owner("## Gate: Review\n- 結論: 承認\n\n" + _rr_marker("changes_requested"))
+        # A correlated marker is the machine authority: it wins over the body field on disagreement.
+        facts, state, _ = self._fold(_review("changes_requested", body="- 結論: 承認"))
         self.assertEqual((facts.review_conclusion, state), (REVIEW_CHANGES_REQUESTED, "implementing"))
 
     def test_marker_position_and_trailing_placement_do_not_lose_it(self):
-        # The canonical marker is read wherever it sits (before the heading, or last after findings).
-        for notes in (
-            _rr_marker("changes_requested") + "\n## Gate: Review\n- finding_1",
-            "## Gate: Review\n### Findings\n- F1 ...\n- F2 ...\n\n" + _rr_marker("changes_requested"),
-        ):
-            with self.subTest(notes=notes):
-                facts, state, _ = self._owner(notes)
-                self.assertEqual((facts.review_conclusion, state), (REVIEW_CHANGES_REQUESTED, "implementing"))
+        # The marker is read wherever it sits in the review_result note (mid-body or trailing).
+        journals = [
+            _request_journal(),
+            _result_journal(
+                "changes_requested",
+                heading="## Gate: Review",
+                body="### Findings\n- F1 ...\n- F2 ...",
+            ),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_CHANGES_REQUESTED, "implementing"))
 
     def test_approved_and_blocker_markers_project_their_outcomes(self):
-        approved, state_a, owner_a = self._owner("## Gate: Review\n" + _rr_marker("approved"))
+        approved, state_a, owner_a = self._fold(_review("approved"))
         self.assertEqual((approved.review_conclusion, state_a, owner_a), ("approved", "owner_waiting", OWNER_COORDINATOR))
-        blocker, state_b, owner_b = self._owner(
-            "## Gate: Review\n" + _rr_marker("changes_requested", extra="blocker=1")
-        )
+        blocker, state_b, owner_b = self._fold(_review("changes_requested", blocker=True))
         self.assertTrue(blocker.blocker_recorded)
         self.assertEqual((state_b, owner_b), ("blocked", OWNER_COORDINATOR))
 
     def test_canonical_marker_establishes_the_review_gate_without_a_gate_heading(self):
-        # A reworded heading (the exact drift class #13952 keeps hitting) still folds, because a
-        # CANONICAL marker independently establishes the review gate.
-        facts, state, owner = self._owner("## Durable review note (reworded heading)\n" + _rr_marker("changes_requested"))
+        # A reworded review_result heading still folds, because the correlated marker independently
+        # establishes the review gate.
+        facts, state, owner = self._fold(
+            _review("changes_requested", heading="## Durable review note (reworded heading)")
+        )
         self.assertEqual((facts.latest_gate, state, owner), (_GATE_REVIEW, "implementing", OWNER_WORKER))
 
-    # -- fail-closed identity fence (review j#83388 F1/F2) -------------------------------
+    # -- fail-closed: body fallback + shape identity (reviews j#83388 F1/F2) --------------
 
     def test_malformed_conclusion_marker_does_not_fall_back_to_the_body(self):
         # F1: a review_result marker with an out-of-vocabulary conclusion must NOT let the body
         # ``結論: 承認`` promote the lane — the marker's presence forbids the fallback.
-        facts, state, owner = self._owner("## Gate: Review\n- 結論: 承認\n" + _rr_marker("bogus"))
+        facts, state, owner = self._fold(_review("bogus", body="- 結論: 承認"))
         self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_AUDITOR))
 
-    def test_a_valid_and_an_invalid_marker_together_fail_closed(self):
-        # F1: a valid changes_requested marker alongside a malformed one is not "one clear
-        # outcome" — the malformed marker shadows the journal to pending.
-        facts, state, _ = self._owner(
-            "## Gate: Review\n" + _rr_marker("changes_requested") + "\n" + _rr_marker("bogus")
-        )
-        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
-
     def test_marker_missing_head_is_not_authoritative(self):
-        # F2: no head -> malformed identity -> shadow. With a gate heading the review is pending;
-        # with a reworded heading there is no marker-only gate at all (unknown).
-        facts, state, _ = self._owner("## Gate: Review\n" + _rr_marker("changes_requested", head=None))
+        # F2: no head -> shape identity fails -> shadow (pending) even with a correlated request.
+        facts, state, _ = self._fold(_review("changes_requested", head=None))
         self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
-        self.assertIsNone(self._owner("## Durable review\n" + _rr_marker("changes_requested", head=None))[0])
 
     def test_marker_abbreviated_or_upper_head_is_not_authoritative(self):
         # F2: a truncated / upper-case head is not a full commit head (v2 identity fails closed).
         for bad in ("abc123", _HEAD.upper(), _HEAD[:39], _HEAD + "0"):
             with self.subTest(head=bad):
-                facts, state, _ = self._owner("## Gate: Review\n" + _rr_marker("approved", head=bad))
+                facts, state, _ = self._fold(_review("approved", head=bad))
                 self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
 
     def test_marker_missing_or_nonnumeric_req_is_not_authoritative(self):
-        # F2: the answered review_request journal must be a non-blank numeric id.
+        # F2/F4: the declared req must be a non-blank numeric id AND correlate to a real request.
         for bad in (None, "x", "j83188", ""):
             with self.subTest(req=bad):
-                facts, state, _ = self._owner("## Gate: Review\n" + _rr_marker("changes_requested", req=bad))
+                facts, state, _ = self._fold(
+                    [_request_journal(), _result_journal("changes_requested", req=bad)]
+                )
                 self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
 
     def test_canonical_marker_without_a_conclusion_is_audit_owed(self):
-        # A review whose canonical-identity marker speaks no conclusion (and no field) is
-        # fail-closed to pending — the audit is still owed, never guessed.
-        facts, state, owner = self._owner("## Gate: Review\n" + _rr_marker(None))
+        # A correlated review whose marker speaks no conclusion (and no field) is fail-closed to
+        # pending — the audit is still owed, never guessed.
+        facts, state, owner = self._fold(_review(None))
         self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_AUDITOR))
 
-    def test_conflicting_canonical_markers_fail_closed(self):
-        # Two canonical markers that disagree are ambiguous -> pending (never a coin-flip).
-        facts, state, _ = self._owner(
-            "## Gate: Review\n" + _rr_marker("approved") + "\n" + _rr_marker("changes_requested")
+    def test_conflicting_markers_on_one_journal_fail_closed(self):
+        # Two review_result markers on one journal disagree -> ambiguous -> pending.
+        journals = [
+            _request_journal(),
+            _j(
+                _RES_J,
+                "## Gate: Review\n"
+                f"[mozyo:workflow-event:gate=review_result:conclusion=approved:head={_HEAD}:req={_REQ_J}]\n"
+                f"[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head={_HEAD}:req={_REQ_J}]",
+            ),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    # -- fail-closed: review-generation correlation (review j#83422 F3/F4) ----------------
+
+    def test_head_drift_from_the_request_is_not_authoritative(self):
+        # F4: the review_result head must EQUAL the review_request head it answers.
+        facts, state, _ = self._fold(
+            [_request_journal(head=_HEAD2), _result_journal("approved", head=_HEAD, req=_REQ_J)]
         )
         self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_nonexistent_or_zero_req_is_not_authoritative(self):
+        # F4: a req pointing at no real review_request journal (or ``0``) correlates to nothing.
+        for bad_req in ("999", "0"):
+            with self.subTest(req=bad_req):
+                facts, state, _ = self._fold(
+                    [_request_journal(), _result_journal("approved", req=bad_req)]
+                )
+                self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_uncorrelated_result_without_a_preceding_request_is_not_authoritative(self):
+        # F4: a review_result with no preceding review_request is an uncorrelated outcome -> pending.
+        facts, state, _ = self._fold([_result_journal("approved")])
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_newer_malformed_review_shadows_an_older_approved(self):
+        # F3: the durable-history regression. j90 request, j100 canonical approved, j101 a newer
+        # reworded + malformed review. j101 must still count (shadow) so the old approved does NOT
+        # re-surface as the latest authority.
+        journals = [
+            _request_journal(jid="90"),
+            _result_journal("approved", head=_HEAD, req="90", jid="100"),
+            _result_journal(
+                "bogus", head=_HEAD, req="90", jid="101", heading="## Durable review reworded"
+            ),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual(facts.latest_gate_journal, "101")  # the newer bad review is the latest
+        self.assertEqual((facts.review_conclusion, state), (REVIEW_PENDING, "review_waiting"))
+
+    def test_newer_valid_review_supersedes_an_older_one(self):
+        # The healthy counterpart: a newer CANONICAL review wins over an older canonical review.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _result_journal("changes_requested", head=_HEAD, req="90", jid="100"),
+            _request_journal(head=_HEAD2, jid="110"),
+            _result_journal("approved", head=_HEAD2, req="110", jid="120"),
+        ]
+        facts, state, owner = self._fold(journals)
+        self.assertEqual(facts.latest_gate_journal, "120")
+        self.assertEqual((facts.review_conclusion, state, owner), ("approved", "owner_waiting", OWNER_COORDINATOR))
+
+    # -- non-review markers ---------------------------------------------------------------
 
     def test_review_finding_verdict_marker_is_not_an_audit_review(self):
         # The implementer's verdict marker is not gate-bearing: it must never become a review.

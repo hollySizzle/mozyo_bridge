@@ -114,17 +114,18 @@ class TemplateMandatedJournalsFoldThroughTheGrammar(unittest.TestCase):
 
 
 class StructuredMarkerProducerConsumerContract(unittest.TestCase):
-    """Redmine #13952 R3: the marker PRODUCER and the glance CONSUMER share ONE token grammar.
+    """Redmine #13952 R3/R4: the marker PRODUCER and the glance CONSUMER share ONE token grammar.
 
-    The R2 fix pinned the heading / ``結論`` field literals. R3 adds the second drift the same
+    The R2 fix pinned the heading / ``結論`` field literals. R3/R4 adds the second drift the same
     issue kept hitting: a durable review recorded with the canonical structured marker
-    (``[mozyo:workflow-event:gate=review_result:conclusion=…]``) but a reworded heading or a
-    Markdown-emphasized / English-labelled body conclusion was dropped to ``pending`` — the
-    coordinator saw "auditor review owed" for a review that had already concluded
+    (``[mozyo:workflow-event:gate=review_result:conclusion=…:head=…:req=…]``) but a reworded
+    heading or a Markdown-emphasized / English-labelled body conclusion was dropped to ``pending``
+    — the coordinator saw "auditor review owed" for a review that had already concluded
     changes_requested (installed 0.12.2, j#83324: #13811 j#83313 / #13951 j#83311). The consumer
-    now reads the marker as the unambiguous authority, and it reads it through the SAME
-    :func:`render_workflow_event_marker` producer contract the watcher uses — so the two cannot
-    re-fork. This drives the *producer renderer's own output* through the *glance grammar*.
+    now reads the marker as the authority only when it EXACT-CORRELATES to its rendered
+    review_request, both read through the SAME :func:`render_workflow_event_marker` producer
+    contract — so the two cannot re-fork. This drives the producer's own review_request AND the
+    review_result that answers it through the *glance grammar*.
     """
 
     def test_rendered_review_result_marker_folds_to_its_conclusion(self) -> None:
@@ -142,7 +143,13 @@ class StructuredMarkerProducerConsumerContract(unittest.TestCase):
                     target_head="a" * 40,
                     review_request_journal="83188",
                 )
-                facts = fold_issue_gate_facts([("83311", f"## Gate: Review\n{marker}")])
+                request = render_workflow_event_marker("review_request", target_head="a" * 40)
+                facts = fold_issue_gate_facts(
+                    [
+                        ("83188", f"## Gate: Review Request\n{request}"),
+                        ("83311", f"## Gate: Review\n{marker}"),
+                    ]
+                )
                 self.assertIsNotNone(facts)
                 self.assertEqual(facts.latest_gate, GATE_REVIEW)
                 self.assertEqual(facts.review_conclusion, expected_conclusion)
@@ -164,11 +171,29 @@ class StructuredMarkerProducerConsumerContract(unittest.TestCase):
             target_head="a" * 40,
             review_request_journal="83236",
         )
-        facts = fold_issue_gate_facts([("83313", note)])
+        request = render_workflow_event_marker("review_request", target_head="a" * 40)
+        facts = fold_issue_gate_facts(
+            [("83236", f"## Gate: Review Request\n{request}"), ("83313", note)]
+        )
         self.assertEqual(facts.latest_gate, GATE_REVIEW)
         self.assertEqual(facts.review_conclusion, REVIEW_CHANGES_REQUESTED)
         self.assertEqual(
             classify_lane_state(lane_signal_from_gate_facts("13952", facts)), "implementing"
+        )
+
+    def test_uncorrelated_rendered_marker_fails_closed(self) -> None:
+        # F4 producer-contract corollary: the SAME rendered review_result marker, folded WITHOUT
+        # its review_request in history, is uncorrelated -> pending (never authoritative alone).
+        marker = render_workflow_event_marker(
+            "review_result",
+            conclusion="approved",
+            target_head="a" * 40,
+            review_request_journal="83236",
+        )
+        facts = fold_issue_gate_facts([("83313", f"## Gate: Review\n{marker}")])
+        self.assertEqual(facts.review_conclusion, "pending")
+        self.assertEqual(
+            classify_lane_state(lane_signal_from_gate_facts("13952", facts)), "review_waiting"
         )
 
 
