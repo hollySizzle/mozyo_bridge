@@ -65,6 +65,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
+    RELEASE_NOT_REQUESTED,
+    RELEASE_RELEASED,
     CasOutcome,
     DecisionPointer,
     DecisionPointerError,
@@ -83,6 +85,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     declared_generation_attested,
     declared_generation_exactly_live,
     drive_process_release,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_toctou import (  # noqa: E501
+    BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT,
+    BLOCK_RELEASE_BOUNDARY_MUTATION,
+    BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,
+    BLOCK_WORKTREE_UNREADABLE,
+    WorktreeMutationFingerprint,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
+    LaneActivityObservation,
+    fresh_release_disposition,
+    post_release_residue,
+    read_fingerprint,
+    read_live_lane_activity,
+    read_live_worktree_fingerprint,
+    redrive_detail,
+    revalidate_boundary,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
@@ -276,20 +295,57 @@ class HibernateOutcome:
     transition: Optional[CasOutcome] = None
     release: Optional[ReleaseOutcome] = None
     detail: str = ""
+    #: Redmine #13843: the release-boundary (T1) re-validation fired on the fresh path (zero
+    #: transition / zero close). A redrive boundary block folds into :attr:`redrive_blocked`.
+    boundary_blocked: bool = False
+    #: The typed reasons the boundary re-validation blocked (rendered with the preflight ones).
+    boundary_reasons: tuple[str, ...] = ()
+    #: Redmine #13843: the post-release (T2) check / release admission block withheld a success
+    #: — the lane stays hibernated (work preserved) and :attr:`recovery_detail` names the next
+    #: action.
+    success_withheld: bool = False
+    recovery_detail: str = ""
 
     @property
     def is_blocked(self) -> bool:
         if self.already_hibernated:
             # A re-drive on an already-hibernated lane still fails closed when its
-            # current preservation gate is unmet or the inventory is unreadable (R1-F2):
-            # never a silent zero-close reported as success.
+            # current preservation gate is unmet, the inventory is unreadable (R1-F2), or the
+            # release-boundary re-validation fired (Redmine #13843): never a silent zero-close
+            # reported as success.
             return self.redrive_blocked
+        # Redmine #13843: the release-boundary re-validation blocked the fresh path (pre-CAS,
+        # zero mutation).
+        if self.boundary_blocked:
+            return True
         if not self.preflight.may_hibernate:
             return True
         # A commit that was attempted but not applied (a lost CAS race) is a block.
         if self.executed and self.transition is not None and not self.transition.applied:
             return True
         return False
+
+    @property
+    def blocked_reasons(self) -> tuple[str, ...]:
+        """The preflight blocked reasons plus any release-boundary (T1) reasons (#13843)."""
+        return tuple(self.preflight.blocked_reasons) + tuple(self.boundary_reasons)
+
+    @property
+    def is_success(self) -> bool:
+        """A clean, FULLY-actuated hibernate success (Redmine #13843 review F5).
+
+        Requires the release to have COMPLETED — ``released`` (every slot closed) or
+        ``not_requested`` (no live slot / dead processes); a ``partial`` / ``requested`` /
+        refused release is an incomplete actuation (re-drive needed), not a clean success.
+        """
+        if not self.executed or self.is_blocked or self.success_withheld:
+            return False
+        if self.release is not None and self.release.process_release not in (
+            RELEASE_RELEASED,
+            RELEASE_NOT_REQUESTED,
+        ):
+            return False
+        return True
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -300,6 +356,12 @@ class HibernateOutcome:
             "already_hibernated": self.already_hibernated,
             "redrive_blocked": self.redrive_blocked,
             "is_blocked": self.is_blocked,
+            "is_success": self.is_success,
+            "boundary_blocked": self.boundary_blocked,
+            "boundary_reasons": list(self.boundary_reasons),
+            "success_withheld": self.success_withheld,
+            "recovery_detail": self.recovery_detail,
+            "blocked_reasons": list(self.blocked_reasons),
             "preflight": self.preflight.as_payload(),
             "transition": (
                 {"applied": self.transition.applied, "reason": self.transition.reason,
@@ -328,6 +390,12 @@ class SublaneHibernateOps(Protocol):
     def read_attestation(
         self, assigned_name: str
     ) -> Optional[IdentityAttestationRecord]: ...
+
+    def read_worktree_mutation(self) -> WorktreeMutationFingerprint: ...
+
+    def read_lane_activity(
+        self, workspace_id: str, lane: str, rows: Sequence[Mapping[str, object]]
+    ) -> LaneActivityObservation: ...
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult: ...
 
@@ -386,6 +454,19 @@ class LiveSublaneHibernateOps:
             return HerdrIdentityAttestationStore().read(assigned_name)
         except Exception:  # noqa: BLE001 — unreadable attestation -> None -> gate fails closed
             return None
+
+    def read_worktree_mutation(self) -> WorktreeMutationFingerprint:
+        """Live worktree fingerprint (#13843) — delegates to the tri-state fail-closed probe."""
+        return read_live_worktree_fingerprint(self.repo_root, self.timeout)
+
+    def read_lane_activity(
+        self, workspace_id: str, lane: str, rows: Sequence[Mapping[str, object]]
+    ) -> LaneActivityObservation:
+        """Live worker-busy / pending-composer observation (#13843 F2), fail-closed."""
+        return read_live_lane_activity(
+            rows, workspace_id, lane, repo_root=self.repo_root, env=self.env,
+            runner=self.runner, timeout=self.timeout,
+        )
 
     def execute_close(self, plan: HerdrRetireClosePlan) -> HerdrRetireCloseResult:
         return execute_herdr_retire_close(
@@ -505,10 +586,15 @@ class SublaneHibernateUseCase:
                 detail="lifecycle store unreadable; fail closed",
             )
 
-        # Read the live inventory ONCE, keeping readability explicit (R1-F1). An
-        # unreadable inventory is never folded to "empty"; the same snapshot is reused for
-        # the release close so nothing is re-read between the gate and the actuation.
+        # Read the live inventory ONCE for the preflight gates, keeping readability explicit
+        # (R1-F1). An unreadable inventory is never folded to "empty". The release close does
+        # NOT reuse this stale snapshot: Redmine #13843 re-reads a FRESH inventory + worktree
+        # fingerprint at the release boundary and blocks on any divergence (see
+        # :func:`sublane_hibernate_boundary.revalidate_boundary`).
         rows, inventory_readable = self.ops.read_inventory()
+        # Redmine #13843 preflight (T0) worktree fingerprint — the baseline the release-boundary
+        # re-validation compares the fresh (T1) capture against.
+        fingerprint_preflight = read_fingerprint(self.ops)
 
         # Project-gateway action-time exact-generation fences (Redmine #13811; design #13780
         # j#78386 §1-2). The release closes the lane's CURRENT live slots, so before any
@@ -579,9 +665,45 @@ class SublaneHibernateUseCase:
                 and project_generation_matched
                 and project_attestation_ok
             )
+            # Redmine #13843: the redrive re-drives a process release, so it takes the SAME
+            # release-boundary TOCTOU fence as the fresh path — a fresh worktree fingerprint +
+            # live-generation re-read before the (idempotent) close, and a post-release check
+            # after it. A boundary divergence blocks the redrive (zero close), and a
+            # post-release residue withholds the resumed success.
             release = None
+            boundary_reasons: tuple[str, ...] = ()
+            post_residue = False
+            recovery_detail = ""
             if execute and redrive_ok:
-                release = self._drive_release(key, lane, workspace_id, rows, action_id)
+                rows1, fingerprint_boundary, boundary_reasons = revalidate_boundary(
+                    ops=self.ops,
+                    store=self.store,
+                    key=key,
+                    rec0=rec,
+                    rows0=rows,
+                    fingerprint_preflight=fingerprint_preflight,
+                    workspace_id=workspace_id,
+                    lane=lane,
+                    project_scope=project_scope,
+                )
+                if not boundary_reasons:
+                    # Bind the resume to the T1-verified revision (Redmine #13843 review F3):
+                    # an advance between T1 and the driver read closes nothing.
+                    release = self._drive_release(
+                        key, lane, workspace_id, rows1, action_id,
+                        expected_revision=rec.revision,
+                    )
+                    if release.admission_blocked:
+                        boundary_reasons = (BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,)
+                        release = None
+                    else:
+                        post = post_release_residue(
+                            ops=self.ops, fingerprint_boundary=fingerprint_boundary
+                        )
+                        post_residue = post.residue_detected
+                        recovery_detail = post.recovery_detail
+            redrive_executed = execute and redrive_ok and not boundary_reasons
+            redrive_blocked = execute and (not redrive_ok or bool(boundary_reasons))
             preflight = HibernatePreflight(
                 original_identity_known=True,  # the hibernated lane is known
                 park_satisfied=request.assertions.park_satisfied,
@@ -596,19 +718,21 @@ class SublaneHibernateUseCase:
                 assertions=request.assertions,
             )
             return HibernateOutcome(
-                executed=execute and redrive_ok,
+                executed=redrive_executed,
                 preflight=preflight,
                 issue=issue,
                 lane=lane,
                 project_scope=project_scope,
                 already_hibernated=True,
-                redrive_blocked=execute and not redrive_ok,
+                redrive_blocked=redrive_blocked,
+                boundary_reasons=boundary_reasons,
                 release=release,
-                detail=(
-                    "lane already hibernated; release re-drive blocked (preservation gate "
-                    "unmet or inventory unreadable)"
-                    if execute and not redrive_ok
-                    else "lane already hibernated; resumed release"
+                success_withheld=post_residue,
+                recovery_detail=recovery_detail,
+                detail=redrive_detail(
+                    redrive_ok=redrive_ok,
+                    boundary_reasons=boundary_reasons,
+                    post_residue=post_residue,
                 ),
             )
 
@@ -664,6 +788,40 @@ class SublaneHibernateUseCase:
                 ),
             )
 
+        # Redmine #13843 release-boundary (T1) TOCTOU fence. Between the preflight snapshot
+        # and the process release a worker can start a worktree mutation (the operator's
+        # clean/idle assertions and the inventory read are NOT atomic with the pane close),
+        # so re-read a FRESH worktree fingerprint + live inventory here and block on any
+        # divergence from the preflight capture BEFORE the disposition CAS. A block is a typed
+        # fail-closed with **lifecycle transition 0 / process close 0** — the lane stays active
+        # and nothing is closed.
+        rows1, fingerprint_boundary, boundary_reasons = revalidate_boundary(
+            ops=self.ops,
+            store=self.store,
+            key=key,
+            rec0=rec,
+            rows0=rows,
+            fingerprint_preflight=fingerprint_preflight,
+            workspace_id=workspace_id,
+            lane=lane,
+            project_scope=project_scope,
+        )
+        if boundary_reasons:
+            return HibernateOutcome(
+                executed=False,
+                preflight=preflight,
+                issue=issue,
+                lane=lane,
+                project_scope=project_scope,
+                boundary_blocked=True,
+                boundary_reasons=boundary_reasons,
+                detail=(
+                    "fail-closed: release-boundary re-validation blocked ("
+                    + ", ".join(boundary_reasons)
+                    + ")"
+                ),
+            )
+
         # Commit point: CAS active -> hibernated, guarded on the lane's exact state +
         # revision and the durable decision anchor. Nothing is closed until this lands, and
         # may_hibernate already required a readable inventory — so the CAS is never reached
@@ -693,7 +851,18 @@ class SublaneHibernateUseCase:
                 detail=f"hibernate commit refused ({transition.reason})",
             )
 
-        release = self._drive_release(key, lane, workspace_id, rows, action_id)
+        # Release on the FRESH boundary snapshot (rows1), bound to the exact revision the CAS
+        # just committed (Redmine #13843 review F3): an authority advance between the CAS and the
+        # driver read closes nothing (admission_blocked). Then the post-release (T2) check +
+        # disposition resolution withhold the success on residue / admission block.
+        release = self._drive_release(
+            key, lane, workspace_id, rows1, action_id,
+            expected_revision=transition.revision,
+        )
+        post = post_release_residue(
+            ops=self.ops, fingerprint_boundary=fingerprint_boundary
+        )
+        withheld, recovery, detail = fresh_release_disposition(release, post)
         return HibernateOutcome(
             executed=True,
             preflight=preflight,
@@ -702,7 +871,9 @@ class SublaneHibernateUseCase:
             project_scope=project_scope,
             transition=transition,
             release=release,
-            detail="lane hibernated; managed processes released",
+            success_withheld=withheld,
+            recovery_detail=recovery,
+            detail=detail,
         )
 
     def _project_gates(
@@ -769,6 +940,8 @@ class SublaneHibernateUseCase:
         workspace_id: str,
         rows: Sequence[Mapping[str, object]],
         action_id: str,
+        *,
+        expected_revision: Optional[int] = None,
     ) -> ReleaseOutcome:
         """Open (or resume) the release generation and close the lane's managed slots.
 
@@ -777,8 +950,9 @@ class SublaneHibernateUseCase:
         generation open and re-drivable (Redmine #13682). ``rows`` is the readability-vetted
         inventory snapshot the caller already read (R1-F1), so an empty ``rows`` means a
         *confirmed*-empty inventory, never an unreadable one. ``action_id`` is the caller's
-        immutable action identity — journal-scoped for a project-gateway lane (Redmine #13811
-        R4 F2), the byte-identical ``hibernate:<lane>`` for an issue lane.
+        immutable action identity. ``expected_revision`` binds the release to the T1-verified
+        lifecycle authority (Redmine #13843 review F3): a driver read that no longer carries it
+        closes nothing (admission_blocked).
         """
         return drive_process_release(
             store=self.store,
@@ -788,6 +962,7 @@ class SublaneHibernateUseCase:
             workspace_id=workspace_id,
             action_id=action_id,
             rows=rows,
+            expected_revision=expected_revision,
         )
 
 
@@ -801,6 +976,8 @@ __all__ = (
     "BLOCK_PENDING_PROMPT",
     "BLOCK_PROJECT_GENERATION_MISMATCH",
     "BLOCK_PROJECT_UNATTESTED",
+    "BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT",
+    "BLOCK_RELEASE_BOUNDARY_MUTATION",
     "BLOCK_REVIEW_PENDING",
     "BLOCK_STALE_ACTION_GENERATION",
     "BLOCK_STALE_ACTION_IDENTITY",
@@ -808,6 +985,8 @@ __all__ = (
     "BLOCK_UNRECORDED_BOUNDARY",
     "BLOCK_UNPUSHED_COMMITS",
     "BLOCK_WORKING",
+    "BLOCK_WORKTREE_UNREADABLE",
+    "WorktreeMutationFingerprint",
     "PARK_BASIS_DEPENDENCY",
     "PARK_BASIS_EARLY_HIBERNATE",
     "PARK_BASIS_NONE",

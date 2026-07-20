@@ -74,6 +74,12 @@ retire_三義:
       注: hibernate は close / dogfood 成功 / owner approval へ読み替えない。common safety gate
           (pending review/callback/integration/work/prompt・dirty/unpushed・identity 不明) は fail-closed。
           owner approval pending は basis 依存 (early hibernate では blocker にしない)。
+      release-boundary TOCTOU 保全 fence (Redmine #13843): preflight と process release は atomic で
+          なく、間に worker が worktree mutation を開始でき dirty residue を残す。release 直前の再検証・
+          typed blocked・post-check withhold・recovery 収束の **execution 契約は本 map に複製しない**。
+          正本: [[logic-managed-state-model]] `lane_lifecycle_records` の「hibernate release-boundary
+          TOCTOU 保全 fence」節 (fingerprint/activity/attestation/revision の release 直前再検証と
+          process_release state 分離)、および `sublane_hibernate*.py` module docstring。
 
 [5] retire               lane を退役する (pane/worktree/branch)。owner 確認なしに退役してよい条件は所有 doc。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),

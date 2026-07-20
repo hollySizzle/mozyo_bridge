@@ -194,6 +194,13 @@ class ReleaseOutcome:
     failed: tuple[tuple[str, str, str], ...] = ()
     foreign_names: tuple[str, ...] = ()
     detail: str = ""
+    #: Redmine #13843 review F3: the caller passed an ``expected_revision`` (a T1-verified
+    #: authority token) and the driver's fresh row read did NOT match it — the lifecycle
+    #: authority advanced between the caller's re-validation and the driver read, so the
+    #: driver closed NOTHING (a zero-close admission block, not "nothing to release"). The
+    #: caller treats this as a re-validation block, never a success. ``False`` for a caller
+    #: that passes no ``expected_revision`` (the supersede path, unchanged).
+    admission_blocked: bool = False
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -204,6 +211,7 @@ class ReleaseOutcome:
                 {"role": r, "locator": loc, "detail": d} for r, loc, d in self.failed
             ],
             "foreign_names": list(self.foreign_names),
+            "admission_blocked": self.admission_blocked,
             "detail": self.detail,
         }
 
@@ -494,6 +502,7 @@ def drive_process_release(
     workspace_id: str,
     action_id: str,
     rows: Optional[Sequence[Mapping[str, object]]] = None,
+    expected_revision: Optional[int] = None,
 ) -> ReleaseOutcome:
     """Open (or idempotently resume) a release generation and close the lane's slots.
 
@@ -512,6 +521,13 @@ def drive_process_release(
     one folded to empty. When ``rows`` is ``None`` the driver reads it via ``ops.live_rows``
     (the supersede path, whose fail-open to ``()`` is its documented boundary).
 
+    ``expected_revision`` (Redmine #13843 review F3) binds the release to the caller's exact
+    T1-verified lifecycle authority: when supplied and the driver's FRESH row read does not
+    carry that revision, the lifecycle authority advanced between the caller's re-validation
+    and this read (a check-then-act race), so the driver closes NOTHING and returns
+    ``admission_blocked`` (a zero-close, not "nothing to release"). ``None`` (the supersede
+    path) skips the check — unchanged.
+
     Only a lane that has already left ``active`` is released here — a lane still holding
     its work is never a release target (the caller's disposition CAS must land first).
     """
@@ -529,6 +545,19 @@ def drive_process_release(
             action_id=action_id,
             process_release=(rec.process_release if rec else RELEASE_NOT_REQUESTED),
             detail="lane is still active; no release",
+        )
+    if expected_revision is not None and rec.revision != expected_revision:
+        # Redmine #13843 review F3: the lifecycle authority advanced since the caller's T1
+        # re-validation — close NOTHING and report the admission block (never re-bind a stale
+        # retry to a newer release authority).
+        return ReleaseOutcome(
+            action_id=action_id,
+            process_release=rec.process_release,
+            admission_blocked=True,
+            detail=(
+                f"release admission blocked: revision drift (expected {expected_revision}, "
+                f"row {rec.revision}); zero-close"
+            ),
         )
 
     rows = ops.live_rows() if rows is None else rows

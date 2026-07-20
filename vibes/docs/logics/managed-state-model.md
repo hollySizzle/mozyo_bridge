@@ -290,7 +290,25 @@ Table naming:
     lane_disposition='active' AND issue_id <> ''` で **workspace scope** に固定する。home-global な
     unique は、同じ issue 番号を正当に持つ別 project と衝突する。
   - `released` は command outcome / desired state であり **live absence の正本ではない**。process
-    presence は従来どおり live inventory (`observed_liveness`) を読む。
+    presence は従来どおり live inventory (`observed_liveness`) を読む。`released` は release の
+    **完了**であり、`partial` は close 未完 (再 drive 要) の別 state として区別する。hibernate の
+    「clean success」判定 (`is_success`) と CLI exit は `process_release == released`（または live
+    slot 無しの `not_requested`）に bind し、`partial` を fully-actuated success として報告しない
+    (#13843)。
+  - **hibernate release-boundary TOCTOU 保全 fence** (#13843)。hibernate の preflight (clean/idle/
+    fingerprint 取得) と managed process release は **atomic でない**。preflight snapshot と release の
+    間に worker が worktree mutation を開始でき、lane が `hibernated`/`released` でも durable boundary
+    record 無しの dirty residue が残る。actuation は preflight (T0) で状態 snapshot を取り、**release
+    直前 (T1)** に同一 fresh snapshot で ①worktree fingerprint (tracked 内容+untracked 内容に感応な
+    digest、porcelain 行だけでない)、②worker running / pending composer の live 観測、③live managed
+    slot (`assigned_name→locator`)、④lifecycle revision、⑤(project-gateway) exact declared generation
+    + startup attestation を **再検証**し、preflight から drift したら **lifecycle transition 0 /
+    process close 0 の typed blocked**。CAS→partial→retry は idempotent で redrive も同じ fence を通す
+    (dirty residue を clean と記録しない)。release 後 (T2) の post-check で unexpected worktree residue を
+    検出したら **success を withhold** し (lane は `hibernated` のまま、issue/worktree/branch/commit を
+    保存)、durable recovery/boundary-record path へ収束させる。fingerprint / activity / attestation の
+    live 観測が **読めない場合は fail-closed** (clean と誤認しない)。実装契約の詳細は
+    `sublane_hibernate*.py` の module docstring と IR anchor を読む。
   - **owner binding と decision anchor は別 field である** (schema v2、#13689 R2-F1)。`issue_id` は
     「この lane がどの issue を所有しているか」(unbound lane では **空**)、`decision_source` /
     `decision_issue_id` / `decision_journal` は「現在の state をどの durable record が決めたか」で
