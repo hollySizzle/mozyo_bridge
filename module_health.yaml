@@ -1117,7 +1117,7 @@ allowlist:
       facade keeps one thin call site that builds the typed request from the resolved envelope +
       raw scalars and returns the use case result. Net -262. Shared baseline change: reconcile at
       integration if another tranche/lane also edits this file.
-      Tightened 3044 -> 2861 for #13729 tranche 5 (handoff target-resolution preflight): the
+      Tightened 3044 -> 2860 for #13729 tranche 5 (handoff target-resolution preflight): the
       ~218-line inline block that resolves the send target (herdr-native inventory / tmux pane
       resolver), emits the `target_unavailable` `<session>:codex` gateway diagnostic, surfaces the
       same-lane duplicate diagnostics, resolves `--target-repo auto` (herdr self-root / explicit
