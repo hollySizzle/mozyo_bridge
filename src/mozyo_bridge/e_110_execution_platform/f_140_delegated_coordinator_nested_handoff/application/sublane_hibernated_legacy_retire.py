@@ -43,9 +43,13 @@ Action-time verification, every axis fail-closed (nothing is written unless ALL 
   durable ``released`` + **empty** ``worktree_identity`` + settled replacement, guarded on
   the row's exact revision (a revision race loses :data:`MIGRATE_REVISION_RACE`).
 
-A duplicate replay is idempotent: an already-``retired`` row owning this issue is a verified
-no-op success (:data:`MIGRATE_ALREADY_RETIRED`), read before the live check so a completed
-migration replays without depending on a live inventory.
+A duplicate replay is idempotent, but never trusted blind: an already-``retired`` row owning
+this issue is a verified no-op success (:data:`MIGRATE_ALREADY_RETIRED`) reported ONLY AFTER
+the full live / quiescence gate above confirms the unit is empty — no expected managed slot
+live, no duplicate or unreadable slot, and no foreign occupant (the #13841 review j#79150 F2
+invariant, extended to the foreign / duplicate / unreadable axes by Redmine #13897). A
+persisted ``retired`` disposition does not prove the unit is quiescent now, so the replay
+never reports success while a pair — or a foreign process — is still running under it.
 
 Boundary (Redmine #13841): no process launch / close / resume, no worktree / branch removal,
 no raw Herdr / tmux, no origin/main, no production / tag / publish. Synthetic regression only.
