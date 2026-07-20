@@ -1802,7 +1802,7 @@ def orchestrate_handoff(
             _emit(
                 make_outcome(
                     status="blocked",
-                    reason="target_unavailable",
+                    reason=("invalid_args" if exc.reason == "invalid_args" else "target_unavailable"),  # #13884
                     receiver=receiver,
                     target=None,
                     anchor=anchor,

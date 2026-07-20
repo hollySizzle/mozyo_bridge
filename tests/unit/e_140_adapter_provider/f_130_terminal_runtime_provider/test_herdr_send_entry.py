@@ -33,6 +33,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    HerdrExplicitTargetMismatchError,
     HerdrSendEntryError,
     explicit_tmux_pane_target,
     herdr_backend_selected,
@@ -547,9 +548,13 @@ class ExplicitTargetMismatchHerdrSendTest(unittest.TestCase):
     ``--target <worker-locator>`` alongside ``--target-lane`` and still resolves the stable
     slot). After resolution the rail cross-checks the explicit target against the resolved
     identity: a target that AGREES with the derived route passes through (resolve-to-exact);
-    a MISMATCH fails closed with a typed ``explicit_target_mismatch`` zero-send reason (no
-    coordinator / sender-lane fallback). The fixture is the exact reported shape — a
-    coordinator + TWO lane gateways in one shared workspace.
+    a MISMATCH raises :class:`HerdrExplicitTargetMismatchError` (a discriminable
+    :class:`HerdrSendEntryError` subclass — NOT a new fail-closed reason token; the herdr
+    resolution vocabulary stays the #13302 ledger set per herdr-native-identity.md §3.1),
+    which the send branch projects onto a zero-send ``blocked`` / ``invalid_args`` outcome.
+    The fixture is the exact reported shape — a coordinator + TWO lane gateways in one shared
+    workspace. The CLI delivery-JSON contract for the mismatch is pinned end-to-end in
+    ``tests/scenarios/test_herdr_worker_stable_target.py``.
     """
 
     #: coordinator (codex, default lane) + two lane gateways (codex) in the SAME shared
@@ -594,11 +599,10 @@ class ExplicitTargetMismatchHerdrSendTest(unittest.TestCase):
         # no false-positive sent; the send branch converts it to a zero-send blocked outcome).
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self._ctx(tmp)
-            with self.assertRaises(HerdrSendEntryError) as c:
+            with self.assertRaises(HerdrExplicitTargetMismatchError) as c:
                 self._resolve(ctx, self._args(ctx, target=self.GATEWAY_A_LOCATOR, to="codex"))
-        self.assertEqual(c.exception.reason, "explicit_target_mismatch")
         msg = str(c.exception)
-        # The typed refusal names the derived (wrong) target, the sender-echo cause, and the
+        # The refusal names the derived (wrong) target, the sender-echo cause, and the
         # sanctioned selector so the coordinator can re-issue correctly.
         self.assertIn(self.COORDINATOR_LOCATOR, msg)  # the derived (wrong) agent, surfaced
         self.assertIn("--target-lane", msg)
@@ -609,9 +613,8 @@ class ExplicitTargetMismatchHerdrSendTest(unittest.TestCase):
         # lane-specific state (the ticket reproduced across two targets).
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self._ctx(tmp)
-            with self.assertRaises(HerdrSendEntryError) as c:
+            with self.assertRaises(HerdrExplicitTargetMismatchError):
                 self._resolve(ctx, self._args(ctx, target=self.GATEWAY_B_LOCATOR, to="codex"))
-        self.assertEqual(c.exception.reason, "explicit_target_mismatch")
 
     def test_session_window_style_target_mismatch_fails_closed(self) -> None:
         # A ``session:window`` string names no live herdr agent, so it can never agree with
@@ -619,9 +622,8 @@ class ExplicitTargetMismatchHerdrSendTest(unittest.TestCase):
         # sender's own lane.
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self._ctx(tmp)
-            with self.assertRaises(HerdrSendEntryError) as c:
+            with self.assertRaises(HerdrExplicitTargetMismatchError):
                 self._resolve(ctx, self._args(ctx, target="cockpit:codex", to="codex"))
-        self.assertEqual(c.exception.reason, "explicit_target_mismatch")
 
     def test_explicit_target_consistent_with_target_lane_resolves_exact(self) -> None:
         # Resolve-to-exact: --target <gateway-A locator> PAIRED with --target-lane LANE_A.

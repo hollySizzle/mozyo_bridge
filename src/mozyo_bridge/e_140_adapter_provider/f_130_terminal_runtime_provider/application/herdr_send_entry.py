@@ -78,16 +78,30 @@ class HerdrSendEntryError(ValueError):
         self.reason = reason
 
 
-# Redmine #13884: an explicit concrete ``--target`` (a live herdr locator / assigned name)
-# named a DIFFERENT agent than the #13305 route authority resolved from ``--to`` +
-# ``--target-lane`` + ``--target-repo``. The locator is never the routing key (transient
-# cache, #13305); this reason fires when the explicit target and the derived route
-# *disagree*, so the rail refuses instead of silently sending to the derived agent (which
-# for a coordinator's cross-lane ``--target`` was the sender's own pane — a sender echo with
-# a false-positive ``sent``). Carried on the raised :class:`HerdrSendEntryError`; the
-# ``orchestrate_handoff`` herdr branch projects every such raise onto the same zero-send
-# ``blocked`` / ``target_unavailable`` outcome (``target=None``, no injection).
-REASON_EXPLICIT_TARGET_MISMATCH: str = "explicit_target_mismatch"
+#: The existing delivery-outcome reason a herdr explicit-target mismatch projects onto
+#: (Redmine #13884 review j#83307 F1/F2). NOT a new fail-closed token: the herdr resolution
+#: vocabulary stays the #13302 ledger set (``vibes/docs/specs/herdr-native-identity.md``
+#: §3.1). ``invalid_args`` (an inconsistent ``--target`` argument, not an unavailable window)
+#: is the pre-existing ``DeliveryOutcome`` reason whose ``next_action`` ("supply the required
+#: arguments") is consistent with the cause; the full ``--target-lane`` retry guidance rides
+#: the die message. ``orchestrate_handoff`` reads this off ``exc.reason`` and surfaces it
+#: instead of the generic ``target_unavailable`` (which would tell the operator to start a
+#: window — contradicting the cause).
+EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON: str = "invalid_args"
+
+
+class HerdrExplicitTargetMismatchError(HerdrSendEntryError):
+    """An explicit ``--target`` named a different agent than the resolved route (#13884).
+
+    A discriminable :class:`HerdrSendEntryError` subclass carrying the pre-existing
+    :data:`EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON` (``invalid_args``) as its ``reason`` — no
+    new fail-closed token is minted (herdr-native-identity.md §3.1). The locator is never
+    promoted to a routing authority (#13305); this only refuses when the named target and
+    the resolved target disagree, and it stays a zero-send (``target=None``, no injection).
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, reason=EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON)
 
 
 def _terminal_transport_config_for_root(
@@ -416,7 +430,7 @@ def resolve_herdr_send_target(
     # named target and the resolved target disagree.
     if norm_target and norm_target != RECEIVER_COORDINATOR and norm_target not in AGENT_PROVIDERS:
         if norm_target not in (_norm(resolution.locator), _norm(resolution.assigned_name)):
-            raise HerdrSendEntryError(
+            raise HerdrExplicitTargetMismatchError(
                 f"herdr send named an explicit --target {target!r} but the route authority "
                 f"resolved a different agent (live locator {resolution.locator!r}, name "
                 f"{resolution.assigned_name!r}) from --to={receiver!r} + --target-lane="
@@ -425,8 +439,7 @@ def resolve_herdr_send_target(
                 "disagree; refusing to send to the derived target, which would echo the "
                 "send onto the sender's own lane and report a false-positive `sent` "
                 "(Redmine #13884). Pin the intended lane with --target-lane <lane> (or use "
-                "--target coordinator) so the route authority resolves the target you named.",
-                reason=REASON_EXPLICIT_TARGET_MISMATCH,
+                "--target coordinator) so the route authority resolves the target you named."
             )
     # The synthesized target record's `cwd` is the TARGET agent's repo root (the tmux path
     # reads the target pane's own cwd). Three shapes (#13331 / #13377 j#73640 finding 1):
@@ -479,7 +492,8 @@ def resolve_herdr_send_target(
 
 __all__ = (
     "HerdrSendEntryError",
-    "REASON_EXPLICIT_TARGET_MISMATCH",
+    "HerdrExplicitTargetMismatchError",
+    "EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON",
     "explicit_tmux_pane_target",
     "herdr_backend_selected",
     "herdr_effective_backend_selected",
