@@ -37,6 +37,10 @@ def _print_recovery(outcome) -> None:
     print(f"  reason: {outcome.reason}")
     if outcome.backups:
         print(f"  backups: {', '.join(outcome.backups)}")
+    if outcome.residue:
+        # A rollback could not remove its own backup copies: name the residue so the operator can
+        # clear it. This is NOT zero-write, and hiding it would misreport the store state (R2 #13951).
+        print(f"  RESIDUE (remove by hand): {', '.join(outcome.residue)}")
     _print_diagnosis(outcome.diagnosis)
 
 

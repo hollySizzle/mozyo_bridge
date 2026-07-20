@@ -516,6 +516,83 @@ class ConcurrentRefusalZeroWriteTest(unittest.TestCase):
         # the rollback deletes only files THIS call created — the pre-existing forensic copy survives.
         self.assertTrue(self._backup_files(lease))
 
+    def test_rollback_unlink_failure_is_reported_not_hidden(self):
+        # Review R2: if the rollback's unlink FAILS, a backup residue remains on disk. The earlier
+        # revision swallowed the error and still reported zero_write=True with no backups — hiding a
+        # real write. The outcome must instead be a typed rollback_incomplete: zero_write=False, the
+        # residue basenames named (redaction-safe), and a recovery action in the reason.
+        from mozyo_bridge.core.state.callback_sweep_lease import RECOVERY_ROLLBACK_INCOMPLETE
+
+        lease = self._lost()
+        diag = lease.diagnose()
+        original = lease._backup_artifacts
+
+        def mutate_mid_backup(recovery_id):
+            result = original(recovery_id)
+            lease.sidecar_path.write_text("mutated-during-backup", encoding="utf-8")
+            return result
+
+        lease._backup_artifacts = mutate_mid_backup
+        real_unlink = Path.unlink
+
+        def failing_unlink(self, *a, **k):
+            if "recovery-backup" in self.name:
+                raise OSError("permission denied")
+            return real_unlink(self, *a, **k)
+
+        with mock.patch.object(Path, "unlink", failing_unlink):
+            out = lease.recover_guarded(expected_fingerprint=diag.fingerprint, apply=True)
+
+        self.assertEqual(out.status, RECOVERY_ROLLBACK_INCOMPLETE)
+        self.assertFalse(out.zero_write)  # a residue remains — NOT zero-write
+        self.assertTrue(out.residue)
+        # the residue names match what is actually on disk, and are redaction-safe basenames
+        on_disk = {p.name for p in self._backup_files(lease)}
+        self.assertEqual(set(out.residue), on_disk)
+        for name in out.residue:
+            self.assertNotIn("/", name)
+        self.assertNotIn("/", json.dumps(out.as_dict()["residue"]))
+        # the operator is told to remove it by hand
+        self.assertIn("residue", out.reason.lower())
+
+    def test_rollback_failure_still_never_deletes_a_preexisting_forensic_backup(self):
+        # The residue-reporting path must keep the R2 invariant: a rollback (even a failing one) only
+        # ever targets THIS call's backups, never a pre-existing forensic copy.
+        from mozyo_bridge.core.state.callback_sweep_lease import RECOVERY_ROLLBACK_INCOMPLETE
+
+        lease = self._lost()
+        diag = lease.diagnose()
+        lease._backup_artifacts(diag.fingerprint)  # a prior forensic backup already exists
+        preexisting = {p.name for p in self._backup_files(lease)}
+        self.assertTrue(preexisting)
+
+        original = lease._backup_artifacts
+
+        def mutate_and_new_backup(recovery_id):
+            # a fresh backup path this call creates (distinct id) + a mid-backup mutation
+            self_lease = lease
+            result = original(recovery_id)
+            self_lease.sidecar_path.write_text("mutated-again", encoding="utf-8")
+            return result
+
+        # force a NEW created backup by unlinking the reused one first is unnecessary — instead make
+        # unlink fail so any created copy becomes residue; the pre-existing copy must survive either way.
+        real_unlink = Path.unlink
+
+        def failing_unlink(self, *a, **k):
+            if "recovery-backup" in self.name:
+                raise OSError("permission denied")
+            return real_unlink(self, *a, **k)
+
+        lease._backup_artifacts = mutate_and_new_backup
+        with mock.patch.object(Path, "unlink", failing_unlink):
+            out = lease.recover_guarded(expected_fingerprint=diag.fingerprint, apply=True)
+
+        # whatever the disposition, the pre-existing forensic backup is still on disk.
+        surviving = {p.name for p in self._backup_files(lease)}
+        self.assertTrue(preexisting.issubset(surviving))
+        self.assertIn(out.status, (RECOVERY_ROLLBACK_INCOMPLETE, RECOVERY_REFUSED_CONCURRENT))
+
 
 if __name__ == "__main__":
     unittest.main()

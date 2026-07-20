@@ -101,6 +101,11 @@ RECOVERY_REFUSED_CONCURRENT = "refused_concurrent_mutation"
 #: ``--apply`` was requested without the ``expected_fingerprint`` that binds it to a diagnosis. An
 #: unbound apply cannot detect a concurrent mutation, so it is refused. Zero-write.
 RECOVERY_REFUSED_UNBOUND = "refused_unbound"
+#: A concurrent mutation was caught DURING the backup, but rolling back this call's backup copies
+#: failed (an ``unlink`` error), so a backup residue remains on disk. This is NOT zero-write — the
+#: residue is reported (``residue``) with a recovery action so the operator can remove it. Swallowing
+#: the cleanup error and reporting zero-write would hide a real write (review R2 #13951).
+RECOVERY_ROLLBACK_INCOMPLETE = "rollback_incomplete"
 
 #: Backup filename infix for the artifacts recovery preserves before minting a fresh store.
 RECOVERY_BACKUP_INFIX = ".recovery-backup-"
@@ -232,6 +237,10 @@ class LeaseRecoveryOutcome:
     #: Basenames (redaction-safe) of the artifacts backed up before a mint; empty unless applied.
     backups: tuple[str, ...]
     reason: str
+    #: Basenames (redaction-safe) of backup copies THIS call created but could NOT remove after a
+    #: concurrent-mutation refusal (a rollback ``unlink`` failed). Non-empty means a real write
+    #: remains on disk, so the outcome is NOT zero-write — never a hidden residue (review R2 #13951).
+    residue: tuple[str, ...] = ()
 
     @property
     def applied(self) -> bool:
@@ -239,8 +248,14 @@ class LeaseRecoveryOutcome:
 
     @property
     def zero_write(self) -> bool:
-        """True for every non-applying outcome — the whole point of the gate."""
-        return self.status != RECOVERY_APPLIED
+        """True only when this outcome left the filesystem untouched.
+
+        A mint (``RECOVERY_APPLIED``) writes, and a rollback that could not remove its own backup
+        copies (``residue`` non-empty) also leaves a write behind — both are NOT zero-write. Every
+        other refusal is genuinely write-0. This is computed from what actually happened, not from
+        "non-applied ⇒ nothing written", which hid a backup residue on a cleanup failure (R2 #13951).
+        """
+        return self.status != RECOVERY_APPLIED and not self.residue
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -248,6 +263,7 @@ class LeaseRecoveryOutcome:
             "applied": self.applied,
             "zero_write": self.zero_write,
             "backups": list(self.backups),
+            "residue": list(self.residue),
             "reason": self.reason,
             "diagnosis": self.diagnosis.as_dict(),
         }
@@ -634,11 +650,27 @@ class CallbackSweepLease:
         # back the backups THIS call created (never a pre-existing forensic copy) so the refusal is
         # truly zero net write, then refuse.
         if self.fingerprint() != diagnosis.fingerprint:
+            residue: list[str] = []
             for path in created:
                 try:
                     path.unlink()
                 except OSError:
-                    pass
+                    # Cleanup failed: the backup copy remains on disk. Do NOT swallow this and claim
+                    # zero-write (review R2 #13951) — record the residue so it is reported honestly.
+                    residue.append(path.name)
+            if residue:
+                return LeaseRecoveryOutcome(
+                    status=RECOVERY_ROLLBACK_INCOMPLETE,
+                    diagnosis=diagnosis,
+                    backups=(),
+                    reason=(
+                        "the store changed while backing it up (concurrent mutation) and this "
+                        "call's backup copies could not be removed — a backup residue remains on "
+                        "disk (NOT zero-write). Remove the listed residue file(s) by hand, then "
+                        "re-run status before retrying recovery"
+                    ),
+                    residue=tuple(residue),
+                )
             return outcome(
                 RECOVERY_REFUSED_CONCURRENT,
                 "the store changed while backing it up (concurrent mutation); rolled back this "
@@ -859,6 +891,7 @@ __all__ = (
     "RECOVERY_REFUSED_UNREADABLE",
     "RECOVERY_REFUSED_CONCURRENT",
     "RECOVERY_REFUSED_UNBOUND",
+    "RECOVERY_ROLLBACK_INCOMPLETE",
     "RECOVERY_BACKUP_INFIX",
     "LeaseRecoveryOutcome",
 )
