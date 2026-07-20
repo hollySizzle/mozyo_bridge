@@ -12,6 +12,43 @@ The boundary (j#74307):
   exactly as-is; ``workflow watch`` still ingests markers only. This module is a separate
   read-model adapter that interprets the *governed journal template* for display, and it
   produces no watcher events and mutates nothing.
+- **The generation-correlated structured marker is the review authority (Redmine #13952 R3/R4).**
+  In addition to the ``## Gate:`` heading grammar, this module reads the SAME structured
+  ``[mozyo:workflow-event:gate=review_result:conclusion=<token>:head=<full_head>:req=<journal>]``
+  token the #12672 watcher standardizes on. A same-lane reviewer already emits it, so a durable
+  review is recognized even when its heading is reworded or its ``結論`` value carries Markdown
+  emphasis / an English label — the drift class this issue keeps hitting (#13811 j#83313 / #13951
+  j#83311 both fell to "auditor review owed" although each carried
+  ``gate=review_result:conclusion=changes_requested``). A review_result marker is AUTHORITATIVE
+  only when it is CANONICAL: it must EXACT-CORRELATE to the review round it answers — its ``req``
+  equals the review_request journal it correlates to and its full 40/64-hex ``head`` equals that
+  request's head, with an explicit ``conclusion`` / ``blocker`` (review j#83388 F2 + j#83422 F4).
+  The correlation reuses the callback fence's own helpers
+  (:mod:`...domain.review_return_route`) so the grammar is not re-forked. Such a canonical
+  marker's conclusion OUTRANKS the body ``結論`` field / heading qualifier and establishes the
+  review gate on its own. Any OTHER review_result marker (malformed identity, uncorrelated /
+  drifted / non-existent ``req``, head drift, out-of-vocabulary conclusion, or two conflicting
+  markers) is fail-closed to ``pending`` — the body is NOT consulted (review j#83388 F1) — yet it
+  STILL establishes the review gate, so a newer bad review shadows an older one in the latest
+  computation and an old approved cannot re-surface (review j#83422 F3). This is exactly the
+  callback generation fence's disposition for a malformed / uncorrelated review marker. Reading
+  the token is still read-only: it produces no watcher events and mutates nothing.
+  Channel / round-supersession invariants keep this honest (reviews j#83467 / j#83558): (1) ONLY
+  the ``workflow-event`` channel is consulted — the ``handoff`` channel is a delivery
+  *notification* (a pointer), never durable review truth, so it cannot establish a gate, correlate
+  a request, or shadow a result (F5); (2) a structured ``review_request`` / ``review_result``
+  marker — the review family ONLY (:data:`_MARKER_ESTABLISHED_GATES`) — makes its journal a
+  recognized review gate even under a reworded heading, so a newer review_request supersedes an
+  older review_result (F6); the callback-facing ``owner_close_approval_waiting`` and the
+  fact-bearing ``implementation_done`` / ``blocked`` markers are NOT promoted from a marker alone
+  (their gate comes from the heading), so a waiting-callback marker never reads as owner approval
+  (F7); (3) when a review marker and the heading DISAGREE, the structured marker wins — a
+  ``## Gate: Review`` + ``結論`` body cannot beat a ``gate=review_request`` marker into a false
+  approval (F8), and an open review round SUPPRESSES a conflicting ``close`` / ``owner_close``
+  heading so the lane cannot advance to close / retire past it (:data:`_REVIEW_SUPERSEDES_PROGRESSION`;
+  ``blocked`` stays as the safe side, ``implementation_done`` stays as a sticky-fact gate — F10);
+  (4) a single journal carrying BOTH a review_request and a review_result marker is contradictory
+  and folds to ``pending`` / review_waiting, never a body/heading approval (F9).
 - **Only line-anchored gate headings are read**, in the two governed shapes: the prefixed
   ``## Gate: <kind>`` and the suffixed ``## <kind> Gate`` (Redmine #13952: same-lane reviewers
   durably write ``## Review Gate — 要修正``). Both are normalized (case / surrounding
@@ -58,6 +95,25 @@ import re
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
+    JournalMarker,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    RedmineJournalEntry,
+    extract_markers,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
+    correlated_review_request_journal,
+    is_explicit_review_conclusion,
+    is_full_commit_head,
+    review_request_head,
+    review_request_is_ambiguous,
+    review_result_conclusion,
+    review_result_head,
+    review_result_is_ambiguous,
+    review_result_marker_request,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     CALLBACK_NONE,
     GATE_BLOCKED,
@@ -234,6 +290,52 @@ CANONICAL_REVIEW_CONCLUSION_TOKENS: dict[str, str] = {
     "blocked": REVIEW_OUTCOME_BLOCKER,
 }
 
+# ---------------------------------------------------------------------------
+# The canonical structured workflow-event review_result marker (Redmine #13952 R3/R4).
+#
+# The SAME machine token the #12672 watcher standardizes on
+# (``[mozyo:workflow-event:gate=review_result:conclusion=<token>:head=<full_head>:req=<journal>]``).
+# The glance grammar reads a durable review's outcome from this token — never re-guessed from prose
+# — so a review is recognized even when its heading is reworded or its ``結論`` value carries
+# Markdown emphasis / an English label.
+#
+# A review_result marker is AUTHORITATIVE only when it is CANONICAL under the **Review Generation
+# Marker Contract v2** (Redmine #13974 / #13952 review j#83388 F2 + j#83422 F4): its ``head`` and
+# ``req`` must EXACT-CORRELATE to the review round it answers, not merely be well-shaped. Reusing
+# the callback fence's own helpers (so the grammar is not re-forked) it must (a) be a single
+# unambiguous review_result on its journal, (b) DECLARE a ``req`` that equals the review_request
+# journal it correlates to (the greatest review_request before it — an uncorrelated / drifted /
+# non-existent / ``0`` req is fail-closed), (c) carry a full 40/64-hex ``head`` EQUAL to that
+# review_request's head, and (d) carry an explicit ``conclusion`` (``approved`` /
+# ``changes_requested``) or a ``blocker`` flag.
+#
+# Any OTHER review_result marker (malformed identity, uncorrelated, out-of-vocabulary conclusion,
+# or two conflicting markers) is a SHADOW: it still establishes the review gate — so a newer bad
+# review is not silently dropped and cannot let an OLDER approved re-surface as latest (j#83422
+# F3) — but its conclusion is fail-closed ``pending`` (the audit is still owed) and it never
+# consults the body ``結論`` field / heading qualifier. That is exactly the callback generation
+# fence's disposition for a malformed / uncorrelated review marker.
+# ---------------------------------------------------------------------------
+
+#: The runtime gate a review_result marker maps onto (the ``review`` gate).
+_MARKER_REVIEW_GATE = GATE_REVIEW
+
+#: A synthetic, constant issue id for the internal marker correlation. ``fold_issue_gate_facts``
+#: receives ``(journal_id, notes)`` pairs for ONE issue, so every marker built here shares this id
+#: and the correlation helpers (which filter by issue) see one consistent issue — the value itself
+#: is never surfaced.
+_CORRELATION_ISSUE = "0"
+
+#: The disposition of the review_result marker(s) in one journal (Redmine #13952 review j#83388 /
+#: j#83422). ``absent`` — no review_result marker (the legacy heading / ``結論`` field fallback
+#: applies). ``canonical`` — a single review_result marker that exact-correlates to its review
+#: request (authoritative conclusion + establishes the review gate). ``shadow`` — a review_result
+#: marker is present but not canonical: fail-closed to ``pending`` with NO body fallback, yet it
+#: STILL establishes the review gate so it shadows an older review in the latest computation.
+_MARKER_ABSENT = "absent"
+_MARKER_CANONICAL = "canonical"
+_MARKER_SHADOW = "shadow"
+
 # A line-anchored ``## Integration disposition: <value>`` heading (the canonical governed
 # form; a ``## Gate: Integration disposition:`` variant is also accepted). ``<value>`` is the
 # first identifier token; classified against the completion / deferral vocabularies above.
@@ -324,13 +426,186 @@ def _classify_conclusion(value: str) -> Tuple[str, bool]:
     return outcome, False
 
 
-def _review_outcome(notes: str, heading_qualifier: str) -> Tuple[str, bool]:
+def _issue_markers(journals: Sequence[Tuple[object, str]]) -> Tuple[JournalMarker, ...]:
+    """Every structured ``workflow-event`` gate marker across one issue's journals (pure).
+
+    Built once per fold via the ONE watcher extractor (:func:`...redmine_journal_source
+    .extract_markers`) so the review-generation correlation reuses the callback fence's exact
+    contract instead of a re-forked scanner. Restricted to the ``workflow-event`` channel: the
+    ``handoff`` channel is a delivery *notification* (a pointer), NEVER durable review truth, so
+    it must not establish a gate, correlate a request, or shadow a result (Redmine #13952 R6
+    review j#83467 F5). All markers share :data:`_CORRELATION_ISSUE` (the fold is single-issue),
+    so the correlation helpers — which filter by issue — see one consistent issue.
+    """
+    entries = [
+        RedmineJournalEntry(
+            issue_id=_CORRELATION_ISSUE,
+            journal_id=str(journal_id).strip(),
+            notes=str(notes or ""),
+        )
+        for journal_id, notes in (journals or ())
+    ]
+    return extract_markers(entries, channels={MARKER_CHANNEL_WORKFLOW_EVENT})
+
+
+#: The ONLY runtime gates a structured marker may establish in the glance (Redmine #13952 R7
+#: review j#83558 F7). A ``review_request`` recorded under a reworded heading must still supersede
+#: an older review_result (F6), and a ``review_result`` must still shadow an older review (F3) —
+#: so the review family is marker-authoritative. But the marker union is DELIBERATELY NOT extended
+#: to the other gate-bearing kinds: ``owner_close_approval_waiting`` is a callback-facing marker
+#: (it only wakes the coordinator, it does NOT grant approval — central preset "Close Approval
+#: Separation"), and ``implementation_done`` / ``blocked`` markers carry facts (commit / …) the
+#: glance would not fully carry from the marker, so promoting them from a marker alone is not
+#: semantics-preserving. Those gates come from the heading (always present on the real journal).
+_MARKER_ESTABLISHED_GATES: frozenset[str] = frozenset({GATE_REVIEW, GATE_REVIEW_REQUEST})
+
+#: The heading-derived gates a structured review marker SUPPRESSES on the same journal (Redmine
+#: #13952 R8 review j#83594 F10). When a review round is open (a review_request / review_result
+#: marker is present), a conflicting ``## Gate: Close`` / ``owner_close_approval`` heading must NOT
+#: advance the lane past the open round to close / retire — the structured review authority is
+#: current. ``blocked`` is deliberately NOT here (a stop is the safe side, never a false
+#: progression) and ``implementation_done`` is not here (it is a sticky-fact gate BELOW review that
+#: never advances past it, so a combined ``Implementation Done + Review Request`` keeps its commit
+#: fact while folding to review_waiting).
+_REVIEW_SUPERSEDES_PROGRESSION: frozenset[str] = frozenset(
+    {GATE_CLOSE, GATE_OWNER_CLOSE_APPROVAL}
+)
+
+
+def _journal_marker_gates(markers: Sequence[JournalMarker], journal: str) -> set:
+    """The review-family runtime gates the ``workflow-event`` markers on ``journal`` establish (pure).
+
+    Restricted to :data:`_MARKER_ESTABLISHED_GATES` (Redmine #13952 R7 review j#83558 F7): a
+    structured ``review_request`` / ``review_result`` marker is the durable authority for its gate,
+    so it makes its journal a recognized review gate even under a reworded heading — a newer
+    review_request supersedes an older review_result (F6) and a review_result shadows an older
+    review (F3). The other gate-bearing marker kinds (owner-close waiting / implementation_done /
+    blocked) are NOT promoted from a marker alone (see :data:`_MARKER_ESTABLISHED_GATES`).
+    ``JournalMarker.gate`` is already the runtime gate, so the mapping is not re-derived here.
+    """
+    j = str(journal).strip()
+    return {
+        mk.gate
+        for mk in markers
+        if str(mk.journal).strip() == j and mk.gate in _MARKER_ESTABLISHED_GATES
+    }
+
+
+def _has_review_result_marker(markers: Sequence[JournalMarker], journal: str) -> bool:
+    """Whether ``journal`` carries any review_result (``review`` gate) marker (pure)."""
+    j = str(journal).strip()
+    return any(
+        mk.gate == _MARKER_REVIEW_GATE and str(mk.journal).strip() == j for mk in markers
+    )
+
+
+def _has_review_request_marker(markers: Sequence[JournalMarker], journal: str) -> bool:
+    """Whether ``journal`` carries any review_request (``review_request`` gate) marker (pure)."""
+    j = str(journal).strip()
+    return any(
+        mk.gate == GATE_REVIEW_REQUEST and str(mk.journal).strip() == j for mk in markers
+    )
+
+
+def _review_result_blocker(markers: Sequence[JournalMarker], journal: str) -> bool:
+    """Whether the review_result marker on ``journal`` set the ``blocker`` flag (pure)."""
+    j = str(journal).strip()
+    return any(
+        mk.gate == _MARKER_REVIEW_GATE and str(mk.journal).strip() == j and mk.blocker_recorded
+        for mk in markers
+    )
+
+
+def _canonical_review_outcome(
+    markers: Sequence[JournalMarker], journal: str
+) -> Optional[Tuple[str, bool]]:
+    """The ``(conclusion, blocker)`` a CANONICAL review_result marker speaks, or None (pure).
+
+    Canonical = the review round the result answers is EXACT-CORRELATED, reusing the callback
+    fence's own helpers (Review Generation Marker Contract v2; #13974 / #13952 review j#83388 F2 +
+    j#83422 F4). Ordered, fail-closed, mirroring ``review_return_route.plan_review_return`` step 2d:
+
+    1. the journal carries a single, unambiguous review_result marker;
+    2. it DECLARES a ``req`` and that req exact-matches the review_request it correlates to (the
+       greatest review_request journal before it) — a missing / drifted / non-existent / ``0`` req
+       correlates to nothing and fails closed;
+    3. that review_request is itself unambiguous;
+    4. the review_result and its review_request both carry FULL 40/64-hex heads that are EQUAL
+       (the result reviewed the head the round pinned);
+    5. the review_result carries an explicit conclusion (``approved`` / ``changes_requested``) or a
+       ``blocker`` flag.
+
+    Any failure -> None: the caller shadows the journal to ``pending``.
+    """
+    issue = _CORRELATION_ISSUE
+    j = str(journal).strip()
+    # Redmine #13952 R8 review j#83594 F9: a single journal carrying BOTH a review_result and a
+    # review_request marker is contradictory — it claims an old round's outcome AND a fresh round
+    # at once, with no order authority to resolve which. It is not a clean action authority, so it
+    # is never canonical (the caller shadows it to pending -> review_waiting, no approval).
+    if _has_review_request_marker(markers, j):
+        return None
+    if review_result_is_ambiguous(markers, issue, j):
+        return None
+    declared_req = review_result_marker_request(markers, issue, j)
+    correlated = correlated_review_request_journal(markers, issue, j)
+    if not declared_req or not correlated or declared_req != correlated:
+        return None
+    if review_request_is_ambiguous(markers, issue, correlated):
+        return None
+    result_head = review_result_head(markers, issue, j)
+    request_head = review_request_head(markers, issue, correlated)
+    if not is_full_commit_head(result_head) or not is_full_commit_head(request_head):
+        return None
+    if result_head != request_head:
+        return None
+    conclusion = review_result_conclusion(markers, issue, j)
+    blocker = _review_result_blocker(markers, j)
+    if is_explicit_review_conclusion(conclusion):
+        classified, token_blocker = _classify_conclusion(conclusion)
+        return classified, (blocker or token_blocker)
+    if blocker:
+        return REVIEW_PENDING, True
+    return None
+
+
+def _review_result_disposition(
+    markers: Sequence[JournalMarker], journal: str
+) -> Tuple[str, str, bool]:
+    """One journal's review_result disposition -> ``(disposition, conclusion, blocker)`` (pure).
+
+    ``absent`` — no review_result marker (the legacy heading / ``結論`` field fallback applies).
+    ``canonical`` — a review_result marker that exact-correlates to its review round (authoritative
+    conclusion + establishes the review gate). ``shadow`` — a review_result marker is present but
+    not canonical: fail-closed ``pending`` with NO body fallback, yet it STILL establishes the
+    review gate so a newer bad review shadows an older one in the latest computation (j#83422 F3).
+    """
+    if not _has_review_result_marker(markers, journal):
+        return _MARKER_ABSENT, REVIEW_PENDING, False
+    outcome = _canonical_review_outcome(markers, journal)
+    if outcome is None:
+        return _MARKER_SHADOW, REVIEW_PENDING, False
+    conclusion, blocker = outcome
+    return _MARKER_CANONICAL, conclusion, blocker
+
+
+def _review_outcome(
+    notes: str, heading_qualifier: str, disposition: str, marker_conclusion: str, marker_blocker: bool
+) -> Tuple[str, bool]:
     """Read an audit review journal's outcome -> ``(conclusion, blocker)`` (never sentiment).
 
-    The canonical explicit ``結論:`` field wins. Only when it is absent does the review
-    heading's own bounded qualifier stand in for it (#13952 j#81029
-    ``## Gate: Review Result — changes_requested``), read against the same closed vocabulary.
+    Priority (#13952 R3/R4): a CANONICAL, generation-correlated ``gate=review_result`` marker is
+    the unambiguous machine authority and wins. When a review_result marker is present but not
+    canonical (``shadow``), the outcome is fail-closed ``pending`` and the body is NOT consulted —
+    a malformed / uncorrelated marker never advances the owner. Only when NO review_result marker
+    is present (``absent``) does the legacy path apply: the explicit ``結論:`` field wins, and only
+    when it too is absent does the review heading's own bounded qualifier stand in (#13952 j#81029
+    ``## Gate: Review Result — changes_requested``), each read against the same closed vocabulary.
     """
+    if disposition == _MARKER_CANONICAL:
+        return marker_conclusion, marker_blocker
+    if disposition == _MARKER_SHADOW:
+        return REVIEW_PENDING, False
     match = _CONCLUSION_RE.search(notes or "")
     if match:
         return _classify_conclusion(match.group("value"))
@@ -409,6 +684,9 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     """
     recognized: list[_RecognizedJournal] = []
     integration_recorded = False
+    # Redmine #13952 R4: the review-generation correlation reads the WHOLE issue's markers (a
+    # review_result correlates to its review_request in the same history), so extract them once.
+    issue_markers = _issue_markers(journals or ())
 
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
@@ -430,11 +708,33 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
             gates.add(gate)
             if gate == GATE_REVIEW and qualifier and not review_qualifier:
                 review_qualifier = qualifier
+        # Redmine #13952 R3/R4/R6/R7: a structured ``workflow-event`` review marker is the durable
+        # AUTHORITY for the review-family gate, so it establishes its gate even under a reworded
+        # heading (a review_result shadows an older review — j#83422 F3; a review_request supersedes
+        # an older result — j#83467 F6). When a review marker and the heading DISAGREE on the review
+        # family, the structured marker wins (j#83558 F8): the heading's review / review_request gate
+        # is dropped so a ``## Gate: Review`` + ``結論: 承認`` body cannot beat a ``gate=review_request``
+        # marker into a false approval. Non-review heading gates (start / close / …) are untouched.
+        jid_s = str(journal_id).strip()
+        marker_review_gates = _journal_marker_gates(issue_markers, jid_s)
+        if marker_review_gates:
+            # F8: the structured review authority replaces a conflicting heading review gate.
+            gates -= _MARKER_ESTABLISHED_GATES
+            # F10: an open review round is current, so a conflicting close / owner-close heading may
+            # not advance the lane past it (blocked stays — a stop is safe-side; impl_done stays —
+            # it is a sticky-fact gate below review).
+            gates -= _REVIEW_SUPERSEDES_PROGRESSION
+            gates |= marker_review_gates
+        marker_disposition, marker_conclusion, marker_blocker = _review_result_disposition(
+            issue_markers, jid_s
+        )
         if not gates:
             continue
         top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
         if GATE_REVIEW in gates:
-            conclusion, blocker = _review_outcome(notes, review_qualifier)
+            conclusion, blocker = _review_outcome(
+                notes, review_qualifier, marker_disposition, marker_conclusion, marker_blocker
+            )
         else:
             conclusion, blocker = REVIEW_PENDING, False
         commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))

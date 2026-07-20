@@ -208,7 +208,11 @@ def _gate_marker_from_fields(
 
 
 def extract_markers_from_note(
-    issue_id: str, journal_id: str, notes: str
+    issue_id: str,
+    journal_id: str,
+    notes: str,
+    *,
+    channels: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[JournalMarker, ...]:
     """Extract every structured gate marker from one journal note (pure; never prose).
 
@@ -216,6 +220,12 @@ def extract_markers_from_note(
     into a :class:`JournalMarker` when it names a gate-bearing kind, and returns them in
     note order. A note with no recognized marker token yields ``()`` — the watcher reads the
     structured token, never the surrounding narrative.
+
+    ``channels`` optionally restricts extraction to a SUBSET of the recognized channels — the
+    channel provenance a caller needs to keep the two channels apart (Redmine #13952 R6 review
+    j#83467 F5: the ``handoff`` channel is a delivery *notification*, not durable review truth,
+    so a read-model over the durable record must be able to ask for the ``workflow-event``
+    channel alone). ``None`` (the default) keeps the existing all-recognized-channels behavior.
     """
     if not notes:
         return ()
@@ -228,6 +238,8 @@ def extract_markers_from_note(
     for match in _MARKER_RE.finditer(notes):
         channel = match.group("channel")
         if channel not in _RECOGNIZED_CHANNELS:
+            continue
+        if channels is not None and channel not in channels:
             continue
         fields = _parse_marker_fields(match.group("body"))
         marker = _gate_marker_from_fields(entry, channel, fields)
@@ -242,19 +254,26 @@ def extract_marker(entry: RedmineJournalEntry) -> JournalMarker | None:
     return markers[0] if markers else None
 
 
-def extract_markers(entries: Iterable[RedmineJournalEntry]) -> tuple[JournalMarker, ...]:
+def extract_markers(
+    entries: Iterable[RedmineJournalEntry],
+    *,
+    channels: "frozenset[str] | set[str] | None" = None,
+) -> tuple[JournalMarker, ...]:
     """All structured gate markers across an ordered sequence of journal entries (pure).
 
     One entry may carry more than one structured marker (e.g. a combined Implementation Done
     / Review Request gate journal embedding both tokens); each becomes its own
     :class:`JournalMarker`. Entries are read in order so the result is replay-stable, and the
     intake's duplicate suppression (same ``redmine:<issue>:<journal>`` anchor) handles a
-    re-read of the same entry.
+    re-read of the same entry. ``channels`` restricts extraction to a channel subset (see
+    :func:`extract_markers_from_note`); ``None`` keeps all recognized channels.
     """
     markers: list[JournalMarker] = []
     for entry in entries:
         markers.extend(
-            extract_markers_from_note(entry.issue_id, entry.journal_id, entry.notes)
+            extract_markers_from_note(
+                entry.issue_id, entry.journal_id, entry.notes, channels=channels
+            )
         )
     return tuple(markers)
 
