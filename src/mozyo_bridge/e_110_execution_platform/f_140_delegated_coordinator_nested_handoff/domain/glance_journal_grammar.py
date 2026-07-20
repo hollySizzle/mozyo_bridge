@@ -12,6 +12,19 @@ The boundary (j#74307):
   exactly as-is; ``workflow watch`` still ingests markers only. This module is a separate
   read-model adapter that interprets the *governed journal template* for display, and it
   produces no watcher events and mutates nothing.
+- **The canonical structured marker is the unambiguous authority (Redmine #13952 R3).** In
+  addition to the ``## Gate:`` heading grammar, this module reads the SAME structured
+  ``[mozyo:workflow-event:gate=<kind>:conclusion=<token>:...]`` token the #12672 watcher
+  standardizes on (via :func:`...redmine_journal_source.marker_fields_in_note`), UNIONED with
+  the heading facts. A same-lane reviewer already emits it, so a durable review is recognized
+  even when its heading is reworded or its ``結論`` value carries Markdown emphasis / an
+  English label — the drift class this issue keeps hitting (#13811 j#83313 / #13951 j#83311
+  both fell to "auditor review owed" although each carried
+  ``gate=review_result:conclusion=changes_requested``). The marker's ``conclusion`` OUTRANKS
+  the body ``結論`` field and the heading qualifier; a ``review_result`` marker that speaks no
+  in-vocabulary conclusion (and no ``blocker`` flag), or two review_result markers that
+  disagree, fail closed to ``pending`` (the audit is still owed) rather than being guessed.
+  Reading the token is still read-only: it produces no watcher events and mutates nothing.
 - **Only line-anchored gate headings are read**, in the two governed shapes: the prefixed
   ``## Gate: <kind>`` and the suffixed ``## <kind> Gate`` (Redmine #13952: same-lane reviewers
   durably write ``## Review Gate — 要修正``). Both are normalized (case / surrounding
@@ -56,8 +69,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
+    MARKER_GATE_ALIASES,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    GATE_BEARING_KINDS,
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    marker_fields_in_note,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     CALLBACK_NONE,
     GATE_BLOCKED,
@@ -234,6 +255,30 @@ CANONICAL_REVIEW_CONCLUSION_TOKENS: dict[str, str] = {
     "blocked": REVIEW_OUTCOME_BLOCKER,
 }
 
+# ---------------------------------------------------------------------------
+# The canonical structured workflow-event marker (Redmine #13952 R3).
+#
+# The SAME machine token the #12672 watcher standardizes on
+# (``[mozyo:workflow-event:gate=<kind>:conclusion=<token>:...]``). The glance grammar reads it
+# as a first-class gate/conclusion authority, UNIONED with the ``## Gate:`` heading grammar, so
+# a durable review recorded with the canonical marker is recognized even when its heading is
+# reworded or its ``結論`` value carries Markdown emphasis / an English label. The gate-bearing
+# vocabulary and the marker-name -> runtime-gate mapping are REUSED from the one producer /
+# consumer contract (:data:`...redmine_journal_source.GATE_BEARING_KINDS` /
+# :data:`...redmine_event_intake.MARKER_GATE_ALIASES`) so the two sides cannot re-fork into
+# separate literal lists.
+# ---------------------------------------------------------------------------
+
+#: The marker-facing gate name of a recorded review outcome (maps onto the runtime review gate).
+_MARKER_REVIEW_RESULT_KIND = "review_result"
+
+#: Marker-facing gate kind -> runtime gate. Built from the shared vocabularies so it stays
+#: pinned to the watcher's gate set (``review_result`` -> ``review``,
+#: ``owner_close_approval_waiting`` -> ``owner_close_approval``; the rest pass through).
+_MARKER_GATE: dict[str, str] = {
+    kind: MARKER_GATE_ALIASES.get(kind, kind) for kind in GATE_BEARING_KINDS
+}
+
 # A line-anchored ``## Integration disposition: <value>`` heading (the canonical governed
 # form; a ``## Gate: Integration disposition:`` variant is also accepted). ``<value>`` is the
 # first identifier token; classified against the completion / deferral vocabularies above.
@@ -324,13 +369,89 @@ def _classify_conclusion(value: str) -> Tuple[str, bool]:
     return outcome, False
 
 
+def _marker_flag(raw: Optional[str]) -> bool:
+    """A structured-marker boolean field (``blocker=1`` / ``true`` / ``yes``); default False."""
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "y")
+
+
+def _workflow_event_markers(notes: str) -> Tuple[Mapping[str, str], ...]:
+    """Every ``[mozyo:workflow-event:...]`` marker's parsed field dict in a note (pure, in order).
+
+    Reuses the ONE structured-token scanner the #12672 watcher is built on
+    (:func:`...redmine_journal_source.marker_fields_in_note`) so producer and this consumer
+    cannot re-fork onto separate token grammars. Non-workflow-event channels are dropped.
+    """
+    return tuple(
+        fields
+        for channel, fields in marker_fields_in_note(notes or "")
+        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
+    )
+
+
+def _marker_gates(notes: str) -> set:
+    """Every runtime gate a structured workflow-event marker names in a note (pure).
+
+    Each marker's ``gate`` (or legacy ``kind``) field is mapped through :data:`_MARKER_GATE`,
+    the shared gate-bearing vocabulary. A non-gate kind (``implementation_request`` /
+    ``review_finding_verdict`` / an unknown token) contributes nothing — the same fail-closed
+    exclusion the ``## Gate:`` heading allowlist applies, kept structural (never prose).
+    """
+    gates: set = set()
+    for fields in _workflow_event_markers(notes):
+        kind = (fields.get("gate") or fields.get("kind") or "").strip()
+        gate = _MARKER_GATE.get(kind)
+        if gate is not None:
+            gates.add(gate)
+    return gates
+
+
+def _marker_review_conclusion(notes: str) -> Tuple[str, bool, bool]:
+    """The review conclusion from the canonical ``gate=review_result`` marker (pure).
+
+    Returns ``(conclusion, blocker, explicit)``. ``explicit`` is True only when a
+    ``review_result`` marker actually SPEAKS an outcome: an in-vocabulary ``conclusion`` token
+    (classified against the SAME closed :data:`CANONICAL_REVIEW_CONCLUSION_TOKENS` the ``結論``
+    field uses) or an explicit ``blocker`` flag. That is the unambiguous machine authority
+    (#13952 R3): it OUTRANKS the ``結論`` field and the heading qualifier, so a
+    Markdown-emphasized / English-labelled body conclusion no longer drops the review to
+    "audit owed". When no review_result marker speaks a conclusion, ``explicit`` is False and
+    the caller falls back to the field / qualifier. Two review_result markers that speak
+    DIFFERENT outcomes are ambiguous and fail closed to ``pending`` (still explicit, so the
+    caller does not then guess from the body) — never a fabricated conclusion.
+    """
+    outcomes: set = set()
+    for fields in _workflow_event_markers(notes):
+        kind = (fields.get("gate") or fields.get("kind") or "").strip()
+        if kind != _MARKER_REVIEW_RESULT_KIND:
+            continue
+        raw = (fields.get("conclusion") or "").strip()
+        conclusion, blocker = _classify_conclusion(raw) if raw else (REVIEW_PENDING, False)
+        if _marker_flag(fields.get("blocker")):
+            blocker = True
+        if conclusion != REVIEW_PENDING or blocker:
+            outcomes.add((conclusion, blocker))
+    if not outcomes:
+        return REVIEW_PENDING, False, False
+    if len(outcomes) == 1:
+        conclusion, blocker = next(iter(outcomes))
+        return conclusion, blocker, True
+    return REVIEW_PENDING, False, True
+
+
 def _review_outcome(notes: str, heading_qualifier: str) -> Tuple[str, bool]:
     """Read an audit review journal's outcome -> ``(conclusion, blocker)`` (never sentiment).
 
-    The canonical explicit ``結論:`` field wins. Only when it is absent does the review
-    heading's own bounded qualifier stand in for it (#13952 j#81029
-    ``## Gate: Review Result — changes_requested``), read against the same closed vocabulary.
+    Priority (#13952 R3): the canonical structured ``gate=review_result`` marker is the
+    unambiguous machine authority and wins when it speaks an outcome. Otherwise the canonical
+    explicit ``結論:`` field wins, and only when both are absent does the review heading's own
+    bounded qualifier stand in (#13952 j#81029 ``## Gate: Review Result — changes_requested``),
+    each read against the same closed vocabulary.
     """
+    conclusion, blocker, explicit = _marker_review_conclusion(notes)
+    if explicit:
+        return conclusion, blocker
     match = _CONCLUSION_RE.search(notes or "")
     if match:
         return _classify_conclusion(match.group("value"))
@@ -430,6 +551,11 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
             gates.add(gate)
             if gate == GATE_REVIEW and qualifier and not review_qualifier:
                 review_qualifier = qualifier
+        # Redmine #13952 R3: union the canonical structured workflow-event marker gates. A
+        # review recorded with a reworded heading but the canonical
+        # ``gate=review_result:...`` marker is still recognized; when both agree the union is
+        # a no-op. The conclusion is resolved marker-first below (:func:`_review_outcome`).
+        gates |= _marker_gates(notes)
         if not gates:
             continue
         top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))

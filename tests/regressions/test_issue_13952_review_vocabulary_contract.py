@@ -33,6 +33,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    render_gate_note,
+    render_workflow_event_marker,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     GATE_REVIEW,
     REVIEW_APPROVED,
@@ -107,6 +111,65 @@ class TemplateMandatedJournalsFoldThroughTheGrammar(unittest.TestCase):
         # Guard the closed vocabulary: ``blocker`` is the out-of-conclusion outcome, so the
         # review vocabulary never grows a fourth REVIEW_CONCLUSIONS member.
         self.assertEqual(CANONICAL_REVIEW_CONCLUSION_TOKENS["blocker"], REVIEW_OUTCOME_BLOCKER)
+
+
+class StructuredMarkerProducerConsumerContract(unittest.TestCase):
+    """Redmine #13952 R3: the marker PRODUCER and the glance CONSUMER share ONE token grammar.
+
+    The R2 fix pinned the heading / ``結論`` field literals. R3 adds the second drift the same
+    issue kept hitting: a durable review recorded with the canonical structured marker
+    (``[mozyo:workflow-event:gate=review_result:conclusion=…]``) but a reworded heading or a
+    Markdown-emphasized / English-labelled body conclusion was dropped to ``pending`` — the
+    coordinator saw "auditor review owed" for a review that had already concluded
+    changes_requested (installed 0.12.2, j#83324: #13811 j#83313 / #13951 j#83311). The consumer
+    now reads the marker as the unambiguous authority, and it reads it through the SAME
+    :func:`render_workflow_event_marker` producer contract the watcher uses — so the two cannot
+    re-fork. This drives the *producer renderer's own output* through the *glance grammar*.
+    """
+
+    def test_rendered_review_result_marker_folds_to_its_conclusion(self) -> None:
+        # Each conclusion the producer can render round-trips through the consumer to the
+        # coordinator state it means — pinned end to end (producer -> marker -> grammar -> state).
+        cases = {
+            "changes_requested": (REVIEW_CHANGES_REQUESTED, "implementing"),
+            "approved": (REVIEW_APPROVED, "owner_waiting"),
+        }
+        for token, (expected_conclusion, expected_state) in cases.items():
+            with self.subTest(conclusion=token):
+                marker = render_workflow_event_marker(
+                    "review_result",
+                    conclusion=token,
+                    target_head="a" * 40,
+                    review_request_journal="83188",
+                )
+                facts = fold_issue_gate_facts([("83311", f"## Gate: Review\n{marker}")])
+                self.assertIsNotNone(facts)
+                self.assertEqual(facts.latest_gate, GATE_REVIEW)
+                self.assertEqual(facts.review_conclusion, expected_conclusion)
+                state = classify_lane_state(lane_signal_from_gate_facts("13952", facts))
+                self.assertEqual(state, expected_state)
+
+    def test_rendered_gate_note_survives_a_reworded_heading_and_bold_body(self) -> None:
+        # The exact live shapes: the producer's gate note (prose body + embedded marker) folds
+        # to worker even when the human body carries a reworded heading and a bold conclusion
+        # value — the token, not the prose, is authoritative.
+        body = (
+            "## Gate: Review — project-gateway hibernate exact-generation fence (T1 R2)\n"
+            "- conclusion: **changes_requested**"
+        )
+        note = render_gate_note(
+            "review_result",
+            body=body,
+            conclusion="changes_requested",
+            target_head="a" * 40,
+            review_request_journal="83236",
+        )
+        facts = fold_issue_gate_facts([("83313", note)])
+        self.assertEqual(facts.latest_gate, GATE_REVIEW)
+        self.assertEqual(facts.review_conclusion, REVIEW_CHANGES_REQUESTED)
+        self.assertEqual(
+            classify_lane_state(lane_signal_from_gate_facts("13952", facts)), "implementing"
+        )
 
 
 if __name__ == "__main__":
