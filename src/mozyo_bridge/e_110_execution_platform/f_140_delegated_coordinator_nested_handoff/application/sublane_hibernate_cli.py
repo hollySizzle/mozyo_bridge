@@ -42,8 +42,9 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
     if outcome.already_hibernated:
         lines.append("  lane already hibernated (idempotent resume)")
     if outcome.is_blocked:
+        # Redmine #13843: render the release-boundary reasons alongside the preflight ones.
         lines.append(
-            "  -> fail-closed blocked: " + ", ".join(outcome.preflight.blocked_reasons)
+            "  -> fail-closed blocked: " + ", ".join(outcome.blocked_reasons)
         )
         if outcome.transition is not None and not outcome.transition.applied:
             lines.append(f"  commit refused: {outcome.transition.reason}")
@@ -60,6 +61,12 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
             lines.append(f"    - closed {role} {locator}")
         for role, locator, detail in rel.failed:
             lines.append(f"    ! close failed {role} {locator}: {detail}")
+    # Redmine #13843: a released lane whose post-release check found unexpected residue is a
+    # WITHHELD success, not a clean one — surface the recovery next-action and exit non-zero.
+    if outcome.success_withheld:
+        lines.append("  -> success WITHHELD: post-release worktree residue detected")
+        if outcome.recovery_detail:
+            lines.append(f"     recovery: {outcome.recovery_detail}")
     if not outcome.executed and outcome.preflight.may_hibernate:
         lines.append("  (preflight only; re-run with --execute to hibernate the lane)")
     return "\n".join(lines)
@@ -102,7 +109,9 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_hibernate_text(outcome), file=sys.stdout)
-    return 1 if outcome.is_blocked else 0
+    # Redmine #13843: a withheld success (post-release residue) is not a clean success — it
+    # must exit non-zero so the coordinator converges to the recovery / boundary-record path.
+    return 1 if outcome.is_blocked or outcome.success_withheld else 0
 
 
 def register_sublane_hibernate_parser(sublane_sub: Any) -> None:

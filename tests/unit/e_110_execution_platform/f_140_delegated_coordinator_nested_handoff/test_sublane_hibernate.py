@@ -52,6 +52,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_PENDING_PROMPT,
     BLOCK_PROJECT_GENERATION_MISMATCH,
     BLOCK_PROJECT_UNATTESTED,
+    BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT,
+    BLOCK_RELEASE_BOUNDARY_MUTATION,
     BLOCK_REVIEW_PENDING,
     BLOCK_STALE_ACTION_GENERATION,
     BLOCK_STALE_ACTION_IDENTITY,
@@ -59,12 +61,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_UNPUSHED_COMMITS,
     BLOCK_UNRECORDED_BOUNDARY,
     BLOCK_WORKING,
+    BLOCK_WORKTREE_UNREADABLE,
     PARK_BASIS_DEPENDENCY,
     PARK_BASIS_EARLY_HIBERNATE,
     HibernateAssertions,
     HibernateRequest,
     LiveSublaneHibernateOps,
     SublaneHibernateUseCase,
+    WorktreeMutationFingerprint,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
     cmd_sublane_hibernate,
@@ -100,24 +104,62 @@ def _all_gates(**overrides) -> HibernateAssertions:
     return HibernateAssertions(**base)
 
 
-class _FakeOps:
-    """Fake hibernate IO port: canned workspace / inventory (rows + readability) / close."""
+#: A readable, clean, quiescent worktree fingerprint (the default the fence sees when a test
+#: does not exercise the #13843 TOCTOU fence). Two of these compare equal, so the fence is a
+#: no-op unless a test scripts a diverging sequence.
+_CLEAN_FP = WorktreeMutationFingerprint(readable=True)
 
-    def __init__(self, *, rows, close_result=None, readable=True, attestations=None):
+
+class _FakeOps:
+    """Fake hibernate IO port: canned workspace / inventory (rows + readability) / close.
+
+    ``fingerprints`` (Redmine #13843) optionally scripts the successive worktree-mutation
+    fingerprints the release-boundary fence reads (T0 preflight, T1 boundary, T2 post-release)
+    — a deterministic synthetic TOCTOU with NO timing / sleep. When exhausted (or omitted) the
+    reader returns a clean, quiescent fingerprint, so an unrelated test is unaffected.
+    Similarly ``inventory_sequence`` scripts successive inventory reads (the fresh boundary
+    re-read differs from the preflight read) to drive a live-generation drift.
+    """
+
+    def __init__(
+        self,
+        *,
+        rows,
+        close_result=None,
+        readable=True,
+        attestations=None,
+        fingerprints=None,
+        inventory_sequence=None,
+    ):
         self._rows = list(rows)
         self._readable = readable
         self._close_result = close_result
         self._attestations = dict(attestations or {})
+        self._fingerprints = list(fingerprints) if fingerprints is not None else None
+        self._inventory_sequence = (
+            [list(r) for r in inventory_sequence]
+            if inventory_sequence is not None
+            else None
+        )
         self.close_calls: list = []
+        self.worktree_reads = 0
 
     def workspace_id(self) -> str:
         return WS
 
     def read_inventory(self):
+        if self._inventory_sequence:
+            return self._inventory_sequence.pop(0), self._readable
         return list(self._rows), self._readable
 
     def read_attestation(self, assigned_name):
         return self._attestations.get(assigned_name)
+
+    def read_worktree_mutation(self):
+        self.worktree_reads += 1
+        if self._fingerprints:
+            return self._fingerprints.pop(0)
+        return _CLEAN_FP
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
@@ -515,6 +557,10 @@ _HIBERNATE_MOD = (
     "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
     ".application.sublane_hibernate"
 )
+_CLI_MOD = (
+    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+    ".application.sublane_hibernate_cli"
+)
 
 
 class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
@@ -600,6 +646,59 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
             ):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
+
+    def test_cmd_returns_nonzero_when_success_withheld(self) -> None:
+        # Redmine #13843: a released lane whose post-release check finds residue is a WITHHELD
+        # success, not a clean one — the CLI must exit non-zero so the coordinator converges to
+        # the recovery / boundary-record path.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            args = argparse.Namespace(
+                repo=None,
+                issue=ISSUE,
+                lane=LANE,
+                journal=JOURNAL,
+                explicitly_parked=True,
+                callbacks_drained=True,
+                no_review_pending=True,
+                no_owner_approval_pending=True,
+                no_integration_pending=True,
+                no_pending_prompt=True,
+                not_working=True,
+                worktree_clean=True,
+                boundary_recorded=False,
+                execute=True,
+                json=False,
+            )
+            residue_ops = _FakeOps(
+                rows=[
+                    _row("codex", LANE, f"{WS}:p2"),
+                    _row("claude", LANE, f"{WS}:p3"),
+                ],
+                fingerprints=[
+                    WorktreeMutationFingerprint(readable=True),
+                    WorktreeMutationFingerprint(readable=True),
+                    WorktreeMutationFingerprint(
+                        readable=True, dirty=True, digest="post-residue"
+                    ),
+                ],
+            )
+            # The CLI imports these into its OWN namespace, so patch the CLI module (not the
+            # use-case module) for the patch to take effect on the actual actuation.
+            with mock.patch(
+                f"{_CLI_MOD}.LiveSublaneHibernateOps", return_value=residue_ops
+            ), mock.patch(
+                f"{_CLI_MOD}.LaneLifecycleStore", return_value=store
+            ):
+                rc = cmd_sublane_hibernate(args)
+            self.assertEqual(rc, 1)
+            # Preserved despite the withheld success: hibernated, issue binding intact.
+            rec = store.get(LaneLifecycleKey(WS, LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+            self.assertEqual(rec.issue_id, ISSUE)
 
 
 def _early_gates(**overrides) -> HibernateAssertions:
@@ -1214,6 +1313,339 @@ class SublaneProjectGatewayHibernateTest(unittest.TestCase):
             self.assertTrue(outcome.is_blocked)
             self.assertIn(BLOCK_ORIGINAL_IDENTITY, outcome.preflight.blocked_reasons)
             self.assertEqual(ops.close_calls, [])
+
+
+# ---------------------------------------------------------------------------
+# Release-boundary TOCTOU preservation fence (Redmine #13843).
+# ---------------------------------------------------------------------------
+
+
+def _dirty_fp(digest: str = "worker-write-1", *, dirty=True, untracked=False):
+    """A readable but MUTATED worktree fingerprint (a diff appeared)."""
+    return WorktreeMutationFingerprint(
+        readable=True, dirty=dirty, untracked=untracked, digest=digest
+    )
+
+
+class SublaneHibernateToctouFenceTest(unittest.TestCase):
+    """Synthetic TOCTOU: a worktree mutation / generation drift appears between the preflight
+    snapshot and the release boundary (Redmine #13843). Driven by a scripted fingerprint /
+    inventory sequence — deterministic, no timing / sleep / fault injection."""
+
+    def _store(self, tmp) -> LaneLifecycleStore:
+        return LaneLifecycleStore(home=Path(tmp))
+
+    def _declare(self, store) -> None:
+        store.declare_active(
+            LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+        )
+
+    def _rows(self):
+        return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+
+    def test_boundary_worktree_mutation_blocks_before_cas(self) -> None:
+        # A clean preflight (T0), then a fresh diff at the boundary (T1): zero lifecycle
+        # transition, zero process close, lane stays active.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            ops = _FakeOps(
+                rows=self._rows(),
+                fingerprints=[_CLEAN_FP, _dirty_fp("w1")],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertTrue(outcome.boundary_blocked)
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.blocked_reasons)
+            self.assertIsNone(outcome.transition)  # CAS never attempted
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+            # The fence actually ran: T0 + T1 fingerprint reads (no T2, no release).
+            self.assertEqual(ops.worktree_reads, 2)
+
+    def test_boundary_running_mutation_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            running = WorktreeMutationFingerprint(readable=True, mutation_in_flight=True)
+            ops = _FakeOps(rows=self._rows(), fingerprints=[_CLEAN_FP, running])
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_boundary_pending_composer_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            composer = WorktreeMutationFingerprint(readable=True, pending_composer=True)
+            ops = _FakeOps(rows=self._rows(), fingerprints=[_CLEAN_FP, composer])
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_boundary_unreadable_worktree_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            unreadable = WorktreeMutationFingerprint(readable=False)
+            ops = _FakeOps(rows=self._rows(), fingerprints=[_CLEAN_FP, unreadable])
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_WORKTREE_UNREADABLE, outcome.boundary_reasons)
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_boundary_generation_drift_blocks(self) -> None:
+        # The live managed slot set changes between the preflight read and the boundary read
+        # (the worker pane recycled to a new locator) — a generation drift the preflight
+        # snapshot no longer describes. Zero mutation.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            preflight_rows = self._rows()
+            boundary_rows = [
+                _row("codex", LANE, f"{WS}:p2"),
+                _row("claude", LANE, f"{WS}:p99"),  # recycled worker locator
+            ]
+            ops = _FakeOps(
+                rows=preflight_rows,
+                inventory_sequence=[preflight_rows, boundary_rows],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT, outcome.boundary_reasons
+            )
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_ACTIVE,
+            )
+
+    def test_post_release_residue_withholds_success(self) -> None:
+        # T0 == T1 clean, so the CAS + release proceed (panes close). A mutation then races in
+        # DURING the close window (T2 diverges): success is withheld, a recovery next-action is
+        # attached, and the lane is PRESERVED (hibernated, issue intact — nothing discarded).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            ops = _FakeOps(
+                rows=self._rows(),
+                fingerprints=[_CLEAN_FP, _CLEAN_FP, _dirty_fp("post-residue")],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            # The actuation itself was not blocked, but the success is withheld.
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.executed)
+            self.assertTrue(outcome.success_withheld)
+            self.assertFalse(outcome.is_success)
+            self.assertTrue(outcome.recovery_detail)
+            self.assertEqual(len(ops.close_calls), 1)  # the release DID happen
+            # Preserved: hibernated, issue binding intact, worktree/branch/commits untouched.
+            rec = store.get(LaneLifecycleKey(WS, LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+            self.assertEqual(rec.issue_id, ISSUE)
+            self.assertEqual(ops.worktree_reads, 3)  # T0 + T1 + T2
+
+    def test_clean_fingerprints_hibernate_and_report_success(self) -> None:
+        # Positive control: three clean captures -> a clean, fully-actuated success.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            ops = _FakeOps(
+                rows=self._rows(), fingerprints=[_CLEAN_FP, _CLEAN_FP, _CLEAN_FP]
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertFalse(outcome.success_withheld)
+            self.assertTrue(outcome.is_success)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
+
+    def test_redrive_boundary_mutation_blocks_zero_close(self) -> None:
+        # A partial release, then a redrive whose boundary fingerprint diverges: the redrive is
+        # blocked (zero close), the row stays hibernated / partial — never advanced to released
+        # over a now-mutated worktree, and never recorded clean.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS,
+                lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            first = SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            self.assertEqual(first.release.process_release, RELEASE_PARTIAL)
+
+            retry_ops = _FakeOps(
+                rows=self._rows(), fingerprints=[_CLEAN_FP, _dirty_fp("mid-redrive")]
+            )
+            retry = SublaneHibernateUseCase(ops=retry_ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(retry.already_hibernated)
+            self.assertTrue(retry.is_blocked)
+            self.assertTrue(retry.redrive_blocked)
+            self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, retry.boundary_reasons)
+            self.assertIsNone(retry.release)
+            self.assertEqual(retry_ops.close_calls, [])
+            rec = store.get(LaneLifecycleKey(WS, LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+            self.assertEqual(rec.process_release, RELEASE_PARTIAL)
+
+
+class WorktreeMutationFingerprintTest(unittest.TestCase):
+    """The pure #13843 value object + boundary / post-check decisions (fail-closed)."""
+
+    def test_clean_captures_are_not_diverged(self) -> None:
+        a = WorktreeMutationFingerprint(readable=True)
+        b = WorktreeMutationFingerprint(readable=True)
+        self.assertFalse(a.diverged_from(b))
+        self.assertTrue(a.quiescent)
+
+    def test_stable_dirty_is_not_diverged(self) -> None:
+        # A pre-existing dirty worktree (a dependency park with a boundary journal) that does
+        # not change is NOT a divergence — the fence blocks on a change, not on dirtiness.
+        a = WorktreeMutationFingerprint(readable=True, dirty=True, digest="X")
+        b = WorktreeMutationFingerprint(readable=True, dirty=True, digest="X")
+        self.assertFalse(a.diverged_from(b))
+
+    def test_digest_change_is_diverged(self) -> None:
+        a = WorktreeMutationFingerprint(readable=True, dirty=True, digest="Y")
+        b = WorktreeMutationFingerprint(readable=True, dirty=True, digest="X")
+        self.assertTrue(a.diverged_from(b))
+
+    def test_unreadable_either_side_is_diverged(self) -> None:
+        clean = WorktreeMutationFingerprint(readable=True)
+        bad = WorktreeMutationFingerprint(readable=False)
+        self.assertTrue(bad.diverged_from(clean))
+        self.assertTrue(clean.diverged_from(bad))
+        self.assertFalse(bad.quiescent)
+
+    def test_activity_on_later_capture_is_diverged(self) -> None:
+        clean = WorktreeMutationFingerprint(readable=True)
+        running = WorktreeMutationFingerprint(readable=True, mutation_in_flight=True)
+        self.assertTrue(running.diverged_from(clean))
+
+
+_BOUNDARY_MOD = (
+    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+    ".application.sublane_hibernate_boundary"
+)
+# The live git-status probe lives in the boundary leaf, so patch subprocess.run there.
+_LIVE_MOD_SUBPROCESS = f"{_BOUNDARY_MOD}.subprocess.run"
+
+
+class _CP:
+    """A minimal stand-in for subprocess.CompletedProcess."""
+
+    def __init__(self, returncode, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+class LiveHibernateWorktreeFingerprintTest(unittest.TestCase):
+    """R (Redmine #13843): the REAL adapter's git-status -> fingerprint conversion, incl.
+    the fail-closed / non-git tri-state (a git-invocation failure is never "clean")."""
+
+    def _ops(self):
+        return LiveSublaneHibernateOps(repo_root=Path("."))
+
+    def test_clean_repo_is_readable_and_clean(self) -> None:
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(0, "true\n"), _CP(0, "")],
+        ):
+            fp = self._ops().read_worktree_mutation()
+        self.assertTrue(fp.readable)
+        self.assertFalse(fp.dirty)
+        self.assertFalse(fp.untracked)
+
+    def test_dirty_repo_reports_dirty_and_untracked(self) -> None:
+        status = " M src/foo.py\n?? bar.txt\n"
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(0, "true\n"), _CP(0, status)],
+        ):
+            fp = self._ops().read_worktree_mutation()
+        self.assertTrue(fp.readable)
+        self.assertTrue(fp.dirty)
+        self.assertTrue(fp.untracked)
+        self.assertTrue(fp.digest)
+
+    def test_status_error_is_unreadable_not_clean(self) -> None:
+        # Inside a work tree but `status` failed -> fail closed (never "clean").
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(0, "true\n"), _CP(128, "")],
+        ):
+            fp = self._ops().read_worktree_mutation()
+        self.assertFalse(fp.readable)
+
+    def test_non_git_directory_is_readable_clean(self) -> None:
+        # git ran and said "not a work tree" -> a non-git scaffold lane (readable, clean).
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(128, "")],
+        ):
+            fp = self._ops().read_worktree_mutation()
+        self.assertTrue(fp.readable)
+        self.assertFalse(fp.dirty)
+
+    def test_git_invocation_failure_is_unreadable(self) -> None:
+        # The git binary is missing / the call raised -> fail closed, NOT a clean non-git lane.
+        with mock.patch(_LIVE_MOD_SUBPROCESS, side_effect=OSError("no git")):
+            fp = self._ops().read_worktree_mutation()
+        self.assertFalse(fp.readable)
+
+    def test_digest_is_stable_and_order_independent(self) -> None:
+        # The digest is over the SORTED status lines, so row order does not change it.
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(0, "true\n"), _CP(0, " M a.py\n?? b.txt\n")],
+        ):
+            fp1 = self._ops().read_worktree_mutation()
+        with mock.patch(
+            _LIVE_MOD_SUBPROCESS,
+            side_effect=[_CP(0, "true\n"), _CP(0, "?? b.txt\n M a.py\n")],
+        ):
+            fp2 = self._ops().read_worktree_mutation()
+        self.assertEqual(fp1.digest, fp2.digest)
 
 
 if __name__ == "__main__":

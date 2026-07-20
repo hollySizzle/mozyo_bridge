@@ -74,6 +74,21 @@ retire_三義:
       注: hibernate は close / dogfood 成功 / owner approval へ読み替えない。common safety gate
           (pending review/callback/integration/work/prompt・dirty/unpushed・identity 不明) は fail-closed。
           owner approval pending は basis 依存 (early hibernate では blocker にしない)。
+      release-boundary TOCTOU fence (Redmine #13843): preflight の clean/idle 判定と managed
+          process release は atomic でない。preflight snapshot と process release の間に worker が
+          worktree mutation を開始でき、lane が hibernated/released でも uncommitted residue が残る。
+          actuation は preflight (T0) で worktree fingerprint (`git status` porcelain digest + dirty/
+          untracked + running-mutation/pending-composer) を取得し、**release 直前 (T1) に fresh 再読**
+          して T0 と照合する: fingerprint divergence / running mutation / pending composer / live
+          managed-slot (assigned-name→locator) drift / boundary fingerprint unreadable のいずれかで
+          **lifecycle transition 0 / process close 0 の typed blocked** (`release_boundary_mutation` /
+          `release_boundary_generation_drift` / `worktree_fingerprint_unreadable`)。CAS→partial
+          release→retry は idempotent で redrive も同じ fence を通す (dirty residue を clean と記録
+          しない)。release 後 (T2) の post-check で unexpected dirty mutation を検出したら **success を
+          withhold** し (lane は hibernated のまま — issue/worktree/branch/commit は保存)、durable
+          recovery/boundary-record path (boundary journal 記録 → 次 generation で resume/adopt) へ収束
+          させ、CLI は non-zero exit する。fence は timing/sleep/常時有効 fault injection を持たず、
+          synthetic regression は scripted fingerprint/inventory sequence で決定論的に駆動する。
 
 [5] retire               lane を退役する (pane/worktree/branch)。owner 確認なしに退役してよい条件は所有 doc。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),
