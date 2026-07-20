@@ -228,13 +228,14 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
-  - id: spec-ticket-system-neutral-orchestrator
-    type: spec
+  - id: logic-ticket-system-neutral-orchestrator
+    type: logic
     status: active
-    canonical_path: vibes/docs/specs/ticket-system-neutral-orchestrator.md
-    purpose: Redmineを推奨・既定adapterに留め、durable work record port、authority map、normalized event、reconcile / recovery、review / integration / close sequence、0.12.2 current gapとmigration incrementsを固定するprovider-neutral自動orchestrator設計正本。
-    audit_role: ticket_system_neutral_orchestrator_spec
+    canonical_path: vibes/docs/logics/ticket-system-neutral-orchestrator.md
+    purpose: Redmineを推奨・既定アダプターに留め、永続作業記録port、正本境界、正規化event、再照合・回復、review・integration・closeのsequence、現行0.12.2との差、段階移行を固定するプロバイダー非依存の自動オーケストレーター制御設計正本。
+    audit_role: ticket_system_neutral_orchestrator_logic
     related_document_refs:
+      - logic-plugin-ready-adapter-boundary
       - logic-coordinator-sublane-development-flow
       - logic-workflow-step-command-design
       - logic-autonomous-ticket-entrypoint
@@ -557,6 +558,7 @@ documents:
     purpose: external plugin API 公開前に、ticket / presentation / terminal runtime / catalog / telemetry / release helper の built-in adapter 境界と v0.8 最初の候補を分類する設計正本。
     audit_role: plugin_ready_adapter_boundary_logic
     related_document_refs:
+      - logic-ticket-system-neutral-orchestrator
       - logic-managed-state-model
       - logic-workspace-registry
       - logic-coordinator-sublane-development-flow
@@ -841,7 +843,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/workflow-step-command-design.md
-    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、work item 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。現行bindingはRedmine、provider-neutral contractはspec-ticket-system-neutral-orchestrator。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
+    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、work item 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。現行bindingはRedmine、provider-neutral contractはlogic-ticket-system-neutral-orchestrator。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
     audit_role: workflow_step_command_design_logic
     related_document_refs:
       - logic-ticketless-project-gateway-runtime-ux
@@ -851,7 +853,7 @@ documents:
       - spec-route-identity-ledger
       - logic-tmux-send-safety-contract
       - logic-coordinator-sublane-development-flow
-      - spec-ticket-system-neutral-orchestrator
+      - logic-ticket-system-neutral-orchestrator
       - rule-project-agent-workflow
       - rule-docs-catalog-governance
       - spec-project-map
@@ -969,7 +971,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の durable work record recovery (current adapterはRedmine journal) と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。provider-neutral contractはspec-ticket-system-neutral-orchestrator。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の durable work record recovery (current adapterはRedmine journal) と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。provider-neutral contractはlogic-ticket-system-neutral-orchestrator。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - logic-sublane-lifecycle-map
@@ -986,7 +988,7 @@ documents:
       - logic-session-inventory
       - logic-tmux-send-safety-contract
       - logic-delegated-coordinator-cockpit-display
-      - spec-ticket-system-neutral-orchestrator
+      - logic-ticket-system-neutral-orchestrator
       - skill-workflow-reference
       - spec-project-map
 
@@ -1358,12 +1360,12 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/autonomous-ticket-entrypoint.md
-    purpose: ticket-ID entrypointとdurable work record起点の自律作業設計。Redmine / Asana別のintakeはprovider adapter規則であり、製品中核のprovider-neutral contractはspec-ticket-system-neutral-orchestrator。
+    purpose: ticket-ID entrypointとdurable work record起点の自律作業設計。Redmine / Asana別のintakeはprovider adapter規則であり、製品中核のprovider-neutral contractはlogic-ticket-system-neutral-orchestrator。
     audit_role: autonomous_ticket_entrypoint_logic
     related_document_refs:
       - skill-workflow-reference
       - logic-tmux-send-safety-contract
-      - spec-ticket-system-neutral-orchestrator
+      - logic-ticket-system-neutral-orchestrator
 
   - id: logic-ack-completion-receiver-state
     type: logic

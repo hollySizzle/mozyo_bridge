@@ -3,9 +3,9 @@
 Redmine #12755 Add workflow step as the single standard agent command の設計方針を固定する。
 本書は `mozyo-bridge workflow step` の思想、責務境界、既存 primitive との関係を定義する。
 具体的な CLI flag、JSON field、実装 module 名、error wording は実装側 help / tests を正本にする。
-provider-neutralな orchestrator / event / authority contractは
-`vibes/docs/specs/ticket-system-neutral-orchestrator.md`を正本とする。本書のRedmine語彙は
-current 0.12.2 bindingとincrement履歴であり、製品必須providerを意味しない。
+プロバイダー非依存のオーケストレーター・イベント・権限契約は
+`vibes/docs/logics/ticket-system-neutral-orchestrator.md`を正本とする。本書に残るRedmine語彙は、
+現行0.12.2のbindingと段階実装の履歴であり、製品必須プロバイダーを意味しない。
 
 ## 背景
 
