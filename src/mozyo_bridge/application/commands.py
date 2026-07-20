@@ -125,7 +125,6 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     project_preflight_target,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
-    AUTO_TARGET_REPO,
     KIND_LABELS,
     MODE_PENDING,
     MODE_QUEUE_ENTER,
@@ -138,7 +137,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     TargetActivationOutcome,
     build_inactive_pane_fallback_command,
     evaluate_standard_target_admission,
-    is_explicit_pane_target,
     make_outcome,
     resolve_queue_enter_retry_policy,
     resolve_standard_target_admission_policy,
@@ -157,6 +155,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail import (
     TmuxTransportRailRequest,
     run_tmux_transport_rail,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_target_resolution import (
+    TargetResolutionRequest,
+    run_target_resolution,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
@@ -210,7 +212,6 @@ active_herdr_turn_start_rail = None
 # instead of via the tmux pane resolver, so a pure herdr session (no tmux server)
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
-    HerdrSendEntryError,
     herdr_auto_target_repo,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
@@ -1790,224 +1791,39 @@ def orchestrate_handoff(
     ticketless_callback_payload = _anchor_plan.callback_payload
     ticketless_consultation_payload = _anchor_plan.consultation_payload
     ticketless_work_intake_payload = _anchor_plan.work_intake_payload
-    if herdr_send:
-        # Redmine #13261 (increment 2): pure-herdr target resolution. There is no
-        # tmux pane to read, so resolve the receiver against the live herdr inventory
-        # scoped by the launch-time sender identity (env + anchor) and synthesize a
-        # `project_preflight_target`-compatible pane record whose `id` is the live
-        # herdr locator. Fail-closed (un-attested sender / unavailable inventory /
-        # no single live agent) emits a `target_unavailable` blocked outcome and dies
-        # — never a silent tmux fallback.
-        try:
-            target_info = resolve_herdr_send_target(
-                repo_root=repo_root,
-                target=inp.target,
-                target_repo=inp.target_repo,
-                target_lane=inp.target_lane,
-                receiver=receiver,
-            )
-        except HerdrSendEntryError as exc:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason=("invalid_args" if exc.reason == "invalid_args" else "target_unavailable"),  # #13884
-                    receiver=receiver,
-                    target=None,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-    else:
-        target_arg = inp.target or receiver
-        try:
-            target_info = pane_info(target_arg)
-        except SystemExit:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="target_unavailable",
-                    receiver=receiver,
-                    target=None,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            # Diagnostics only (Redmine #11776): when a `<session>:codex` gateway
-            # location fails to resolve, distinguish exact tmux window-name
-            # resolution from inventory agent_kind classification and list the
-            # session's Codex-like candidate panes. Best-effort and additive — the
-            # original resolver failure (already printed) and the blocked outcome
-            # are unchanged.
-            try:
-                if (
-                    ":" in target_arg
-                    and not target_arg.startswith("%")
-                    and target_arg.split(":", 1)[1].split(".", 1)[0] == "codex"
-                ):
-                    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-                    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-                        codex_gateway_candidates,
-                    )
-                    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
-                        target_unavailable_codex_diagnostic,
-                    )
-
-                    _sess = target_arg.split(":", 1)[0]
-                    _cands = [
-                        rec.to_dict()
-                        for rec in codex_gateway_candidates(_sess, _pr.pane_lines())
-                    ]
-                    _diag = target_unavailable_codex_diagnostic(
-                        _sess, "codex", _cands
-                    )
-                    print(_diag, file=sys.stderr)
-            except (Exception, SystemExit):
-                # Diagnostics are strictly best-effort. `pane_lines()` calls
-                # `die()` (SystemExit) when tmux is absent, so catch SystemExit too
-                # — a diagnostics failure must never replace the original
-                # `target_unavailable` outcome (Redmine #11778).
-                pass
-            raise
-
-    target = target_info["id"]
-
-    # Redmine #12229: surface duplicate same-lane receiver panes in the durable
-    # record so the receiver pane and any stale-input duplicate stay both
-    # visible and the receiver/actor record cannot silently diverge (a cockpit
-    # gateway repair can leave two same-lane Claude panes, #12226 j#61213). This
-    # reads a LIVE tmux snapshot at action time
-    # (`vibes/docs/logics/runtime-observability-boundary.md`), never a stored
-    # projection. It is strictly diagnostic and best-effort: it never blocks the
-    # send and never replaces an outcome (an explicit `--target %pane` is the
-    # documented escape hatch, and queue-enter's Step 11 active-split gate
-    # already fail-closes the inactive duplicate). A snapshot read failure must
-    # not change delivery, so swallow any error.
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-
-    duplicate_lane_panes: list[str] = []
-    if not herdr_send:
-        # Redmine #13261: this same-lane-duplicate diagnostic reads a LIVE tmux pane
-        # snapshot, which has no meaning in a pure herdr session — so it is an
-        # explicit no-op under the herdr backend (an empty list), not a swallowed
-        # tmux-absence error. herdr identity uniqueness is enforced upstream by the
-        # assigned-name decode (a duplicate assigned name fails closed).
-        try:
-            duplicate_lane_panes = [
-                _pr.duplicate_pane_record_row(pane)
-                for pane in _pr.same_lane_receiver_duplicates(
-                    target_info, _pr.pane_lines(), receiver
-                )
-            ]
-        except (Exception, SystemExit):
-            duplicate_lane_panes = []
-
-    # `--target-repo auto` (Redmine #11778): resolve the cross-workspace
-    # identity gate from the explicitly-named pane's own cwd so the operator
-    # does not hand-run `tmux display-message -p -t %pane '#{pane_current_path}'`
-    # before a safe gateway send. Strictly limited to an explicit `%pane`
-    # target — never a receiver label, a `session:window` location, or implicit
-    # discovery — and fail-closed when the pane cwd has no inferable
-    # workspace/repo root. The resolved root then flows through the SAME
-    # cross-session admission and `target_repo_mismatch` gates below as a
-    # hand-passed `--target-repo <root>`; auto cannot weaken them (a pane with
-    # no reachable marker is rejected here, and `--to claude` cross-session is
-    # still blocked downstream regardless).
-    if resolved_target_repo == AUTO_TARGET_REPO and herdr_send:
-        # Redmine #13331 (j#73312 #2): herdr has no `%pane` to infer from, so `auto`
-        # resolves to the sender's own repo root (the same-workspace target's repo). tmux
-        # `auto` is untouched (guarded on `herdr_send`). See `herdr_auto_target_repo`.
-        resolved_target_repo = herdr_auto_target_repo(repo_root)
-    elif resolved_target_repo == AUTO_TARGET_REPO:
-        raw_target = inp.target
-        if not is_explicit_pane_target(raw_target):
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "`--target-repo auto` requires an explicit `%pane` target; "
-                f"target={(raw_target or '<receiver-window>')!r} is not a "
-                "`%pane` id. Auto never widens to receiver-label, "
-                "`session:window`, or discovery targets — name the exact pane, "
-                "or pass an explicit `--target-repo <root>`."
-            )
-            raise AssertionError("unreachable")
-        auto_cwd = target_info.get("cwd") or ""
-        # Prefer the real Git worktree root over a nested project-local scaffold
-        # marker (Redmine #12658 j#66504): a target pane inside a monorepo project
-        # subdir that carries its own `.mozyo-bridge/scaffold.json` must still
-        # resolve `--target-repo auto` to the Git repo root, not the subdir, so the
-        # repo gate gates on the Git root as documented. Non-git scaffold
-        # workspaces still fall back to the marker resolver (#11301).
-        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-            resolve_workspace_root as _resolve_workspace_root,
-        )
-
-        auto_root = _resolve_workspace_root(auto_cwd)
-        if not auto_root:
-            _emit(
-                make_outcome(
-                    status="blocked",
-                    reason="target_repo_mismatch",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "`--target-repo auto` could not infer a workspace/repo root "
-                f"from target_cwd={(auto_cwd or '<unknown>')!r}; identity "
-                "unestablished, fail-closed. Scaffold the target workspace so "
-                "it carries a `.mozyo-bridge/scaffold.json` / git marker, or "
-                "pass an explicit `--target-repo <root>`."
-            )
-            raise AssertionError("unreachable")
-        # Diagnostics: record the resolved cwd and inferred root so the auto
-        # decision is auditable, then hand the concrete root to the gates below.
-        print(
-            f"--target-repo auto resolved: target_pane={target} "
-            f"target_cwd={auto_cwd!r} -> repo_root={auto_root!r}",
-            file=sys.stderr,
-        )
-        resolved_target_repo = auto_root
-
-    # Explicit-pane preflight projection (Redmine #11908): resolve the target
-    # pane onto the canonical `TargetRecord` identity vocabulary
-    # (`vibes/docs/logics/unit-target-model.md` "Resolver priority") via the same
-    # projection `agents targets` uses, so normal-local and cockpit panes share
-    # one resolver. Pane option role/workspace/lane is primary; the window name
-    # is a compatibility fallback (`role_source == window_name`); ambiguous /
-    # unknown is surfaced for fail-closed handling below.
-    preflight_target = project_preflight_target(target_info)
+    # Redmine #13729 tranche 5: the handoff target-resolution preflight slice owns the herdr /
+    # tmux target resolution, the `target_unavailable` `<session>:codex` gateway diagnostic, the
+    # same-lane duplicate diagnostics, the `--target-repo auto` resolution, and the canonical
+    # `project_preflight_target` projection. It is carved into the typed
+    # ``handoff_target_resolution`` use case — the facade only assembles the typed request (the
+    # resolved `repo_root` + `herdr_send` backend predicate + the raw target scalars + the
+    # terminal-outcome context) and reads the resolved values back off the typed result, so no
+    # downstream gate reads a mutated Namespace attribute. The emitted blocked outcomes, the
+    # printed diagnostics, the re-raised tmux resolver ``SystemExit``, and every ``die`` message
+    # are byte-identical to the original inline block.
+    _target_resolution = run_target_resolution(
+        TargetResolutionRequest(
+            repo_root=repo_root,
+            target=inp.target,
+            target_repo=inp.target_repo,
+            target_lane=inp.target_lane,
+            receiver=receiver,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            source=source,
+            record_format=record_format,
+            record_command=record_command,
+            resolved_target_repo=resolved_target_repo,
+            herdr_send=herdr_send,
+        ),
+        emit=_emit,
+    )
+    target_info = _target_resolution.target_info
+    target = _target_resolution.target
+    duplicate_lane_panes = _target_resolution.duplicate_lane_panes
+    resolved_target_repo = _target_resolution.resolved_target_repo
+    preflight_target = _target_resolution.preflight_target
 
     # Main-lane implementation-dispatch guard (Redmine #12441; prevention note
     # #12438 j#63436; role-based since Redmine #13174). In the managed cockpit /

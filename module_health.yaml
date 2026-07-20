@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3044
+    lines: 2860
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1117,6 +1117,23 @@ allowlist:
       facade keeps one thin call site that builds the typed request from the resolved envelope +
       raw scalars and returns the use case result. Net -262. Shared baseline change: reconcile at
       integration if another tranche/lane also edits this file.
+      Tightened 3044 -> 2860 for #13729 tranche 5 (handoff target-resolution preflight): the
+      ~218-line inline block that resolves the send target (herdr-native inventory / tmux pane
+      resolver), emits the `target_unavailable` `<session>:codex` gateway diagnostic, surfaces the
+      same-lane duplicate diagnostics, resolves `--target-repo auto` (herdr self-root / explicit
+      `%pane` cwd inference with the `invalid_args` + `target_repo_mismatch` fail-closed gates), and
+      projects the canonical `project_preflight_target` moved to the new
+      `f_130_handoff_routing/application/handoff_target_resolution.py`
+      (`TargetResolutionUseCase` over a typed `TargetResolutionRequest` + `TargetResolutionResult`
+      + a side-effect `TargetResolutionOps` port; `LiveTargetResolutionOps` routes the
+      resolve_herdr_send_target / pane_info / herdr_auto_target_repo / project_preflight_target and
+      the pane-resolver / project-discovery / diagnostic seams through `commands` at call time so
+      every monkeypatch seam stays in force). The facade keeps one thin call site that builds the
+      typed request from the resolved envelope + backend predicate and reads the resolved
+      target_info / target / duplicate_lane_panes / resolved_target_repo / preflight_target back off
+      the typed result (and drop the now-orphaned `HerdrSendEntryError` / `AUTO_TARGET_REPO` /
+      `is_explicit_pane_target` facade imports, whose only uses moved into the use case). Net -184.
+      Shared baseline change: reconcile at integration if another tranche/lane also edits this file.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
