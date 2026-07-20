@@ -939,6 +939,62 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         self.assertEqual(facts.latest_gate_journal, "120")
         self.assertEqual((facts.review_conclusion, state, owner), ("approved", "owner_waiting", OWNER_COORDINATOR))
 
+    # -- fail-closed: the handoff channel is a notification, not truth (review j#83467 F5) -
+
+    def _handoff(self, kind, *, journal="100", jid="101"):
+        # A delivery-notification note on the ``handoff`` channel (a pointer, never durable truth).
+        marker = f"[mozyo:handoff:source=redmine:issue=13952:journal={journal}:kind={kind}:to=claude]"
+        return _j(jid, f"## Handoff delivery record\n{marker}")
+
+    def test_handoff_review_result_notification_does_not_shadow_the_truth(self):
+        # F5a: a NEWER handoff kind=review_result delivery note must not become a review and shadow
+        # the real approved result — the handoff channel is a pointer, not the durable record.
+        journals = [
+            _request_journal(jid="90"),
+            _result_journal("approved", jid="100"),
+            self._handoff("review_result", journal="100", jid="101"),
+        ]
+        facts, state, owner = self._fold(journals)
+        self.assertEqual(facts.latest_gate_journal, "100")
+        self.assertEqual((facts.review_conclusion, state, owner), ("approved", "owner_waiting", OWNER_COORDINATOR))
+
+    def test_handoff_review_request_notification_does_not_break_correlation(self):
+        # F5b: a handoff kind=review_request delivery note between the real request and result must
+        # not be treated as a competing review_request that breaks the result's correlation.
+        journals = [
+            _request_journal(jid="90"),
+            self._handoff("review_request", journal="90", jid="95"),
+            _result_journal("approved", req="90", jid="100"),
+        ]
+        facts, state, owner = self._fold(journals)
+        self.assertEqual((facts.review_conclusion, state, owner), ("approved", "owner_waiting", OWNER_COORDINATOR))
+
+    # -- round supersession: a newer review_request marker (review j#83467 F6) ------------
+
+    def test_newer_marker_only_review_request_supersedes_an_older_result(self):
+        # F6: a newer canonical review_request under a reworded (non-gate) heading must still make
+        # its journal a recognized review_request gate, so an older approved result goes stale.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _result_journal("approved", head=_HEAD, req="90", jid="100"),
+            _j("110", f"## Durable re-review note\n[mozyo:workflow-event:gate=review_request:head={_HEAD2}]"),
+        ]
+        facts, state, owner = self._fold(journals)
+        self.assertEqual(facts.latest_gate_journal, "110")
+        self.assertEqual((facts.latest_gate, state, owner), (GATE_REVIEW_REQUEST, "review_waiting", OWNER_AUDITOR))
+
+    def test_newer_malformed_review_request_still_supersedes(self):
+        # F6: even a head-less / malformed newer review_request means the round restarted — the old
+        # result is stale, so it must not stay the authority (fail-closed toward re-review).
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _result_journal("approved", head=_HEAD, req="90", jid="100"),
+            _j("110", "## Durable re-review\n[mozyo:workflow-event:gate=review_request]"),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual(facts.latest_gate_journal, "110")
+        self.assertEqual(state, "review_waiting")
+
     # -- non-review markers ---------------------------------------------------------------
 
     def test_review_finding_verdict_marker_is_not_an_audit_review(self):
