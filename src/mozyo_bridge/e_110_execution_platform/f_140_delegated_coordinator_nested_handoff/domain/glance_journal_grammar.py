@@ -33,13 +33,18 @@ The boundary (j#74307):
   computation and an old approved cannot re-surface (review j#83422 F3). This is exactly the
   callback generation fence's disposition for a malformed / uncorrelated review marker. Reading
   the token is still read-only: it produces no watcher events and mutates nothing.
-  Two channel / round-supersession invariants keep this honest (review j#83467): (1) ONLY the
-  ``workflow-event`` channel is consulted — the ``handoff`` channel is a delivery *notification*
-  (a pointer), never durable review truth, so it cannot establish a gate, correlate a request, or
-  shadow a result (F5); (2) EVERY gate-bearing ``workflow-event`` marker — including a
-  ``review_request`` recorded under a reworded heading — makes its journal a recognized gate, so a
-  newer review_request supersedes an older review_result in the latest computation even when
-  heading vocabulary drifts (F6).
+  Channel / round-supersession invariants keep this honest (reviews j#83467 / j#83558): (1) ONLY
+  the ``workflow-event`` channel is consulted — the ``handoff`` channel is a delivery
+  *notification* (a pointer), never durable review truth, so it cannot establish a gate, correlate
+  a request, or shadow a result (F5); (2) a structured ``review_request`` / ``review_result``
+  marker — the review family ONLY (:data:`_MARKER_ESTABLISHED_GATES`) — makes its journal a
+  recognized review gate even under a reworded heading, so a newer review_request supersedes an
+  older review_result (F6); the callback-facing ``owner_close_approval_waiting`` and the
+  fact-bearing ``implementation_done`` / ``blocked`` markers are NOT promoted from a marker alone
+  (their gate comes from the heading), so a waiting-callback marker never reads as owner approval
+  (F7); (3) when a review marker and the heading DISAGREE on the review family, the structured
+  marker wins — a ``## Gate: Review`` + ``結論`` body cannot beat a ``gate=review_request`` marker
+  into a false approval (F8).
 - **Only line-anchored gate headings are read**, in the two governed shapes: the prefixed
   ``## Gate: <kind>`` and the suffixed ``## <kind> Gate`` (Redmine #13952: same-lane reviewers
   durably write ``## Review Gate — 要修正``). Both are normalized (case / surrounding
@@ -439,19 +444,35 @@ def _issue_markers(journals: Sequence[Tuple[object, str]]) -> Tuple[JournalMarke
     return extract_markers(entries, channels={MARKER_CHANNEL_WORKFLOW_EVENT})
 
 
-def _journal_marker_gates(markers: Sequence[JournalMarker], journal: str) -> set:
-    """The runtime gates the ``workflow-event`` markers on ``journal`` establish (pure).
+#: The ONLY runtime gates a structured marker may establish in the glance (Redmine #13952 R7
+#: review j#83558 F7). A ``review_request`` recorded under a reworded heading must still supersede
+#: an older review_result (F6), and a ``review_result`` must still shadow an older review (F3) —
+#: so the review family is marker-authoritative. But the marker union is DELIBERATELY NOT extended
+#: to the other gate-bearing kinds: ``owner_close_approval_waiting`` is a callback-facing marker
+#: (it only wakes the coordinator, it does NOT grant approval — central preset "Close Approval
+#: Separation"), and ``implementation_done`` / ``blocked`` markers carry facts (commit / …) the
+#: glance would not fully carry from the marker, so promoting them from a marker alone is not
+#: semantics-preserving. Those gates come from the heading (always present on the real journal).
+_MARKER_ESTABLISHED_GATES: frozenset[str] = frozenset({GATE_REVIEW, GATE_REVIEW_REQUEST})
 
-    Redmine #13952 R6 review j#83467 F6: a structured gate marker is the durable authority for
-    gate recognition, so a review_request (or any gate-bearing) marker recorded under a reworded
-    heading STILL makes its journal a recognized gate — a newer review_request then supersedes an
-    older review_result in the latest computation (heading vocabulary drift can no longer hide a
-    fresh round). ``JournalMarker.gate`` is already the runtime gate
-    (``review_result`` -> ``review``, ``owner_close_approval_waiting`` -> ``owner_close_approval``,
-    …), so the mapping is not re-derived here.
+
+def _journal_marker_gates(markers: Sequence[JournalMarker], journal: str) -> set:
+    """The review-family runtime gates the ``workflow-event`` markers on ``journal`` establish (pure).
+
+    Restricted to :data:`_MARKER_ESTABLISHED_GATES` (Redmine #13952 R7 review j#83558 F7): a
+    structured ``review_request`` / ``review_result`` marker is the durable authority for its gate,
+    so it makes its journal a recognized review gate even under a reworded heading — a newer
+    review_request supersedes an older review_result (F6) and a review_result shadows an older
+    review (F3). The other gate-bearing marker kinds (owner-close waiting / implementation_done /
+    blocked) are NOT promoted from a marker alone (see :data:`_MARKER_ESTABLISHED_GATES`).
+    ``JournalMarker.gate`` is already the runtime gate, so the mapping is not re-derived here.
     """
     j = str(journal).strip()
-    return {mk.gate for mk in markers if str(mk.journal).strip() == j}
+    return {
+        mk.gate
+        for mk in markers
+        if str(mk.journal).strip() == j and mk.gate in _MARKER_ESTABLISHED_GATES
+    }
 
 
 def _has_review_result_marker(markers: Sequence[JournalMarker], journal: str) -> bool:
@@ -657,13 +678,18 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
             gates.add(gate)
             if gate == GATE_REVIEW and qualifier and not review_qualifier:
                 review_qualifier = qualifier
-        # Redmine #13952 R3/R4/R6: a structured ``workflow-event`` gate marker is the durable
-        # authority for gate recognition, so every gate-bearing marker on this journal makes it a
-        # recognized gate even under a reworded heading. That both keeps a review_result (canonical
-        # or shadow) in the latest computation — a newer bad review shadows an older approved
-        # (j#83422 F3) — and lets a newer review_request supersede an older result (j#83467 F6).
+        # Redmine #13952 R3/R4/R6/R7: a structured ``workflow-event`` review marker is the durable
+        # AUTHORITY for the review-family gate, so it establishes its gate even under a reworded
+        # heading (a review_result shadows an older review — j#83422 F3; a review_request supersedes
+        # an older result — j#83467 F6). When a review marker and the heading DISAGREE on the review
+        # family, the structured marker wins (j#83558 F8): the heading's review / review_request gate
+        # is dropped so a ``## Gate: Review`` + ``結論: 承認`` body cannot beat a ``gate=review_request``
+        # marker into a false approval. Non-review heading gates (start / close / …) are untouched.
         jid_s = str(journal_id).strip()
-        gates |= _journal_marker_gates(issue_markers, jid_s)
+        marker_review_gates = _journal_marker_gates(issue_markers, jid_s)
+        if marker_review_gates:
+            gates -= _MARKER_ESTABLISHED_GATES
+            gates |= marker_review_gates
         marker_disposition, marker_conclusion, marker_blocker = _review_result_disposition(
             issue_markers, jid_s
         )

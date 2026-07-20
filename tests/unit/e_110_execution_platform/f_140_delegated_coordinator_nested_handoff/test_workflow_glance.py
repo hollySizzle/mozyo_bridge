@@ -995,6 +995,82 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         self.assertEqual(facts.latest_gate_journal, "110")
         self.assertEqual(state, "review_waiting")
 
+    # -- marker union is review-family only (review j#83558 F7) ---------------------------
+
+    def test_owner_close_waiting_marker_is_not_owner_approval(self):
+        # F7: ``owner_close_approval_waiting`` is a callback-facing marker (it wakes the coordinator,
+        # it does NOT grant approval — Close Approval Separation). It must not establish an
+        # owner_close gate from a marker alone and read as an approved, close-ready lane.
+        journals = [
+            _request_journal(jid="90"),
+            _result_journal("approved", jid="100"),
+            _j("110", "## Durable note\n[mozyo:workflow-event:gate=owner_close_approval_waiting]"),
+        ]
+        facts, state, owner = self._fold(journals)
+        self.assertEqual(facts.latest_gate_journal, "100")  # the reworded owner-close note is not a gate
+        self.assertEqual((state, owner), ("owner_waiting", OWNER_COORDINATOR))
+
+    def test_implementation_done_marker_alone_does_not_establish_a_gate(self):
+        # F7: only the review family is marker-authoritative. A reworded implementation_done marker
+        # (no heading) establishes no gate — the real journals always carry the heading.
+        facts = fold_issue_gate_facts(
+            [_j("100", "## Durable note\n[mozyo:workflow-event:gate=implementation_done]")]
+        )
+        self.assertIsNone(facts)
+
+    def test_real_owner_close_heading_still_reaches_close_waiting(self):
+        # Non-regression: owner close approval is granted via the HEADING (a real approval record),
+        # so a genuine ``## Gate: owner_close_approval`` + merged disposition still folds to close.
+        facts = fold_issue_gate_facts(
+            [
+                _j("100", "## Gate: owner_close_approval\n- commit_hash: `abc1234`"),
+                _j("101", "## Integration disposition: merged"),
+            ]
+        )
+        sig = lane_signal_from_gate_facts("7", facts, issue_open=True)
+        self.assertEqual(classify_lane_state(sig), "close_waiting")
+
+    def test_marker_commit_flag_alone_does_not_fabricate_commit_bearing(self):
+        # F7 corollary: the glance does not adopt a marker's ``commit=`` fact; commit_bearing comes
+        # from a ``commit:`` field in the note, so a marker-only ``commit=1`` never fabricates it.
+        journals = [
+            _request_journal(jid="90"),
+            _j("110", f"## Durable re-review\n[mozyo:workflow-event:gate=review_request:head={_HEAD2}:commit=1]"),
+        ]
+        facts, _, _ = self._fold(journals)
+        self.assertFalse(facts.commit_bearing)
+
+    # -- marker/heading conflict: structured authority wins (review j#83558 F8) -----------
+
+    def test_review_request_marker_overrides_a_conflicting_review_heading(self):
+        # F8: a journal that carries a canonical ``gate=review_request`` marker AND a ``## Gate:
+        # Review`` heading with a ``結論: 承認`` body is a NEW request — the structured marker wins,
+        # so the body approval cannot beat it into owner_waiting.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _result_journal("approved", head=_HEAD, req="90", jid="100"),
+            _j(
+                "110",
+                f"## Gate: Review\n- 結論: 承認\n[mozyo:workflow-event:gate=review_request:head={_HEAD2}]",
+            ),
+        ]
+        facts, state, owner = self._fold(journals)
+        self.assertEqual((facts.latest_gate_journal, facts.latest_gate), ("110", GATE_REVIEW_REQUEST))
+        self.assertEqual((state, owner), ("review_waiting", OWNER_AUDITOR))
+
+    def test_review_result_marker_overrides_a_conflicting_request_heading(self):
+        # The symmetric case: a ``## Gate: Review Request`` heading but a canonical review_result
+        # marker is a RESULT — the structured marker wins and its conclusion is authoritative.
+        journals = [
+            _request_journal(head=_HEAD, jid="90"),
+            _j(
+                "100",
+                f"## Gate: Review Request\n[mozyo:workflow-event:gate=review_result:conclusion=changes_requested:head={_HEAD}:req=90]",
+            ),
+        ]
+        facts, state, _ = self._fold(journals)
+        self.assertEqual((facts.latest_gate, facts.review_conclusion, state), (_GATE_REVIEW, REVIEW_CHANGES_REQUESTED, "implementing"))
+
     # -- non-review markers ---------------------------------------------------------------
 
     def test_review_finding_verdict_marker_is_not_an_audit_review(self):
