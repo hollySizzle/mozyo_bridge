@@ -83,6 +83,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     HEALTH_PROVIDER_EXITED,
     HEALTH_RECEIVER_UNREADABLE,
     HEALTH_SHELL_RESIDUE,
+    HEALTH_STARTUP_EVIDENCE_UNAVAILABLE,
     HEALTH_STARTUP_INTERACTION,
     SCREEN_BLOCKED,
     SCREEN_CLEAR,
@@ -306,7 +307,20 @@ def _slot_health(
     *, slot_provider, assigned_name, locator, disposition, health, blocker_id
 ) -> SlotHealth:
     healthy = health == HEALTH_HEALTHY
-    owed = (not healthy) and disposition == DISPOSITION_FRESH_LAUNCHED
+    # Redmine #14231: `startup_evidence_unavailable` is non-green but owes NO compensation.
+    # The slot itself was observed live at its launched locator, screen-clear, and
+    # generation-matched-attested — the ONLY thing missing is this run's own record of how
+    # it got there. Treating that as rollback_owed would close a demonstrably working pane
+    # over a reporting gap, and would give the evidence projection rollback authority *by
+    # its absence* — exactly what Design Answer j#84724 forbids ("新しいprojectionは診断で
+    # あり、workflow truth・rollback authority・liveness authorityへ昇格しない"). It stays
+    # fail-closed in the sense the answer asked for: the run does not report a green, and
+    # the operator is pointed at `herdr startup-status` — it just does not demand a close.
+    owed = (
+        (not healthy)
+        and health != HEALTH_STARTUP_EVIDENCE_UNAVAILABLE
+        and disposition == DISPOSITION_FRESH_LAUNCHED
+    )
     return SlotHealth(
         provider=slot_provider,
         assigned_name=assigned_name,
