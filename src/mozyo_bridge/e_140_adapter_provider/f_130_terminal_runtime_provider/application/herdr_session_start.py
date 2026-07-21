@@ -897,6 +897,7 @@ def _prepare_session_locked(
                 launch_argv_extra=launch_argv_extra,
                 order_deferred=order_deferred,
                 replacement_action_id=replacement_action_id,
+                action_id=transaction.action_id if transaction is not None else "",
             )
         )
         if plan.kind == "launch":
