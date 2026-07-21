@@ -13,6 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from tests.support.private_path_fixtures import macos_home_path
+
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
     HandoffCallbackSender,
@@ -127,7 +129,10 @@ class SendReasonIsCarriedAndNormalized(unittest.TestCase):
             UNRECOGNIZED_ZERO_SEND_REASON,
         )
 
-        secret = "/Users/someone/.mozyo_bridge/token-abc123"
+        # Composed at runtime: `release check tree` blocks a personal-home literal in a tracked
+        # file, redaction fixtures included (Redmine #14244). The value handed to the code under
+        # test is still exactly a home-path-shaped secret.
+        secret = macos_home_path("someone") + "/.mozyo_bridge/token-abc123"
         result = self._send("blocked", secret)
         self.assertEqual(result.send_reason, UNRECOGNIZED_ZERO_SEND_REASON)
         self.assertNotIn("token-abc123", result.send_reason)
