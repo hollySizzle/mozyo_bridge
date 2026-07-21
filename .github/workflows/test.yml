@@ -238,6 +238,22 @@ jobs:
           /tmp/smoke-venv/bin/mozyo-bridge --help > /dev/null
           /tmp/smoke-venv/bin/mozyo --help > /dev/null
 
+      - name: Installed fault-path smoke (built artifact)
+        # Redmine #14097 installed layer: from the EXACT built wheel, install into an isolated
+        # venv and drive every fault shape's public entrypoint + a representative path as real
+        # `mozyo-bridge` subprocesses, proving installed provenance (venv, never the checkout or a
+        # pipx global). The hermetic source-public-dispatch truth tables run in the unit `discover`
+        # gate above; this is the artifact-provenance half the review required. Fake herdr backend
+        # over `MOZYO_HERDR_BINARY` only; no operator home / real Herdr / tmux / SQLite / network
+        # service. A build/runtime-dependency shortfall fails the gate (never a silent skip).
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl | head -n1)"
+          if [ -z "$WHEEL" ]; then
+            echo "::error::no wheel built for the installed fault smoke"; exit 1
+          fi
+          python smoke/installed_fault_smoke.py --wheel "$WHEEL"
+
       - name: Integration batch summary
         if: always()
         env:
@@ -251,7 +267,8 @@ jobs:
             echo "- exact SHA: \`$SHA\`"
             echo "- Python: 3.12 (clean Linux single-Python full)"
             echo "- gates: health check, docs validate, full \`unittest discover\`,"
-            echo "  wheel+sdist build, fresh-install smoke (\`mozyo-bridge\` / \`mozyo\`)"
+            echo "  wheel+sdist build, fresh-install smoke (\`mozyo-bridge\` / \`mozyo\`),"
+            echo "  installed fault-path smoke (#14097: provenance + shape entrypoints)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   full-matrix:
