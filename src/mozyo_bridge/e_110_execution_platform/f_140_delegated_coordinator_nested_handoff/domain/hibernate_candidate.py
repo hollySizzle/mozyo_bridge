@@ -111,28 +111,27 @@ _REQUIRED_CONJUNCTS = {
     BASIS_DEPENDENCY_PARK: DEPENDENCY_PARK_CONJUNCTS,
 }
 
-# Per-conjunct evidence anchor (Redmine #14219 R1-F2). A conjunct's provenance proves WHERE the
-# evidence came from; its anchor proves WHAT the evidence is about. Both must line up with the
-# candidate, or a valid-but-off-target proof (an approval at a DIFFERENT head, an integration on a
-# different issue) could be synthesised into a candidate.
+# Per-conjunct evidence anchor (Redmine #14219 R1-F2 + R2-F1). A conjunct's provenance proves WHERE
+# the evidence came from; its anchor proves WHAT lane, generation, and commit the evidence is about.
+# An issue-only anchor is NOT enough (R2-F1): a durable record for the same issue but a superseded
+# lane generation, a different lane, or a different head could otherwise be synthesised into the
+# current candidate. So EVERY conjunct must bind to the candidate's exact lane identity
+# (workspace + lane + generation); a durable record from an old generation or another lane cannot
+# count.
 #
-#   * head-anchored — the evidence is about a specific commit (a review_result marker carries the
-#     full head; a CI run and a push-reachability check are each about one head). ``bound_head``
-#     must equal the candidate's head.
-#   * issue-anchored — the evidence is about the issue, not a commit (integration disposition is
-#     issue+journal; a dogfood delegation and a park declaration are issue-scoped durable records).
-#     ``bound_issue`` must equal the candidate's issue.
-CONJUNCT_ANCHOR_HEAD = "head"
-CONJUNCT_ANCHOR_ISSUE = "issue"
-
-_CONJUNCT_ANCHOR = {
-    CONJUNCT_REVIEW_APPROVED: CONJUNCT_ANCHOR_HEAD,
-    CONJUNCT_STAGING_INTEGRATED: CONJUNCT_ANCHOR_ISSUE,
-    CONJUNCT_REQUIRED_CI_GREEN: CONJUNCT_ANCHOR_HEAD,
-    CONJUNCT_DOGFOOD_DELEGATED: CONJUNCT_ANCHOR_ISSUE,
-    CONJUNCT_COMMITS_PUSHED: CONJUNCT_ANCHOR_HEAD,
-    CONJUNCT_PARK_DECLARED: CONJUNCT_ANCHOR_ISSUE,
-}
+# Head-bearing conjuncts additionally bind to the candidate head — the evidence names a specific
+# commit: a review_result marker carries the full head; a CI run is about one commit; an
+# integration disposition names the integrated commit (skill ``references/workflow.md``); a dogfood
+# delegation carries the exact SHA (skill ``references/release.md``); a push-reachability check is
+# of one head. The dependency-park declaration is not about a commit, so it binds to the lane
+# identity only.
+_CONJUNCT_REQUIRES_HEAD = frozenset({
+    CONJUNCT_REVIEW_APPROVED,
+    CONJUNCT_STAGING_INTEGRATED,
+    CONJUNCT_REQUIRED_CI_GREEN,
+    CONJUNCT_DOGFOOD_DELEGATED,
+    CONJUNCT_COMMITS_PUSHED,
+})
 
 # --------------------------------------------------------------------------------------------------
 # Non-candidate reasons — the closed vocabulary emitted when a lane is NOT a hibernate candidate.
@@ -231,18 +230,21 @@ class BasisConjunct:
     """One durable precondition, bound from its OWN authority AND to the candidate's exact anchor.
 
     ``key`` is a ``CONJUNCT_*`` token; ``provenance`` must equal :data:`_CONJUNCT_AUTHORITY` for
-    that key (WHERE the evidence came from). The anchor (WHAT the evidence is about) must line up
-    with the candidate too (Redmine #14219 R1-F2): a head-anchored conjunct
-    (:data:`_CONJUNCT_ANCHOR`) carries ``bound_head`` and it must equal the candidate head; an
-    issue-anchored conjunct carries ``bound_issue`` and it must equal the candidate issue. The
-    unused field stays ``""``.
+    that key (WHERE the evidence came from). The anchor (WHAT lane / commit the evidence is about)
+    must line up with the candidate too (Redmine #14219 R1-F2 + R2-F1): every conjunct binds to the
+    candidate's exact lane identity via ``bound_workspace`` / ``bound_lane`` / ``bound_generation``
+    (so an old-generation or cross-lane record cannot count), and a head-bearing conjunct
+    (:data:`_CONJUNCT_REQUIRES_HEAD`) additionally carries ``bound_head`` equal to the candidate
+    head. ``bound_generation`` of 0 and empty strings mean "unbound" and never match.
     """
 
     key: str
     satisfied: bool
     provenance: str
+    bound_workspace: str = ""
+    bound_lane: str = ""
+    bound_generation: int = 0
     bound_head: str = ""
-    bound_issue: str = ""
     detail: str = ""
 
     def as_payload(self) -> dict:
@@ -250,8 +252,10 @@ class BasisConjunct:
             "key": self.key,
             "satisfied": self.satisfied,
             "provenance": self.provenance,
+            "bound_workspace": self.bound_workspace,
+            "bound_lane": self.bound_lane,
+            "bound_generation": self.bound_generation,
             "bound_head": self.bound_head,
-            "bound_issue": self.bound_issue,
         }
 
 
@@ -381,33 +385,41 @@ def bind_lifecycle_anchor(
     )
 
 
-def _anchor_matches(conjunct: BasisConjunct, *, candidate_head: str, candidate_issue: str) -> bool:
-    """Whether the conjunct's evidence is bound to the candidate's exact head / issue.
+def _anchor_matches(conjunct: BasisConjunct, *, anchor: "LifecycleAnchor", candidate_head: str) -> bool:
+    """Whether the conjunct's evidence is bound to the candidate's exact lane and (if head-bearing)
+    commit.
 
-    Head-anchored evidence must carry a non-empty ``bound_head`` equal to the candidate head;
-    issue-anchored evidence a non-empty ``bound_issue`` equal to the candidate issue. An empty or
-    drifted anchor means the evidence — however genuine — is about a different commit / issue and
-    cannot count (Redmine #14219 R1-F2).
+    Every conjunct must name the candidate's exact lane identity — workspace, lane, and generation
+    (Redmine #14219 R2-F1) — so a durable record from a superseded generation or a different lane
+    cannot count. A head-bearing conjunct must additionally carry ``bound_head`` equal to the
+    candidate head. An empty or drifted anchor means the evidence — however genuine — is about a
+    different lane / commit and does not apply.
     """
-    if _CONJUNCT_ANCHOR[conjunct.key] == CONJUNCT_ANCHOR_HEAD:
+    if not (
+        conjunct.bound_workspace and conjunct.bound_workspace == anchor.repo_workspace_id
+        and conjunct.bound_lane and conjunct.bound_lane == anchor.lane_id
+        and conjunct.bound_generation and conjunct.bound_generation == anchor.lane_generation
+    ):
+        return False
+    if conjunct.key in _CONJUNCT_REQUIRES_HEAD:
         return bool(conjunct.bound_head) and conjunct.bound_head == candidate_head
-    return bool(conjunct.bound_issue) and conjunct.bound_issue == candidate_issue
+    return True
 
 
 def _evaluate_basis(
     declared_basis: str,
     conjuncts: Sequence[BasisConjunct],
     *,
+    anchor: "LifecycleAnchor",
     candidate_head: str,
-    candidate_issue: str,
 ) -> Optional[str]:
     """Return a non-candidate reason if the declared basis is not satisfied, else ``None``.
 
     Only the conjuncts REQUIRED by the declared basis are considered — a candidate never falls back
     to another basis. Reason precedence, most structural first: authority mismatch (wrong source) →
     partially unknown (a required conjunct is missing) → anchor mismatch (right source, but the
-    evidence is about a different head / issue) → unsatisfied (evidence about this candidate says
-    no).
+    evidence is about a different lane / generation / head) → unsatisfied (evidence about this
+    candidate says no).
     """
     required = _REQUIRED_CONJUNCTS[declared_basis]
     by_key = {c.key: c for c in conjuncts}
@@ -422,10 +434,10 @@ def _evaluate_basis(
     for key in required:
         if key not in by_key:
             return NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN
-    # 3. Anchor mismatch: a required conjunct's evidence is about a different head / issue than the
-    #    candidate — a genuine proof, but not of THIS lane at THIS head.
+    # 3. Anchor mismatch: a required conjunct's evidence is about a different lane / generation /
+    #    head than the candidate — a genuine proof, but not of THIS lane at THIS head.
     for key in required:
-        if not _anchor_matches(by_key[key], candidate_head=candidate_head, candidate_issue=candidate_issue):
+        if not _anchor_matches(by_key[key], anchor=anchor, candidate_head=candidate_head):
             return NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH
     # 4. Unsatisfied: a required conjunct is present, correctly-sourced, on-target, but false.
     for key in required:
@@ -453,7 +465,8 @@ def classify_hibernate_candidate(
       3. ``head`` must be present and bound from a :data:`HEAD_AUTHORITIES` authority — never the
          lifecycle record.
       4. The declared basis's required conjuncts must each be satisfied from their own authority AND
-         be bound to this candidate's exact head / issue (Redmine #14219 R1-F2).
+         be bound to this candidate's exact lane identity — and, if head-bearing, its exact head
+         (Redmine #14219 R1-F2 + R2-F1).
     """
     issue_id = selected.issue_id.strip()
     if declared_basis not in DECLARABLE_BASES:
@@ -470,7 +483,7 @@ def classify_hibernate_candidate(
         return HibernateNonCandidate(issue_id, NON_CANDIDATE_HEAD_UNBOUND)
 
     basis_reason = _evaluate_basis(
-        declared_basis, conjuncts, candidate_head=head.value, candidate_issue=anchor.issue_id
+        declared_basis, conjuncts, anchor=anchor, candidate_head=head.value
     )
     if basis_reason is not None:
         return HibernateNonCandidate(issue_id, basis_reason)

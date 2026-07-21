@@ -63,15 +63,17 @@ def _head(value: str = HEAD, provenance: str = hc.PROVENANCE_GIT_REMOTE) -> hc.B
     return hc.BoundField(value=value, provenance=provenance)
 
 
-# The five correctly-sourced, on-anchor, satisfied early-hibernate conjuncts.
-def _conj(key, provenance, *, satisfied=True, bound_head=None, bound_issue=None):
-    if bound_head is None and hc._CONJUNCT_ANCHOR[key] == hc.CONJUNCT_ANCHOR_HEAD:
-        bound_head = HEAD
-    if bound_issue is None and hc._CONJUNCT_ANCHOR[key] == hc.CONJUNCT_ANCHOR_ISSUE:
-        bound_issue = ISSUE
+# A correctly-sourced, on-anchor, satisfied conjunct: bound to the candidate lane identity, and to
+# the candidate head when the conjunct is head-bearing. Any of the bound_* kwargs can be overridden
+# to drive a negative case.
+def _conj(key, provenance, *, satisfied=True, bound_workspace=WS, bound_lane=LANE,
+          bound_generation=GEN, bound_head=None):
+    if bound_head is None:
+        bound_head = HEAD if key in hc._CONJUNCT_REQUIRES_HEAD else ""
     return hc.BasisConjunct(
         key=key, satisfied=satisfied, provenance=provenance,
-        bound_head=bound_head or "", bound_issue=bound_issue or "",
+        bound_workspace=bound_workspace, bound_lane=bound_lane,
+        bound_generation=bound_generation, bound_head=bound_head,
     )
 
 
@@ -179,79 +181,71 @@ class HeadAuthorityTests(unittest.TestCase):
 
 
 class ConjunctAnchorTests(unittest.TestCase):
-    """R1-F2: each conjunct's evidence must be about the candidate's exact head / issue."""
+    """R1-F2 + R2-F1: each conjunct's evidence must be about the candidate's exact lane identity
+    (workspace + lane + generation) and, if head-bearing, its exact head."""
 
+    def _one(self, key, provenance, **bound):
+        return _classify((_Rec(),), conjuncts=_early_conjuncts(**{
+            key: _conj(key, provenance, **bound)
+        }))
+
+    # -- head drift on head-bearing conjuncts -------------------------------------------------
     def test_review_evidence_at_a_different_head_is_rejected(self):
-        got = _classify(
-            (_Rec(),),
-            conjuncts=_early_conjuncts(**{
-                hc.CONJUNCT_REVIEW_APPROVED: _conj(
-                    hc.CONJUNCT_REVIEW_APPROVED, hc.PROVENANCE_REVIEW_RECORD, bound_head="b" * 40
-                )
-            }),
-        )
+        got = self._one(hc.CONJUNCT_REVIEW_APPROVED, hc.PROVENANCE_REVIEW_RECORD, bound_head="b" * 40)
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
     def test_head_bearing_conjunct_with_empty_head_is_rejected(self):
-        got = _classify(
-            (_Rec(),),
-            conjuncts=_early_conjuncts(**{
-                hc.CONJUNCT_COMMITS_PUSHED: _conj(
-                    hc.CONJUNCT_COMMITS_PUSHED, hc.PROVENANCE_GIT_REMOTE, bound_head=""
-                )
-            }),
-        )
+        got = self._one(hc.CONJUNCT_COMMITS_PUSHED, hc.PROVENANCE_GIT_REMOTE, bound_head="")
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
     def test_ci_evidence_head_drift_is_rejected(self):
-        got = _classify(
-            (_Rec(),),
-            conjuncts=_early_conjuncts(**{
-                hc.CONJUNCT_REQUIRED_CI_GREEN: _conj(
-                    hc.CONJUNCT_REQUIRED_CI_GREEN, hc.PROVENANCE_CI_RECORD, bound_head="c" * 40
-                )
-            }),
+        got = self._one(hc.CONJUNCT_REQUIRED_CI_GREEN, hc.PROVENANCE_CI_RECORD, bound_head="c" * 40)
+        self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+    def test_integration_evidence_at_a_different_head_is_rejected(self):
+        # R2-F1: integration must name the candidate's integrated commit, not merely the issue.
+        got = self._one(
+            hc.CONJUNCT_STAGING_INTEGRATED, hc.PROVENANCE_INTEGRATION_RECORD, bound_head="d" * 40
         )
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
-    def test_integration_evidence_for_a_different_issue_is_rejected(self):
-        got = _classify(
-            (_Rec(),),
-            conjuncts=_early_conjuncts(**{
-                hc.CONJUNCT_STAGING_INTEGRATED: _conj(
-                    hc.CONJUNCT_STAGING_INTEGRATED, hc.PROVENANCE_INTEGRATION_RECORD,
-                    bound_issue="99999",
-                )
-            }),
+    def test_dogfood_delegation_at_a_different_head_is_rejected(self):
+        # R2-F1: a dogfood delegation carries the exact SHA; a delegation of another SHA is stale.
+        got = self._one(
+            hc.CONJUNCT_DOGFOOD_DELEGATED, hc.PROVENANCE_DELEGATION_RECORD, bound_head="e" * 40
         )
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
-    def test_issue_bound_conjunct_with_empty_issue_is_rejected(self):
-        got = _classify(
-            (_Rec(),),
-            conjuncts=_early_conjuncts(**{
-                hc.CONJUNCT_DOGFOOD_DELEGATED: _conj(
-                    hc.CONJUNCT_DOGFOOD_DELEGATED, hc.PROVENANCE_DELEGATION_RECORD, bound_issue=""
-                )
-            }),
+    # -- lane-identity drift on every conjunct (R2-F1) ----------------------------------------
+    def test_evidence_from_an_old_lane_generation_is_rejected(self):
+        # The same issue's superseded generation must not count after a re-hydrate.
+        got = self._one(
+            hc.CONJUNCT_STAGING_INTEGRATED, hc.PROVENANCE_INTEGRATION_RECORD, bound_generation=GEN - 1
+        )
+        self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+    def test_evidence_for_a_different_lane_is_rejected(self):
+        got = self._one(
+            hc.CONJUNCT_REVIEW_APPROVED, hc.PROVENANCE_REVIEW_RECORD, bound_lane="lane-OTHER"
+        )
+        self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+    def test_evidence_for_a_different_workspace_is_rejected(self):
+        got = self._one(
+            hc.CONJUNCT_COMMITS_PUSHED, hc.PROVENANCE_GIT_REMOTE, bound_workspace="ws-OTHER"
+        )
+        self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+    def test_conjunct_with_unbound_lane_identity_is_rejected(self):
+        # Empty workspace/lane and generation 0 (the default "unbound") never match.
+        got = self._one(
+            hc.CONJUNCT_REVIEW_APPROVED, hc.PROVENANCE_REVIEW_RECORD,
+            bound_workspace="", bound_lane="", bound_generation=0,
         )
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
     def test_on_anchor_evidence_is_accepted(self):
         self.assertIsInstance(_classify((_Rec(),)), hc.HibernateCandidate)
-
-    def test_a_head_authority_alone_cannot_launder_a_wrong_head(self):
-        # provenance right, but head drifted -> still rejected (authority != anchor).
-        got = _classify(
-            (_Rec(),),
-            head=_head(provenance=hc.PROVENANCE_REVIEW_RECORD),
-            conjuncts=_early_conjuncts(**{
-                hc.CONJUNCT_REVIEW_APPROVED: _conj(
-                    hc.CONJUNCT_REVIEW_APPROVED, hc.PROVENANCE_REVIEW_RECORD, bound_head="z" * 40
-                )
-            }),
-        )
-        self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
 
 class BasisTests(unittest.TestCase):
@@ -331,14 +325,25 @@ class DependencyParkTests(unittest.TestCase):
             head=_head(),
             conjuncts=(hc.BasisConjunct(
                 key=hc.CONJUNCT_PARK_DECLARED, satisfied=True,
-                provenance=hc.PROVENANCE_REVIEW_RECORD, bound_issue=ISSUE,
+                provenance=hc.PROVENANCE_REVIEW_RECORD,
+                bound_workspace=WS, bound_lane=LANE, bound_generation=GEN,
             ),),
         )
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_AUTHORITY_MISMATCH)
 
-    def test_dependency_park_rejects_a_declaration_for_a_different_issue(self):
-        got = self._park(bound_issue="99999")
+    def test_dependency_park_rejects_a_declaration_for_an_old_generation(self):
+        # R2-F1: park binds to the selected lane generation; a superseded declaration is stale.
+        got = self._park(bound_generation=GEN - 1)
         self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+    def test_dependency_park_rejects_a_declaration_for_a_different_lane(self):
+        got = self._park(bound_lane="lane-OTHER")
+        self.assertEqual(got.reason, hc.NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+    def test_dependency_park_does_not_require_a_head(self):
+        # Park is lane-anchored only; an empty bound_head must NOT sink it.
+        got = self._park(bound_head="")
+        self.assertIsInstance(got, hc.HibernateCandidate)
 
     def test_early_hibernate_conjuncts_do_not_satisfy_a_declared_park(self):
         got = hc.classify_hibernate_candidate(
