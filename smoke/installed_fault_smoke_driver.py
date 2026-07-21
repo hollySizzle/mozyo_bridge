@@ -33,7 +33,25 @@ _FAKE_HERDR_CLI = _REPO_ROOT / "smoke" / "support" / "fake_herdr_cli.py"
 
 
 def _base_env(home: Path, *, herdr_state: Path | None = None) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE", "MOZYO_REPO")}
+    """The isolated subprocess environment for one installed drive (HERMETIC).
+
+    Every ``MOZYO_*`` variable is scrubbed, not inherited (Redmine #14248). The harness used to
+    pass ``os.environ`` through with only ``TMUX`` / ``TMUX_PANE`` / ``MOZYO_REPO`` removed, so a
+    run started from an attested lane-agent pane inherited that pane's ``MOZYO_AGENT_ROLE`` /
+    ``MOZYO_LANE_ID`` / ``MOZYO_WORKSPACE_ID`` / ``MOZYO_HERDR_BINARY``. The callback drive needs
+    an attested lane-sender identity, so on such a host it silently borrowed the operator's — and
+    passed — while clean Linux CI, which has no lane agent, failed with ``send_outcome=not_sent``.
+
+    Measured both directions on the exact same wheel: Linux with ``MOZYO_AGENT_ROLE`` injected
+    goes green, and macOS with the ambient ``MOZYO_*`` scrubbed goes red with CI's exact failure
+    signature. So the red was never a platform difference or a callback-contract regression — the
+    macOS green was a FALSE green from environment leakage, and the smoke was not hermetic. Each
+    fixture now states the identity it needs explicitly (below), so the result is the same on
+    every host.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MOZYO_")}
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
     env["MOZYO_BRIDGE_HOME"] = str(home)
     if herdr_state is not None:
         # The installed CLI shells out to this exact executable as its herdr binary (a directly
@@ -88,8 +106,15 @@ def _write_state(fake: FakeHerdr, tmp: Path, name: str) -> Path:
     return state
 
 
-def drive_representative(cli: Path, tmp: Path) -> dict[str, bool]:
-    """Drive a representative CRITICAL path per fault shape through the installed artifact."""
+def drive_representative(
+    cli: Path, tmp: Path, diagnostics: "dict | None" = None
+) -> dict[str, bool]:
+    """Drive a representative CRITICAL path per fault shape through the installed artifact.
+
+    ``diagnostics`` (Redmine #14248) is an optional sink for CONTENT-FREE per-path failure detail.
+    The verdict stays a bool per path — the summary contract is unchanged — but a failing path can
+    now say WHICH dimension broke instead of only ``false``.
+    """
     results: dict[str, bool] = {}
 
     # callback-lease: bootstrap the store, then a healthy status read (no herdr backend needed).
@@ -134,7 +159,7 @@ def drive_representative(cli: Path, tmp: Path) -> dict[str, bool]:
     results["recover_stale"] = _drive_recover_stale(cli, tmp)
     results["recover_stale_negative"] = _drive_recover_stale_negative(cli, tmp)
     results["session_rollback"] = _drive_session_rollback(cli, tmp)
-    results["callback_exactly_once"] = _drive_callback_exactly_once(cli, tmp)
+    results["callback_exactly_once"] = _drive_callback_exactly_once(cli, tmp, diagnostics)
     return results
 
 
@@ -394,12 +419,19 @@ def _drive_session_rollback(cli: Path, tmp: Path) -> bool:
         return False
 
 
-def _drive_callback_exactly_once(cli: Path, tmp: Path) -> bool:
+def _drive_callback_exactly_once(cli: Path, tmp: Path, diagnostics: "dict | None" = None) -> bool:
     """F4 critical path installed: the same dispatch anchor is DELIVERED (sent) exactly once.
 
     Ingest the anchor, then ``--deliver`` it and re-``--deliver``: the send/recovery edge fires
     once (a delivered row is terminal, so the re-deliver sends nothing), and a post-delivery sweep
     does not amplify the pending / dead-letter backlog.
+
+    ``diagnostics`` (Redmine #14248) receives a CONTENT-FREE record of which conjunct failed. The
+    predicate used to collapse ingest / deliver / re-deliver / sweep into one boolean, so a CI log
+    showed ``callback_exactly_once=false`` with no way to tell a send-outcome regression from a
+    duplicate redelivery, a backlog amplification, or a harness/parse fault — the #14248 Linux
+    failure was undiagnosable for exactly that reason. Only counts, exit codes and closed-vocabulary
+    tokens are recorded: no body, no path, no raw ANSI, no credential.
     """
     ws_id = "fixture-14097-smoke-cb"
     repo = _herdr_repo_named(tmp, ws_id, "cb_repo")
@@ -424,28 +456,99 @@ def _drive_callback_exactly_once(cli: Path, tmp: Path) -> bool:
 
     def env():
         e = _base_env(home, herdr_state=state)
+        # The lane-sender identity this drive REQUIRES, stated explicitly rather than inherited
+        # (Redmine #14248). The scenario is a lane agent firing one callback, so the herdr-native
+        # identity gate legitimately demands an attested sender; supplying it here is fixture
+        # setup, NOT a relaxation of that gate — an unattested shell is still refused.
         e["MOZYO_WORKSPACE_ID"] = ws_id
+        e["MOZYO_AGENT_ROLE"] = "codex"
+        e["MOZYO_LANE_ID"] = "default"
         return e
 
     common = ["--candidate", "14097:84000:coordinator:implementation_done",
               "--redmine-json", str(snap), "--workspace-id", ws_id, "--cursor", "84001", "--json"]
     # The deliver's nested `handoff send` attests the sender from the CWD anchor, so run under the
     # herdr repo whose anchor is this workspace (else env-vs-anchor workspace mismatch blocks it).
-    _run(cli, ["workflow", "callbacks", "--ingest", *common], env(), cwd=str(repo))
+    ing = _run(cli, ["workflow", "callbacks", "--ingest", *common], env(), cwd=str(repo))
     d1 = _run(cli, ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
     d2 = _run(cli, ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
     sw = _run(cli, ["workflow", "callbacks", "--sweep", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
+    record: dict = {
+        "ingest_exit": ing.returncode,
+        "deliver1_exit": d1.returncode,
+        "deliver2_exit": d2.returncode,
+        "sweep_exit": sw.returncode,
+        "fake_transition_observed": _fake_transition_observed(state),
+    }
     try:
         p1, p2, sweep = json.loads(d1.stdout), json.loads(d2.stdout), json.loads(sw.stdout)
-        # The dispatch anchor is DELIVERED (a confirmed turn-start terminal) exactly once: the
-        # deliver claims + sends the row and the receiver's turn-start confirms it; the re-deliver
-        # sends nothing (a delivered row is terminal — duplicate notification 0); and a post-delivery
-        # sweep does not amplify the pending / dead-letter backlog.
-        return (len(p1["delivered"]) == 1 and p1["delivered"][0]["send_outcome"] == "delivered"
-                and p2["delivered"] == []
-                and sweep["dead_letter"] == [] and len(sweep["pending"]) == 0)
-    except (ValueError, KeyError, IndexError):
+    except ValueError:
+        record["parse_ok"] = False
+        _record_cb_diag(diagnostics, record, failed=["json_parse"])
         return False
+    record["parse_ok"] = True
+    try:
+        first = list(p1.get("delivered") or ())
+        second = list(p2.get("delivered") or ())
+        record.update({
+            "first_delivered_count": len(first),
+            "first_send_outcome": (first[0].get("send_outcome") if first else None),
+            "first_send_reason": (first[0].get("reason") if first else None),
+            "second_delivered_count": len(second),
+            "sweep_pending_count": len(list(sweep.get("pending") or ())),
+            "sweep_dead_letter_count": len(list(sweep.get("dead_letter") or ())),
+        })
+    except (AttributeError, IndexError, KeyError, TypeError):
+        _record_cb_diag(diagnostics, record, failed=["shape"])
+        return False
+    # The dispatch anchor is DELIVERED (a confirmed turn-start terminal) exactly once: the
+    # deliver claims + sends the row and the receiver's turn-start confirms it; the re-deliver
+    # sends nothing (a delivered row is terminal — duplicate notification 0); and a post-delivery
+    # sweep does not amplify the pending / dead-letter backlog.
+    #
+    # Each conjunct is named so a failure says WHICH dimension broke. The conjunction itself is
+    # unchanged: this is diagnosis, not relaxation (#14248 acceptance — no failure is softened).
+    conjuncts = {
+        "first_delivery_exactly_one": record["first_delivered_count"] == 1,
+        "first_send_outcome_delivered": record["first_send_outcome"] == "delivered",
+        "second_delivery_zero": record["second_delivered_count"] == 0,
+        "sweep_dead_letter_zero": record["sweep_dead_letter_count"] == 0,
+        "sweep_pending_zero": record["sweep_pending_count"] == 0,
+    }
+    failed = sorted(name for name, held in conjuncts.items() if not held)
+    _record_cb_diag(diagnostics, record, failed=failed)
+    return not failed
+
+
+def _fake_transition_observed(state_path: Path) -> "bool | None":
+    """Did the fake herdr actually consume the armed turn-start transition? (content-free).
+
+    ``None`` when the state file cannot be read or does not express it — never guessed. This is
+    the platform/timing axis #14248 needs separated from a callback-contract regression: if the
+    armed transition never fired, the failure is the fake's turn-start seam, not the send edge.
+    """
+    try:
+        raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    agents = raw.get("agents")
+    if isinstance(agents, dict):
+        agents = list(agents.values())
+    if not isinstance(agents, list):
+        return None
+    for agent in agents:
+        if isinstance(agent, dict) and "armed_transitions" in agent:
+            # Armed transitions are consumed as they fire, so an empty/absent list means the
+            # armed turn-start was observed.
+            return not agent.get("armed_transitions")
+    return None
+
+
+def _record_cb_diag(diagnostics: "dict | None", record: dict, *, failed: list) -> None:
+    """Attach the content-free exactly-once record under ``callback_exactly_once``."""
+    if diagnostics is None:
+        return
+    diagnostics["callback_exactly_once"] = {**record, "failed_conjuncts": list(failed)}
 
 
 def _herdr_repo_named(tmp: Path, ws_id: str, name: str) -> Path:

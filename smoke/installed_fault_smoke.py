@@ -141,6 +141,7 @@ def recover_stale_accepts(outcome: "dict | None") -> bool:
 def build_summary(
     *, provenance_problems: list[str], wheel_name: str, wheel_sha256: str,
     entrypoints: dict[str, int], representative: dict[str, bool],
+    representative_diagnostics: "dict | None" = None,
 ) -> dict:
     """The final smoke verdict (secret-free, JSON-safe). PURE.
 
@@ -162,6 +163,14 @@ def build_summary(
         "representative": dict(representative),
         "representative_ok": representative_ok,
         "representative_missing": missing,
+        # Redmine #14248: CONTENT-FREE per-path failure detail (counts / exit codes / closed
+        # vocabulary tokens only — no body, path, raw ANSI or credential). Emitted ONLY for paths
+        # that failed, so a green run's output is unchanged and a red CI log is diagnosable.
+        "representative_diagnostics": {
+            name: detail
+            for name, detail in (representative_diagnostics or {}).items()
+            if representative.get(name) is not True
+        },
     }
 
 
@@ -229,10 +238,12 @@ def run_smoke(args: argparse.Namespace) -> dict:
             version=facts["version"], venv_dir=str(tmp / "venv"), checkout_root=str(_REPO_ROOT),
         )
         entrypoints = drive_entrypoints(cli, tmp)
-        representative = drive_representative(cli, tmp)
+        representative_diagnostics: dict = {}
+        representative = drive_representative(cli, tmp, representative_diagnostics)
         return build_summary(
             provenance_problems=problems, wheel_name=wheel.name, wheel_sha256=sha256_file(wheel),
             entrypoints=entrypoints, representative=representative,
+            representative_diagnostics=representative_diagnostics,
         )
 
 
