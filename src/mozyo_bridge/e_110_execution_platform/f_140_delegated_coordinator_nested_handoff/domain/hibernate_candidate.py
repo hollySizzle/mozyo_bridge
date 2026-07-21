@@ -111,6 +111,29 @@ _REQUIRED_CONJUNCTS = {
     BASIS_DEPENDENCY_PARK: DEPENDENCY_PARK_CONJUNCTS,
 }
 
+# Per-conjunct evidence anchor (Redmine #14219 R1-F2). A conjunct's provenance proves WHERE the
+# evidence came from; its anchor proves WHAT the evidence is about. Both must line up with the
+# candidate, or a valid-but-off-target proof (an approval at a DIFFERENT head, an integration on a
+# different issue) could be synthesised into a candidate.
+#
+#   * head-anchored — the evidence is about a specific commit (a review_result marker carries the
+#     full head; a CI run and a push-reachability check are each about one head). ``bound_head``
+#     must equal the candidate's head.
+#   * issue-anchored — the evidence is about the issue, not a commit (integration disposition is
+#     issue+journal; a dogfood delegation and a park declaration are issue-scoped durable records).
+#     ``bound_issue`` must equal the candidate's issue.
+CONJUNCT_ANCHOR_HEAD = "head"
+CONJUNCT_ANCHOR_ISSUE = "issue"
+
+_CONJUNCT_ANCHOR = {
+    CONJUNCT_REVIEW_APPROVED: CONJUNCT_ANCHOR_HEAD,
+    CONJUNCT_STAGING_INTEGRATED: CONJUNCT_ANCHOR_ISSUE,
+    CONJUNCT_REQUIRED_CI_GREEN: CONJUNCT_ANCHOR_HEAD,
+    CONJUNCT_DOGFOOD_DELEGATED: CONJUNCT_ANCHOR_ISSUE,
+    CONJUNCT_COMMITS_PUSHED: CONJUNCT_ANCHOR_HEAD,
+    CONJUNCT_PARK_DECLARED: CONJUNCT_ANCHOR_ISSUE,
+}
+
 # --------------------------------------------------------------------------------------------------
 # Non-candidate reasons — the closed vocabulary emitted when a lane is NOT a hibernate candidate.
 # Every "unknown / stale / ambiguous / uncertain" resolves to one of these (a typed zero-actuation),
@@ -119,11 +142,14 @@ _REQUIRED_CONJUNCTS = {
 NON_CANDIDATE_LIFECYCLE_UNREADABLE = "lifecycle_store_unreadable"
 NON_CANDIDATE_LIFECYCLE_ABSENT = "active_lifecycle_record_absent"
 NON_CANDIDATE_LANE_AMBIGUOUS = "active_lane_ambiguous"
+NON_CANDIDATE_WORKSPACE_MISMATCH = "selected_workspace_mismatch"
+NON_CANDIDATE_LANE_IDENTITY_MISMATCH = "selected_lane_mismatch"
 NON_CANDIDATE_GENERATION_MISMATCH = "lane_generation_mismatch"
 NON_CANDIDATE_REVISION_MISMATCH = "lifecycle_revision_mismatch"
 NON_CANDIDATE_HEAD_UNBOUND = "head_authority_absent"
 NON_CANDIDATE_DECLARED_BASIS_INVALID = "declared_basis_invalid"
 NON_CANDIDATE_CONJUNCT_AUTHORITY_MISMATCH = "conjunct_authority_mismatch"
+NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH = "conjunct_anchor_mismatch"
 NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN = "basis_partially_unknown"
 NON_CANDIDATE_BASIS_UNSATISFIED = "basis_unsatisfied"
 
@@ -131,11 +157,14 @@ HIBERNATE_NON_CANDIDATE_REASONS = frozenset({
     NON_CANDIDATE_LIFECYCLE_UNREADABLE,
     NON_CANDIDATE_LIFECYCLE_ABSENT,
     NON_CANDIDATE_LANE_AMBIGUOUS,
+    NON_CANDIDATE_WORKSPACE_MISMATCH,
+    NON_CANDIDATE_LANE_IDENTITY_MISMATCH,
     NON_CANDIDATE_GENERATION_MISMATCH,
     NON_CANDIDATE_REVISION_MISMATCH,
     NON_CANDIDATE_HEAD_UNBOUND,
     NON_CANDIDATE_DECLARED_BASIS_INVALID,
     NON_CANDIDATE_CONJUNCT_AUTHORITY_MISMATCH,
+    NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH,
     NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN,
     NON_CANDIDATE_BASIS_UNSATISFIED,
 })
@@ -182,18 +211,38 @@ class LifecycleAnchor:
 
 
 @dataclass(frozen=True)
+class SelectedLane:
+    """The EXACT lane identity the enumeration selected (Redmine #14219 R1-F1).
+
+    A hibernate candidate must re-bind to *this* lane, not merely to "the single active lane for the
+    issue". The classifier confirms the freshly-read lifecycle record matches all four dimensions
+    (workspace / lane / generation / revision); any drift is a stale selection → zero-actuation.
+    """
+
+    issue_id: str
+    repo_workspace_id: str
+    lane_id: str
+    lane_generation: int
+    revision: int
+
+
+@dataclass(frozen=True)
 class BasisConjunct:
-    """One durable precondition, bound from its OWN authority.
+    """One durable precondition, bound from its OWN authority AND to the candidate's exact anchor.
 
     ``key`` is a ``CONJUNCT_*`` token; ``provenance`` must equal :data:`_CONJUNCT_AUTHORITY` for
-    that key or the classifier rejects the whole candidate. ``bound_head`` records the head the
-    evidence is bound to for head-bearing conjuncts (review approval); it is ``""`` otherwise.
+    that key (WHERE the evidence came from). The anchor (WHAT the evidence is about) must line up
+    with the candidate too (Redmine #14219 R1-F2): a head-anchored conjunct
+    (:data:`_CONJUNCT_ANCHOR`) carries ``bound_head`` and it must equal the candidate head; an
+    issue-anchored conjunct carries ``bound_issue`` and it must equal the candidate issue. The
+    unused field stays ``""``.
     """
 
     key: str
     satisfied: bool
     provenance: str
     bound_head: str = ""
+    bound_issue: str = ""
     detail: str = ""
 
     def as_payload(self) -> dict:
@@ -202,6 +251,7 @@ class BasisConjunct:
             "satisfied": self.satisfied,
             "provenance": self.provenance,
             "bound_head": self.bound_head,
+            "bound_issue": self.bound_issue,
         }
 
 
@@ -259,23 +309,30 @@ def _disposition(rec: object) -> str:
 def bind_lifecycle_anchor(
     records: Optional[Sequence[object]],
     *,
-    issue_id: str,
+    selected: SelectedLane,
 ) -> "LifecycleAnchor | HibernateNonCandidate":
-    """Fold the read-only lifecycle rows to the single active record for ``issue_id``.
+    """Re-bind the EXACT selected lane from the read-only lifecycle rows (Redmine #14219 R1-F1).
 
-    Fail-closed, matching ``authority_execution_index``'s ``len(recs) != 1 -> drop`` guard:
+    Two stages, both fail-closed:
 
-      * ``records is None`` (store unknown / newer / malformed / partial — the readonly
-        downgrade guard) → :data:`NON_CANDIDATE_LIFECYCLE_UNREADABLE`.
-      * no active record for the issue → :data:`NON_CANDIDATE_LIFECYCLE_ABSENT`.
-      * more than one active record (original/recovery or cross-workspace) →
-        :data:`NON_CANDIDATE_LANE_AMBIGUOUS`.
-      * exactly one → a :class:`LifecycleAnchor`, provenance ``lifecycle_readonly``.
+    1. Ambiguity guard (matching ``authority_execution_index``'s ``len(recs) != 1 -> drop``):
+
+       * ``records is None`` (store unknown / newer / malformed / partial — the readonly
+         downgrade guard) → :data:`NON_CANDIDATE_LIFECYCLE_UNREADABLE`.
+       * no active record for the issue → :data:`NON_CANDIDATE_LIFECYCLE_ABSENT`.
+       * more than one active record (original/recovery or cross-workspace) →
+         :data:`NON_CANDIDATE_LANE_AMBIGUOUS`.
+
+    2. Exact-identity confirmation — the single active record must match the enumeration's
+       ``selected`` lane on ALL four dimensions, or the selection is stale / points at a different
+       lane (workspace / lane / generation / revision mismatch). Only then is a
+       :class:`LifecycleAnchor` returned. This is what stops "the single active row for the issue"
+       from silently standing in for the lane the enumeration actually chose.
 
     ``records is ()`` (an absent store, nothing created) is distinct from ``None`` and folds to
     ``absent``, not ``unreadable``.
     """
-    issue_id = issue_id.strip()
+    issue_id = selected.issue_id.strip()
     if records is None:
         return HibernateNonCandidate(issue_id, NON_CANDIDATE_LIFECYCLE_UNREADABLE)
     active = [
@@ -289,24 +346,68 @@ def bind_lifecycle_anchor(
             issue_id, NON_CANDIDATE_LANE_AMBIGUOUS, detail=f"{len(active)} active records"
         )
     rec = active[0]
+    ws = str(getattr(rec, "repo_workspace_id", "") or "")
+    lane = str(getattr(rec, "lane_id", "") or "")
+    generation = int(getattr(rec, "lane_generation", 0) or 0)
+    revision = int(getattr(rec, "revision", 0) or 0)
+
+    if ws != selected.repo_workspace_id:
+        return HibernateNonCandidate(
+            issue_id, NON_CANDIDATE_WORKSPACE_MISMATCH,
+            detail=f"selected={selected.repo_workspace_id} bound={ws}",
+        )
+    if lane != selected.lane_id:
+        return HibernateNonCandidate(
+            issue_id, NON_CANDIDATE_LANE_IDENTITY_MISMATCH,
+            detail=f"selected={selected.lane_id} bound={lane}",
+        )
+    if generation != selected.lane_generation:
+        return HibernateNonCandidate(
+            issue_id, NON_CANDIDATE_GENERATION_MISMATCH,
+            detail=f"selected={selected.lane_generation} bound={generation}",
+        )
+    if revision != selected.revision:
+        return HibernateNonCandidate(
+            issue_id, NON_CANDIDATE_REVISION_MISMATCH,
+            detail=f"selected={selected.revision} bound={revision}",
+        )
     return LifecycleAnchor(
         issue_id=issue_id,
-        repo_workspace_id=str(getattr(rec, "repo_workspace_id", "") or ""),
-        lane_id=str(getattr(rec, "lane_id", "") or ""),
-        lane_generation=int(getattr(rec, "lane_generation", 0) or 0),
-        revision=int(getattr(rec, "revision", 0) or 0),
+        repo_workspace_id=ws,
+        lane_id=lane,
+        lane_generation=generation,
+        revision=revision,
         disposition=DISPOSITION_ACTIVE,
     )
 
 
+def _anchor_matches(conjunct: BasisConjunct, *, candidate_head: str, candidate_issue: str) -> bool:
+    """Whether the conjunct's evidence is bound to the candidate's exact head / issue.
+
+    Head-anchored evidence must carry a non-empty ``bound_head`` equal to the candidate head;
+    issue-anchored evidence a non-empty ``bound_issue`` equal to the candidate issue. An empty or
+    drifted anchor means the evidence — however genuine — is about a different commit / issue and
+    cannot count (Redmine #14219 R1-F2).
+    """
+    if _CONJUNCT_ANCHOR[conjunct.key] == CONJUNCT_ANCHOR_HEAD:
+        return bool(conjunct.bound_head) and conjunct.bound_head == candidate_head
+    return bool(conjunct.bound_issue) and conjunct.bound_issue == candidate_issue
+
+
 def _evaluate_basis(
-    declared_basis: str, conjuncts: Sequence[BasisConjunct]
+    declared_basis: str,
+    conjuncts: Sequence[BasisConjunct],
+    *,
+    candidate_head: str,
+    candidate_issue: str,
 ) -> Optional[str]:
     """Return a non-candidate reason if the declared basis is not satisfied, else ``None``.
 
     Only the conjuncts REQUIRED by the declared basis are considered — a candidate never falls back
-    to another basis. Reason precedence, most structural first: authority mismatch (an attempted
-    proxy) → partially unknown (a required conjunct is missing) → unsatisfied (evidence says no).
+    to another basis. Reason precedence, most structural first: authority mismatch (wrong source) →
+    partially unknown (a required conjunct is missing) → anchor mismatch (right source, but the
+    evidence is about a different head / issue) → unsatisfied (evidence about this candidate says
+    no).
     """
     required = _REQUIRED_CONJUNCTS[declared_basis]
     by_key = {c.key: c for c in conjuncts}
@@ -321,7 +422,12 @@ def _evaluate_basis(
     for key in required:
         if key not in by_key:
             return NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN
-    # 3. Unsatisfied: a required conjunct is present, correctly-sourced, but false.
+    # 3. Anchor mismatch: a required conjunct's evidence is about a different head / issue than the
+    #    candidate — a genuine proof, but not of THIS lane at THIS head.
+    for key in required:
+        if not _anchor_matches(by_key[key], candidate_head=candidate_head, candidate_issue=candidate_issue):
+            return NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH
+    # 4. Unsatisfied: a required conjunct is present, correctly-sourced, on-target, but false.
     for key in required:
         if not by_key[key].satisfied:
             return NON_CANDIDATE_BASIS_UNSATISFIED
@@ -330,54 +436,42 @@ def _evaluate_basis(
 
 def classify_hibernate_candidate(
     *,
-    issue_id: str,
+    selected: SelectedLane,
     declared_basis: str,
     records: Optional[Sequence[object]],
     head: Optional[BoundField],
     conjuncts: Sequence[BasisConjunct],
-    observed_generation: Optional[int] = None,
-    observed_revision: Optional[int] = None,
 ) -> "HibernateCandidate | HibernateNonCandidate":
     """Decide whether a lane is a hibernate candidate, fail-closed. PURE.
 
     Order of gates (each a typed zero-actuation on failure):
 
       1. ``declared_basis`` must be a real basis (a typed basis event, never inferred).
-      2. Re-bind the exact lane anchor from the read-only lifecycle records.
-      3. Currency: the re-bound ``lane_generation`` / ``revision`` must match what the enumeration
-         observed (the read-model snapshot that selected this lane). A drift is stale → zero-op.
-      4. ``head`` must be present and bound from a :data:`HEAD_AUTHORITIES` authority — never the
+      2. Re-bind and confirm the EXACT ``selected`` lane from the read-only lifecycle records —
+         workspace / lane / generation / revision must all match (Redmine #14219 R1-F1); any drift
+         (stale selection, wrong lane) is a typed zero-actuation.
+      3. ``head`` must be present and bound from a :data:`HEAD_AUTHORITIES` authority — never the
          lifecycle record.
-      5. The declared basis's required conjuncts must each be satisfied from their own authority.
+      4. The declared basis's required conjuncts must each be satisfied from their own authority AND
+         be bound to this candidate's exact head / issue (Redmine #14219 R1-F2).
     """
-    issue_id = issue_id.strip()
+    issue_id = selected.issue_id.strip()
     if declared_basis not in DECLARABLE_BASES:
         return HibernateNonCandidate(
             issue_id, NON_CANDIDATE_DECLARED_BASIS_INVALID, detail=str(declared_basis)
         )
 
-    bound = bind_lifecycle_anchor(records, issue_id=issue_id)
+    bound = bind_lifecycle_anchor(records, selected=selected)
     if isinstance(bound, HibernateNonCandidate):
         return bound
     anchor = bound
 
-    if observed_generation is not None and observed_generation != anchor.lane_generation:
-        return HibernateNonCandidate(
-            issue_id,
-            NON_CANDIDATE_GENERATION_MISMATCH,
-            detail=f"observed={observed_generation} bound={anchor.lane_generation}",
-        )
-    if observed_revision is not None and observed_revision != anchor.revision:
-        return HibernateNonCandidate(
-            issue_id,
-            NON_CANDIDATE_REVISION_MISMATCH,
-            detail=f"observed={observed_revision} bound={anchor.revision}",
-        )
-
     if head is None or not head.value.strip() or head.provenance not in HEAD_AUTHORITIES:
         return HibernateNonCandidate(issue_id, NON_CANDIDATE_HEAD_UNBOUND)
 
-    basis_reason = _evaluate_basis(declared_basis, conjuncts)
+    basis_reason = _evaluate_basis(
+        declared_basis, conjuncts, candidate_head=head.value, candidate_issue=anchor.issue_id
+    )
     if basis_reason is not None:
         return HibernateNonCandidate(issue_id, basis_reason)
 

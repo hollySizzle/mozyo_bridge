@@ -20,19 +20,21 @@ from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
 from ..domain.hibernate_candidate import (
     HibernateNonCandidate,
     LifecycleAnchor,
+    SelectedLane,
     bind_lifecycle_anchor,
 )
 
 
 def bind_active_lifecycle_anchor(
-    issue_id: str, *, home: Optional[Path] = None
+    selected: SelectedLane, *, home: Optional[Path] = None
 ) -> "LifecycleAnchor | HibernateNonCandidate":
-    """Re-bind the single active lane anchor for ``issue_id`` from the read-only lifecycle store.
+    """Re-bind and confirm the EXACT ``selected`` lane from the read-only lifecycle store.
 
     A thin shell: the read is :func:`load_lane_lifecycle_readonly` (non-creating, ``mode=ro``,
-    fail-closed to ``None``); the decision is the pure :func:`bind_lifecycle_anchor`. ``()`` (absent
+    fail-closed to ``None``); the decision is the pure :func:`bind_lifecycle_anchor`, which confirms
+    the record matches ``selected`` on workspace / lane / generation / revision. ``()`` (absent
     store) folds to ``active_lifecycle_record_absent``; ``None`` (unreadable) to
     ``lifecycle_store_unreadable``.
     """
     records = load_lane_lifecycle_readonly(home=home)
-    return bind_lifecycle_anchor(records, issue_id=issue_id)
+    return bind_lifecycle_anchor(records, selected=selected)

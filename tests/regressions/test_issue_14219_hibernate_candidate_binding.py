@@ -46,6 +46,14 @@ def _decision(journal: str = "85466") -> DecisionPointer:
     return DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=journal)
 
 
+def _selected(**over) -> hc.SelectedLane:
+    base = dict(
+        issue_id=ISSUE, repo_workspace_id=WS, lane_id=LANE, lane_generation=1, revision=1
+    )
+    base.update(over)
+    return hc.SelectedLane(**base)
+
+
 class HibernateCandidateBindingTests(unittest.TestCase):
     def test_single_active_lane_binds_the_exact_anchor(self):
         with TemporaryDirectory() as raw:
@@ -57,7 +65,7 @@ class HibernateCandidateBindingTests(unittest.TestCase):
                 issue_id=ISSUE,
                 worktree_identity="wt_14219alpha",
             )
-            got = bind_active_lifecycle_anchor(ISSUE, home=home)
+            got = bind_active_lifecycle_anchor(_selected(), home=home)
             self.assertIsInstance(got, hc.LifecycleAnchor)
             self.assertEqual(got.repo_workspace_id, WS)
             self.assertEqual(got.lane_id, LANE)
@@ -80,9 +88,22 @@ class HibernateCandidateBindingTests(unittest.TestCase):
                 target=DISPOSITION_HIBERNATED,
                 decision=_decision("85467"),
             )
-            got = bind_active_lifecycle_anchor(ISSUE, home=home)
+            got = bind_active_lifecycle_anchor(_selected(), home=home)
             self.assertIsInstance(got, hc.HibernateNonCandidate)
             self.assertEqual(got.reason, hc.NON_CANDIDATE_LIFECYCLE_ABSENT)
+
+    def test_a_single_active_lane_that_is_not_the_selected_one_is_rejected(self):
+        # R1-F1 end-to-end: the store's only active row for the issue is a DIFFERENT lane than the
+        # enumeration selected. Deriving "the active lane for the issue" would wrongly accept it.
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = LaneLifecycleStore(home=home)
+            store.declare_active(
+                LaneLifecycleKey(WS, "lane-actually-present"), decision=_decision(), issue_id=ISSUE
+            )
+            got = bind_active_lifecycle_anchor(_selected(lane_id="lane-enumeration-chose"), home=home)
+            self.assertIsInstance(got, hc.HibernateNonCandidate)
+            self.assertEqual(got.reason, hc.NON_CANDIDATE_LANE_IDENTITY_MISMATCH)
 
     def test_two_active_lanes_for_one_issue_are_ambiguous(self):
         with TemporaryDirectory() as raw:
@@ -94,14 +115,14 @@ class HibernateCandidateBindingTests(unittest.TestCase):
             store.declare_active(
                 LaneLifecycleKey("ws-beta", "lane-beta"), decision=_decision(), issue_id=ISSUE
             )
-            got = bind_active_lifecycle_anchor(ISSUE, home=home)
+            got = bind_active_lifecycle_anchor(_selected(), home=home)
             self.assertIsInstance(got, hc.HibernateNonCandidate)
             self.assertEqual(got.reason, hc.NON_CANDIDATE_LANE_AMBIGUOUS)
 
     def test_absent_store_is_absent_and_creates_nothing(self):
         with TemporaryDirectory() as raw:
             home = Path(raw)
-            got = bind_active_lifecycle_anchor(ISSUE, home=home)
+            got = bind_active_lifecycle_anchor(_selected(), home=home)
             self.assertIsInstance(got, hc.HibernateNonCandidate)
             self.assertEqual(got.reason, hc.NON_CANDIDATE_LIFECYCLE_ABSENT)
             # the readonly read created nothing.
@@ -119,7 +140,7 @@ class HibernateCandidateBindingTests(unittest.TestCase):
             path.write_bytes(b"this is not a sqlite database")
             # sanity: the raw readonly read itself fails closed to None on a corrupt store.
             self.assertIsNone(load_lane_lifecycle_readonly(home=home))
-            got = bind_active_lifecycle_anchor(ISSUE, home=home)
+            got = bind_active_lifecycle_anchor(_selected(), home=home)
             self.assertIsInstance(got, hc.HibernateNonCandidate)
             self.assertEqual(got.reason, hc.NON_CANDIDATE_LIFECYCLE_UNREADABLE)
 
