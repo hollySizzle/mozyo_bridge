@@ -146,6 +146,33 @@ locator-matched self-attestation** を観測できるまで success を返さな
 `hibernated_record_missing_pins` を返す場合は、一方の guard を緩めたり locator を手入力せず、専用の
 `sublane converge-bound-pair` (#13933) を使う。
 
+### active-lane `sublane quarantine` のapprovalを組み立てる (#14234)
+
+`sublane quarantine --execute` は `--assigned-name` / `--locator` / `--action-generation` /
+`--approved-revision` / `--approval-observed-at` をすべて要求する。これらは**推測してはならない** exact
+generation tokenであり、`sublane list` は返さない。raw Herdr・内部Python API・pane bodyを使わずに組み立てるには、
+公開read-only surfaceを使う。
+
+```
+mozyo-bridge sublane quarantine-inspect --issue <id> --lane <lane> --role <role> [--repo <root>] [--json]
+```
+
+- read-onlyである。store write、close、launch、Herdr mutationを行わない。
+- managed inventoryをidentity decodeで一度だけ読み、既存の #13763 quarantine inspectorへ**同じsnapshot**を渡して
+  classifyする。したがってdiscoveryとclassificationが別のinventory readでdriftしない。`sublane list` とは責務が異なり、
+  こちらは「approvalがどのexact generationを束縛するか」を答える。
+- `approval_ready=true` のときだけ、貼付可能なowner approval記録と exact `--execute` command lineを出力する。
+  approval journal idは**placeholder**であり、owner が実際に記録した後に実idへ置換する (id を予測しない)。
+- composer本文・hash・length・raw ANSI・path・credentialは出力しない。出るのはidentity / revision / generation
+  tokenとclassificationだけである。
+- 組み立て不能な場合は typed reason でfail-closedし、exit非ゼロになる: `inventory_unreadable` /
+  `composer_unreadable` / `receiver_absent` / `duplicate_receiver` / `revision_unreadable` /
+  `attestation_unreadable` / `known_marker_requires_q_enter` / `not_quarantine_candidate` /
+  `workspace_unresolved`。**refusal時はtemplateを出さない** (execute側fenceが拒否するapprovalを貼らせないため)。
+- `known_marker_requires_q_enter` はreceiver replacementではなく、既存delivery railのq-enterで処理する。
+- receiverのrevision / attested generation / locatorが変化したらapprovalは無効である。`--execute` は実状態と
+  再照合してfail-closedするので、driftしたapprovalは適用されずに拒否される。inspectを取り直してapprovalを出し直す。
+
 ### pending composer がpairをpreserveしている場合
 
 `converge-bound-pair` が `pair_contains_preserved_slot` / `preserve_pending_composer` を返したら、そのcommandへ
