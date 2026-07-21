@@ -125,6 +125,10 @@ class LiveSessionRetireOps:
             return "unknown"
 
     def observe_composer(self, locator: str) -> tuple[bool, Optional[bool]]:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
+            apply_ghost_empty,
+            default_ghost_policy,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
             observe_composer_text,
         )
@@ -137,7 +141,21 @@ class LiveSessionRetireOps:
             if not read.ok:
                 return (False, None)
             observation = observe_composer_text(read.content)
-            return (observation.readable, observation.has_pending)
+            # Redmine #14239: share the hibernate rail's provider ghost gate (#14065
+            # Phase 2) instead of the raw text verdict, so a provider-declared dim
+            # ghost placeholder does not demand a discard approval here while the
+            # sibling hibernate rail admits it as empty. `normal` / `mixed` /
+            # `unknown`, an unreadable or unresolved render, and any read error all
+            # preserve the text verdict (fail-closed inside the gate) — a real unsent
+            # input still blocks without an exact direct-owner approval.
+            has_pending = apply_ghost_empty(
+                observation.has_pending,
+                policy=default_ghost_policy(),
+                repo_root=self._repo_root,
+                env=self._env,
+                locator=locator,
+            )
+            return (observation.readable, has_pending)
         except Exception:  # noqa: BLE001 - a failed composer read is fail-soft to unreadable
             return (False, None)
 
