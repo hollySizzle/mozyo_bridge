@@ -907,6 +907,30 @@ class _AttestingHerdr(FakeHerdr):
                     replacement_action_id=self.action_id,
                 )
             )
+        # Redmine #14222 j#85125 F2: a real wrapped launch appends its attributed
+        # execution-stage rows before exec'ing, and the health probe now demands them
+        # before a green. Model that per launch, keyed by the injected startup action.
+        launch_action = ""
+        for index, token in enumerate(rest):
+            if token == "--env" and index + 1 < len(rest):
+                key, _, value = rest[index + 1].partition("=")
+                if key == "MOZYO_STARTUP_ACTION_ID":
+                    launch_action = value
+        if live and launch_action:
+            from mozyo_bridge.core.state.startup_execution_events import (
+                STAGE_PROVIDER_EXEC_CALL_REACHED,
+                STAGE_WRAPPER_ENTERED,
+                append_execution_event,
+            )
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+            )
+
+            events_fence = StartupTransactionFence(home=self._attestation_home)
+            for stage in (STAGE_WRAPPER_ENTERED, STAGE_PROVIDER_EXEC_CALL_REACHED):
+                append_execution_event(
+                    events_fence, launch_action, stage, participant=name
+                )
         return result
 
 

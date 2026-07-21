@@ -48,11 +48,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath, PureWindowsPath
 from typing import Collection, Iterable, Mapping, Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     parse_location,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle_redaction import (  # noqa: E501
+    portable_worktree_label,
+    redact_worktree_paths,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     LAUNCH_BLOCKED,
@@ -108,79 +111,9 @@ def parse_issue_from_lane_label(lane_label: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-# ---------------------------------------------------------------------------
-# Record-path redaction (Redmine #13368; privacy系統対処).
-#
-# A lane ``worktree_path`` is a host-local absolute path and is **private state**:
-# ``src/mozyo_bridge/core/state/lane_metadata.py`` marks it "local/private state
-# only; do not copy to a Redmine journal / pasteable durable record", and
-# ``vibes/docs/rules/public-private-boundary.md`` forbids personal home / private
-# project absolute paths in a public record. j#73454 (#13358 review finding 2) was
-# exactly such a leak: a gateway dispatch outcome carried the absolute worktree
-# path into the Redmine journal. These helpers make every *pasteable human-readable*
-# record redact the absolute path to its portable **sibling basename** — the lane
-# worktree directory name (e.g. ``mozyo_bridge_issue_13368_record_path_redaction``),
-# which carries no home prefix and still identifies the lane. The absolute path
-# stays only in the structured JSON outcome / local state, mirroring the #12098
-# ``ExecutionRoot`` doctrine (``workdir`` absolute in the machine surface, portable
-# pointer in the pasteable text).
-# ---------------------------------------------------------------------------
-
-#: A leading Windows drive designator (``C:`` / ``d:``). Its presence — like a
-#: backslash separator — marks a Windows-shaped path whose basename POSIX flavor
-#: cannot extract (Redmine #13368 review j#73538 finding 1).
-_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
-
-
-def _portable_basename(text: str) -> str:
-    """Final path component of ``text`` for either a POSIX or a Windows path (pure).
-
-    Redmine #13368 review j#73538 (finding 1): a lane ``worktree_path`` may be a
-    Windows-shaped host-local path (``C:\\Users\\<user>\\lane``). ``PurePosixPath``
-    does not treat ``\\`` as a separator, so its ``.name`` returns the whole string
-    and the private prefix survives redaction. Detect a Windows shape (a backslash
-    separator or a leading drive designator) and use the Windows flavor for it;
-    otherwise the POSIX flavor. Falls back to the raw string when no component can
-    be derived (e.g. a bare drive), never an empty result.
-    """
-    if "\\" in text or _WINDOWS_DRIVE_RE.match(text):
-        return PureWindowsPath(text).name or text
-    return PurePosixPath(text).name or text
-
-
-def portable_worktree_label(worktree_path: Optional[str]) -> str:
-    """Pasteable-safe label for a lane worktree: its sibling basename (pure, #13368).
-
-    Returns the worktree directory basename (no personal home / private-project
-    absolute prefix), so it is safe to render into a Redmine journal / pasteable
-    durable record. Handles both POSIX and Windows-shaped paths (:func:`_portable_basename`).
-    Empty input renders as ``-`` (matching the existing ``or '-'`` field convention
-    in the record renderers).
-    """
-    text = (worktree_path or "").strip()
-    if not text:
-        return "-"
-    return _portable_basename(text)
-
-
-def redact_worktree_paths(text: str, *worktree_paths: Optional[str]) -> str:
-    """Redact known host-local worktree absolute paths in composed record text (pure).
-
-    Replaces each supplied absolute worktree path with its portable sibling basename
-    (:func:`portable_worktree_label`) wherever it appears in ``text`` — e.g. inside a
-    replayable ``git worktree add <abs>`` / ``cockpit append --repo <abs>`` command
-    line — so a pasteable text record carries no private path while the exact command
-    (with the absolute path) is still preserved in the structured JSON outcome
-    (#13368). Replacement is by the exact known string, never by guessing a home
-    prefix, so it cannot mangle unrelated text.
-    """
-    out = text
-    for raw in worktree_paths:
-        candidate = (raw or "").strip()
-        if candidate:
-            out = out.replace(candidate, _portable_basename(candidate))
-    return out
-
+# Record-path redaction (Redmine #13368) relocated to sublane_lifecycle_redaction.py
+# (Redmine #14224 module-health reduction); portable_worktree_label / redact_worktree_paths
+# imported above and re-exported below for existing callers.
 
 # ---------------------------------------------------------------------------
 # list / status: sublane inventory projection.
@@ -619,6 +552,8 @@ class SublaneCreateRequest:
     worker_role: str = WORKER_ROLE
     work_unit: str = DEFAULT_WORK_UNIT_GRANULARITY
     work_unit_decision_anchor: Optional[str] = None
+    #: #14224: no parent UserStory (a fact no probe can infer); default fail-closed.
+    leaf_standalone: bool = False
     # #13293: the explicit base ref the lane worktree is cut from. ``None`` keeps the
     # historical ``git worktree add <path> -b <branch>`` behavior (branch off the main
     # checkout's current HEAD); a supplied ref pins the base so a stale checkout can
@@ -628,10 +563,11 @@ class SublaneCreateRequest:
     base_ref: Optional[str] = None
 
     def work_unit_decision(self) -> WorkUnitDispatchDecision:
-        """The fail-closed #13002 work-unit dispatch decision for this request."""
+        """The fail-closed #13002/#14224 work-unit dispatch decision for this request."""
         return decide_work_unit_dispatch(
             self.work_unit,
             explicit_decision_anchor=self.work_unit_decision_anchor,
+            leaf_standalone=self.leaf_standalone,
         )
 
     def resolved_upstream_coordinator(self) -> str:

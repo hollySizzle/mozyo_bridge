@@ -89,6 +89,14 @@ HEALTH_UNPROFILED_PROVIDER = "unprofiled_provider"
 #: what is being waited for. An unwrapped launch is a supported fallback, so this is a
 #: named non-success with a fix, never a hard failure.
 HEALTH_ATTESTATION_UNAVAILABLE = "attestation_unavailable"
+#: Everything observable about this slot is positive, but the launch's own execution-stage
+#: evidence (Redmine #14231) is missing for an action that WAS expected to record it. The
+#: post-launch gate fails closed here rather than reporting a green (Design Consultation
+#: Answer j#84724, clarification j#84743): a live-looking slot whose launch we cannot
+#: describe is exactly the state that made the original ``provider_exited`` unactionable.
+#: Deliberately NOT read as "the wrapper never ran" or "the provider exited" — it says only
+#: that the evidence is absent, which is a reporting gap, not a diagnosis.
+HEALTH_STARTUP_EVIDENCE_UNAVAILABLE = "startup_evidence_unavailable"
 #: No probe was performed (dry-run, or a read-only surfacing). Not a success verdict.
 HEALTH_NOT_PROBED = "not_probed"
 
@@ -102,11 +110,34 @@ HEALTH_OUTCOMES: frozenset[str] = frozenset(
         HEALTH_ATTESTATION_TIMEOUT,
         HEALTH_ATTESTATION_MISMATCH,
         HEALTH_ATTESTATION_UNAVAILABLE,
+        HEALTH_STARTUP_EVIDENCE_UNAVAILABLE,
         HEALTH_LOCATOR_DRIFT,
         HEALTH_INVENTORY_UNREADABLE,
         HEALTH_UNPROFILED_PROVIDER,
         HEALTH_NOT_PROBED,
     }
+)
+
+# --- Axis 3: whether this launch's own execution-stage evidence exists (#14231) -------
+#
+# Tri-state on purpose. The gate must distinguish "evidence was expected and is missing"
+# (a real fail-closed condition) from "this launch was never going to record evidence"
+# (an unwrapped launch, an older launcher that does not inject the action id, or a caller
+# that does not consult the projection at all). Collapsing those two into one boolean
+# would turn every legitimately unwrapped launch non-green — a behavior change #14231
+# explicitly does not want, and one that would fire on the exact fallback path #13637
+# supports.
+
+#: This launch was not expected to record execution-stage evidence, or the caller does not
+#: consult it. The gate is not armed — byte-invariant with the pre-#14231 verdicts.
+EVIDENCE_NOT_APPLICABLE = "not_applicable"
+#: Execution-stage evidence exists for this launch's action.
+EVIDENCE_PRESENT = "present"
+#: Evidence was expected for this action and is absent / unreadable — fail closed.
+EVIDENCE_UNAVAILABLE = "unavailable"
+
+STARTUP_EVIDENCE_STATES: frozenset[str] = frozenset(
+    {EVIDENCE_NOT_APPLICABLE, EVIDENCE_PRESENT, EVIDENCE_UNAVAILABLE}
 )
 
 # --- Axis 3: what this run owes for the effects it already caused ---------------------
@@ -267,6 +298,12 @@ HEALTH_DETAIL: dict[str, str] = {
         "this launch was not wrapped by the startup self-check, so its boot identity "
         "cannot be verified; put a `mozyo-bridge` on the launch env PATH to wrap it"
     ),
+    HEALTH_STARTUP_EVIDENCE_UNAVAILABLE: (
+        "the slot looks live and attested, but this action recorded no execution-stage "
+        "evidence, so where its launch actually went cannot be described; read "
+        "`mozyo-bridge herdr startup-status --action-id <id>`. Missing evidence is a "
+        "reporting gap, not proof that the wrapper never ran or that the provider exited"
+    ),
     HEALTH_LOCATOR_DRIFT: (
         "the durable name resolves to a locator other than the one `agent start` "
         "returned; refusing to treat another process as this run's launch"
@@ -292,6 +329,7 @@ def classify_startup_health(
     launched_locator: str,
     screen: str,
     attestation: str,
+    evidence: str = EVIDENCE_NOT_APPLICABLE,
 ) -> str:
     """Classify one fresh-launched slot from observed facts (pure, total, fail-closed).
 
@@ -305,8 +343,16 @@ def classify_startup_health(
     3. screen facts outrank attestation facts. The wrapper writes its attestation
        *before* exec (#13637), so a trust-screened agent still has a valid record;
        reporting ``attestation_*`` there would name the wrong cause;
-    4. attestation last: absent (nothing arrived in the deadline) is distinct from
-       invalid (something arrived and did not bind).
+    4. attestation next: absent (nothing arrived in the deadline) is distinct from
+       invalid (something arrived and did not bind);
+    5. execution-stage evidence LAST (Redmine #14231): it only ever downgrades what
+       would otherwise be :data:`HEALTH_HEALTHY`. Ordering it last is the point — every
+       verdict above names a specific, actionable cause, and an evidence gap must never
+       mask one of them. It fires only when ``evidence`` is
+       :data:`EVIDENCE_UNAVAILABLE` (expected and missing); the default
+       :data:`EVIDENCE_NOT_APPLICABLE` leaves every pre-#14231 verdict byte-invariant,
+       so an unwrapped launch or a caller that does not consult the projection is
+       unaffected.
 
     Only an all-positive path reaches :data:`HEALTH_HEALTHY`.
     """
@@ -329,6 +375,11 @@ def classify_startup_health(
         # admitted (Answer j#80989 Q1.6).
         return HEALTH_RECEIVER_UNREADABLE
     if attestation == ATTESTATION_OK:
+        # Redmine #14231: the only place the evidence gate can fire. Everything else this
+        # function can return already names a concrete cause; a missing launch record must
+        # downgrade a would-be green, never overwrite a named failure.
+        if evidence == EVIDENCE_UNAVAILABLE:
+            return HEALTH_STARTUP_EVIDENCE_UNAVAILABLE
         return HEALTH_HEALTHY
     if attestation == ATTESTATION_ABSENT:
         return HEALTH_ATTESTATION_TIMEOUT
@@ -355,6 +406,9 @@ __all__ = (
     "DISPOSITION_FRESH_LAUNCHED",
     "DISPOSITION_PLANNED",
     "DISPOSITION_SURFACED",
+    "EVIDENCE_NOT_APPLICABLE",
+    "EVIDENCE_PRESENT",
+    "EVIDENCE_UNAVAILABLE",
     "HEALTH_ATTESTATION_MISMATCH",
     "HEALTH_ATTESTATION_TIMEOUT",
     "HEALTH_ATTESTATION_UNAVAILABLE",
@@ -367,8 +421,10 @@ __all__ = (
     "HEALTH_PROVIDER_EXITED",
     "HEALTH_RECEIVER_UNREADABLE",
     "HEALTH_SHELL_RESIDUE",
+    "HEALTH_STARTUP_EVIDENCE_UNAVAILABLE",
     "HEALTH_STARTUP_INTERACTION",
     "HEALTH_UNPROFILED_PROVIDER",
+    "STARTUP_EVIDENCE_STATES",
     "SCREEN_BLOCKED",
     "SCREEN_CLEAR",
     "SCREEN_NOT_PROBED",

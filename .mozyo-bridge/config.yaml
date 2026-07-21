@@ -1,4 +1,8 @@
 version: 2
+work_unit:
+  granularity: user_story
+sublane_integration:
+  integration_branch: main-next
 agents:
   profiles:
     implementation:

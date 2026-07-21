@@ -73,6 +73,18 @@ MOZYO_BRIDGE_LAUNCHER_ENV = "MOZYO_BRIDGE_LAUNCHER"
 #: not know is inherited, not an argparse error, so no launch dies of version skew).
 MOZYO_PROVIDER_ARGV0_ENV = "MOZYO_PROVIDER_ARGV0"
 
+#: The launch-env key carrying the reserved startup-transaction ``action_id`` to the
+#: #13637 wrapper (Redmine #14231, Design Consultation Answer j#84724). Unlike
+#: ``--replacement-action-id`` (a CLI flag emitted only on the rare replacement-recovery
+#: path), this value is non-empty on EVERY managed launch, so it rides an ``--env`` key —
+#: exactly the :data:`MOZYO_PROVIDER_ARGV0_ENV` precedent (docstring above): a herdr
+#: ``--env`` key an older wrapper does not read is silently inherited, not an argparse
+#: error, so a version-skewed wrapper (a different install resolved for `attest_launcher`)
+#: degrades to "no execution-event evidence" rather than a hard launch failure. Always
+#: injected (never conditional on non-empty) because, unlike the replacement id, this one
+#: always has a value once ``reserve()`` has run.
+MOZYO_STARTUP_ACTION_ID_ENV = "MOZYO_STARTUP_ACTION_ID"
+
 #: The wrapper subcommand every managed launch execs the provider THROUGH (Redmine
 #: #13637): ``<launcher> herdr agent-attest ...``. Named once so the wrapper argv
 #: (:func:`build_agent_start_argv`) and the capability probe
@@ -226,6 +238,7 @@ def build_agent_start_argv(
     resolved: ResolvedProviderLaunch,
     launch_argv_extra: Sequence[str],
     replacement_action_id: str = "",
+    action_id: str = "",
 ) -> list[str]:
     """Assemble the full ``herdr agent start`` argv for one launched slot (pure).
 
@@ -331,6 +344,14 @@ def build_agent_start_argv(
     # byte-for-byte the pre-#13637 env set (no extra --env).
     if attest_launcher:
         env_flags += ["--env", f"MOZYO_BRIDGE_HOME={store_home}"]
+    # Reserved startup-transaction action_id (Redmine #14231, Design Answer j#84724):
+    # rides along ONLY when wrapping, same reasoning as MOZYO_BRIDGE_HOME above — only the
+    # wrapper reads it (to append typed execution-stage events), so an unwrapped launch
+    # stays byte-for-byte the pre-#14231 env set. Emitted whenever wrapping AND a caller
+    # supplied one (empty on a caller that has no transaction, e.g. some test harnesses);
+    # never gates or fails the launch either way.
+    if attest_launcher and (action_id or "").strip():
+        env_flags += ["--env", f"{MOZYO_STARTUP_ACTION_ID_ENV}={action_id.strip()}"]
     # Provider argv[0] alias (Redmine #14017): the provider command keeps the verified
     # realpath as its exec target (argv[0] token after `--`), but a symlinked provider
     # whose stable trusted alias differs from that realpath is handed argv[0]=<alias> by

@@ -323,6 +323,12 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         upstream_coordinator=getattr(args, "upstream_coordinator", None),
         work_unit=work_unit,
         work_unit_decision_anchor=decision_anchor,
+        # Redmine #14224 correction (j#84882): this is the SECOND request-construction
+        # site (the plan-only surface builds its own in sublane_lifecycle_command). Both
+        # must carry the same leaf admission input, or the same argv resolves differently
+        # across `sublane create` (plan) and `--dry-run` / `--execute` — which is exactly
+        # the drift the exact-installed black-box caught.
+        leaf_standalone=bool(getattr(args, "leaf_standalone", False)),
         base_ref=getattr(args, "base_ref", None),
     )
     fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)

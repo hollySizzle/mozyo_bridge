@@ -28,6 +28,9 @@ import uuid
 from pathlib import Path
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.startup_execution_events import (
+    ensure_execution_events_table,
+)
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_SUCCESS,
     PHASE_HEALTH_CHECK,
@@ -72,6 +75,23 @@ class StartupTransaction:
         """Durably record the identity BEFORE the run's first side effect."""
         self._action = self._fence.reserve(self._unit, self._nonce)
         return self._action.action_id
+
+    def ensure_execution_events(self) -> None:
+        """Preflight the optional execution-events projection (Redmine #14231).
+
+        Must run AFTER :meth:`reserve` and before the first Herdr side effect (Design
+        Consultation Answer j#84724): a failure here is a reserve-time failure, and the
+        caller should treat it as zero-actuation exactly like a :meth:`reserve` failure.
+        This table is diagnostic-only (see :mod:`...core.state.startup_execution_events`)
+        and never gates rollback / close authority — only whether the wrapper will have
+        anywhere to append its typed stage evidence.
+        """
+        if self._action is None:
+            raise StartupTransactionError(
+                "execution-events preflight was called before reserve(); the reserve "
+                "must precede every side effect"
+            )
+        ensure_execution_events_table(self._fence, self._action.action_id)
 
     def record_launch(self, slot, *, receipt: str = "") -> None:
         """Record one completed ``agent start`` as a participant of this action."""
@@ -137,6 +157,11 @@ def open_startup_transaction(
     Raises :class:`StartupTransactionError` when the authority is unusable. That is
     deliberate and is the whole point of reserving first: a run that cannot record what it
     is about to start must not start it — an untracked partial pair is the defect.
+
+    Redmine #14231: also preflights the optional execution-events projection right after
+    reserving, before this function returns to the caller (and so before any Herdr side
+    effect the caller performs next) — a raise here is a reserve-time failure exactly like
+    a :meth:`StartupTransaction.reserve` failure, zero-actuation.
     """
     if dry_run:
         return None
@@ -148,6 +173,7 @@ def open_startup_transaction(
         nonce=nonce or new_action_nonce(),
     )
     transaction.reserve()
+    transaction.ensure_execution_events()
     return transaction
 
 
