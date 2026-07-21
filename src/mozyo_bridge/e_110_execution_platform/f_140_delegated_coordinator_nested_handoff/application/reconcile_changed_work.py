@@ -57,17 +57,25 @@ def redmine_changed_issue_ids(
 
     Queries ``issues.json?issue_id=<ids>&status_id=*&updated_on=>=<since-1day>`` against the TRUSTED
     base URL (the api key stays in the request header, the destination is the resolved base by
-    construction), returning ``(changed_ids, next_watermark, ok)``. A blank ``since`` (never reconciled)
-    or any credential / transport / parse failure returns ``ok=False`` -> the selector reconciles the
-    whole roster (fail-open). ``next_watermark`` is ``now`` (the query time), advanced by the caller
-    only on a successful pass, with the one-day overlap covering the date granularity.
+    construction), returning ``(changed_ids, next_watermark, ok)``. A credential / transport / parse
+    failure returns ``ok=False`` -> the selector reconciles the whole roster (fail-open). ``next_watermark``
+    is ``now`` (the query time), advanced by the caller only on a fully-successful pass, with the one-day
+    overlap covering the date granularity.
+
+    **Bootstrap (Redmine #14150 review F1)**: a blank ``since`` (never reconciled) does NOT query — it
+    returns ``(all ids, now, True)`` so the first pass reconciles the whole roster AND the commit SEEDS
+    the watermark to ``now``. The next pass then has a real ``since`` and queries incrementally, instead
+    of blank-``since`` fail-open full-reconcile forever (the F1 defect: the watermark was never seeded).
     """
     ids = [str(i).strip() for i in (issue_ids or ()) if str(i).strip()]
     if not ids:
         return frozenset(), str(now or ""), True  # nothing to ask about; a trivially-successful read
     since_date = _date_floor(since)
     if not since_date:
-        return frozenset(), "", False  # never reconciled -> fail open (reconcile all), set no watermark
+        # Bootstrap (F1): reconcile all this pass AND seed the watermark so the next pass goes
+        # incremental. changed=all ids (so the selector reconciles the whole roster), ok=True, so the
+        # commit advances the watermark to ``now`` on success.
+        return frozenset(ids), str(now or ""), True
     try:
         from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
             normalize_base_url,
@@ -122,23 +130,30 @@ def redmine_changed_issue_ids(
     return frozenset(changed & set(ids)), str(now or ""), True
 
 
-def _issues_with_local_work(outbox: CallbackOutbox, workspace_id: str) -> "frozenset[str]":
-    """Roster issues carrying un-accounted local outbox work (pending / inflight / uncertain).
+def _issues_with_local_work(
+    outbox: CallbackOutbox, workspace_id: str
+) -> "tuple[frozenset[str], bool]":
+    """``(issues carrying un-accounted local outbox work, ok)`` — pending / inflight / uncertain.
 
     Such an issue MUST be reconciled even if unchanged, so its pending rows are delivered — skipping it
-    would strand review_return / lane_gateway rows the local drain deliberately defers. Fail-open (an
-    unreadable outbox forces the issue set empty, so nothing is force-reconciled on that basis alone).
+    would strand review_return / lane_gateway rows the local drain deliberately defers. Redmine #14150
+    review F3: a read failure returns ``ok=False`` (NOT an empty set) so the caller fails OPEN
+    (reconciles the whole roster) — an unreadable outbox must not be silently read as "no local work"
+    (which would let an unchanged issue skip its reconcile while its local recovery is unverifiable).
     """
     wsid = str(workspace_id or "").strip()
     try:
         rows = outbox.read(states=[CALLBACK_PENDING, CALLBACK_INFLIGHT, CALLBACK_UNCERTAIN])
-    except Exception:  # noqa: BLE001 - an unreadable outbox forces nothing here (the changed set still applies)
-        return frozenset()
-    return frozenset(
-        str(getattr(r, "issue", "") or "").strip()
-        for r in rows
-        if str(getattr(r, "workspace_id", "") or "").strip() == wsid
-        and str(getattr(r, "issue", "") or "").strip()
+    except Exception:  # noqa: BLE001 - an unreadable outbox is a fail-OPEN signal, never "no work"
+        return frozenset(), False
+    return (
+        frozenset(
+            str(getattr(r, "issue", "") or "").strip()
+            for r in rows
+            if str(getattr(r, "workspace_id", "") or "").strip() == wsid
+            and str(getattr(r, "issue", "") or "").strip()
+        ),
+        True,
     )
 
 
@@ -157,9 +172,11 @@ def build_reconcile_incremental_fn(
     ``changed_work_fn(issue_ids, since) -> (changed_ids, next_watermark, ok)`` is the provider-neutral
     changed-work port (the Redmine adapter is :func:`redmine_changed_issue_ids`; tests inject a fake).
     ``lane_facts_fn`` / ``authoritative_map_fn`` build each issue's LOCAL snapshot; the outbox supplies
-    the un-accounted-work set. ``commit`` advances the changed watermark + persists snapshots ONLY for
-    the issues the caller reconciled without error, so a transient provider failure never advances past
-    an un-read issue.
+    the un-accounted-work set. ``commit`` persists snapshots for the reconciled-without-error issues and
+    advances the scope watermark ONLY when EVERY selected reconcile target succeeded (Redmine #14150
+    review F2) — a partial failure leaves the watermark so the next pass re-queries the still-unread
+    change (a transient provider failure never advances past an un-read issue). An unreadable outbox
+    (review F3) fails OPEN to a whole-roster reconcile.
     """
 
     def _reconcile_incremental_fn(workspace_id: str, roster: Sequence[str]):
@@ -181,22 +198,35 @@ def build_reconcile_incremental_fn(
                 lane_id, generation, disposition, owners.get(issue, "")
             )
         prior = cadence_store.read_issue_snapshots(wsid, issues)
-        has_local_work = _issues_with_local_work(outbox, wsid)
+        has_local_work, local_work_ok = _issues_with_local_work(outbox, wsid)
+        # Redmine #14150 review F3: an unreadable outbox fails OPEN — force the selector to reconcile
+        # the whole roster (never let an unchanged issue skip while its local recovery is unverifiable).
+        effective_changed_ok = changed_ok and local_work_ok
         to_reconcile, skipped = select_reconcile_issues(
-            issues, changed_ids=changed_ids, changed_ok=changed_ok,
+            issues, changed_ids=changed_ids, changed_ok=effective_changed_ok,
             snapshot_by_issue=snapshot_by_issue, prior_snapshot_by_issue=prior,
             has_local_work=has_local_work,
         )
+        to_reconcile_set = set(to_reconcile)
 
         def _commit(reconciled_issues: Sequence[str]) -> None:
             now = now_fn()
-            for issue in reconciled_issues:
-                iss = str(issue).strip()
+            reconciled = {str(i).strip() for i in (reconciled_issues or ())}
+            for iss in reconciled:
                 if iss in snapshot_by_issue:
                     cadence_store.write_issue_snapshot(
                         wsid, iss, snapshot=snapshot_by_issue[iss], now=now
                     )
-            if changed_ok and next_watermark:
+            # Redmine #14150 review F2: advance the scope watermark ONLY when EVERY selected target
+            # reconciled without error (``to_reconcile_set <= reconciled`` — vacuously true when nothing
+            # was selected, so an idle "nothing changed" pass still advances). A partial failure keeps
+            # the old watermark so the next pass re-queries the still-unread change (success-only advance).
+            if (
+                changed_ok
+                and local_work_ok
+                and next_watermark
+                and to_reconcile_set <= reconciled
+            ):
                 cadence_store.advance_changed_watermark(wsid, watermark=next_watermark, now=now)
 
         return to_reconcile, skipped, _commit

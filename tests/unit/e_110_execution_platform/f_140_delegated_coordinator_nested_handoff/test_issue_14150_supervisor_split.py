@@ -506,6 +506,147 @@ class ReconcileIncrementalWiringTest(unittest.TestCase):
         self.assertNotEqual(store.read_issue_snapshots("wsA", ["1"])["1"], "")
 
 
+class ReconcileIncrementalRecoveryTest(unittest.TestCase):
+    """Redmine #14150 R3 review j#84332: bootstrap seed (F1), partial-failure watermark (F2),
+    unreadable-outbox fail-open (F3)."""
+
+    def _fn(self, *, changed_work_fn, outbox=None):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_changed_work import (
+            build_reconcile_incremental_fn,
+        )
+        d = Path(tempfile.mkdtemp())
+        store = ReconcileCadenceStore(path=d / "rc.sqlite")
+        ob = outbox if outbox is not None else CallbackOutbox(path=d / "wf.sqlite")
+        fn = build_reconcile_incremental_fn(
+            cadence_store=store, lifecycle_store=object(), outbox=ob,
+            lane_facts_fn=lambda ws, i: ("lane", 1, "active"),
+            authoritative_map_fn=lambda: {},
+            changed_work_fn=changed_work_fn, now_fn=lambda: CLOCK,
+        )
+        return fn, store
+
+    def test_f1_bootstrap_seeds_watermark_then_goes_incremental(self) -> None:
+        calls = []
+
+        def cw(ids, since):
+            calls.append(since)
+            if not since:  # bootstrap: all changed + seed watermark
+                return frozenset(ids), "2026-07-20T10:00:00+00:00", True
+            return frozenset(), "2026-07-20T11:00:00+00:00", True  # 2nd pass: nothing changed
+
+        fn, store = self._fn(changed_work_fn=cw)
+        to1, skip1, commit1 = fn("wsA", ["1", "2"])
+        self.assertEqual(set(to1), {"1", "2"})  # bootstrap reconciles all
+        commit1(["1", "2"])  # full success
+        self.assertEqual(store.read_changed_watermark("wsA"), "2026-07-20T10:00:00+00:00")  # SEEDED
+        # Second pass: watermark is set -> query runs incrementally, snapshots now match -> skip.
+        to2, skip2, _ = fn("wsA", ["1", "2"])
+        self.assertEqual(calls[1], "2026-07-20T10:00:00+00:00")  # queried WITH the seeded since
+        self.assertEqual(to2, ())          # nothing changed -> incremental skip
+        self.assertEqual(set(skip2), {"1", "2"})
+
+    def test_f2_partial_failure_does_not_advance_watermark(self) -> None:
+        fn, store = self._fn(
+            changed_work_fn=lambda ids, since: (frozenset({"1", "2"}), "2026-07-20T12:00:00+00:00", True)
+        )
+        store.advance_changed_watermark("wsA", watermark="2026-07-20T00:00:00+00:00", now=CLOCK)
+        to, _skip, commit = fn("wsA", ["1", "2"])
+        self.assertEqual(set(to), {"1", "2"})
+        commit(["1"])  # issue 2 FAILED (not in reconciled set)
+        # Watermark unchanged -> next pass re-queries from the old window (issue 2 is re-found).
+        self.assertEqual(store.read_changed_watermark("wsA"), "2026-07-20T00:00:00+00:00")
+
+    def test_f3_unreadable_outbox_fails_open_reconciles_all(self) -> None:
+        class _BoomOutbox:
+            def read(self, states=None):
+                raise RuntimeError("outbox unreadable")
+
+        # No provider change AND snapshots would match, but the unreadable outbox forces a full reconcile.
+        fn, store = self._fn(
+            changed_work_fn=lambda ids, since: (frozenset(), "2026-07-20T12:00:00+00:00", True),
+            outbox=_BoomOutbox(),
+        )
+        # Seed snapshots so they'd otherwise match (no snapshot-change).
+        store.write_issue_snapshot("wsA", "1", snapshot=issue_reconcile_snapshot_str("lane", 1, "active", ""), now=CLOCK)
+        to, skip, _ = fn("wsA", ["1"])
+        self.assertEqual(set(to), {"1"})  # fail-open: reconciled despite no change (outbox unverifiable)
+        self.assertEqual(skip, ())
+
+
+class RedmineChangedWorkAdapterTest(unittest.TestCase):
+    """Redmine #14150 R3 review j#84332 verification gap: direct adapter query/credential/parse contract."""
+
+    def _fake_urlopen(self, body):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _open(request, timeout=None):
+            self._last_request = request
+            yield type("R", (), {"read": lambda _self: body.encode("utf-8")})()
+        return _open
+
+    def test_bootstrap_blank_since_returns_all_and_seeds_no_query(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_changed_work import (
+            redmine_changed_issue_ids,
+        )
+        called = {"n": 0}
+
+        def _boom(*a, **k):
+            called["n"] += 1
+            raise AssertionError("bootstrap must not query the provider")
+
+        changed, wm, ok = redmine_changed_issue_ids(["1", "2"], "", now="2026-07-20T10:00:00+00:00", urlopen=_boom)
+        self.assertEqual(changed, frozenset({"1", "2"}))
+        self.assertEqual(wm, "2026-07-20T10:00:00+00:00")
+        self.assertTrue(ok)
+        self.assertEqual(called["n"], 0)
+
+    def test_query_parses_changed_ids_and_filters_to_roster(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            reconcile_changed_work as rcw,
+        )
+        body = '{"issues": [{"id": 1}, {"id": 99}]}'  # 99 is not in the roster -> filtered out
+        creds = type("C", (), {"api_key": "k", "base_url": "https://redmine.test"})()
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials.resolve_redmine_credentials",
+            return_value=creds,
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context.normalize_base_url",
+            return_value="https://redmine.test",
+        ):
+            changed, wm, ok = rcw.redmine_changed_issue_ids(
+                ["1", "2"], "2026-07-20T00:00:00+00:00", now="2026-07-20T10:00:00+00:00",
+                urlopen=self._fake_urlopen(body),
+            )
+        self.assertTrue(ok)
+        self.assertEqual(changed, frozenset({"1"}))  # 1 changed & in roster; 99 filtered
+        self.assertEqual(wm, "2026-07-20T10:00:00+00:00")
+        self.assertIn("updated_on", self._last_request.full_url)  # the query carried the since filter
+
+    def test_missing_credentials_fail_open(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            reconcile_changed_work as rcw,
+        )
+        creds = type("C", (), {"api_key": None, "base_url": None})()
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials.resolve_redmine_credentials",
+            return_value=creds,
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context.normalize_base_url",
+            return_value=None,
+        ):
+            changed, wm, ok = rcw.redmine_changed_issue_ids(
+                ["1"], "2026-07-20T00:00:00+00:00", now="2026-07-20T10:00:00+00:00",
+                urlopen=self._fake_urlopen("{}"),
+            )
+        self.assertFalse(ok)  # fail-open -> selector reconciles all
+        self.assertEqual(changed, frozenset())
+
+
 class SupervisorHonorsIncrementalTest(unittest.TestCase):
     """Redmine #14150 review F2: the supervisor provider-reads ONLY the selector's to-reconcile subset."""
 
