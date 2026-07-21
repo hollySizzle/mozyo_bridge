@@ -67,7 +67,7 @@ class BuildSummaryTests(unittest.TestCase):
             provenance_problems=[], wheel_name="mozyo_bridge-0.12.2-py3-none-any.whl",
             wheel_sha256="deadbeef",
             entrypoints={s: 0 for s, _ in mod.SHAPE_ENTRYPOINTS},
-            representative={"callback_lease": True, "sublane_list": True},
+            representative={k: True for k in mod.REQUIRED_REPRESENTATIVE},
         )
         base.update(over)
         return mod.build_summary(**base)
@@ -77,6 +77,22 @@ class BuildSummaryTests(unittest.TestCase):
         self.assertTrue(summary["ok"])
         self.assertTrue(summary["provenance_ok"])
         self.assertEqual(summary["artifact"]["sha256"], "deadbeef")
+        self.assertEqual(summary["representative_missing"], [])
+
+    def test_a_missing_required_critical_path_fails_closed(self):
+        # A shape whose installed critical path was never driven must not read ok (review j#84441).
+        partial = {"callback_lease": True, "sublane_list": True}
+        summary = self._summary(representative=partial)
+        self.assertFalse(summary["representative_ok"])
+        self.assertFalse(summary["ok"])
+        self.assertIn("recover_stale", summary["representative_missing"])
+        self.assertIn("session_rollback", summary["representative_missing"])
+        self.assertIn("callback_exactly_once", summary["representative_missing"])
+
+    def test_required_paths_cover_f2_f3_f4(self):
+        # The F2 / F3 / F4 accepted-finding critical paths are all required installed.
+        for key in ("recover_stale", "session_rollback", "callback_exactly_once"):
+            self.assertIn(key, mod.REQUIRED_REPRESENTATIVE)
 
     def test_provenance_problem_fails(self):
         summary = self._summary(provenance_problems=["module loaded from the checkout"])

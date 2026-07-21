@@ -234,15 +234,23 @@ class CallbackLeaseRecoveryThroughPublicCli(unittest.TestCase):
         self.assertEqual(again["duplicates"], 1)
         self.assertFalse(again["outcomes"][0]["inserted"])
 
-        # A fresh-turn sweep surfaces the single pending anchor and does NOT amplify the backlog.
+        # The SEND edge, not just enqueue-uniqueness: with an isolated counting transport, deliver
+        # the anchor and re-deliver it. The anchor is SENT exactly once (a delivered row is
+        # terminal; the re-deliver sends nothing) — duplicate notification 0.
+        with h.counting_callback_transport() as sends:
+            delivered = h.callbacks_cli("--deliver", "--workspace-id", h.workspace_id, "--json").json()
+            self.assertEqual(len(delivered["delivered"]), 1)
+            self.assertEqual(delivered["delivered"][0]["send_outcome"], "delivered")
+            self.assertEqual(len(sends), 1)  # exactly one send
+
+            redelivered = h.callbacks_cli("--deliver", "--workspace-id", h.workspace_id, "--json").json()
+            self.assertEqual(redelivered["delivered"], [])  # nothing re-sent
+            self.assertEqual(len(sends), 1)  # still exactly one send (duplicate notification 0)
+
+        # After delivery, a fresh-turn sweep does NOT amplify the pending / dead-letter backlog.
         swept = h.callbacks_cli("--sweep", "--workspace-id", h.workspace_id, "--json").json()
-        self.assertEqual(len(swept["pending"]), 1)
-        self.assertEqual(swept["pending"][0]["journal"], "84000")
         self.assertEqual(swept["dead_letter"], [])
-        # A second sweep is still exactly one pending, zero dead-letter (no growth).
-        reswept = h.callbacks_cli("--sweep", "--workspace-id", h.workspace_id, "--json").json()
-        self.assertEqual(len(reswept["pending"]), 1)
-        self.assertEqual(reswept["dead_letter"], [])
+        self.assertEqual(len(swept["pending"]), 0)  # the anchor is delivered, not re-pending
 
     def test_rollback_cleanup_failure_is_a_typed_residue_never_hidden(self):
         # Item 3 of the IR: a rollback whose backup cleanup fails is an HONEST rollback_incomplete
