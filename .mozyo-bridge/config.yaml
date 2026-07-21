@@ -1,4 +1,6 @@
 version: 2
+work_unit:
+  granularity: user_story
 agents:
   profiles:
     implementation:
