@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.support.private_path_fixtures import linux_home_path
+
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = ROOT / "smoke" / "installed_fault_smoke.py"
 
@@ -21,6 +23,11 @@ _spec = importlib.util.spec_from_file_location("installed_fault_smoke", _SCRIPT)
 mod = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(mod)
+
+# A global pipx install lives under the user's home, so this fixture path is genuinely
+# home-shaped and is composed at runtime: `release check tree` blocks a `/home/<name>/`
+# literal in a tracked file, fixtures included.
+_PIPX_GLOBAL_BIN = linux_home_path("u") + "/.local/pipx/venvs/mozyo-bridge/bin/mozyo-bridge"
 
 
 class VerifyProvenanceTests(unittest.TestCase):
@@ -48,7 +55,7 @@ class VerifyProvenanceTests(unittest.TestCase):
 
     def test_pipx_global_is_flagged(self):
         problems = mod.verify_provenance(
-            **self._facts(executable="/home/u/.local/pipx/venvs/mozyo-bridge/bin/mozyo-bridge")
+            **self._facts(executable=_PIPX_GLOBAL_BIN)
         )
         self.assertTrue(any("pipx" in p for p in problems))
 
